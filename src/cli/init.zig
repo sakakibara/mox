@@ -77,7 +77,9 @@ fn dirNonEmpty(io: Io, path: []const u8) !bool {
 fn gitClone(arena: std.mem.Allocator, io: Io, url: []const u8, dest: []const u8) !void {
     // Disable git's `ext::`/`file::` command transports so a hostile URL cannot
     // run a shell command during clone; `--` blocks option injection.
-    const result = std.process.run(arena, io, .{ .argv = &.{ "git", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=user", "clone", "--", url, dest } }) catch |e| switch (e) {
+    // `core.autocrlf=false` keeps the checkout byte-exact: dotfiles are content
+    // mox composes verbatim, so a Windows CRLF rewrite would corrupt them.
+    const result = std.process.run(arena, io, .{ .argv = &.{ "git", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=user", "-c", "core.autocrlf=false", "clone", "--", url, dest } }) catch |e| switch (e) {
         error.FileNotFound => return error.GitNotFound,
         else => return error.CloneFailed,
     };
