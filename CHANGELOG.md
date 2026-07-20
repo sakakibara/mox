@@ -4,6 +4,15 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-07-21
+
+### Added
+- `mox init --clone <url> --apply` clones and applies in one step, so the
+  installer one-liner brings up a whole machine from scratch:
+  `sh -c "$(curl -fsSL .../install.sh)" -- init --clone <url> --apply`. Without
+  `--apply`, `init --clone` still stops for review first -- the safe default,
+  since applying a freshly cloned repo runs its setup scripts.
+
 ## [0.1.1] - 2026-07-21
 
 ### Added
