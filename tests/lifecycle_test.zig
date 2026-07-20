@@ -459,6 +459,49 @@ test "doctor --fix rebuilds malformed provenance for tracked files" {
     try std.testing.expect(std.mem.indexOf(u8, after.out, "bad-provenance") == null);
 }
 
+/// Seed a throwaway git repo at `repo` with a committed working tree so
+/// `mox init --clone` has something to clone. Skips the test if git is
+/// unavailable. The identity is throwaway test scaffolding, not a real repo.
+fn gitSeed(io: Io, a: std.mem.Allocator, repo: []const u8) !void {
+    const step = struct {
+        fn run(io_: Io, a_: std.mem.Allocator, argv: []const []const u8) !void {
+            const r = std.process.run(a_, io_, .{ .argv = argv }) catch return error.SkipZigTest;
+            switch (r.term) {
+                .exited => |c| if (c != 0) return error.SkipZigTest,
+                else => return error.SkipZigTest,
+            }
+        }
+    }.run;
+    try step(io, a, &.{ "git", "init", "-q", repo });
+    try step(io, a, &.{ "git", "-C", repo, "add", "src" });
+    try step(io, a, &.{ "git", "-C", repo, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-q", "-m", "seed" });
+}
+
+test "init --clone --apply: clones the repo and applies it in one command" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A source repo with a committed src/ tree to clone from.
+    try writeRepo(io, &tmp, "source/src/.zshrc", "hello from clone\n");
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const source = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "source" });
+    try gitSeed(io, a, source);
+
+    // Empty repo dir (no create_repo_src) so init --clone is allowed.
+    const h = try testutil.setup(a, io, &tmp, .{});
+
+    const r = try h.run(&.{ "mox", "init", "--clone", source, "--apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Cloned AND applied in one step: the live file is written.
+    try std.testing.expectEqualStrings("hello from clone\n", try read(io, a, try h.homePath(".zshrc")));
+    // With --apply, the "review then apply" prompt is suppressed.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Review the repository") == null);
+}
+
 test "uninstall: removes state, preserves private and trash and the source repo" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

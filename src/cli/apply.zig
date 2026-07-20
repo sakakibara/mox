@@ -12,12 +12,16 @@ pub const Spec = struct {
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+    return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts);
+}
+
+/// The apply pipeline, callable with explicit flags so `mox init --apply` can
+/// run it right after a clone. `run` is the thin CLI wrapper over it.
+pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool) anyerror!u8 {
     const context = ctx.context.?;
-    const force = a.force;
-    const dry_run = a.dry_run;
     // Skip setup scripts (also implied by --dry-run) for fast, side-effect-
     // free file-only applies; scripts may install packages or hit the network.
-    const skip_scripts = dry_run or a.skip_scripts;
+    const skip_scripts = dry_run or skip_scripts_arg;
 
     const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 1;
     defer lk.release();

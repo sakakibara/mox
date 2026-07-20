@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
+const apply = @import("apply.zig");
 const mox = @import("../root.zig");
 
 const Io = std.Io;
@@ -11,6 +12,7 @@ const CloneFn = *const fn (std.mem.Allocator, Io, []const u8, []const u8) anyerr
 
 const Spec = struct {
     clone: cli.spec.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply')" }),
+    apply: cli.spec.Flag(.{ .help = "after cloning, apply immediately (write files, run scripts) instead of stopping to review" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
@@ -19,17 +21,25 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.err.writeAll("mox init: --clone requires a repository URL\n");
             return 2;
         }
-        return runClone(ctx, url, gitClone);
+        const rc = try runClone(ctx, url, gitClone, a.apply);
+        if (rc != 0) return rc;
+        // Opt-in one-command bootstrap: clone, then apply a repo the user trusts.
+        if (a.apply) return apply.applyImpl(ctx, false, false, false);
+        return rc;
     }
-    return initFresh(ctx);
+    const rc = try initFresh(ctx);
+    if (rc != 0) return rc;
+    if (a.apply) return apply.applyImpl(ctx, false, false, false);
+    return rc;
 }
 
-/// Clone `url` into the repo dir. Deliberately does NOT apply: a freshly cloned
-/// repo is untrusted until the user has looked at it, and applying would write
-/// its files and run its `scripts/` (arbitrary code) unreviewed. The user
-/// reviews, then runs `mox apply` themselves. Refuses if the repo dir already
-/// has content, so an existing repo is never clobbered.
-fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn) !u8 {
+/// Clone `url` into the repo dir. Does not apply by default: a freshly cloned
+/// repo is untrusted until looked at, and applying would write its files and
+/// run its `scripts/` (arbitrary code) unreviewed -- so the user reviews, then
+/// runs `mox apply`. `apply_now` (from `init --apply`) opts into applying right
+/// away for a repo the user trusts. Refuses a non-empty repo dir, so an
+/// existing repo is never clobbered.
+fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn, apply_now: bool) !u8 {
     const context = ctx.context.?;
     if (try dirNonEmpty(ctx.io, context.paths.repo_dir)) {
         try ctx.err.print("mox init: refusing to clone into non-empty {s}\n", .{context.paths.repo_dir});
@@ -43,7 +53,9 @@ fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn) !u8 {
         return 1;
     };
     try ctx.out.print("Cloned {s} to {s}\n", .{ url, context.paths.repo_dir });
-    try ctx.out.writeAll("Review the repository, then run 'mox apply' to interview for facts, write files, and run setup scripts.\n");
+    if (!apply_now) {
+        try ctx.out.writeAll("Review the repository, then run 'mox apply' to interview for facts, write files, and run setup scripts.\n");
+    }
     return 0;
 }
 
@@ -103,8 +115,8 @@ fn initFresh(ctx: *app.Ctx) !u8 {
 pub const command = app.command(Spec, .{
     .name = "init",
     .summary = "Initialize a fresh mox repo",
-    .usage = "mox init [--clone <url>]",
-    .details = "Creates src/ and scripts/. --clone <url>: git clone <url> into the repo dir for you to review (does not apply -- run 'mox apply' yourself); refuses a non-empty repo dir.",
+    .usage = "mox init [--clone <url>] [--apply]",
+    .details = "Creates src/ and scripts/. --clone <url>: git clone <url> into the repo dir; without --apply it stops for you to review (then run 'mox apply'), with --apply it applies right away (writes files, runs scripts) for a one-command bootstrap. Refuses a non-empty repo dir.",
     .group = .general,
     .needs_context = true,
 }, run);
