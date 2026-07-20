@@ -103,6 +103,16 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try attrs.write(ctx.io, context.paths.repo_dir);
     }
 
+    // A generator's produced-set manifest is keyed by the generator's live path,
+    // not its source file, so a rename would leave the old leaves tracked under
+    // the old key -- orphaned, never pruned. Re-key the manifest to the new live
+    // path so the next apply prunes the old leaves rather than leaking them.
+    const prior_gen = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, old_live);
+    if (prior_gen.len > 0) {
+        try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, new_live, prior_gen);
+        try mox.apply.generated.deleteManifest(ctx.alloc, ctx.io, context.paths.state_dir, old_live);
+    }
+
     // Rename base then its overlay dir.
     if (std.fs.path.dirname(new_base_abs)) |parent| Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
     if (file.has_base and file.source_base_abs.len > 0) {

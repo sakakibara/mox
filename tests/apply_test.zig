@@ -2029,3 +2029,31 @@ test "apply generator: a top-level for..into sharing the file with another direc
     // Nothing was fanned out: the generator's rows never materialized.
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
 }
+
+test "apply generator: mox mv re-keys the manifest so the old leaves are pruned, not orphaned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenFixture(io, &tmp, &.{ "a", "b" });
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".config/id-a.inc")));
+
+    // Move the generator source into a subdirectory: its leaves now render under
+    // the new dir. The old leaves must be pruned (snapshot-first) on the next
+    // apply, not left orphaned under the old location.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "mv", ".config/gen.inc", ".config/sub/gen.inc" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // New leaves at the moved location.
+    try std.testing.expectEqualStrings("key=a\n", try read(io, a, try c.homePath(".config/sub/id-a.inc")));
+    try std.testing.expectEqualStrings("key=b\n", try read(io, a, try c.homePath(".config/sub/id-b.inc")));
+    // Old leaves pruned, not orphaned, and recoverable.
+    try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
+    try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
+    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/id-a.inc", "key=a\n"));
+}
