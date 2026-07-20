@@ -77,6 +77,20 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run mox");
     run_step.dependOn(&run_cmd.step);
 
+    // Generated reference docs (Zig stdlib pattern). Browse
+    // `zig-out/docs/index.html` after `zig build docs`.
+    const docs_obj = b.addObject(.{
+        .name = "mox",
+        .root_module = lib_mod,
+    });
+    const docs_install = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate API reference docs to zig-out/docs/");
+    docs_step.dependOn(&docs_install.step);
+
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     const exe_tests = b.addTest(.{ .root_module = exe_mod });
 
