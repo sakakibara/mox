@@ -116,7 +116,8 @@ jobs:
             x86_64-macos:mox-x86_64-macos \
             x86_64-linux-musl:mox-x86_64-linux \
             aarch64-linux-musl:mox-aarch64-linux \
-            x86_64-windows:mox-x86_64-windows
+            x86_64-windows:mox-x86_64-windows \
+            aarch64-windows:mox-aarch64-windows
           for pair in "$@"; do
             target="${pair%%:*}"; asset="${pair##*:}"
             echo "== $target -> $asset =="
