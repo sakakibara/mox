@@ -9,6 +9,13 @@ on:
     # Nightly bounded fuzz run of the DSL parse pipeline and ini_merge.
     - cron: "0 4 * * *"
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.16.0"
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -19,16 +26,40 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-      - name: Format check
+      - uses: actions/checkout@v6
+
+      - name: install zig (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   triple=x86_64-linux ;;
+            Linux-ARM64) triple=aarch64-linux ;;
+            macOS-ARM64) triple=aarch64-macos ;;
+            macOS-X64)   triple=x86_64-macos ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-${triple}-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: install zig (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $dst = Join-Path $env:USERPROFILE 'zig'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          Expand-Archive -LiteralPath zig.zip -DestinationPath $dst
+          "$dst\zig-x86_64-windows-$env:ZIG_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: format check
         run: zig fmt --check build.zig src tests
-      - name: Build
+      - name: build
         run: zig build
-      - name: Test
+      - name: test
         run: zig build test --summary all
 
   fuzz:
@@ -40,10 +71,13 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-      - name: Fuzz (bounded)
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: fuzz (bounded)
         run: timeout 600 zig build fuzz

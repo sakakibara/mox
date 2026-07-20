@@ -1,12 +1,12 @@
 name: release
 
 # Cut a release by pushing a v<x.y.z> tag. Before tagging:
-#   - build.zig.zon `.version` equals the tag (the verify job enforces this).
+#   - build.zig.zon `.version` equals the tag (the build job enforces this).
 #   - CHANGELOG.md has a dated section for the version; its body becomes the
-#     release notes (the verify job fails a missing or empty section).
-# Best practice is still to push main, watch ci go green on every platform, then
-# tag -- but the test job below re-runs the suite on the tagged commit across all
-# platforms and gates the build, so a tag on an untested commit cannot publish.
+#     release notes.
+# Push main, watch ci go green on every platform, then tag. The test job below
+# re-runs the suite on the tagged commit across all platforms and gates the
+# build, so a tag on an untested commit cannot publish.
 
 on:
   push:
@@ -15,39 +15,18 @@ on:
 permissions:
   contents: write
 
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Tag matches build.zig.zon version
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          zon="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          if [ "$tag" != "$zon" ]; then
-            echo "tag v$tag does not match build.zig.zon version $zon" >&2
-            exit 1
-          fi
-      - name: CHANGELOG has a non-empty section for the version
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          awk -v ver="$version" '
-            $0 ~ "^## \\[?" ver "\\]?" { flag=1; next }
-            /^## / && flag { flag=0 }
-            flag { print }
-          ' CHANGELOG.md > notes.md
-          if [ ! -s notes.md ]; then
-            echo "CHANGELOG.md has no non-empty section for $version" >&2
-            exit 1
-          fi
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
-  # Re-run the suite on every platform for the exact tagged commit, so a tag on
-  # an untested commit cannot publish a broken build even if CI was not watched
-  # to green first. build waits on this.
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  # Re-run the full suite on every platform for the exact tagged commit, so a
+  # tag on an untested commit cannot publish a broken build even if ci was not
+  # watched to green first. build-and-release waits on this.
   test:
-    needs: verify
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -55,86 +34,119 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-      - name: Test
+      - uses: actions/checkout@v6
+
+      - name: install zig (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   triple=x86_64-linux ;;
+            Linux-ARM64) triple=aarch64-linux ;;
+            macOS-ARM64) triple=aarch64-macos ;;
+            macOS-X64)   triple=x86_64-macos ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-${triple}-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: install zig (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $dst = Join-Path $env:USERPROFILE 'zig'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          Expand-Archive -LiteralPath zig.zip -DestinationPath $dst
+          "$dst\zig-x86_64-windows-$env:ZIG_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: test
         run: zig build test --summary all
 
-  build:
+  # One job cross-compiles every target (Zig cross-compiles from Linux), packages
+  # them, writes SHA256SUMS, and publishes -- so no artifacts pass between jobs.
+  build-and-release:
     needs: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-macos
-            asset: mox-aarch64-macos
-          - target: x86_64-macos
-            asset: mox-x86_64-macos
-          - target: x86_64-linux-musl
-            asset: mox-x86_64-linux
-          - target: aarch64-linux-musl
-            asset: mox-aarch64-linux
-          - target: x86_64-windows
-            asset: mox-x86_64-windows
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-      - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
-      - name: Package
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp LICENSE README.md dist/
-          if [ -f zig-out/bin/mox.exe ]; then
-            cp zig-out/bin/mox.exe dist/
-            (cd dist && zip -r "../${{ matrix.asset }}.zip" .)
-          else
-            cp zig-out/bin/mox dist/
-            tar -czf "${{ matrix.asset }}.tar.gz" -C dist .
-          fi
-      - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ matrix.asset }}
-          path: |
-            ${{ matrix.asset }}.tar.gz
-            ${{ matrix.asset }}.zip
-          if-no-files-found: error
+      - uses: actions/checkout@v6
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Download build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Extract release notes from CHANGELOG
+      # Fail before the build if the tag, build.zig.zon, and CHANGELOG.md
+      # disagree, or the changelog section is missing. Cheapest gate first.
+      - name: verify version and extract notes
+        shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          zon_version="$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",/\1/p' build.zig.zon)"
+          if [ "$version" != "$zon_version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match build.zig.zon version $zon_version" >&2
+            exit 1
+          fi
           awk -v ver="$version" '
-            $0 ~ "^## \\[?" ver "\\]?" { flag=1; next }
-            /^## / && flag { flag=0 }
-            flag { print }
+            index($0, "## [" ver "]") == 1 { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
           ' CHANGELOG.md > RELEASE_NOTES.md
           if [ ! -s RELEASE_NOTES.md ]; then
             echo "CHANGELOG.md has no non-empty section for $version" >&2
             exit 1
           fi
-      - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: build, package, and checksum every target
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$(pwd)/dist"
+          mkdir -p "$dist"
+          # target : asset-basename
+          set -- \
+            aarch64-macos:mox-aarch64-macos \
+            x86_64-macos:mox-x86_64-macos \
+            x86_64-linux-musl:mox-x86_64-linux \
+            aarch64-linux-musl:mox-aarch64-linux \
+            x86_64-windows:mox-x86_64-windows
+          for pair in "$@"; do
+            target="${pair%%:*}"; asset="${pair##*:}"
+            echo "== $target -> $asset =="
+            rm -rf zig-out
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe
+            pkg="$(mktemp -d)"
+            cp LICENSE README.md "$pkg/"
+            case "$target" in
+              *windows*)
+                cp zig-out/bin/mox.exe "$pkg/"
+                (cd "$pkg" && zip -qr "$dist/${asset}.zip" .)
+                ;;
+              *)
+                cp zig-out/bin/mox "$pkg/"
+                tar -czf "$dist/${asset}.tar.gz" -C "$pkg" .
+                ;;
+            esac
+            rm -rf "$pkg"
+          done
+          cd "$dist"
+          sha256sum mox-* > SHA256SUMS
+          echo "== dist =="; ls -la; echo "== SHA256SUMS =="; cat SHA256SUMS
+
+      # Publish with softprops (third-party) pinned to a commit SHA, not a movable
+      # tag, so a compromised or retagged release cannot run with this job's
+      # contents:write token. SHA is v3.0.2.
+      - name: create release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
+          name: ${{ github.ref_name }}
           body_path: RELEASE_NOTES.md
-          files: artifacts/**/*
+          files: dist/*
           fail_on_unmatched_files: true
