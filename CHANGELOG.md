@@ -4,6 +4,15 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-07-21
+
+### Added
+- `mox upgrade [<version>] [--yes]` self-updates the binary: it fetches the
+  latest (or a named) release, verifies the download against the release's
+  `SHA256SUMS` before unpacking it, and atomically replaces the running binary
+  -- never auto-downgrading, and refusing any download it cannot verify.
+- Releases now include an `aarch64-windows` (ARM Windows) binary.
+
 ## [0.1.2] - 2026-07-21
 
 ### Added
