@@ -4,6 +4,21 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-21
+
+### Added
+- A one-line installer (`install.sh`, `install.ps1`): it downloads the release
+  binary for the host platform, verifies it against a published `SHA256SUMS`,
+  and installs it, depending on nothing a fresh machine lacks (a shell, curl or
+  wget, and tar). Arguments after `--` pass straight to mox, so
+  `init --clone <url> --apply` installs and bootstraps a machine in one command.
+  `BINDIR`, `MOX_VERSION`, and `MOX_BASE_URL` tune the install.
+- Releases now publish a `SHA256SUMS` asset covering every binary.
+
+### Fixed
+- `mox mv` on a generator source now re-keys its produced-set manifest to the new
+  location, so the next apply prunes the old leaves instead of orphaning them.
+
 ## [0.1.0] - 2026-07-20
 
 Initial release. mox keeps config files in their native format and composes
