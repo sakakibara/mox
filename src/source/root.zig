@@ -5,6 +5,7 @@ pub const path = @import("path.zig");
 pub const junk = @import("junk.zig");
 pub const axes = @import("axes.zig");
 pub const attributes = @import("attributes.zig");
+pub const ignore = @import("ignore/root.zig");
 
 test {
     _ = tree;
@@ -13,4 +14,5 @@ test {
     _ = junk;
     _ = axes;
     _ = attributes;
+    _ = ignore;
 }
