@@ -697,6 +697,50 @@ test "apply: exact-dir sweep refuses to delete a subtree with an unsnapshottable
     try std.testing.expect(exists(io, readable));
 }
 
+test "apply: a tracked-but-ignored source is skipped, not written" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config/oldtool");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.config/oldtool/conf", .data = "x\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = ".config/oldtool/\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, try c.homePath(".config/oldtool/conf")));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipping") != null);
+}
+
+test "apply: exact prune leaves an ignored live file alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.claude");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/.mox-exact", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/CLAUDE.md", .data = "rules\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = ".claude/.credentials.json\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    // A live secret sitting in the exact dir, never applied by mox.
+    const secret = try c.homePath(".claude/.credentials.json");
+    if (std.fs.path.dirname(secret)) |d| try Io.Dir.cwd().createDirPath(io, d);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, secret));
+    try std.testing.expectEqualStrings("SECRET\n", try read(io, a, secret));
+}
+
 test "facts set: a value with a control character is refused, facts file uncorrupted" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -12,6 +12,8 @@ const std = @import("std");
 const Io = std.Io;
 const applied = @import("applied.zig");
 const snapshot = @import("snapshot.zig");
+const ignore_match = @import("../source/ignore/match.zig");
+const source_path = @import("../source/path.zig");
 
 /// Bound on how deep an unmanaged subdirectory is walked when snapshotting its
 /// files before removal. A pathologically deep foreign tree stops here rather
@@ -49,7 +51,9 @@ pub fn managedChildName(dir_live: []const u8, file_live: []const u8) ?[]const u8
 }
 
 /// Sweep each exact directory, removing live entries not among
-/// `managed_live`. Returns the removal/refusal tally.
+/// `managed_live`. An entry matching `ruleset` (checked home-relative to
+/// `home`) is exempt -- it is not mox's to prune. Returns the removal/refusal
+/// tally.
 pub fn enforce(
     arena: std.mem.Allocator,
     io: Io,
@@ -58,10 +62,12 @@ pub fn enforce(
     opts: Options,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
+    ruleset: *const ignore_match.RuleSet,
+    home: []const u8,
 ) !Result {
     var result: Result = .{};
     for (exact_dirs) |dir_live| {
-        try enforceOne(arena, io, dir_live, managed_live, opts, stdout, stderr, &result);
+        try enforceOne(arena, io, dir_live, managed_live, opts, stdout, stderr, &result, ruleset, home);
     }
     return result;
 }
@@ -77,6 +83,8 @@ fn enforceOne(
     stdout: *Io.Writer,
     stderr: *Io.Writer,
     result: *Result,
+    ruleset: *const ignore_match.RuleSet,
+    home: []const u8,
 ) !void {
     var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return,
@@ -94,6 +102,8 @@ fn enforceOne(
     for (entries.items) |e| {
         if (isManagedChild(dir_live, e.name, managed_live)) continue;
         const live_path = try std.fs.path.join(arena, &.{ dir_live, e.name });
+        const rel = try source_path.liveKeyRelToHome(arena, home, live_path);
+        if (ruleset.isIgnored(rel, e.kind == .directory)) continue; // ignored live entries are not mox's to prune
         switch (e.kind) {
             .file => try sweepFile(arena, io, live_path, opts, stdout, stderr, result),
             .directory => try sweepDir(arena, io, live_path, opts, stdout, stderr, result),
@@ -277,7 +287,8 @@ test "enforce: an unreadable file is refused, never deleted with an empty snapsh
         .force = true, // even forced, an unsnapshottable file must not be lost
         .dry_run = false,
     };
-    const res = try enforce(a, io, &.{dir_live}, &.{}, opts, &out_aw.writer, &err_aw.writer);
+    const empty_ruleset: ignore_match.RuleSet = .{ .rules = &.{} };
+    const res = try enforce(a, io, &.{dir_live}, &.{}, opts, &out_aw.writer, &err_aw.writer, &empty_ruleset, base);
 
     try std.testing.expectEqual(@as(usize, 0), res.removed);
     try std.testing.expectEqual(@as(usize, 1), res.refused);
