@@ -35,6 +35,10 @@ On Windows (PowerShell):
 
 `MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror.
 
+Update an installed mox in place with `mox upgrade` -- it downloads the latest
+release, verifies it against the published `SHA256SUMS`, and replaces the running
+binary (`mox upgrade <version>` for a specific one).
+
 ### From source
 
 Requires Zig 0.16.0.

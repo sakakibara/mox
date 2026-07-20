@@ -20,6 +20,7 @@ pub const addtree_cmd = @import("addtree.zig");
 pub const doctor_cmd = @import("doctor.zig");
 pub const uninstall_cmd = @import("uninstall.zig");
 pub const sync_cmd = @import("sync.zig");
+pub const upgrade_cmd = @import("upgrade.zig");
 pub const lock = @import("lock.zig");
 pub const app = @import("app.zig");
 
@@ -40,6 +41,7 @@ test {
     _ = doctor_cmd;
     _ = uninstall_cmd;
     _ = sync_cmd;
+    _ = upgrade_cmd;
     _ = add_cmd;
     _ = lock;
     _ = status_cmd;

@@ -89,6 +89,15 @@ pub const MoxCli = cli.cli.Cli(.{
     .renderHelpFooter = renderHelpFooter,
 });
 
+/// The environment a command reads through. A `needs_context` command takes it
+/// from its loaded `Context`; one that runs without a context (e.g. `upgrade`,
+/// which needs no mox repo) still must not read the process's own environment
+/// when a caller (the test harness) supplied one via `environ_override`.
+pub fn envOf(ctx: *Ctx) Env {
+    if (ctx.context) |c| return c.env;
+    return environ_override orelse Env.current();
+}
+
 pub const Ctx = MoxCli.Ctx;
 pub const Command = MoxCli.Command;
 pub const run = MoxCli.run;
@@ -136,6 +145,7 @@ const remove_cmd = @import("remove.zig");
 const doctor_cmd = @import("doctor.zig");
 const uninstall_cmd = @import("uninstall.zig");
 const sync_cmd = @import("sync.zig");
+const upgrade_cmd = @import("upgrade.zig");
 
 /// Every registered top-level command.
 pub const command_table = [_]Command{
@@ -159,6 +169,7 @@ pub const command_table = [_]Command{
     doctor_cmd.command,
     uninstall_cmd.command,
     sync_cmd.command,
+    upgrade_cmd.command,
     version_cmd,
 };
 
