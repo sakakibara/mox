@@ -7,7 +7,35 @@ and per-machine differences.
 Named for the mox: a small artifact that costs nothing to play and
 powers everything else.
 
-## Build
+## Install
+
+One command, depending on nothing a fresh machine lacks (a shell, curl or wget,
+and tar). It downloads the release binary for your platform, verifies it against
+the release's `SHA256SUMS`, and installs to `~/.local/bin` (override with
+`BINDIR`):
+
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)"
+```
+
+mox is meant to be the *first* thing on a new machine -- it installs your
+runtimes and packages from there. Pass any mox arguments after `--` to install
+and bootstrap in one step:
+
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)" -- \
+    init --clone https://github.com/<you>/dotfiles --apply
+```
+
+On Windows (PowerShell):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sakakibara/mox/main/install.ps1)))
+```
+
+`MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror.
+
+### From source
 
 Requires Zig 0.16.0.
 
