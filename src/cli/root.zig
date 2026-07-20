@@ -1,0 +1,50 @@
+//! Public API for the mox CLI module.
+pub const paths = @import("paths.zig");
+pub const tty = @import("tty.zig");
+pub const prompt = @import("prompt.zig");
+pub const init_cmd = @import("init.zig");
+pub const add_cmd = @import("add.zig");
+pub const apply_cmd = @import("apply.zig");
+pub const status_cmd = @import("status.zig");
+pub const secret_cmd = @import("secret.zig");
+pub const trigger_cmd = @import("trigger.zig");
+pub const data_cmd = @import("data.zig");
+pub const commit_cmd = @import("commit.zig");
+pub const diff_cmd = @import("diff.zig");
+pub const edit_cmd = @import("edit.zig");
+pub const export_cmd = @import("export.zig");
+pub const fileops = @import("fileops.zig");
+pub const mv_cmd = @import("mv.zig");
+pub const remove_cmd = @import("remove.zig");
+pub const addtree_cmd = @import("addtree.zig");
+pub const doctor_cmd = @import("doctor.zig");
+pub const uninstall_cmd = @import("uninstall.zig");
+pub const sync_cmd = @import("sync.zig");
+pub const lock = @import("lock.zig");
+pub const app = @import("app.zig");
+
+test {
+    _ = app;
+    _ = apply_cmd;
+    _ = secret_cmd;
+    _ = trigger_cmd;
+    _ = data_cmd;
+    _ = commit_cmd;
+    _ = diff_cmd;
+    _ = edit_cmd;
+    _ = export_cmd;
+    _ = fileops;
+    _ = mv_cmd;
+    _ = remove_cmd;
+    _ = addtree_cmd;
+    _ = doctor_cmd;
+    _ = uninstall_cmd;
+    _ = sync_cmd;
+    _ = add_cmd;
+    _ = lock;
+    _ = status_cmd;
+    _ = init_cmd;
+    _ = paths;
+    _ = tty;
+    _ = prompt;
+}

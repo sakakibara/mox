@@ -1,0 +1,41 @@
+.{
+    .name = .mox,
+    .version = "0.1.0",
+    .fingerprint = 0x3f50f07a66b54f5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .toml = .{
+            .url = "https://github.com/sakakibara/toml-zig/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "toml-0.4.0-L7MJe5qrCgCF-2BmK9hpRu9Kb1qPPHllZo7xY67iJVQg",
+        },
+        .json = .{
+            .url = "https://github.com/sakakibara/json-zig/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "json-0.2.0-YtF7Jd3FBgB8HsKlP1vHrSaBwxAV5ExU0Rzl59iC3-Vy",
+        },
+        .yaml = .{
+            .url = "https://github.com/sakakibara/yaml-zig/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "yaml-0.2.0-MIhruG0iCwB4qHX0sJG8-uhv1bzT2-KASVrj6byCXeoo",
+        },
+        .cli = .{
+            .url = "https://github.com/sakakibara/cli-zig/archive/refs/tags/v0.1.2.tar.gz",
+            .hash = "cli-0.1.2-xmo03xd-BAD6wIBj_iubwhbHiM2aDe_A5hJvkuKKYeXR",
+        },
+        .env = .{
+            .url = "https://github.com/sakakibara/env-zig/archive/refs/tags/v0.1.1.tar.gz",
+            .hash = "env-0.1.1-sTEXsnNyAADkVRj6KAJjvfbgZQZVq56Rg2I4CoTy63sG",
+        },
+        .ini = .{
+            .url = "https://github.com/sakakibara/ini-zig/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "ini-0.2.0-_bxUWWfJBgBe8jPtcfOfIhOkq7F83cXKErHmh--xFfS_",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        ".github",
+        "LICENSE",
+        "README.md",
+    },
+}

@@ -1,0 +1,93 @@
+(* mox directive DSL - normative grammar.
+
+   This grammar is the source of truth for what mox accepts inside managed
+   files. It is deliberately bounded: no recursion into user data, no
+   arithmetic, no string transforms, no regex, no glob. Every construct below
+   is finite and terminates. Anything not derivable here is rejected at parse
+   or compose time; see tests/dsl_rejection_test.zig for the locked non-features.
+
+   A directive is a single comment line whose body begins with `mox:`. The
+   comment marker is the host file's own line-comment lead (`#`, `--`, `//`,
+   ...), inferred from extension, shebang, or an apparent directive line. *)
+
+directive     = marker "mox:" ( line_dir | region_open | "end" ) EOL ;
+
+line_dir      = "include" string [ "when" axis_expr ]
+              | "secret" string ;
+
+region_open   = "replace" ( string [ "when" axis_expr ] | "from" string )
+              | "append"  string [ "when" axis_expr ]
+              | "prepend" string [ "when" axis_expr ]
+              | "remove" "when" axis_expr
+              | "from" string
+              | "when" axis_expr
+              | "for" ident "in" data_source [ "when" axis_expr ] [ "where" row_expr ]
+                    [ "into" string ] ;
+
+(* A `for` data source is a bare ident (the per-file `<base>.d/<name>` data
+   file), a quoted repo-relative path (e.g. "data/abbreviations.toml", which the
+   private layer shadows), or -- inside another loop -- an enclosing row's list
+   field `var.field`. `into "<path>"` (top-level `for` only) makes the loop a
+   generator: one file per row at the rendered path, the source not materialized.
+   A region body is itself a sequence of content lines and nested directives (a
+   `when`/`for` inside a `for`), each closed by its own `end`, matched by depth
+   to a bounded nesting depth -- so every construct still terminates. *)
+data_source   = ident | string ;
+
+axis_expr     = axis_or ;
+axis_or       = axis_and { "or" axis_and } ;
+axis_and      = axis_not { "and" axis_not } ;
+axis_not      = "not" axis_not | axis_atom ;
+axis_atom     = ident [ "=" value ] | "(" axis_expr ")" ;
+
+row_expr      = row_or ;
+row_or        = row_and { "or" row_and } ;
+row_and       = row_not { "and" row_not } ;
+row_not       = "not" row_not | row_atom ;
+(* A dotted ident `var.field` is a loop-variable field reference (`var` must
+   name an in-scope loop); a bare ident is a machine axis. An in-loop `when`
+   uses row_expr, so it mixes row-field and machine-axis conditions. *)
+row_atom      = ident [ "has" string | "=" ( string | ident ) ]
+              | "(" row_expr ")" ;
+
+(* Captures appear in region bodies and loop templates, not in directive
+   lines. A capture substitutes one value; a chain tries members left to
+   right and takes the first non-empty, with an optional literal default.
+
+   A `data.` member reads a committed scalar from `data/FILE.toml` (private
+   layer shadows repo). It has EXACTLY two depths: FILE.KEY (a top-level key)
+   or FILE.TABLE.KEY (a scalar one table deep) -- `<data.x>` and anything
+   deeper are rejected. FILE, TABLE, and KEY are all `[a-z][a-z0-9_-]*`
+   (TOML bare keys admit `-`). A missing file/key falls back to a `default`;
+   a non-scalar value (array/table) is always a compose error.
+
+   A `secret:` capture resolves a secret URI (the `secret` directive's five
+   schemes) and splices its value mid-line. The URI runs verbatim to the
+   closing `>` -- so `"` is legal -- and must be non-empty. A literal `>` in
+   the payload is escaped `\>` (and `\\` is a literal backslash); every other
+   backslash stands for itself. It shares one apply-wide cache with the
+   directive; off the apply path it emits a `<SECRET:URI>` placeholder instead
+   of resolving. *)
+capture       = "<" ( chain | "secret:" secret_uri ) ">" ;
+secret_uri    = uri_byte { uri_byte } ;
+uri_byte      = "\>" | "\\" | ? any byte except an unescaped ">" ? ;
+chain         = member { " | " member } [ " | " "default" string ] ;
+member        = ( "machine." | "env." | "entry." ) ident
+              | "data." data_file "." data_key [ "." data_key ]
+              | ident ;
+data_file     = lower { lower | digit | "_" | "-" } ;
+data_key      = lower { lower | digit | "_" | "-" } ;
+lower         = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j"
+              | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t"
+              | "u" | "v" | "w" | "x" | "y" | "z" ;
+
+(* Terminals. A value is a bare ident token, never a quoted string: axis
+   comparisons are exact equality against a fixed token, which is why glob
+   and regex axis values do not parse. *)
+marker        = ? host file's line-comment lead, e.g. "#" "--" "//" ? ;
+string        = '"' { ? any byte except '"' ? } '"' ;
+ident         = ident_start { ident_cont } ;
+ident_start   = letter | digit | "_" | "+" | "-" | "." ;
+ident_cont    = letter | digit | "_" | "+" | "-" | "." ;
+value         = ident ;
+EOL           = ? end of line ? ;

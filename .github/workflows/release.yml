@@ -1,0 +1,140 @@
+name: release
+
+# Cut a release by pushing a v<x.y.z> tag. Before tagging:
+#   - build.zig.zon `.version` equals the tag (the verify job enforces this).
+#   - CHANGELOG.md has a dated section for the version; its body becomes the
+#     release notes (the verify job fails a missing or empty section).
+# Best practice is still to push main, watch ci go green on every platform, then
+# tag -- but the test job below re-runs the suite on the tagged commit across all
+# platforms and gates the build, so a tag on an untested commit cannot publish.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Tag matches build.zig.zon version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          zon="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ "$tag" != "$zon" ]; then
+            echo "tag v$tag does not match build.zig.zon version $zon" >&2
+            exit 1
+          fi
+      - name: CHANGELOG has a non-empty section for the version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[?" ver "\\]?" { flag=1; next }
+            /^## / && flag { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no non-empty section for $version" >&2
+            exit 1
+          fi
+
+  # Re-run the suite on every platform for the exact tagged commit, so a tag on
+  # an untested commit cannot publish a broken build even if CI was not watched
+  # to green first. build waits on this.
+  test:
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Test
+        run: zig build test --summary all
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            asset: mox-aarch64-macos
+          - target: x86_64-macos
+            asset: mox-x86_64-macos
+          - target: x86_64-linux-musl
+            asset: mox-x86_64-linux
+          - target: aarch64-linux-musl
+            asset: mox-aarch64-linux
+          - target: x86_64-windows
+            asset: mox-x86_64-windows
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp LICENSE README.md dist/
+          if [ -f zig-out/bin/mox.exe ]; then
+            cp zig-out/bin/mox.exe dist/
+            (cd dist && zip -r "../${{ matrix.asset }}.zip" .)
+          else
+            cp zig-out/bin/mox dist/
+            tar -czf "${{ matrix.asset }}.tar.gz" -C dist .
+          fi
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.tar.gz
+            ${{ matrix.asset }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[?" ver "\\]?" { flag=1; next }
+            /^## / && flag { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "CHANGELOG.md has no non-empty section for $version" >&2
+            exit 1
+          fi
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: artifacts/**/*
+          fail_on_unmatched_files: true

@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Nightly bounded fuzz run of the DSL parse pipeline and ini_merge.
+    - cron: "0 4 * * *"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    # A wedged test must fail the job, not sit on a runner for six hours.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check build.zig src tests
+      - name: Build
+        run: zig build
+      - name: Test
+        run: zig build test --summary all
+
+  fuzz:
+    # Nightly only. Exercises the fuzz targets (tests/fuzz_test.zig) under a
+    # wall-clock bound. Continuous fuzzing (`zig build fuzz --fuzz`) is gated
+    # on an upstream Zig 0.16.0 test-runner fix; until then this runs the
+    # targets as bounded smoke checks so a regression that crashes them fails
+    # the nightly rather than hanging.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Fuzz (bounded)
+        run: timeout 600 zig build fuzz
