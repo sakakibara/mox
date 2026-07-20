@@ -33,79 +33,106 @@ On Windows (PowerShell):
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/sakakibara/mox/main/install.ps1)))
 ```
 
-`MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror.
+`MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror. Update in
+place with `mox upgrade` (it verifies the download against `SHA256SUMS`).
 
-Update an installed mox in place with `mox upgrade` -- it downloads the latest
-release, verifies it against the published `SHA256SUMS`, and replaces the running
-binary (`mox upgrade <version>` for a specific one).
-
-### From source
-
-Requires Zig 0.16.0.
-
-```sh
-zig build
-./zig-out/bin/mox
-```
-
-## How it works
-
-mox composes each managed file from a base file in `src/` plus overlays
-selected by *axes* -- `os`, `arch`, `profile`, `machine`, and any fact your
-source compares by value. How an overlay applies depends on the file's format.
-A **structured** file (TOML, JSON, YAML, INI, gitconfig) takes overlays as
-sibling files in a `<name>.d/` directory, each named by the axis tuple it
-matches: a `config.toml` beside `config.toml.d/os=darwin.toml` composes to the
-merged darwin variant on a Mac and to the base elsewhere. The overlay is a
-partial document that deep-merges into the base -- nested tables merge key by
-key, while a scalar or array in the overlay replaces the base's -- and the most
-specific matching tuple wins. A structured file can be gated as a whole, too:
-with no base it materializes only where an overlay matches, and a leading
-`# mox: when` at line 1 governs whether it appears at all -- either way overlays
-still deep-merge. A **text or code** file (a `.zshrc`, a Lua config)
-instead selects its per-axis content in place, through the comment DSL: a
-`# mox: when os=darwin` region, or an `include` / `replace from` directive that
-splices a fragment from the file's `.d/` directory. Either way files keep their
-native format; there is no template language in the file body, only that small
-comment DSL (`include`, `replace`, `for`, `when`, and more, covered in
-[docs/dsl.md](docs/dsl.md)). Values you interpolate -- an email, a signing key --
-are *facts*, kept in `$XDG_CONFIG_HOME/mox/facts.toml`, never in the repo.
-
-Managed files keep their native names -- no mode or type prefix on the filename.
-A file's target mode is its source file's own permission bits, so `chmod +x` the
-source and git carries the exec bit (0644 and 0755 round-trip a clone). The
-attributes git cannot carry -- a mode that is neither 0644 nor 0755 (0600, 0444),
-a symlink target, and `mox add --seed-once` intent -- are recorded in a
-generated `.mox/attributes.toml`, keyed by portable target path. That file is
-machine-written; do not hand-edit it. A symlink is a regular source file whose
-content is the link target, so it composes by axis like any other file; `mox add`
-of a live symlink captures it. See [docs/dsl.md](docs/dsl.md) for details.
-
-Setup scripts live in `scripts/pre/` (run before the write pass, for bootstrap
-installers) and `scripts/post/` (run after, for reloads). Each runs on every
-apply -- guard expensive work inside the script with `mox trigger`. A script is
-gated by a single-tuple subdir (`scripts/pre/os=darwin/`) and may add its own
-axis-expression gate as a `# mox: when os=darwin or os=linux` comment among its
-leading lines; both must hold for it to run.
+To build from source instead (requires Zig 0.16.0): `zig build`.
 
 ## Quickstart
 
+The whole model is one loop: **edit a config in its normal format, then
+`mox apply`.**
+
 ```sh
-mox init                 # create a fresh repo (src/ and scripts/)
-mox add ~/.zshrc         # start managing a live file
-mox facts                # fill in any facts your files interpolate
-mox apply                # compose every managed file to its live path
+mox init                              # a fresh repo (or: init --clone <url> --apply)
+mox add ~/.config/fish/config.fish    # start managing an existing file
+mox apply                             # write every managed file to its live path
 ```
 
-Edit a live file and `mox commit` routes the change back into the right source;
-`mox status` and `mox diff` show what differs before you apply. (These assume
-`mox` is on your `PATH`; otherwise call `./zig-out/bin/mox`.)
+`mox add` copies the file into your repo's `src/` under its normal name
+(`src/.config/fish/config.fish`) -- no `dot_`/`executable_` prefixes. From then
+on you edit the source and run `mox apply`; mox composes it (see
+[How it works](#how-it-works)) and writes it live.
+
+## Day to day
+
+| You want to... | Do this |
+| --- | --- |
+| See what's managed and what changed | `mox status` (`mox diff` for the actual diff) |
+| Manage a new file / a whole dir | `mox add <path>` / `mox add-tree <dir>` |
+| Change a config | edit the source (`mox edit <path>` opens it), then `mox apply` |
+| Preview before writing | `mox apply --dry-run` |
+| Keep a hand-edit you made to the *live* file | `mox commit <path>` -- routes it back into the source |
+| Make something Mac-only (or per-profile) | a `foo.toml.d/os=darwin.toml` overlay, or a `# mox: when os=darwin` block |
+| Use a per-machine value (email, key) | a *fact* -- `mox facts`, referenced as `<machine.email>` |
+| Share to another machine | `git push` in the repo, then `mox apply` there (or `mox sync`) |
+| Undo a bad apply | `mox snapshot list`, then `mox rollback <id>` |
+| Update mox itself | `mox upgrade` |
+
+A step-by-step walkthrough of each task is in [docs/usage.md](docs/usage.md).
+
+## How it works
+
+mox composes each managed file from a **base** file in `src/` plus **overlays**
+selected by *axes* -- `os`, `arch`, `profile`, `machine`, and any fact your
+source compares by value. How an overlay applies depends on the file's format.
+
+### Structured files (TOML, JSON, YAML, INI, gitconfig)
+
+Overlays are sibling files in a `<name>.d/` directory, each named by the axis
+tuple it matches. `config.toml` beside `config.toml.d/os=darwin.toml` composes to
+the merged darwin variant on a Mac, and to the base elsewhere. An overlay is a
+*partial* document that deep-merges into the base -- nested tables merge key by
+key, while a scalar or array replaces -- and the most specific matching tuple
+wins. A file can also be gated as a whole: with no base it materializes only
+where an overlay matches, and a leading `# mox: when` on line 1 governs whether
+it appears at all.
+
+### Text and code files (`.zshrc`, a Lua config)
+
+These select their per-axis content *in place*, through a small comment DSL: a
+`# mox: when os=darwin` region, or an `include` / `replace from` directive that
+splices a fragment from the file's `.d/` directory. There is no template language
+in the file body -- only that DSL (`include`, `replace`, `for`, `when`, and more,
+covered in [docs/dsl.md](docs/dsl.md)).
+
+### Facts
+
+Values you interpolate -- an email, a signing key -- are *facts*, written
+`<machine.email | default "...">` in a source and kept in
+`$XDG_CONFIG_HOME/mox/facts.toml`, never in the repo. `mox apply` interviews you
+once for any a reachable file needs and are not yet set.
+
+### Secrets
+
+A whole-line `# mox: secret "<uri>"` or a mid-line `<secret:URI>` capture resolves
+a secret at apply time from `env:`, `file://`, `op://` (1Password), `pass://`, or
+`cmd:`. The cleartext is written to the live file but never cached in mox state or
+committed, and a file that resolves an `op://`/`pass://` secret is applied 0600.
+
+### Modes and symlinks
+
+Managed files keep their native names -- no mode or type prefix. A file's target
+mode is its source's own permission bits, so `chmod +x` the source and git
+carries the exec bit (0644 and 0755 survive a clone). Modes git cannot carry
+(0600, 0444), symlink targets, and `mox add --seed-once` intent are recorded in a
+generated `.mox/attributes.toml` (machine-written; don't hand-edit). A symlink is
+just a source file whose content is the link target, so it composes by axis like
+anything else.
+
+### Setup scripts
+
+`scripts/pre/` run before the write pass (bootstrap installers); `scripts/post/`
+run after (reloads). Each runs on every apply -- guard expensive work inside the
+script with `mox trigger`. Gate a script by a single-tuple subdir
+(`scripts/pre/os=darwin/`) and/or a leading `# mox: when os=darwin or os=linux`
+comment.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `init` | Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>` clones an existing dotfiles repo into the repo dir for you to review; it does not apply (a cloned repo's files and scripts are untrusted until you look at them -- run `mox apply` yourself once you have). Refuses a non-empty repo dir |
+| `init` | Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>` clones an existing dotfiles repo into the repo dir; by default it stops for you to review (a cloned repo's files and scripts are untrusted until you look at them), `--apply` applies right away for a one-command bootstrap. Refuses a non-empty repo dir |
 | `add <path>` | Start managing a live file as a base file in `src/` |
 | `add-tree <dir>` | Recursively `add` every non-junk regular file under a live directory; already-managed files and junk are skipped |
 | `mv <old> <new>` | Rename a managed file's source (base file and its `.d/` overlay dir) so the live target changes on the next apply. The old source is copied into the timestamped trash first (recoverable); its `.mox/attributes.toml` entry (mode, symlink, seed-once) is carried to the new name. Takes the lock |
@@ -124,12 +151,13 @@ Edit a live file and `mox commit` routes the change back into the right source;
 | `sync` | Fetch, fast-forward, and push the dotfiles repo (`--no-pull` / `--no-push` skip a half). Any uncommitted change refuses the sync until you commit it; mox never commits on your behalf. Fast-forwards the upstream branch only: diverged local history is refused (merge or rebase it yourself, then re-run) rather than auto-merged and pushed, and a rejected push asks you to sync again. Takes the lock |
 | `secret <uri>` | Resolve a secret URI to stdout: `env:NAME`, `file://PATH`, `op://VAULT/ITEM/FIELD`, `pass://ENTRY`, or `cmd:SHELL` (runs `/bin/sh -c` and takes the first stdout line) |
 | `trigger ...` | Setup-script staleness primitives (`hash`, `seen-version`, `every`) |
+| `upgrade` | Download and install a newer mox release, verified against its `SHA256SUMS`, replacing the running binary. `mox upgrade <version>` for a specific one; never auto-downgrades; `--yes` skips the prompt |
 | `uninstall` | Remove mox's machine-local state (applied records, provenance, ...). The private layer is preserved unless `--purge-private`; snapshots and trash -- your recoverable pre-mox originals -- are preserved unless `--purge-snapshots` / `--purge-trash` or confirmed on a terminal. The user's source repo is never touched. Takes the lock |
 | `help`, `version` | Show help or the mox version |
 
-Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `sync`) take a single-writer
-lock at `state/mox.lock`; a second process is refused while the first runs.
-An unknown command exits 2.
+Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `sync`, `upgrade`)
+take a single-writer lock at `state/mox.lock`; a second process is refused while
+the first runs. An unknown command exits 2.
 
 ## Privacy
 
