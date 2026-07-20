@@ -142,6 +142,7 @@ fn recordAttrs(
 const Spec = struct {
     path: cli.spec.Pos([]const u8, .{ .help = "live file to start managing" }),
     seed_once: cli.spec.Flag(.{ .help = "seed the target once; never overwrite an existing one" }),
+    force: cli.spec.Flag(.{ .help = "add even if the path matches an ignore rule" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
@@ -151,6 +152,19 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.err.writeAll("mox add: HOME not set\n");
         return 1;
     };
+
+    if (!a.force) {
+        const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, live_path);
+        const is_dir = if (Io.Dir.cwd().statFile(ctx.io, live_path, .{ .follow_symlinks = false })) |st|
+            st.kind == .directory
+        else |_|
+            false;
+        if (ruleset.isIgnored(rel, is_dir)) {
+            try ctx.err.print("mox add: {s} matches an ignore rule; use --force to add it anyway\n", .{rel});
+            return 1;
+        }
+    }
 
     const result = try addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, a.seed_once);
     switch (result.outcome) {

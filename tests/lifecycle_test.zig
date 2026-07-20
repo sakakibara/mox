@@ -315,6 +315,57 @@ test "add-tree: adds every non-junk file under a live dir, skipping junk" {
     try std.testing.expect(!exists(io, try h.srcOf(".config/app/.DS_Store")));
 }
 
+test "add-tree: ignore file refuses sensitive paths, adds the rest" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+
+    // A live ~/.claude-like tree under the harness home.
+    try writeRepo(io, &tmp, "home/.claude/CLAUDE.md", "rules\n");
+    try writeRepo(io, &tmp, "home/.claude/.credentials.json", "SECRET\n");
+    try writeRepo(io, &tmp, "home/.claude/projects/p.jsonl", "{}\n");
+    // Repo ignore file.
+    try writeRepo(io, &tmp, "repo/.moxignore", ".claude/.credentials.json\n.claude/projects/\n");
+
+    // A shell would have expanded `~/.claude` to this absolute path already.
+    const dir = try h.homePath(".claude");
+    const r = try h.run(&.{ "mox", "add-tree", dir });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // The good file is now a source; the secret and the ignored dir are not.
+    try std.testing.expect(exists(io, try h.srcOf(".claude/CLAUDE.md")));
+    try std.testing.expect(!exists(io, try h.srcOf(".claude/.credentials.json")));
+    try std.testing.expect(!exists(io, try h.srcOf(".claude/projects/p.jsonl")));
+}
+
+test "add: refuses an ignored path with a hint; --force overrides" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.ssh/id_rsa", "PRIVATE\n");
+    try writeRepo(io, &tmp, "repo/.moxignore", ".ssh/id_rsa\n");
+    const live = try h.homePath(".ssh/id_rsa");
+
+    const refused = try h.run(&.{ "mox", "add", live });
+    try std.testing.expectEqual(@as(u8, 1), refused.rc);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "matches an ignore rule") != null);
+    try std.testing.expect(!exists(io, try h.srcOf(".ssh/id_rsa")));
+
+    const forced = try h.run(&.{ "mox", "add", live, "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expect(exists(io, try h.srcOf(".ssh/id_rsa")));
+}
+
 /// Overwrite every regular file in `dir_abs` with `garbage`.
 fn corruptAll(io: Io, a: std.mem.Allocator, dir_abs: []const u8, garbage: []const u8) !void {
     var dir = try Io.Dir.cwd().openDir(io, dir_abs, .{ .iterate = true });

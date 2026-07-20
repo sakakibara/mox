@@ -30,8 +30,10 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "add-tree")) orelse return 1;
     defer lk.release();
 
+    const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+
     var counts: Counts = .{};
-    walk(ctx, dir_abs, &counts) catch |e| switch (e) {
+    walk(ctx, dir_abs, &ruleset, &counts) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox add-tree: {s}: not found\n", .{dir_abs});
             return 1;
@@ -43,19 +45,31 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     return if (counts.failed > 0) 1 else 0;
 }
 
-fn walk(ctx: *app.Ctx, dir_abs: []const u8, counts: *Counts) !void {
+fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.match.RuleSet, counts: *Counts) !void {
     const context = ctx.context.?;
     var dir = try Io.Dir.cwd().openDir(ctx.io, dir_abs, .{ .iterate = true, .follow_symlinks = false });
     defer dir.close(ctx.io);
 
+    const home = context.env.getAlloc(ctx.alloc, "HOME") catch context.paths.home;
+
     var it = dir.iterate();
     while (try it.next(ctx.io)) |entry| {
-        if (mox.source.junk.isJunk(entry.name)) continue;
         const child = try std.fs.path.join(ctx.alloc, &.{ dir_abs, entry.name });
         switch (entry.kind) {
-            .directory => try walk(ctx, child, counts),
+            .directory => {
+                const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, child);
+                if (ruleset.isIgnored(rel, true)) {
+                    counts.skipped += 1;
+                    continue;
+                }
+                try walk(ctx, child, ruleset, counts);
+            },
             .file => {
-                const home = context.env.getAlloc(ctx.alloc, "HOME") catch context.paths.home;
+                const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, child);
+                if (mox.source.junk.isJunk(entry.name) or ruleset.isIgnored(rel, false)) {
+                    counts.skipped += 1;
+                    continue;
+                }
                 // Bulk-adding a tree never seeds once; only single-file add
                 // exposes the intent.
                 const result = add.addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, child, false) catch {
