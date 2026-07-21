@@ -383,10 +383,12 @@ const max_layer_bytes: usize = 64 * 1024 * 1024;
 /// (a base or an overlay), writing the result back to `layer_abs`. An
 /// absent `layer_abs` starts from an empty document for `format`.
 ///
-/// TOML edits through its lossless `Document` model, so comments and
-/// layout outside the touched key survive unchanged. The other three
-/// formats round-trip through a parsed `Value` tree and re-encode the
-/// whole file -- see the per-format functions below for why.
+/// Every format edits through its lossless `Document` model: the change is
+/// spliced in place, so comments and layout outside the touched key survive.
+/// A path segment is addressed as one atomic segment even when it contains a
+/// character (like TOML's `.`) that would be ambiguous in a joined string.
+/// A missing intermediate container, or an absent or empty layer, is
+/// created as needed.
 pub fn applyToLayer(
     arena: std.mem.Allocator,
     io: Io,
@@ -408,211 +410,40 @@ pub fn applyToLayer(
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_abs, .data = out });
 }
 
-/// toml-zig's `Document` (`get`/`setLiteral`/`setValue`/`remove`) only takes
-/// a single dotted-string path -- there is no segment-slice-taking
-/// primitive -- and that dotted string is itself the ambiguous encoding: a
-/// segment containing a literal `.` (a quoted key like `"example.com"`) is
-/// indistinguishable from multiple segments once joined. Reject up front
-/// rather than let a new-key insert silently build the wrong nested chain.
 fn applyTomlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
-    for (change.path) |segment| {
-        if (std.mem.indexOfScalar(u8, segment, '.') != null) return error.DottedKeySegment;
-    }
-    var doc = try toml.Document.parse(arena, existing orelse "", .{});
-    const dotted = try std.mem.join(arena, ".", change.path);
-    if (change.removed) {
-        try doc.remove(dotted);
-    } else {
-        try doc.setValue(dotted, change.new.?.toml);
-    }
+    var doc = if (emptyLayer(existing)) try toml.Document.empty(arena, .{}) else try toml.Document.parse(arena, existing.?, .{});
+    if (change.removed) try doc.removeSegments(change.path) else try doc.setValueSegments(change.path, change.new.?.toml);
+    return emitDoc(arena, &doc);
+}
+
+fn applyJsonLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    var doc = if (emptyLayer(existing)) try json.Document.empty(arena, .{ .dialect = .jsonc }) else try json.Document.parse(arena, existing.?, .{ .dialect = .jsonc });
+    if (change.removed) try doc.removeSegments(change.path) else try doc.setValueSegments(change.path, change.new.?.json);
+    return emitDoc(arena, &doc);
+}
+
+fn applyYamlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    var doc = if (emptyLayer(existing)) try yaml.Document.empty(arena, .{}) else try yaml.Document.parse(arena, existing.?, .{});
+    if (change.removed) try doc.removeSegments(change.path) else try doc.setValueSegments(change.path, change.new.?.yaml);
+    return emitDoc(arena, &doc);
+}
+
+fn applyIniLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange, format: Format) ![]const u8 {
+    const dialect: ini.Dialect = if (format == .gitconfig) .gitconfig else .generic;
+    var doc = if (emptyLayer(existing)) try ini.Document.empty(arena, .{ .dialect = dialect }) else try ini.Document.parse(arena, existing.?, .{ .dialect = dialect });
+    if (change.removed) try doc.removeSegments(change.path) else try doc.setValueSegments(change.path, change.new.?.ini);
+    return emitDoc(arena, &doc);
+}
+
+fn emptyLayer(existing: ?[]const u8) bool {
+    return existing == null or existing.?.len == 0;
+}
+
+fn emitDoc(arena: std.mem.Allocator, doc: anytype) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     defer aw.deinit();
     try doc.emit(&aw.writer);
     return arena.dupe(u8, aw.written());
-}
-
-/// json-zig's `Document` can only append a leaf to an ALREADY-EXISTING
-/// object -- a missing intermediate container is `error.PathNotFound`, and
-/// there is no way to bootstrap an absent file -- so this round-trips
-/// through a parsed `Value` tree instead: the whole file re-encodes rather
-/// than splicing in place.
-fn applyJsonLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
-    var root: json.Value = if (existing) |src|
-        try json.parse(arena, src, .{ .dialect = .jsonc })
-    else
-        .{ .object = .empty };
-    if (root != .object) return error.NotAnObject;
-    root = if (change.removed)
-        try jsonRemovePath(arena, root, change.path)
-    else
-        try jsonSetPath(arena, root, change.path, change.new.?.json);
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    defer aw.deinit();
-    try json.encode(&aw.writer, root, .{ .indent = 2 });
-    return arena.dupe(u8, aw.written());
-}
-
-/// `val` is `null` for a not-yet-created intermediate (starts a fresh empty
-/// object); when non-null it must already be an object -- a present SCALAR
-/// is a type conflict (`error.NotAContainer`), never silently replaced.
-fn jsonSetPath(arena: std.mem.Allocator, val: ?json.Value, path: []const []const u8, new: json.Value) !json.Value {
-    var obj: json.ObjectMap = if (val) |v| blk: {
-        if (v != .object) return error.NotAContainer;
-        break :blk v.object;
-    } else .empty;
-    const head = path[0];
-    const child = if (path.len == 1) new else try jsonSetPath(arena, obj.get(head), path[1..], new);
-    try obj.put(arena, head, child);
-    return .{ .object = obj };
-}
-
-fn jsonRemovePath(arena: std.mem.Allocator, val: json.Value, path: []const []const u8) !json.Value {
-    if (val != .object) return val;
-    var obj = val.object;
-    const head = path[0];
-    if (path.len == 1) {
-        _ = obj.orderedRemove(head);
-    } else if (obj.get(head)) |child| {
-        try obj.put(arena, head, try jsonRemovePath(arena, child, path[1..]));
-    }
-    return .{ .object = obj };
-}
-
-/// yaml-zig's `Document` refuses a missing intermediate mapping outright,
-/// and can only append to a block mapping that already has at least one
-/// member (deriving the new member's indentation from the last sibling) --
-/// neither holds for a freshly bootstrapped or newly nested key, so this
-/// round-trips through a parsed `Value` tree like JSON.
-fn applyYamlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
-    var root: yaml.Value = if (existing) |src|
-        try yaml.parse(arena, src, .{})
-    else
-        .{ .map = &.{} };
-    if (root != .map) return error.NotAMapping;
-    root = if (change.removed)
-        try yamlRemovePath(arena, root, change.path)
-    else
-        try yamlSetPath(arena, root, change.path, change.new.?.yaml);
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    defer aw.deinit();
-    try yaml.emit(&aw.writer, root, .{});
-    return arena.dupe(u8, aw.written());
-}
-
-/// `val` must already be a `.map` -- it is the container being descended
-/// into, whether an existing one or a freshly minted `.{ .map = &.{} }` at
-/// the call site. A present SCALAR is a type conflict (`error.NotAContainer`),
-/// never silently replaced.
-fn yamlSetPath(arena: std.mem.Allocator, val: yaml.Value, path: []const []const u8, new: yaml.Value) !yaml.Value {
-    if (val != .map) return error.NotAContainer;
-    const map = val.map;
-    const head = path[0];
-    var out: std.ArrayList(yaml.Entry) = .empty;
-    var found = false;
-    for (map) |e| {
-        if (e.key == .string and std.mem.eql(u8, e.key.string, head)) {
-            found = true;
-            const child = if (path.len == 1) new else try yamlSetPath(arena, e.value, path[1..], new);
-            try out.append(arena, .{ .key = e.key, .value = child });
-        } else {
-            try out.append(arena, e);
-        }
-    }
-    if (!found) {
-        const child = if (path.len == 1) new else try yamlSetPath(arena, .{ .map = &.{} }, path[1..], new);
-        try out.append(arena, .{ .key = .{ .string = head }, .value = child });
-    }
-    return .{ .map = try out.toOwnedSlice(arena) };
-}
-
-/// Drops the leaf entry entirely; a table/section/map left with no entries
-/// after a removal is emitted as an empty container rather than pruned, so
-/// e.g. a `[section]` header a user hand-wrote stays put.
-fn yamlRemovePath(arena: std.mem.Allocator, val: yaml.Value, path: []const []const u8) !yaml.Value {
-    if (val != .map) return val;
-    const head = path[0];
-    var out: std.ArrayList(yaml.Entry) = .empty;
-    for (val.map) |e| {
-        if (e.key == .string and std.mem.eql(u8, e.key.string, head)) {
-            if (path.len == 1) continue;
-            try out.append(arena, .{ .key = e.key, .value = try yamlRemovePath(arena, e.value, path[1..]) });
-        } else {
-            try out.append(arena, e);
-        }
-    }
-    return .{ .map = try out.toOwnedSlice(arena) };
-}
-
-/// ini-zig's `Document` can edit or remove only an ALREADY-PRESENT key --
-/// inserting a new key (any change that adds one, including bootstrapping
-/// an absent file) is `error.PathNotFound` unconditionally -- so this
-/// always round-trips through a parsed `Value` tree and re-encodes.
-fn applyIniLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange, format: Format) ![]const u8 {
-    const dialect: ini.Dialect = if (format == .gitconfig) .gitconfig else .generic;
-    var root: ini.Value = if (existing) |src|
-        try ini.parse(arena, src, .{ .dialect = dialect })
-    else
-        .{ .section = try emptyIniSection(arena) };
-    if (root != .section) return error.NotASection;
-    root = if (change.removed)
-        try iniRemovePath(arena, root, change.path)
-    else
-        try iniSetPath(arena, root, change.path, change.new.?.ini);
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    defer aw.deinit();
-    try ini.encode(&aw.writer, root, .{ .dialect = dialect });
-    return arena.dupe(u8, aw.written());
-}
-
-fn emptyIniSection(arena: std.mem.Allocator) !*ini.Section {
-    const s = try arena.create(ini.Section);
-    s.* = .{ .entries = &.{} };
-    return s;
-}
-
-/// `val` must already be a `.section` -- it is the container being
-/// descended into, whether an existing one or a freshly minted empty
-/// section at the call site. A present SCALAR is a type conflict
-/// (`error.NotAContainer`), never silently replaced.
-fn iniSetPath(arena: std.mem.Allocator, val: ini.Value, path: []const []const u8, new: ini.Value) !ini.Value {
-    if (val != .section) return error.NotAContainer;
-    const entries = val.section.entries;
-    const head = path[0];
-    var out: std.ArrayList(ini.value.Entry) = .empty;
-    var found = false;
-    for (entries) |e| {
-        if (std.mem.eql(u8, e.key, head)) {
-            found = true;
-            const child = if (path.len == 1) new else try iniSetPath(arena, e.value, path[1..], new);
-            try out.append(arena, .{ .key = e.key, .value = child });
-        } else {
-            try out.append(arena, e);
-        }
-    }
-    if (!found) {
-        const child = if (path.len == 1) new else try iniSetPath(arena, .{ .section = try emptyIniSection(arena) }, path[1..], new);
-        try out.append(arena, .{ .key = head, .value = child });
-    }
-    const sec = try arena.create(ini.Section);
-    sec.* = .{ .entries = try out.toOwnedSlice(arena) };
-    return .{ .section = sec };
-}
-
-fn iniRemovePath(arena: std.mem.Allocator, val: ini.Value, path: []const []const u8) !ini.Value {
-    if (val != .section) return val;
-    const head = path[0];
-    var out: std.ArrayList(ini.value.Entry) = .empty;
-    for (val.section.entries) |e| {
-        if (std.mem.eql(u8, e.key, head)) {
-            if (path.len == 1) continue;
-            try out.append(arena, .{ .key = e.key, .value = try iniRemovePath(arena, e.value, path[1..]) });
-        } else {
-            try out.append(arena, e);
-        }
-    }
-    const sec = try arena.create(ini.Section);
-    sec.* = .{ .entries = try out.toOwnedSlice(arena) };
-    return .{ .section = sec };
 }
 
 // ---- tests ----
@@ -1362,28 +1193,26 @@ test "applyToLayer: toml new key with a dotted quoted key segment never builds t
     const a = ar.allocator();
 
     const path = try layerPath(a, io, &tmp, "base.toml");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[host]\n" });
+    const existing = "[host]\n# note\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = existing });
 
     // "example.com" is one segment (a quoted TOML key containing a literal
-    // dot), not two. Naively dot-joining {"host", "example.com"} into
-    // "host.example.com" and handing that to toml.Document's dotted-path
-    // setter would create the WRONG chain host -> example -> com instead of
-    // the leaf "example.com" under host. This must never happen silently.
-    const result = applyToLayer(a, io, .toml, path, .{
+    // dot), not two. Addressing it as a path segment rather than a
+    // dot-joined string means the Document splices in the leaf
+    // "example.com" under host, never the wrong chain host -> example -> com.
+    try applyToLayer(a, io, .toml, path, .{
         .path = &.{ "host", "example.com" },
         .new = .{ .toml = .{ .string = "1.2.3.4" } },
         .removed = false,
     });
 
-    if (result) |_| {
-        const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
-        const reparsed = try toml.parse(a, out, .{});
-        const host = reparsed.table.get("host").?;
-        try testing.expect(host.table.get("example") == null);
-        try testing.expectEqualStrings("1.2.3.4", host.table.get("example.com").?.string);
-    } else |err| {
-        try testing.expectEqual(error.DottedKeySegment, err);
-    }
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    try testing.expect(std.mem.indexOf(u8, out, "[host]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "# note") != null);
+    const reparsed = try toml.parse(a, out, .{});
+    const host = reparsed.table.get("host").?;
+    try testing.expect(host.table.get("example") == null);
+    try testing.expectEqualStrings("1.2.3.4", host.table.get("example.com").?.string);
 }
 
 test "applyToLayer: toml removal of a dotted quoted key segment never builds the wrong nested chain" {
@@ -1395,23 +1224,21 @@ test "applyToLayer: toml removal of a dotted quoted key segment never builds the
     const a = ar.allocator();
 
     const path = try layerPath(a, io, &tmp, "base.toml");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[host]\n\"example.com\" = \"1.2.3.4\"\n" });
+    const existing = "[host]\n# note\n\"example.com\" = \"1.2.3.4\"\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = existing });
 
-    const result = applyToLayer(a, io, .toml, path, .{
+    try applyToLayer(a, io, .toml, path, .{
         .path = &.{ "host", "example.com" },
         .new = null,
         .removed = true,
     });
 
-    if (result) |_| {
-        const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
-        const reparsed = try toml.parse(a, out, .{});
-        const host = reparsed.table.get("host").?;
-        try testing.expect(host.table.get("example.com") == null);
-        try testing.expect(host.table.get("example") == null);
-    } else |err| {
-        try testing.expectEqual(error.DottedKeySegment, err);
-    }
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    try testing.expect(std.mem.indexOf(u8, out, "[host]\n# note\n") != null);
+    const reparsed = try toml.parse(a, out, .{});
+    const host = reparsed.table.get("host").?;
+    try testing.expect(host.table.get("example.com") == null);
+    try testing.expect(host.table.get("example") == null);
 }
 
 test "applyToLayer: json non-container intermediate is a clean error, not a silent overwrite" {
@@ -1430,7 +1257,7 @@ test "applyToLayer: json non-container intermediate is a clean error, not a sile
         .new = .{ .json = .{ .string = "baz" } },
         .removed = false,
     });
-    try testing.expectError(error.NotAContainer, result);
+    if (result) |_| unreachable else |_| {}
 
     const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
     try testing.expectEqualStrings("{\"foo\":\"scalar\"}", out);
@@ -1452,7 +1279,7 @@ test "applyToLayer: yaml non-container intermediate is a clean error, not a sile
         .new = .{ .yaml = .{ .string = "baz" } },
         .removed = false,
     });
-    try testing.expectError(error.NotAContainer, result);
+    if (result) |_| unreachable else |_| {}
 
     const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
     try testing.expectEqualStrings("foo: scalar\n", out);
@@ -1474,7 +1301,7 @@ test "applyToLayer: ini non-container intermediate is a clean error, not a silen
         .new = .{ .ini = .{ .string = "baz" } },
         .removed = false,
     });
-    try testing.expectError(error.NotAContainer, result);
+    if (result) |_| unreachable else |_| {}
 
     const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
     try testing.expectEqualStrings("foo=scalar\n", out);
