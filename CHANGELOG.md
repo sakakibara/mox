@@ -4,6 +4,15 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-07-21
+
+### Fixed
+- `mox doctor` no longer reports a tracked file as "tracked-and-ignored" when it
+  is ignored only inside a `# mox: when` region (intentional per-machine
+  gating, e.g. a Windows-only `*.ps1` ignored on macOS). The advisory now fires
+  only for a file ignored by an unconditional rule -- one that can never apply
+  under any configuration.
+
 ## [0.1.4] - 2026-07-21
 
 ### Added
