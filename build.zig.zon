@@ -1,6 +1,6 @@
 .{
     .name = .mox,
-    .version = "0.1.3",
+    .version = "0.1.4",
     .fingerprint = 0x3f50f07a66b54f5,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

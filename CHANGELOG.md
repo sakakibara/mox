@@ -4,15 +4,20 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.4] - 2026-07-21
 
 ### Added
-- A repo-scoped ignore mechanism (`.moxignore` and `.mox/ignore`, gitignore
-  syntax, axis-gated with `# mox: when`): matching paths are refused by
-  `add`/`add-tree`, skipped by `apply`, exempt from `.mox-exact` pruning, and
-  hidden from `status`/`diff`; `doctor` flags a tracked path that an ignore rule
-  also matches. `mox init` scaffolds a starter `.moxignore` guarding common
-  secret files (fully deletable).
+- A repo-scoped ignore mechanism. Rules live in `.moxignore` (root) or
+  `.mox/ignore` (both optional, merged), use gitignore syntax matched against
+  the home-relative path (a file under an ignored directory is itself ignored),
+  and can be axis-gated with `# mox: when` -- composed through mox's own DSL, no
+  separate template language. A matching path is refused by `add`/`add-tree`
+  (`add --force` overrides), never materialized by `apply`, exempt from
+  `.mox-exact` pruning even under `--force`, hidden from `status`/`diff`, and
+  flagged by `doctor` when a tracked source also matches. `mox init` scaffolds a
+  starter `.moxignore` guarding common secret files (fully deletable), and
+  `add`/`add-tree` print a non-blocking note when a file that looks like a
+  secret is added.
 
 ## [0.1.3] - 2026-07-21
 
