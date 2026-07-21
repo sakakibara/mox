@@ -167,6 +167,14 @@ fn isValidFactName(name: []const u8) bool {
     return true;
 }
 
+/// True when `name`/`value` could be written by `persist` without either
+/// being refused: see `isValidFactName` and `hasControlChar`. Lets a caller
+/// that is ABOUT to route an edit to a fact check first, rather than
+/// discover the refusal only once other writes may already be applied.
+pub fn canPersist(name: []const u8, value: []const u8) bool {
+    return isValidFactName(name) and !hasControlChar(value);
+}
+
 /// Persist `answers` into the machine-local facts file, replacing any
 /// existing assignments of the same names and preserving everything else
 /// (comments included). A name or value carrying a control character is
@@ -397,6 +405,14 @@ test "isValidFactName: bare-key charset only, so a name cannot break the TOML" {
     try std.testing.expect(!isValidFactName("a\"b")); // quote
     try std.testing.expect(!isValidFactName("a.b")); // dotted key is a table path
     try std.testing.expect(!isValidFactName("[x]")); // section header
+}
+
+test "canPersist: rejects exactly what persist itself would refuse" {
+    try std.testing.expect(canPersist("email", "team@work.com"));
+    try std.testing.expect(!canPersist("email", "a\tb"));
+    try std.testing.expect(!canPersist("email", "a\nadmin = 1"));
+    try std.testing.expect(!canPersist("a.b", "ok"));
+    try std.testing.expect(!canPersist("", "ok"));
 }
 
 test "loadSchema: missing file yields empty schema" {

@@ -668,12 +668,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     }
 
     // Fact edits routed from each file, pre-write (`old_value` was captured
-    // at classification time, before any write this run), so a rejected
-    // file's routing can restore its facts exactly like `routed_orig` restores
-    // its sources. Scoped per file like everything else here: two different
-    // files editing the SAME fact name to different values in one run, where
-    // only one is rejected, is not resolved by this (a rare, self-inflicted
-    // ambiguity, not attempted here).
+    // at classification time, before any write this run), collected per file
+    // like `routed_orig`. A rejected file's entries here are candidates for
+    // restoration, not restored outright: `restoreUnkeptFacts`, run once every
+    // file's outcome is known, is what decides whether a given fact actually
+    // goes back.
     const fact_backup = try ctx.alloc.alloc([]const FactEdit, tree.files.len);
     @memset(fact_backup, &.{});
     for (tree.files, 0..) |_, fidx| {
@@ -762,7 +761,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             if (is_coupling) {
                 try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
             } else {
-                try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
+                try restoreRouted(ctx.io, routed_orig[fidx]);
             }
             continue;
         };
@@ -799,7 +798,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         if (composed == null) {
             mismatch = true;
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
+            try restoreRouted(ctx.io, routed_orig[fidx]);
             try ctx.err.print(
                 "mox commit: {s}: the edited sources no longer compose; not committed\n",
                 .{file.live_path},
@@ -848,7 +847,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             // itself is wrong. Either way this file is not committed, and "not
             // committed" leaves nothing behind.
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
+            try restoreRouted(ctx.io, routed_orig[fidx]);
             if (unrouted_hunks[fidx] > 0) {
                 try ctx.err.print(
                     "mox commit: {s}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
@@ -868,7 +867,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
             mismatch = true;
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
+            try restoreRouted(ctx.io, routed_orig[fidx]);
             try ctx.err.print(
                 "mox commit: {s}: routing would change configuration {s}, which you did not choose to affect; not committed\n",
                 .{ file.live_path, configs[vi].label },
@@ -884,6 +883,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  committed {s}\n", .{file.live_path});
         committed_count += 1;
     }
+
+    // Every file's outcome is final now: restore whichever routed facts no
+    // committed file still depends on. Doing this here, rather than inline as
+    // each file was rejected above, is what lets a fact two files route to the
+    // same value survive a sibling's unrelated rejection.
+    try restoreUnkeptFacts(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items, fact_owners.items, fact_backup, rolled_back);
 
     // Re-index the coupling graph from the post-write sources so a later
     // commit sees the current token layout.
@@ -1224,10 +1229,12 @@ fn addBackup(arena: std.mem.Allocator, io: Io, list: *std.ArrayList(Backup), pat
 
 /// Roll a rejected routing back to its sources' pre-write bytes: a file that
 /// existed regains its exact content, and one the synthesis created is removed
-/// -- along with every directory it created to hold it. Also rolls back any
-/// fact this routing wrote: restored to its pre-run value, or removed
-/// entirely when it did not exist before this run.
-fn restoreRouted(arena: std.mem.Allocator, io: Io, facts_path: []const u8, backups: []const Backup, facts: []const FactEdit) !void {
+/// -- along with every directory it created to hold it. Facts are handled
+/// separately, by `restoreUnkeptFacts`, once every file's outcome is known: a
+/// fact's on-disk state is shared by every file that routed to it, so restoring
+/// it here -- the instant THIS file is rejected -- could pull it out from
+/// under a sibling file that routed the same fact and is still committed.
+fn restoreRouted(io: Io, backups: []const Backup) !void {
     for (backups) |b| {
         if (b.content) |bytes| {
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = b.path, .data = bytes });
@@ -1236,11 +1243,41 @@ fn restoreRouted(arena: std.mem.Allocator, io: Io, facts_path: []const u8, backu
         Io.Dir.cwd().deleteFile(io, b.path) catch {};
         if (b.created_dir) |d| Io.Dir.cwd().deleteTree(io, d) catch {};
     }
-    for (facts) |e| {
-        if (e.old_value) |v| {
-            try mox.machine.interview.persist(arena, io, facts_path, &.{.{ .name = e.name, .value = v }});
-        } else {
-            try mox.machine.interview.remove(arena, io, facts_path, e.name);
+}
+
+/// Restore every fact whose write this run must undo: one routed by at least
+/// one rejected file (`fact_backup`/`rolled_back`, index-aligned with
+/// `tree.files`) and by no file that is still committed. A fact's physical
+/// slot in the facts file is shared by every file that routed to it -- a
+/// rejected file's OWN backup would restore it unconditionally, even when a
+/// sibling file that also routed it was verified and kept -- so this runs once,
+/// after every file's outcome is final, and restores each affected name at
+/// most once.
+fn restoreUnkeptFacts(
+    arena: std.mem.Allocator,
+    io: Io,
+    facts_path: []const u8,
+    fact_edits: []const FactEdit,
+    fact_owners: []const usize,
+    fact_backup: []const []const FactEdit,
+    rolled_back: []const bool,
+) !void {
+    var kept_names = std.StringHashMap(void).init(arena);
+    for (fact_edits, fact_owners) |e, owner| {
+        if (!rolled_back[owner]) try kept_names.put(e.name, {});
+    }
+    var restored_names = std.StringHashMap(void).init(arena);
+    for (fact_backup, 0..) |fb, fidx| {
+        if (!rolled_back[fidx]) continue;
+        for (fb) |e| {
+            if (kept_names.contains(e.name)) continue;
+            if (restored_names.contains(e.name)) continue;
+            try restored_names.put(e.name, {});
+            if (e.old_value) |v| {
+                try mox.machine.interview.persist(arena, io, facts_path, &.{.{ .name = e.name, .value = v }});
+            } else {
+                try mox.machine.interview.remove(arena, io, facts_path, e.name);
+            }
         }
     }
 }
@@ -1645,6 +1682,13 @@ fn interpolatedRoute(
 
     const cap = after[changed_idx];
     const fact = asMachineCapture(cap.name) orelse return .{ .manual = "came from a capture" };
+    // A name or value `persist` would refuse (a control character, or a name
+    // that is not a valid TOML bare key) must never reach the write phase:
+    // caught here, before any [f]/[d] choice is offered, so the hunk can only
+    // ever become an ordinary manual one -- never a write that starts, then
+    // throws with other sources already rewritten.
+    if (!mox.machine.interview.canPersist(fact, cap.value))
+        return .{ .manual = "came from a capture; the new value cannot be saved as a fact" };
 
     var old_value: ?[]const u8 = null;
     for (m_state.custom_facts) |f| {

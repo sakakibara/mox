@@ -1690,6 +1690,205 @@ test "commit: a multi-capture interpolated line with an ambiguous change falls b
     try std.testing.expectEqualStrings("email = \"a@x.com\"\nprofile = \"alice\"\n", facts);
 }
 
+test "commit: a shared fact survives when a file that also routed it is independently rejected" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two managed files both interpolate the same machine.email fact. .bashrc
+    // is a plain single-configuration file: its [f] choice has nothing else
+    // to fail on. .zshrc additionally has a shared EDITOR line that the user
+    // routes to the private layer -- no automatic route, so THAT file's
+    // routing is rejected for a reason that has nothing to do with the fact.
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export A=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
+    // EDITOR and EMAIL are kept non-adjacent (a spacer line between them) so
+    // their edits form two independent hunks rather than one straddling hunk.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export SHELL_OK=1\n" ++
+        "export EDITOR=vim\n" ++
+        "export SPACER=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n" ++
+        "# mox: when os=darwin\n" ++
+        "export BREW=1\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "export APT=1\n" ++
+        "# mox: end\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const bashrc_live = try h.liveOf(".bashrc");
+    const zshrc_live = try h.liveOf(".zshrc");
+    try editLive(io, a, bashrc_live, "export EMAIL=old@home.com", "export EMAIL=shared@new.com");
+    try editLive(io, a, zshrc_live, "export EDITOR=vim", "export EDITOR=nvim");
+    try editLive(io, a, zshrc_live, "export EMAIL=old@home.com", "export EMAIL=shared@new.com");
+
+    // .bashrc: [f]. .zshrc: EDITOR to the private layer (candidate 4: universal,
+    // axis(os), machine-local, private), then EMAIL's [f].
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n4\nf\n");
+
+    // .zshrc's routing was rejected (the EDITOR hunk never reached a source),
+    // so the overall run reports a failure.
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, ".zshrc") != null);
+
+    // .bashrc committed the shared fact...
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") != null);
+    // ...and .zshrc's rejection must not pull that fact out from under it: the
+    // new value survives, not the pre-run one.
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expectEqualStrings("email = \"shared@new.com\"\n", facts);
+
+    // .bashrc's own recompose (using the surviving fact) still matches live.
+    const bashrc_src = try read(io, a, try h.srcOf(".bashrc"));
+    try std.testing.expectEqualStrings(
+        "export A=1\nexport EMAIL=<machine.email | default \"nobody@example.com\">\n",
+        bashrc_src,
+    );
+    // .zshrc's own sources are untouched: [f] never writes src, and the
+    // private-routed EDITOR hunk never had anywhere to go.
+    const zshrc_src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expect(std.mem.indexOf(u8, zshrc_src, "export EDITOR=vim\n") != null);
+}
+
+test "commit: an interpolated fact edit whose new value has a control character is classified manual outright" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "export EMAIL=old@home.com") != null);
+    // A raw tab in the new value could never be persisted as a fact: it would
+    // break facts.toml's own line-oriented format. This is what a fixed
+    // classifier must catch BEFORE offering [f], not what `persist` catches
+    // after the fact (literally) once other sources may already be written.
+    try editLive(io, a, live, "export EMAIL=old@home.com", "export EMAIL=new\tvalue");
+
+    // "f" is fed as if the user tried to route it to the fact anyway. If the
+    // hunk is still classified `.fact`, this selects [f] and (pre-fix) the
+    // write phase crashes on `persist`. If it is classified `.manual` (only
+    // [m]/[s] on offer), "f" matches neither and the prompt loop runs out of
+    // input, aborting cleanly -- proving [f] was never reachable.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n");
+
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: aborted; no changes written") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "This value comes from machine.email.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "InvalidFactValue") == null);
+
+    // Nothing was written anywhere: not the fact, not the source.
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expectEqualStrings("email = \"old@home.com\"\n", facts);
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expectEqualStrings(
+        "export A=1\nexport EMAIL=<machine.email | default \"nobody@example.com\">\n",
+        src,
+    );
+}
+
+test "commit: a fact interpolated in a multi-configuration file allowlists the sibling it actually affects and commits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `.interpolated` provenance is only ever emitted for an UNGATED base
+    // line (a `# mox: when` body composes structurally instead), so EMAIL
+    // here is universal: os=linux (the file's only other configuration)
+    // recomposes differently once the fact changes. The single-config
+    // sibling test above never exercises `simulateFactImpact` at all (its
+    // file has no other configuration to allowlist); this one does, and the
+    // file must still commit -- not be rejected for "changing a
+    // configuration you did not choose to affect".
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export SHELL_OK=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n" ++
+        "# mox: when os=darwin\n" ++
+        "export BREW=1\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "export APT=1\n" ++
+        "# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "export EMAIL=nobody@example.com") != null);
+    try editLive(io, a, live, "export EMAIL=nobody@example.com", "export EMAIL=team@work.com");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "email = \"team@work.com\"") != null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: firstViolation still aborts an unintended configuration change in one file alongside a legitimate multi-configuration fact commit in another" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // .bashrc: the same multi-configuration fact edit as the sibling test
+    // above -- its own os=linux sibling is legitimately allowlisted and it
+    // commits. .zshrc: the leftover-fragment narrowing hazard, unrelated to
+    // any fact, that must still be caught. Two different files' allowed
+    // sets must never bleed into each other: the fact correctly widening
+    // .bashrc's own allowlist must not excuse .zshrc's unintended change.
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export SHELL_OK=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n" ++
+        "# mox: when os=darwin\n" ++
+        "export BREW=1\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "export APT=1\n" ++
+        "# mox: end\n");
+    try writeSharedBaseFixture(io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc.d/os/linux", "export EDITOR=vim-linux\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const zshrc_before = try read(io, a, try h.srcOf(".zshrc"));
+
+    const bashrc_live = try h.liveOf(".bashrc");
+    try editLive(io, a, bashrc_live, "export EMAIL=nobody@example.com", "export EMAIL=team@work.com");
+    const zshrc_live = try h.liveOf(".zshrc");
+    try editLive(io, a, zshrc_live, "export EDITOR=vim", "export EDITOR=nvim");
+
+    // .bashrc: [f]. .zshrc: candidate 2 (narrow to os), which the leftover
+    // fragment turns into an unintended os=linux change.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "f\n2\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "os=linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "did not choose to affect") != null);
+
+    // .bashrc's fact commit stands...
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "email = \"team@work.com\"") != null);
+    // ...and .zshrc's rejected narrowing left its source untouched.
+    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
+    try std.testing.expect(!exists(io, frag));
+    try std.testing.expectEqualStrings(zshrc_before, try read(io, a, try h.srcOf(".zshrc")));
+}
+
 test "commit: a routable hunk still commits when the same file has a manual hunk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
