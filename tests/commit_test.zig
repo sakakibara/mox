@@ -1579,6 +1579,117 @@ test "commit: a data-interpolated line is reported manual and left in source ver
     try std.testing.expect(std.mem.indexOf(u8, src, "EDITED") == null);
 }
 
+test "commit: an interpolated machine-fact edit routes to facts.toml, never to src, when the user picks [f]" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `.gitconfig` composes structurally (Cat A, whole-file merge) and never
+    // attributes `.interpolated` provenance per line; `.zshrc` is Cat B
+    // (line/directive-based), matching every other interpolation test here.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "export EMAIL=old@home.com") != null);
+    try editLive(io, a, live, "export EMAIL=old@home.com", "export EMAIL=new@work.com");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "This value comes from machine.email.") != null);
+
+    // The fact carries the new value...
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "email = \"new@work.com\"") != null);
+    // ...and the source template is untouched, byte for byte: [f] never
+    // writes to repo src.
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expectEqualStrings(
+        "export A=1\nexport EMAIL=<machine.email | default \"nobody@example.com\">\n",
+        src,
+    );
+
+    // Recompose (with the newly-written fact) matches live: status is clean.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: an interpolated machine-fact edit rewrites the source default when the user picks [d]" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
+    // No facts.toml: the default is what is actually in effect.
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "export EMAIL=nobody@example.com") != null);
+    try editLive(io, a, live, "export EMAIL=nobody@example.com", "export EMAIL=team@work.com");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "d\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // The source default carries the new value...
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expectEqualStrings(
+        "export A=1\nexport EMAIL=<machine.email | default \"team@work.com\">\n",
+        src,
+    );
+    // ...and no fact was ever written.
+    try std.testing.expect(!exists(io, try h.homePath(".config/mox/facts.toml")));
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a multi-capture interpolated line with an ambiguous change falls back to manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two captures on one line; the hand-edit changes BOTH values, so which
+    // one the edit is "about" cannot be told apart. Never guess: manual.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n" ++
+        "export WHO=<machine.email> and <machine.profile>\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"a@x.com\"\nprofile = \"alice\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "export WHO=a@x.com and alice") != null);
+    try editLive(io, a, live, "export WHO=a@x.com and alice", "export WHO=b@y.com and bob");
+
+    // No hunk was routed at all (nothing to verify a recompose against), so
+    // this matches the sibling "data-interpolated" manual test: only the
+    // output and the untouched sources are asserted, not the exit code.
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+
+    // Nothing written: the source keeps both literal captures, and neither
+    // fact changed.
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expectEqualStrings(
+        "export A=1\nexport WHO=<machine.email> and <machine.profile>\n",
+        src,
+    );
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expectEqualStrings("email = \"a@x.com\"\nprofile = \"alice\"\n", facts);
+}
+
 test "commit: a routable hunk still commits when the same file has a manual hunk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

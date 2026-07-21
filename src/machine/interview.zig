@@ -212,6 +212,29 @@ pub fn persist(arena: std.mem.Allocator, io: Io, facts_path: []const u8, answers
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = out.items });
 }
 
+/// Remove `name`'s assignment from the machine-local facts file, leaving
+/// everything else (including comments) intact. A missing file, or a name
+/// with no assignment, is a no-op. Used to roll a fact write back to "never
+/// set" when the name did not exist before it was written.
+pub fn remove(arena: std.mem.Allocator, io: Io, facts_path: []const u8, name: []const u8) !void {
+    const existing = Io.Dir.cwd().readFileAlloc(io, facts_path, arena, .limited(max_schema_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        if (lines.peek() == null and line.len == 0) break;
+        if (assignedName(line)) |n| {
+            if (std.mem.eql(u8, n, name)) continue;
+        }
+        try out.appendSlice(arena, line);
+        try out.append(arena, '\n');
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = out.items });
+}
+
 fn assignedName(line: []const u8) ?[]const u8 {
     const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
     const name = std.mem.trim(u8, line[0..eq], " \t");
@@ -327,6 +350,40 @@ test "persist: a control character in a value or name is refused" {
     try std.testing.expectError(error.InvalidFactName, persist(a, std.testing.io, facts_path, &bad_name));
 
     // Nothing was written.
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(std.testing.io, facts_path, .{}));
+}
+
+test "remove: drops only the named assignment, keeps comments and other facts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "facts.toml",
+        .data = "# my facts\nprofile = \"personal\"\nemail = \"a@b.com\"\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cwd_path = try std.process.currentPathAlloc(io, arena.allocator());
+    const facts_path = try std.fs.path.join(arena.allocator(), &.{
+        cwd_path, ".zig-cache", "tmp", &tmp.sub_path, "facts.toml",
+    });
+
+    try remove(arena.allocator(), io, facts_path, "email");
+
+    const written = try Io.Dir.cwd().readFileAlloc(io, facts_path, arena.allocator(), .limited(4096));
+    try std.testing.expectEqualStrings("# my facts\nprofile = \"personal\"\n", written);
+}
+
+test "remove: a missing file or an absent name is a no-op" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    const facts_path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", "no-such-facts-remove.toml" });
+
+    try remove(a, std.testing.io, facts_path, "email");
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(std.testing.io, facts_path, .{}));
 }
 

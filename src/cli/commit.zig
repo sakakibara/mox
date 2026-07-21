@@ -80,8 +80,25 @@ const RowEdit = struct {
 const Route = union(enum) {
     line: struct { edit: LineEdit, desc: []const u8, shared: bool },
     row: struct { edit: RowEdit, desc: []const u8 },
+    /// A single unambiguous `<machine.X>` capture accounts for the whole
+    /// hunk: `default_edit` is the alternative write, into the source's `|
+    /// default` clause, that `[d]` chooses instead of the fact.
+    fact: struct {
+        name: []const u8,
+        new_value: []const u8,
+        old_value: ?[]const u8,
+        default_edit: LineEdit,
+        default_desc: []const u8,
+    },
     manual: []const u8,
 };
+
+/// A pending write to the machine-local facts file (never repo `src`),
+/// routed from an interpolated hunk's `[f]` choice. `old_value` is what the
+/// fact resolved to before this run (null when it was unset, i.e. the
+/// source's default was in effect), so a rejected routing can restore
+/// exactly that prior state.
+const FactEdit = struct { name: []const u8, new_value: []const u8, old_value: ?[]const u8 };
 
 /// Everything the per-hunk classifier needs. Grouped so the shared-origin
 /// pipeline (impact analysis, candidate prompt, verification allowlist) can be
@@ -116,6 +133,8 @@ const RunAccum = struct {
     line_owners: *std.ArrayList(usize),
     row_edits: *std.ArrayList(RowEdit),
     row_owners: *std.ArrayList(usize),
+    fact_edits: *std.ArrayList(FactEdit),
+    fact_owners: *std.ArrayList(usize),
     synth_plans: *std.ArrayList(SynthDecision),
     synth_owners: *std.ArrayList(usize),
     affected: []bool,
@@ -238,6 +257,17 @@ const ms_choices = [_]prompt.Choice{
     .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
 };
 
+/// Interpolated-value prompt: `f` writes the new value into the fact, `d`
+/// writes it into the source's `| default` instead, `s` is the manual-style
+/// split escape hatch (a no-op for a single-line hunk, exactly like
+/// `ynms_choices`' `s`), `m` downgrades to manual.
+const fact_choices = [_]prompt.Choice{
+    .{ .key = "f", .label = "fact", .help = "set the fact to the new value" },
+    .{ .key = "d", .label = "default", .help = "change the source default instead" },
+    .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
+    .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
+};
+
 /// F-coupling prompt: `y` updates the other consumer, `d` declines this
 /// (token, file-pair), `D` declines the token everywhere.
 const yndd_choices = [_]prompt.Choice{
@@ -303,7 +333,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
     defer lk.release();
 
-    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    // A fact write in the write phase re-captures this, so a routed file's
+    // recompose (later in this same run) sees the new value.
+    var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
@@ -379,11 +411,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 
     var line_edits: std.ArrayList(LineEdit) = .empty;
     var row_edits: std.ArrayList(RowEdit) = .empty;
+    var fact_edits: std.ArrayList(FactEdit) = .empty;
     var synth_plans: std.ArrayList(SynthDecision) = .empty;
     // Index of the managed file each pending edit was routed from, so a file
     // whose routing verification fails can restore exactly the sources it wrote.
     var line_owners: std.ArrayList(usize) = .empty;
     var row_owners: std.ArrayList(usize) = .empty;
+    var fact_owners: std.ArrayList(usize) = .empty;
     var synth_owners: std.ArrayList(usize) = .empty;
     const affected = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(affected, false);
@@ -425,6 +459,8 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         .line_owners = &line_owners,
         .row_edits = &row_edits,
         .row_owners = &row_owners,
+        .fact_edits = &fact_edits,
+        .fact_owners = &fact_owners,
         .synth_plans = &synth_plans,
         .synth_owners = &synth_owners,
         .affected = affected,
@@ -631,6 +667,24 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         routed_orig[fidx] = try bs.toOwnedSlice(ctx.alloc);
     }
 
+    // Fact edits routed from each file, pre-write (`old_value` was captured
+    // at classification time, before any write this run), so a rejected
+    // file's routing can restore its facts exactly like `routed_orig` restores
+    // its sources. Scoped per file like everything else here: two different
+    // files editing the SAME fact name to different values in one run, where
+    // only one is rejected, is not resolved by this (a rare, self-inflicted
+    // ambiguity, not attempted here).
+    const fact_backup = try ctx.alloc.alloc([]const FactEdit, tree.files.len);
+    @memset(fact_backup, &.{});
+    for (tree.files, 0..) |_, fidx| {
+        if (!affected[fidx]) continue;
+        var fb: std.ArrayList(FactEdit) = .empty;
+        for (fact_edits.items, fact_owners.items) |e, owner| {
+            if (owner == fidx) try fb.append(ctx.alloc, e);
+        }
+        fact_backup[fidx] = try fb.toOwnedSlice(ctx.alloc);
+    }
+
     // Baseline: each touched file's per-configuration compose BEFORE writing,
     // so verification can prove routing changed only the configurations the
     // user chose. Each file's configuration space was built once, from its
@@ -673,6 +727,15 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try mox.classify.synth.materialize(ctx.alloc, ctx.io, base_abs, base_content, plans.items);
     }
     try applyCouplingEdits(ctx.alloc, ctx.io, coupling_edits);
+    try applyFactEdits(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items);
+    // A fact write changes what `<machine.X>` interpolation resolves to for
+    // EVERY file recomposed below, this routed file included: re-capture so
+    // the recompose-verify step sees the new value instead of the one this
+    // run started with.
+    if (fact_edits.items.len > 0) {
+        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+        bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    }
 
     // Rewalk so region synthesis (new fragments/regions) is reflected when the
     // edited files are recomposed and verified.
@@ -699,7 +762,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             if (is_coupling) {
                 try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
             } else {
-                try restoreRouted(ctx.io, routed_orig[fidx]);
+                try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
             }
             continue;
         };
@@ -736,7 +799,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         if (composed == null) {
             mismatch = true;
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
             try ctx.err.print(
                 "mox commit: {s}: the edited sources no longer compose; not committed\n",
                 .{file.live_path},
@@ -785,7 +848,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             // itself is wrong. Either way this file is not committed, and "not
             // committed" leaves nothing behind.
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
             if (unrouted_hunks[fidx] > 0) {
                 try ctx.err.print(
                     "mox commit: {s}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
@@ -805,7 +868,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
             mismatch = true;
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try restoreRouted(ctx.alloc, ctx.io, context.paths.facts_path, routed_orig[fidx], fact_backup[fidx]);
             try ctx.err.print(
                 "mox commit: {s}: routing would change configuration {s}, which you did not choose to affect; not committed\n",
                 .{ file.live_path, configs[vi].label },
@@ -1161,8 +1224,10 @@ fn addBackup(arena: std.mem.Allocator, io: Io, list: *std.ArrayList(Backup), pat
 
 /// Roll a rejected routing back to its sources' pre-write bytes: a file that
 /// existed regains its exact content, and one the synthesis created is removed
-/// -- along with every directory it created to hold it.
-fn restoreRouted(io: Io, backups: []const Backup) !void {
+/// -- along with every directory it created to hold it. Also rolls back any
+/// fact this routing wrote: restored to its pre-run value, or removed
+/// entirely when it did not exist before this run.
+fn restoreRouted(arena: std.mem.Allocator, io: Io, facts_path: []const u8, backups: []const Backup, facts: []const FactEdit) !void {
     for (backups) |b| {
         if (b.content) |bytes| {
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = b.path, .data = bytes });
@@ -1170,6 +1235,13 @@ fn restoreRouted(io: Io, backups: []const Backup) !void {
         }
         Io.Dir.cwd().deleteFile(io, b.path) catch {};
         if (b.created_dir) |d| Io.Dir.cwd().deleteTree(io, d) catch {};
+    }
+    for (facts) |e| {
+        if (e.old_value) |v| {
+            try mox.machine.interview.persist(arena, io, facts_path, &.{.{ .name = e.name, .value = v }});
+        } else {
+            try mox.machine.interview.remove(arena, io, facts_path, e.name);
+        }
     }
 }
 
@@ -1205,7 +1277,7 @@ fn processHunk(
     hunk_no: usize,
     hunk_total: usize,
 ) !HunkOutcome {
-    const route = try routeHunk(cc.arena, cc.io, segments, hunk, file, a_lines, b_lines);
+    const route = try routeHunk(cc.arena, cc.io, segments, hunk, file, a_lines, b_lines, cc.m_state);
     switch (route) {
         .manual => |reason| {
             if (!cc.interactive) {
@@ -1392,6 +1464,78 @@ fn processHunk(
             }
             return .cont;
         },
+        .fact => |r| {
+            // Non-interactive modes (--yes, --dry-run, strict, plain non-TTY
+            // without --yes) keep this hunk's PRE-existing outcome: manual.
+            // Writing a fact -- machine identity data -- without an explicit
+            // human decision is not something any of those modes should do
+            // silently, exactly like the plain `.manual` case above.
+            if (!cc.interactive) {
+                ra.manual_count.* += 1;
+                ra.manual_hunks[fidx] += 1;
+                ra.pending.* = true;
+                try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
+                return .cont;
+            }
+            try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+            try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+            try cc.stdout.print("  This value comes from machine.{s}.\n", .{r.name});
+            const legend_line = try legend(cc.arena, &fact_choices, 0, cc.sty);
+            switch (try prompt.ask(cc.ask_mode, &fact_choices, 0, legend_line, cc.input, cc.stdout)) {
+                .chosen => |i| switch (i) {
+                    0 => {
+                        // [f]: the fact. Never touches repo src.
+                        try ra.fact_edits.append(cc.arena, .{ .name = r.name, .new_value = r.new_value, .old_value = r.old_value });
+                        try ra.fact_owners.append(cc.arena, fidx);
+                        ra.affected[fidx] = true;
+                        if (space.configs.len > 1) {
+                            const imp = try simulateFactImpact(cc, file, r.name, r.new_value, space.configs);
+                            for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
+                        }
+                        try cc.stdout.print("  set fact machine.{s} = \"{s}\"\n", .{ r.name, r.new_value });
+                    },
+                    1 => {
+                        // [d]: the source's default, via the ordinary LineEdit
+                        // machinery (backup, apply, impact simulation).
+                        try ra.line_edits.append(cc.arena, r.default_edit);
+                        try ra.line_owners.append(cc.arena, fidx);
+                        ra.affected[fidx] = true;
+                        if (space.configs.len > 1) {
+                            const imp = try simulateImpact(cc, file, r.default_edit, space.configs);
+                            for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
+                        }
+                        try cc.stdout.print("  edit {s}\n", .{r.default_desc});
+                    },
+                    2 => {
+                        // [s]: a fact route is always single-segment, like
+                        // `.line`/`.row`; a split here is always a no-op.
+                        const subs = try splitHunk(cc.arena, segments, hunk);
+                        if (subs.len <= 1) {
+                            ra.manual_count.* += 1;
+                            ra.manual_hunks[fidx] += 1;
+                            ra.pending.* = true;
+                            try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
+                        } else {
+                            for (subs) |sub| {
+                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total);
+                                if (outcome != .cont) return outcome;
+                            }
+                        }
+                    },
+                    else => {
+                        // [m]: manual.
+                        ra.manual_count.* += 1;
+                        ra.manual_hunks[fidx] += 1;
+                        ra.pending.* = true;
+                        try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
+                    },
+                },
+                .abort => return .abort,
+                .abort_strict => return .abort_strict,
+                .report_only => unreachable,
+            }
+            return .cont;
+        },
     }
 }
 
@@ -1404,6 +1548,7 @@ fn routeHunk(
     file: mox.source.tree.ManagedFile,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
+    m_state: *const mox.machine.state.MachineState,
 ) !Route {
     const seg = mox.provenance.map.covering(segments, hunk.a_start, hunk.a_len) orelse
         return .{ .manual = "hunk straddles origins or is uncovered" };
@@ -1448,9 +1593,84 @@ fn routeHunk(
             } };
         },
         .secret => return .{ .manual = "came from a secret" },
-        .interpolated => return .{ .manual = "came from a capture" },
+        .interpolated => |o| {
+            if (hunk.a_len != 1 or hunk.b_len != 1)
+                return .{ .manual = "came from a capture" };
+            const start = (o.origin_line - 1) + (hunk.a_start - seg.out_start);
+            return interpolatedRoute(arena, io, file, start, old_lines[0], new_lines[0], m_state);
+        },
         .overlay => return .{ .manual = "came from a structural merge" },
     }
+}
+
+/// Route a single-line hunk over a `<machine.X>`-interpolated base line: read
+/// the raw template at `start` (0-based, in the base source -- `.interpolated`
+/// origins are only ever emitted for base-file lines, never fragments), and
+/// see whether exactly one of its captures accounts for the whole live edit.
+/// Manual for anything else -- a structural mismatch against the recorded
+/// template, more than one capture changing at once, or the one that changed
+/// not being a genuine user-settable fact -- so a fact is never guessed at.
+fn interpolatedRoute(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: mox.source.tree.ManagedFile,
+    start: u32,
+    old_line: []const u8,
+    new_line: []const u8,
+    m_state: *const mox.machine.state.MachineState,
+) !Route {
+    const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch
+        return .{ .manual = "came from a capture" };
+    const lines = try mox.diff.lines.splitLines(arena, content);
+    if (start >= lines.len) return .{ .manual = "came from a capture" };
+    const template = lines[start];
+
+    const before = (try matchCaptures(arena, template, old_line)) orelse return .{ .manual = "came from a capture" };
+    const after = (try matchCaptures(arena, template, new_line)) orelse return .{ .manual = "came from a capture" };
+    if (before.len != after.len) return .{ .manual = "came from a capture" };
+
+    var changed: usize = 0;
+    var changed_idx: usize = 0;
+    for (before, 0..) |b, i| {
+        if (!std.mem.eql(u8, b.value, after[i].value)) {
+            changed += 1;
+            changed_idx = i;
+        }
+    }
+    // Not exactly one changed capture: either nothing moved (the literal
+    // frame absorbed the whole diff, which matchCaptures would already have
+    // rejected) or more than one did, and which one is responsible for the
+    // live edit is genuinely ambiguous. Never guess.
+    if (changed != 1) return .{ .manual = "came from a capture" };
+
+    const cap = after[changed_idx];
+    const fact = asMachineCapture(cap.name) orelse return .{ .manual = "came from a capture" };
+
+    var old_value: ?[]const u8 = null;
+    for (m_state.custom_facts) |f| {
+        if (std.mem.eql(u8, f.name, fact)) {
+            old_value = f.value;
+            break;
+        }
+    }
+
+    const new_template_line = try spliceDefault(arena, template, cap.name, cap.open, cap.close, cap.value);
+    const default_edit: LineEdit = .{
+        .path = file.source_base_abs,
+        .start = start,
+        .del = 1,
+        .new_lines = try arena.dupe([]const u8, &.{new_template_line}),
+        .private = false,
+    };
+    const default_desc = try std.fmt.allocPrint(arena, "{s}:{d}", .{ file.source_base_path, start + 1 });
+
+    return .{ .fact = .{
+        .name = fact,
+        .new_value = cap.value,
+        .old_value = old_value,
+        .default_edit = default_edit,
+        .default_desc = default_desc,
+    } };
 }
 
 fn lessU32(_: void, x: u32, y: u32) bool {
@@ -1799,6 +2019,44 @@ fn simulateRowImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edi
     return impact.impact(arena, configs, before, after);
 }
 
+/// Run impact analysis for a fact edit: snapshot every configuration's
+/// compose under the CURRENT fact value, then again under `new_value` --
+/// purely in memory (an in-place `MachineState` copy, never a facts.toml
+/// write), so there is nothing to revert on error.
+fn simulateFactImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, name: []const u8, new_value: []const u8, configs: []const Configuration) !impact.Impact {
+    const arena = cc.arena;
+    const io = cc.io;
+    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
+    const edited_state = try withFact(arena, cc.m_state.*, name, new_value);
+    const after = try impact.snapshot(arena, io, file, configs, &edited_state, cc.secrets);
+    return impact.impact(arena, configs, before, after);
+}
+
+/// `base` with `name` set to `value` among its custom facts (replacing an
+/// existing entry, or appending a new one). `base.custom_facts` is not
+/// mutated; the returned state's is a fresh arena-owned slice.
+fn withFact(arena: std.mem.Allocator, base: mox.machine.state.MachineState, name: []const u8, value: []const u8) !mox.machine.state.MachineState {
+    var facts = try arena.alloc(mox.machine.state.Fact, base.custom_facts.len + 1);
+    var n: usize = 0;
+    var replaced = false;
+    for (base.custom_facts) |f| {
+        if (std.mem.eql(u8, f.name, name)) {
+            facts[n] = .{ .name = name, .value = value };
+            replaced = true;
+        } else {
+            facts[n] = f;
+        }
+        n += 1;
+    }
+    if (!replaced) {
+        facts[n] = .{ .name = name, .value = value };
+        n += 1;
+    }
+    var out = base;
+    out.custom_facts = facts[0..n];
+    return out;
+}
+
 /// Apply one line edit to `content` in memory, preserving its trailing-newline
 /// shape. Mirrors `applyLineEdits` for a single splice.
 fn editedContent(arena: std.mem.Allocator, content: []const u8, edit: LineEdit) ![]u8 {
@@ -1846,15 +2104,25 @@ fn candidateHelp(arena: std.mem.Allocator, c: candidates.Candidate) ![]const u8 
     };
 }
 
-/// Parse `line` against a single-line loop `template`, returning the field
-/// updates for its `<entry.X>` / bare captures, or null when the line does not
-/// match the template's literal frame. Captures against `<machine.X>` /
-/// `<env.X>` are skipped (their value is machine-derived, not row data).
-/// Templates are linted to forbid adjacent captures, so every interior
+/// One `<...>` capture matched against a composed line by literal-position
+/// splitting: `name` is the raw text between `<` and `>` (a ` | default "..."`
+/// clause, if any, still attached), `value` is the substring of the matched
+/// line it captured, and `open`/`close` are the byte indices of `<`/`>` in
+/// `template` -- shared by every line matched against the SAME template
+/// instance, so a caller can splice a replacement back into it.
+const RawCapture = struct { name: []const u8, value: []const u8, open: usize, close: usize };
+
+/// Match `line` against `template`'s literal frame, returning every `<...>`
+/// capture's raw name, matched value, and template span, in template order --
+/// or null when the non-capture text does not line up. A template with no
+/// captures matches only by exact equality, yielding an empty (non-null)
+/// slice. Templates are linted to forbid adjacent captures, so every interior
 /// literal is non-empty, which makes the greedy match unambiguous.
-fn reverseTemplate(arena: std.mem.Allocator, template: []const u8, line: []const u8) !?[]const Field {
+fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u8) !?[]const RawCapture {
     var literals: std.ArrayList([]const u8) = .empty;
     var names: std.ArrayList([]const u8) = .empty;
+    var opens: std.ArrayList(usize) = .empty;
+    var closes: std.ArrayList(usize) = .empty;
     var i: usize = 0;
     var lit_start: usize = 0;
     while (i < template.len) {
@@ -1865,6 +2133,8 @@ fn reverseTemplate(arena: std.mem.Allocator, template: []const u8, line: []const
             };
             try literals.append(arena, template[lit_start..i]);
             try names.append(arena, template[i + 1 .. close]);
+            try opens.append(arena, i);
+            try closes.append(arena, close);
             i = close + 1;
             lit_start = i;
             continue;
@@ -1906,10 +2176,23 @@ fn reverseTemplate(arena: std.mem.Allocator, template: []const u8, line: []const
         }
     }
 
-    var fields: std.ArrayList(Field) = .empty;
+    var caps = try arena.alloc(RawCapture, names.items.len);
     for (names.items, 0..) |name, ci| {
-        const field = captureField(name) orelse continue;
-        try fields.append(arena, .{ .name = field, .value = values[ci] });
+        caps[ci] = .{ .name = name, .value = values[ci], .open = opens.items[ci], .close = closes.items[ci] };
+    }
+    return caps;
+}
+
+/// Parse `line` against a single-line loop `template`, returning the field
+/// updates for its `<entry.X>` / bare captures, or null when the line does not
+/// match the template's literal frame. Captures against `<machine.X>` /
+/// `<env.X>` are skipped (their value is machine-derived, not row data).
+fn reverseTemplate(arena: std.mem.Allocator, template: []const u8, line: []const u8) !?[]const Field {
+    const raw = (try matchCaptures(arena, template, line)) orelse return null;
+    var fields: std.ArrayList(Field) = .empty;
+    for (raw) |c| {
+        const field = captureField(c.name) orelse continue;
+        try fields.append(arena, .{ .name = field, .value = c.value });
     }
     return try fields.toOwnedSlice(arena);
 }
@@ -1922,6 +2205,59 @@ fn captureField(name: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, name, "env.")) return null;
     if (std.mem.indexOf(u8, name, " | ") != null) return null;
     return name;
+}
+
+/// Fact name a capture's raw text maps to, when it is a plain `<machine.X>`
+/// or `<machine.X | default "...">` reference to a genuine user-defined fact
+/// -- never a fallback chain (which member actually produced the value is
+/// ambiguous), and never a name `formatMachineField` resolves itself before
+/// ever consulting `custom_facts` (writing that as a fact would be silently
+/// ineffective). Null for anything else.
+fn asMachineCapture(name: []const u8) ?[]const u8 {
+    const marker = " | default \"";
+    const field = if (std.mem.indexOf(u8, name, marker)) |idx|
+        std.mem.trimEnd(u8, name[0..idx], " \t")
+    else if (std.mem.indexOf(u8, name, " | ") != null)
+        return null
+    else
+        name;
+    if (!std.mem.startsWith(u8, field, "machine.")) return null;
+    const fact = field[8..];
+    if (isBuiltinMachineField(fact)) return null;
+    return fact;
+}
+
+/// True when `field` is one of the `MachineState` fields `formatMachineField`
+/// (`src/compose/interp.zig`) resolves itself before ever falling through to
+/// `custom_facts`.
+fn isBuiltinMachineField(field: []const u8) bool {
+    const builtins = [_][]const u8{
+        "os",             "arch",            "hostname",       "username",
+        "home",           "brew_prefix",     "cargo_home",     "gopath",
+        "pnpm_home",      "xdg_config_home", "xdg_cache_home", "xdg_data_home",
+        "xdg_state_home",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, field, b)) return true;
+    }
+    return std.mem.startsWith(u8, field, "tool_path.");
+}
+
+/// Rebuild `template` with the capture spanning `[open, close]` (whose raw
+/// text is `inner`) rewritten to carry `value` as its `| default "..."`
+/// clause -- replacing an existing default, or adding one when the capture
+/// had none.
+fn spliceDefault(arena: std.mem.Allocator, template: []const u8, inner: []const u8, open: usize, close: usize, value: []const u8) ![]const u8 {
+    const marker = " | default \"";
+    const field = if (std.mem.indexOf(u8, inner, marker)) |idx| std.mem.trimEnd(u8, inner[0..idx], " \t") else inner;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, template[0 .. open + 1]);
+    try out.appendSlice(arena, field);
+    try out.appendSlice(arena, marker);
+    try out.appendSlice(arena, value);
+    try out.append(arena, '"');
+    try out.appendSlice(arena, template[close..]);
+    return out.toOwnedSlice(arena);
 }
 
 /// Apply all line edits, grouped by physical file, so a file is rewritten once
@@ -2029,6 +2365,22 @@ fn applyRowEdits(arena: std.mem.Allocator, io: Io, edits: []const RowEdit) !void
         }
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = e.data_source, .data = content });
     }
+}
+
+/// Write every routed fact edit to the machine-local facts file in one pass,
+/// deduping by name (last edit in `edits` wins) so a batch never asks
+/// `persist` to assign the same key twice. This is the `[f]` write path: it
+/// touches only `facts_path`, never repo `src`.
+fn applyFactEdits(arena: std.mem.Allocator, io: Io, facts_path: []const u8, edits: []const FactEdit) !void {
+    if (edits.len == 0) return;
+    var answers: std.ArrayList(mox.machine.state.Fact) = .empty;
+    outer: for (edits, 0..) |e, i| {
+        for (edits[i + 1 ..]) |later| {
+            if (std.mem.eql(u8, later.name, e.name)) continue :outer;
+        }
+        try answers.append(arena, .{ .name = e.name, .value = e.new_value });
+    }
+    try mox.machine.interview.persist(arena, io, facts_path, answers.items);
 }
 
 /// Rewrite the `key = "value"` lines of the `target_row`-th `[[stem]]` table,
@@ -2140,6 +2492,7 @@ fn routeLabel(arena: std.mem.Allocator, route: Route, file: mox.source.tree.Mana
     return switch (route) {
         .line => |r| lineRouteLabel(arena, r.edit, file),
         .row => |r| std.fmt.allocPrint(arena, "data source {s} (row {d})", .{ r.edit.data_source, r.edit.row }),
+        .fact => |r| std.fmt.allocPrint(arena, "interpolated -- machine.{s}", .{r.name}),
         .manual => |reason| std.fmt.allocPrint(arena, "manual -- {s}", .{reason}),
     };
 }
@@ -2491,7 +2844,24 @@ test "routeHunk: a private-only base file's edit is flagged private by location"
     const a_lines = [_][]const u8{"key = old"};
     const b_lines = [_][]const u8{"key = new"};
 
-    const route = try routeHunk(a, io, &segs, hunk, file, &a_lines, &b_lines);
+    const m_state: mox.machine.state.MachineState = .{
+        .os = "linux",
+        .arch = "x86_64",
+        .hostname = "h",
+        .username = "u",
+        .home = "/home/u",
+        .tools_on_path = &.{},
+        .defined_envs = &.{},
+        .brew_prefix = "",
+        .cargo_home = "",
+        .gopath = "",
+        .pnpm_home = "",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+    };
+    const route = try routeHunk(a, io, &segs, hunk, file, &a_lines, &b_lines, &m_state);
     try testing.expect(route == .line);
     try testing.expect(route.line.edit.private);
 }
