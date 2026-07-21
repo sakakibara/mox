@@ -11,6 +11,7 @@ pub const secret_cmd = @import("secret.zig");
 pub const trigger_cmd = @import("trigger.zig");
 pub const data_cmd = @import("data.zig");
 pub const commit_cmd = @import("commit.zig");
+pub const commit_struct = @import("commit_struct.zig");
 pub const diff_cmd = @import("diff.zig");
 pub const edit_cmd = @import("edit.zig");
 pub const export_cmd = @import("export.zig");
@@ -33,6 +34,7 @@ test {
     _ = trigger_cmd;
     _ = data_cmd;
     _ = commit_cmd;
+    _ = commit_struct;
     _ = diff_cmd;
     _ = edit_cmd;
     _ = export_cmd;
