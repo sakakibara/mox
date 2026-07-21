@@ -1304,6 +1304,72 @@ test "apply: .mox-exact keeps managed files including a nested managed dir" {
     try std.testing.expect(exists(io, try c.homePath(".config/app/sub/deep.txt")));
 }
 
+test "apply: a path argument writes only that file, leaving another managed file untouched" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.zshrc", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.bashrc", .data = "b\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const zshrc_live = try c.homePath(".zshrc");
+    const r = try c.run(&.{ "mox", "apply", zshrc_live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, zshrc_live));
+    try std.testing.expect(!exists(io, try c.homePath(".bashrc")));
+}
+
+test "apply: an unmanaged path argument exits non-zero reporting not managed, writes nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.zshrc", .data = "a\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const nope = try c.homePath(".nope");
+    const r = try c.run(&.{ "mox", "apply", nope });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not managed") != null);
+    try std.testing.expect(!exists(io, try c.homePath(".zshrc")));
+}
+
+test "apply: a scoped run skips the .mox-exact prune sweep entirely" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config/app");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.config/app/keep.txt", .data = "keep\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.config/app/.mox-exact", .data = "" });
+
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // A foreign file mox never wrote, inside the exact-marked directory. An
+    // unscoped apply would refuse (nonzero rc) without --force; a scoped
+    // apply naming only keep.txt must not even look at it.
+    const foreign = try c.homePath(".config/app/foreign.txt");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = foreign, .data = "mine\n" });
+
+    const keep_live = try c.homePath(".config/app/keep.txt");
+    const r = try c.run(&.{ "mox", "apply", keep_live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, foreign));
+}
+
 test "run_scripts: a hung script is killed within the configured timeout" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

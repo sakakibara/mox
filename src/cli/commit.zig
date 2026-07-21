@@ -34,6 +34,7 @@ const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const prompt = @import("prompt.zig");
+const scope = @import("scope.zig");
 const mox = @import("../root.zig");
 
 const Io = std.Io;
@@ -215,6 +216,7 @@ const Spec = struct {
     dry_run: cli.spec.Flag(.{ .help = "report only, exit 1 if edits remain" }),
     yes: cli.spec.Flag(.{ .help = "take defaults without prompting" }),
     abort_on_prompt: cli.spec.Flag(.{ .help = "strict CI: rc 2 on the first prompt" }),
+    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
 /// A file's own configuration space, built once from its source and reused
@@ -262,6 +264,25 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         else => return e,
     };
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+
+    // A scoped commit routes only the named files: everything else is left
+    // for a later `mox commit`, so `scoped_live` gates the main routing loop
+    // rather than shrinking `tree.files` (which every fidx-indexed array
+    // below is still sized against).
+    var scoped_live: ?std.StringHashMap(void) = null;
+    if (a.paths.len > 0) {
+        var diag: scope.Diag = .{};
+        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, a.paths, &diag) catch |e| switch (e) {
+            error.NotManaged => {
+                try ctx.err.print("mox commit: {s}: not managed\n", .{diag.capture().?});
+                return 1;
+            },
+            else => return e,
+        };
+        var set: std.StringHashMap(void) = .init(ctx.alloc);
+        for (scoped_files) |f| try set.put(f.live_path, {});
+        scoped_live = set;
+    }
 
     const scripted_input = app.stdin_override;
     // Strict CI: rc 2 for a prompt that WOULD have been needed. That is a fact
@@ -344,6 +365,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     var strict_abort = false;
 
     files: for (tree.files, 0..) |file, fidx| {
+        if (scoped_live) |set| {
+            if (!set.contains(file.live_path)) continue;
+        }
         if (file.is_symlink) continue;
         // Seed-once files carry no applied record and are user-owned after
         // creation; there is nothing to route back to their source.

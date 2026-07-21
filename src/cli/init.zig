@@ -24,12 +24,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         const rc = try runClone(ctx, url, gitClone, a.apply);
         if (rc != 0) return rc;
         // Opt-in one-command bootstrap: clone, then apply a repo the user trusts.
-        if (a.apply) return apply.applyImpl(ctx, false, false, false);
+        if (a.apply) return apply.applyImpl(ctx, false, false, false, &.{});
         return rc;
     }
     const rc = try initFresh(ctx);
     if (rc != 0) return rc;
-    if (a.apply) return apply.applyImpl(ctx, false, false, false);
+    if (a.apply) return apply.applyImpl(ctx, false, false, false, &.{});
     return rc;
 }
 

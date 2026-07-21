@@ -4,20 +4,25 @@ const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const mox = @import("../root.zig");
+const scope = @import("scope.zig");
 
 pub const Spec = struct {
     dry_run: cli.spec.Flag(.{ .help = "report only, write nothing" }),
     force: cli.spec.Flag(.{ .help = "overwrite drifted files" }),
     skip_scripts: cli.spec.Flag(.{ .help = "compose and write files, run no scripts" }),
+    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
-    return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts);
+    return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts, a.paths);
 }
 
 /// The apply pipeline, callable with explicit flags so `mox init --apply` can
-/// run it right after a clone. `run` is the thin CLI wrapper over it.
-pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool) anyerror!u8 {
+/// run it right after a clone. `run` is the thin CLI wrapper over it. `paths`
+/// limits the run to those managed files (empty: every file); when non-empty
+/// the `.mox-exact` prune sweep is skipped entirely, since it reasons about
+/// the whole tree and a scoped apply must touch only the named files.
+pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, paths: []const []const u8) anyerror!u8 {
     const context = ctx.context.?;
     // Skip setup scripts (also implied by --dry-run) for fast, side-effect-
     // free file-only applies; scripts may install packages or hit the network.
@@ -104,6 +109,19 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
     const home = m_state.home;
 
+    const scoped = paths.len > 0;
+    var files: []const mox.source.tree.ManagedFile = tree.files;
+    if (scoped) {
+        var diag: scope.Diag = .{};
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, paths, &diag) catch |e| switch (e) {
+            error.NotManaged => {
+                try ctx.err.print("mox apply: {s}: not managed\n", .{diag.capture().?});
+                return 1;
+            },
+            else => return e,
+        };
+    }
+
     var counts: Counts = .{};
 
     const snap_id = try mox.apply.snapshot.freshId(ctx.alloc, ctx.io, context.paths.snapshots_dir);
@@ -115,13 +133,13 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
     var produced: std.StringHashMap(void) = .init(ctx.alloc);
     // Regular managed targets, for the generator collision check.
     var regular_live: std.StringHashMap(void) = .init(ctx.alloc);
-    for (tree.files) |f| try regular_live.put(f.live_path, {});
+    for (files) |f| try regular_live.put(f.live_path, {});
     // Every generator seen this run (succeeded or failed), so pruning and manifest
     // recording happen AFTER all generators have composed. This makes the keep set
     // global and order-independent instead of "producers seen so far".
     var gen_states: std.ArrayList(GenState) = .empty;
 
-    for (tree.files) |file| {
+    for (files) |file| {
         // A GENERATOR (`for ... into`) fans out to N files instead of writing
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are
@@ -296,7 +314,7 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
     // keep set is the managed set: a generated leaf (current, or a failed
     // generator's prior) is protected and never swept.
     var exact_result = mox.apply.exact.Result{};
-    if (tree.exact_dirs.len > 0) {
+    if (!scoped and tree.exact_dirs.len > 0) {
         var managed_live: std.ArrayList([]const u8) = .empty;
         var kit = keep_set.keyIterator();
         while (kit.next()) |p| try managed_live.append(ctx.alloc, p.*);

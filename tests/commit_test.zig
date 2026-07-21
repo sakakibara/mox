@@ -1757,3 +1757,58 @@ test "commit: a coupled token in a symlink target or seed-once body is not rewri
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mylink") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "seed.local") == null);
 }
+
+test "commit: a path argument limits routing to that file, leaving another drifted file alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export B=1\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const zshrc_live = try h.liveOf(".zshrc");
+    const bashrc_live = try h.liveOf(".bashrc");
+    try editLive(io, a, zshrc_live, "export A=1", "export A=11");
+    try editLive(io, a, bashrc_live, "export B=1", "export B=11");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", zshrc_live });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // The scoped file's edit landed in its source.
+    try std.testing.expectEqualStrings("export A=11\n", try read(io, a, try h.srcOf(".zshrc")));
+    // The out-of-scope file was never routed: its source is untouched, and its
+    // live edit still shows as drift.
+    try std.testing.expectEqualStrings("export B=1\n", try read(io, a, try h.srcOf(".bashrc")));
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, ".bashrc") != null);
+}
+
+test "commit: an unmanaged path argument exits non-zero reporting not managed, commits nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export A=1", "export A=11");
+
+    const nope = try h.liveOf(".nope");
+    const res = try h.run(&.{ "mox", "commit", "--yes", nope });
+    try std.testing.expect(res.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "not managed") != null);
+    // Untouched: the edit is still only in the live file.
+    try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.srcOf(".zshrc")));
+}

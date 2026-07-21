@@ -150,6 +150,107 @@ test "status: an ignored tracked file is not reported" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "oldtool") == null);
 }
 
+test "status: a path argument limits output to that file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\n");
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "b\n");
+
+    const live = try h.liveOf(".zshrc");
+    const r = try h.run(&.{ "mox", "status", live });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, ".zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, ".bashrc") == null);
+
+    // No-arg behavior is unchanged: both files are reported.
+    const all = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, all.out, ".zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.out, ".bashrc") != null);
+}
+
+test "status: an unmanaged path argument exits non-zero reporting not managed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\n");
+
+    const nope = try h.liveOf(".nope");
+    const r = try h.run(&.{ "mox", "status", nope });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not managed") != null);
+}
+
+test "diff: a path argument limits the stat summary to that file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\nb\nc\n");
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "x\ny\nz\n");
+    _ = try h.run(&.{ "mox", "apply" });
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\nB\nc\n");
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "x\nY\nz\n");
+
+    const live = try h.liveOf(".zshrc");
+    const r = try h.run(&.{ "mox", "diff", "--stat", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, ".zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, ".bashrc") == null);
+}
+
+test "diff: an unmanaged path argument exits non-zero reporting not managed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\n");
+
+    const nope = try h.liveOf(".nope");
+    const r = try h.run(&.{ "mox", "diff", nope });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not managed") != null);
+}
+
+test "__complete: the managed-file dynamic resolver offers every managed live path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\n");
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "b\n");
+
+    const r = try h.run(&.{ "mox", "__complete", "status", "" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const zshrc = try h.liveOf(".zshrc");
+    const bashrc = try h.liveOf(".bashrc");
+    try std.testing.expect(std.mem.indexOf(u8, r.out, zshrc) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, bashrc) != null);
+}
+
 test "edit: base name launches $EDITOR on the source; unmanaged errors with a candidate" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

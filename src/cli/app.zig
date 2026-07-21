@@ -8,6 +8,7 @@ const std = @import("std");
 const cli = @import("cli");
 const paths_mod = @import("paths.zig");
 const Env = @import("env").Env;
+const mox = @import("../root.zig");
 
 pub const VERSION = @import("build_options").version;
 
@@ -81,12 +82,36 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
     );
 }
 
+/// `.dynamic` completion resolver for every `paths` positional (`status`,
+/// `diff`, `apply`, `commit`). `key == "managed-file"` walks the source tree
+/// (base + private layer) and offers every managed file's live path; any
+/// other key, or a `loadContext` failure (no `ctx.context`), yields no
+/// candidates -- broken completion must never crash the shell.
+fn moxResolveCompletion(alloc: std.mem.Allocator, key: []const u8, prev: ?[]const u8, cur: []const u8, ctx: anytype) anyerror!cli.complete.Result {
+    _ = prev;
+    _ = cur;
+    const none: cli.complete.Result = .{ .directive = .default, .candidates = &.{} };
+    if (!std.mem.eql(u8, key, "managed-file")) return none;
+    const context = ctx.context orelse return none;
+
+    const src_dir = std.fs.path.join(alloc, &.{ context.paths.repo_dir, "src" }) catch return none;
+    const base_tree = mox.source.tree.walk(alloc, ctx.io, src_dir, context.paths.home) catch return none;
+    const tree = mox.private.layer.merge(alloc, ctx.io, base_tree, context.paths.private_dir, context.paths.home) catch return none;
+
+    var out: std.ArrayList(cli.complete.Candidate) = .empty;
+    for (tree.files) |f| {
+        out.append(alloc, .{ .value = f.live_path }) catch return none;
+    }
+    return .{ .directive = .default, .candidates = out.toOwnedSlice(alloc) catch return none };
+}
+
 pub const MoxCli = cli.cli.Cli(.{
     .Context = Context,
     .Group = Group,
     .loadContext = loadContext,
     .messagePrefix = "mox: ",
     .renderHelpFooter = renderHelpFooter,
+    .resolveCompletion = moxResolveCompletion,
 });
 
 /// The environment a command reads through. A `needs_context` command takes it

@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
+const scope = @import("scope.zig");
 
 /// One status cell: the label to print and whether it counts against the
 /// exit code (the scripting contract: rc 1 when any file needs attention).
@@ -19,9 +20,11 @@ fn cellFor(disp: mox.apply.applied.Disposition) Cell {
     };
 }
 
-const Spec = struct {};
+const Spec = struct {
+    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
+};
 
-fn run(ctx: *app.Ctx, _: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -42,8 +45,20 @@ fn run(ctx: *app.Ctx, _: cli.args.Args(Spec)) anyerror!u8 {
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
     const home = m_state.home;
 
+    var files: []const mox.source.tree.ManagedFile = tree.files;
+    if (a.paths.len > 0) {
+        var diag: scope.Diag = .{};
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, a.paths, &diag) catch |e| switch (e) {
+            error.NotManaged => {
+                try ctx.err.print("mox status: {s}: not managed\n", .{diag.capture().?});
+                return 1;
+            },
+            else => return e,
+        };
+    }
+
     var problems: usize = 0;
-    for (tree.files) |file| {
+    for (files) |file| {
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so status has nothing to report for it.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);

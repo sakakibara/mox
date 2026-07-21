@@ -9,6 +9,7 @@ const app = @import("app.zig");
 const mox = @import("../root.zig");
 const style = @import("style.zig");
 const tty = @import("tty.zig");
+const scope = @import("scope.zig");
 
 const Io = std.Io;
 const Hunk = mox.diff.lines.Hunk;
@@ -115,6 +116,7 @@ fn secretMask(arena: std.mem.Allocator, count: usize, segments: []const mox.prov
 const Spec = struct {
     stat: cli.spec.Flag(.{ .help = "per-file added/removed summary instead of full hunks" }),
     color: cli.spec.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
+    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
@@ -145,10 +147,22 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
     const home = m_state.home;
 
+    var files: []const mox.source.tree.ManagedFile = tree.files;
+    if (a.paths.len > 0) {
+        var diag: scope.Diag = .{};
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, a.paths, &diag) catch |e| switch (e) {
+            error.NotManaged => {
+                try ctx.err.print("mox diff: {s}: not managed\n", .{diag.capture().?});
+                return 1;
+            },
+            else => return e,
+        };
+    }
+
     var total: Stat = .{};
     var changed: usize = 0;
 
-    for (tree.files) |file| {
+    for (files) |file| {
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so diff has nothing to compare it against.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
