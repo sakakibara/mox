@@ -7,6 +7,8 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
+const style = @import("style.zig");
+const tty = @import("tty.zig");
 
 const Io = std.Io;
 const Hunk = mox.diff.lines.Hunk;
@@ -45,15 +47,20 @@ pub fn renderFile(
     hunks: []const Hunk,
     a_secret: []const bool,
     b_secret: []const bool,
+    sty: style.Style,
 ) ![]u8 {
     if (hunks.len == 0) return "";
     const redaction = mox.provenance.map.secret_redaction;
     var aw: Io.Writer.Allocating = .init(arena);
     const out = &aw.writer;
+    try sty.dim(out);
     try out.print("--- {s} (live)\n", .{label});
     try out.print("+++ {s} (composed)\n", .{label});
+    try sty.close(out);
     for (hunks) |h| {
+        try sty.dim(out);
         try out.print("@@ -{d},{d} +{d},{d} @@\n", .{ h.a_start + 1, h.a_len, h.b_start + 1, h.b_len });
+        try sty.close(out);
         // Redact the whole hunk when a secret line sits on either side: the two
         // sides of a rotated/removed secret pair up here, and over-redacting a
         // mixed hunk in the DISPLAY is safe where leaking a value is not.
@@ -61,12 +68,16 @@ pub fn renderFile(
         var i: u32 = 0;
         while (i < h.a_len) : (i += 1) {
             const line = if (secret) redaction else a_lines[h.a_start + i];
+            try sty.red(out);
             try out.print("-{s}\n", .{line});
+            try sty.close(out);
         }
         i = 0;
         while (i < h.b_len) : (i += 1) {
             const line = if (secret) redaction else b_lines[h.b_start + i];
+            try sty.green(out);
             try out.print("+{s}\n", .{line});
+            try sty.close(out);
         }
     }
     return aw.toOwnedSlice();
@@ -103,11 +114,17 @@ fn secretMask(arena: std.mem.Allocator, count: usize, segments: []const mox.prov
 
 const Spec = struct {
     stat: cli.spec.Flag(.{ .help = "per-file added/removed summary instead of full hunks" }),
+    color: cli.spec.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const stat_mode = a.stat;
+    const sty = style.Style{ .on = style.enabled(
+        tty.isInteractive(1),
+        context.env.get(ctx.alloc, "NO_COLOR") != null,
+        a.color orelse .auto,
+    ) };
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -185,7 +202,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             const b_secret = try secretMask(ctx.alloc, b_lines.len, prov.items);
             const prior = try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
             const a_secret = if (prior) |m| try secretMask(ctx.alloc, a_lines.len, m.segments) else &.{};
-            const rendered = try renderFile(ctx.alloc, file.live_path, a_lines, b_lines, hunks, a_secret, b_secret);
+            const rendered = try renderFile(ctx.alloc, file.live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
             try ctx.out.writeAll(rendered);
         }
     }
@@ -223,7 +240,8 @@ test "renderFile: a changed line renders both sides under a hunk header" {
     const b = [_][]const u8{ "one", "TWO", "three" };
     const hunks = [_]Hunk{.{ .a_start = 1, .a_len = 1, .b_start = 1, .b_len = 1 }};
     const no_secret: []const bool = &.{};
-    const out = try renderFile(arena.allocator(), "/home/me/.zshrc", &a, &b, &hunks, no_secret, no_secret);
+    const off = style.Style{ .on = false };
+    const out = try renderFile(arena.allocator(), "/home/me/.zshrc", &a, &b, &hunks, no_secret, no_secret, off);
     const expected =
         "--- /home/me/.zshrc (live)\n" ++
         "+++ /home/me/.zshrc (composed)\n" ++
@@ -238,7 +256,8 @@ test "renderFile: no hunks renders empty" {
     defer arena.deinit();
     const empty: []const []const u8 = &.{};
     const no_secret: []const bool = &.{};
-    const out = try renderFile(arena.allocator(), "x", empty, empty, &.{}, no_secret, no_secret);
+    const off = style.Style{ .on = false };
+    const out = try renderFile(arena.allocator(), "x", empty, empty, &.{}, no_secret, no_secret, off);
     try testing.expectEqualStrings("", out);
 }
 
@@ -251,7 +270,8 @@ test "renderFile: a hunk touching a secret line redacts both sides" {
     // Line 1 is a resolved secret on both sides.
     const a_secret = [_]bool{ false, true };
     const b_secret = [_]bool{ false, true };
-    const out = try renderFile(arena.allocator(), "/home/me/.netrc", &a, &b, &hunks, &a_secret, &b_secret);
+    const off = style.Style{ .on = false };
+    const out = try renderFile(arena.allocator(), "/home/me/.netrc", &a, &b, &hunks, &a_secret, &b_secret, off);
     const red = mox.provenance.map.secret_redaction;
     const expected =
         "--- /home/me/.netrc (live)\n" ++
@@ -261,4 +281,22 @@ test "renderFile: a hunk touching a secret line redacts both sides" {
         "+" ++ red ++ "\n";
     try testing.expectEqualStrings(expected, out);
     try testing.expect(std.mem.indexOf(u8, out, "s3cr3t") == null);
+}
+
+test "renderFile: colored output wraps removed lines red, added lines green, headers dim" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = [_][]const u8{"two"};
+    const b = [_][]const u8{"TWO"};
+    const hunks = [_]Hunk{.{ .a_start = 0, .a_len = 1, .b_start = 0, .b_len = 1 }};
+    const no_secret: []const bool = &.{};
+    const on = style.Style{ .on = true };
+    const out = try renderFile(arena.allocator(), "x", &a, &b, &hunks, no_secret, no_secret, on);
+    const expected =
+        "\x1b[2m--- x (live)\n" ++
+        "+++ x (composed)\n\x1b[0m" ++
+        "\x1b[2m@@ -1,1 +1,1 @@\n\x1b[0m" ++
+        "\x1b[31m-two\n\x1b[0m" ++
+        "\x1b[32m+TWO\n\x1b[0m";
+    try testing.expectEqualStrings(expected, out);
 }

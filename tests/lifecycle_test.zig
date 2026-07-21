@@ -105,6 +105,35 @@ test "diff: a drifted file shows its hunk, a clean file shows nothing" {
     try std.testing.expect(std.mem.indexOf(u8, stat.out, "+1 -1") != null);
 }
 
+test "diff --color=always colors +/- lines; --color=never and the non-TTY default do not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\nb\nc\n");
+    _ = try h.run(&.{ "mox", "apply" });
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\nB\nc\n");
+
+    const colored = try h.run(&.{ "mox", "diff", "--color=always" });
+    try std.testing.expectEqual(@as(u8, 0), colored.rc);
+    try std.testing.expect(std.mem.indexOf(u8, colored.out, "\x1b[31m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored.out, "\x1b[32m") != null);
+
+    const never = try h.run(&.{ "mox", "diff", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), never.rc);
+    try std.testing.expect(std.mem.indexOf(u8, never.out, "\x1b[") == null);
+
+    // The harness's captured stdout is not a real TTY, so the default `auto`
+    // flag stays off with no `--color` given at all.
+    const default = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), default.rc);
+    try std.testing.expect(std.mem.indexOf(u8, default.out, "\x1b[") == null);
+}
+
 test "status: an ignored tracked file is not reported" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
