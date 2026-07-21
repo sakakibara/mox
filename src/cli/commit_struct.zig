@@ -394,6 +394,7 @@ pub fn applyToLayer(
     layer_abs: []const u8,
     change: KeyPathChange,
 ) !void {
+    if (change.path.len == 0) return error.EmptyPath;
     const existing: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, layer_abs, arena, .limited(max_layer_bytes)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => return e,
@@ -407,7 +408,16 @@ pub fn applyToLayer(
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_abs, .data = out });
 }
 
+/// toml-zig's `Document` (`get`/`setLiteral`/`setValue`/`remove`) only takes
+/// a single dotted-string path -- there is no segment-slice-taking
+/// primitive -- and that dotted string is itself the ambiguous encoding: a
+/// segment containing a literal `.` (a quoted key like `"example.com"`) is
+/// indistinguishable from multiple segments once joined. Reject up front
+/// rather than let a new-key insert silently build the wrong nested chain.
 fn applyTomlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    for (change.path) |segment| {
+        if (std.mem.indexOfScalar(u8, segment, '.') != null) return error.DottedKeySegment;
+    }
     var doc = try toml.Document.parse(arena, existing orelse "", .{});
     const dotted = try std.mem.join(arena, ".", change.path);
     if (change.removed) {
@@ -442,10 +452,16 @@ fn applyJsonLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPa
     return arena.dupe(u8, aw.written());
 }
 
-fn jsonSetPath(arena: std.mem.Allocator, val: json.Value, path: []const []const u8, new: json.Value) !json.Value {
-    var obj = if (val == .object) val.object else json.ObjectMap.empty;
+/// `val` is `null` for a not-yet-created intermediate (starts a fresh empty
+/// object); when non-null it must already be an object -- a present SCALAR
+/// is a type conflict (`error.NotAContainer`), never silently replaced.
+fn jsonSetPath(arena: std.mem.Allocator, val: ?json.Value, path: []const []const u8, new: json.Value) !json.Value {
+    var obj: json.ObjectMap = if (val) |v| blk: {
+        if (v != .object) return error.NotAContainer;
+        break :blk v.object;
+    } else .empty;
     const head = path[0];
-    const child = if (path.len == 1) new else try jsonSetPath(arena, obj.get(head) orelse .{ .object = .empty }, path[1..], new);
+    const child = if (path.len == 1) new else try jsonSetPath(arena, obj.get(head), path[1..], new);
     try obj.put(arena, head, child);
     return .{ .object = obj };
 }
@@ -483,8 +499,13 @@ fn applyYamlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPa
     return arena.dupe(u8, aw.written());
 }
 
+/// `val` must already be a `.map` -- it is the container being descended
+/// into, whether an existing one or a freshly minted `.{ .map = &.{} }` at
+/// the call site. A present SCALAR is a type conflict (`error.NotAContainer`),
+/// never silently replaced.
 fn yamlSetPath(arena: std.mem.Allocator, val: yaml.Value, path: []const []const u8, new: yaml.Value) !yaml.Value {
-    const map = if (val == .map) val.map else &[_]yaml.Entry{};
+    if (val != .map) return error.NotAContainer;
+    const map = val.map;
     const head = path[0];
     var out: std.ArrayList(yaml.Entry) = .empty;
     var found = false;
@@ -549,8 +570,13 @@ fn emptyIniSection(arena: std.mem.Allocator) !*ini.Section {
     return s;
 }
 
+/// `val` must already be a `.section` -- it is the container being
+/// descended into, whether an existing one or a freshly minted empty
+/// section at the call site. A present SCALAR is a type conflict
+/// (`error.NotAContainer`), never silently replaced.
 fn iniSetPath(arena: std.mem.Allocator, val: ini.Value, path: []const []const u8, new: ini.Value) !ini.Value {
-    const entries = if (val == .section) val.section.entries else &[_]ini.value.Entry{};
+    if (val != .section) return error.NotAContainer;
+    const entries = val.section.entries;
     const head = path[0];
     var out: std.ArrayList(ini.value.Entry) = .empty;
     var found = false;
@@ -1325,4 +1351,150 @@ test "applyToLayer: gitconfig nested subsection change sets the key under the gi
     const origin = remote.section.findValue("origin").?;
     try testing.expectEqualStrings("git@example.com:x/y.git", origin.section.findValue("url").?.string);
     try testing.expectEqualStrings("foo", reparsed.section.findValue("user").?.section.findValue("name").?.string);
+}
+
+test "applyToLayer: toml new key with a dotted quoted key segment never builds the wrong nested chain" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[host]\n" });
+
+    // "example.com" is one segment (a quoted TOML key containing a literal
+    // dot), not two. Naively dot-joining {"host", "example.com"} into
+    // "host.example.com" and handing that to toml.Document's dotted-path
+    // setter would create the WRONG chain host -> example -> com instead of
+    // the leaf "example.com" under host. This must never happen silently.
+    const result = applyToLayer(a, io, .toml, path, .{
+        .path = &.{ "host", "example.com" },
+        .new = .{ .toml = .{ .string = "1.2.3.4" } },
+        .removed = false,
+    });
+
+    if (result) |_| {
+        const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+        const reparsed = try toml.parse(a, out, .{});
+        const host = reparsed.table.get("host").?;
+        try testing.expect(host.table.get("example") == null);
+        try testing.expectEqualStrings("1.2.3.4", host.table.get("example.com").?.string);
+    } else |err| {
+        try testing.expectEqual(error.DottedKeySegment, err);
+    }
+}
+
+test "applyToLayer: toml removal of a dotted quoted key segment never builds the wrong nested chain" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[host]\n\"example.com\" = \"1.2.3.4\"\n" });
+
+    const result = applyToLayer(a, io, .toml, path, .{
+        .path = &.{ "host", "example.com" },
+        .new = null,
+        .removed = true,
+    });
+
+    if (result) |_| {
+        const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+        const reparsed = try toml.parse(a, out, .{});
+        const host = reparsed.table.get("host").?;
+        try testing.expect(host.table.get("example.com") == null);
+        try testing.expect(host.table.get("example") == null);
+    } else |err| {
+        try testing.expectEqual(error.DottedKeySegment, err);
+    }
+}
+
+test "applyToLayer: json non-container intermediate is a clean error, not a silent overwrite" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"foo\":\"scalar\"}" });
+
+    const result = applyToLayer(a, io, .json, path, .{
+        .path = &.{ "foo", "bar" },
+        .new = .{ .json = .{ .string = "baz" } },
+        .removed = false,
+    });
+    try testing.expectError(error.NotAContainer, result);
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    try testing.expectEqualStrings("{\"foo\":\"scalar\"}", out);
+}
+
+test "applyToLayer: yaml non-container intermediate is a clean error, not a silent overwrite" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.yaml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "foo: scalar\n" });
+
+    const result = applyToLayer(a, io, .yaml, path, .{
+        .path = &.{ "foo", "bar" },
+        .new = .{ .yaml = .{ .string = "baz" } },
+        .removed = false,
+    });
+    try testing.expectError(error.NotAContainer, result);
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    try testing.expectEqualStrings("foo: scalar\n", out);
+}
+
+test "applyToLayer: ini non-container intermediate is a clean error, not a silent overwrite" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "foo=scalar\n" });
+
+    const result = applyToLayer(a, io, .ini, path, .{
+        .path = &.{ "foo", "bar" },
+        .new = .{ .ini = .{ .string = "baz" } },
+        .removed = false,
+    });
+    try testing.expectError(error.NotAContainer, result);
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    try testing.expectEqualStrings("foo=scalar\n", out);
+}
+
+test "applyToLayer: empty path is a clean error, not a panic" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "x = 1\n" });
+
+    const result = applyToLayer(a, io, .toml, path, .{
+        .path = &.{},
+        .new = .{ .toml = .{ .integer = 2 } },
+        .removed = false,
+    });
+    try testing.expectError(error.EmptyPath, result);
 }
