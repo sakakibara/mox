@@ -1790,6 +1790,38 @@ test "commit: a path argument limits routing to that file, leaving another drift
     try std.testing.expect(std.mem.indexOf(u8, st.out, ".bashrc") != null);
 }
 
+test "commit: a path-scoped commit skips cross-file coupling" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two managed sources share the same email token.
+    try writeRepo(io, &tmp, "repo/src/.myenv", "email = old@example.com\n");
+    try writeRepo(io, &tmp, "repo/src/.mysigners", "old@example.com signing\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // Seed the coupling graph over both sources.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    const live = try h.liveOf(".myenv");
+    try editLive(io, a, live, "old@example.com", "new@example.com");
+
+    // Scoped to the edited file only: the routed edit lands, but the coupling
+    // pass that would offer to update .mysigners never runs.
+    const res = try h.run(&.{ "mox", "commit", "--yes", live });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, ".mysigners") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 coupled") != null);
+
+    // The scoped edit landed; the coupled source was never touched.
+    try std.testing.expectEqualStrings("email = new@example.com\n", try read(io, a, try h.srcOf(".myenv")));
+    try std.testing.expectEqualStrings("old@example.com signing\n", try read(io, a, try h.srcOf(".mysigners")));
+}
+
 test "commit: an unmanaged path argument exits non-zero reporting not managed, commits nothing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

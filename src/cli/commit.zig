@@ -597,8 +597,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     if (report_mode) {
         // Report the coupling updates a real commit would offer for the routed
         // renames, honoring declines. Nothing is written; each pending update
-        // counts toward the "edits remain" exit code.
-        const coupled = if (line_edits.items.len > 0)
+        // counts toward the "edits remain" exit code. A path-scoped commit
+        // routes only the named files and must not reach out to other sources.
+        const coupled = if (scoped_live == null and line_edits.items.len > 0)
             try reportCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, &protected, ctx.out)
         else
             0;
@@ -621,9 +622,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 
     // F-coupling: a token a routed edit changed may live in other managed
     // sources; offer to update them in the same write pass. Runs after routing
-    // (final edits known) and before any write (abort still writes nothing).
+    // (final edits known) and before any write (abort still writes nothing). A
+    // path-scoped commit routes only the named files and must not reach out to
+    // couple other sources, so the whole pass is skipped when scoped.
     var coupling_edits: []const CouplingEdit = &.{};
-    if (line_edits.items.len > 0) {
+    if (scoped_live == null and line_edits.items.len > 0) {
         const cres = try resolveCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, &protected, ask_mode, input, ctx.out);
         if (cres.abort) aborted = true;
         if (cres.abort_strict) strict_abort = true;
