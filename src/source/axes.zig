@@ -272,6 +272,25 @@ test "ofFile: a .d overlay filename is a value comparison" {
     try std.testing.expectEqualStrings("work", ax.valuesFor("profile")[0].value);
 }
 
+test "ofFile: a .psm1 gated on os=windows is a value comparison" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/AesEncrypt.psm1", "# mox: when os=windows\n" ++
+        "function Protect-String { }\n");
+
+    const src_dir = try srcPathAlloc(a, &tmp);
+    const tree = try source.tree.walk(a, io, src_dir, "/home/me");
+    const ax = try ofFile(a, io, tree.files[0]);
+
+    try std.testing.expect(ax.comparesValueOf("os"));
+    try std.testing.expectEqualStrings("windows", ax.valuesFor("os")[0].value);
+}
+
 test "ofTree: tuple names and directive axes; interpolation-only fact absent" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

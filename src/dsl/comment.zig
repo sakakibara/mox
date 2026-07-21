@@ -87,6 +87,13 @@ pub fn markerForExtension(ident: []const u8) ?[]const u8 {
         .{ .ext = ".scala", .marker = "//" },
         .{ .ext = ".swift", .marker = "//" },
         .{ .ext = ".dart", .marker = "//" },
+        // Windows / PowerShell
+        .{ .ext = ".ps1", .marker = "#" },
+        .{ .ext = ".psm1", .marker = "#" },
+        .{ .ext = ".psd1", .marker = "#" },
+        // Windows batch (`rem`)
+        .{ .ext = ".cmd", .marker = "rem" },
+        .{ .ext = ".bat", .marker = "rem" },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, lower, entry.ext)) return entry.marker;
@@ -146,4 +153,28 @@ test "marker for .clj is ;" {
 
 test "marker for .erl is %" {
     try std.testing.expectEqualStrings("%", markerForExtension(".erl").?);
+}
+
+test "marker for .ps1 is #" {
+    try std.testing.expectEqualStrings("#", markerForExtension(".ps1").?);
+}
+
+test "marker for .psm1 is #" {
+    try std.testing.expectEqualStrings("#", markerForExtension(".psm1").?);
+}
+
+test "marker for .psd1 is #" {
+    try std.testing.expectEqualStrings("#", markerForExtension(".psd1").?);
+}
+
+test "marker for .cmd is rem" {
+    try std.testing.expectEqualStrings("rem", markerForExtension(".cmd").?);
+}
+
+test "marker for .bat is rem" {
+    try std.testing.expectEqualStrings("rem", markerForExtension(".bat").?);
+}
+
+test "marker for .psm1 is case-insensitive" {
+    try std.testing.expectEqualStrings("#", markerForExtension(".PSM1").?);
 }

@@ -353,6 +353,117 @@ test "compose catB: scoped when...end on line 1 gates only its region, keeps tra
     try std.testing.expect(std.mem.indexOf(u8, out.?, "mac-only line") == null);
 }
 
+test "compose catB: .psm1 gated on os=windows composes to nothing under darwin" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/AesEncrypt.psm1", "# mox: when os=windows\n" ++
+        "function Protect-String { }\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    try bindings.put("os", "darwin");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    try std.testing.expect(out == null);
+}
+
+test "compose catB: .psm1 gated on os=windows composes its content under windows" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/AesEncrypt.psm1", "# mox: when os=windows\n" ++
+        "function Protect-String { }\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    try bindings.put("os", "windows");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    try std.testing.expect(out != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "function Protect-String") != null);
+}
+
+test "compose catB: .cmd gated with rem marker composes to nothing under darwin" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/setup.cmd", "rem mox: when os=windows\n" ++
+        "echo hello\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    try bindings.put("os", "darwin");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    try std.testing.expect(out == null);
+}
+
+test "compose catB: .cmd gated with rem marker composes its content under windows" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/setup.cmd", "rem mox: when os=windows\n" ++
+        "echo hello\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    try bindings.put("os", "windows");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    try std.testing.expect(out != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "echo hello") != null);
+}
+
+test "compose catB: .bat gated with rem marker (scoped when...end)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/run.bat", "rem mox: when os=windows\n" ++
+        "windows-only line\n" ++
+        "rem mox: end\n" ++
+        "always present line\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    try bindings.put("os", "linux");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    try std.testing.expect(out != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "always present line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "windows-only line") == null);
+}
+
 test "composeFile: dispatches Cat C for .png" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
