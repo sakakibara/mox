@@ -93,9 +93,10 @@ const ClassCtx = struct {
     input: *Io.Reader,
     ask_mode: prompt.Mode,
     report_mode: bool,
-    /// True only when a prompt actually reads from a terminal (or scripted
-    /// stdin): gates the per-hunk header, which would be noise under `--yes`
-    /// or `--abort-on-prompt` (neither ever shows it).
+    /// True when a prompt would actually read from a terminal (or scripted
+    /// stdin), OR under `--abort-on-prompt` (which prints it right before the
+    /// strict abort). Gates the per-hunk header; `--yes` alone suppresses it
+    /// as noise.
     interactive: bool,
     sty: style.Style,
     /// What the narrowings accepted earlier in this run will create.
@@ -1450,7 +1451,11 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
     var qw: Io.Writer.Allocating = .init(cc.arena);
     try qw.writer.writeAll(notice);
     try writeCandidates(cc.arena, &qw.writer, cands, cc.hostname);
-    try qw.writer.writeAll("  choose> ");
+    try qw.writer.writeAll("  ");
+    try cc.sty.bold(&qw.writer);
+    try qw.writer.writeAll("choose>");
+    try cc.sty.close(&qw.writer);
+    try qw.writer.writeAll(" ");
     const question = try qw.toOwnedSlice();
 
     switch (try prompt.ask(cc.ask_mode, choices.items, 0, question, cc.input, cc.stdout)) {
@@ -1954,14 +1959,15 @@ fn printMiniDiff(sty: style.Style, out: *Io.Writer, hunk: Hunk, a_lines: []const
 }
 
 /// Per-hunk header for an interactive prompt: `<home-rel path>  hunk N/M  ->
-/// <route>`, so the prompt reads without cross-referencing the diff.
+/// <route>` (two spaces before the route), so the prompt reads without
+/// cross-referencing the diff.
 fn printHunkHeader(out: *Io.Writer, sty: style.Style, rel: []const u8, hunk_no: usize, hunk_total: usize, route: []const u8) !void {
     try sty.bold(out);
     try out.print("{s}", .{rel});
     try sty.close(out);
     try out.print("  hunk {d}/{d}  ", .{ hunk_no, hunk_total });
     try sty.dim(out);
-    try out.print("-> {s}", .{route});
+    try out.print("->  {s}", .{route});
     try sty.close(out);
     try out.writeAll("\n");
 }
