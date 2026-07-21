@@ -108,6 +108,12 @@ fn initFresh(ctx: *app.Ctx) !u8 {
         };
     }
 
+    const moxignore_path = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, ".moxignore" });
+    Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = moxignore_path, .data = mox.source.ignore.load.scaffold_moxignore }) catch |e| {
+        try ctx.err.print("mox init: failed to write .moxignore: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+
     try ctx.out.print("Initialized mox repo at {s}\n", .{context.paths.repo_dir});
     try ctx.out.print("State directory: {s}\n", .{context.paths.state_dir});
     try ctx.out.print("Private layer:   {s}\n", .{context.paths.private_dir});

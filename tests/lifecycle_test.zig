@@ -588,6 +588,24 @@ test "init --clone --apply: clones the repo and applies it in one command" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Review the repository") == null);
 }
 
+test "init: scaffolds a starter .moxignore" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Empty repo dir (no create_repo_src) so init builds it fresh.
+    const h = try testutil.setup(a, io, &tmp, .{});
+
+    const r = try h.run(&.{ "mox", "init" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const moxignore_path = try std.fs.path.join(a, &.{ h.repo, ".moxignore" });
+    const body = try read(io, a, moxignore_path);
+    try std.testing.expect(std.mem.indexOf(u8, body, ".credentials.json") != null);
+}
+
 test "uninstall: removes state, preserves private and trash and the source repo" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
