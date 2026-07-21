@@ -359,6 +359,25 @@ test "add-tree: ignore file refuses sensitive paths, adds the rest" {
     try std.testing.expect(!exists(io, try h.srcOf(".claude/projects/p.jsonl")));
 }
 
+test "add: notes a secret-looking file that is not ignored" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.ssh/deploy.pem", "KEY\n");
+    const live = try h.homePath(".ssh/deploy.pem");
+
+    const r = try h.run(&.{ "mox", "add", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "looks like a secret") != null);
+    // It is still added (non-blocking).
+    try std.testing.expect(exists(io, try h.srcOf(".ssh/deploy.pem")));
+}
+
 test "add: refuses an ignored path with a hint; --force overrides" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

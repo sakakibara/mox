@@ -82,6 +82,9 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                     .added => {
                         counts.added += 1;
                         try ctx.out.print("  added {s}\n", .{child});
+                        if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(child))) {
+                            try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{child});
+                        }
                     },
                     .already_managed => counts.skipped += 1,
                     else => counts.skipped += 1,

@@ -172,6 +172,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     switch (result.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s}\n", .{ live_path, result.src_path });
+            if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(live_path))) {
+                try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{live_path});
+            }
             // Rebuild the coupling graph so the new file's tokens can couple
             // with existing sources on the next commit.
             buildInitialCoupling(ctx) catch {};
