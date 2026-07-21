@@ -213,9 +213,12 @@ fn generatorProblems(
     return out.toOwnedSlice(arena);
 }
 
-/// Tracked sources whose home-relative key matches an ignore rule, directly or
-/// via a containing directory: tracked-but-ignored is a contradiction mox
-/// surfaces rather than silently picking a side. Best-effort, like the other
+/// Tracked sources whose home-relative key matches an UNCONDITIONAL ignore
+/// rule (one outside any `# mox: when` region), directly or via a containing
+/// directory: tracked-but-ignored-everywhere is a real contradiction mox
+/// surfaces rather than silently picking a side. A rule gated to other
+/// machines (`# mox: when os=windows`) is intentional per-machine gating, not
+/// a contradiction, so it is excluded here. Best-effort, like the other
 /// checks -- any step that cannot run yields no findings. Arena-owned live paths.
 fn trackedAndIgnored(
     arena: std.mem.Allocator,
@@ -224,10 +227,9 @@ fn trackedAndIgnored(
     context: app.Context,
 ) ![]const []const u8 {
     const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
-    var bindings = mox.machine.bindings.fromMachineState(arena, m_state) catch return &.{};
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
-    const ruleset = mox.source.ignore.load.load(arena, io, context.paths.repo_dir, &bindings, &m_state) catch return &.{};
+    const ruleset = mox.source.ignore.load.loadUnconditional(arena, io, context.paths.repo_dir) catch return &.{};
 
     var out: std.ArrayList([]const u8) = .empty;
     for (tree.files) |file| {

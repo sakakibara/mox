@@ -590,6 +590,26 @@ test "doctor: flags a tracked source that matches an ignore rule" {
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
+test "doctor: a file ignored only under a `when`-gate for another machine is not flagged" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "linux" });
+    try writeRepo(io, &tmp, "repo/src/.config/gh.ps1", "x\n");
+    // Ignored only on darwin -- this machine is pinned to linux, so the rule
+    // does not apply here and gh.ps1 is intentionally per-machine gated, not
+    // a real tracked-vs-ignored contradiction.
+    try writeRepo(io, &tmp, "repo/.moxignore", "# mox: when os=darwin\n.config/gh.ps1\n# mox: end\n");
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "tracked-and-ignored") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
 /// Seed a throwaway git repo at `repo` with a committed working tree so
 /// `mox init --clone` has something to clone. Skips the test if git is
 /// unavailable. The identity is throwaway test scaffolding, not a real repo.

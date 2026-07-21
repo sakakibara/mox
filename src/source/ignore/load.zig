@@ -64,6 +64,54 @@ pub fn load(
     return match.compile(arena, buf.items);
 }
 
+/// Strip a file's `# mox: when ... # mox: end` regions, keeping only lines at
+/// when-depth 0. A tracked when-region marker is dropped along with the
+/// gated lines it brackets; a kept line (including any stray `#`-comment) is
+/// harmless, since `match.compile` treats a `#`-led line as a comment.
+fn stripConditional(arena: std.mem.Allocator, text: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    var depth: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "# mox: when")) {
+            depth += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "# mox: end")) {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (depth == 0) {
+            try buf.appendSlice(arena, line);
+            try buf.append(arena, '\n');
+        }
+    }
+    return buf.toOwnedSlice(arena);
+}
+
+/// Load only the unconditional ignore rules -- those outside any
+/// `# mox: when ... # mox: end` region. Used by `doctor` to flag a file that
+/// is ignored under EVERY configuration (a real contradiction), as opposed to
+/// one ignored only on some machines via axis gating (intentional). Reads the
+/// same two files as `load` but does not compose them: an unconditional rule
+/// is axis-independent, so no bindings/machine state are needed.
+pub fn loadUnconditional(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !match.RuleSet {
+    const namespaced = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "ignore" });
+    const root = try std.fs.path.join(arena, &.{ repo_dir, ".moxignore" });
+
+    var buf: std.ArrayList(u8) = .empty;
+    if (try readOptional(arena, io, namespaced)) |t| {
+        try buf.appendSlice(arena, try stripConditional(arena, t));
+        try buf.append(arena, '\n');
+    }
+    if (try readOptional(arena, io, root)) |t| {
+        try buf.appendSlice(arena, try stripConditional(arena, t));
+        try buf.append(arena, '\n');
+    }
+    return match.compile(arena, buf.items);
+}
+
 pub const scaffold_moxignore: []const u8 =
     \\# mox ignore file (gitignore syntax). Paths are relative to your home dir.
     \\# These keep credentials out of a synced dotfiles repo. Delete any line
@@ -164,6 +212,31 @@ test "load: axis-gated rules resolve for the current machine" {
     const linux = try load(a, io, repo, &linux_bindings, &linux_state);
     try testing.expect(linux.isIgnored("always.txt", false));
     try testing.expect(linux.isIgnored("linux-only", true));
+}
+
+test "loadUnconditional: keeps unconditional rules, drops when-gated ones" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = pathbuf[0..try tmp.dir.realPath(io, &pathbuf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".moxignore", .data =
+        \\always.txt
+        \\# mox: when os=linux
+        \\cond.txt
+        \\# mox: end
+        \\
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const set = try loadUnconditional(a, io, repo);
+    try testing.expect(set.isIgnored("always.txt", false));
+    try testing.expect(!set.isIgnored("cond.txt", false));
 }
 
 test "load: missing files yield an empty (never-ignoring) set" {
