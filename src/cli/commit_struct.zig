@@ -227,7 +227,7 @@ fn walkYaml(
         // and are never matched).
         const key = entryKeyYaml(entry) orelse continue;
         const path = try appendPath(arena, prefix, key);
-        if (mapGetYaml(composed.map, key)) |cv| {
+        if (yaml.Value.mapGet(composed.map, key)) |cv| {
             try diffYamlValue(arena, path, entry.value, cv, out);
         } else {
             try out.append(arena, .{ .path = path, .new = null, .removed = true });
@@ -235,7 +235,7 @@ fn walkYaml(
     }
     for (composed.map) |entry| {
         const key = entryKeyYaml(entry) orelse continue;
-        if (mapGetYaml(live.map, key) != null) continue;
+        if (yaml.Value.mapGet(live.map, key) != null) continue;
         const path = try appendPath(arena, prefix, key);
         try out.append(arena, .{ .path = path, .new = .{ .yaml = entry.value }, .removed = false });
     }
@@ -268,13 +268,6 @@ fn yamlEql(a: yaml.Value, b: yaml.Value) bool {
 
 fn entryKeyYaml(e: yaml.Entry) ?[]const u8 {
     return if (e.key == .string) e.key.string else null;
-}
-
-fn mapGetYaml(entries: []const yaml.Entry, k: []const u8) ?yaml.Value {
-    for (entries) |e| {
-        if (e.key == .string and std.mem.eql(u8, e.key.string, k)) return e.value;
-    }
-    return null;
 }
 
 fn walkIni(
@@ -352,6 +345,13 @@ fn iniSectionEql(a: ini.Section, b: ini.Section) bool {
 /// have already established the two slices are not equal outright, so a
 /// permutation match here means the only difference is element order --
 /// which has no stable per-element identity to express as a key path.
+///
+/// Array-diff policy: a same-length reordering of an array (a permutation)
+/// is `error.Unrepresentable` (ambiguous: reorder vs. element-wise edits).
+/// Any other array difference -- including a mid-insert or a length change
+/// -- is a whole-array replacement (a normal `KeyPathChange` setting the
+/// path to the composed array), which is correct because arrays replace
+/// rather than merge in mox composition.
 fn isPermutation(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -572,6 +572,95 @@ test "yaml diff: whole sequence replacement yields a normal change" {
     try testing.expectEqualStrings("fish", seq[0].string);
 }
 
+test "yaml diff: duplicate composed key resolves to the last-wins value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // `composed` has a literal duplicate `name` key; YAML semantics say the
+    // later occurrence wins. The diff must compare `live` against "bar"
+    // (last-wins), not "foo" (first occurrence).
+    const result = try diffOne(a, .yaml, "name: baz\n", "name: foo\nname: bar\n");
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("name", result[0].path[0]);
+    try testing.expect(!result[0].removed);
+    try testing.expectEqualStrings("bar", result[0].new.?.yaml.string);
+}
+
+test "toml diff: mid-insert array yields a normal change with the full composed array" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = try diffOne(a, .toml, "shells = [\"a\", \"c\"]\n", "shells = [\"a\", \"b\", \"c\"]\n");
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("shells", result[0].path[0]);
+    try testing.expect(!result[0].removed);
+    const arr = result[0].new.?.toml.array;
+    try testing.expectEqual(@as(usize, 3), arr.items.len);
+    try testing.expectEqualStrings("a", arr.items[0].string);
+    try testing.expectEqualStrings("b", arr.items[1].string);
+    try testing.expectEqualStrings("c", arr.items[2].string);
+}
+
+test "toml diff: same-length array permutation is unrepresentable" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = diffOne(a, .toml, "shells = [\"a\", \"b\"]\n", "shells = [\"b\", \"a\"]\n");
+    try testing.expectError(error.Unrepresentable, result);
+}
+
+test "json diff: mid-insert array yields a normal change with the full composed array" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = try diffOne(a, .json, "{\"shells\":[\"a\",\"c\"]}", "{\"shells\":[\"a\",\"b\",\"c\"]}");
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("shells", result[0].path[0]);
+    try testing.expect(!result[0].removed);
+    const arr = result[0].new.?.json.array;
+    try testing.expectEqual(@as(usize, 3), arr.len);
+    try testing.expectEqualStrings("a", arr[0].string);
+    try testing.expectEqualStrings("b", arr[1].string);
+    try testing.expectEqualStrings("c", arr[2].string);
+}
+
+test "json diff: same-length array permutation is unrepresentable" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = diffOne(a, .json, "{\"shells\":[\"a\",\"b\"]}", "{\"shells\":[\"b\",\"a\"]}");
+    try testing.expectError(error.Unrepresentable, result);
+}
+
+test "json diff: added key at top level yields normal change with composed value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = try diffOne(a, .json, "{\"x\":1}", "{\"x\":1,\"y\":2}");
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("y", result[0].path[0]);
+    try testing.expect(!result[0].removed);
+    try testing.expectEqual(@as(i64, 2), result[0].new.?.json.integer);
+}
+
+test "yaml diff: added key at top level yields normal change with composed value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = try diffOne(a, .yaml, "x: 1\n", "x: 1\ny: 2\n");
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("y", result[0].path[0]);
+    try testing.expect(!result[0].removed);
+    try testing.expectEqual(@as(i128, 2), result[0].new.?.yaml.int);
+}
+
 test "ini diff: key change yields one KeyPathChange" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -580,6 +669,18 @@ test "ini diff: key change yields one KeyPathChange" {
     const result = try diffOne(a, .ini, "top=1\n", "top=2\n");
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expectEqualStrings("top", result[0].path[0]);
+    try testing.expect(!result[0].removed);
+    try testing.expectEqualStrings("2", result[0].new.?.ini.string);
+}
+
+test "ini diff: added key at top level yields normal change with composed value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const result = try diffOne(a, .ini, "x=1\n", "x=1\ny=2\n");
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("y", result[0].path[0]);
     try testing.expect(!result[0].removed);
     try testing.expectEqualStrings("2", result[0].new.?.ini.string);
 }
