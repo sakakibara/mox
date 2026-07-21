@@ -4,6 +4,18 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-07-21
+
+### Added
+- The comment DSL now recognizes PowerShell and batch files: `.ps1`, `.psm1`,
+  `.psd1` use a `#` marker and `.cmd`, `.bat` use `rem`, so a `# mox: when` /
+  `rem mox: when` directive gates those files like any other source.
+
+### Fixed
+- `mox doctor` no longer reports a Windows-gated PowerShell module (a `.psm1`
+  gated `# mox: when os=windows`) as "never-materializes". The gate is now
+  parsed, so the module is correctly seen to materialize on Windows.
+
 ## [0.1.5] - 2026-07-21
 
 ### Fixed
