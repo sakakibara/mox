@@ -1,6 +1,7 @@
 //! Public API for the mox CLI module.
 pub const paths = @import("paths.zig");
 pub const tty = @import("tty.zig");
+pub const style = @import("style.zig");
 pub const prompt = @import("prompt.zig");
 pub const init_cmd = @import("init.zig");
 pub const add_cmd = @import("add.zig");
@@ -48,5 +49,6 @@ test {
     _ = init_cmd;
     _ = paths;
     _ = tty;
+    _ = style;
     _ = prompt;
 }
