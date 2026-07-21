@@ -21,6 +21,8 @@ const json = @import("json");
 const yaml = @import("yaml");
 const ini = @import("ini");
 
+const Io = std.Io;
+
 pub const Format = enum { toml, json, yaml, ini, gitconfig };
 
 /// The composed-side value for a `KeyPathChange`, tagged by the format lib
@@ -373,6 +375,218 @@ fn isPermutation(
         return false;
     }
     return true;
+}
+
+const max_layer_bytes: usize = 64 * 1024 * 1024;
+
+/// Apply one key-path change to a single layer's structured source file
+/// (a base or an overlay), writing the result back to `layer_abs`. An
+/// absent `layer_abs` starts from an empty document for `format`.
+///
+/// TOML edits through its lossless `Document` model, so comments and
+/// layout outside the touched key survive unchanged. The other three
+/// formats round-trip through a parsed `Value` tree and re-encode the
+/// whole file -- see the per-format functions below for why.
+pub fn applyToLayer(
+    arena: std.mem.Allocator,
+    io: Io,
+    format: Format,
+    layer_abs: []const u8,
+    change: KeyPathChange,
+) !void {
+    const existing: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, layer_abs, arena, .limited(max_layer_bytes)) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => return e,
+    };
+    const out = switch (format) {
+        .toml => try applyTomlLayer(arena, existing, change),
+        .json => try applyJsonLayer(arena, existing, change),
+        .yaml => try applyYamlLayer(arena, existing, change),
+        .ini, .gitconfig => try applyIniLayer(arena, existing, change, format),
+    };
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_abs, .data = out });
+}
+
+fn applyTomlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    var doc = try toml.Document.parse(arena, existing orelse "", .{});
+    const dotted = try std.mem.join(arena, ".", change.path);
+    if (change.removed) {
+        try doc.remove(dotted);
+    } else {
+        try doc.setValue(dotted, change.new.?.toml);
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    return arena.dupe(u8, aw.written());
+}
+
+/// json-zig's `Document` can only append a leaf to an ALREADY-EXISTING
+/// object -- a missing intermediate container is `error.PathNotFound`, and
+/// there is no way to bootstrap an absent file -- so this round-trips
+/// through a parsed `Value` tree instead: the whole file re-encodes rather
+/// than splicing in place.
+fn applyJsonLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    var root: json.Value = if (existing) |src|
+        try json.parse(arena, src, .{ .dialect = .jsonc })
+    else
+        .{ .object = .empty };
+    if (root != .object) return error.NotAnObject;
+    root = if (change.removed)
+        try jsonRemovePath(arena, root, change.path)
+    else
+        try jsonSetPath(arena, root, change.path, change.new.?.json);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    try json.encode(&aw.writer, root, .{ .indent = 2 });
+    return arena.dupe(u8, aw.written());
+}
+
+fn jsonSetPath(arena: std.mem.Allocator, val: json.Value, path: []const []const u8, new: json.Value) !json.Value {
+    var obj = if (val == .object) val.object else json.ObjectMap.empty;
+    const head = path[0];
+    const child = if (path.len == 1) new else try jsonSetPath(arena, obj.get(head) orelse .{ .object = .empty }, path[1..], new);
+    try obj.put(arena, head, child);
+    return .{ .object = obj };
+}
+
+fn jsonRemovePath(arena: std.mem.Allocator, val: json.Value, path: []const []const u8) !json.Value {
+    if (val != .object) return val;
+    var obj = val.object;
+    const head = path[0];
+    if (path.len == 1) {
+        _ = obj.orderedRemove(head);
+    } else if (obj.get(head)) |child| {
+        try obj.put(arena, head, try jsonRemovePath(arena, child, path[1..]));
+    }
+    return .{ .object = obj };
+}
+
+/// yaml-zig's `Document` refuses a missing intermediate mapping outright,
+/// and can only append to a block mapping that already has at least one
+/// member (deriving the new member's indentation from the last sibling) --
+/// neither holds for a freshly bootstrapped or newly nested key, so this
+/// round-trips through a parsed `Value` tree like JSON.
+fn applyYamlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    var root: yaml.Value = if (existing) |src|
+        try yaml.parse(arena, src, .{})
+    else
+        .{ .map = &.{} };
+    if (root != .map) return error.NotAMapping;
+    root = if (change.removed)
+        try yamlRemovePath(arena, root, change.path)
+    else
+        try yamlSetPath(arena, root, change.path, change.new.?.yaml);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    try yaml.emit(&aw.writer, root, .{});
+    return arena.dupe(u8, aw.written());
+}
+
+fn yamlSetPath(arena: std.mem.Allocator, val: yaml.Value, path: []const []const u8, new: yaml.Value) !yaml.Value {
+    const map = if (val == .map) val.map else &[_]yaml.Entry{};
+    const head = path[0];
+    var out: std.ArrayList(yaml.Entry) = .empty;
+    var found = false;
+    for (map) |e| {
+        if (e.key == .string and std.mem.eql(u8, e.key.string, head)) {
+            found = true;
+            const child = if (path.len == 1) new else try yamlSetPath(arena, e.value, path[1..], new);
+            try out.append(arena, .{ .key = e.key, .value = child });
+        } else {
+            try out.append(arena, e);
+        }
+    }
+    if (!found) {
+        const child = if (path.len == 1) new else try yamlSetPath(arena, .{ .map = &.{} }, path[1..], new);
+        try out.append(arena, .{ .key = .{ .string = head }, .value = child });
+    }
+    return .{ .map = try out.toOwnedSlice(arena) };
+}
+
+/// Drops the leaf entry entirely; a table/section/map left with no entries
+/// after a removal is emitted as an empty container rather than pruned, so
+/// e.g. a `[section]` header a user hand-wrote stays put.
+fn yamlRemovePath(arena: std.mem.Allocator, val: yaml.Value, path: []const []const u8) !yaml.Value {
+    if (val != .map) return val;
+    const head = path[0];
+    var out: std.ArrayList(yaml.Entry) = .empty;
+    for (val.map) |e| {
+        if (e.key == .string and std.mem.eql(u8, e.key.string, head)) {
+            if (path.len == 1) continue;
+            try out.append(arena, .{ .key = e.key, .value = try yamlRemovePath(arena, e.value, path[1..]) });
+        } else {
+            try out.append(arena, e);
+        }
+    }
+    return .{ .map = try out.toOwnedSlice(arena) };
+}
+
+/// ini-zig's `Document` can edit or remove only an ALREADY-PRESENT key --
+/// inserting a new key (any change that adds one, including bootstrapping
+/// an absent file) is `error.PathNotFound` unconditionally -- so this
+/// always round-trips through a parsed `Value` tree and re-encodes.
+fn applyIniLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange, format: Format) ![]const u8 {
+    const dialect: ini.Dialect = if (format == .gitconfig) .gitconfig else .generic;
+    var root: ini.Value = if (existing) |src|
+        try ini.parse(arena, src, .{ .dialect = dialect })
+    else
+        .{ .section = try emptyIniSection(arena) };
+    if (root != .section) return error.NotASection;
+    root = if (change.removed)
+        try iniRemovePath(arena, root, change.path)
+    else
+        try iniSetPath(arena, root, change.path, change.new.?.ini);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    try ini.encode(&aw.writer, root, .{ .dialect = dialect });
+    return arena.dupe(u8, aw.written());
+}
+
+fn emptyIniSection(arena: std.mem.Allocator) !*ini.Section {
+    const s = try arena.create(ini.Section);
+    s.* = .{ .entries = &.{} };
+    return s;
+}
+
+fn iniSetPath(arena: std.mem.Allocator, val: ini.Value, path: []const []const u8, new: ini.Value) !ini.Value {
+    const entries = if (val == .section) val.section.entries else &[_]ini.value.Entry{};
+    const head = path[0];
+    var out: std.ArrayList(ini.value.Entry) = .empty;
+    var found = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.key, head)) {
+            found = true;
+            const child = if (path.len == 1) new else try iniSetPath(arena, e.value, path[1..], new);
+            try out.append(arena, .{ .key = e.key, .value = child });
+        } else {
+            try out.append(arena, e);
+        }
+    }
+    if (!found) {
+        const child = if (path.len == 1) new else try iniSetPath(arena, .{ .section = try emptyIniSection(arena) }, path[1..], new);
+        try out.append(arena, .{ .key = head, .value = child });
+    }
+    const sec = try arena.create(ini.Section);
+    sec.* = .{ .entries = try out.toOwnedSlice(arena) };
+    return .{ .section = sec };
+}
+
+fn iniRemovePath(arena: std.mem.Allocator, val: ini.Value, path: []const []const u8) !ini.Value {
+    if (val != .section) return val;
+    const head = path[0];
+    var out: std.ArrayList(ini.value.Entry) = .empty;
+    for (val.section.entries) |e| {
+        if (std.mem.eql(u8, e.key, head)) {
+            if (path.len == 1) continue;
+            try out.append(arena, .{ .key = e.key, .value = try iniRemovePath(arena, e.value, path[1..]) });
+        } else {
+            try out.append(arena, e);
+        }
+    }
+    const sec = try arena.create(ini.Section);
+    sec.* = .{ .entries = try out.toOwnedSlice(arena) };
+    return .{ .section = sec };
 }
 
 // ---- tests ----
@@ -736,4 +950,379 @@ test "gitconfig diff: whole multi-value replacement yields the nested path" {
     try testing.expectEqual(@as(usize, 2), list.len);
     try testing.expectEqualStrings("refs/c", list[0]);
     try testing.expectEqualStrings("refs/d", list[1]);
+}
+
+// ---- applyToLayer tests ----
+
+fn layerPath(a: std.mem.Allocator, io: Io, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    return std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, name });
+}
+
+test "applyToLayer: toml scalar change on an existing base sets the key and keeps a comment" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "# keep me\nname = \"foo\"\nversion = 1\n" });
+
+    try applyToLayer(a, io, .toml, path, .{
+        .path = &.{"version"},
+        .new = .{ .toml = .{ .integer = 2 } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    try testing.expect(std.mem.indexOf(u8, out, "# keep me") != null);
+    const reparsed = try toml.parse(a, out, .{});
+    try testing.expectEqual(@as(i64, 2), reparsed.table.get("version").?.integer);
+    try testing.expectEqualStrings("foo", reparsed.table.get("name").?.string);
+}
+
+test "applyToLayer: toml nested path creates the nested key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "top = 1\n" });
+
+    try applyToLayer(a, io, .toml, path, .{
+        .path = &.{ "user", "name" },
+        .new = .{ .toml = .{ .string = "bar" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try toml.parse(a, out, .{});
+    try testing.expectEqualStrings("bar", reparsed.table.get("user").?.table.get("name").?.string);
+}
+
+test "applyToLayer: toml removed=true deletes the leaf key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "name = \"foo\"\nversion = 1\n" });
+
+    try applyToLayer(a, io, .toml, path, .{ .path = &.{"version"}, .new = null, .removed = true });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try toml.parse(a, out, .{});
+    try testing.expect(reparsed.table.get("version") == null);
+    try testing.expectEqualStrings("foo", reparsed.table.get("name").?.string);
+}
+
+test "applyToLayer: toml absent layer file is created with just that key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "overlay.toml");
+
+    try applyToLayer(a, io, .toml, path, .{
+        .path = &.{"x"},
+        .new = .{ .toml = .{ .integer = 1 } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try toml.parse(a, out, .{});
+    try testing.expectEqual(@as(i64, 1), reparsed.table.get("x").?.integer);
+}
+
+test "applyToLayer: json scalar change on an existing base sets the key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"name\":\"foo\",\"version\":1}" });
+
+    try applyToLayer(a, io, .json, path, .{
+        .path = &.{"version"},
+        .new = .{ .json = .{ .integer = 2 } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try json.parse(a, out, .{ .dialect = .jsonc });
+    try testing.expectEqual(@as(i128, 2), reparsed.object.get("version").?.integer);
+    try testing.expectEqualStrings("foo", reparsed.object.get("name").?.string);
+}
+
+test "applyToLayer: json nested path creates the nested key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"top\":1}" });
+
+    try applyToLayer(a, io, .json, path, .{
+        .path = &.{ "user", "name" },
+        .new = .{ .json = .{ .string = "bar" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try json.parse(a, out, .{ .dialect = .jsonc });
+    try testing.expectEqualStrings("bar", reparsed.object.get("user").?.object.get("name").?.string);
+}
+
+test "applyToLayer: json removed=true deletes the leaf key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"name\":\"foo\",\"version\":1}" });
+
+    try applyToLayer(a, io, .json, path, .{ .path = &.{"version"}, .new = null, .removed = true });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try json.parse(a, out, .{ .dialect = .jsonc });
+    try testing.expect(reparsed.object.get("version") == null);
+    try testing.expectEqualStrings("foo", reparsed.object.get("name").?.string);
+}
+
+test "applyToLayer: json absent layer file is created with just that key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "overlay.json");
+
+    try applyToLayer(a, io, .json, path, .{
+        .path = &.{"x"},
+        .new = .{ .json = .{ .integer = 1 } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try json.parse(a, out, .{ .dialect = .jsonc });
+    try testing.expectEqual(@as(i128, 1), reparsed.object.get("x").?.integer);
+}
+
+test "applyToLayer: yaml scalar change on an existing base sets the key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.yaml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "name: foo\nversion: 1\n" });
+
+    try applyToLayer(a, io, .yaml, path, .{
+        .path = &.{"version"},
+        .new = .{ .yaml = .{ .int = 2 } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try yaml.parse(a, out, .{});
+    try testing.expectEqual(@as(i128, 2), yaml.Value.mapGet(reparsed.map, "version").?.int);
+    try testing.expectEqualStrings("foo", yaml.Value.mapGet(reparsed.map, "name").?.string);
+}
+
+test "applyToLayer: yaml nested path creates the nested key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.yaml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "top: 1\n" });
+
+    try applyToLayer(a, io, .yaml, path, .{
+        .path = &.{ "user", "name" },
+        .new = .{ .yaml = .{ .string = "bar" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try yaml.parse(a, out, .{});
+    const user = yaml.Value.mapGet(reparsed.map, "user").?;
+    try testing.expectEqualStrings("bar", yaml.Value.mapGet(user.map, "name").?.string);
+}
+
+test "applyToLayer: yaml removed=true deletes the leaf key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.yaml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "name: foo\nversion: 1\n" });
+
+    try applyToLayer(a, io, .yaml, path, .{ .path = &.{"version"}, .new = null, .removed = true });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try yaml.parse(a, out, .{});
+    try testing.expect(yaml.Value.mapGet(reparsed.map, "version") == null);
+    try testing.expectEqualStrings("foo", yaml.Value.mapGet(reparsed.map, "name").?.string);
+}
+
+test "applyToLayer: yaml absent layer file is created with just that key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "overlay.yaml");
+
+    try applyToLayer(a, io, .yaml, path, .{
+        .path = &.{"x"},
+        .new = .{ .yaml = .{ .int = 1 } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try yaml.parse(a, out, .{});
+    try testing.expectEqual(@as(i128, 1), yaml.Value.mapGet(reparsed.map, "x").?.int);
+}
+
+test "applyToLayer: ini scalar change on an existing base sets the key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "name=foo\nversion=1\n" });
+
+    try applyToLayer(a, io, .ini, path, .{
+        .path = &.{"version"},
+        .new = .{ .ini = .{ .string = "2" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .generic });
+    try testing.expectEqualStrings("2", reparsed.section.findValue("version").?.string);
+    try testing.expectEqualStrings("foo", reparsed.section.findValue("name").?.string);
+}
+
+test "applyToLayer: ini nested path creates the nested section and key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "top=1\n" });
+
+    try applyToLayer(a, io, .ini, path, .{
+        .path = &.{ "user", "name" },
+        .new = .{ .ini = .{ .string = "bar" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .generic });
+    const user = reparsed.section.findValue("user").?;
+    try testing.expectEqualStrings("bar", user.section.findValue("name").?.string);
+}
+
+test "applyToLayer: ini removed=true deletes the leaf key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "name=foo\nversion=1\n" });
+
+    try applyToLayer(a, io, .ini, path, .{ .path = &.{"version"}, .new = null, .removed = true });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .generic });
+    try testing.expect(reparsed.section.findValue("version") == null);
+    try testing.expectEqualStrings("foo", reparsed.section.findValue("name").?.string);
+}
+
+test "applyToLayer: ini absent layer file is created with just that key" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "overlay.ini");
+
+    try applyToLayer(a, io, .ini, path, .{
+        .path = &.{"x"},
+        .new = .{ .ini = .{ .string = "1" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .generic });
+    try testing.expectEqualStrings("1", reparsed.section.findValue("x").?.string);
+}
+
+test "applyToLayer: gitconfig nested subsection change sets the key under the gitconfig dialect" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, ".gitconfig");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[user]\n\tname = foo\n" });
+
+    try applyToLayer(a, io, .gitconfig, path, .{
+        .path = &.{ "remote", "origin", "url" },
+        .new = .{ .ini = .{ .string = "git@example.com:x/y.git" } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .gitconfig });
+    const remote = reparsed.section.findValue("remote").?;
+    const origin = remote.section.findValue("origin").?;
+    try testing.expectEqualStrings("git@example.com:x/y.git", origin.section.findValue("url").?.string);
+    try testing.expectEqualStrings("foo", reparsed.section.findValue("user").?.section.findValue("name").?.string);
 }
