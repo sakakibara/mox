@@ -19,6 +19,19 @@ pub const RuleSet = struct {
         }
         return ignored;
     }
+
+    /// True if `rel` (home-relative, '/'-separated, no leading '/') is ignored
+    /// directly, or by virtue of any ancestor directory matching a rule.
+    /// `leaf_is_dir` is the kind of the leaf itself.
+    pub fn isPathIgnored(self: RuleSet, rel: []const u8, leaf_is_dir: bool) bool {
+        if (self.isIgnored(rel, leaf_is_dir)) return true;
+        var i: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, rel, i, '/')) |slash| {
+            if (self.isIgnored(rel[0..slash], true)) return true;
+            i = slash + 1;
+        }
+        return false;
+    }
 };
 
 /// Parse `text` (newline-separated) into rules. Blank lines and lines whose
@@ -262,4 +275,39 @@ test "match: question mark and char class" {
     const a = s.allocator();
     try testing.expect(try ig(a, "*.pe?", "key.pem", false));
     try testing.expect(try ig(a, "id_[re]sa", "id_rsa", false));
+}
+
+test "isPathIgnored: leaf-file rule matches directly" {
+    var s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer s.deinit();
+    const a = s.allocator();
+    const set = try compile(a, ".claude/.credentials.json\n");
+    try testing.expect(set.isPathIgnored(".claude/.credentials.json", false));
+}
+
+test "isPathIgnored: a dir-only ancestor rule matches a leaf checked in isolation" {
+    var s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer s.deinit();
+    const a = s.allocator();
+    const set = try compile(a, "foo/\n");
+    // isIgnored alone misses this: dir_only is skipped when is_dir is false.
+    try testing.expect(!set.isIgnored("foo/bar", false));
+    try testing.expect(set.isPathIgnored("foo/bar", false));
+}
+
+test "isPathIgnored: a top-level file with no ancestors is unaffected by the walk" {
+    var s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer s.deinit();
+    const a = s.allocator();
+    const set = try compile(a, "*.jsonl\n");
+    try testing.expect(set.isPathIgnored("x.jsonl", false));
+    try testing.expect(!set.isPathIgnored("x.txt", false));
+}
+
+test "isPathIgnored: a directory leaf is matched directly, not just via ancestor walk" {
+    var s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer s.deinit();
+    const a = s.allocator();
+    const set = try compile(a, "projects/\n");
+    try testing.expect(set.isPathIgnored(".claude/projects", true));
 }

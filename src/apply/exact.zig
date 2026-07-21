@@ -103,10 +103,10 @@ fn enforceOne(
         if (isManagedChild(dir_live, e.name, managed_live)) continue;
         const live_path = try std.fs.path.join(arena, &.{ dir_live, e.name });
         const rel = try source_path.liveKeyRelToHome(arena, home, live_path);
-        if (ruleset.isIgnored(rel, e.kind == .directory)) continue; // ignored live entries are not mox's to prune
+        if (ruleset.isPathIgnored(rel, e.kind == .directory)) continue; // ignored live entries are not mox's to prune
         switch (e.kind) {
             .file => try sweepFile(arena, io, live_path, opts, stdout, stderr, result),
-            .directory => try sweepDir(arena, io, live_path, opts, stdout, stderr, result),
+            .directory => try sweepDir(arena, io, live_path, opts, stdout, stderr, result, ruleset, home),
             else => try sweepOther(io, live_path, opts, stdout, stderr, result),
         }
     }
@@ -168,11 +168,23 @@ fn sweepDir(
     stdout: *Io.Writer,
     stderr: *Io.Writer,
     result: *Result,
+    ruleset: *const ignore_match.RuleSet,
+    home: []const u8,
 ) !void {
     // A foreign directory is always "unknown"; removing it needs --force.
     if (!opts.force) {
         result.refused += 1;
         try stderr.print("  UNMANAGED {s}/ (exact dir; --force to remove)\n", .{live_path});
+        return;
+    }
+    // The whole-directory exemption above only covers a foreign dir whose OWN
+    // path is ignored. A non-ignored foreign dir may still harbor an ignored
+    // descendant several levels down; the guarantee that mox never deletes an
+    // ignored file is absolute, so the entire subtree is refused rather than
+    // deleted around it.
+    if (try subtreeHasIgnored(arena, io, live_path, home, ruleset, 0)) {
+        result.refused += 1;
+        try stderr.print("  UNMANAGED {s}/ contains ignored entries; not removed\n", .{live_path});
         return;
     }
     if (opts.dry_run) {
@@ -215,6 +227,29 @@ fn sweepOther(
     try Io.Dir.cwd().deleteFile(io, live_path);
     result.removed += 1;
     try stdout.print("  removed {s} (unmanaged, exact dir)\n", .{live_path});
+}
+
+/// True if any entry under `dir_live`, at any depth, is ignored per `ruleset`
+/// (checked home-relative, by its own kind). An unreadable or un-openable
+/// subdirectory is treated as containing nothing further to check, not as
+/// ignored -- it is caught separately by the unsnapshottable-refusal path.
+fn subtreeHasIgnored(arena: std.mem.Allocator, io: Io, dir_live: []const u8, home: []const u8, ruleset: *const ignore_match.RuleSet, depth: usize) !bool {
+    if (depth >= max_depth) return false;
+    var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    defer dir.close(io);
+
+    var entries: std.ArrayList(Entry) = .empty;
+    var iter = dir.iterate();
+    while (try iter.next(io)) |e| {
+        try entries.append(arena, .{ .name = try arena.dupe(u8, e.name), .kind = e.kind });
+    }
+    for (entries.items) |e| {
+        const child = try std.fs.path.join(arena, &.{ dir_live, e.name });
+        const rel = try source_path.liveKeyRelToHome(arena, home, child);
+        if (ruleset.isPathIgnored(rel, e.kind == .directory)) return true;
+        if (e.kind == .directory and try subtreeHasIgnored(arena, io, child, home, ruleset, depth + 1)) return true;
+    }
+    return false;
 }
 
 /// Snapshot every file under `dir_live`. Returns true only when the whole

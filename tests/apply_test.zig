@@ -741,6 +741,98 @@ test "apply: exact prune leaves an ignored live file alone" {
     try std.testing.expectEqualStrings("SECRET\n", try read(io, a, secret));
 }
 
+test "apply: --force exact sweep leaves an ignored direct-child file alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.claude");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/.mox-exact", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/CLAUDE.md", .data = "rules\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = ".claude/.credentials.json\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    // A live secret sitting in the exact dir, never applied by mox.
+    const secret = try c.homePath(".claude/.credentials.json");
+    if (std.fs.path.dirname(secret)) |d| try Io.Dir.cwd().createDirPath(io, d);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
+
+    // --force would remove any other unmanaged file in this exact dir; the
+    // ignored one must survive the actual deletion path, not just be refused.
+    const r = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, secret));
+    try std.testing.expectEqualStrings("SECRET\n", try read(io, a, secret));
+}
+
+test "apply: exact prune leaves an entry ignored only via a dir-only ancestor rule alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The exact dir is nested under `.claude`, which is dir-only ignored. A
+    // dir-only rule never matches a leaf checked in isolation (is_dir=false),
+    // so this only survives via the ancestor walk in isPathIgnored.
+    try tmp.dir.createDirPath(io, "repo/src/.claude/plugins");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/plugins/.mox-exact", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/plugins/marketplace.json", .data = "{}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = ".claude/\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    // An untracked, never-applied file directly inside the exact dir.
+    const token = try c.homePath(".claude/plugins/token");
+    if (std.fs.path.dirname(token)) |d| try Io.Dir.cwd().createDirPath(io, d);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = token, .data = "TOKEN\n" });
+
+    const r = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, token));
+    try std.testing.expectEqualStrings("TOKEN\n", try read(io, a, token));
+}
+
+test "apply: --force exact sweep refuses a foreign subdir harboring a nested ignored file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.claude");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/.mox-exact", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/CLAUDE.md", .data = "rules\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = "secret.txt\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    // A foreign, non-ignored subdir with an innocuous file and a nested
+    // ignored file two levels down -- neither the subdir itself nor its
+    // direct children match the rule; only the deep descendant does.
+    const oldtool_dir = try c.homePath(".claude/oldtool");
+    const nested_dir = try c.homePath(".claude/oldtool/sub");
+    try Io.Dir.cwd().createDirPath(io, nested_dir);
+    const readme = try c.homePath(".claude/oldtool/readme.txt");
+    const secret = try c.homePath(".claude/oldtool/sub/secret.txt");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = readme, .data = "notes\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
+
+    // --force would otherwise remove the whole foreign subtree; the buried
+    // ignored file must block the removal of the ENTIRE directory.
+    const r = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(exists(io, oldtool_dir));
+    try std.testing.expect(exists(io, readme));
+    try std.testing.expect(exists(io, secret));
+    try std.testing.expectEqualStrings("SECRET\n", try read(io, a, secret));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UNMANAGED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ignored") != null);
+}
+
 test "facts set: a value with a control character is refused, facts file uncorrupted" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -131,7 +131,7 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never composed or written.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
-        if (isPathIgnored(&ruleset, rel)) {
+        if (ruleset.isPathIgnored(rel, false)) {
             try ctx.out.print("  skipping {s} (ignored)\n", .{file.live_path});
             continue;
         }
@@ -657,21 +657,6 @@ fn currentMode(io: std.Io, live_path: []const u8) ?u32 {
     if (!std.Io.File.Permissions.has_executable_bit) return null;
     const st = std.Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch return null;
     return @intCast(st.permissions.toMode() & 0o777);
-}
-
-/// True when `rel` itself, or any directory containing it, matches an ignore
-/// rule. `RuleSet.isIgnored` tests one path at its own kind, so a directory-
-/// only rule (`foo/`) never fires against a leaf checked with `is_dir=false`;
-/// every ancestor component is checked too, mirroring what a top-down live
-/// walk would prune before ever reaching this leaf.
-fn isPathIgnored(ruleset: *const mox.source.ignore.match.RuleSet, rel: []const u8) bool {
-    if (ruleset.isIgnored(rel, false)) return true;
-    var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, rel, i, '/')) |slash| {
-        if (ruleset.isIgnored(rel[0..slash], true)) return true;
-        i = slash + 1;
-    }
-    return false;
 }
 
 /// True when `live_path` is itself a symlink (no-follow). chmod follows links,
