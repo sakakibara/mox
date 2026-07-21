@@ -162,7 +162,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             st.kind == .directory
         else |_|
             false;
-        if (ruleset.isIgnored(rel, is_dir)) {
+        if (ruleset.isPathIgnored(rel, is_dir)) {
             try ctx.err.print("mox add: {s} matches an ignore rule; use --force to add it anyway\n", .{rel});
             return 1;
         }

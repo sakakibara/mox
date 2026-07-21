@@ -1514,6 +1514,28 @@ test "apply generator: writes one file per row; the generator's own path is not 
     try std.testing.expect(!exists(io, try c.homePath(".config/gen.inc")));
 }
 
+test "apply generator: a rendered output matching an ignore rule is skipped, not written" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two rows: "a" renders to id-a.inc (kept), "b" renders to id-b.inc, which
+    // an ignore rule targets directly -- the generator must honor it same as
+    // any other tracked source, not shield it from pruning via the keep-set.
+    try writeGenFixture(io, &tmp, &.{ "a", "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = "id-b.inc\n" });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("key=a\n", try read(io, a, try c.homePath(".config/id-a.inc")));
+    try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipping") != null);
+}
+
 test "apply generator prune: dropping a row removes its file (snapshotted), others intact, unrelated file untouched" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -401,6 +401,32 @@ test "add: refuses an ignored path with a hint; --force overrides" {
     try std.testing.expect(exists(io, try h.srcOf(".ssh/id_rsa")));
 }
 
+test "add: refuses a path under a dir-only ignored ancestor; --force overrides" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.claude/projects/session.jsonl", "{}\n");
+    // A dir-only rule: isIgnored alone would miss a leaf checked in isolation
+    // (dir_only is skipped when is_dir is false), so this only refuses via the
+    // ancestor-aware isPathIgnored.
+    try writeRepo(io, &tmp, "repo/.moxignore", ".claude/projects/\n");
+    const live = try h.homePath(".claude/projects/session.jsonl");
+
+    const refused = try h.run(&.{ "mox", "add", live });
+    try std.testing.expectEqual(@as(u8, 1), refused.rc);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "matches an ignore rule") != null);
+    try std.testing.expect(!exists(io, try h.srcOf(".claude/projects/session.jsonl")));
+
+    const forced = try h.run(&.{ "mox", "add", live, "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expect(exists(io, try h.srcOf(".claude/projects/session.jsonl")));
+}
+
 /// Overwrite every regular file in `dir_abs` with `garbage`.
 fn corruptAll(io: Io, a: std.mem.Allocator, dir_abs: []const u8, garbage: []const u8) !void {
     var dir = try Io.Dir.cwd().openDir(io, dir_abs, .{ .iterate = true });

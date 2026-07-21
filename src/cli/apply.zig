@@ -126,7 +126,7 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are
         // deferred to a second pass against the global keep set below.
-        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &counts, &snapshotted, &produced, &regular_live, &gen_states)) continue;
+        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home)) continue;
 
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never composed or written.
@@ -316,7 +316,7 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
             ctx.out,
             ctx.err,
             &ruleset,
-            home,
+            context.paths.home,
         );
         if (exact_result.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += exact_result.refused;
@@ -493,7 +493,9 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
 /// is a normal managed file (the caller composes it the usual way). Returns
 /// true after fanning out: each produced output is written through
 /// `applyRegularFile` and the generator's state is recorded in `gen_states` for
-/// the deferred prune/manifest pass. A rendered path colliding with a regular
+/// the deferred prune/manifest pass. An output whose rendered path matches an
+/// ignore rule is skipped individually (not written, not kept) while its
+/// siblings still materialize. A rendered path colliding with a regular
 /// managed target or another generator's output, escaping the target dir via a
 /// symlinked parent, or a compose failure, fails that generator whole (it
 /// produces nothing, prunes nothing, and its prior leaves stay protected).
@@ -511,6 +513,8 @@ fn applyGenerator(
     produced: *std.StringHashMap(void),
     regular_live: *std.StringHashMap(void),
     gen_states: *std.ArrayList(GenState),
+    ruleset: *const mox.source.ignore.match.RuleSet,
+    home: []const u8,
 ) !bool {
     var diag: mox.compose.interp.Diag = .{};
     const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, m_state, secrets, &diag) catch |e| {
@@ -551,6 +555,14 @@ fn applyGenerator(
     // Current produced set for the manifest + global keep-set.
     var current: std.ArrayList([]const u8) = .empty;
     for (outputs) |o| {
+        // A generated output whose rendered path matches an ignore rule (itself
+        // or a containing directory) is outside mox's management, same as any
+        // other source: never written, never added to the keep set.
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, o.live_path);
+        if (ruleset.isPathIgnored(rel, false)) {
+            try ctx.out.print("  skipping {s} (ignored)\n", .{o.live_path});
+            continue;
+        }
         try current.append(ctx.alloc, o.live_path);
         try produced.put(o.live_path, {});
         try applyRegularFile(ctx, .{
