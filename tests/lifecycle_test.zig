@@ -105,6 +105,22 @@ test "diff: a drifted file shows its hunk, a clean file shows nothing" {
     try std.testing.expect(std.mem.indexOf(u8, stat.out, "+1 -1") != null);
 }
 
+test "status: an ignored tracked file is not reported" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/oldtool/conf", "x\n");
+    try writeRepo(io, &tmp, "repo/.moxignore", ".config/oldtool/\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "oldtool") == null);
+}
+
 test "edit: base name launches $EDITOR on the source; unmanaged errors with a candidate" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -508,6 +524,25 @@ test "doctor --fix rebuilds malformed provenance for tracked files" {
     const after = try h.run(&.{ "mox", "doctor" });
     try std.testing.expectEqual(@as(u8, 0), after.rc);
     try std.testing.expect(std.mem.indexOf(u8, after.out, "bad-provenance") == null);
+}
+
+test "doctor: flags a tracked source that matches an ignore rule" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/oldtool/conf", "x\n");
+    try writeRepo(io, &tmp, "repo/.moxignore", ".config/oldtool/\n");
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "oldtool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "ignore") != null);
+    // An advisory is never a rebuild-gating problem, so the rc stays 0.
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
 /// Seed a throwaway git repo at `repo` with a committed working tree so

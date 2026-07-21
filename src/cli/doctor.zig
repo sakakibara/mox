@@ -102,6 +102,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  generator {s}\n", .{msg});
     }
 
+    // Tracked sources that also match an ignore rule: a contradiction the user
+    // should resolve, since the source is tracked but will never be applied.
+    for (try trackedAndIgnored(ctx.alloc, ctx.io, src_dir, context)) |p| {
+        advisories += 1;
+        try ctx.out.print("  tracked-and-ignored {s} (matches an ignore rule; it will not be applied -- remove one)\n", .{p});
+    }
+
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
     var problems = bad_prov.len;
@@ -202,6 +209,29 @@ fn generatorProblems(
             },
             else => continue,
         };
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Tracked sources whose home-relative key matches an ignore rule, directly or
+/// via a containing directory: tracked-but-ignored is a contradiction mox
+/// surfaces rather than silently picking a side. Best-effort, like the other
+/// checks -- any step that cannot run yields no findings. Arena-owned live paths.
+fn trackedAndIgnored(
+    arena: std.mem.Allocator,
+    io: Io,
+    src_dir: []const u8,
+    context: app.Context,
+) ![]const []const u8 {
+    const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
+    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
+    const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
+    const ruleset = mox.source.ignore.load.load(arena, io, context.paths.repo_dir) catch return &.{};
+
+    var out: std.ArrayList([]const u8) = .empty;
+    for (tree.files) |file| {
+        const rel = try mox.source.path.liveKeyRelToHome(arena, m_state.home, file.live_path);
+        if (ruleset.isPathIgnored(rel, false)) try out.append(arena, file.live_path);
     }
     return out.toOwnedSlice(arena);
 }

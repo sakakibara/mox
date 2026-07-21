@@ -39,8 +39,15 @@ fn run(ctx: *app.Ctx, _: cli.args.Args(Spec)) anyerror!u8 {
     };
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 
+    const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const home = m_state.home;
+
     var problems: usize = 0;
     for (tree.files) |file| {
+        // A tracked source matching an ignore rule (itself or a containing
+        // directory) is never applied, so status has nothing to report for it.
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
+        if (ruleset.isPathIgnored(rel, false)) continue;
         // A GENERATOR: report each file in its current produced set with its
         // own clean/OUTDATED/DRIFT/MISSING state, one line per produced path.
         {

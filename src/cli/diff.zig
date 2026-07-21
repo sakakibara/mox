@@ -125,10 +125,17 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     };
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 
+    const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const home = m_state.home;
+
     var total: Stat = .{};
     var changed: usize = 0;
 
     for (tree.files) |file| {
+        // A tracked source matching an ignore rule (itself or a containing
+        // directory) is never applied, so diff has nothing to compare it against.
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
+        if (ruleset.isPathIgnored(rel, false)) continue;
         // Seed-once and symlink files carry no line-level composed content to
         // diff (user-owned after first write / target-only respectively).
         if (file.create_once or file.is_symlink) continue;
