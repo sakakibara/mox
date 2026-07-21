@@ -35,6 +35,7 @@ const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const prompt = @import("prompt.zig");
 const scope = @import("scope.zig");
+const style = @import("style.zig");
 const mox = @import("../root.zig");
 
 const Io = std.Io;
@@ -92,6 +93,11 @@ const ClassCtx = struct {
     input: *Io.Reader,
     ask_mode: prompt.Mode,
     report_mode: bool,
+    /// True only when a prompt actually reads from a terminal (or scripted
+    /// stdin): gates the per-hunk header, which would be noise under `--yes`
+    /// or `--abort-on-prompt` (neither ever shows it).
+    interactive: bool,
+    sty: style.Style,
     /// What the narrowings accepted earlier in this run will create.
     claims: *Claims,
 };
@@ -185,9 +191,9 @@ const Decision = union(enum) {
 /// Per-hunk routing prompt choices; index 0 (yes) is the default and index 2
 /// (manual) downgrades the hunk. `q` aborts, handled by the prompt module.
 const ynm_choices = [_]prompt.Choice{
-    .{ .key = "y", .label = "yes" },
-    .{ .key = "n", .label = "no" },
-    .{ .key = "m", .label = "manual" },
+    .{ .key = "y", .label = "yes", .help = "route this edit into its source" },
+    .{ .key = "n", .label = "no", .help = "skip -- leave the drift" },
+    .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
 };
 
 /// F-coupling prompt: `y` updates the other consumer, `d` declines this
@@ -216,6 +222,7 @@ const Spec = struct {
     dry_run: cli.spec.Flag(.{ .help = "report only, exit 1 if edits remain" }),
     yes: cli.spec.Flag(.{ .help = "take defaults without prompting" }),
     abort_on_prompt: cli.spec.Flag(.{ .help = "strict CI: rc 2 on the first prompt" }),
+    color: cli.spec.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -245,6 +252,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const dry_run = a.dry_run;
     const yes = a.yes;
+    const sty = style.Style{ .on = style.enabled(
+        tty.isInteractive(1),
+        context.env.get(ctx.alloc, "NO_COLOR") != null,
+        a.color orelse .auto,
+    ) };
 
     const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
     defer lk.release();
@@ -318,6 +330,8 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         .input = input,
         .ask_mode = ask_mode,
         .report_mode = report_mode,
+        .interactive = interactive,
+        .sty = sty,
         .claims = &claims,
     };
 
@@ -419,7 +433,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
 
-        for (hunks) |hunk| {
+        for (hunks, 0..) |hunk, hi| {
             const route = try routeHunk(ctx.alloc, ctx.io, prov.segments, hunk, file, a_lines, b_lines);
             switch (route) {
                 .manual => |reason| {
@@ -435,7 +449,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
                     // belongs; everything else keeps the origin behind a plain
                     // [Y/n/m] confirm (bootstrap / axis-specific / private).
                     if (r.shared and space.configs.len > 1) {
-                        switch (try classifyLine(&cc, file, r.edit, r.desc, space)) {
+                        switch (try classifyLine(&cc, file, r.edit, r.desc, space, hi + 1, hunks.len)) {
                             .abort => {
                                 aborted = true;
                                 break :files;
@@ -486,16 +500,17 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
                     if (report_mode) {
                         pending = true;
                         try ctx.out.print("  would edit {s}\n", .{r.desc});
-                        try printMiniDiff(ctx.out, hunk, a_lines, b_lines);
+                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
                         // Collected so report mode can also surface coupling
                         // divergences; never written (report mode returns
                         // before the write phase).
                         try line_edits.append(ctx.alloc, r.edit);
                         try line_owners.append(ctx.alloc, fidx);
                     } else if (interactive) {
-                        try ctx.out.print("  edit {s}\n", .{r.desc});
-                        try printMiniDiff(ctx.out, hunk, a_lines, b_lines);
-                        switch (try prompt.ask(ask_mode, &ynm_choices, 0, "  [Y/n/m/q] ", input, ctx.out)) {
+                        try printHunkHeader(ctx.out, sty, try mox.source.path.liveKeyRelToHome(ctx.alloc, m_state.home, file.live_path), hi + 1, hunks.len, try routeLabel(ctx.alloc, route, file));
+                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
+                        const legend_line = try legend(ctx.alloc, &ynm_choices, 0, sty);
+                        switch (try prompt.ask(ask_mode, &ynm_choices, 0, legend_line, input, ctx.out)) {
                             .chosen => |i| switch (i) {
                                 0 => accept = true,
                                 1 => declined_hunks[fidx] += 1,
@@ -538,11 +553,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
                     if (report_mode) {
                         pending = true;
                         try ctx.out.print("  would update {s}\n", .{r.desc});
-                        try printMiniDiff(ctx.out, hunk, a_lines, b_lines);
+                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
                     } else if (interactive) {
-                        try ctx.out.print("  update {s}\n", .{r.desc});
-                        try printMiniDiff(ctx.out, hunk, a_lines, b_lines);
-                        switch (try prompt.ask(ask_mode, &ynm_choices, 0, "  [Y/n/m/q] ", input, ctx.out)) {
+                        try printHunkHeader(ctx.out, sty, try mox.source.path.liveKeyRelToHome(ctx.alloc, m_state.home, file.live_path), hi + 1, hunks.len, try routeLabel(ctx.alloc, route, file));
+                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
+                        const legend_line = try legend(ctx.alloc, &ynm_choices, 0, sty);
+                        switch (try prompt.ask(ask_mode, &ynm_choices, 0, legend_line, input, ctx.out)) {
                             .chosen => |i| switch (i) {
                                 0 => accept = true,
                                 1 => declined_hunks[fidx] += 1,
@@ -910,12 +926,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     }
     if (skipped_secret > 0) {
         try ctx.out.print(
-            "\nmox commit: {d} committed, {d} coupled, {d} manual, {d} skipped\n",
+            "\nmox commit: {d} routed, {d} coupled, {d} manual, {d} skipped\n",
             .{ committed_count, coupled_count, manual_count, skipped_secret },
         );
     } else {
         try ctx.out.print(
-            "\nmox commit: {d} committed, {d} coupled, {d} manual\n",
+            "\nmox commit: {d} routed, {d} coupled, {d} manual\n",
             .{ committed_count, coupled_count, manual_count },
         );
     }
@@ -1403,7 +1419,7 @@ fn findByLive(tree: mox.source.tree.ManagedTree, live_path: []const u8) ?mox.sou
 /// Impact analysis still runs, but for INFORMATION and for verification: the
 /// notice names what else the edit reaches, and the labels a choice is allowed
 /// to change seed the post-write guard.
-fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: LineEdit, desc: []const u8, space: FileSpace) !Decision {
+fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: LineEdit, desc: []const u8, space: FileSpace, hunk_no: usize, hunk_total: usize) !Decision {
     const imp = try simulateImpact(cc, file, edit, space.configs);
     const notice = try impactNotice(cc.arena, file.live_path, imp, space.configs.len - 1);
     const cands = try candidates.compute(cc.arena, cc.this_bindings, space.ax);
@@ -1414,12 +1430,22 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
         return .report;
     }
 
-    var choices: std.ArrayList(prompt.Choice) = .empty;
-    for (cands, 0..) |_, i| {
-        try choices.append(cc.arena, .{ .key = try std.fmt.allocPrint(cc.arena, "{d}", .{i + 1}), .label = "" });
+    if (cc.interactive) {
+        const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
+        const route_label = try std.fmt.allocPrint(cc.arena, "shared -- changes {d} configuration(s)", .{imp.affected.len});
+        try printHunkHeader(cc.stdout, cc.sty, rel, hunk_no, hunk_total, route_label);
     }
-    try choices.append(cc.arena, .{ .key = "m", .label = "manual" });
-    try choices.append(cc.arena, .{ .key = "s", .label = "skip" });
+
+    var choices: std.ArrayList(prompt.Choice) = .empty;
+    for (cands, 0..) |c, i| {
+        try choices.append(cc.arena, .{
+            .key = try std.fmt.allocPrint(cc.arena, "{d}", .{i + 1}),
+            .label = try candidateLabel(cc.arena, c, cc.hostname),
+            .help = try candidateHelp(cc.arena, c),
+        });
+    }
+    try choices.append(cc.arena, .{ .key = "m", .label = "manual", .help = "no automatic route; handle this hunk by hand" });
+    try choices.append(cc.arena, .{ .key = "s", .label = "skip", .help = "leave this hunk as drift; ask again next commit" });
 
     var qw: Io.Writer.Allocating = .init(cc.arena);
     try qw.writer.writeAll(notice);
@@ -1629,7 +1655,7 @@ fn writeCandidates(arena: std.mem.Allocator, w: *Io.Writer, cands: []const candi
     for (cands, 0..) |c, i| {
         try w.print("    [{d}] {s}\n", .{ i + 1, try candidateLabel(arena, c, hostname) });
     }
-    try w.writeAll("    [m] manual  [s] skip  [q] quit\n");
+    try w.writeAll("    [m] manual  [s] skip  [q] quit  [?] help\n");
 }
 
 /// Human-readable label for a candidate.
@@ -1639,6 +1665,16 @@ fn candidateLabel(arena: std.mem.Allocator, c: candidates.Candidate, hostname: [
         .axis => c.label,
         .machine_local => try std.fmt.allocPrint(arena, "machine={s} (only here)", .{hostname}),
         .private => "private",
+    };
+}
+
+/// `?`-help text for a candidate: what choosing it does to the edit.
+fn candidateHelp(arena: std.mem.Allocator, c: candidates.Candidate) ![]const u8 {
+    return switch (c.kind) {
+        .universal => "keep the edit everywhere -- every configuration composes it",
+        .axis => std.fmt.allocPrint(arena, "narrow the edit to configurations where {s}", .{c.label}),
+        .machine_local => "narrow the edit to only this machine",
+        .private => "narrow the edit to the private layer (no automatic route)",
     };
 }
 
@@ -1902,11 +1938,121 @@ fn filenameStem(path: []const u8) []const u8 {
     return basename[0..dot];
 }
 
-fn printMiniDiff(out: *Io.Writer, hunk: Hunk, a_lines: []const []const u8, b_lines: []const []const u8) !void {
+fn printMiniDiff(sty: style.Style, out: *Io.Writer, hunk: Hunk, a_lines: []const []const u8, b_lines: []const []const u8) !void {
     var i: u32 = 0;
-    while (i < hunk.a_len) : (i += 1) try out.print("    - {s}\n", .{a_lines[hunk.a_start + i]});
+    while (i < hunk.a_len) : (i += 1) {
+        try sty.red(out);
+        try out.print("    - {s}\n", .{a_lines[hunk.a_start + i]});
+        try sty.close(out);
+    }
     i = 0;
-    while (i < hunk.b_len) : (i += 1) try out.print("    + {s}\n", .{b_lines[hunk.b_start + i]});
+    while (i < hunk.b_len) : (i += 1) {
+        try sty.green(out);
+        try out.print("    + {s}\n", .{b_lines[hunk.b_start + i]});
+        try sty.close(out);
+    }
+}
+
+/// Per-hunk header for an interactive prompt: `<home-rel path>  hunk N/M  ->
+/// <route>`, so the prompt reads without cross-referencing the diff.
+fn printHunkHeader(out: *Io.Writer, sty: style.Style, rel: []const u8, hunk_no: usize, hunk_total: usize, route: []const u8) !void {
+    try sty.bold(out);
+    try out.print("{s}", .{rel});
+    try sty.close(out);
+    try out.print("  hunk {d}/{d}  ", .{ hunk_no, hunk_total });
+    try sty.dim(out);
+    try out.print("-> {s}", .{route});
+    try sty.close(out);
+    try out.writeAll("\n");
+}
+
+/// Destination named in a hunk header: where a routed edit lands and why.
+fn routeLabel(arena: std.mem.Allocator, route: Route, file: mox.source.tree.ManagedFile) ![]const u8 {
+    return switch (route) {
+        .line => |r| lineRouteLabel(arena, r.edit, file),
+        .row => |r| std.fmt.allocPrint(arena, "data source {s} (row {d})", .{ r.edit.data_source, r.edit.row }),
+        .manual => |reason| std.fmt.allocPrint(arena, "manual -- {s}", .{reason}),
+    };
+}
+
+fn lineRouteLabel(arena: std.mem.Allocator, edit: LineEdit, file: mox.source.tree.ManagedFile) ![]const u8 {
+    if (edit.private) return std.fmt.allocPrint(arena, "private {s}", .{edit.path});
+    // `source_base_path` is already repo-relative, e.g. "src/.zshrc".
+    if (file.has_base and std.mem.eql(u8, edit.path, file.source_base_abs))
+        return std.fmt.allocPrint(arena, "{s} (base)", .{file.source_base_path});
+    if (fragmentTuple(file, edit.path)) |t|
+        return std.fmt.allocPrint(arena, "fragment {s}", .{try tupleLabel(arena, t)});
+    return std.fmt.allocPrint(arena, "fragment {s}", .{edit.path});
+}
+
+/// The axis tuple of the region/overlay fragment at `path`, or null when
+/// `path` is not one of `file`'s known fragments (a universal include/append
+/// fragment carries an empty, i.e. universal, tuple of its own).
+fn fragmentTuple(file: mox.source.tree.ManagedFile, path: []const u8) ?mox.source.tree.AxisTuple {
+    for (file.regions) |region| {
+        for (region.fragments) |frag| {
+            if (std.mem.eql(u8, frag.path, path)) return frag.tuple;
+        }
+    }
+    for (file.overlays) |ov| {
+        if (std.mem.eql(u8, ov.path, path)) return ov.tuple;
+    }
+    return null;
+}
+
+/// `os=darwin+profile=work` style label for an axis tuple; "universal" for an
+/// empty one.
+fn tupleLabel(arena: std.mem.Allocator, t: mox.source.tree.AxisTuple) ![]const u8 {
+    if (t.pairs.len == 0) return "universal";
+    var out: std.ArrayList(u8) = .empty;
+    for (t.pairs, 0..) |p, i| {
+        if (i > 0) try out.append(arena, '+');
+        try out.appendSlice(arena, p.name);
+        try out.append(arena, '=');
+        try out.appendSlice(arena, p.value);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Colorized, self-describing prompt legend, e.g. `[Y]es  [n]o  [m]anual
+/// [q]uit  [?]help `: every choice names its own action, and the default
+/// choice's key renders uppercase. Replaces a bare `[Y/n/m/q]` literal.
+fn legend(arena: std.mem.Allocator, choices: []const prompt.Choice, default_index: usize, sty: style.Style) ![]const u8 {
+    var aw: Io.Writer.Allocating = .init(arena);
+    const out = &aw.writer;
+    try out.writeAll("  ");
+    for (choices, 0..) |c, i| {
+        try writeGlyph(out, c, i == default_index, sty);
+        try out.writeAll("  ");
+    }
+    try sty.bold(out);
+    try out.writeAll("[q]");
+    try sty.close(out);
+    try out.writeAll("uit  ");
+    try sty.bold(out);
+    try out.writeAll("[?]");
+    try sty.close(out);
+    try out.writeAll("help ");
+    return aw.toOwnedSlice();
+}
+
+/// Write one choice as `[K]abel` when the label starts with the key's own
+/// letter (`y`/`yes` -> `[y]es`), else `[key] label`. The default choice's
+/// single-letter key renders uppercase.
+fn writeGlyph(out: *Io.Writer, c: prompt.Choice, is_default: bool, sty: style.Style) !void {
+    var buf: [1]u8 = undefined;
+    const key: []const u8 = if (is_default and c.key.len == 1 and std.ascii.isAlphabetic(c.key[0])) blk: {
+        buf[0] = std.ascii.toUpper(c.key[0]);
+        break :blk &buf;
+    } else c.key;
+    try sty.bold(out);
+    try out.print("[{s}]", .{key});
+    try sty.close(out);
+    if (c.key.len == 1 and c.label.len > 0 and std.ascii.toLower(c.label[0]) == std.ascii.toLower(c.key[0])) {
+        try out.writeAll(c.label[1..]);
+    } else {
+        try out.print(" {s}", .{c.label});
+    }
 }
 
 pub const command = app.command(Spec, .{

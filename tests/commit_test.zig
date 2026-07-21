@@ -911,7 +911,7 @@ test "commit: the candidate prompt drives a non-default choice, and a non-base n
     try std.testing.expect(std.mem.indexOf(u8, res.out, "no automatic route to profile=personal") != null);
     // Choice 1 (universal, the --yes default) would have routed the hunk to its
     // origin and reported one committed file; choice 3 commits nothing.
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
 
     // A narrowing with no automatic route writes nothing at all: the whole
     // source tree -- base, both fragments, the data-free `.d/` -- is byte-equal.
@@ -1068,7 +1068,7 @@ test "commit: narrowing to an axis the file already has a region for is refused,
     try std.testing.expect(std.mem.indexOf(u8, res.out, "[2] os=") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "already has a region named \"os\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "left uncommitted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
 
     // The base is byte-identical: no second region was wrapped around the line.
     try std.testing.expectEqualStrings(base_before, try read(io, a, try h.srcOf(".zshrc")));
@@ -1159,7 +1159,7 @@ test "commit: a leftover fragment at the exact synthesis path is refused, its co
     const res = try h.runWithInput(&.{ "mox", "commit" }, "2\n");
     try std.testing.expect(std.mem.indexOf(u8, res.out, "already exists") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "left uncommitted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
 
     // Neither the base nor the leftover fragment's content was touched: no
     // silent data loss.
@@ -1225,7 +1225,7 @@ test "commit: narrowing a shebang line is refused, leaving the script and its wh
     const res = try h.runWithInput(&.{ "mox", "commit" }, "2\n");
     try std.testing.expect(std.mem.indexOf(u8, res.out, "cannot wrap the first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "left uncommitted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
 
     // The source is untouched: no region wraps the shebang, and no fragment was
     // written anywhere under the source tree.
@@ -1324,7 +1324,7 @@ test "commit: a second narrowing to an axis this same run already claimed is ref
     // disk -- and refusing it leaves the file unroutable, so nothing is written.
     const res = try h.runWithInput(&.{ "mox", "commit" }, "2\n2\n");
     try std.testing.expect(std.mem.indexOf(u8, res.out, "left uncommitted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
     // Nothing corrupt on disk: no region wraps either line, no fragment was
@@ -1373,7 +1373,7 @@ test "commit: a routed file whose recompose still differs from live is restored,
     // bare "output differs".
     try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) were left uncommitted") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
 
     // "Not committed" left nothing behind: the base is byte-identical, and the
     // fragment and the region directory the synthesis created are gone.
@@ -1572,7 +1572,7 @@ test "commit: a data-interpolated line is reported manual and left in source ver
     // The edit over an interpolated line has no route back into source: it is
     // reported manual, and nothing is committed.
     try std.testing.expect(std.mem.indexOf(u8, res.out, "manual") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 committed, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
     // The source keeps the literal capture, not the expanded/edited value.
     const src = try read(io, a, try h.srcOf(".zshrc"));
     try std.testing.expect(std.mem.indexOf(u8, src, "export KEY=<data.signing.pub>") != null);
@@ -1612,7 +1612,7 @@ test "commit: a routable hunk still commits when the same file has a manual hunk
     // The report is coherent: the manual hunk is named, the commit is counted,
     // and the message says what is left to do instead of "output differs".
     try std.testing.expect(std.mem.indexOf(u8, res.out, "came from a capture") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 committed, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 1 manual") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) could not be routed") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "run 'mox apply'") != null);
     // Edits remain, so the exit code says so.
@@ -1657,7 +1657,7 @@ test "commit: a routable hunk still commits when the same file has a declined hu
 
     // The report is coherent: the decline is named, the commit is counted,
     // and the message says how to discard it instead of "output differs".
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 committed, 0 coupled, 0 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) were declined") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "run 'mox apply'") != null);
     // Edits remain, so the exit code says so.
@@ -1666,6 +1666,89 @@ test "commit: a routable hunk still commits when the same file has a declined hu
     // The applied record did NOT advance: the declined hunk is still real
     // drift, and `mox status` keeps reporting it.
     try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a routed hunk's interactive prompt shows a self-explaining header and legend" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export A=1", "export A=2");
+
+    // --color=never for deterministic bytes: the header, diff, and legend
+    // must all read without ANSI escapes getting in the way of the check.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // The header names the hunk's position and where it routes -- no need to
+    // cross-reference the diff to know what "y" commits to.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "hunk 1/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "src/.zshrc (base)") != null);
+    // Not a doubled "src/src/..." prefix.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "src/src/") == null);
+    // The legend is self-explaining: every key names its own action.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[Y]es") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[n]o") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[m]anual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[?]help") != null);
+    // The end summary reports the routed/coupled/manual counts.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
+}
+
+test "commit: ? at the per-hunk prompt prints help for every choice, then re-asks" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export A=1", "export A=2");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "?\ny\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // The help block explains each key; the edit still commits ("y" after).
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "route this edit into its source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "skip -- leave the drift") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "manual -- handle by hand") != null);
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "export A=2") != null);
+}
+
+test "commit: --color=always colors the per-hunk mini-diff and header" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export A=1", "export A=2");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=always" }, "y\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "\x1b[31m") != null); // removed line, red
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "\x1b[32m") != null); // added line, green
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "\x1b[1m") != null); // bold path/keys
 }
 
 test "commit: the summary counts nothing as committed when the routing was rejected" {
@@ -1691,7 +1774,7 @@ test "commit: the summary counts nothing as committed when the routing was rejec
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") != null);
     // The summary must not claim a commit the command refused to make.
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
 }
 

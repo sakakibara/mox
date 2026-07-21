@@ -31,6 +31,9 @@ pub const Mode = enum {
 pub const Choice = struct {
     key: []const u8,
     label: []const u8,
+    /// One-line explanation shown when the user types `?` at the prompt.
+    /// Empty means the label alone stands for it.
+    help: []const u8 = "",
 };
 
 pub const Outcome = union(enum) {
@@ -64,7 +67,7 @@ pub fn ask(
     }
 
     var attempts: usize = 0;
-    while (attempts < max_ask_attempts) : (attempts += 1) {
+    while (attempts < max_ask_attempts) {
         try out.writeAll(question);
         try out.flush();
         // takeDelimiter (not the -Exclusive variant) consumes the newline, so
@@ -72,6 +75,14 @@ pub fn ask(
         // of yielding "" forever. EOF (null) aborts.
         const line = (try input.takeDelimiter('\n')) orelse return .abort;
         const t = std.mem.trim(u8, line, " \t\r");
+        // `?` is the user orienting themselves, not a wrong guess: print what
+        // every choice does and re-ask without spending an attempt.
+        if (t.len == 1 and t[0] == '?') {
+            try printHelp(choices, out);
+            try out.flush();
+            continue;
+        }
+        attempts += 1;
         if (t.len == 0) return .{ .chosen = default_index };
         // `q` is a universal abort at every prompt.
         if (t.len == 1 and std.ascii.toLower(t[0]) == 'q') return .abort;
@@ -85,6 +96,17 @@ pub fn ask(
         }
     }
     return .abort;
+}
+
+/// One line per choice (`key`, `label`, `help`), plus the universal `q`, so
+/// `?` explains every option without leaving the prompt.
+fn printHelp(choices: []const Choice, out: *Io.Writer) !void {
+    for (choices) |c| {
+        try out.print("  [{s}] {s}", .{ c.key, c.label });
+        if (c.help.len > 0) try out.print(" -- {s}", .{c.help});
+        try out.writeAll("\n");
+    }
+    try out.writeAll("  [q] quit -- abort, write nothing\n");
 }
 
 /// Case-insensitive match of typed input against a choice key. Digit keys
@@ -201,6 +223,35 @@ test "ask: blank-line no-progress input is bounded, then aborts" {
     // default_index picks the default only on EMPTY input; "zzz" is non-empty
     // and never matches, so attempts exhaust and it aborts.
     try testing.expectEqual(Outcome.abort, try ask(.interactive, &choices, 0, "> ", &input, &out_aw.writer));
+}
+
+test "ask: ? prints a help block without spending an attempt, then re-asks" {
+    const choices = [_]Choice{
+        .{ .key = "y", .label = "yes", .help = "do the thing" },
+        .{ .key = "n", .label = "no", .help = "skip it" },
+    };
+    var out_aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer out_aw.deinit();
+
+    var input = Io.Reader.fixed("?\ny\n");
+    const outcome = try ask(.interactive, &choices, 0, "> ", &input, &out_aw.writer);
+    try testing.expectEqual(Outcome{ .chosen = 0 }, outcome);
+    try testing.expect(std.mem.indexOf(u8, out_aw.written(), "[y] yes -- do the thing") != null);
+    try testing.expect(std.mem.indexOf(u8, out_aw.written(), "[n] no -- skip it") != null);
+    try testing.expect(std.mem.indexOf(u8, out_aw.written(), "[q] quit -- abort, write nothing") != null);
+}
+
+test "ask: ? never counts toward max_ask_attempts" {
+    const choices = [_]Choice{.{ .key = "y", .label = "yes" }};
+    var out_aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer out_aw.deinit();
+
+    // Well past the attempt bound if "?" consumed attempts; a real answer
+    // still lands because it never does.
+    const scripted = "?\n" ** (max_ask_attempts + 5) ++ "y\n";
+    var input = Io.Reader.fixed(scripted);
+    const outcome = try ask(.interactive, &choices, 0, "> ", &input, &out_aw.writer);
+    try testing.expectEqual(Outcome{ .chosen = 0 }, outcome);
 }
 
 test "renderChoices: letters and numbers render with a quit suffix" {
