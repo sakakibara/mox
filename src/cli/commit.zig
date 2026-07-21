@@ -5,10 +5,13 @@
 //! through the provenance recorded at apply time, back to the source that
 //! produced it: a base line to `src/`, a fragment line to its fragment file,
 //! a private-layer line to the private file (NEVER repo src), a loop row to
-//! its data source. Secret, interpolated, structural-merge, and straddling
-//! hunks have no safe automatic route and are reported as manual.
+//! its data source. Secret, interpolated, and structural-merge hunks have no
+//! safe automatic route and are reported as manual. A hunk spanning more than
+//! one of these origins (a straddle) is also reported manual, unless the user
+//! `split`s it at the per-hunk prompt: each resulting piece lies within one
+//! origin and routes on its own.
 //!
-//! On a TTY each routed hunk is confirmed `[Y/n/m]`; `--yes` takes the
+//! On a TTY each routed hunk is confirmed `[Y/n/m/s]`; `--yes` takes the
 //! defaults; `--dry-run` and a non-TTY without `--yes` only report (exit 1
 //! when hunks remain); `--abort-on-prompt` exits 2 for a prompt that would have
 //! been needed, terminal or not. All writes happen after every prompt, so
@@ -20,8 +23,9 @@
 //! and region directory a narrowing synthesized.
 //!
 //! A manual hunk, and a hunk the user deliberately declines (`n`) or skips
-//! (`s`), are differences the recompose is EXPECTED to keep: both stay in the
-//! live file by design, so a file that has one can never recompose to live
+//! (`s` at the candidate prompt), are differences the recompose is EXPECTED
+//! to keep: both stay in the live file by design, so a file that has one can
+//! never recompose to live
 //! however well its other hunks routed. Those routed edits stand, the applied
 //! record does not advance (the rest is still real drift), and the report
 //! says what is left. A hunk the tool could not route to the candidate the
@@ -102,6 +106,31 @@ const ClassCtx = struct {
     /// What the narrowings accepted earlier in this run will create.
     claims: *Claims,
 };
+
+/// Mutable per-run tallies and output collectors the per-hunk pipeline
+/// (`processHunk`) updates. Grouped into one struct, rather than threaded as
+/// individual parameters, so a split hunk's sub-hunks can recurse back into
+/// the SAME pipeline instead of a stripped-down copy of it.
+const RunAccum = struct {
+    line_edits: *std.ArrayList(LineEdit),
+    line_owners: *std.ArrayList(usize),
+    row_edits: *std.ArrayList(RowEdit),
+    row_owners: *std.ArrayList(usize),
+    synth_plans: *std.ArrayList(SynthDecision),
+    synth_owners: *std.ArrayList(usize),
+    affected: []bool,
+    allowed: []std.StringHashMap(void),
+    manual_hunks: []usize,
+    declined_hunks: []usize,
+    unrouted_hunks: []usize,
+    manual_count: *usize,
+    routed_count: *usize,
+    pending: *bool,
+};
+
+/// What the caller of `processHunk` does next: keep going, or unwind the
+/// whole file loop because the user aborted (plain or strict).
+const HunkOutcome = enum { cont, abort, abort_strict };
 
 /// A region synthesis to materialize after all prompts.
 const SynthDecision = struct {
@@ -190,11 +219,23 @@ const Decision = union(enum) {
 };
 
 /// Per-hunk routing prompt choices; index 0 (yes) is the default and index 2
-/// (manual) downgrades the hunk. `q` aborts, handled by the prompt module.
-const ynm_choices = [_]prompt.Choice{
+/// (manual) downgrades the hunk. `split` breaks a hunk that covers more than
+/// one provenance segment into per-segment sub-hunks (a no-op here, since a
+/// hunk that reached `.line`/`.row` already resolved to exactly one segment).
+/// `q` aborts, handled by the prompt module.
+const ynms_choices = [_]prompt.Choice{
     .{ .key = "y", .label = "yes", .help = "route this edit into its source" },
     .{ .key = "n", .label = "no", .help = "skip -- leave the drift" },
     .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
+    .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
+};
+
+/// A hunk `routeHunk` could not resolve to any source has two options: accept
+/// the tool's manual determination, or split it at its provenance-segment
+/// boundaries and let each piece route on its own.
+const ms_choices = [_]prompt.Choice{
+    .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
+    .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
 };
 
 /// F-coupling prompt: `y` updates the other consumer, `d` declines this
@@ -379,6 +420,23 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     var aborted = false;
     var strict_abort = false;
 
+    const ra: RunAccum = .{
+        .line_edits = &line_edits,
+        .line_owners = &line_owners,
+        .row_edits = &row_edits,
+        .row_owners = &row_owners,
+        .synth_plans = &synth_plans,
+        .synth_owners = &synth_owners,
+        .affected = affected,
+        .allowed = allowed,
+        .manual_hunks = manual_hunks,
+        .declined_hunks = declined_hunks,
+        .unrouted_hunks = unrouted_hunks,
+        .manual_count = &manual_count,
+        .routed_count = &routed_count,
+        .pending = &pending,
+    };
+
     files: for (tree.files, 0..) |file, fidx| {
         if (scoped_live) |set| {
             if (!set.contains(file.live_path)) continue;
@@ -435,165 +493,15 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         const space = spaces[fidx].?;
 
         for (hunks, 0..) |hunk, hi| {
-            const route = try routeHunk(ctx.alloc, ctx.io, prov.segments, hunk, file, a_lines, b_lines);
-            switch (route) {
-                .manual => |reason| {
-                    manual_count += 1;
-                    manual_hunks[fidx] += 1;
-                    pending = true;
-                    try ctx.out.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+            switch (try processHunk(&cc, &ra, file, fidx, space, prov.segments, a_lines, b_lines, hunk, hi + 1, hunks.len)) {
+                .cont => {},
+                .abort => {
+                    aborted = true;
+                    break :files;
                 },
-                .line => |r| {
-                    routed_count += 1;
-                    // A shared-origin edit in a file whose OWN configuration
-                    // space has more than one member asks where the edit
-                    // belongs; everything else keeps the origin behind a plain
-                    // [Y/n/m] confirm (bootstrap / axis-specific / private).
-                    if (r.shared and space.configs.len > 1) {
-                        switch (try classifyLine(&cc, file, r.edit, r.desc, space, hi + 1, hunks.len)) {
-                            .abort => {
-                                aborted = true;
-                                break :files;
-                            },
-                            .abort_strict => {
-                                strict_abort = true;
-                                break :files;
-                            },
-                            .report => {
-                                pending = true;
-                                // Report mode returns before the write phase;
-                                // the edit is collected only so the coupling
-                                // updates a real commit would offer are also
-                                // surfaced.
-                                try line_edits.append(ctx.alloc, r.edit);
-                                try line_owners.append(ctx.alloc, fidx);
-                            },
-                            .skip => declined_hunks[fidx] += 1,
-                            .unroutable => unrouted_hunks[fidx] += 1,
-                            .manual => {
-                                manual_count += 1;
-                                manual_hunks[fidx] += 1;
-                                pending = true;
-                            },
-                            .origin => |labels| {
-                                try line_edits.append(ctx.alloc, r.edit);
-                                try line_owners.append(ctx.alloc, fidx);
-                                affected[fidx] = true;
-                                for (labels) |l| try allowed[fidx].put(l, {});
-                                try ctx.out.print("  edit {s}\n", .{r.desc});
-                            },
-                            .synth => |sd| {
-                                try synth_plans.append(ctx.alloc, sd);
-                                try synth_owners.append(ctx.alloc, fidx);
-                                affected[fidx] = true;
-                                for (sd.allowed) |l| try allowed[fidx].put(l, {});
-                                // Preview the synthesized directive structure
-                                // before any write.
-                                try ctx.out.print("  synthesize {s}={s} region in {s}\n", .{ sd.plan.region, sd.plan.value, r.desc });
-                                try ctx.out.print("    + {s}\n", .{sd.plan.directive_line});
-                                try ctx.out.print("    + fragment {s}\n", .{sd.plan.fragment_path});
-                            },
-                        }
-                        continue;
-                    }
-
-                    var accept = !report_mode and !interactive;
-                    if (report_mode) {
-                        pending = true;
-                        try ctx.out.print("  would edit {s}\n", .{r.desc});
-                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
-                        // Collected so report mode can also surface coupling
-                        // divergences; never written (report mode returns
-                        // before the write phase).
-                        try line_edits.append(ctx.alloc, r.edit);
-                        try line_owners.append(ctx.alloc, fidx);
-                    } else if (interactive) {
-                        try printHunkHeader(ctx.out, sty, try mox.source.path.liveKeyRelToHome(ctx.alloc, m_state.home, file.live_path), hi + 1, hunks.len, try routeLabel(ctx.alloc, route, file));
-                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
-                        const legend_line = try legend(ctx.alloc, &ynm_choices, 0, sty);
-                        switch (try prompt.ask(ask_mode, &ynm_choices, 0, legend_line, input, ctx.out)) {
-                            .chosen => |i| switch (i) {
-                                0 => accept = true,
-                                1 => declined_hunks[fidx] += 1,
-                                else => {
-                                    manual_count += 1;
-                                    manual_hunks[fidx] += 1;
-                                },
-                            },
-                            .abort => {
-                                aborted = true;
-                                break :files;
-                            },
-                            .abort_strict => {
-                                strict_abort = true;
-                                break :files;
-                            },
-                            .report_only => unreachable,
-                        }
-                    }
-                    if (accept) {
-                        try line_edits.append(ctx.alloc, r.edit);
-                        try line_owners.append(ctx.alloc, fidx);
-                        affected[fidx] = true;
-                        // This route made no classification choice (axis-gated
-                        // fragment, private layer, or a file with a single
-                        // configuration): the configurations its origin feeds
-                        // are exactly the ones it is meant to change, so
-                        // verification must expect them to differ.
-                        if (space.configs.len > 1) {
-                            const imp = try simulateImpact(&cc, file, r.edit, space.configs);
-                            for (imp.affected) |l| try allowed[fidx].put(l, {});
-                        }
-                        if (!interactive and !report_mode)
-                            try ctx.out.print("  edit {s}\n", .{r.desc});
-                    }
-                },
-                .row => |r| {
-                    routed_count += 1;
-                    var accept = !report_mode and !interactive;
-                    if (report_mode) {
-                        pending = true;
-                        try ctx.out.print("  would update {s}\n", .{r.desc});
-                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
-                    } else if (interactive) {
-                        try printHunkHeader(ctx.out, sty, try mox.source.path.liveKeyRelToHome(ctx.alloc, m_state.home, file.live_path), hi + 1, hunks.len, try routeLabel(ctx.alloc, route, file));
-                        try printMiniDiff(sty, ctx.out, hunk, a_lines, b_lines);
-                        const legend_line = try legend(ctx.alloc, &ynm_choices, 0, sty);
-                        switch (try prompt.ask(ask_mode, &ynm_choices, 0, legend_line, input, ctx.out)) {
-                            .chosen => |i| switch (i) {
-                                0 => accept = true,
-                                1 => declined_hunks[fidx] += 1,
-                                else => {
-                                    manual_count += 1;
-                                    manual_hunks[fidx] += 1;
-                                },
-                            },
-                            .abort => {
-                                aborted = true;
-                                break :files;
-                            },
-                            .abort_strict => {
-                                strict_abort = true;
-                                break :files;
-                            },
-                            .report_only => unreachable,
-                        }
-                    }
-                    if (accept) {
-                        try row_edits.append(ctx.alloc, r.edit);
-                        try row_owners.append(ctx.alloc, fidx);
-                        affected[fidx] = true;
-                        // A loop row belongs to its data source, not to any
-                        // configuration: like the non-shared line routes above,
-                        // it makes no classification choice, so the
-                        // configurations it feeds are the ones it may change.
-                        if (space.configs.len > 1) {
-                            const imp = try simulateRowImpact(&cc, file, r.edit, space.configs);
-                            for (imp.affected) |l| try allowed[fidx].put(l, {});
-                        }
-                        if (!interactive and !report_mode)
-                            try ctx.out.print("  update {s}\n", .{r.desc});
-                    }
+                .abort_strict => {
+                    strict_abort = true;
+                    break :files;
                 },
             }
         }
@@ -1280,6 +1188,213 @@ fn buildCouplingGraph(arena: std.mem.Allocator, io: Io, tree: mox.source.tree.Ma
     return mox.coupling.index.build(arena, inputs.items);
 }
 
+/// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks
+/// produced by a `split` re-enter this same function, so a straddling hunk's
+/// pieces get the identical treatment a top-level hunk would: their own
+/// route, their own header, their own y/n/m/s prompt.
+fn processHunk(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    space: FileSpace,
+    segments: []const Segment,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    hunk: Hunk,
+    hunk_no: usize,
+    hunk_total: usize,
+) !HunkOutcome {
+    const route = try routeHunk(cc.arena, cc.io, segments, hunk, file, a_lines, b_lines);
+    switch (route) {
+        .manual => |reason| {
+            if (!cc.interactive) {
+                ra.manual_count.* += 1;
+                ra.manual_hunks[fidx] += 1;
+                ra.pending.* = true;
+                try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+                return .cont;
+            }
+            try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+            try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+            const legend_line = try legend(cc.arena, &ms_choices, 0, cc.sty);
+            switch (try prompt.ask(cc.ask_mode, &ms_choices, 0, legend_line, cc.input, cc.stdout)) {
+                .chosen => |i| switch (i) {
+                    0 => {
+                        ra.manual_count.* += 1;
+                        ra.manual_hunks[fidx] += 1;
+                        ra.pending.* = true;
+                        try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+                    },
+                    else => {
+                        const subs = try splitHunk(cc.arena, segments, hunk);
+                        if (subs.len <= 1) {
+                            // Single-segment hunk: nothing to split. The
+                            // least-surprising outcome is the tool's own
+                            // determination standing, same as choosing manual.
+                            ra.manual_count.* += 1;
+                            ra.manual_hunks[fidx] += 1;
+                            ra.pending.* = true;
+                            try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+                        } else {
+                            for (subs) |sub| {
+                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total);
+                                if (outcome != .cont) return outcome;
+                            }
+                        }
+                    },
+                },
+                .abort => return .abort,
+                .abort_strict => return .abort_strict,
+                .report_only => unreachable,
+            }
+            return .cont;
+        },
+        .line => |r| {
+            ra.routed_count.* += 1;
+            // A shared-origin edit in a file whose OWN configuration space has
+            // more than one member asks where the edit belongs; everything
+            // else keeps the origin behind a plain [Y/n/m] confirm (bootstrap
+            // / axis-specific / private).
+            if (r.shared and space.configs.len > 1) {
+                switch (try classifyLine(cc, file, r.edit, r.desc, space, hunk_no, hunk_total)) {
+                    .abort => return .abort,
+                    .abort_strict => return .abort_strict,
+                    .report => {
+                        ra.pending.* = true;
+                        // Report mode returns before the write phase; the edit
+                        // is collected only so the coupling updates a real
+                        // commit would offer are also surfaced.
+                        try ra.line_edits.append(cc.arena, r.edit);
+                        try ra.line_owners.append(cc.arena, fidx);
+                    },
+                    .skip => ra.declined_hunks[fidx] += 1,
+                    .unroutable => ra.unrouted_hunks[fidx] += 1,
+                    .manual => {
+                        ra.manual_count.* += 1;
+                        ra.manual_hunks[fidx] += 1;
+                        ra.pending.* = true;
+                    },
+                    .origin => |labels| {
+                        try ra.line_edits.append(cc.arena, r.edit);
+                        try ra.line_owners.append(cc.arena, fidx);
+                        ra.affected[fidx] = true;
+                        for (labels) |l| try ra.allowed[fidx].put(l, {});
+                        try cc.stdout.print("  edit {s}\n", .{r.desc});
+                    },
+                    .synth => |sd| {
+                        try ra.synth_plans.append(cc.arena, sd);
+                        try ra.synth_owners.append(cc.arena, fidx);
+                        ra.affected[fidx] = true;
+                        for (sd.allowed) |l| try ra.allowed[fidx].put(l, {});
+                        // Preview the synthesized directive structure before
+                        // any write.
+                        try cc.stdout.print("  synthesize {s}={s} region in {s}\n", .{ sd.plan.region, sd.plan.value, r.desc });
+                        try cc.stdout.print("    + {s}\n", .{sd.plan.directive_line});
+                        try cc.stdout.print("    + fragment {s}\n", .{sd.plan.fragment_path});
+                    },
+                }
+                return .cont;
+            }
+
+            var accept = !cc.report_mode and !cc.interactive;
+            if (cc.report_mode) {
+                ra.pending.* = true;
+                try cc.stdout.print("  would edit {s}\n", .{r.desc});
+                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                // Collected so report mode can also surface coupling
+                // divergences; never written (report mode returns before the
+                // write phase).
+                try ra.line_edits.append(cc.arena, r.edit);
+                try ra.line_owners.append(cc.arena, fidx);
+            } else if (cc.interactive) {
+                try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                const legend_line = try legend(cc.arena, &ynms_choices, 0, cc.sty);
+                switch (try prompt.ask(cc.ask_mode, &ynms_choices, 0, legend_line, cc.input, cc.stdout)) {
+                    .chosen => |i| switch (i) {
+                        0 => accept = true,
+                        1 => ra.declined_hunks[fidx] += 1,
+                        2 => {
+                            ra.manual_count.* += 1;
+                            ra.manual_hunks[fidx] += 1;
+                        },
+                        // `s`: `routeHunk` only returns `.line` for a hunk
+                        // `covering()` found entirely within one segment, so a
+                        // split here is always a no-op; just route it.
+                        else => accept = true,
+                    },
+                    .abort => return .abort,
+                    .abort_strict => return .abort_strict,
+                    .report_only => unreachable,
+                }
+            }
+            if (accept) {
+                try ra.line_edits.append(cc.arena, r.edit);
+                try ra.line_owners.append(cc.arena, fidx);
+                ra.affected[fidx] = true;
+                // This route made no classification choice (axis-gated
+                // fragment, private layer, or a file with a single
+                // configuration): the configurations its origin feeds are
+                // exactly the ones it is meant to change, so verification
+                // must expect them to differ.
+                if (space.configs.len > 1) {
+                    const imp = try simulateImpact(cc, file, r.edit, space.configs);
+                    for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
+                }
+                if (!cc.interactive and !cc.report_mode)
+                    try cc.stdout.print("  edit {s}\n", .{r.desc});
+            }
+            return .cont;
+        },
+        .row => |r| {
+            ra.routed_count.* += 1;
+            var accept = !cc.report_mode and !cc.interactive;
+            if (cc.report_mode) {
+                ra.pending.* = true;
+                try cc.stdout.print("  would update {s}\n", .{r.desc});
+                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+            } else if (cc.interactive) {
+                try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                const legend_line = try legend(cc.arena, &ynms_choices, 0, cc.sty);
+                switch (try prompt.ask(cc.ask_mode, &ynms_choices, 0, legend_line, cc.input, cc.stdout)) {
+                    .chosen => |i| switch (i) {
+                        0 => accept = true,
+                        1 => ra.declined_hunks[fidx] += 1,
+                        2 => {
+                            ra.manual_count.* += 1;
+                            ra.manual_hunks[fidx] += 1;
+                        },
+                        // `s`: a loop-row route is always single-segment; a
+                        // split here is always a no-op, so just route it.
+                        else => accept = true,
+                    },
+                    .abort => return .abort,
+                    .abort_strict => return .abort_strict,
+                    .report_only => unreachable,
+                }
+            }
+            if (accept) {
+                try ra.row_edits.append(cc.arena, r.edit);
+                try ra.row_owners.append(cc.arena, fidx);
+                ra.affected[fidx] = true;
+                // A loop row belongs to its data source, not to any
+                // configuration: like the non-shared line routes above, it
+                // makes no classification choice, so the configurations it
+                // feeds are the ones it may change.
+                if (space.configs.len > 1) {
+                    const imp = try simulateRowImpact(cc, file, r.edit, space.configs);
+                    for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
+                }
+                if (!cc.interactive and !cc.report_mode)
+                    try cc.stdout.print("  update {s}\n", .{r.desc});
+            }
+            return .cont;
+        },
+    }
+}
+
 /// Map one diff hunk to a source edit, or report why it cannot be routed.
 fn routeHunk(
     arena: std.mem.Allocator,
@@ -1336,6 +1451,54 @@ fn routeHunk(
         .interpolated => return .{ .manual = "came from a capture" },
         .overlay => return .{ .manual = "came from a structural merge" },
     }
+}
+
+fn lessU32(_: void, x: u32, y: u32) bool {
+    return x < y;
+}
+
+/// Split `hunk` at provenance-segment boundaries so each returned sub-hunk's
+/// a-range lies within a single segment (what lets `routeHunk` resolve it
+/// instead of downgrading to manual for straddling). A hunk already within
+/// one segment -- the common case, and always true once `routeHunk` has
+/// already resolved a hunk to `.line`/`.row` -- returns as a single-element
+/// slice equal to `hunk`.
+///
+/// `b`-side lines are apportioned to each piece in proportion to its share of
+/// `a_len` (the last piece taking the remainder), so the sub-hunks' `b`-ranges
+/// exactly tile the original: this is exact for the common straddle (adjacent
+/// single-line edits, `a_len == b_len`) and a reasonable approximation
+/// otherwise, but every sub-hunk's `a`-range is always exact.
+fn splitHunk(arena: std.mem.Allocator, segments: []const Segment, hunk: Hunk) ![]const Hunk {
+    if (hunk.a_len == 0) return &.{hunk};
+    const a_end = hunk.a_start + hunk.a_len;
+
+    var bounds: std.ArrayList(u32) = .empty;
+    try bounds.append(arena, hunk.a_start);
+    for (segments) |s| {
+        if (s.out_start > hunk.a_start and s.out_start < a_end) try bounds.append(arena, s.out_start);
+    }
+    try bounds.append(arena, a_end);
+    std.mem.sort(u32, bounds.items, {}, lessU32);
+
+    var points: std.ArrayList(u32) = .empty;
+    for (bounds.items) |v| {
+        if (points.items.len == 0 or points.items[points.items.len - 1] != v) try points.append(arena, v);
+    }
+    if (points.items.len <= 2) return &.{hunk};
+
+    var out: std.ArrayList(Hunk) = .empty;
+    var b_done: u32 = 0;
+    for (points.items[0 .. points.items.len - 1], points.items[1..], 0..) |lo, hi, i| {
+        const is_last = i == points.items.len - 2;
+        const b_len = if (is_last)
+            hunk.b_len - b_done
+        else
+            @as(u32, @intCast(@as(u64, hunk.b_len) * (hi - hunk.a_start) / hunk.a_len)) - b_done;
+        try out.append(arena, .{ .a_start = lo, .a_len = hi - lo, .b_start = hunk.b_start + b_done, .b_len = b_len });
+        b_done += b_len;
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Confirm the source file at `path` still holds `expected` verbatim at line

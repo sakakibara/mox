@@ -1729,6 +1729,97 @@ test "commit: ? at the per-hunk prompt prints help for every choice, then re-ask
     try std.testing.expect(std.mem.indexOf(u8, src, "export A=2") != null);
 }
 
+test "commit: a hunk straddling two provenance segments splits and routes each piece to its own source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Composed live is exactly two lines: "# top" (base) then "alias x=1"
+    // (the included fragment's content, replacing the directive line). With
+    // no context line between them, editing both forms ONE diff hunk that
+    // spans a base segment and a fragment segment -- a straddle `routeHunk`
+    // alone cannot route.
+    try writeRepo(io, &tmp, "repo/src/.myrc", "# top\n# mox: include \"extra.sh\"\n");
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", "alias x=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".myrc");
+    try editLive(io, a, live, "# top", "# TOP");
+    try editLive(io, a, live, "alias x=1", "alias x=111");
+
+    // Without splitting this whole hunk would be reported manual (see the
+    // sibling non-interactive assertion below). Interactively: "s" splits it,
+    // then "y" accepts each of the two resulting per-source pieces.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // Both pieces landed in their own source.
+    const base = try read(io, a, try h.srcOf(".myrc"));
+    try std.testing.expectEqualStrings("# TOP\n# mox: include \"extra.sh\"\n", base);
+    const frag = try read(io, a, try h.srcOf(".myrc.d/extra.sh"));
+    try std.testing.expectEqualStrings("alias x=111\n", frag);
+
+    // The file routed (both pieces landed); the straddle did not fall back to
+    // manual (contrast the non-interactive sibling test below: "1 manual").
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
+
+    // Recompose now matches live exactly: status is clean.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a straddling hunk left unsplit is reported manual, non-interactively" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myrc", "# top\n# mox: include \"extra.sh\"\n");
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", "alias x=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".myrc");
+    try editLive(io, a, live, "# top", "# TOP");
+    try editLive(io, a, live, "alias x=1", "alias x=111");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "hunk straddles origins or is uncovered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    const base = try read(io, a, try h.srcOf(".myrc"));
+    try std.testing.expectEqualStrings("# top\n# mox: include \"extra.sh\"\n", base);
+    const frag = try read(io, a, try h.srcOf(".myrc.d/extra.sh"));
+    try std.testing.expectEqualStrings("alias x=1\n", frag);
+}
+
+test "commit: split on an already single-segment hunk is a no-op that just routes it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export A=1", "export A=2");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "export A=2") != null);
+}
+
 test "commit: --color=always colors the per-hunk mini-diff and header" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
