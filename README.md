@@ -120,6 +120,14 @@ generated `.mox/attributes.toml` (machine-written; don't hand-edit). A symlink i
 just a source file whose content is the link target, so it composes by axis like
 anything else.
 
+### Ignoring files
+
+A repo-scoped `.moxignore` / `.mox/ignore` (gitignore syntax, axis-gated like
+any other file) keeps a path out of mox entirely: refused by `add`/`add-tree`,
+skipped by `apply`, and exempt from exact-directory pruning. `mox init`
+scaffolds a starter file guarding common secret paths. See
+[docs/ignore.md](docs/ignore.md).
+
 ### Setup scripts
 
 `scripts/pre/` run before the write pass (bootstrap installers); `scripts/post/`
@@ -133,8 +141,8 @@ comment.
 | Command | What it does |
 | --- | --- |
 | `init` | Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>` clones an existing dotfiles repo into the repo dir; by default it stops for you to review (a cloned repo's files and scripts are untrusted until you look at them), `--apply` applies right away for a one-command bootstrap. Refuses a non-empty repo dir |
-| `add <path>` | Start managing a live file as a base file in `src/` |
-| `add-tree <dir>` | Recursively `add` every non-junk regular file under a live directory; already-managed files and junk are skipped |
+| `add <path>` | Start managing a live file as a base file in `src/`. A path matching a repo ignore rule (`.moxignore` / `.mox/ignore`) is refused (`--force` overrides) |
+| `add-tree <dir>` | Recursively `add` every non-junk regular file under a live directory; already-managed files, junk, and paths matching a repo ignore rule are skipped |
 | `mv <old> <new>` | Rename a managed file's source (base file and its `.d/` overlay dir) so the live target changes on the next apply. The old source is copied into the timestamped trash first (recoverable); its `.mox/attributes.toml` entry (mode, symlink, seed-once) is carried to the new name. Takes the lock |
 | `remove <name>` | Stop managing a file: move its source (base + `.d/`) into `<state>/trash/<timestamp>/` recoverably and leave the live file orphaned. `--purge` also deletes the live file, snapshotting it first. Takes the lock |
 | `apply` | Compose all managed files and write them to their live paths (`--dry-run`, `--force`) |

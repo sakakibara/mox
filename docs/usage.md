@@ -129,6 +129,15 @@ export TOKEN="<secret:op://Personal/GitHub/token>"
 Schemes: `env:`, `file://`, `op://` (1Password), `pass://`, `cmd:`. A file that
 resolves an `op://`/`pass://` secret is written 0600.
 
+## Keeping secrets out
+
+A fresh repo from `mox init` already has a `.moxignore` guarding common
+credential paths (SSH keys, `*.pem`, Claude's credential files); `add` and
+`add-tree` refuse a path it matches (`add --force` overrides one), and
+`apply` skips a tracked one that a rule now covers. Add your own patterns to
+`.moxignore` (gitignore syntax) to keep other paths out. Full reference:
+[docs/ignore.md](ignore.md).
+
 ## Syncing a second machine
 
 mox does not commit for you. Commit in the repo, then:
