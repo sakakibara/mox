@@ -30,7 +30,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "add-tree")) orelse return 1;
     defer lk.release();
 
-    const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
 
     var counts: Counts = .{};
     walk(ctx, dir_abs, &ruleset, &counts) catch |e| switch (e) {

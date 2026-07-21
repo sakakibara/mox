@@ -154,7 +154,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     };
 
     if (!a.force) {
-        const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+        const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+        var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, live_path);
         const is_dir = if (Io.Dir.cwd().statFile(ctx.io, live_path, .{ .follow_symlinks = false })) |st|
             st.kind == .directory

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const mox = @import("../../root.zig");
 const match = @import("match.zig");
 const testing = std.testing;
 
@@ -12,19 +13,51 @@ fn readOptional(arena: std.mem.Allocator, io: Io, path: []const u8) !?[]u8 {
     };
 }
 
+/// Read an ignore file and resolve its axis-gated regions for this machine.
+/// A plain pattern list (no `# mox:` directive) has no inferable comment
+/// marker, so it is returned verbatim; a directive-bearing file composes as a
+/// Category-B source (`#` inferred from the directive) so `# mox: when os=...`
+/// regions gate per machine. A missing file yields null.
+fn resolve(
+    arena: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    bindings: *const std.StringHashMap([]const u8),
+    m_state: *const mox.machine.state.MachineState,
+) !?[]u8 {
+    const raw = (try readOptional(arena, io, path)) orelse return null;
+    if (std.mem.indexOf(u8, raw, "# mox:") == null) return raw;
+    const file: mox.source.tree.ManagedFile = .{
+        .source_base_path = path,
+        .source_base_abs = path,
+        .live_path = path,
+        .has_base = true,
+        .overlays = &.{},
+        .regions = &.{},
+    };
+    return (try mox.compose.catB.compose(arena, io, file, bindings, m_state)) orelse "";
+}
+
 /// Load and merge the repo's ignore files into one RuleSet. `.mox/ignore`
 /// contributes first, root `.moxignore` last (so its rules win ties under
-/// last-match-wins). A missing file contributes nothing.
-pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !match.RuleSet {
+/// last-match-wins). Each file's `# mox: when` regions are resolved for the
+/// current machine before compiling. A missing file contributes nothing.
+pub fn load(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    bindings: *const std.StringHashMap([]const u8),
+    m_state: *const mox.machine.state.MachineState,
+) !match.RuleSet {
     const namespaced = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "ignore" });
     const root = try std.fs.path.join(arena, &.{ repo_dir, ".moxignore" });
 
     var buf: std.ArrayList(u8) = .empty;
-    if (try readOptional(arena, io, namespaced)) |t| {
+    if (try resolve(arena, io, namespaced, bindings, m_state)) |t| {
         try buf.appendSlice(arena, t);
         try buf.append(arena, '\n');
     }
-    if (try readOptional(arena, io, root)) |t| {
+    if (try resolve(arena, io, root, bindings, m_state)) |t| {
         try buf.appendSlice(arena, t);
         try buf.append(arena, '\n');
     }
@@ -73,9 +106,64 @@ test "load: merges .mox/ignore and .moxignore, root wins ties" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const set = try load(a, io, repo);
+    const st = stateForOs("darwin");
+    var bindings = try mox.machine.bindings.fromMachineState(a, st);
+    const set = try load(a, io, repo, &bindings, &st);
     try testing.expect(set.isIgnored("a/b.jsonl", false)); // from .mox/ignore
     try testing.expect(!set.isIgnored(".secret", false)); // root negation wins (last)
+}
+
+fn stateForOs(os: []const u8) mox.machine.state.MachineState {
+    return .{
+        .os = os,
+        .arch = "aarch64",
+        .hostname = "test",
+        .username = "u",
+        .home = "/h",
+        .tools_on_path = &.{},
+        .defined_envs = &.{},
+        .brew_prefix = "",
+        .cargo_home = "",
+        .gopath = "",
+        .pnpm_home = "",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+    };
+}
+
+test "load: axis-gated rules resolve for the current machine" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = pathbuf[0..try tmp.dir.realPath(io, &pathbuf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".moxignore", .data =
+        \\always.txt
+        \\# mox: when os=linux
+        \\linux-only/
+        \\# mox: end
+        \\
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const darwin_state = stateForOs("darwin");
+    var darwin_bindings = try mox.machine.bindings.fromMachineState(a, darwin_state);
+    const darwin = try load(a, io, repo, &darwin_bindings, &darwin_state);
+    try testing.expect(darwin.isIgnored("always.txt", false));
+    try testing.expect(!darwin.isIgnored("linux-only", true));
+
+    const linux_state = stateForOs("linux");
+    var linux_bindings = try mox.machine.bindings.fromMachineState(a, linux_state);
+    const linux = try load(a, io, repo, &linux_bindings, &linux_state);
+    try testing.expect(linux.isIgnored("always.txt", false));
+    try testing.expect(linux.isIgnored("linux-only", true));
 }
 
 test "load: missing files yield an empty (never-ignoring) set" {
@@ -88,6 +176,8 @@ test "load: missing files yield an empty (never-ignoring) set" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const set = try load(a, io, repo);
+    const st = stateForOs("darwin");
+    var bindings = try mox.machine.bindings.fromMachineState(a, st);
+    const set = try load(a, io, repo, &bindings, &st);
     try testing.expect(!set.isIgnored("anything", false));
 }
