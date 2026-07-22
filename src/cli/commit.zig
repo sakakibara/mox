@@ -11,22 +11,25 @@
 //! `split`s it at the per-hunk prompt: each resulting piece lies within one
 //! origin and routes on its own.
 //!
-//! On a TTY each routed hunk is confirmed `[Y/n/m/s]`; `--yes` takes the
-//! defaults; `--dry-run` and a non-TTY without `--yes` only report (exit 1
-//! when hunks remain); `--abort-on-prompt` exits 2 for a prompt that would have
-//! been needed, terminal or not. All writes happen after every prompt, so
-//! aborting writes nothing. After a file's sources are edited it is recomposed:
+//! On a TTY a routed line/row hunk is confirmed `[y/s/x]`, an unroutable
+//! hunk `[s/x]`, an interpolated hunk `[f/d/x/s]`, and a structured key
+//! change `[y/p/s]`; `--yes` takes the defaults; `--dry-run` and a non-TTY
+//! without `--yes` only report (exit 1 when hunks remain);
+//! `--abort-on-prompt` exits 2 for a prompt that would have been needed,
+//! terminal or not. All writes happen after every prompt, so aborting writes
+//! nothing. After a file's sources are edited it is recomposed:
 //! only when the result is byte-identical to the live file, and no
 //! configuration the user did not choose changed, is the applied record
 //! advanced. A file that fails either check is not committed, and "not
 //! committed" means every source it wrote is restored -- including a fragment
 //! and region directory a narrowing synthesized.
 //!
-//! A manual hunk, and a hunk the user deliberately declines (`n`) or skips
-//! (`s` at the candidate prompt), are differences the recompose is EXPECTED
-//! to keep: both stay in the live file by design, so a file that has one can
-//! never recompose to live
-//! however well its other hunks routed. Those routed edits stand, the applied
+//! A manual hunk, and a hunk the user skips, are differences the recompose
+//! is EXPECTED to keep: skip is `s` in the per-hunk `[y/s/x]` prompt
+//! (decline the route outright) or `s` at the candidate prompt (decline
+//! only the candidate picked) -- both stay in the live file by design, so a
+//! file that has one can never recompose to live however well its other
+//! hunks routed. Those routed edits stand, the applied
 //! record does not advance (the rest is still real drift), and the report
 //! says what is left. A hunk the tool could not route to the candidate the
 //! user picked (no automatic path, a hazard) is not something the user asked
@@ -1304,7 +1307,8 @@ fn buildCouplingGraph(arena: std.mem.Allocator, io: Io, tree: mox.source.tree.Ma
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks
 /// produced by a `split` re-enter this same function, so a straddling hunk's
 /// pieces get the identical treatment a top-level hunk would: their own
-/// route, their own header, their own y/n/m/s prompt.
+/// route, their own header, their own prompt -- `[s/x]` manual, `[y/s/x]`
+/// line/row, `[f/d/x/s]` interpolated.
 fn processHunk(
     cc: *const ClassCtx,
     ra: *const RunAccum,
