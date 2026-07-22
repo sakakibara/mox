@@ -2581,3 +2581,159 @@ test "commit: declining the [p] to base confirm places nothing" {
     try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
     try std.testing.expectEqualStrings("x = 2\n", try read(io, a, try h.srcOf("other.toml.d/os=windows.toml")));
 }
+
+test "commit: structured promote detects a sibling revealed only by another file (repo-wide)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // config.toml only ever names os=darwin; os=linux exists ONLY via other.toml.
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    try writeRepo(io, &tmp, "repo/src/other.toml", "x = 1\n");
+    try writeRepo(io, &tmp, "repo/src/other.toml.d/os=linux.toml", "x = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // [p] -> base, then decline: we assert only that os=linux was DETECTED and
+    // listed at the confirm -- the soundness property. Declining leaves sources
+    // untouched (rc 1), so the assertion does not depend on commit behavior.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\nn\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    // The repo-wide sibling was surfaced: the OLD per-file space would omit it.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=linux") != null);
+    // Declined -> nothing placed.
+    try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+}
+
+test "commit: structured secret-derived key is skipped, never routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "token = \"<secret:env:MOX_TEST_TOKEN>\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    var h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    // Re-build env with the secret variable present, so apply composes a
+    // cleartext token into live.
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", h.home);
+    try map.put("USER", "tester");
+    try map.put("MOX_REPO", h.repo);
+    try map.put("MOX_STATE_DIR", h.state);
+    try map.put("MOX_OS", "darwin");
+    try map.put("MOX_TEST_TOKEN", "s3cr3t");
+    const map_ptr = try a.create(std.process.Environ.Map);
+    map_ptr.* = map;
+    h.env = .{ .map = map_ptr };
+
+    _ = try h.run(&.{ "mox", "apply" });
+    // A file whose composition resolved a secret has no cached cleartext, so a
+    // live edit to it is reported skipped (edit the source directly). This
+    // asserts the secret invariant holds end-to-end: no source bakes the token.
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "s3cr3t", "changed");
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "changed") == null);
+    _ = res;
+}
+
+test "commit: structured [y] routes to the winning overlay (json)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/settings.json", "{\"theme\":\"light\",\"font\":\"mono\"}");
+    try writeRepo(io, &tmp, "repo/src/settings.json.d/os=darwin.json", "{\"theme\":\"dark\"}");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("settings.json");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    const ov = try read(io, a, try h.srcOf("settings.json.d/os=darwin.json"));
+    try std.testing.expect(std.mem.indexOf(u8, ov, "solarized") != null);
+    // The base is never touched by a [y] to the overlay: byte-identical.
+    try std.testing.expectEqualStrings("{\"theme\":\"light\",\"font\":\"mono\"}", try read(io, a, try h.srcOf("settings.json")));
+}
+
+test "commit: structured [y] routes to the winning overlay (yaml)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.yaml", "theme: light\nfont: mono\n");
+    try writeRepo(io, &tmp, "repo/src/config.yaml.d/os=darwin.yaml", "theme: dark\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.yaml");
+    try editLive(io, a, live, "dark", "solarized");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.yaml.d/os=darwin.yaml")), "solarized") != null);
+}
+
+test "commit: structured [y] routes to the winning overlay (ini)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/app.ini", "[ui]\ntheme=light\nfont=mono\n");
+    try writeRepo(io, &tmp, "repo/src/app.ini.d/os=darwin.ini", "[ui]\ntheme=dark\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("app.ini");
+    try editLive(io, a, live, "theme=dark", "theme=solarized");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.ini.d/os=darwin.ini")), "solarized") != null);
+}
+
+test "commit: structured [y] routes to the winning overlay (gitconfig)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "[user]\n\tname = base\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/os=darwin.gitconfig", "[user]\n\tname = darwin\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf(".gitconfig");
+    try editLive(io, a, live, "name = darwin", "name = picked");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".gitconfig.d/os=darwin.gitconfig")), "picked") != null);
+    // The base user.name is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".gitconfig")), "base") != null);
+}
