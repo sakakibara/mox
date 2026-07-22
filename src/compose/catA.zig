@@ -427,6 +427,18 @@ fn collectMatchingLayers(
     return paths;
 }
 
+/// Public wrapper over `collectMatchingLayers`: the absolute paths of every
+/// layer that matches `bindings`, least-specific-first (base, if any, first).
+/// `mox commit` re-reads exactly this set to recompute per-key layer ownership
+/// at commit time.
+pub fn matchingLayerPaths(
+    arena: std.mem.Allocator,
+    file: ManagedFile,
+    bindings: *const std.StringHashMap([]const u8),
+) ![]const []const u8 {
+    return collectMatchingLayers(arena, file, bindings);
+}
+
 const LayerRef = struct {
     path: []const u8,
     tuple: source.tree.AxisTuple,

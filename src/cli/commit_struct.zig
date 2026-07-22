@@ -20,6 +20,7 @@ const toml = @import("toml");
 const json = @import("json");
 const yaml = @import("yaml");
 const ini = @import("ini");
+const category = @import("../compose/category.zig");
 
 const Io = std.Io;
 
@@ -444,6 +445,214 @@ fn emitDoc(arena: std.mem.Allocator, doc: anytype) ![]const u8 {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     return arena.dupe(u8, aw.written());
+}
+
+/// Detect the structured format of a managed-file source path, or null when it
+/// is not a Cat-A structured format. Mirrors the composer's extension table,
+/// with gitconfig recognized by path shape rather than extension.
+pub fn formatOfPath(path: []const u8) ?Format {
+    if (category.isGitConfigPath(path)) return .gitconfig;
+    const Pair = struct { ext: []const u8, format: Format };
+    const table = [_]Pair{
+        .{ .ext = ".toml", .format = .toml },
+        .{ .ext = ".yaml", .format = .yaml },
+        .{ .ext = ".yml", .format = .yaml },
+        .{ .ext = ".json", .format = .json },
+        .{ .ext = ".ini", .format = .ini },
+        .{ .ext = ".gitconfig", .format = .gitconfig },
+    };
+    var longest: ?Format = null;
+    var longest_len: usize = 0;
+    for (table) |entry| {
+        if (std.mem.endsWith(u8, path, entry.ext) and entry.ext.len > longest_len) {
+            longest = entry.format;
+            longest_len = entry.ext.len;
+        }
+    }
+    return longest;
+}
+
+/// Parse one layer's bytes into a `Value` tagged by `format`, for the pure
+/// layer-selection walk. INI and gitconfig share ini-zig's `Value`.
+pub fn parseLayer(arena: std.mem.Allocator, format: Format, bytes: []const u8) !Value {
+    return switch (format) {
+        .toml => .{ .toml = try toml.parse(arena, bytes, .{}) },
+        .json => .{ .json = try json.parse(arena, bytes, .{ .dialect = .jsonc }) },
+        .yaml => .{ .yaml = try yaml.parse(arena, bytes, .{}) },
+        .ini => .{ .ini = try ini.parse(arena, bytes, .{ .dialect = .generic }) },
+        .gitconfig => .{ .ini = try ini.parse(arena, bytes, .{ .dialect = .gitconfig }) },
+    };
+}
+
+/// One parsed source layer of a structured file. `layers` passed to
+/// `resolveLayer` are ordered least-specific-first (the composer's fold order):
+/// index 0 is the base when the file has one, then overlays in increasing
+/// specificity, so the LAST layer defining a key is the one that wins it.
+pub const StructLayer = struct {
+    path: []const u8,
+    is_base: bool,
+    value: Value,
+};
+
+/// Where a `KeyPathChange` should be written, recomputed from the parsed
+/// layers rather than stored provenance.
+pub const Resolution = struct {
+    action: Action,
+    /// Index into `layers` of the default target: the winner for a changed key,
+    /// the base for a new key, the sole definer for a single-layer removal.
+    /// Meaningful only when `action != .skip`.
+    target: usize,
+    /// Indices of every layer that DEFINES the key, most-specific-first. Empty
+    /// for a new key. Drives the pick menu's shadow-deletion annotations.
+    definers: []const usize,
+    /// Set only when `action == .skip`.
+    skip_reason: ?[]const u8,
+
+    pub const Action = enum { set, remove, skip };
+};
+
+/// Resolve the layer a single `KeyPathChange` should be written to. Pure over
+/// `layers` (already parsed, least-specific-first); mutates nothing.
+pub fn resolveLayer(
+    arena: std.mem.Allocator,
+    format: Format,
+    layers: []const StructLayer,
+    change: KeyPathChange,
+) !Resolution {
+    // Every layer that defines the key, most-specific-first.
+    var defs: std.ArrayList(usize) = .empty;
+    var i: usize = layers.len;
+    while (i > 0) {
+        i -= 1;
+        if (definesPath(format, layers[i].value, change.path)) try defs.append(arena, i);
+    }
+    const definers = try defs.toOwnedSlice(arena);
+
+    if (change.removed) {
+        if (definers.len == 0)
+            return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "key is not defined by any source layer" };
+        if (definers.len > 1)
+            return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "defined by more than one layer; removing one only surfaces another" };
+        return .{ .action = .remove, .target = definers[0], .definers = definers, .skip_reason = null };
+    }
+
+    if (definers.len == 0)
+        return .{ .action = .set, .target = 0, .definers = definers, .skip_reason = null };
+
+    const winner = definers[0];
+    if (layerScalar(format, layers[winner].value, change.path)) |s| {
+        if (hasCapture(s))
+            return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "value is interpolation- or secret-derived" };
+    }
+    return .{ .action = .set, .target = winner, .definers = definers, .skip_reason = null };
+}
+
+/// Paths of every layer more specific than `chosen` that defines the key: the
+/// override entries a placement at `chosen` must delete to take effect.
+/// `definers` is most-specific-first; layers are least-specific-first, so a
+/// definer index greater than `chosen` is more specific.
+pub fn shadowers(
+    arena: std.mem.Allocator,
+    layers: []const StructLayer,
+    definers: []const usize,
+    chosen: usize,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (definers) |d| {
+        if (d > chosen) try out.append(arena, layers[d].path);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Whether `value` defines `path`, walking nested containers per format.
+fn definesPath(format: Format, value: Value, path: []const []const u8) bool {
+    return switch (format) {
+        .toml => tomlHas(value.toml, path),
+        .json => jsonHas(value.json, path),
+        .yaml => yamlHas(value.yaml, path),
+        .ini, .gitconfig => iniHas(value.ini, path),
+    };
+}
+
+fn tomlHas(v: toml.Value, path: []const []const u8) bool {
+    if (path.len == 0) return true;
+    if (v != .table) return false;
+    const child = v.table.get(path[0]) orelse return false;
+    return tomlHas(child, path[1..]);
+}
+
+fn jsonHas(v: json.Value, path: []const []const u8) bool {
+    if (path.len == 0) return true;
+    if (v != .object) return false;
+    const child = v.object.get(path[0]) orelse return false;
+    return jsonHas(child, path[1..]);
+}
+
+fn yamlHas(v: yaml.Value, path: []const []const u8) bool {
+    if (path.len == 0) return true;
+    if (v != .map) return false;
+    const child = yaml.Value.mapGet(v.map, path[0]) orelse return false;
+    return yamlHas(child, path[1..]);
+}
+
+fn iniHas(v: ini.Value, path: []const []const u8) bool {
+    if (path.len == 0) return true;
+    if (v != .section) return false;
+    const child = v.section.findValue(path[0]) orelse return false;
+    return iniHas(child, path[1..]);
+}
+
+/// The leaf scalar string at `path` in `value`, or null when the leaf is
+/// absent or not a string. Only strings can carry an interpolation capture.
+fn layerScalar(format: Format, value: Value, path: []const []const u8) ?[]const u8 {
+    return switch (format) {
+        .toml => tomlScalar(value.toml, path),
+        .json => jsonScalar(value.json, path),
+        .yaml => yamlScalar(value.yaml, path),
+        .ini, .gitconfig => iniScalar(value.ini, path),
+    };
+}
+
+fn tomlScalar(v: toml.Value, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return if (v == .string) v.string else null;
+    if (v != .table) return null;
+    const child = v.table.get(path[0]) orelse return null;
+    return tomlScalar(child, path[1..]);
+}
+
+fn jsonScalar(v: json.Value, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return if (v == .string) v.string else null;
+    if (v != .object) return null;
+    const child = v.object.get(path[0]) orelse return null;
+    return jsonScalar(child, path[1..]);
+}
+
+fn yamlScalar(v: yaml.Value, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return if (v == .string) v.string else null;
+    if (v != .map) return null;
+    const child = yaml.Value.mapGet(v.map, path[0]) orelse return null;
+    return yamlScalar(child, path[1..]);
+}
+
+fn iniScalar(v: ini.Value, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return if (v == .string) v.string else null;
+    if (v != .section) return null;
+    const child = v.section.findValue(path[0]) orelse return null;
+    return iniScalar(child, path[1..]);
+}
+
+/// Whether `s` holds any non-empty `<...>` capture. Conservative on purpose: a
+/// structured value carrying a capture is interpolation- or secret-derived, and
+/// routing its resolved live value into source would bake a fact or secret. The
+/// never-bake-a-secret / never-guess-a-fact invariants win over precision here.
+fn hasCapture(s: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, i, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, s, lt + 1, '>') orelse return false;
+        if (gt > lt + 1) return true;
+        i = gt + 1;
+    }
+    return false;
 }
 
 // ---- tests ----
@@ -1394,4 +1603,168 @@ test "applyToLayer: empty path is a clean error, not a panic" {
         .removed = false,
     });
     try testing.expectError(error.EmptyPath, result);
+}
+
+test "resolveLayer: changed key won by an overlay targets that overlay" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try toml.parse(a, "theme = \"light\"\nfont = \"mono\"\n", .{});
+    const ov = try toml.parse(a, "theme = \"dark\"\n", .{});
+    const layers = [_]StructLayer{
+        .{ .path = "base.toml", .is_base = true, .value = .{ .toml = base } },
+        .{ .path = "os=darwin.toml", .is_base = false, .value = .{ .toml = ov } },
+    };
+    const change: KeyPathChange = .{ .path = &.{"theme"}, .new = .{ .toml = .{ .string = "solarized" } }, .removed = false };
+
+    const res = try resolveLayer(a, .toml, &layers, change);
+    try testing.expectEqual(Resolution.Action.set, res.action);
+    try testing.expectEqual(@as(usize, 1), res.target);
+    try testing.expectEqual(@as(usize, 2), res.definers.len);
+    try testing.expectEqual(@as(usize, 1), res.definers[0]);
+    try testing.expectEqual(@as(usize, 0), res.definers[1]);
+}
+
+test "resolveLayer: new key with no definer targets the base" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try toml.parse(a, "theme = \"light\"\n", .{});
+    const ov = try toml.parse(a, "theme = \"dark\"\n", .{});
+    const layers = [_]StructLayer{
+        .{ .path = "base.toml", .is_base = true, .value = .{ .toml = base } },
+        .{ .path = "os=darwin.toml", .is_base = false, .value = .{ .toml = ov } },
+    };
+    const change: KeyPathChange = .{ .path = &.{"newkey"}, .new = .{ .toml = .{ .integer = 1 } }, .removed = false };
+
+    const res = try resolveLayer(a, .toml, &layers, change);
+    try testing.expectEqual(Resolution.Action.set, res.action);
+    try testing.expectEqual(@as(usize, 0), res.target);
+    try testing.expectEqual(@as(usize, 0), res.definers.len);
+}
+
+test "resolveLayer: single-layer removal targets the sole definer" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try toml.parse(a, "theme = \"light\"\n", .{});
+    const ov = try toml.parse(a, "extra = \"x\"\n", .{});
+    const layers = [_]StructLayer{
+        .{ .path = "base.toml", .is_base = true, .value = .{ .toml = base } },
+        .{ .path = "os=darwin.toml", .is_base = false, .value = .{ .toml = ov } },
+    };
+    const change: KeyPathChange = .{ .path = &.{"extra"}, .new = null, .removed = true };
+
+    const res = try resolveLayer(a, .toml, &layers, change);
+    try testing.expectEqual(Resolution.Action.remove, res.action);
+    try testing.expectEqual(@as(usize, 1), res.target);
+}
+
+test "resolveLayer: multi-layer removal is skipped" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try toml.parse(a, "theme = \"light\"\n", .{});
+    const ov = try toml.parse(a, "theme = \"dark\"\n", .{});
+    const layers = [_]StructLayer{
+        .{ .path = "base.toml", .is_base = true, .value = .{ .toml = base } },
+        .{ .path = "os=darwin.toml", .is_base = false, .value = .{ .toml = ov } },
+    };
+    const change: KeyPathChange = .{ .path = &.{"theme"}, .new = null, .removed = true };
+
+    const res = try resolveLayer(a, .toml, &layers, change);
+    try testing.expectEqual(Resolution.Action.skip, res.action);
+    try testing.expect(res.skip_reason != null);
+}
+
+test "resolveLayer: an interpolation-derived value is skipped, never routed" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try toml.parse(a, "email = \"<machine.email>\"\n", .{});
+    const layers = [_]StructLayer{
+        .{ .path = "base.toml", .is_base = true, .value = .{ .toml = base } },
+    };
+    const change: KeyPathChange = .{ .path = &.{"email"}, .new = .{ .toml = .{ .string = "me@x.test" } }, .removed = false };
+
+    const res = try resolveLayer(a, .toml, &layers, change);
+    try testing.expectEqual(Resolution.Action.skip, res.action);
+}
+
+test "shadowers: entries more specific than the chosen layer are returned" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try toml.parse(a, "theme = \"light\"\n", .{});
+    const ov = try toml.parse(a, "theme = \"dark\"\n", .{});
+    const layers = [_]StructLayer{
+        .{ .path = "base.toml", .is_base = true, .value = .{ .toml = base } },
+        .{ .path = "os=darwin.toml", .is_base = false, .value = .{ .toml = ov } },
+    };
+    // definers most-specific-first: overlay (1), base (0).
+    const definers = [_]usize{ 1, 0 };
+    const sh = try shadowers(a, &layers, &definers, 0);
+    try testing.expectEqual(@as(usize, 1), sh.len);
+    try testing.expectEqualStrings("os=darwin.toml", sh[0]);
+
+    const none = try shadowers(a, &layers, &definers, 1);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "resolveLayer: yaml winner and json winner resolve the most-specific layer" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const ybase = try yaml.parse(a, "theme: light\n", .{});
+    const yov = try yaml.parse(a, "theme: dark\n", .{});
+    const ylayers = [_]StructLayer{
+        .{ .path = "base.yaml", .is_base = true, .value = .{ .yaml = ybase } },
+        .{ .path = "os=darwin.yaml", .is_base = false, .value = .{ .yaml = yov } },
+    };
+    const ychange: KeyPathChange = .{ .path = &.{"theme"}, .new = .{ .yaml = .{ .string = "solarized" } }, .removed = false };
+    const yres = try resolveLayer(a, .yaml, &ylayers, ychange);
+    try testing.expectEqual(@as(usize, 1), yres.target);
+
+    const jbase = try json.parse(a, "{\"theme\":\"light\"}", .{ .dialect = .jsonc });
+    const jov = try json.parse(a, "{\"theme\":\"dark\"}", .{ .dialect = .jsonc });
+    const jlayers = [_]StructLayer{
+        .{ .path = "base.json", .is_base = true, .value = .{ .json = jbase } },
+        .{ .path = "os=darwin.json", .is_base = false, .value = .{ .json = jov } },
+    };
+    const jchange: KeyPathChange = .{ .path = &.{"theme"}, .new = .{ .json = .{ .string = "solarized" } }, .removed = false };
+    const jres = try resolveLayer(a, .json, &jlayers, jchange);
+    try testing.expectEqual(@as(usize, 1), jres.target);
+}
+
+test "resolveLayer: gitconfig nested key resolves through sections" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const base = try ini.parse(a, "[user]\n\tname = base\n", .{ .dialect = .gitconfig });
+    const ov = try ini.parse(a, "[user]\n\tname = over\n", .{ .dialect = .gitconfig });
+    const layers = [_]StructLayer{
+        .{ .path = "base.gitconfig", .is_base = true, .value = .{ .ini = base } },
+        .{ .path = "os=darwin.gitconfig", .is_base = false, .value = .{ .ini = ov } },
+    };
+    const change: KeyPathChange = .{ .path = &.{ "user", "name" }, .new = .{ .ini = .{ .string = "picked" } }, .removed = false };
+    const res = try resolveLayer(a, .gitconfig, &layers, change);
+    try testing.expectEqual(@as(usize, 1), res.target);
+    try testing.expectEqual(@as(usize, 2), res.definers.len);
+}
+
+test "formatOfPath: recognizes structured formats and rejects others" {
+    try testing.expectEqual(Format.toml, formatOfPath("src/config.toml").?);
+    try testing.expectEqual(Format.json, formatOfPath("src/settings.json").?);
+    try testing.expectEqual(Format.yaml, formatOfPath("src/c.yaml").?);
+    try testing.expectEqual(Format.ini, formatOfPath("src/app.ini").?);
+    try testing.expectEqual(Format.gitconfig, formatOfPath("src/.gitconfig").?);
+    try testing.expect(formatOfPath("src/.zshrc") == null);
 }

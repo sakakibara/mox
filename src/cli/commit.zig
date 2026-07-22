@@ -223,7 +223,7 @@ const Decision = union(enum) {
     /// Report-only: the analysis was printed; nothing to write.
     report,
     /// User explicitly skipped this hunk at the candidate prompt (`s`): a
-    /// deliberate decline, ordinary as declining at the plain `[Y/n/m]`
+    /// deliberate decline, ordinary as declining at the plain `[y/s]`
     /// prompt.
     skip,
     /// The candidate the user picked has no automatic route (private layer,
@@ -237,35 +237,39 @@ const Decision = union(enum) {
     abort_strict,
 };
 
-/// Per-hunk routing prompt choices; index 0 (yes) is the default and index 2
-/// (manual) downgrades the hunk. `split` breaks a hunk that covers more than
-/// one provenance segment into per-segment sub-hunks (a no-op here, since a
-/// hunk that reached `.line`/`.row` already resolved to exactly one segment).
-/// `q` aborts, handled by the prompt module.
-const ynms_choices = [_]prompt.Choice{
+/// Per-hunk routing prompt for a routable line/row hunk: accept the route, skip
+/// it (leave the drift; the file stays uncommitted), or split a straddling hunk
+/// into per-segment pieces (a no-op once a hunk resolved to `.line`/`.row`).
+const ys_choices = [_]prompt.Choice{
     .{ .key = "y", .label = "yes", .help = "route this edit into its source" },
-    .{ .key = "n", .label = "no", .help = "skip -- leave the drift" },
-    .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
-    .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
+    .{ .key = "s", .label = "skip", .help = "skip -- leave the drift" },
+    .{ .key = "x", .label = "split", .help = "split -- break this hunk into per-source pieces" },
 };
 
-/// A hunk `routeHunk` could not resolve to any source has two options: accept
-/// the tool's manual determination, or split it at its provenance-segment
-/// boundaries and let each piece route on its own.
-const ms_choices = [_]prompt.Choice{
-    .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
-    .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
+/// A hunk `routeHunk` could not resolve to any source: skip it (handle by hand,
+/// leaving the drift), or split it at its provenance-segment boundaries so each
+/// piece routes on its own.
+const sx_choices = [_]prompt.Choice{
+    .{ .key = "s", .label = "skip", .help = "skip -- handle by hand, leave the drift" },
+    .{ .key = "x", .label = "split", .help = "split -- break this hunk into per-source pieces" },
 };
 
-/// Interpolated-value prompt: `f` writes the new value into the fact, `d`
-/// writes it into the source's `| default` instead, `s` is the manual-style
-/// split escape hatch (a no-op for a single-line hunk, exactly like
-/// `ynms_choices`' `s`), `m` downgrades to manual.
+/// Interpolated-value prompt: `f` writes the new value into the fact, `d` writes
+/// it into the source's `| default` instead, `x` is the split escape hatch (a
+/// no-op for a single-line hunk), `s` skips (leave the drift).
 const fact_choices = [_]prompt.Choice{
     .{ .key = "f", .label = "fact", .help = "set the fact to the new value" },
     .{ .key = "d", .label = "default", .help = "change the source default instead" },
-    .{ .key = "s", .label = "split", .help = "split -- break this hunk into per-source pieces" },
-    .{ .key = "m", .label = "manual", .help = "manual -- handle by hand" },
+    .{ .key = "x", .label = "split", .help = "split -- break this hunk into per-source pieces" },
+    .{ .key = "s", .label = "skip", .help = "skip -- leave the drift" },
+};
+
+/// Structured key-change prompt: accept the winning layer, pick which layer to
+/// place the key in, or skip (leave the key only in the live file).
+const struct_choices = [_]prompt.Choice{
+    .{ .key = "y", .label = "yes", .help = "write to the winning layer" },
+    .{ .key = "p", .label = "pick", .help = "choose which layer to place the key in" },
+    .{ .key = "s", .label = "skip", .help = "skip -- leave the key in the live file only" },
 };
 
 /// F-coupling prompt: `y` updates the other consumer, `d` declines this
@@ -1326,8 +1330,8 @@ fn processHunk(
             }
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
             try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
-            const legend_line = try legend(cc.arena, &ms_choices, 0, cc.sty);
-            switch (try prompt.ask(cc.ask_mode, &ms_choices, 0, legend_line, cc.input, cc.stdout)) {
+            const legend_line = try legend(cc.arena, &sx_choices, 0, cc.sty);
+            switch (try prompt.ask(cc.ask_mode, &sx_choices, 0, legend_line, cc.input, cc.stdout)) {
                 .chosen => |i| switch (i) {
                     0 => {
                         ra.manual_count.* += 1;
@@ -1363,7 +1367,7 @@ fn processHunk(
             ra.routed_count.* += 1;
             // A shared-origin edit in a file whose OWN configuration space has
             // more than one member asks where the edit belongs; everything
-            // else keeps the origin behind a plain [Y/n/m] confirm (bootstrap
+            // else keeps the origin behind a plain [y/s] confirm (bootstrap
             // / axis-specific / private).
             if (r.shared and space.configs.len > 1) {
                 switch (try classifyLine(cc, file, r.edit, r.desc, space, hunk_no, hunk_total)) {
@@ -1419,16 +1423,12 @@ fn processHunk(
             } else if (cc.interactive) {
                 try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
-                const legend_line = try legend(cc.arena, &ynms_choices, 0, cc.sty);
-                switch (try prompt.ask(cc.ask_mode, &ynms_choices, 0, legend_line, cc.input, cc.stdout)) {
+                const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
+                switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
                     .chosen => |i| switch (i) {
                         0 => accept = true,
                         1 => ra.declined_hunks[fidx] += 1,
-                        2 => {
-                            ra.manual_count.* += 1;
-                            ra.manual_hunks[fidx] += 1;
-                        },
-                        // `s`: `routeHunk` only returns `.line` for a hunk
+                        // `x`: `routeHunk` only returns `.line` for a hunk
                         // `covering()` found entirely within one segment, so a
                         // split here is always a no-op; just route it.
                         else => accept = true,
@@ -1466,16 +1466,12 @@ fn processHunk(
             } else if (cc.interactive) {
                 try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
-                const legend_line = try legend(cc.arena, &ynms_choices, 0, cc.sty);
-                switch (try prompt.ask(cc.ask_mode, &ynms_choices, 0, legend_line, cc.input, cc.stdout)) {
+                const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
+                switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
                     .chosen => |i| switch (i) {
                         0 => accept = true,
                         1 => ra.declined_hunks[fidx] += 1,
-                        2 => {
-                            ra.manual_count.* += 1;
-                            ra.manual_hunks[fidx] += 1;
-                        },
-                        // `s`: a loop-row route is always single-segment; a
+                        // `x`: a loop-row route is always single-segment; a
                         // split here is always a no-op, so just route it.
                         else => accept = true,
                     },
@@ -1544,7 +1540,7 @@ fn processHunk(
                         try cc.stdout.print("  edit {s}\n", .{r.default_desc});
                     },
                     2 => {
-                        // [s]: a fact route is always single-segment, like
+                        // [x]: a fact route is always single-segment, like
                         // `.line`/`.row`; a split here is always a no-op.
                         const subs = try splitHunk(cc.arena, segments, hunk);
                         if (subs.len <= 1) {
@@ -1560,7 +1556,7 @@ fn processHunk(
                         }
                     },
                     else => {
-                        // [m]: manual.
+                        // [s]: skip.
                         ra.manual_count.* += 1;
                         ra.manual_hunks[fidx] += 1;
                         ra.pending.* = true;
@@ -2624,7 +2620,7 @@ fn writeGlyph(out: *Io.Writer, c: prompt.Choice, is_default: bool, sty: style.St
 pub const command = app.command(Spec, .{
     .name = "commit",
     .summary = "Route live-file edits back into their sources",
-    .details = "Prompts [Y/n/m] per hunk (--yes: take defaults; --dry-run: report only, exit 1 if edits remain; --abort-on-prompt: strict CI, rc 2 on the first prompt). Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region); a changed token shared by other sources prompts to update them too.",
+    .details = "Prompts [y/s] per hunk (--yes: take defaults; --dry-run: report only, exit 1 if edits remain; --abort-on-prompt: strict CI, rc 2 on the first prompt); a structured key change prompts [y/p/s] to accept the winning layer, pick another, or skip. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region); a changed token shared by other sources prompts to update them too.",
     .group = .general,
     .needs_context = true,
 }, run);

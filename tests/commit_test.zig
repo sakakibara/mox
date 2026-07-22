@@ -1941,10 +1941,10 @@ test "commit: a routable hunk still commits when the same file has a declined hu
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Declining a hunk (`n`) is an ordinary, designed action, just like a
+    // Declining a hunk (`s`) is an ordinary, designed action, just like a
     // manual hunk: the recompose is EXPECTED to still differ from live, so it
     // must not take the ACCEPTED hunk down with it. Two plain base lines, no
-    // axis anywhere, so both hit the [Y/n/m] prompt directly.
+    // axis anywhere, so both hit the [y/s/x] prompt directly.
     try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n" ++
         "export MIDDLE=1\n" ++
         "export B=1\n");
@@ -1955,8 +1955,8 @@ test "commit: a routable hunk still commits when the same file has a declined hu
     try editLive(io, a, live, "export A=1", "export A=2");
     try editLive(io, a, live, "export B=1", "export B=2");
 
-    // First hunk accepted (y), second declined (n).
-    const res = try h.runWithInput(&.{ "mox", "commit" }, "y\nn\n");
+    // First hunk accepted (y), second declined (s, skip).
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "y\ns\n");
 
     // The accepted edit is IN the source, not announced and then reverted.
     const src = try read(io, a, try h.srcOf(".zshrc"));
@@ -2006,8 +2006,8 @@ test "commit: a routed hunk's interactive prompt shows a self-explaining header 
     try std.testing.expect(std.mem.indexOf(u8, res.out, "src/src/") == null);
     // The legend is self-explaining: every key names its own action.
     try std.testing.expect(std.mem.indexOf(u8, res.out, "[Y]es") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "[n]o") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "[m]anual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[s]kip") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[x] split") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "[?]help") != null);
     // The end summary reports the routed/coupled/manual counts.
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
@@ -2034,7 +2034,7 @@ test "commit: ? at the per-hunk prompt prints help for every choice, then re-ask
     // The help block explains each key; the edit still commits ("y" after).
     try std.testing.expect(std.mem.indexOf(u8, res.out, "route this edit into its source") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "skip -- leave the drift") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "manual -- handle by hand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "split -- break this hunk into per-source pieces") != null);
     const src = try read(io, a, try h.srcOf(".zshrc"));
     try std.testing.expect(std.mem.indexOf(u8, src, "export A=2") != null);
 }
@@ -2062,9 +2062,9 @@ test "commit: a hunk straddling two provenance segments splits and routes each p
     try editLive(io, a, live, "alias x=1", "alias x=111");
 
     // Without splitting this whole hunk would be reported manual (see the
-    // sibling non-interactive assertion below). Interactively: "s" splits it,
+    // sibling non-interactive assertion below). Interactively: "x" splits it,
     // then "y" accepts each of the two resulting per-source pieces.
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\ny\ny\n");
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "x\ny\ny\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
 
     // Both pieces landed in their own source.
@@ -2123,7 +2123,7 @@ test "commit: split on an already single-segment hunk is a no-op that just route
     const live = try h.liveOf(".zshrc");
     try editLive(io, a, live, "export A=1", "export A=2");
 
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "x\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
     const src = try read(io, a, try h.srcOf(".zshrc"));
