@@ -2514,7 +2514,7 @@ test "commit: structured [p] to a middle layer places there and deletes the more
     try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
 }
 
-test "SCRATCH: pick to base confirms only the fall-through sibling, never the one with its own override" {
+test "commit: structured [p] to base confirms and changes only the fall-through sibling, not one with its own override" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2540,7 +2540,6 @@ test "SCRATCH: pick to base confirms only the fall-through sibling, never the on
 
     // [p] then base (candidate 1), then confirm y.
     const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\ny\n");
-    std.debug.print("RC={d}\nOUT=\n{s}\nERR=\n{s}\n", .{ res.rc, res.out, res.err });
 
     try std.testing.expectEqualStrings("theme = \"solarized\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
     try std.testing.expectEqualStrings("", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
@@ -2549,4 +2548,36 @@ test "SCRATCH: pick to base confirms only the fall-through sibling, never the on
 
     try std.testing.expect(std.mem.indexOf(u8, res.out, "os=windows") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "os=linux") == null);
+}
+
+test "commit: declining the [p] to base confirm places nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    // A second file whose overlay reveals os=windows repo-wide, but config.toml
+    // itself has no os=windows overlay, so that fall-through machine makes the
+    // pick's cross-configuration confirm fire.
+    try writeRepo(io, &tmp, "repo/src/other.toml", "x = 1\n");
+    try writeRepo(io, &tmp, "repo/src/other.toml.d/os=windows.toml", "x = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // [p] then base (candidate 1), then decline the confirm with n.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\nn\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // Nothing was placed anywhere: base, the winning overlay, and the
+    // fall-through sibling's file all stay byte-identical to their originals.
+    try std.testing.expectEqualStrings("theme = \"light\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    try std.testing.expectEqualStrings("x = 2\n", try read(io, a, try h.srcOf("other.toml.d/os=windows.toml")));
 }
