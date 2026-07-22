@@ -44,6 +44,7 @@ const prompt = @import("prompt.zig");
 const scope = @import("scope.zig");
 const style = @import("style.zig");
 const mox = @import("../root.zig");
+const commit_struct = @import("commit_struct.zig");
 
 const Io = std.Io;
 const Segment = mox.provenance.map.Segment;
@@ -75,6 +76,26 @@ const RowEdit = struct {
     stem: []const u8,
     row: u32,
     fields: []const Field,
+};
+
+/// A pending structured key-path edit to one source layer of a Cat-A file.
+/// Applied via `commit_struct.applyToLayer` in the write phase (deferred like
+/// every other route, so abort writes nothing); its `layer_abs` is backed up in
+/// `routed_orig` for rollback.
+const StructEdit = struct {
+    format: commit_struct.Format,
+    layer_abs: []const u8,
+    change: commit_struct.KeyPathChange,
+};
+
+/// Result of `simulateStructImpact`: which repo-wide configurations a placement
+/// changes, plus the pre/post-edit compose of every configuration (index-
+/// aligned with the `configs` slice) so the pick confirm can show the key's
+/// value before and after.
+const StructImpact = struct {
+    affected: []const []const u8,
+    before: impact.Snapshot,
+    after: impact.Snapshot,
 };
 
 /// The routing decision for a single hunk. `shared` on a line route marks a
@@ -140,6 +161,8 @@ const RunAccum = struct {
     fact_owners: *std.ArrayList(usize),
     synth_plans: *std.ArrayList(SynthDecision),
     synth_owners: *std.ArrayList(usize),
+    struct_edits: *std.ArrayList(StructEdit),
+    struct_owners: *std.ArrayList(usize),
     affected: []bool,
     allowed: []std.StringHashMap(void),
     manual_hunks: []usize,
@@ -420,12 +443,14 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     var row_edits: std.ArrayList(RowEdit) = .empty;
     var fact_edits: std.ArrayList(FactEdit) = .empty;
     var synth_plans: std.ArrayList(SynthDecision) = .empty;
+    var struct_edits: std.ArrayList(StructEdit) = .empty;
     // Index of the managed file each pending edit was routed from, so a file
     // whose routing verification fails can restore exactly the sources it wrote.
     var line_owners: std.ArrayList(usize) = .empty;
     var row_owners: std.ArrayList(usize) = .empty;
     var fact_owners: std.ArrayList(usize) = .empty;
     var synth_owners: std.ArrayList(usize) = .empty;
+    var struct_owners: std.ArrayList(usize) = .empty;
     const affected = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(affected, false);
     // Per-file set of configuration labels the user chose to affect;
@@ -470,6 +495,8 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         .fact_owners = &fact_owners,
         .synth_plans = &synth_plans,
         .synth_owners = &synth_owners,
+        .struct_edits = &struct_edits,
+        .struct_owners = &struct_owners,
         .affected = affected,
         .allowed = allowed,
         .manual_hunks = manual_hunks,
@@ -529,6 +556,29 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             },
             else => return e,
         };
+
+        // A Cat-A file that merged overlays routes by key path over the
+        // REPO-WIDE configuration space (a fall-through machine another file's
+        // overlay reveals must be seen), so its FileSpace carries the repo-wide
+        // configs. Stashing it in spaces[fidx] means baseline, snapshot, and the
+        // guard all verify this file over that space with no guard-loop change.
+        if (commit_struct.formatOfPath(file.source_base_path)) |sf| {
+            if (containsOverlayOrigin(prov.segments)) {
+                spaces[fidx] = try structFileSpace(ctx.alloc, ctx.io, &bindings, file, context.paths.repo_dir);
+                switch (try processStructFile(&cc, &ra, file, fidx, spaces[fidx].?, sf, last_content, live)) {
+                    .cont => {},
+                    .abort => {
+                        aborted = true;
+                        break :files;
+                    },
+                    .abort_strict => {
+                        strict_abort = true;
+                        break :files;
+                    },
+                }
+                continue;
+            }
+        }
 
         // Built once per file (from ITS OWN source, never a published
         // census) and reused across every hunk below.
@@ -671,6 +721,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try addBackup(ctx.alloc, ctx.io, &bs, sd.base_abs);
             try addBackup(ctx.alloc, ctx.io, &bs, sd.plan.fragment_path);
         }
+        for (struct_edits.items, struct_owners.items) |e, owner| {
+            if (owner == fidx) try addBackup(ctx.alloc, ctx.io, &bs, e.layer_abs);
+        }
         routed_orig[fidx] = try bs.toOwnedSlice(ctx.alloc);
     }
 
@@ -733,6 +786,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try mox.classify.synth.materialize(ctx.alloc, ctx.io, base_abs, base_content, plans.items);
     }
     try applyCouplingEdits(ctx.alloc, ctx.io, coupling_edits);
+    // Struct edits touch source layers, independent of facts; sequential
+    // applyToLayer calls on the same layer accumulate correctly because each
+    // re-reads the file.
+    for (struct_edits.items) |e| {
+        try commit_struct.applyToLayer(ctx.alloc, ctx.io, e.format, e.layer_abs, e.change);
+    }
     try applyFactEdits(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items);
     // A fact write changes what `<machine.X>` interpolation resolves to for
     // EVERY file recomposed below, this routed file included: re-capture so
@@ -1302,6 +1361,380 @@ fn buildCouplingGraph(arena: std.mem.Allocator, io: Io, tree: mox.source.tree.Ma
         try inputs.append(arena, .{ .id = file.source_base_abs, .content = content });
     }
     return mox.coupling.index.build(arena, inputs.items);
+}
+
+/// Whether any provenance segment came from a structural merge (`.overlay`).
+/// This is the exact set that routes to manual today, and the set the
+/// key-path flow takes over.
+fn containsOverlayOrigin(segments: []const Segment) bool {
+    for (segments) |s| {
+        if (s.origin == .overlay) return true;
+    }
+    return false;
+}
+
+/// The configurations `file`'s edits can affect, over the REPO-WIDE value
+/// space. `axes.ofFileOverTree` gives the file's own compared axis NAMES, each
+/// carrying the repo-wide value SET (`axes.ofTree` unions every axis value
+/// referenced across ALL source files -- every `.d/` overlay tuple and every
+/// when/where expression). So a machine revealed only by another file's
+/// overlay (an `os=linux` a sibling declares) is in this file's space, while an
+/// axis no file references is not a phantom dimension. The per-file space
+/// alone would miss such a fall-through machine, so a structured promote must
+/// enumerate this way to be sound.
+fn structConfigs(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: mox.source.tree.ManagedFile,
+    this_bindings: *const std.StringHashMap([]const u8),
+    repo_dir: []const u8,
+) ![]const Configuration {
+    const ax = try mox.source.axes.ofFileOverTree(arena, io, file, repo_dir);
+    return config_space.enumerate(arena, this_bindings, ax);
+}
+
+/// A `FileSpace` for a structured file whose `.configs` is the REPO-WIDE set.
+/// Stashed into `spaces[fidx]` so every guard step (`baseline`, the post-write
+/// `snapshot`, `firstViolation`) verifies this file over the repo-wide space.
+/// `.ax` is the file's own axes; the structured route never reads it (only the
+/// line-hunk `candidates.compute` does), but it keeps the field well-formed.
+fn structFileSpace(
+    arena: std.mem.Allocator,
+    io: Io,
+    this_bindings: *const std.StringHashMap([]const u8),
+    file: mox.source.tree.ManagedFile,
+    repo_dir: []const u8,
+) !FileSpace {
+    return .{
+        .ax = try mox.source.axes.ofFile(arena, io, file),
+        .configs = try structConfigs(arena, io, file, this_bindings, repo_dir),
+    };
+}
+
+/// The parsed source layers of a structured file, least-specific-first (the
+/// composer's fold order), so `resolveLayer` sees base at index 0 then overlays
+/// in increasing specificity. Re-reads exactly the layer set the composer
+/// merged for this machine's bindings.
+fn structLayers(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: mox.source.tree.ManagedFile,
+    bindings: *const std.StringHashMap([]const u8),
+    format: commit_struct.Format,
+) ![]const commit_struct.StructLayer {
+    const paths = try mox.compose.catA.matchingLayerPaths(arena, file, bindings);
+    var out: std.ArrayList(commit_struct.StructLayer) = .empty;
+    for (paths) |p| {
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(max_file_bytes));
+        try out.append(arena, .{
+            .path = p,
+            .is_base = file.has_base and std.mem.eql(u8, p, file.source_base_abs),
+            .value = try commit_struct.parseLayer(arena, format, bytes),
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Restore a layer file to `original` (its pre-simulation bytes), or delete it
+/// when it did not exist before. Used to revert `simulateStructImpact`'s
+/// transient write.
+fn restoreLayerBytes(io: Io, path: []const u8, original: ?[]const u8) !void {
+    if (original) |bytes| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    } else {
+        Io.Dir.cwd().deleteFile(io, path) catch {};
+    }
+}
+
+/// One placement's full effect over the REPO-WIDE `configs`: transiently apply
+/// every edit in `edits` (the write at the chosen layer plus its surgical
+/// override deletions), snapshot each configuration's compose before and after,
+/// then restore every touched layer to its pre-simulation bytes -- so the tree
+/// is byte-identical afterward. Returns the changed configuration labels and
+/// both snapshots (the pick confirm renders the key's before/after value from
+/// them). Used for both `affected_winner` (the winner write alone) and
+/// `affected_pick` (the full pick), whose set difference is the `extra` a pick
+/// reaches beyond the plain `[y]`.
+fn simulateStructImpact(
+    cc: *const ClassCtx,
+    file: mox.source.tree.ManagedFile,
+    edits: []const StructEdit,
+    configs: []const Configuration,
+) !StructImpact {
+    const arena = cc.arena;
+    const io = cc.io;
+
+    // Each DISTINCT touched layer's pre-simulation bytes, captured once (null
+    // when the layer did not exist: a fresh overlay the placement creates).
+    // Several edits may touch one layer, so restore keys on the path, not on
+    // the edit.
+    var origs: std.StringHashMap(?[]const u8) = .init(arena);
+    for (edits) |e| {
+        if (origs.contains(e.layer_abs)) continue;
+        const cur: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, e.layer_abs, arena, .limited(max_file_bytes)) catch |er| switch (er) {
+            error.FileNotFound => null,
+            else => return er,
+        };
+        try origs.put(e.layer_abs, cur);
+    }
+
+    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
+
+    var apply_err: ?anyerror = null;
+    for (edits) |e| {
+        commit_struct.applyToLayer(arena, io, e.format, e.layer_abs, e.change) catch |er| {
+            apply_err = er;
+            break;
+        };
+    }
+    const after = if (apply_err == null)
+        impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |er| blk: {
+            apply_err = er;
+            break :blk before;
+        }
+    else
+        before;
+
+    // Restore every touched layer unconditionally, even on error, so a failed
+    // simulation never leaves a partial write behind.
+    var it = origs.iterator();
+    while (it.next()) |kv| try restoreLayerBytes(io, kv.key_ptr.*, kv.value_ptr.*);
+
+    if (apply_err) |er| return er;
+
+    const imp = try impact.impact(arena, configs, before, after);
+    return .{ .affected = imp.affected, .before = before, .after = after };
+}
+
+/// Per-key-change diff line for the prompt/report: the key path and its new
+/// value or removal, plus the resolved route label.
+fn printKeyChange(sty: style.Style, out: *Io.Writer, change: commit_struct.KeyPathChange, label: []const u8) !void {
+    try out.writeAll("    ");
+    for (change.path, 0..) |seg, i| {
+        if (i > 0) try out.writeAll(".");
+        try out.writeAll(seg);
+    }
+    if (change.removed) {
+        try sty.red(out);
+        try out.writeAll("  (removed)");
+        try sty.close(out);
+    }
+    try sty.dim(out);
+    try out.print("  ->  {s}\n", .{label});
+    try sty.close(out);
+}
+
+/// Route a structured (Cat-A merged) file's hand-edits back into their source
+/// layers. Each changed key path is one prompt item: `[y]` writes it to the
+/// winning layer, `[p]` picks a layer, `[s]` leaves it. An un-routable key
+/// (interpolation/secret-derived, or a multi-layer removal) is reported and
+/// left. Every accepted edit is deferred to the write phase and passes through
+/// the recompose-verify guard.
+fn processStructFile(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    space: FileSpace,
+    format: commit_struct.Format,
+    last_content: []const u8,
+    live: []const u8,
+) !HunkOutcome {
+    const changes = commit_struct.changedKeyPaths(cc.arena, format, last_content, live) catch |e| switch (e) {
+        error.Unrepresentable => {
+            // A same-length array reorder has no stable key-path identity.
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            try cc.stdout.print("  manual: {s} (a reordered array cannot be routed by key)\n", .{file.live_path});
+            return .cont;
+        },
+        else => return e,
+    };
+    if (changes.len == 0) return .cont;
+    // A manual (un-routable) key and a user `[s]` skip are both "explained"
+    // mismatches (see `recordStructPlacement`'s doc comment): the file must
+    // still pass through the recompose-verify guard so either one leaves it
+    // correctly reported as uncommitted, rather than silently ignored the way
+    // an unaffected file is.
+    ra.affected[fidx] = true;
+
+    const layers = try structLayers(cc.arena, cc.io, file, cc.this_bindings, format);
+    const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
+
+    for (changes) |change| {
+        const res = try commit_struct.resolveLayer(cc.arena, format, layers, change);
+        if (res.action == .skip) {
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            try cc.stdout.print("  manual: {s} {s}: {s}\n", .{ file.live_path, try keyPathLabel(cc.arena, change.path), res.skip_reason.? });
+            continue;
+        }
+
+        const winner_label = try structRouteLabel(cc.arena, layers, res, change);
+
+        if (cc.report_mode) {
+            ra.pending.* = true;
+            try cc.stdout.print("  would write {s} {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path) });
+            try printKeyChange(cc.sty, cc.stdout, change, winner_label);
+            continue;
+        }
+
+        var chosen: ?usize = res.target;
+        if (cc.interactive) {
+            try printHunkHeader(cc.stdout, cc.sty, rel, 0, 0, winner_label);
+            try printKeyChange(cc.sty, cc.stdout, change, winner_label);
+            const legend_line = try legend(cc.arena, &struct_choices, 0, cc.sty);
+            switch (try prompt.ask(cc.ask_mode, &struct_choices, 0, legend_line, cc.input, cc.stdout)) {
+                .chosen => |i| switch (i) {
+                    0 => chosen = res.target,
+                    // `pickLayer` returns null when the user declines the pick's
+                    // cross-configuration confirm (or the trailing skip), which
+                    // is a deliberate decline like `[s]`.
+                    1 => chosen = try pickLayer(cc, file, format, layers, res, change, space.configs),
+                    else => chosen = null, // skip
+                },
+                .abort => return .abort,
+                .abort_strict => return .abort_strict,
+                .report_only => unreachable,
+            }
+        }
+
+        if (chosen) |chosen_idx| {
+            try recordStructPlacement(cc, ra, file, fidx, space, format, layers, res, chosen_idx, change);
+            if (!cc.interactive)
+                try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), layers[chosen_idx].path });
+        } else {
+            ra.declined_hunks[fidx] += 1;
+        }
+    }
+    return .cont;
+}
+
+/// The edits a placement of `change` at `layers[chosen]` performs: the write
+/// (or removal) at `chosen`, then a deletion of the key from every layer MORE
+/// SPECIFIC than `chosen` that defines it (the surgical shadow removals, from
+/// `shadowers`). Both the winner simulation (`chosen == res.target`, no
+/// shadowers) and the pick simulation build their edit set through this, so
+/// `affected_winner` and `affected_pick` come from the same construction.
+fn structPickEdits(
+    arena: std.mem.Allocator,
+    format: commit_struct.Format,
+    layers: []const commit_struct.StructLayer,
+    definers: []const usize,
+    chosen: usize,
+    change: commit_struct.KeyPathChange,
+) ![]const StructEdit {
+    var out: std.ArrayList(StructEdit) = .empty;
+    try out.append(arena, .{ .format = format, .layer_abs = layers[chosen].path, .change = change });
+    const shadow = try commit_struct.shadowers(arena, layers, definers, chosen);
+    for (shadow) |sp| {
+        try out.append(arena, .{
+            .format = format,
+            .layer_abs = sp,
+            .change = .{ .path = change.path, .new = null, .removed = true },
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Record a placement of `change`'s key into `layers[chosen_idx]` (plus its
+/// surgical override deletions) as deferred edits, and derive `allowed` from
+/// the ACTUAL edits: `affected_pick` (the winner set plus any confirmed
+/// `extra`) for a `[p]`, or `affected_winner` for a plain `[y]` (whose only
+/// edit is the winner write). The confirm in `pickLayer` is what makes a
+/// promote's `extra` part of what the user chose; the guard rolls back only a
+/// change OUTSIDE this set (an unseen/unconfirmed one).
+fn recordStructPlacement(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    space: FileSpace,
+    format: commit_struct.Format,
+    layers: []const commit_struct.StructLayer,
+    res: commit_struct.Resolution,
+    chosen_idx: usize,
+    change: commit_struct.KeyPathChange,
+) !void {
+    const edits = try structPickEdits(cc.arena, format, layers, res.definers, chosen_idx, change);
+
+    if (space.configs.len > 1) {
+        const imp = try simulateStructImpact(cc, file, edits, space.configs);
+        for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
+    }
+
+    for (edits) |e| {
+        try ra.struct_edits.append(cc.arena, e);
+        try ra.struct_owners.append(cc.arena, fidx);
+    }
+
+    ra.affected[fidx] = true;
+    ra.routed_count.* += 1;
+}
+
+/// The labels in `pick` that are not in `winner`: the configurations a `[p]`
+/// placement reaches BEYOND the plain `[y]` edit -- exactly what the confirm
+/// must list. A configuration with its own override of the key recomposes
+/// identically under both and never appears here.
+fn labelDifference(
+    arena: std.mem.Allocator,
+    pick: []const []const u8,
+    winner: []const []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (pick) |l| {
+        var found = false;
+        for (winner) |w| {
+            if (std.mem.eql(u8, l, w)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) try out.append(arena, l);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// `foo.bar` label for a key path.
+fn keyPathLabel(arena: std.mem.Allocator, path: []const []const u8) ![]const u8 {
+    return std.mem.join(arena, ".", path);
+}
+
+/// Route label for a structured key change: the winning (default) layer, named
+/// as base or its axis tuple.
+fn structRouteLabel(
+    arena: std.mem.Allocator,
+    layers: []const commit_struct.StructLayer,
+    res: commit_struct.Resolution,
+    change: commit_struct.KeyPathChange,
+) ![]const u8 {
+    const target = layers[res.target];
+    const verb = if (change.removed) "remove from" else "write to";
+    if (target.is_base) return std.fmt.allocPrint(arena, "{s} base {s}", .{ verb, target.path });
+    return std.fmt.allocPrint(arena, "{s} {s}", .{ verb, target.path });
+}
+
+/// Layer picker for a structured key change. Task 3 replaces this body with the
+/// full menu (candidate list + cross-configuration confirm); until then a pick
+/// behaves as accepting the winner.
+fn pickLayer(
+    cc: *const ClassCtx,
+    file: mox.source.tree.ManagedFile,
+    format: commit_struct.Format,
+    layers: []const commit_struct.StructLayer,
+    res: commit_struct.Resolution,
+    change: commit_struct.KeyPathChange,
+    configs: []const Configuration,
+) !?usize {
+    _ = cc;
+    _ = file;
+    _ = format;
+    _ = layers;
+    _ = change;
+    _ = configs;
+    return res.target;
 }
 
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks

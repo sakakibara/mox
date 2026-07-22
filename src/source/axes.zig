@@ -224,6 +224,27 @@ pub fn ofFile(arena: std.mem.Allocator, io: Io, file: source.tree.ManagedFile) !
     return ax;
 }
 
+/// `file`'s own compared axis NAMES, each carrying the REPO-WIDE value SET
+/// seen anywhere under `repo_dir` (`ofTree`) rather than just what `file`
+/// itself names. A machine revealed only by another file's overlay (an
+/// `os=linux` a sibling declares) enters the space this way, while an axis no
+/// file references stays out -- no phantom dimension. Used to enumerate the
+/// blast radius of a structured (Cat-A merged) file's key-path edit, which
+/// must be sound over the whole repo, not just this file's own directives.
+pub fn ofFileOverTree(arena: std.mem.Allocator, io: Io, file: source.tree.ManagedFile, repo_dir: []const u8) !Axes {
+    const file_ax = try ofFile(arena, io, file);
+    const tree_ax = try ofTree(arena, io, repo_dir);
+
+    var ax = initAxes(arena);
+    var it = file_ax.compared.keyIterator();
+    while (it.next()) |name| {
+        try ax.compared.put(name.*, {});
+        try ax.names.put(name.*, {});
+        if (tree_ax.valuesOf.get(name.*)) |list| try ax.valuesOf.put(name.*, list);
+    }
+    return ax;
+}
+
 test "ofFile: a value comparison makes an axis; a presence test does not" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

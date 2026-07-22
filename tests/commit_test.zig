@@ -2328,3 +2328,80 @@ test "commit: an unmanaged path argument exits non-zero reporting not managed, c
     // Untouched: the edit is still only in the live file.
     try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.srcOf(".zshrc")));
 }
+
+test "commit: structured overlay-won key routes [y] to the winning overlay layer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    const apply_res = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), apply_res.rc);
+
+    // Composed live: theme won by the darwin overlay (dark), font from base.
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // The edit landed in the winning overlay, not the base.
+    try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    try std.testing.expectEqualStrings("theme = \"light\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), st.rc);
+}
+
+test "commit: structured key [s] skip leaves the source untouched and the file uncommitted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "s\n");
+    // A skipped key stays only in live: the file is not committed (rc 1).
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+}
+
+test "commit: structured new key [y] routes to the base layer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    // Append a brand-new key that no layer defines.
+    const cur = try read(io, a, live);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = try std.fmt.allocPrint(a, "{s}font = \"mono\"\n", .{cur}) });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    // The new key lands in the base, not the overlay.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "font = \"mono\"") != null);
+    try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+}
