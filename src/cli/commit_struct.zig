@@ -1159,6 +1159,76 @@ test "applyToLayer: ini absent layer file is created with just that key" {
     try testing.expectEqualStrings("1", reparsed.section.findValue("x").?.string);
 }
 
+test "applyToLayer: ini add of a whole new section materializes it and keeps prior content" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "top=1\n" });
+
+    // A section that exists only on the composed side is diffed to a whole
+    // `.section` value at the section's path (see walkIni).
+    var entries = [_]ini.value.Entry{
+        .{ .key = "name", .value = .{ .string = "alice" } },
+        .{ .key = "email", .value = .{ .string = "a@b.c" } },
+    };
+    var sec = ini.Section{ .entries = entries[0..] };
+    try applyToLayer(a, io, .ini, path, .{
+        .path = &.{"user"},
+        .new = .{ .ini = .{ .section = &sec } },
+        .removed = false,
+    });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .generic });
+    try testing.expectEqualStrings("1", reparsed.section.findValue("top").?.string);
+    const user = reparsed.section.findValue("user").?.section;
+    try testing.expectEqualStrings("alice", user.findValue("name").?.string);
+    try testing.expectEqualStrings("a@b.c", user.findValue("email").?.string);
+}
+
+test "applyToLayer: ini removed=true on a section path deletes the whole section" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "top=1\n[user]\nname=alice\n" });
+
+    try applyToLayer(a, io, .ini, path, .{ .path = &.{"user"}, .new = null, .removed = true });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try ini.parse(a, out, .{ .dialect = .generic });
+    try testing.expect(reparsed.section.findValue("user") == null);
+    try testing.expectEqualStrings("1", reparsed.section.findValue("top").?.string);
+}
+
+test "applyToLayer: toml removed=true on a table path deletes the whole table" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const path = try layerPath(a, io, &tmp, "base.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "top = 1\n\n[user]\nname = \"alice\"\n" });
+
+    try applyToLayer(a, io, .toml, path, .{ .path = &.{"user"}, .new = null, .removed = true });
+
+    const out = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_layer_bytes));
+    const reparsed = try toml.parse(a, out, .{});
+    try testing.expect(reparsed.table.get("user") == null);
+    try testing.expectEqual(@as(i64, 1), reparsed.table.get("top").?.integer);
+}
+
 test "applyToLayer: gitconfig nested subsection change sets the key under the gitconfig dialect" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});

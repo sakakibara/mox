@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .toml = .{
-            .url = "https://github.com/sakakibara/toml-zig/archive/refs/tags/v0.5.0.tar.gz",
-            .hash = "toml-0.5.0-L7MJe1BuCwANO7N-HPazwrVEj0nnPu0l2Mcm_p-e1ATd",
+            .url = "https://github.com/sakakibara/toml-zig/archive/refs/tags/v0.6.0.tar.gz",
+            .hash = "toml-0.6.0-L7MJe3OzCwA3XOqr_osjlm3RKU-wMgeeap3oKpgdfuYw",
         },
         .json = .{
             .url = "https://github.com/sakakibara/json-zig/archive/refs/tags/v0.3.0.tar.gz",
@@ -25,8 +25,8 @@
             .hash = "env-0.1.1-sTEXsnNyAADkVRj6KAJjvfbgZQZVq56Rg2I4CoTy63sG",
         },
         .ini = .{
-            .url = "https://github.com/sakakibara/ini-zig/archive/refs/tags/v0.4.0.tar.gz",
-            .hash = "ini-0.4.0-_bxUWT-yCQB34_0AJu2uKWwPZo7L6BVsmUZG2ueljtMD",
+            .url = "https://github.com/sakakibara/ini-zig/archive/refs/tags/v0.5.0.tar.gz",
+            .hash = "ini-0.5.0-_bxUWVyGCgCgm7ie1QwWln9XtwRzoJ7vsm5ktdUAoF1O",
         },
     },
     .paths = .{
