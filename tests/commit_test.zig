@@ -2379,6 +2379,57 @@ test "commit: structured key [s] skip leaves the source untouched and the file u
     // A skipped key stays only in live: the file is not committed (rc 1).
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+
+    // `processStructFile` marks the file affected the instant a key changes,
+    // even a skipped one, so it still reaches the recompose-verify guard --
+    // but nothing was actually routed, so the guard must not report this file
+    // as committed: no "committed" line, no phantom "routed" count, and no
+    // instruction to run 'mox apply' to discard edits that were never written.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 0 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) were declined") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "run 'mox apply'") == null);
+}
+
+test "commit: a routed structured key still commits when the same file has a skipped key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    // Two independently routable keys: the overlay-won `theme` and the
+    // base-only `font`. One is accepted, the other skipped.
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+    try editLive(io, a, live, "\"mono\"", "\"sans\"");
+
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "y\ns\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // Exactly one of the two keys made it into its source layer; the other
+    // stays only in live.
+    const overlay = try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml"));
+    const base = try read(io, a, try h.srcOf("config.toml"));
+    const theme_routed = std.mem.indexOf(u8, overlay, "solarized") != null;
+    const font_routed = std.mem.indexOf(u8, base, "sans") != null;
+    try std.testing.expect(theme_routed != font_routed);
+
+    // A real routed edit exists for this file, so the guard's mixed-file
+    // reporting -- "committed", the routed count, and the "run 'mox apply' to
+    // discard them" wording -- still applies exactly as it does for a
+    // partially-declined line-hunk file.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled, 0 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) were declined") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "run 'mox apply' to discard them") != null);
 }
 
 test "commit: structured new key [y] routes to the base layer" {

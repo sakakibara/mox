@@ -884,28 +884,61 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             // drift.
             const explained = manual_hunks[fidx] + declined_hunks[fidx];
             if (explained > 0) {
+                // `ra.affected[fidx]` is forced true for a structured file the
+                // instant any key changes (see `processStructFile`'s doc
+                // comment), even when every key ends up manual or declined and
+                // nothing was ever routed. `routed_orig[fidx]` holds a backup
+                // per actually-routed edit owned by this file, so its emptiness
+                // is the real "was anything committed" signal -- distinct from
+                // `explained > 0`, which only says the mismatch is accounted
+                // for.
+                const has_routed = routed_orig[fidx].len > 0;
                 if (manual_hunks[fidx] > 0 and declined_hunks[fidx] > 0) {
-                    try ctx.err.print(
-                        "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
-                            "in the live file; the routed edits were committed to the sources -- edit the rest in by hand, " ++
-                            "then run 'mox apply'\n",
-                        .{ file.live_path, manual_hunks[fidx], declined_hunks[fidx] },
-                    );
+                    if (has_routed) {
+                        try ctx.err.print(
+                            "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
+                                "in the live file; the routed edits were committed to the sources -- edit the rest in by hand, " ++
+                                "then run 'mox apply'\n",
+                            .{ file.live_path, manual_hunks[fidx], declined_hunks[fidx] },
+                        );
+                    } else {
+                        try ctx.err.print(
+                            "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
+                                "in the live file; not committed\n",
+                            .{ file.live_path, manual_hunks[fidx], declined_hunks[fidx] },
+                        );
+                    }
                 } else if (manual_hunks[fidx] > 0) {
-                    try ctx.err.print(
-                        "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; " ++
-                            "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n",
-                        .{ file.live_path, manual_hunks[fidx] },
-                    );
+                    if (has_routed) {
+                        try ctx.err.print(
+                            "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; " ++
+                                "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n",
+                            .{ file.live_path, manual_hunks[fidx] },
+                        );
+                    } else {
+                        try ctx.err.print(
+                            "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; not committed\n",
+                            .{ file.live_path, manual_hunks[fidx] },
+                        );
+                    }
                 } else {
-                    try ctx.err.print(
-                        "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; " ++
-                            "the routed edits were committed to the sources -- run 'mox apply' to discard them\n",
-                        .{ file.live_path, declined_hunks[fidx] },
-                    );
+                    if (has_routed) {
+                        try ctx.err.print(
+                            "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; " ++
+                                "the routed edits were committed to the sources -- run 'mox apply' to discard them\n",
+                            .{ file.live_path, declined_hunks[fidx] },
+                        );
+                    } else {
+                        try ctx.err.print(
+                            "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; not committed\n",
+                            .{ file.live_path, declined_hunks[fidx] },
+                        );
+                    }
                 }
-                try ctx.out.print("  committed {s}\n", .{file.live_path});
-                committed_count += 1;
+                if (has_routed) {
+                    try ctx.out.print("  committed {s}\n", .{file.live_path});
+                    committed_count += 1;
+                }
                 continue;
             }
             // Nothing explains the difference away: either a narrowing the tool
