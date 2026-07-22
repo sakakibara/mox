@@ -2456,3 +2456,97 @@ test "commit: structured new key [y] routes to the base layer" {
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "font = \"mono\"") != null);
     try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
 }
+
+test "commit: structured [p] to base promotes the key and drops the overriding entry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // [p] then candidate 1 (base).
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // Base now holds the promoted value; the overriding overlay entry is gone.
+    try std.testing.expectEqualStrings("theme = \"solarized\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), st.rc);
+}
+
+test "commit: structured [p] to a middle layer places there and deletes the more specific override" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin+profile=work.toml", "theme = \"work\"\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"work\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"work\"", "\"solarized\"");
+
+    // Layers listed least-specific-first: [1]=base, [2]=os=darwin, [3]=os=darwin+profile=work.
+    // Pick [2] (the os=darwin overlay, a middle layer).
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n2\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    // The more specific override was deleted so the middle placement surfaces.
+    try std.testing.expectEqualStrings("", try read(io, a, try h.srcOf("config.toml.d/os=darwin+profile=work.toml")));
+    try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
+}
+
+test "SCRATCH: pick to base confirms only the fall-through sibling, never the one with its own override" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    // Sibling WITH its own override: must recompose identically regardless of
+    // what happens to base or darwin's entry, so it must never appear in extra.
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"linux-theme\"\n");
+    // A second file whose overlay reveals os=windows repo-wide, but config.toml
+    // itself has no os=windows overlay, so that sibling falls through to base
+    // and MUST appear in extra when base's theme value changes.
+    try writeRepo(io, &tmp, "repo/src/other.toml", "x = 1\n");
+    try writeRepo(io, &tmp, "repo/src/other.toml.d/os=windows.toml", "x = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // [p] then base (candidate 1), then confirm y.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\ny\n");
+    std.debug.print("RC={d}\nOUT=\n{s}\nERR=\n{s}\n", .{ res.rc, res.out, res.err });
+
+    try std.testing.expectEqualStrings("theme = \"solarized\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    // The sibling with its own override must be byte-identical: untouched.
+    try std.testing.expectEqualStrings("theme = \"linux-theme\"\n", try read(io, a, try h.srcOf("config.toml.d/os=linux.toml")));
+
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=windows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=linux") == null);
+}

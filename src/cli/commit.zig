@@ -1749,9 +1749,21 @@ fn structRouteLabel(
     return std.fmt.allocPrint(arena, "{s} {s}", .{ verb, target.path });
 }
 
-/// Layer picker for a structured key change. Task 3 replaces this body with the
-/// full menu (candidate list + cross-configuration confirm); until then a pick
-/// behaves as accepting the winner.
+/// A pick reaching configurations beyond the plain `[y]` edit takes one
+/// confirm before it is placed; the default is `n` so an un-answered prompt
+/// (or `--yes`, which never reaches here) does not promote.
+const confirm_choices = [_]prompt.Choice{
+    .{ .key = "y", .label = "yes", .help = "apply the pick, changing the configurations listed above" },
+    .{ .key = "n", .label = "no", .help = "do not place this key" },
+};
+
+/// Present the layer picker for a structured key change: base and each
+/// applicable overlay, the current winner marked, each shadowed candidate
+/// annotated with the override entries a placement there deletes. When the
+/// chosen layer changes configurations BEYOND the plain `[y]` edit, list those
+/// with the key's before/after value and take one confirm. Returns the chosen
+/// layer index, or null to skip (the trailing skip, an abort, or a declined
+/// confirm -- all deliberate declines of this key).
 fn pickLayer(
     cc: *const ClassCtx,
     file: mox.source.tree.ManagedFile,
@@ -1761,13 +1773,96 @@ fn pickLayer(
     change: commit_struct.KeyPathChange,
     configs: []const Configuration,
 ) !?usize {
-    _ = cc;
-    _ = file;
-    _ = format;
-    _ = layers;
-    _ = change;
-    _ = configs;
-    return res.target;
+    try cc.stdout.print("  place {s} in...\n", .{try keyPathLabel(cc.arena, change.path)});
+
+    var choices: std.ArrayList(prompt.Choice) = .empty;
+    for (layers, 0..) |layer, i| {
+        const is_winner = i == res.target;
+        const shadow = try commit_struct.shadowers(cc.arena, layers, res.definers, i);
+        const suffix = if (is_winner)
+            try cc.arena.dupe(u8, "  (current)")
+        else if (shadow.len > 0)
+            try shadowNote(cc.arena, shadow)
+        else
+            try cc.arena.dupe(u8, "");
+        const name = if (layer.is_base)
+            try std.fmt.allocPrint(cc.arena, "base {s}", .{layer.path})
+        else
+            layer.path;
+        try cc.stdout.print("    [{d}] {s}{s}\n", .{ i + 1, name, suffix });
+        const key = try std.fmt.allocPrint(cc.arena, "{d}", .{i + 1});
+        try choices.append(cc.arena, .{ .key = key, .label = name });
+    }
+    // Trailing skip.
+    try choices.append(cc.arena, .{ .key = "s", .label = "skip" });
+
+    const legend_line = try legend(cc.arena, choices.items, res.target, cc.sty);
+    const picked: usize = switch (try prompt.ask(cc.ask_mode, choices.items, res.target, legend_line, cc.input, cc.stdout)) {
+        .chosen => |i| if (i < layers.len) i else return null, // trailing skip
+        .abort => return null,
+        .abort_strict => return null,
+        .report_only => return null,
+    };
+
+    // The winner is identical to `[y]`: no cross-configuration effect to
+    // confirm. Single-config files (no repo-wide sibling) also skip the confirm
+    // because `extra` is necessarily empty.
+    if (picked == res.target or configs.len <= 1) return picked;
+
+    // `extra` = configs the actual pick changes that the plain `[y]` winner
+    // edit does not. A config with its own override of the key is in neither.
+    const winner_edits = try structPickEdits(cc.arena, format, layers, res.definers, res.target, change);
+    const pick_edits = try structPickEdits(cc.arena, format, layers, res.definers, picked, change);
+    const winner_imp = try simulateStructImpact(cc, file, winner_edits, configs);
+    const pick_imp = try simulateStructImpact(cc, file, pick_edits, configs);
+    const extra = try labelDifference(cc.arena, pick_imp.affected, winner_imp.affected);
+    if (extra.len == 0) return picked;
+
+    try cc.stdout.writeAll("  placing here also changes:\n");
+    for (extra) |label| {
+        const ci = configIndex(configs, label) orelse continue;
+        const before_v = try structValueText(cc.arena, format, pick_imp.before.per_config[ci], change.path);
+        const after_v = try structValueText(cc.arena, format, pick_imp.after.per_config[ci], change.path);
+        try cc.stdout.print("    {s}: {s} -> {s}\n", .{ label, before_v, after_v });
+    }
+    const cl = try legend(cc.arena, &confirm_choices, 1, cc.sty);
+    switch (try prompt.ask(cc.ask_mode, &confirm_choices, 1, cl, cc.input, cc.stdout)) {
+        .chosen => |i| return if (i == 0) picked else null,
+        else => return null,
+    }
+}
+
+/// "(removes your override in a.toml, b.toml)" annotation for a shadowed
+/// candidate: the overrides a placement there deletes on THIS machine.
+fn shadowNote(arena: std.mem.Allocator, shadow: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "  (removes your override in ");
+    for (shadow, 0..) |p, i| {
+        if (i > 0) try out.appendSlice(arena, ", ");
+        try out.appendSlice(arena, p);
+    }
+    try out.append(arena, ')');
+    return out.toOwnedSlice(arena);
+}
+
+/// Index of the configuration labelled `label`, or null when none matches.
+fn configIndex(configs: []const Configuration, label: []const u8) ?usize {
+    for (configs, 0..) |c, i| {
+        if (std.mem.eql(u8, c.label, label)) return i;
+    }
+    return null;
+}
+
+/// The key's display value in one configuration's compose, or a marker when the
+/// file is gated off (null bytes) or the key is absent there.
+fn structValueText(
+    arena: std.mem.Allocator,
+    format: commit_struct.Format,
+    bytes: ?[]const u8,
+    path: []const []const u8,
+) ![]const u8 {
+    const b = bytes orelse return "(absent)";
+    return (try commit_struct.displayAt(arena, format, b, path)) orelse "(absent)";
 }
 
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks

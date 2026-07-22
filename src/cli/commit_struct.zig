@@ -655,6 +655,85 @@ fn hasCapture(s: []const u8) bool {
     return false;
 }
 
+/// Render the scalar at `path` in `bytes` (parsed under `format`) as a short
+/// display string for the pick confirm's before/after column, or null when the
+/// path is absent. A non-scalar leaf (a table or array) renders as a bracketed
+/// kind rather than a whole subtree.
+pub fn displayAt(arena: std.mem.Allocator, format: Format, bytes: []const u8, path: []const []const u8) !?[]const u8 {
+    const v = try parseLayer(arena, format, bytes);
+    return switch (format) {
+        .toml => tomlDisplay(arena, v.toml, path),
+        .json => jsonDisplay(arena, v.json, path),
+        .yaml => yamlDisplay(arena, v.yaml, path),
+        .ini, .gitconfig => iniDisplay(arena, v.ini, path),
+    };
+}
+
+fn tomlDisplay(arena: std.mem.Allocator, value: toml.Value, path: []const []const u8) !?[]const u8 {
+    var cur = value;
+    for (path) |seg| {
+        if (cur != .table) return null;
+        cur = cur.table.get(seg) orelse return null;
+    }
+    return switch (cur) {
+        .string => |s| s,
+        .integer => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+        .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+        .boolean => |b| if (b) "true" else "false",
+        .array => "(array)",
+        .table => "(table)",
+        else => "(value)",
+    };
+}
+
+fn jsonDisplay(arena: std.mem.Allocator, value: json.Value, path: []const []const u8) !?[]const u8 {
+    var cur = value;
+    for (path) |seg| {
+        if (cur != .object) return null;
+        cur = cur.object.get(seg) orelse return null;
+    }
+    return switch (cur) {
+        .string => |s| s,
+        .integer => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+        .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+        .bool => |b| if (b) "true" else "false",
+        .null => "null",
+        .number_raw => |s| s,
+        .array => "(array)",
+        .object => "(object)",
+    };
+}
+
+fn yamlDisplay(arena: std.mem.Allocator, value: yaml.Value, path: []const []const u8) !?[]const u8 {
+    var cur = value;
+    for (path) |seg| {
+        if (cur != .map) return null;
+        cur = yaml.Value.mapGet(cur.map, seg) orelse return null;
+    }
+    return switch (cur) {
+        .string => |s| s,
+        .int => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+        .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+        .bool => |b| if (b) "true" else "false",
+        .null => "null",
+        .seq => "(seq)",
+        .map => "(map)",
+    };
+}
+
+fn iniDisplay(arena: std.mem.Allocator, value: ini.Value, path: []const []const u8) !?[]const u8 {
+    var cur = value;
+    for (path) |seg| {
+        if (cur != .section) return null;
+        cur = cur.section.findValue(seg) orelse return null;
+    }
+    return switch (cur) {
+        .string => |s| s,
+        .list => |l| try std.mem.join(arena, ", ", l),
+        .section => "(section)",
+    };
+}
+
 // ---- tests ----
 
 const testing = std.testing;
@@ -1767,4 +1846,15 @@ test "formatOfPath: recognizes structured formats and rejects others" {
     try testing.expectEqual(Format.ini, formatOfPath("src/app.ini").?);
     try testing.expectEqual(Format.gitconfig, formatOfPath("src/.gitconfig").?);
     try testing.expect(formatOfPath("src/.zshrc") == null);
+}
+
+test "displayAt: renders the leaf scalar, or null when absent" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try testing.expectEqualStrings("dark", (try displayAt(a, .toml, "theme = \"dark\"\nn = 3\n", &.{"theme"})).?);
+    try testing.expectEqualStrings("3", (try displayAt(a, .toml, "theme = \"dark\"\nn = 3\n", &.{"n"})).?);
+    try testing.expect((try displayAt(a, .toml, "theme = \"dark\"\n", &.{"missing"})) == null);
+    try testing.expectEqualStrings("picked", (try displayAt(a, .gitconfig, "[user]\n\tname = picked\n", &.{ "user", "name" })).?);
 }
