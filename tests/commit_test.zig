@@ -2414,13 +2414,11 @@ test "commit: a routed structured key still commits when the same file has a ski
     const res = try h.runWithInput(&.{ "mox", "commit" }, "y\ns\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
-    // Exactly one of the two keys made it into its source layer; the other
-    // stays only in live.
-    const overlay = try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml"));
-    const base = try read(io, a, try h.srcOf("config.toml"));
-    const theme_routed = std.mem.indexOf(u8, overlay, "solarized") != null;
-    const font_routed = std.mem.indexOf(u8, base, "sans") != null;
-    try std.testing.expect(theme_routed != font_routed);
+    // Keys are prompted in document order, so `y` took `theme` and `s` left
+    // `font`. Pinning WHICH key landed is the point: an inversion routing the
+    // skipped key and skipping the accepted one is the bug this guards.
+    try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    try std.testing.expectEqualStrings("theme = \"light\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
 
     // A real routed edit exists for this file, so the guard's mixed-file
     // reporting -- "committed", the routed count, and the "run 'mox apply' to
@@ -2727,9 +2725,15 @@ test "commit: structured secret-derived key is skipped, never routed" {
     const live = try h.liveOf("config.toml");
     try editLive(io, a, live, "s3cr3t", "changed");
     const res = try h.run(&.{ "mox", "commit", "--yes" });
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "s3cr3t") == null);
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "changed") == null);
-    _ = res;
+    // The skip happens at the FILE level, before the key-path flow: a
+    // secret-bearing composition is never content-cached, so there is nothing
+    // to diff against. Assert that observable outcome rather than just the
+    // source bytes, which no route was ever in a position to change.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "contains a secret; edit its source directly") != null);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    const src = try read(io, a, try h.srcOf("config.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "changed") == null);
 }
 
 test "commit: a fact route alongside a skip is reported committed, and the skip is not manual" {
