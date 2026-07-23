@@ -2731,6 +2731,37 @@ test "commit: structured secret-derived key is skipped, never routed" {
     _ = res;
 }
 
+test "commit: a source layer rejecting a struct edit rolls that file back, not the run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `foo` is a string in the base and a table in the winning overlay, so a
+    // new `foo.baz` routes to the base and hits a non-container intermediate.
+    try writeRepo(io, &tmp, "repo/src/config.toml", "z = 1\nfoo = \"scalar\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "[foo]\nbar = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export B=2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "z = 1", "z = 2");
+    try editLive(io, a, live, "bar = 1", "bar = 1\nbaz = 2");
+    try editLive(io, a, try h.liveOf(".zshrc"), "export B=2", "export B=22");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    // The `z` edit landed before `foo.baz` was rejected; the file rolls back
+    // whole, so the base is byte-identical rather than half-written.
+    try std.testing.expectEqualStrings("z = 1\nfoo = \"scalar\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "rejected the edit") != null);
+    // The failure is scoped to its own file: an unrelated one still commits.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export B=22") != null);
+}
+
 test "commit: structured capture nested in an array is skipped, never routed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

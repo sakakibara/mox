@@ -789,8 +789,20 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // Struct edits touch source layers, independent of facts; sequential
     // applyToLayer calls on the same layer accumulate correctly because each
     // re-reads the file.
-    for (struct_edits.items) |e| {
-        try commit_struct.applyToLayer(ctx.alloc, ctx.io, e.format, e.layer_abs, e.change);
+    //
+    // A layer that rejects its edit fails only the file that edit was routed
+    // from: the file's remaining edits are abandoned and the verify loop below
+    // restores its sources from `routed_orig`. Letting the error propagate out
+    // of `run` instead would strand every write this phase already made -- this
+    // file's earlier keys and every unrelated file's -- unverified and with the
+    // applied record never advanced.
+    const struct_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
+    @memset(struct_failed, null);
+    for (struct_edits.items, struct_owners.items) |e, owner| {
+        if (struct_failed[owner] != null) continue;
+        commit_struct.applyToLayer(ctx.alloc, ctx.io, e.format, e.layer_abs, e.change) catch |err| {
+            struct_failed[owner] = @errorName(err);
+        };
     }
     try applyFactEdits(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items);
     // A fact write changes what `<machine.X>` interpolation resolves to for
@@ -817,6 +829,16 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         const is_routed = affected[fidx];
         const is_coupling = coupling_only[fidx];
         if (!is_routed and !is_coupling) continue;
+        if (struct_failed[fidx]) |ename| {
+            try ctx.err.print(
+                "mox commit: {s}: a source layer rejected the edit ({s}); not committed\n",
+                .{ file.live_path, ename },
+            );
+            mismatch = true;
+            rolled_back[fidx] = true;
+            try restoreRouted(ctx.io, routed_orig[fidx]);
+            continue;
+        }
         const configs = spaces[fidx].?.configs;
         const file2 = findByLive(tree2, file.live_path) orelse file;
         var prov2: std.ArrayList(Segment) = .empty;
