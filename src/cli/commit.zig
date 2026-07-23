@@ -906,6 +906,23 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             // drift.
             const explained = manual_hunks[fidx] + declined_hunks[fidx];
             if (explained > 0) {
+                // An explained mismatch excuses the file from matching live --
+                // it does NOT excuse it from the cross-configuration check. The
+                // routed edits still stand, so a sibling they change that the
+                // user never chose to affect must roll the file back here just
+                // as it would on the exact-match path below. Skipping it would
+                // disable the backstop for every mixed edit, which is precisely
+                // where a routing bug hides.
+                const after_mixed = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+                if (candidates.firstViolation(configs, baseline[fidx], after_mixed, &allowed[fidx])) |vi| {
+                    rolled_back[fidx] = true;
+                    try restoreRouted(ctx.io, routed_orig[fidx]);
+                    try ctx.err.print(
+                        "mox commit: {s}: routing would change configuration {s}, which you did not choose to affect; not committed\n",
+                        .{ file.live_path, configs[vi].label },
+                    );
+                    continue;
+                }
                 // `ra.affected[fidx]` is forced true for a structured file the
                 // instant any key changes (see `processStructFile`'s doc
                 // comment), even when every key ends up manual or declined and
