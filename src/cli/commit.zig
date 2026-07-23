@@ -1631,9 +1631,40 @@ fn processStructFile(
             try cc.stdout.print("  manual: {s} (a reordered array cannot be routed by key)\n", .{file.live_path});
             return .cont;
         },
-        else => return e,
+        error.OutOfMemory => return e,
+        // A live file the user has broken is that file's problem, not the
+        // run's: report it and leave every other file's routing intact.
+        else => {
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            try cc.stdout.print("  manual: {s} could not be parsed ({s}); edit its source directly\n", .{ file.live_path, @errorName(e) });
+            return .cont;
+        },
     };
-    if (changes.len == 0) return .cont;
+    if (changes.len == 0) {
+        // Live differs from the composed output, but in no key's value: the
+        // drift is a comment, a blank line, or key order, none of which a
+        // structural fold can attribute to a layer. Report it -- dropping it
+        // would claim a clean run while the drift persists and the next apply
+        // discards the edit.
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        try cc.stdout.print("  manual: {s} (comment, blank-line, or ordering drift has no key path)\n", .{file.live_path});
+        return .cont;
+    }
+
+    const layers = structLayers(cc.arena, cc.io, file, cc.this_bindings, format) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            try cc.stdout.print("  manual: {s}: a source layer could not be parsed ({s})\n", .{ file.live_path, @errorName(e) });
+            return .cont;
+        },
+    };
     // A manual (un-routable) key and a user `[s]` skip are both "explained"
     // mismatches (see `recordStructPlacement`'s doc comment): the file must
     // still pass through the recompose-verify guard so either one leaves it
@@ -1641,7 +1672,6 @@ fn processStructFile(
     // an unaffected file is.
     ra.affected[fidx] = true;
 
-    const layers = try structLayers(cc.arena, cc.io, file, cc.this_bindings, format);
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
 
     for (changes, 0..) |change, ki| {

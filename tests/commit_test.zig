@@ -2731,6 +2731,58 @@ test "commit: structured secret-derived key is skipped, never routed" {
     _ = res;
 }
 
+test "commit: structured drift with no key change is reported, never silently dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    const cur = try read(io, a, live);
+    const noted = try std.fmt.allocPrint(a, "# my note\n{s}", .{cur});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = noted });
+
+    // A merged file's comment has no key path. Reporting it as manual is what
+    // keeps `commit` from claiming a clean run while `status` still sees drift.
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "has no key path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    // The drift is still there, and the report is what says so.
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: an unparseable live structured file fails only itself" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export B=2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    try editLive(io, a, try h.liveOf("config.toml"), "\"mono\"", "mono\"");
+    try editLive(io, a, try h.liveOf(".zshrc"), "export B=2", "export B=22");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "could not be parsed") != null);
+    // The broken file does not abandon an unrelated file's routing: without
+    // the per-file catch, the parse error unwound the whole run.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export B=22") != null);
+}
+
 test "commit: a base whose only overlay does not match this machine routes by line" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
