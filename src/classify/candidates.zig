@@ -15,6 +15,7 @@
 const std = @import("std");
 const source = @import("../source/root.zig");
 const config_space = @import("config_space.zig");
+const impact = @import("impact.zig");
 
 const Axes = source.axes.Axes;
 const Configuration = config_space.Configuration;
@@ -86,26 +87,24 @@ pub fn compute(
 /// Index of the first sibling configuration whose composed output changed
 /// between the pre-write `baseline` and post-write `after` snapshots yet was
 /// NOT among the labels the user chose to affect, or null when every change
-/// was intended. Both slices are index-aligned with `configs`; a null entry
-/// means the file is gated off for that configuration.
+/// was intended. Both slices are index-aligned with `configs`.
 pub fn firstViolation(
     configs: []const Configuration,
-    baseline: []const ?[]const u8,
-    after: []const ?[]const u8,
+    baseline: []const impact.ConfigOutput,
+    after: []const impact.ConfigOutput,
     allowed: *const std.StringHashMap(void),
 ) ?usize {
     for (configs, 0..) |cfg, i| {
         if (cfg.is_this_machine) continue;
         if (allowed.contains(cfg.label)) continue;
-        if (differs(baseline[i], after[i])) return i;
+        // A configuration already unable to compose before the edit stays the
+        // repo's pre-existing problem: it is reported separately, and blocking
+        // on it would make every other file uncommittable until it is fixed.
+        // Becoming unable to compose IS this edit's doing, and does block.
+        if (baseline[i].isUncomposable() and after[i].isUncomposable()) continue;
+        if (impact.changedOut(baseline[i], after[i])) return i;
     }
     return null;
-}
-
-fn differs(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return false;
-    if (a == null or b == null) return true;
-    return !std.mem.eql(u8, a.?, b.?);
 }
 
 const testing = std.testing;
@@ -189,9 +188,9 @@ test "firstViolation: flags a changed unaffected configuration, ignores allowed 
     const c1 = Configuration{ .label = "bbbb0001", .bindings = std.StringHashMap([]const u8).init(a), .is_this_machine = false };
     const configs = [_]Configuration{ c0, c1 };
 
-    const baseline = [_]?[]const u8{ "x\n", "y\n" };
+    const baseline = [_]impact.ConfigOutput{ .{ .bytes = "x\n" }, .{ .bytes = "y\n" } };
     // c0 changed and is NOT allowed -> violation at index 0.
-    const after = [_]?[]const u8{ "x-edited\n", "y\n" };
+    const after = [_]impact.ConfigOutput{ .{ .bytes = "x-edited\n" }, .{ .bytes = "y\n" } };
 
     var allowed = std.StringHashMap(void).init(a);
     try testing.expectEqual(@as(?usize, 0), firstViolation(&configs, &baseline, &after, &allowed));

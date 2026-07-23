@@ -763,11 +763,22 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // so verification can prove routing changed only the configurations the
     // user chose. Each file's configuration space was built once, from its
     // own source, when it was first classified above.
-    const baseline = try ctx.alloc.alloc([]const ?[]const u8, tree.files.len);
+    const baseline = try ctx.alloc.alloc([]const impact.ConfigOutput, tree.files.len);
     for (tree.files, 0..) |file, fidx| {
         if (!affected[fidx] and !coupling_only[fidx]) continue;
         const space = spaces[fidx].?;
         baseline[fidx] = (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets)).per_config;
+        // A sibling configuration whose source will not compose cannot be
+        // verified against. Name it, the file, and why -- the guard then holds
+        // it harmless (it was already broken) instead of the run dying on a
+        // bare error that identifies neither the file nor the layer.
+        for (space.configs, baseline[fidx]) |cfg, out| {
+            if (out != .uncomposable) continue;
+            try ctx.err.print(
+                "mox commit: {s}: configuration {s} does not compose ({s}); it cannot be verified -- fix that layer, then re-run\n",
+                .{ file.live_path, cfg.label, out.uncomposable },
+            );
+        }
     }
 
     // Write phase: every prompt is done, so applying now honors the
@@ -2097,14 +2108,19 @@ fn configIndex(configs: []const Configuration, label: []const u8) ?usize {
 }
 
 /// The key's display value in one configuration's compose, or a marker when the
-/// file is gated off (null bytes) or the key is absent there.
+/// file is gated off there, the key is absent, or that configuration's source
+/// will not compose at all.
 fn structValueText(
     arena: std.mem.Allocator,
     format: commit_struct.Format,
-    bytes: ?[]const u8,
+    out: impact.ConfigOutput,
     path: []const []const u8,
 ) ![]const u8 {
-    const b = bytes orelse return "(absent)";
+    const b = switch (out) {
+        .bytes => |b| b,
+        .absent => return "(absent)",
+        .uncomposable => return "(does not compose)",
+    };
     return (try commit_struct.displayAt(arena, format, b, path)) orelse "(absent)";
 }
 

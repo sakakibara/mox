@@ -23,12 +23,26 @@ const ManagedFile = source.tree.ManagedFile;
 const MachineState = machine.state.MachineState;
 const Configuration = config_space.Configuration;
 
+/// What one configuration composed to. A file gated off for a configuration is
+/// a clean ABSENCE; a configuration whose source will not compose at all (a
+/// broken layer only that configuration reads) is UNCOMPOSABLE, which is not a
+/// value and must never be compared as one -- treating it as absence would read
+/// as "the file disappeared for that machine".
+pub const ConfigOutput = union(enum) {
+    bytes: []const u8,
+    absent,
+    uncomposable: []const u8,
+
+    pub fn isUncomposable(self: ConfigOutput) bool {
+        return self == .uncomposable;
+    }
+};
+
 /// Composed output of one file under every simulated configuration, from one
 /// on-disk source state. Entries are index-aligned with the `configs` slice
-/// passed to `snapshot`; null means the file is gated off for that
-/// configuration.
+/// passed to `snapshot`.
 pub const Snapshot = struct {
-    per_config: []const ?[]const u8,
+    per_config: []const ConfigOutput,
     this_machine: ?[]const u8,
 };
 
@@ -53,9 +67,19 @@ pub fn snapshot(
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
 ) !Snapshot {
-    const per = try arena.alloc(?[]const u8, configs.len);
+    const per = try arena.alloc(ConfigOutput, configs.len);
     for (configs, 0..) |cfg, i| {
-        per[i] = try composeOrNull(arena, io, file, &cfg.bindings, m_state, secrets);
+        // A sibling configuration reading a source this machine never composes
+        // can fail on that source alone. That is the repo's problem to report,
+        // not a reason to abandon the caller's whole run, so it is recorded
+        // rather than propagated. This machine's own compose still propagates:
+        // the caller cannot proceed without it.
+        per[i] = if (composeOrNull(arena, io, file, &cfg.bindings, m_state, secrets)) |out|
+            (if (out) |b| ConfigOutput{ .bytes = b } else ConfigOutput.absent)
+        else |e| if (cfg.is_this_machine)
+            return e
+        else
+            ConfigOutput{ .uncomposable = @errorName(e) };
     }
     const this_out = for (configs) |cfg| {
         if (cfg.is_this_machine) break try composeOrNull(arena, io, file, &cfg.bindings, m_state, secrets);
@@ -88,13 +112,24 @@ pub fn impact(
     var affected: std.ArrayList([]const u8) = .empty;
     for (configs, 0..) |cfg, i| {
         if (cfg.is_this_machine) continue;
-        if (changed(before.per_config[i], after.per_config[i]))
+        if (changedOut(before.per_config[i], after.per_config[i]))
             try affected.append(arena, cfg.label);
     }
     return .{
         .affected = try affected.toOwnedSlice(arena),
         .this_machine_changes = changed(before.this_machine, after.this_machine),
     };
+}
+
+/// Whether a configuration's output changed. A configuration that could not
+/// compose on BOTH sides is broken independently of the edit, so it did not
+/// change; one that could not compose on exactly one side did.
+pub fn changedOut(a: ConfigOutput, b: ConfigOutput) bool {
+    if (a.isUncomposable() or b.isUncomposable())
+        return a.isUncomposable() != b.isUncomposable();
+    const ab: ?[]const u8 = if (a == .bytes) a.bytes else null;
+    const bb: ?[]const u8 = if (b == .bytes) b.bytes else null;
+    return changed(ab, bb);
 }
 
 fn changed(a: ?[]const u8, b: ?[]const u8) bool {

@@ -2824,6 +2824,34 @@ test "commit: structured drift with no key change is reported, never silently dr
     try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
 }
 
+test "commit: an unparseable sibling layer is named, and does not stop the commit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    // Broken AFTER apply, and only for a configuration this machine never
+    // composes: os=linux is enumerated for the guard, so its parse error used
+    // to escape as a bare error naming neither the file nor the layer.
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"broken\n");
+    try editLive(io, a, try h.liveOf("config.toml"), "\"dark\"", "\"solarized\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "configuration os=linux does not compose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "TomlParseError") != null);
+    // A configuration already broken before the edit is the repo's problem,
+    // not a reason to refuse an edit that has nothing to do with it.
+    try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+}
+
 test "commit: an unparseable live structured file fails only itself" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
