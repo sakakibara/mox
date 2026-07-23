@@ -110,9 +110,9 @@ fn composeToml(
     // include / from / when. A whole-file gate composes its body structurally.
     // The pass-through preserves comments, blank lines, and key ordering.
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, body, machine_state_opt, secrets, prov, diag);
+        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
         if (containsMoxDirective(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, base, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
     }
 
     // Multi-layer merge: the gate (if any) is already evaluated for the skip;
@@ -125,7 +125,7 @@ fn composeToml(
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try toml.encode(&aw.writer, merged, .{});
-    return interpolate(arena, io, file, aw.written(), machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, aw.written(), machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a `.json` managed file. Mirrors `composeToml`: single layer
@@ -155,9 +155,9 @@ fn composeJson(
     } else null;
 
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, body, machine_state_opt, secrets, prov, diag);
+        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
         if (containsMoxDirectiveJson(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, base, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
     }
 
     var merged: json.Value = try parseJsonFile(arena, io, layers[0]);
@@ -170,7 +170,7 @@ fn composeJson(
     try json.encode(&aw.writer, merged, .{ .indent = 2 });
     // Target files end with a newline, matching the toml composer's output.
     try aw.writer.writeByte('\n');
-    return interpolate(arena, io, file, aw.written(), machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, aw.written(), machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a `.yaml` / `.yml` managed file. Mirrors `composeJson`: single
@@ -199,9 +199,9 @@ fn composeYaml(
     } else null;
 
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, body, machine_state_opt, secrets, prov, diag);
+        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
         if (containsMoxDirective(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, base, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
     }
 
     var merged: yaml.Value = try parseYamlFile(arena, io, layers[0]);
@@ -214,7 +214,7 @@ fn composeYaml(
     // yaml.emit already terminates the document with a trailing newline,
     // matching the toml/json composers' single-newline output convention.
     try yaml.emit(&aw.writer, merged, .{});
-    return interpolate(arena, io, file, aw.written(), machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, aw.written(), machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a gitconfig or INI managed file via raw-line section-merge.
@@ -243,9 +243,9 @@ fn composeSectionMerge(
     } else null;
 
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, body, machine_state_opt, secrets, prov, diag);
+        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
         if (containsMoxDirective(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, base, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
     }
 
     // Raw-line merge preserves comments, so a held gate must be stripped from
@@ -255,7 +255,7 @@ fn composeSectionMerge(
         const overlay = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
         merged = try ini_merge.merge(arena, merged, overlay, dialect);
     }
-    return interpolate(arena, io, file, merged, machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, merged, machine_state_opt, secrets, prov, diag);
 }
 
 /// Heuristic: does `content` contain a `# mox: ...` line? Cheap substring
@@ -306,6 +306,7 @@ fn interpolate(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
+    merged: bool,
     bytes: []const u8,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
@@ -313,7 +314,7 @@ fn interpolate(
     diag: ?*interp.Diag,
 ) !?[]u8 {
     if (machine_state_opt == null) {
-        try recordWhole(arena, prov, bytes, file);
+        try recordWhole(arena, prov, bytes, file, merged);
         return @constCast(bytes);
     }
     const ctx: interp.Ctx = .{
@@ -342,19 +343,23 @@ fn interpolate(
     }
     const result = try out.toOwnedSlice(arena);
     if (secret_seen) {
-        try recordPerLineSecret(arena, prov, result, file, line_secret.items);
+        try recordPerLineSecret(arena, prov, result, file, merged, line_secret.items);
     } else {
-        try recordWhole(arena, prov, result, file);
+        try recordWhole(arena, prov, result, file, merged);
     }
     return result;
 }
 
 /// The non-secret origin a structural Cat A route attributes its output to:
-/// `.base` for a lone base layer, `.overlay` when overlays merged in (line-level
-/// attribution is out of scope for a structural fold, so commit reports such a
-/// hunk as manual).
-fn nonSecretOrigin(file: ManagedFile) prov_mod.map.Origin {
-    return if (file.has_base and file.overlays.len == 0)
+/// `.base` when the output is the base passed through verbatim, `.overlay` when
+/// layers actually merged (line-level attribution is out of scope for a
+/// structural fold, so commit routes such a file by key path instead).
+/// `merged` is whether more than one layer folded, not whether the file
+/// DECLARES overlays: an overlay that does not match this machine contributes
+/// nothing, and a file left composing verbatim from its base still routes by
+/// line.
+fn nonSecretOrigin(file: ManagedFile, merged: bool) prov_mod.map.Origin {
+    return if (file.has_base and !merged)
         .{ .base = .{ .line = 1 } }
     else
         .{ .overlay = .{ .path = if (file.source_base_abs.len > 0) file.source_base_abs else file.source_base_path } };
@@ -369,11 +374,12 @@ fn recordWhole(
     prov: ?*std.ArrayList(Segment),
     bytes: []const u8,
     file: ManagedFile,
+    merged: bool,
 ) !void {
     const p = prov orelse return;
     const n = prov_mod.map.lineCount(bytes);
     if (n == 0) return;
-    try p.append(arena, .{ .out_start = 0, .out_len = n, .origin = nonSecretOrigin(file) });
+    try p.append(arena, .{ .out_start = 0, .out_len = n, .origin = nonSecretOrigin(file, merged) });
 }
 
 /// Attribute an interpolated structural file per line when it carries a secret:
@@ -387,12 +393,13 @@ fn recordPerLineSecret(
     prov: ?*std.ArrayList(Segment),
     bytes: []const u8,
     file: ManagedFile,
+    merged: bool,
     line_secret: []const bool,
 ) !void {
     const p = prov orelse return;
     const n = prov_mod.map.lineCount(bytes);
     if (n == 0) return;
-    const normal = nonSecretOrigin(file);
+    const normal = nonSecretOrigin(file, merged);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const is_secret = i < line_secret.len and line_secret[i];

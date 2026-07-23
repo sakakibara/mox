@@ -2731,6 +2731,31 @@ test "commit: structured secret-derived key is skipped, never routed" {
     _ = res;
 }
 
+test "commit: a base whose only overlay does not match this machine routes by line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The os=linux overlay never folds on darwin, so live is the base passed
+    // through verbatim -- comments and all -- and a comment edit is an ordinary
+    // base line hunk, not a key path.
+    try writeRepo(io, &tmp, "repo/src/config.toml", "# banner\ntheme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"blue\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "# banner", "# banner edited");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("# banner edited\ntheme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("theme = \"blue\"\n", try read(io, a, try h.srcOf("config.toml.d/os=linux.toml")));
+}
+
 test "commit: the pick menu refuses a removal at a layer that does not define the key" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
