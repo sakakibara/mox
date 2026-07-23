@@ -2736,6 +2736,34 @@ test "commit: structured secret-derived key is skipped, never routed" {
     try std.testing.expect(std.mem.indexOf(u8, src, "changed") == null);
 }
 
+test "commit: skipping at the fact prompt is a decline, not an un-routable hunk" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    _ = try h.run(&.{ "mox", "apply" });
+    try editLive(io, a, try h.liveOf(".zshrc"), "export EMAIL=old@home.com", "export EMAIL=new@work.com");
+
+    // The only hunk is the fact one, so this `s` answers the FACT prompt.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "This value comes from machine.email.") != null);
+    // A hunk the user chose to leave is declined, never reported as one the
+    // tool could not route.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "manual: ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "came from a capture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 0 manual") != null);
+    // Nothing was written either way.
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "old@home.com") != null);
+}
+
 test "commit: a fact route alongside a skip is reported committed, and the skip is not manual" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2867,6 +2895,9 @@ test "commit: the pick menu refuses a removal at a layer that does not define th
     const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "unavailable: os=darwin.toml -- does not define it") != null);
+    // No second numbered candidate exists to pick: offering the overlay is
+    // what used to make a removal there abort the run on a raw PathNotFound.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[2]") == null);
     try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
 }
 
@@ -2888,11 +2919,13 @@ test "commit: the pick menu refuses a layer whose entry is interpolated" {
     try editLive(io, a, live, "\"over@x\"", "\"new@x\"");
 
     // The overlay's literal wins, so the edit is routable -- but promoting it
-    // to the base would overwrite the template with this machine's value.
-    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    // to the base would overwrite the template with this machine's value. The
+    // trailing `y` is what makes this drive the hazard rather than the message:
+    // if the base were still offered as [1], that input would confirm the
+    // promote and destroy the template.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\ny\n");
     try std.testing.expect(std.mem.indexOf(u8, res.out, "unavailable: base src/config.toml -- its entry is interpolated") != null);
     try std.testing.expectEqualStrings("email = \"<machine.email>\"\n", try read(io, a, try h.srcOf("config.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "old@home.com") == null);
 }
 
 test "commit: a key the target layer cannot hold is reported, and writes nothing" {

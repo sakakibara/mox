@@ -797,6 +797,40 @@ fn diffOne(arena: std.mem.Allocator, format: Format, live: []const u8, composed:
     return changedKeyPaths(arena, format, live, composed);
 }
 
+/// `capturedAt` at `path` in `bytes` parsed as `format`.
+fn capturedIn(a: std.mem.Allocator, format: Format, bytes: []const u8, path: []const []const u8) !bool {
+    return capturedAt(format, try parseLayer(a, format, bytes), path);
+}
+
+test "capture scan: reaches a nested capture in every format, and spares a literal" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // Each format's container shape differs (toml array/table, json
+    // array/object, yaml seq/map, ini list/section), so each walker is
+    // exercised on a capture nested one level below the named path.
+    try testing.expect(try capturedIn(a, .toml, "hosts = [\"<machine.email>\", \"b\"]\n", &.{"hosts"}));
+    try testing.expect(try capturedIn(a, .toml, "[t]\nk = \"<machine.email>\"\n", &.{"t"}));
+    try testing.expect(try capturedIn(a, .json, "{\"hosts\":[\"<machine.email>\",\"b\"]}", &.{"hosts"}));
+    try testing.expect(try capturedIn(a, .json, "{\"t\":{\"k\":\"<machine.email>\"}}", &.{"t"}));
+    try testing.expect(try capturedIn(a, .yaml, "hosts:\n  - <machine.email>\n  - b\n", &.{"hosts"}));
+    try testing.expect(try capturedIn(a, .yaml, "t:\n  k: <machine.email>\n", &.{"t"}));
+    try testing.expect(try capturedIn(a, .ini, "[t]\nk = <machine.email>\n", &.{"t"}));
+
+    // A leaf capture is still found, and a path that names nothing carries
+    // nothing.
+    try testing.expect(try capturedIn(a, .toml, "k = \"<secret:env:TOK>\"\n", &.{"k"}));
+    try testing.expect(!try capturedIn(a, .toml, "k = \"plain\"\n", &.{"absent"}));
+
+    // An angle-bracket literal is data in every format: it names no
+    // interpolation namespace, so composition passes it through untouched.
+    try testing.expect(!try capturedIn(a, .toml, "authors = [\"Sho <me@example.com>\"]\n", &.{"authors"}));
+    try testing.expect(!try capturedIn(a, .json, "{\"authors\":[\"Sho <me@example.com>\"]}", &.{"authors"}));
+    try testing.expect(!try capturedIn(a, .yaml, "authors:\n  - Sho <me@example.com>\n", &.{"authors"}));
+    try testing.expect(!try capturedIn(a, .ini, "[t]\nauthor = Sho <me@example.com>\n", &.{"t"}));
+}
+
 test "toml diff: scalar change yields one KeyPathChange" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

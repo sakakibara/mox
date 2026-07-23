@@ -811,6 +811,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // of `run` instead would strand every write this phase already made -- this
     // file's earlier keys and every unrelated file's -- unverified and with the
     // applied record never advanced.
+    //
+    // A backstop, not the usual path: `recordStructPlacement` simulates each
+    // placement by applying it for real and restoring, so a layer that will not
+    // take the edit is normally caught at prompt time and reported per key.
+    // Reaching here means the source changed under the run, which no test can
+    // trigger deterministically.
     const struct_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
     @memset(struct_failed, null);
     for (struct_edits.items, struct_owners.items) |e, owner| {
