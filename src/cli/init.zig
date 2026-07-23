@@ -66,6 +66,8 @@ fn dirNonEmpty(io: Io, path: []const u8) !bool {
         else => return e,
     };
     defer dir.close(io);
+    // Raw iterate() is sound here: the result is "does any non-junk entry
+    // exist", independent of the order they are seen.
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (mox.source.junk.isJunk(entry.name)) continue;

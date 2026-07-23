@@ -12,6 +12,7 @@ const std = @import("std");
 const Io = std.Io;
 const write_mod = @import("write.zig");
 const source_path = @import("../source/path.zig");
+const dirent = @import("../source/dirent.zig");
 
 pub const id_len = "YYYYMMDDTHHMMSSZ".len;
 
@@ -115,14 +116,13 @@ pub fn list(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8) ![]cons
     var ids: std.ArrayList([]const u8) = .empty;
     errdefer ids.deinit(arena);
 
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
+    // dirent.sorted gives a total order, so ids come out oldest-first by their
+    // timestamped names -- the order prune relies on to drop the oldest.
+    for (try dirent.sorted(arena, io, dir)) |entry| {
         if (entry.kind != .directory) continue;
-        try ids.append(arena, try arena.dupe(u8, entry.name));
+        try ids.append(arena, entry.name);
     }
-    const out = try ids.toOwnedSlice(arena);
-    std.mem.sort([]const u8, @constCast(out), {}, lessThan);
-    return out;
+    return ids.toOwnedSlice(arena);
 }
 
 /// Delete the oldest snapshots so at most `keep` remain.
@@ -172,6 +172,8 @@ fn restoreDir(
     home: []const u8,
     result: *Restored,
 ) !void {
+    // Raw iterate() is sound here: a restore replays EVERY entry to disk, so
+    // the order it visits them cannot be observed in the result.
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         const rel = if (rel_prefix.len == 0)
@@ -208,10 +210,6 @@ fn restoreDir(
             else => {},
         }
     }
-}
-
-fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
 }
 
 test "saveSymlink + restore round-trips a symlink, not a regular file" {

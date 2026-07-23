@@ -14,6 +14,7 @@ const applied = @import("applied.zig");
 const snapshot = @import("snapshot.zig");
 const ignore_match = @import("../source/ignore/match.zig");
 const source_path = @import("../source/path.zig");
+const dirent = @import("../source/dirent.zig");
 
 /// Bound on how deep an unmanaged subdirectory is walked when snapshotting its
 /// files before removal. A pathologically deep foreign tree stops here rather
@@ -72,8 +73,6 @@ pub fn enforce(
     return result;
 }
 
-const Entry = struct { name: []const u8, kind: Io.File.Kind };
-
 fn enforceOne(
     arena: std.mem.Allocator,
     io: Io,
@@ -92,14 +91,12 @@ fn enforceOne(
     };
     defer dir.close(io);
 
-    // Snapshot the entry list before mutating the directory.
-    var entries: std.ArrayList(Entry) = .empty;
-    var iter = dir.iterate();
-    while (try iter.next(io)) |e| {
-        try entries.append(arena, .{ .name = try arena.dupe(u8, e.name), .kind = e.kind });
-    }
+    // Snapshot the entry list before mutating the directory, in a total order
+    // so a prune reports (and deletes) the same entries in the same sequence on
+    // every machine.
+    const entries = try dirent.sorted(arena, io, dir);
 
-    for (entries.items) |e| {
+    for (entries) |e| {
         if (isManagedChild(dir_live, e.name, managed_live)) continue;
         const live_path = try std.fs.path.join(arena, &.{ dir_live, e.name });
         const rel = try source_path.liveKeyRelToHome(arena, home, live_path);
@@ -238,12 +235,7 @@ fn subtreeHasIgnored(arena: std.mem.Allocator, io: Io, dir_live: []const u8, hom
     var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch return false;
     defer dir.close(io);
 
-    var entries: std.ArrayList(Entry) = .empty;
-    var iter = dir.iterate();
-    while (try iter.next(io)) |e| {
-        try entries.append(arena, .{ .name = try arena.dupe(u8, e.name), .kind = e.kind });
-    }
-    for (entries.items) |e| {
+    for (try dirent.sorted(arena, io, dir)) |e| {
         const child = try std.fs.path.join(arena, &.{ dir_live, e.name });
         const rel = try source_path.liveKeyRelToHome(arena, home, child);
         if (ruleset.isPathIgnored(rel, e.kind == .directory)) return true;
@@ -262,13 +254,8 @@ fn snapshotTree(arena: std.mem.Allocator, io: Io, dir_live: []const u8, opts: Op
     var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch return false;
     defer dir.close(io);
 
-    var names: std.ArrayList(Entry) = .empty;
-    var iter = dir.iterate();
-    while (try iter.next(io)) |e| {
-        try names.append(arena, .{ .name = try arena.dupe(u8, e.name), .kind = e.kind });
-    }
     var complete = true;
-    for (names.items) |e| {
+    for (try dirent.sorted(arena, io, dir)) |e| {
         const child = try std.fs.path.join(arena, &.{ dir_live, e.name });
         switch (e.kind) {
             .file => {

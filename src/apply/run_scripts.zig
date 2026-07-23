@@ -43,6 +43,7 @@ const builtin = @import("builtin");
 const tuple_mod = @import("../source/tuple.zig");
 const match_mod = @import("../compose/match.zig");
 const dsl = @import("../dsl/root.zig");
+const dirent = @import("../source/dirent.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
@@ -126,18 +127,15 @@ pub fn runStage(
 
     var file_names: std.ArrayList([]const u8) = .empty;
     var gated_dirs: std.ArrayList([]const u8) = .empty;
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
+    for (try dirent.sorted(arena, io, dir)) |entry| {
         if (entry.kind == .file) {
-            try file_names.append(arena, try arena.dupe(u8, entry.name));
+            try file_names.append(arena, entry.name);
         } else if (entry.kind == .directory) {
             if (try axisDirMatches(arena, entry.name, bindings)) {
-                try gated_dirs.append(arena, try arena.dupe(u8, entry.name));
+                try gated_dirs.append(arena, entry.name);
             }
         }
     }
-    std.mem.sort([]const u8, file_names.items, {}, lessThan);
-    std.mem.sort([]const u8, gated_dirs.items, {}, lessThan);
 
     var result: Result = .{};
     for (file_names.items) |name| {
@@ -185,12 +183,10 @@ fn runGatedDir(
     defer dir.close(io);
 
     var names: std.ArrayList([]const u8) = .empty;
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
+    for (try dirent.sorted(arena, io, dir)) |entry| {
         if (entry.kind != .file) continue;
-        try names.append(arena, try arena.dupe(u8, entry.name));
+        try names.append(arena, entry.name);
     }
-    std.mem.sort([]const u8, names.items, {}, lessThan);
     for (names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ dir_path, name });
         runOne(arena, io, path, bindings, environ_map, stdout, stderr, result);
@@ -389,10 +385,6 @@ fn directArgv(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     const argv = try arena.alloc([]const u8, 1);
     argv[0] = path;
     return argv;
-}
-
-fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
 }
 
 const testing = std.testing;

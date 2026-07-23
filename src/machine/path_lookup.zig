@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Env = @import("env").Env;
+const dirent = @import("../source/dirent.zig");
 
 const Io = std.Io;
 const Environ = Env;
@@ -58,11 +59,12 @@ pub fn findOnPathFull(
     var dirs = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
     while (dirs.next()) |dir_path| {
         if (dir_path.len == 0) continue;
-        var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
-        defer dir.close(io);
-
-        var it = dir.iterate();
-        while (it.next(io) catch null) |entry| {
+        // Best-effort, like the `openDir` skip above: a PATH dir that will not
+        // enumerate is skipped, not fatal. Sorted so a tie between two names
+        // folding to one command (`git` and `git.exe`) resolves the same way
+        // on every machine, rather than by filesystem order.
+        const entries = dirent.sortedPath(arena, io, dir_path, .{ .iterate = true }) catch continue;
+        for (entries) |entry| {
             if (entry.kind == .directory) continue;
             const folded = try foldName(arena, entry.name);
 

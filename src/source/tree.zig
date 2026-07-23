@@ -3,6 +3,7 @@ const std = @import("std");
 const tuple_mod = @import("tuple.zig");
 const path_mod = @import("path.zig");
 const junk = @import("junk.zig");
+const dirent = @import("dirent.zig");
 const attributes = @import("attributes.zig");
 
 const Io = std.Io;
@@ -262,8 +263,7 @@ fn walkDir(
     defer file_names.deinit(arena);
     defer dir_names.deinit(arena);
 
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
+    for (try dirent.sorted(arena, io, dir)) |entry| {
         if (junk.isJunk(entry.name)) continue;
         if (entry.kind == .sym_link) return error.SymlinkInSource;
         // The exact marker gates its own directory and is never materialized.
@@ -465,8 +465,7 @@ fn enumerateDotD(
     var regions: std.ArrayList(Region) = .empty;
     errdefer regions.deinit(arena);
 
-    var iter = dot_d_dir.iterate();
-    while (try iter.next(io)) |entry| {
+    for (try dirent.sorted(arena, io, dot_d_dir)) |entry| {
         if (junk.isJunk(entry.name)) continue;
         if (entry.kind == .sym_link) return error.SymlinkInSource;
 
@@ -504,8 +503,7 @@ fn enumerateDotD(
 
             var fragments: std.ArrayList(Fragment) = .empty;
             errdefer fragments.deinit(arena);
-            var f_iter = region_dir.iterate();
-            while (try f_iter.next(io)) |f_entry| {
+            for (try dirent.sorted(arena, io, region_dir)) |f_entry| {
                 if (junk.isJunk(f_entry.name)) continue;
                 if (f_entry.kind == .sym_link) return error.SymlinkInSource;
                 if (f_entry.kind != .file) continue;

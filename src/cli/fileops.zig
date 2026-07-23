@@ -64,6 +64,8 @@ pub fn copyTree(io: Io, arena: std.mem.Allocator, src_abs: []const u8, dst_abs: 
         try Io.Dir.cwd().createDirPath(io, dst_abs);
         var dir = try Io.Dir.cwd().openDir(io, src_abs, .{ .iterate = true, .follow_symlinks = false });
         defer dir.close(io);
+        // Raw iterate() is sound here: a copy replays EVERY entry to the
+        // destination, so the order it visits them cannot be observed.
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             const child_src = try std.fs.path.join(arena, &.{ src_abs, entry.name });

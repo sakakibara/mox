@@ -49,13 +49,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 
 fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.match.RuleSet, counts: *Counts) !void {
     const context = ctx.context.?;
-    var dir = try Io.Dir.cwd().openDir(ctx.io, dir_abs, .{ .iterate = true, .follow_symlinks = false });
-    defer dir.close(ctx.io);
+    // Sorted so a tree is added, reported, and recursed in the same order on
+    // every machine; entries are captured before the walk mutates the repo.
+    const entries = try mox.source.dirent.sortedPath(ctx.alloc, ctx.io, dir_abs, .{ .iterate = true, .follow_symlinks = false });
 
     const home = context.env.getAlloc(ctx.alloc, "HOME") catch context.paths.home;
 
-    var it = dir.iterate();
-    while (try it.next(ctx.io)) |entry| {
+    for (entries) |entry| {
         const child = try std.fs.path.join(ctx.alloc, &.{ dir_abs, entry.name });
         switch (entry.kind) {
             .directory => {

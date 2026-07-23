@@ -10,6 +10,7 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
+const dirent = @import("../source/dirent.zig");
 const tty = @import("tty.zig");
 
 const Io = std.Io;
@@ -52,10 +53,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         else => return e,
     };
 
-    var names: std.ArrayList([]const u8) = .empty;
-    var it = dir.iterate();
-    while (try it.next(ctx.io)) |entry| try names.append(ctx.alloc, try ctx.alloc.dupe(u8, entry.name));
+    // Sorted so kept/removed lines print in the same order on every machine.
+    const entries = try dirent.sorted(ctx.alloc, ctx.io, dir);
     dir.close(ctx.io);
+    var names: std.ArrayList([]const u8) = .empty;
+    for (entries) |e| try names.append(ctx.alloc, e.name);
 
     var removed: usize = 0;
     var prompt_names: std.ArrayList([]const u8) = .empty;

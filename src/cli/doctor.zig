@@ -29,8 +29,9 @@ pub fn findMalformedProvenance(arena: std.mem.Allocator, io: Io, state_dir: []co
     defer dir.close(io);
 
     var out: std.ArrayList([]const u8) = .empty;
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
+    // Sorted so the advisory lists the same malformed files in the same order
+    // on every machine.
+    for (try mox.source.dirent.sorted(arena, io, dir)) |entry| {
         if (entry.kind != .file) continue;
         const content = dir.readFileAlloc(io, entry.name, arena, .limited(max_state_bytes)) catch continue;
         if (mox.provenance.map.deserialize(arena, content)) |_| {} else |_| {
