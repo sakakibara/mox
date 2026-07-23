@@ -26,8 +26,10 @@
 //!
 //! A manual hunk, and a hunk the user skips, are differences the recompose
 //! is EXPECTED to keep: skip is `s` in the per-hunk `[y/s/x]` prompt
-//! (decline the route outright) or `s` at the candidate prompt (decline
-//! only the candidate picked) -- both stay in the live file by design, so a
+//! (decline the route outright), `s` at the candidate prompt (decline
+//! only the candidate picked), `s` in a structured file's per-key prompt, or
+//! the trailing `s` in its layer-pick menu (including declining that menu's
+//! cross-configuration confirm) -- all stay in the live file by design, so a
 //! file that has one can never recompose to live however well its other
 //! hunks routed. Those routed edits stand, the applied
 //! record does not advance (the rest is still real drift), and the report
@@ -1724,7 +1726,7 @@ fn processStructFile(
 
         var chosen: ?usize = res.target;
         if (cc.interactive) {
-            try printHunkHeader(cc.stdout, cc.sty, rel, ki + 1, changes.len, winner_label);
+            try printHunkHeader(cc.stdout, cc.sty, rel, "key", ki + 1, changes.len, winner_label);
             try printKeyChange(cc.sty, cc.stdout, change, winner_label);
             const legend_line = try legend(cc.arena, &struct_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &struct_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -1953,11 +1955,14 @@ fn pickLayer(
             try refused.append(cc.arena, try std.fmt.allocPrint(cc.arena, "{s} -- its entry is interpolated", .{name}));
             continue;
         }
-        // A key no layer defines yet has no current home to mark.
+        // A key no layer defines yet has no current home to mark, so the
+        // default is named for what it is instead.
         const is_winner = res.definers.len > 0 and i == res.target;
         const shadow = try commit_struct.shadowers(cc.arena, layers, res.definers, i);
         const suffix = if (is_winner)
             try cc.arena.dupe(u8, "  (current)")
+        else if (res.definers.len == 0 and i == res.target)
+            try cc.arena.dupe(u8, "  (default)")
         else if (shadow.len > 0)
             try shadowNote(cc.arena, shadow)
         else
@@ -2087,7 +2092,7 @@ fn processHunk(
                 try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
                 return .cont;
             }
-            try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+            try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
             try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
             const legend_line = try legend(cc.arena, &sx_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &sx_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -2180,7 +2185,7 @@ fn processHunk(
                 try ra.line_edits.append(cc.arena, r.edit);
                 try ra.line_owners.append(cc.arena, fidx);
             } else if (cc.interactive) {
-                try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+                try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
                 const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
                 switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -2223,7 +2228,7 @@ fn processHunk(
                 try cc.stdout.print("  would update {s}\n", .{r.desc});
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
             } else if (cc.interactive) {
-                try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+                try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
                 const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
                 switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -2269,7 +2274,7 @@ fn processHunk(
                 try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
                 return .cont;
             }
-            try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
+            try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
             try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
             try cc.stdout.print("  This value comes from machine.{s}.\n", .{r.name});
             const legend_line = try legend(cc.arena, &fact_choices, 0, cc.sty);
@@ -2614,7 +2619,7 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
     if (cc.interactive) {
         const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
         const route_label = try std.fmt.allocPrint(cc.arena, "shared -- changes {d} configuration(s)", .{imp.affected.len});
-        try printHunkHeader(cc.stdout, cc.sty, rel, hunk_no, hunk_total, route_label);
+        try printHunkHeader(cc.stdout, cc.sty, rel, "hunk", hunk_no, hunk_total, route_label);
     }
 
     var choices: std.ArrayList(prompt.Choice) = .empty;
@@ -3273,11 +3278,11 @@ fn printMiniDiff(sty: style.Style, out: *Io.Writer, hunk: Hunk, a_lines: []const
 /// Per-hunk header for an interactive prompt: `<home-rel path>  hunk N/M  ->
 /// <route>` (two spaces before the route), so the prompt reads without
 /// cross-referencing the diff.
-fn printHunkHeader(out: *Io.Writer, sty: style.Style, rel: []const u8, hunk_no: usize, hunk_total: usize, route: []const u8) !void {
+fn printHunkHeader(out: *Io.Writer, sty: style.Style, rel: []const u8, unit: []const u8, hunk_no: usize, hunk_total: usize, route: []const u8) !void {
     try sty.bold(out);
     try out.print("{s}", .{rel});
     try sty.close(out);
-    try out.print("  hunk {d}/{d}  ", .{ hunk_no, hunk_total });
+    try out.print("  {s} {d}/{d}  ", .{ unit, hunk_no, hunk_total });
     try sty.dim(out);
     try out.print("->  {s}", .{route});
     try sty.close(out);
