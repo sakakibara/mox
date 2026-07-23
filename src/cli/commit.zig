@@ -11,8 +11,8 @@
 //! `split`s it at the per-hunk prompt: each resulting piece lies within one
 //! origin and routes on its own.
 //!
-//! On a TTY a routed line/row hunk is confirmed `[y/s/x]`, an unroutable
-//! hunk `[s/x]`, an interpolated hunk `[f/d/x/s]`, and a structured key
+//! On a TTY a routed line/row hunk is confirmed `[y/s]`, an unroutable
+//! hunk `[s/x]`, an interpolated hunk `[f/d/s]`, and a structured key
 //! change `[y/p/s]`; `--yes` takes the defaults; `--dry-run` and a non-TTY
 //! without `--yes` only report (exit 1 when hunks remain);
 //! `--abort-on-prompt` exits 2 for a prompt that would have been needed,
@@ -25,7 +25,7 @@
 //! and region directory a narrowing synthesized.
 //!
 //! A manual hunk, and a hunk the user skips, are differences the recompose
-//! is EXPECTED to keep: skip is `s` in the per-hunk `[y/s/x]` prompt
+//! is EXPECTED to keep: skip is `s` in the per-hunk `[y/s]` prompt
 //! (decline the route outright), `s` at the candidate prompt (decline
 //! only the candidate picked), `s` in a structured file's per-key prompt, or
 //! the trailing `s` in its layer-pick menu (including declining that menu's
@@ -279,24 +279,27 @@ const Decision = union(enum) {
 const ys_choices = [_]prompt.Choice{
     .{ .key = "y", .label = "yes", .help = "route this edit into its source" },
     .{ .key = "s", .label = "skip", .help = "skip -- leave the drift" },
-    .{ .key = "x", .label = "split", .help = "split -- break this hunk into per-source pieces" },
 };
 
 /// A hunk `routeHunk` could not resolve to any source: skip it (handle by hand,
 /// leaving the drift), or split it at its provenance-segment boundaries so each
 /// piece routes on its own.
+///
+/// Split is offered ONLY here. `routeHunk` resolves a hunk to a real route only
+/// when `covering()` finds it inside a SINGLE segment, so every other prompt's
+/// hunk has nothing to split by construction -- offering it there advertised an
+/// operation that could not happen, and the arms behind it silently disagreed
+/// (two routed the hunk, one reported it manual).
 const sx_choices = [_]prompt.Choice{
     .{ .key = "s", .label = "skip", .help = "skip -- handle by hand, leave the drift" },
     .{ .key = "x", .label = "split", .help = "split -- break this hunk into per-source pieces" },
 };
 
 /// Interpolated-value prompt: `f` writes the new value into the fact, `d` writes
-/// it into the source's `| default` instead, `x` is the split escape hatch (a
-/// no-op for a single-line hunk), `s` skips (leave the drift).
+/// it into the source's `| default` instead, `s` skips (leave the drift).
 const fact_choices = [_]prompt.Choice{
     .{ .key = "f", .label = "fact", .help = "set the fact to the new value" },
     .{ .key = "d", .label = "default", .help = "change the source default instead" },
-    .{ .key = "x", .label = "split", .help = "split -- break this hunk into per-source pieces" },
     .{ .key = "s", .label = "skip", .help = "skip -- leave the drift" },
 };
 
@@ -2127,8 +2130,8 @@ fn structValueText(
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks
 /// produced by a `split` re-enter this same function, so a straddling hunk's
 /// pieces get the identical treatment a top-level hunk would: their own
-/// route, their own header, their own prompt -- `[s/x]` manual, `[y/s/x]`
-/// line/row, `[f/d/x/s]` interpolated.
+/// route, their own header, their own prompt -- `[s/x]` manual, `[y/s]`
+/// line/row, `[f/d/s]` interpolated.
 fn processHunk(
     cc: *const ClassCtx,
     ra: *const RunAccum,
@@ -2166,12 +2169,14 @@ fn processHunk(
                     else => {
                         const subs = try splitHunk(cc.arena, segments, hunk);
                         if (subs.len <= 1) {
-                            // Single-segment hunk: nothing to split. The
-                            // least-surprising outcome is the tool's own
-                            // determination standing, same as choosing manual.
+                            // An UNCOVERED hunk reaches this prompt too, and it
+                            // has no segment boundary to split at. Say so rather
+                            // than reporting it as though `s` had been chosen:
+                            // the user asked for something the hunk cannot do.
                             ra.manual_count.* += 1;
                             ra.manual_hunks[fidx] += 1;
                             ra.pending.* = true;
+                            try cc.stdout.print("  nothing to split: {s}:{d} lies in no single source\n", .{ file.live_path, hunk.a_start + 1 });
                             try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
                         } else {
                             for (subs) |sub| {
@@ -2251,11 +2256,7 @@ fn processHunk(
                 switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
                     .chosen => |i| switch (i) {
                         0 => accept = true,
-                        1 => ra.declined_hunks[fidx] += 1,
-                        // `x`: `routeHunk` only returns `.line` for a hunk
-                        // `covering()` found entirely within one segment, so a
-                        // split here is always a no-op; just route it.
-                        else => accept = true,
+                        else => ra.declined_hunks[fidx] += 1,
                     },
                     .abort => return .abort,
                     .abort_strict => return .abort_strict,
@@ -2294,10 +2295,7 @@ fn processHunk(
                 switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
                     .chosen => |i| switch (i) {
                         0 => accept = true,
-                        1 => ra.declined_hunks[fidx] += 1,
-                        // `x`: a loop-row route is always single-segment; a
-                        // split here is always a no-op, so just route it.
-                        else => accept = true,
+                        else => ra.declined_hunks[fidx] += 1,
                     },
                     .abort => return .abort,
                     .abort_strict => return .abort_strict,
@@ -2362,22 +2360,6 @@ fn processHunk(
                             for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
                         }
                         try cc.stdout.print("  edit {s}\n", .{r.default_desc});
-                    },
-                    2 => {
-                        // [x]: a fact route is always single-segment, like
-                        // `.line`/`.row`; a split here is always a no-op.
-                        const subs = try splitHunk(cc.arena, segments, hunk);
-                        if (subs.len <= 1) {
-                            ra.manual_count.* += 1;
-                            ra.manual_hunks[fidx] += 1;
-                            ra.pending.* = true;
-                            try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
-                        } else {
-                            for (subs) |sub| {
-                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total);
-                                if (outcome != .cont) return outcome;
-                            }
-                        }
                     },
                     // [s]: a deliberate decline, like `[s]` everywhere else --
                     // not an un-routable hunk. Counting it manual reported a

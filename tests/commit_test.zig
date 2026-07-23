@@ -2007,7 +2007,9 @@ test "commit: a routed hunk's interactive prompt shows a self-explaining header 
     // The legend is self-explaining: every key names its own action.
     try std.testing.expect(std.mem.indexOf(u8, res.out, "[Y]es") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "[s]kip") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "[x] split") != null);
+    // No split: this hunk lies inside one segment, so there is nothing to
+    // split at, and the legend only offers what the hunk can actually do.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[x] split") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "[?]help") != null);
     // The end summary reports the routed/coupled/manual counts.
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
@@ -2034,7 +2036,7 @@ test "commit: ? at the per-hunk prompt prints help for every choice, then re-ask
     // The help block explains each key; the edit still commits ("y" after).
     try std.testing.expect(std.mem.indexOf(u8, res.out, "route this edit into its source") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "skip -- leave the drift") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "split -- break this hunk into per-source pieces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "split -- break this hunk into per-source pieces") == null);
     const src = try read(io, a, try h.srcOf(".zshrc"));
     try std.testing.expect(std.mem.indexOf(u8, src, "export A=2") != null);
 }
@@ -2108,7 +2110,7 @@ test "commit: a straddling hunk left unsplit is reported manual, non-interactive
     try std.testing.expectEqualStrings("alias x=1\n", frag);
 }
 
-test "commit: split on an already single-segment hunk is a no-op that just routes it" {
+test "commit: a routed hunk is not offered a split it could never perform" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2123,8 +2125,12 @@ test "commit: split on an already single-segment hunk is a no-op that just route
     const live = try h.liveOf(".zshrc");
     try editLive(io, a, live, "export A=1", "export A=2");
 
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "x\n");
+    // A hunk only reaches a routed prompt when it lies inside ONE provenance
+    // segment, so there is nothing to split at. Offering `x` there advertised
+    // an operation that silently just routed the hunk instead.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "split") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 1 routed, 0 coupled, 0 manual") != null);
     const src = try read(io, a, try h.srcOf(".zshrc"));
     try std.testing.expect(std.mem.indexOf(u8, src, "export A=2") != null);
