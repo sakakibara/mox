@@ -1854,8 +1854,30 @@ fn pickLayer(
     try cc.stdout.print("  place {s} in...\n", .{try keyPathLabel(cc.arena, change.path)});
 
     var choices: std.ArrayList(prompt.Choice) = .empty;
+    // Layer index behind each offered number: a layer that cannot take the
+    // placement is reported as unavailable rather than offered, so the numbers
+    // are not the layer indices.
+    var cand: std.ArrayList(usize) = .empty;
+    var refused: std.ArrayList([]const u8) = .empty;
     for (layers, 0..) |layer, i| {
-        const is_winner = i == res.target;
+        const name = if (layer.is_base)
+            try std.fmt.allocPrint(cc.arena, "base {s}", .{file.source_base_path})
+        else
+            std.fs.path.basename(layer.path);
+        // Removing at a layer that does not define the key deletes nothing --
+        // the format either errors or silently no-ops, and the key survives.
+        if (change.removed and !isDefiner(res.definers, i)) {
+            try refused.append(cc.arena, try std.fmt.allocPrint(cc.arena, "{s} -- does not define it", .{name}));
+            continue;
+        }
+        // Overwriting an interpolated entry would replace the template with
+        // this machine's resolved value for every machine sharing the source.
+        if (commit_struct.capturedAt(format, layer.value, change.path)) {
+            try refused.append(cc.arena, try std.fmt.allocPrint(cc.arena, "{s} -- its entry is interpolated", .{name}));
+            continue;
+        }
+        // A key no layer defines yet has no current home to mark.
+        const is_winner = res.definers.len > 0 and i == res.target;
         const shadow = try commit_struct.shadowers(cc.arena, layers, res.definers, i);
         const suffix = if (is_winner)
             try cc.arena.dupe(u8, "  (current)")
@@ -1863,20 +1885,26 @@ fn pickLayer(
             try shadowNote(cc.arena, shadow)
         else
             try cc.arena.dupe(u8, "");
-        const name = if (layer.is_base)
-            try std.fmt.allocPrint(cc.arena, "base {s}", .{file.source_base_path})
-        else
-            std.fs.path.basename(layer.path);
-        try cc.stdout.print("    [{d}] {s}{s}\n", .{ i + 1, name, suffix });
-        const key = try std.fmt.allocPrint(cc.arena, "{d}", .{i + 1});
+        const n = cand.items.len + 1;
+        try cc.stdout.print("    [{d}] {s}{s}\n", .{ n, name, suffix });
+        const key = try std.fmt.allocPrint(cc.arena, "{d}", .{n});
         try choices.append(cc.arena, .{ .key = key, .label = name });
+        try cand.append(cc.arena, i);
     }
+    for (refused.items) |r| try cc.stdout.print("    unavailable: {s}\n", .{r});
     // Trailing skip.
     try choices.append(cc.arena, .{ .key = "s", .label = "skip" });
 
-    const legend_line = try legend(cc.arena, choices.items, res.target, cc.sty);
-    const picked: usize = switch (try prompt.ask(cc.ask_mode, choices.items, res.target, legend_line, cc.input, cc.stdout)) {
-        .chosen => |i| if (i < layers.len) i else return .skip, // trailing skip
+    // The resolved target always defines the key (or, for a new key, is the
+    // base), so it is never among the refused: it has a position here.
+    var default_pos: usize = 0;
+    for (cand.items, 0..) |li, p| {
+        if (li == res.target) default_pos = p;
+    }
+
+    const legend_line = try legend(cc.arena, choices.items, default_pos, cc.sty);
+    const picked: usize = switch (try prompt.ask(cc.ask_mode, choices.items, default_pos, legend_line, cc.input, cc.stdout)) {
+        .chosen => |i| if (i < cand.items.len) cand.items[i] else return .skip, // trailing skip
         .abort => return .abort,
         .abort_strict => return .abort_strict,
         .report_only => return .skip,
@@ -1910,6 +1938,13 @@ fn pickLayer(
         .abort_strict => .abort_strict,
         .report_only => .skip,
     };
+}
+
+fn isDefiner(definers: []const usize, i: usize) bool {
+    for (definers) |d| {
+        if (d == i) return true;
+    }
+    return false;
 }
 
 /// "(removes your override in a.toml, b.toml)" annotation for a shadowed

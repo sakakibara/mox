@@ -2731,6 +2731,55 @@ test "commit: structured secret-derived key is skipped, never routed" {
     _ = res;
 }
 
+test "commit: the pick menu refuses a removal at a layer that does not define the key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nextra = \"gone\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "extra = \"gone\"\n", "");
+
+    // Only the base defines `extra`, so it is the sole candidate: the overlay
+    // is reported unavailable instead of offered, and [1] is the base.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "unavailable: os=darwin.toml -- does not define it") != null);
+    try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
+}
+
+test "commit: the pick menu refuses a layer whose entry is interpolated" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "email = \"<machine.email>\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "email = \"over@x\"\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"over@x\"", "\"new@x\"");
+
+    // The overlay's literal wins, so the edit is routable -- but promoting it
+    // to the base would overwrite the template with this machine's value.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "unavailable: base src/config.toml -- its entry is interpolated") != null);
+    try std.testing.expectEqualStrings("email = \"<machine.email>\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "old@home.com") == null);
+}
+
 test "commit: a source layer rejecting a struct edit rolls that file back, not the run" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
