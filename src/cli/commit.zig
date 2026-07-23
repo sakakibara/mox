@@ -369,13 +369,26 @@ fn fileSpace(
 }
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+    return commitImpl(ctx, a.dry_run, a.yes, a.abort_on_prompt, a.color orelse .auto, a.paths);
+}
+
+/// The whole of `mox commit`, callable without an argv. `apply` uses this to
+/// run the commit its drift prompt queued, once it has released the state lock
+/// (the lock is not re-entrant, so this cannot be called from inside apply's
+/// own pass). Acquires the lock itself, exactly as the command does.
+pub fn commitImpl(
+    ctx: *app.Ctx,
+    dry_run: bool,
+    yes: bool,
+    abort_on_prompt: bool,
+    color: style.ColorFlag,
+    paths: []const []const u8,
+) anyerror!u8 {
     const context = ctx.context.?;
-    const dry_run = a.dry_run;
-    const yes = a.yes;
     const sty = style.Style{ .on = style.enabled(
         tty.isInteractive(1),
         context.env.get(ctx.alloc, "NO_COLOR") != null,
-        a.color orelse .auto,
+        color,
     ) };
 
     const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
@@ -404,9 +417,9 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // rather than shrinking `tree.files` (which every fidx-indexed array
     // below is still sized against).
     var scoped_live: ?std.StringHashMap(void) = null;
-    if (a.paths.len > 0) {
+    if (paths.len > 0) {
         var diag: scope.Diag = .{};
-        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, a.paths, &diag) catch |e| switch (e) {
+        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox commit: {s}: not managed\n", .{diag.capture().?});
                 return 1;
@@ -424,11 +437,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // prompting path off a TTY too (`prompt.ask` aborts there instead of
     // reading) rather than short-circuiting into the report. `--dry-run` asks
     // nothing at all, so it stays a pure report.
-    const strict = a.abort_on_prompt and !dry_run;
+    const strict = abort_on_prompt and !dry_run;
     const interactive = ((scripted_input != null or tty.isInteractive(0)) and !dry_run and !yes) or strict;
     const report_mode = dry_run or (!interactive and !yes);
     // `--yes` takes every default without reading input.
-    const ask_mode: prompt.Mode = if (a.abort_on_prompt)
+    const ask_mode: prompt.Mode = if (abort_on_prompt)
         .abort_on_prompt
     else if (yes)
         .assume_default
@@ -3383,7 +3396,7 @@ fn tupleLabel(arena: std.mem.Allocator, t: mox.source.tree.AxisTuple) ![]const u
 /// Colorized, self-describing prompt legend, e.g. `[Y]es  [n]o  [m]anual
 /// [q]uit  [?]help `: every choice names its own action, and the default
 /// choice's key renders uppercase. Replaces a bare `[Y/n/m/q]` literal.
-fn legend(arena: std.mem.Allocator, choices: []const prompt.Choice, default_index: usize, sty: style.Style) ![]const u8 {
+pub fn legend(arena: std.mem.Allocator, choices: []const prompt.Choice, default_index: usize, sty: style.Style) ![]const u8 {
     var aw: Io.Writer.Allocating = .init(arena);
     const out = &aw.writer;
     try out.writeAll("  ");

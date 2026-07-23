@@ -2313,3 +2313,134 @@ test "apply generator: mox mv re-keys the manifest so the old leaves are pruned,
     try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
     try std.testing.expect(try snapshotHas(io, a, c.state, ".config/id-a.inc", "key=a\n"));
 }
+
+// -- interactive drift resolution --
+
+/// Two managed files, applied, then both edited live so both are drifted.
+/// `a.conf` is the one whose live edit should win; `b.conf` the one whose
+/// live copy is damaged and should be discarded.
+fn writeDriftPair(io: Io, tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "keep = source\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "full = source\n" });
+}
+
+test "apply drift: [o] discards the live edit and writes the composed output" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "damaged\n" });
+
+    const res = try c.runWithInput(&.{ "mox", "apply" }, "o\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
+    // The source is never touched by an overwrite.
+    try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.srcOf("b.conf")));
+}
+
+test "apply drift: [s] leaves the live edit alone, exactly as before" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "mine\n" });
+
+    const res = try c.runWithInput(&.{ "mox", "apply" }, "s\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 drifted") != null);
+}
+
+test "apply drift: [c] routes the live edit into source instead of discarding it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("a.conf"), .data = "keep = mine\n" });
+
+    // [c] at the drift prompt, then [y] at commit's own per-hunk prompt.
+    const res = try c.runWithInput(&.{ "mox", "apply" }, "c\ny\n");
+    // The live edit survives AND reaches the source -- the outcome no
+    // combination of today's flags can produce.
+    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.srcOf("a.conf")));
+    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.homePath("a.conf")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "queued") != null);
+    // Nothing is left drifted afterwards.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
+}
+
+test "apply drift: one run resolves two files in opposite directions" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("a.conf"), .data = "keep = mine\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "damaged\n" });
+
+    // Files are walked in tree order: a.conf keeps its live edit, b.conf is
+    // discarded. This is the case --force resolves wrongly and today's apply
+    // cannot resolve at all.
+    const res = try c.runWithInput(&.{ "mox", "apply" }, "c\no\ny\n");
+    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.srcOf("a.conf")));
+    try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
+}
+
+test "apply drift: non-interactive and --force keep their exact contracts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "mine\n" });
+
+    // No stdin at all: skip and report, never prompt. This is what every
+    // script and CI run depends on.
+    const plain = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), plain.rc);
+    try std.testing.expect(std.mem.indexOf(u8, plain.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.err, "re-run with --force") != null);
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
+
+    // --dry-run writes nothing and never prompts, even with input available.
+    const dry = try c.runWithInput(&.{ "mox", "apply", "--dry-run" }, "o\n");
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "Dry run:") != null);
+
+    // --force still overwrites everything with no prompt.
+    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
+}

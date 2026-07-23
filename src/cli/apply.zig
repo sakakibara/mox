@@ -5,6 +5,10 @@ const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
+const prompt = @import("prompt.zig");
+const style = @import("style.zig");
+const commit_mod = @import("commit.zig");
+const diff_mod = @import("diff.zig");
 
 pub const Spec = struct {
     dry_run: cli.spec.Flag(.{ .help = "report only, write nothing" }),
@@ -23,6 +27,26 @@ pub fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 /// the `.mox-exact` prune sweep is skipped entirely, since it reasons about
 /// the whole tree and a scoped apply must touch only the named files.
 pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, paths: []const []const u8) anyerror!u8 {
+    var queued: std.ArrayList([]const u8) = .empty;
+    const rc = try applyPass(ctx, force, dry_run, skip_scripts_arg, paths, &queued);
+    if (queued.items.len == 0) return rc;
+    // Deferred on purpose: the apply pass holds the state lock and the lock is
+    // not re-entrant, so the commit the drift prompt queued can only run once
+    // that pass has returned and released it. Committing a file leaves its
+    // source matching live, so skipping its write above was correct.
+    try ctx.out.print("\nCommitting {d} live edit(s) you chose to keep:\n", .{queued.items.len});
+    const crc = try commit_mod.commitImpl(ctx, false, false, false, .auto, queued.items);
+    return if (rc != 0 or crc != 0) 1 else 0;
+}
+
+fn applyPass(
+    ctx: *app.Ctx,
+    force: bool,
+    dry_run: bool,
+    skip_scripts_arg: bool,
+    paths: []const []const u8,
+    queued_out: *std.ArrayList([]const u8),
+) anyerror!u8 {
     const context = ctx.context.?;
     // Skip setup scripts (also implied by --dry-run) for fast, side-effect-
     // free file-only applies; scripts may install packages or hit the network.
@@ -30,6 +54,22 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
 
     const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 1;
     defer lk.release();
+
+    // Drift is resolved by asking only on a real terminal with nothing already
+    // deciding the outcome. `--force` resolves it before the prompt is reached;
+    // `--dry-run` writes nothing; a non-TTY keeps the skip-and-report contract
+    // every script and CI run depends on.
+    const scripted_input = app.stdin_override;
+    const interactive_drift = (scripted_input != null or tty.isInteractive(0)) and !force and !dry_run;
+    var drift_stdin_buf: [4096]u8 = undefined;
+    var drift_reader: std.Io.File.Reader = .initStreaming(.stdin(), ctx.io, &drift_stdin_buf);
+    var resolver: DriftResolver = .{
+        .arena = ctx.alloc,
+        .input = scripted_input orelse &drift_reader.interface,
+        .sty = .{ .on = style.enabled(tty.isInteractive(1), context.env.get(ctx.alloc, "NO_COLOR") != null, .auto) },
+        .state_dir = context.paths.state_dir,
+    };
+    const resolver_opt: ?*DriftResolver = if (interactive_drift) &resolver else null;
 
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -144,7 +184,7 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are
         // deferred to a second pass against the global keep set below.
-        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home)) continue;
+        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, resolver_opt, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home)) continue;
 
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never composed or written.
@@ -261,6 +301,7 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
                     .mode_explicit = file.mode_explicit,
                     .create_once = file.create_once,
                     .snap_id = snap_id,
+                    .resolver = resolver_opt,
                     .force = force,
                     .dry_run = dry_run,
                 }, &counts, &snapshotted);
@@ -361,6 +402,13 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, post_dir, &bindings, &script_env, ctx.out, ctx.err);
 
+    // Only name the interactive outcomes when they happened: an ordinary apply
+    // prints the line it always has.
+    const resolved: []const u8 = if (counts.overwritten > 0 or counts.queued > 0)
+        try std.fmt.allocPrint(ctx.alloc, "{d} overwritten, {d} queued, ", .{ counts.overwritten, counts.queued })
+    else
+        "";
+
     if (dry_run) {
         try ctx.out.print(
             "\nDry run: {d} would be written, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts not run\n",
@@ -368,14 +416,15 @@ pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bo
         );
     } else {
         try ctx.out.print(
-            "\nApplied: {d} written, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed\n",
+            "\nApplied: {d} written, {d} unchanged, {d} skipped, {s}{d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed\n",
             .{
-                counts.ok,                                counts.unchanged,                       counts.skip,
-                counts.drift,                             counts.fail,                            pre_result.ran + post_result.ran,
-                pre_result.skipped + post_result.skipped, pre_result.failed + post_result.failed,
+                counts.ok,                        counts.unchanged,                         counts.skip,
+                resolved,                         counts.drift,                             counts.fail,
+                pre_result.ran + post_result.ran, pre_result.skipped + post_result.skipped, pre_result.failed + post_result.failed,
             },
         );
     }
+    queued_out.* = resolver.queued;
     const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed;
     return if (total_fail > 0) 1 else 0;
 }
@@ -399,6 +448,106 @@ const Counts = struct {
     skip: usize = 0,
     drift: usize = 0,
     fail: usize = 0,
+    /// Drift the user chose to discard, per file, at the prompt.
+    overwritten: usize = 0,
+    /// Drift the user chose to route back into source; committed after the
+    /// apply pass releases the lock.
+    queued: usize = 0,
+};
+
+const drift_choices = [_]prompt.Choice{
+    .{ .key = "o", .label = "overwrite", .help = "overwrite -- discard the live edit, write the composed output" },
+    .{ .key = "c", .label = "commit", .help = "commit -- route the live edit back into its source" },
+    .{ .key = "d", .label = "diff", .help = "diff -- show what differs, then ask again" },
+    .{ .key = "s", .label = "skip", .help = "skip -- leave it drifted" },
+    .{ .key = "O", .label = "overwrite all", .help = "overwrite this and every remaining drifted file" },
+    .{ .key = "S", .label = "skip all", .help = "skip this and every remaining drifted file" },
+};
+
+const DriftDecision = enum { overwrite, commit, skip, quit };
+
+/// Resolves one drifted file interactively. Sticky answers (`[O]`/`[S]`) are
+/// remembered here, and `[c]` paths accumulate for the deferred commit pass --
+/// apply holds the state lock, and the lock is not re-entrant, so commit cannot
+/// run until apply is done with it.
+const DriftResolver = struct {
+    arena: std.mem.Allocator,
+    input: *std.Io.Reader,
+    sty: style.Style,
+    state_dir: []const u8,
+    sticky: ?DriftDecision = null,
+    queued: std.ArrayList([]const u8) = .empty,
+    aborted: bool = false,
+
+    fn ask(
+        self: *DriftResolver,
+        ctx: *app.Ctx,
+        live_path: []const u8,
+        live: ?[]const u8,
+        composed: []const u8,
+        prov_items: []const mox.provenance.map.Segment,
+    ) !DriftDecision {
+        if (self.sticky) |d| return d;
+        try ctx.err.print("  DRIFT   {s} (live file was edited)\n", .{live_path});
+        while (true) {
+            const line = try commit_mod.legend(self.arena, &drift_choices, 3, self.sty);
+            switch (try prompt.ask(.interactive, &drift_choices, 3, line, self.input, ctx.out)) {
+                .chosen => |i| switch (i) {
+                    0 => return .overwrite,
+                    1 => {
+                        try self.queued.append(self.arena, live_path);
+                        return .commit;
+                    },
+                    2 => {
+                        try self.showDiff(ctx, live_path, live orelse "", composed, prov_items);
+                        continue;
+                    },
+                    3 => return .skip,
+                    4 => {
+                        self.sticky = .overwrite;
+                        return .overwrite;
+                    },
+                    else => {
+                        self.sticky = .skip;
+                        return .skip;
+                    },
+                },
+                // `q`, EOF, or exhausted attempts: stop the run rather than
+                // silently picking an outcome for the remaining files.
+                .abort, .abort_strict => {
+                    self.aborted = true;
+                    return .quit;
+                },
+                .report_only => return .skip,
+            }
+        }
+    }
+
+    /// The same rendering `mox diff` produces, so a secret resolved into the
+    /// composed bytes is redacted here exactly as it is there.
+    fn showDiff(
+        self: *DriftResolver,
+        ctx: *app.Ctx,
+        live_path: []const u8,
+        live: []const u8,
+        composed: []const u8,
+        prov_items: []const mox.provenance.map.Segment,
+    ) !void {
+        const a_lines = try mox.diff.lines.splitLines(self.arena, live);
+        const b_lines = try mox.diff.lines.splitLines(self.arena, composed);
+        const hunks = mox.diff.lines.diff(self.arena, a_lines, b_lines) catch |e| switch (e) {
+            error.TooManyLines => {
+                try ctx.out.print("  too large to diff\n", .{});
+                return;
+            },
+            else => return e,
+        };
+        const b_secret = try diff_mod.secretMask(self.arena, b_lines.len, prov_items);
+        const prior = try mox.provenance.map.read(self.arena, ctx.io, self.state_dir, live_path);
+        const a_secret = if (prior) |m| try diff_mod.secretMask(self.arena, a_lines.len, m.segments) else &.{};
+        const rendered = try diff_mod.renderFile(self.arena, live_path, a_lines, b_lines, hunks, a_secret, b_secret, self.sty);
+        try ctx.out.writeAll(rendered);
+    }
 };
 
 /// Inputs to `applyRegularFile`: everything the per-file write path needs that
@@ -414,6 +563,9 @@ const RegularInput = struct {
     snap_id: []const u8,
     force: bool,
     dry_run: bool,
+    /// Non-null on an interactive run: drift is resolved by asking, not by
+    /// skipping. Null keeps the non-interactive contract (skip and report).
+    resolver: ?*DriftResolver = null,
 };
 
 /// Write one composed regular file through the drift guard, pre-overwrite
@@ -442,9 +594,27 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     const disposition = mox.apply.applied.classify(recorded, live, in.bytes);
     switch (disposition) {
         .drift => if (!in.force) {
-            counts.drift += 1;
-            try ctx.err.print("  DRIFT   {s} (live file was edited; 'mox commit' it or re-run with --force)\n", .{in.live_path});
-            return;
+            const decision: DriftDecision = if (in.resolver) |r|
+                try r.ask(ctx, in.live_path, live, in.bytes, in.prov_items)
+            else
+                .skip;
+            switch (decision) {
+                // Falls out of the switch to the write below, exactly as
+                // `--force` does for this file alone.
+                .overwrite => counts.overwritten += 1,
+                .commit => {
+                    counts.queued += 1;
+                    try ctx.out.print("  queued {s} (will commit the live edit)\n", .{in.live_path});
+                    return;
+                },
+                .quit => return,
+                .skip => {
+                    counts.drift += 1;
+                    if (in.resolver == null)
+                        try ctx.err.print("  DRIFT   {s} (live file was edited; 'mox commit' it or re-run with --force)\n", .{in.live_path});
+                    return;
+                },
+            }
         },
         .unchanged => {
             counts.unchanged += 1;
@@ -526,6 +696,7 @@ fn applyGenerator(
     snap_id: []const u8,
     force: bool,
     dry_run: bool,
+    resolver_opt: ?*DriftResolver,
     counts: *Counts,
     snapshotted: *bool,
     produced: *std.StringHashMap(void),
@@ -592,6 +763,7 @@ fn applyGenerator(
             .mode_explicit = false,
             .create_once = false,
             .snap_id = snap_id,
+            .resolver = resolver_opt,
             .force = force,
             .dry_run = dry_run,
         }, counts, snapshotted);

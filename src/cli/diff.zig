@@ -102,7 +102,7 @@ fn hunkTouchesSecret(h: Hunk, a_secret: []const bool, b_secret: []const bool) bo
 
 /// Build a per-line secret mask of length `count` from provenance `segments`:
 /// `mask[i]` is true when output line `i` is covered by a `.secret` segment.
-fn secretMask(arena: std.mem.Allocator, count: usize, segments: []const mox.provenance.map.Segment) ![]const bool {
+pub fn secretMask(arena: std.mem.Allocator, count: usize, segments: []const mox.provenance.map.Segment) ![]const bool {
     const mask = try arena.alloc(bool, count);
     @memset(mask, false);
     for (segments) |s| {
