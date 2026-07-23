@@ -39,7 +39,7 @@ test "config space: a dotted fragment value yields no phantom sibling machine" {
     try this.put("os", "darwin");
     try this.put("machine", "host.local");
 
-    const configs = try mox.classify.config_space.enumerate(a, &this, ax);
+    const configs = try mox.classify.config_space.enumerate(a, &this, ax, &.{});
 
     // `host.local` IS this machine, not a second one: the `machine` axis has a
     // single value, so the space is exactly {this machine, os=linux}. Reading
@@ -84,7 +84,7 @@ test "config space: an extension-bearing fragment value is still read by its ste
     var this = std.StringHashMap([]const u8).init(a);
     try this.put("os", "darwin");
 
-    const configs = try mox.classify.config_space.enumerate(a, &this, ax);
+    const configs = try mox.classify.config_space.enumerate(a, &this, ax, &.{});
 
     // {os=darwin (this machine), os=linux} -- the `.sh` is an extension here, so
     // it must not enter the space as part of the value.

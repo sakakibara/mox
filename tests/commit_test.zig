@@ -2504,8 +2504,10 @@ test "commit: structured [p] to a middle layer places there and deletes the more
     try editLive(io, a, live, "\"work\"", "\"solarized\"");
 
     // Layers listed least-specific-first: [1]=base, [2]=os=darwin, [3]=os=darwin+profile=work.
-    // Pick [2] (the os=darwin overlay, a middle layer).
-    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n2\n");
+    // Pick [2] (the os=darwin overlay, a middle layer). Placing there also
+    // changes a darwin machine with no profile fact, which reads the os=darwin
+    // overlay, so the pick prompts a cross-configuration confirm; answer y.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n2\ny\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
 
     try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
@@ -2611,6 +2613,86 @@ test "commit: structured promote detects a sibling revealed only by another file
     // Declined -> nothing placed.
     try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
     try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+}
+
+test "commit: structured [p] to base confirms a fall-through sibling that leaves an optional fact unset" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Base names no theme at all; both profile overlays define it, and this
+    // machine's own profile=work wins. A sibling that leaves `profile` UNSET
+    // (never named by any fact) falls through straight to base -- so
+    // promoting theme to base changes what that sibling reads, from absent to
+    // the promoted value. `profile` is an optional custom fact, not one of
+    // os/arch/machine, so its unbound representative must be enumerated even
+    // though this machine itself binds it.
+    try writeRepo(io, &tmp, "repo/src/config.toml", "");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/profile=work.toml", "theme = \"work\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/profile=personal.toml", "theme = \"personal\"\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"work\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"work\"", "\"solarized\"");
+
+    // Layers least-specific-first: [1]=base, [2]=profile=work.toml (the
+    // winner). Pick [1] (promote to base), then decline the confirm.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\nn\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // The fall-through sibling (profile left unset) was surfaced at the
+    // confirm -- the OLD config space, which enumerated `null` only when THIS
+    // machine itself left the axis unbound, would have missed it entirely and
+    // silently promoted.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "profile=(unset)") != null);
+
+    // Declined -> nothing placed anywhere.
+    try std.testing.expectEqualStrings("", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("theme = \"work\"\n", try read(io, a, try h.srcOf("config.toml.d/profile=work.toml")));
+    try std.testing.expectEqualStrings("theme = \"personal\"\n", try read(io, a, try h.srcOf("config.toml.d/profile=personal.toml")));
+}
+
+test "commit: structured [p] to base over a real os sibling never confirms a spurious unbound-os fall-through" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // os=linux has its OWN override, so it recomposes identically regardless
+    // of the promote -- clean, no confirm expected. This also exercises the
+    // derived-axis exclusion: os is always bound on every real machine, so an
+    // "os unset" configuration is a phantom that must never be enumerated,
+    // even though os genuinely varies here (unlike the single-value case,
+    // which is dropped for an unrelated reason and would pass even with the
+    // exclusion missing).
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"blue\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // [p] -> base (candidate 1). No confirm line follows: were os's unbound
+    // representative wrongly enumerated, this input would leave an unanswered
+    // confirm and the run would not cleanly succeed.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "placing here also changes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "unset") == null);
+
+    try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml")));
+    try std.testing.expectEqualStrings("", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    // os=linux keeps its own override, untouched.
+    try std.testing.expectEqualStrings("theme = \"blue\"\n", try read(io, a, try h.srcOf("config.toml.d/os=linux.toml")));
 }
 
 test "commit: structured secret-derived key is skipped, never routed" {

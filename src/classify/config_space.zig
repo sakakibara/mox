@@ -25,6 +25,12 @@ pub fn enumerate(
     arena: std.mem.Allocator,
     this_bindings: *const std.StringHashMap([]const u8),
     ax: source.axes.Axes,
+    /// Axis names for which the unbound (`null`) representative must be
+    /// enumerated even when this machine binds the axis -- e.g. a fall-through
+    /// sibling that leaves an optional fact unset. Every other axis keeps the
+    /// original rule (`null` appears only when this machine is itself
+    /// unbound). Pass `&.{}` to preserve that original rule for every axis.
+    force_unbound: []const []const u8,
 ) ![]Configuration {
     // The axes the source compares, sorted for a stable label and a stable test.
     var compared: std.ArrayList([]const u8) = .empty;
@@ -61,7 +67,7 @@ pub fn enumerate(
 
         var opt_vals: std.ArrayList(?[]const u8) = .empty;
         for (vals.items) |v| try opt_vals.append(arena, v);
-        if (mine == null) try opt_vals.append(arena, null);
+        if (mine == null or contains(force_unbound, name)) try opt_vals.append(arena, null);
         // A lone value is necessarily this machine's own (an unbound axis always
         // contributes `null` as a second member): nothing to enumerate.
         if (opt_vals.items.len == 1) continue;
@@ -80,15 +86,36 @@ pub fn enumerate(
 
         for (names.items, 0..) |name, i| {
             const value = value_sets.items[i][idx[i]];
+            const mine_here = this_bindings.get(name);
             if (value) |v| {
                 try bindings.put(name, v);
                 if (label.items.len != 0) try label.append(arena, '+');
                 try label.appendSlice(arena, name);
                 try label.append(arena, '=');
                 try label.appendSlice(arena, v);
+            } else {
+                // `bindings` started as a clone of THIS machine's bindings, so
+                // an unbound axis must be explicitly dropped -- otherwise a
+                // `force_unbound` sibling (mine_here != null) would silently
+                // keep composing under this machine's own value instead of
+                // simulating a real fall-through. A no-op when mine_here is
+                // itself null, since the clone never had the key.
+                _ = bindings.remove(name);
+                if (mine_here != null) {
+                    // This machine binds the axis but this configuration
+                    // falls through (a `force_unbound` sibling): mark it
+                    // explicitly, or an omitted segment would read
+                    // identically to this machine's own "" label. Without
+                    // `force_unbound` a `null` value only ever arises when
+                    // `mine_here` is itself null, so this branch is
+                    // unreachable for any existing caller.
+                    if (label.items.len != 0) try label.append(arena, '+');
+                    try label.appendSlice(arena, name);
+                    try label.appendSlice(arena, "=(unset)");
+                }
             }
 
-            if (!optEql(this_bindings.get(name), value)) is_this = false;
+            if (!optEql(mine_here, value)) is_this = false;
         }
 
         // A configuration other than this machine's IS another machine, so it
@@ -152,7 +179,7 @@ test "enumerate: varies only axes the source compares by value" {
 
     const ax = try axesFixture(a, &.{ .{ "os", "darwin" }, .{ "os", "linux" } }, &.{"signing_key"});
 
-    const configs = try enumerate(a, &this, ax);
+    const configs = try enumerate(a, &this, ax, &.{});
 
     // os=darwin and os=linux. Nothing else varies.
     try std.testing.expectEqual(@as(usize, 2), configs.len);
@@ -190,7 +217,7 @@ test "enumerate: two compared axes produce their cross product" {
         .{ "profile", "work" }, .{ "profile", "personal" },
     }, &.{});
 
-    const configs = try enumerate(a, &this, ax);
+    const configs = try enumerate(a, &this, ax, &.{});
     try std.testing.expectEqual(@as(usize, 4), configs.len);
 }
 
@@ -203,7 +230,7 @@ test "enumerate: a file naming no axis yields exactly this machine" {
     try this.put("os", "darwin");
 
     const ax = try axesFixture(a, &.{}, &.{});
-    const configs = try enumerate(a, &this, ax);
+    const configs = try enumerate(a, &this, ax, &.{});
 
     try std.testing.expectEqual(@as(usize, 1), configs.len);
     try std.testing.expect(configs[0].is_this_machine);
@@ -224,7 +251,7 @@ test "enumerate: an axis unset on this machine still yields exactly one match" {
         .{ "os", "darwin" },
     }, &.{});
 
-    const configs = try enumerate(a, &this, ax);
+    const configs = try enumerate(a, &this, ax, &.{});
 
     var this_count: usize = 0;
     var this_config: ?Configuration = null;

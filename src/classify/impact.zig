@@ -158,7 +158,7 @@ test "impact: an edit inside a gated region affects only that configuration" {
     var this = std.StringHashMap([]const u8).init(a);
     try this.put("os", "darwin");
     const ax = try source.axes.ofFile(a, io, file);
-    const configs = try config_space.enumerate(a, &this, ax);
+    const configs = try config_space.enumerate(a, &this, ax, &.{});
 
     // Guard the fixture itself: a sibling configuration must actually exist,
     // or the negative assertion below would pass vacuously.
@@ -204,7 +204,7 @@ test "impact: an edit outside any gated region affects every configuration" {
     var this = std.StringHashMap([]const u8).init(a);
     try this.put("os", "darwin");
     const ax = try source.axes.ofFile(a, io, file);
-    const configs = try config_space.enumerate(a, &this, ax);
+    const configs = try config_space.enumerate(a, &this, ax, &.{});
 
     try testing.expect(configs.len >= 2);
     try testing.expect(hasLabel(configs, "os=linux"));

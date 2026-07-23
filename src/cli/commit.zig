@@ -346,7 +346,7 @@ fn fileSpace(
     file: mox.source.tree.ManagedFile,
 ) !FileSpace {
     const ax = try mox.source.axes.ofFile(arena, io, file);
-    const configs = try config_space.enumerate(arena, this_bindings, ax);
+    const configs = try config_space.enumerate(arena, this_bindings, ax, &.{});
     return .{ .ax = ax, .configs = configs };
 }
 
@@ -1406,6 +1406,20 @@ fn containsOverlayOrigin(segments: []const Segment) bool {
     return false;
 }
 
+/// Axes every real machine always binds (`src/machine/bindings.zig`'s
+/// `fromMachineState` sets os/arch/machine unconditionally, from `MachineState`
+/// fields no machine lacks). Their unbound configuration is a phantom that must
+/// never be enumerated. Every other compared axis is an optional custom fact:
+/// a real sibling machine may leave it unset, and `structConfigs` must
+/// enumerate that fall-through configuration for the blast-radius check below
+/// to be sound.
+const derived_axes = [_][]const u8{ "os", "arch", "machine" };
+
+fn isDerivedAxis(name: []const u8) bool {
+    for (derived_axes) |d| if (std.mem.eql(u8, d, name)) return true;
+    return false;
+}
+
 /// The configurations `file`'s edits can affect, over the REPO-WIDE value
 /// space. `axes.ofFileOverTree` gives the file's own compared axis NAMES, each
 /// carrying the repo-wide value SET (`axes.ofTree` unions every axis value
@@ -1415,6 +1429,12 @@ fn containsOverlayOrigin(segments: []const Segment) bool {
 /// axis no file references is not a phantom dimension. The per-file space
 /// alone would miss such a fall-through machine, so a structured promote must
 /// enumerate this way to be sound.
+///
+/// A non-derived compared axis also forces its unbound representative even
+/// when THIS machine binds it: a sibling that leaves an optional fact
+/// (`profile`, say) unset falls through to the base, and a promote that
+/// silently changes what that sibling reads would violate the same soundness
+/// invariant the repo-wide value set exists to uphold.
 fn structConfigs(
     arena: std.mem.Allocator,
     io: Io,
@@ -1423,7 +1443,14 @@ fn structConfigs(
     repo_dir: []const u8,
 ) ![]const Configuration {
     const ax = try mox.source.axes.ofFileOverTree(arena, io, file, repo_dir);
-    return config_space.enumerate(arena, this_bindings, ax);
+
+    var force_unbound: std.ArrayList([]const u8) = .empty;
+    var it = ax.compared.keyIterator();
+    while (it.next()) |name| {
+        if (!isDerivedAxis(name.*)) try force_unbound.append(arena, name.*);
+    }
+
+    return config_space.enumerate(arena, this_bindings, ax, force_unbound.items);
 }
 
 /// A `FileSpace` for a structured file whose `.configs` is the REPO-WIDE set.
@@ -1595,7 +1622,7 @@ fn processStructFile(
     const layers = try structLayers(cc.arena, cc.io, file, cc.this_bindings, format);
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
 
-    for (changes) |change| {
+    for (changes, 0..) |change, ki| {
         const res = try commit_struct.resolveLayer(cc.arena, format, layers, change);
         if (res.action == .skip) {
             ra.manual_count.* += 1;
@@ -1605,10 +1632,11 @@ fn processStructFile(
             continue;
         }
 
-        const winner_label = try structRouteLabel(cc.arena, layers, res, change);
+        const winner_label = try structRouteLabel(cc.arena, file, layers, res, change);
 
         if (cc.report_mode) {
             ra.pending.* = true;
+            ra.routed_count.* += 1;
             try cc.stdout.print("  would write {s} {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path) });
             try printKeyChange(cc.sty, cc.stdout, change, winner_label);
             continue;
@@ -1616,16 +1644,24 @@ fn processStructFile(
 
         var chosen: ?usize = res.target;
         if (cc.interactive) {
-            try printHunkHeader(cc.stdout, cc.sty, rel, 0, 0, winner_label);
+            try printHunkHeader(cc.stdout, cc.sty, rel, ki + 1, changes.len, winner_label);
             try printKeyChange(cc.sty, cc.stdout, change, winner_label);
             const legend_line = try legend(cc.arena, &struct_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &struct_choices, 0, legend_line, cc.input, cc.stdout)) {
                 .chosen => |i| switch (i) {
                     0 => chosen = res.target,
-                    // `pickLayer` returns null when the user declines the pick's
-                    // cross-configuration confirm (or the trailing skip), which
-                    // is a deliberate decline like `[s]`.
-                    1 => chosen = try pickLayer(cc, file, format, layers, res, change, space.configs),
+                    // `pickLayer` returns `.skip` when the user declines the
+                    // pick's cross-configuration confirm (or the trailing
+                    // skip) -- a deliberate decline like `[s]`. `.abort`/
+                    // `.abort_strict` (real `q`/strict-abort inside the pick
+                    // sub-menus) must quit the run exactly like everywhere
+                    // else, not be swallowed as a per-key decline.
+                    1 => switch (try pickLayer(cc, file, format, layers, res, change, space.configs)) {
+                        .picked => |idx| chosen = idx,
+                        .skip => chosen = null,
+                        .abort => return .abort,
+                        .abort_strict => return .abort_strict,
+                    },
                     else => chosen = null, // skip
                 },
                 .abort => return .abort,
@@ -1637,7 +1673,7 @@ fn processStructFile(
         if (chosen) |chosen_idx| {
             try recordStructPlacement(cc, ra, file, fidx, space, format, layers, res, chosen_idx, change);
             if (!cc.interactive)
-                try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), layers[chosen_idx].path });
+                try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) });
         } else {
             ra.declined_hunks[fidx] += 1;
         }
@@ -1735,18 +1771,28 @@ fn keyPathLabel(arena: std.mem.Allocator, path: []const []const u8) ![]const u8 
     return std.mem.join(arena, ".", path);
 }
 
+/// Repo-relative label for a structured layer: the base's repo-relative
+/// source path, or an overlay's filename (e.g. "os=darwin.toml"). Mirrors
+/// `lineRouteLabel`'s repo-relative line-hunk labels -- never the layer's
+/// absolute on-disk path, which would leak the home directory.
+fn structLayerLabel(file: mox.source.tree.ManagedFile, layer: commit_struct.StructLayer) []const u8 {
+    if (layer.is_base) return file.source_base_path;
+    return std.fs.path.basename(layer.path);
+}
+
 /// Route label for a structured key change: the winning (default) layer, named
-/// as base or its axis tuple.
+/// as base or its repo-relative filename.
 fn structRouteLabel(
     arena: std.mem.Allocator,
+    file: mox.source.tree.ManagedFile,
     layers: []const commit_struct.StructLayer,
     res: commit_struct.Resolution,
     change: commit_struct.KeyPathChange,
 ) ![]const u8 {
     const target = layers[res.target];
     const verb = if (change.removed) "remove from" else "write to";
-    if (target.is_base) return std.fmt.allocPrint(arena, "{s} base {s}", .{ verb, target.path });
-    return std.fmt.allocPrint(arena, "{s} {s}", .{ verb, target.path });
+    if (target.is_base) return std.fmt.allocPrint(arena, "{s} base {s}", .{ verb, file.source_base_path });
+    return std.fmt.allocPrint(arena, "{s} {s}", .{ verb, structLayerLabel(file, target) });
 }
 
 /// A pick reaching configurations beyond the plain `[y]` edit takes one
@@ -1757,13 +1803,23 @@ const confirm_choices = [_]prompt.Choice{
     .{ .key = "n", .label = "no", .help = "do not place this key" },
 };
 
+/// `pickLayer`'s outcome: a chosen layer, a deliberate skip/decline (the
+/// trailing skip, `report_only`, or a declined confirm), or a real abort that
+/// must propagate out of `processStructFile` and unwind the whole run --
+/// `q`/strict-abort here quits exactly like everywhere else, and must not be
+/// folded into a per-key decline.
+const PickOutcome = union(enum) {
+    picked: usize,
+    skip,
+    abort,
+    abort_strict,
+};
+
 /// Present the layer picker for a structured key change: base and each
 /// applicable overlay, the current winner marked, each shadowed candidate
 /// annotated with the override entries a placement there deletes. When the
 /// chosen layer changes configurations BEYOND the plain `[y]` edit, list those
-/// with the key's before/after value and take one confirm. Returns the chosen
-/// layer index, or null to skip (the trailing skip, an abort, or a declined
-/// confirm -- all deliberate declines of this key).
+/// with the key's before/after value and take one confirm.
 fn pickLayer(
     cc: *const ClassCtx,
     file: mox.source.tree.ManagedFile,
@@ -1772,7 +1828,7 @@ fn pickLayer(
     res: commit_struct.Resolution,
     change: commit_struct.KeyPathChange,
     configs: []const Configuration,
-) !?usize {
+) !PickOutcome {
     try cc.stdout.print("  place {s} in...\n", .{try keyPathLabel(cc.arena, change.path)});
 
     var choices: std.ArrayList(prompt.Choice) = .empty;
@@ -1786,9 +1842,9 @@ fn pickLayer(
         else
             try cc.arena.dupe(u8, "");
         const name = if (layer.is_base)
-            try std.fmt.allocPrint(cc.arena, "base {s}", .{layer.path})
+            try std.fmt.allocPrint(cc.arena, "base {s}", .{file.source_base_path})
         else
-            layer.path;
+            std.fs.path.basename(layer.path);
         try cc.stdout.print("    [{d}] {s}{s}\n", .{ i + 1, name, suffix });
         const key = try std.fmt.allocPrint(cc.arena, "{d}", .{i + 1});
         try choices.append(cc.arena, .{ .key = key, .label = name });
@@ -1798,16 +1854,16 @@ fn pickLayer(
 
     const legend_line = try legend(cc.arena, choices.items, res.target, cc.sty);
     const picked: usize = switch (try prompt.ask(cc.ask_mode, choices.items, res.target, legend_line, cc.input, cc.stdout)) {
-        .chosen => |i| if (i < layers.len) i else return null, // trailing skip
-        .abort => return null,
-        .abort_strict => return null,
-        .report_only => return null,
+        .chosen => |i| if (i < layers.len) i else return .skip, // trailing skip
+        .abort => return .abort,
+        .abort_strict => return .abort_strict,
+        .report_only => return .skip,
     };
 
     // The winner is identical to `[y]`: no cross-configuration effect to
     // confirm. Single-config files (no repo-wide sibling) also skip the confirm
     // because `extra` is necessarily empty.
-    if (picked == res.target or configs.len <= 1) return picked;
+    if (picked == res.target or configs.len <= 1) return .{ .picked = picked };
 
     // `extra` = configs the actual pick changes that the plain `[y]` winner
     // edit does not. A config with its own override of the key is in neither.
@@ -1816,7 +1872,7 @@ fn pickLayer(
     const winner_imp = try simulateStructImpact(cc, file, winner_edits, configs);
     const pick_imp = try simulateStructImpact(cc, file, pick_edits, configs);
     const extra = try labelDifference(cc.arena, pick_imp.affected, winner_imp.affected);
-    if (extra.len == 0) return picked;
+    if (extra.len == 0) return .{ .picked = picked };
 
     try cc.stdout.writeAll("  placing here also changes:\n");
     for (extra) |label| {
@@ -1826,20 +1882,24 @@ fn pickLayer(
         try cc.stdout.print("    {s}: {s} -> {s}\n", .{ label, before_v, after_v });
     }
     const cl = try legend(cc.arena, &confirm_choices, 1, cc.sty);
-    switch (try prompt.ask(cc.ask_mode, &confirm_choices, 1, cl, cc.input, cc.stdout)) {
-        .chosen => |i| return if (i == 0) picked else null,
-        else => return null,
-    }
+    return switch (try prompt.ask(cc.ask_mode, &confirm_choices, 1, cl, cc.input, cc.stdout)) {
+        .chosen => |i| if (i == 0) .{ .picked = picked } else .skip,
+        .abort => .abort,
+        .abort_strict => .abort_strict,
+        .report_only => .skip,
+    };
 }
 
 /// "(removes your override in a.toml, b.toml)" annotation for a shadowed
-/// candidate: the overrides a placement there deletes on THIS machine.
+/// candidate: the overrides a placement there deletes on THIS machine. `shadow`
+/// entries are always overlay layers more specific than the base (never the
+/// base itself), so a bare filename always identifies one.
 fn shadowNote(arena: std.mem.Allocator, shadow: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "  (removes your override in ");
     for (shadow, 0..) |p, i| {
         if (i > 0) try out.appendSlice(arena, ", ");
-        try out.appendSlice(arena, p);
+        try out.appendSlice(arena, std.fs.path.basename(p));
     }
     try out.append(arena, ')');
     return out.toOwnedSlice(arena);
