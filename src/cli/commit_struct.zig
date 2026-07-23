@@ -540,10 +540,8 @@ pub fn resolveLayer(
         return .{ .action = .set, .target = 0, .definers = definers, .skip_reason = null };
 
     const winner = definers[0];
-    if (layerScalar(format, layers[winner].value, change.path)) |s| {
-        if (hasCapture(s))
-            return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "value is interpolation- or secret-derived" };
-    }
+    if (capturedAt(format, layers[winner].value, change.path))
+        return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "value is interpolation- or secret-derived" };
     return .{ .action = .set, .target = winner, .definers = definers, .skip_reason = null };
 }
 
@@ -602,43 +600,105 @@ fn iniHas(v: ini.Value, path: []const []const u8) bool {
     return iniHas(child, path[1..]);
 }
 
-/// The leaf scalar string at `path` in `value`, or null when the leaf is
-/// absent or not a string. Only strings can carry an interpolation capture.
-fn layerScalar(format: Format, value: Value, path: []const []const u8) ?[]const u8 {
+/// Whether the value `path` names in `value` carries an interpolation capture
+/// anywhere beneath it. A capture nested in an array element, a sub-table, or
+/// an ini list is baked into shared source by a route just as surely as a leaf
+/// one, so the scan covers the whole subtree rather than the leaf alone. An
+/// absent path carries nothing.
+pub fn capturedAt(format: Format, value: Value, path: []const []const u8) bool {
     return switch (format) {
-        .toml => tomlScalar(value.toml, path),
-        .json => jsonScalar(value.json, path),
-        .yaml => yamlScalar(value.yaml, path),
-        .ini, .gitconfig => iniScalar(value.ini, path),
+        .toml => if (tomlAt(value.toml, path)) |v| tomlCapture(v) else false,
+        .json => if (jsonAt(value.json, path)) |v| jsonCapture(v) else false,
+        .yaml => if (yamlAt(value.yaml, path)) |v| yamlCapture(v) else false,
+        .ini, .gitconfig => if (iniAt(value.ini, path)) |v| iniCapture(v) else false,
     };
 }
 
-fn tomlScalar(v: toml.Value, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return if (v == .string) v.string else null;
+fn tomlAt(v: toml.Value, path: []const []const u8) ?toml.Value {
+    if (path.len == 0) return v;
     if (v != .table) return null;
     const child = v.table.get(path[0]) orelse return null;
-    return tomlScalar(child, path[1..]);
+    return tomlAt(child, path[1..]);
 }
 
-fn jsonScalar(v: json.Value, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return if (v == .string) v.string else null;
+fn jsonAt(v: json.Value, path: []const []const u8) ?json.Value {
+    if (path.len == 0) return v;
     if (v != .object) return null;
     const child = v.object.get(path[0]) orelse return null;
-    return jsonScalar(child, path[1..]);
+    return jsonAt(child, path[1..]);
 }
 
-fn yamlScalar(v: yaml.Value, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return if (v == .string) v.string else null;
+fn yamlAt(v: yaml.Value, path: []const []const u8) ?yaml.Value {
+    if (path.len == 0) return v;
     if (v != .map) return null;
     const child = yaml.Value.mapGet(v.map, path[0]) orelse return null;
-    return yamlScalar(child, path[1..]);
+    return yamlAt(child, path[1..]);
 }
 
-fn iniScalar(v: ini.Value, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return if (v == .string) v.string else null;
+fn iniAt(v: ini.Value, path: []const []const u8) ?ini.Value {
+    if (path.len == 0) return v;
     if (v != .section) return null;
     const child = v.section.findValue(path[0]) orelse return null;
-    return iniScalar(child, path[1..]);
+    return iniAt(child, path[1..]);
+}
+
+fn tomlCapture(v: toml.Value) bool {
+    return switch (v) {
+        .string => |s| hasCapture(s),
+        .array => |a| for (a.items) |e| {
+            if (tomlCapture(e)) break true;
+        } else false,
+        .table => |t| blk: {
+            var it = t.iterator();
+            while (it.next()) |kv| {
+                if (hasCapture(kv.key_ptr.*) or tomlCapture(kv.value_ptr.*)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn jsonCapture(v: json.Value) bool {
+    return switch (v) {
+        .string => |s| hasCapture(s),
+        .array => |a| for (a) |e| {
+            if (jsonCapture(e)) break true;
+        } else false,
+        .object => |o| blk: {
+            var it = o.iterator();
+            while (it.next()) |kv| {
+                if (hasCapture(kv.key_ptr.*) or jsonCapture(kv.value_ptr.*)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn yamlCapture(v: yaml.Value) bool {
+    return switch (v) {
+        .string => |s| hasCapture(s),
+        .seq => |s| for (s) |e| {
+            if (yamlCapture(e)) break true;
+        } else false,
+        .map => |m| for (m) |e| {
+            if (yamlCapture(e.key) or yamlCapture(e.value)) break true;
+        } else false,
+        else => false,
+    };
+}
+
+fn iniCapture(v: ini.Value) bool {
+    return switch (v) {
+        .string => |s| hasCapture(s),
+        .list => |l| for (l) |e| {
+            if (hasCapture(e)) break true;
+        } else false,
+        .section => |s| for (s.entries) |e| {
+            if (hasCapture(e.key) or iniCapture(e.value)) break true;
+        } else false,
+    };
 }
 
 /// Whether `s` holds any non-empty `<...>` capture. Conservative on purpose: a

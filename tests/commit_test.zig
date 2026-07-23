@@ -2731,6 +2731,34 @@ test "commit: structured secret-derived key is skipped, never routed" {
     _ = res;
 }
 
+test "commit: structured capture nested in an array is skipped, never routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "hosts = [\"<machine.email>\", \"backup\"]\ntheme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"backup\"", "\"backup\", \"extra\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    // The capture sits in an array ELEMENT, not at the leaf the path names, so
+    // a leaf-only guard would route it and bake the resolved fact into the
+    // shared base. The whole subtree must be scanned.
+    const base = try read(io, a, try h.srcOf("config.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, base, "old@home.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "extra") == null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "<machine.email>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "interpolation- or secret-derived") != null);
+}
+
 test "commit: structured [y] routes to the winning overlay (json)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
