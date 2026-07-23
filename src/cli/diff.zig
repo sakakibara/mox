@@ -171,6 +171,25 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         // diff (user-owned after first write / target-only respectively).
         if (file.create_once or file.is_symlink) continue;
 
+        // A GENERATOR produces N files at rendered paths and never materializes
+        // its own; composing it as an ordinary file rejects its own `into`
+        // clause. Diff what it produces -- the same set status reports and
+        // apply writes -- rather than erroring on the generator itself.
+        {
+            var gdiag: mox.compose.interp.Diag = .{};
+            if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
+                try ctx.err.print("mox diff: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
+                if (gdiag.capture()) |cap|
+                    try ctx.err.print("mox diff:   failing item: {s}\n", .{cap});
+                continue;
+            }) |outputs| {
+                for (outputs) |o| {
+                    try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.live_path, o.content, o.prov, &total, &changed);
+                }
+                continue;
+            }
+        }
+
         // Track provenance so secret-covered lines can be redacted from the
         // printed diff: the resolved secret is inlined into the composed bytes,
         // and must never reach stdout.
@@ -185,46 +204,66 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         // Axis-gated off for this machine: nothing to compose, nothing to diff.
         const composed_bytes = composed orelse continue;
 
-        const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
-            error.FileNotFound => "",
-            else => return e,
-        };
-        if (std.mem.eql(u8, live, composed_bytes)) continue;
-
-        const a_lines = try mox.diff.lines.splitLines(ctx.alloc, live);
-        const b_lines = try mox.diff.lines.splitLines(ctx.alloc, composed_bytes);
-        const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
-            error.TooManyLines => {
-                try ctx.err.print("mox diff: {s}: too large to diff\n", .{file.live_path});
-                continue;
-            },
-            else => return e,
-        };
-        if (hunks.len == 0) continue;
-
-        changed += 1;
-        const s = statOf(hunks);
-        total.added += s.added;
-        total.removed += s.removed;
-
-        if (stat_mode) {
-            try ctx.out.print(" {s} | +{d} -{d}\n", .{ file.live_path, s.added, s.removed });
-        } else {
-            // Composed-side secrets come from this compose's provenance; live-side
-            // secrets from the last-applied provenance mox persisted for the path
-            // (its resolved values may still sit on disk).
-            const b_secret = try secretMask(ctx.alloc, b_lines.len, prov.items);
-            const prior = try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
-            const a_secret = if (prior) |m| try secretMask(ctx.alloc, a_lines.len, m.segments) else &.{};
-            const rendered = try renderFile(ctx.alloc, file.live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
-            try ctx.out.writeAll(rendered);
-        }
+        try diffOne(ctx, context.paths.state_dir, sty, stat_mode, file.live_path, composed_bytes, prov.items, &total, &changed);
     }
 
     if (stat_mode) {
         try ctx.out.print(" {d} file(s) changed, +{d} -{d}\n", .{ changed, total.added, total.removed });
     }
     return 0;
+}
+
+/// Diff one composed result against its live file, printing the rendered hunks
+/// (or the `--stat` line) and accumulating totals. Shared by an ordinary
+/// managed file and by every file a generator produces, so both report the same
+/// way. `prov_segments` is the composed side's provenance, used to redact
+/// secret-covered lines: a resolved secret is inlined into the composed bytes
+/// and must never reach stdout.
+fn diffOne(
+    ctx: *app.Ctx,
+    state_dir: []const u8,
+    sty: style.Style,
+    stat_mode: bool,
+    live_path: []const u8,
+    composed_bytes: []const u8,
+    prov_segments: []const mox.provenance.map.Segment,
+    total: *Stat,
+    changed: *usize,
+) !void {
+    const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    if (std.mem.eql(u8, live, composed_bytes)) return;
+
+    const a_lines = try mox.diff.lines.splitLines(ctx.alloc, live);
+    const b_lines = try mox.diff.lines.splitLines(ctx.alloc, composed_bytes);
+    const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
+        error.TooManyLines => {
+            try ctx.err.print("mox diff: {s}: too large to diff\n", .{live_path});
+            return;
+        },
+        else => return e,
+    };
+    if (hunks.len == 0) return;
+
+    changed.* += 1;
+    const s = statOf(hunks);
+    total.added += s.added;
+    total.removed += s.removed;
+
+    if (stat_mode) {
+        try ctx.out.print(" {s} | +{d} -{d}\n", .{ live_path, s.added, s.removed });
+    } else {
+        // Composed-side secrets come from this compose's provenance; live-side
+        // secrets from the last-applied provenance mox persisted for the path
+        // (its resolved values may still sit on disk).
+        const b_secret = try secretMask(ctx.alloc, b_lines.len, prov_segments);
+        const prior = try mox.provenance.map.read(ctx.alloc, ctx.io, state_dir, live_path);
+        const a_secret = if (prior) |m| try secretMask(ctx.alloc, a_lines.len, m.segments) else &.{};
+        const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
+        try ctx.out.writeAll(rendered);
+    }
 }
 
 pub const command = app.command(Spec, .{

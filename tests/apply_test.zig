@@ -1562,6 +1562,38 @@ fn writeGenFixture(io: Io, tmp: *std.testing.TmpDir, slugs: []const []const u8) 
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = body.items });
 }
 
+test "diff generator: diffs what it produces, not the generator itself" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenFixture(io, &tmp, &.{ "a", "b" });
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // Freshly applied: the produced files match, so there is nothing to show
+    // -- and, critically, no attempt to compose the generator as an ordinary
+    // file (which rejects its own `into` clause as IntoOnNonGenerator).
+    const clean = try c.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, clean.err, "compose failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, clean.err, "IntoOnNonGenerator") == null);
+    try std.testing.expect(std.mem.indexOf(u8, clean.out, "gen.inc") == null);
+
+    // Edit one produced file: diff must report THAT path, since the generator
+    // has no live file of its own to compare.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(".config/id-a.inc"), .data = "key=EDITED\n" });
+    const res = try c.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "compose failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "key=EDITED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "key=a") != null);
+    // The untouched sibling row is not reported.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "id-b.inc") == null);
+}
+
 test "apply generator: writes one file per row; the generator's own path is not written" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
