@@ -165,7 +165,7 @@ fn neverMaterializing(
         // materializes on a machine that has it, which the config space cannot
         // represent -- so a null-everywhere result there is not proof.
         if (!allNamesCompared(ax)) continue;
-        const configs = try mox.classify.config_space.enumerate(arena, &this_bindings, ax, &.{});
+        const configs = try mox.classify.config_space.enumerate(arena, &this_bindings, ax, &.{}, &.{});
         const materializes = for (configs) |cfg| {
             const composed = mox.compose.composeFileTracked(arena, io, file, &cfg.bindings, &m_state, null, null, null) catch break true;
             if (composed != null) break true;

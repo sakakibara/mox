@@ -2473,9 +2473,11 @@ test "commit: structured [p] to base promotes the key and drops the overriding e
     const live = try h.liveOf("config.toml");
     try editLive(io, a, live, "\"dark\"", "\"solarized\"");
 
-    // [p] then candidate 1 (base).
-    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    // [p] then candidate 1 (base), then confirm: the base is what a machine
+    // running an os this repo never names composes, so the promote reaches it.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\ny\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=(other): light -> solarized") != null);
 
     // Base now holds the promoted value; the overriding overlay entry is gone.
     try std.testing.expectEqualStrings("theme = \"solarized\"\nfont = \"mono\"\n", try read(io, a, try h.srcOf("config.toml")));
@@ -2666,12 +2668,11 @@ test "commit: structured [p] to base over a real os sibling never confirms a spu
     const a = arena.allocator();
 
     // os=linux has its OWN override, so it recomposes identically regardless
-    // of the promote -- clean, no confirm expected. This also exercises the
-    // derived-axis exclusion: os is always bound on every real machine, so an
-    // "os unset" configuration is a phantom that must never be enumerated,
-    // even though os genuinely varies here (unlike the single-value case,
-    // which is dropped for an unrelated reason and would pass even with the
-    // exclusion missing).
+    // of the promote and never appears in the confirm. This pins the shape of
+    // the derived-axis representative: os is bound on every real machine, so
+    // an "os unset" configuration is a phantom that must never be enumerated,
+    // while "an os no source names" is a real machine the promote does reach
+    // and must be listed.
     try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
     try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
     try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"blue\"\n");
@@ -2681,12 +2682,12 @@ test "commit: structured [p] to base over a real os sibling never confirms a spu
     const live = try h.liveOf("config.toml");
     try editLive(io, a, live, "\"dark\"", "\"solarized\"");
 
-    // [p] -> base (candidate 1). No confirm line follows: were os's unbound
-    // representative wrongly enumerated, this input would leave an unanswered
-    // confirm and the run would not cleanly succeed.
-    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\n");
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\ny\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "placing here also changes") == null);
+    // The unnamed-os machine is listed; os=linux, which overrides the key
+    // itself, is not; and no phantom "unset" configuration appears at all.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=(other): light -> solarized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=linux") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "unset") == null);
 
     try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml")));
@@ -2888,7 +2889,7 @@ test "commit: the pick menu refuses a layer whose entry is interpolated" {
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("config.toml")), "old@home.com") == null);
 }
 
-test "commit: a source layer rejecting a struct edit rolls that file back, not the run" {
+test "commit: a key the target layer cannot hold is reported, and writes nothing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2910,11 +2911,11 @@ test "commit: a source layer rejecting a struct edit rolls that file back, not t
     try editLive(io, a, try h.liveOf(".zshrc"), "export B=2", "export B=22");
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
-    try std.testing.expectEqual(@as(u8, 1), res.rc);
-    // The `z` edit landed before `foo.baz` was rejected; the file rolls back
-    // whole, so the base is byte-identical rather than half-written.
-    try std.testing.expectEqualStrings("z = 1\nfoo = \"scalar\"\n", try read(io, a, try h.srcOf("config.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "rejected the edit") != null);
+    // The impact simulation applies the edit for real and restores it, so the
+    // bad key is caught before the write phase: it is reported un-routable and
+    // the sibling key on the same file is unaffected by it.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "cannot hold this key") != null);
+    try std.testing.expectEqualStrings("z = 2\nfoo = \"scalar\"\n", try read(io, a, try h.srcOf("config.toml")));
     // The failure is scoped to its own file: an unrelated one still commits.
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export B=22") != null);
 }

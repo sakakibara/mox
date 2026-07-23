@@ -346,7 +346,7 @@ fn fileSpace(
     file: mox.source.tree.ManagedFile,
 ) !FileSpace {
     const ax = try mox.source.axes.ofFile(arena, io, file);
-    const configs = try config_space.enumerate(arena, this_bindings, ax, &.{});
+    const configs = try config_space.enumerate(arena, this_bindings, ax, &.{}, &.{});
     return .{ .ax = ax, .configs = configs };
 }
 
@@ -1434,11 +1434,13 @@ fn containsOverlayOrigin(segments: []const Segment) bool {
 
 /// Axes every real machine always binds (`src/machine/bindings.zig`'s
 /// `fromMachineState` sets os/arch/machine unconditionally, from `MachineState`
-/// fields no machine lacks). Their unbound configuration is a phantom that must
-/// never be enumerated. Every other compared axis is an optional custom fact:
-/// a real sibling machine may leave it unset, and `structConfigs` must
-/// enumerate that fall-through configuration for the blast-radius check below
-/// to be sound.
+/// fields no machine lacks). Their UNBOUND configuration is a phantom that must
+/// never be enumerated -- but a value the sources never name is not: a machine
+/// running an os this repo has never mentioned is real, and a promote reaches
+/// it. So a derived axis gets the `(other)` representative instead of the
+/// unbound one. Every other compared axis is an optional custom fact: a real
+/// sibling machine may leave it unset, and that fall-through configuration is
+/// what must be enumerated for the blast-radius check below to be sound.
 const derived_axes = [_][]const u8{ "os", "arch", "machine" };
 
 fn isDerivedAxis(name: []const u8) bool {
@@ -1471,12 +1473,17 @@ fn structConfigs(
     const ax = try mox.source.axes.ofFileOverTree(arena, io, file, repo_dir);
 
     var force_unbound: std.ArrayList([]const u8) = .empty;
+    var force_other: std.ArrayList([]const u8) = .empty;
     var it = ax.compared.keyIterator();
     while (it.next()) |name| {
-        if (!isDerivedAxis(name.*)) try force_unbound.append(arena, name.*);
+        if (isDerivedAxis(name.*)) {
+            try force_other.append(arena, name.*);
+        } else {
+            try force_unbound.append(arena, name.*);
+        }
     }
 
-    return config_space.enumerate(arena, this_bindings, ax, force_unbound.items);
+    return config_space.enumerate(arena, this_bindings, ax, force_unbound.items, force_other.items);
 }
 
 /// A `FileSpace` for a structured file whose `.configs` is the REPO-WIDE set.
@@ -1727,9 +1734,19 @@ fn processStructFile(
         }
 
         if (chosen) |chosen_idx| {
-            try recordStructPlacement(cc, ra, file, fidx, space, format, layers, res, chosen_idx, change);
-            if (!cc.interactive)
-                try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) });
+            switch (try recordStructPlacement(cc, ra, file, fidx, space, format, layers, res, chosen_idx, change)) {
+                .placed => if (!cc.interactive)
+                    try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) }),
+                .unroutable => {
+                    ra.manual_count.* += 1;
+                    ra.manual_hunks[fidx] += 1;
+                    ra.pending.* = true;
+                    try cc.stdout.print(
+                        "  manual: {s} {s}: {s} cannot hold this key\n",
+                        .{ file.live_path, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) },
+                    );
+                },
+            }
         } else {
             ra.declined_hunks[fidx] += 1;
         }
@@ -1782,11 +1799,19 @@ fn recordStructPlacement(
     res: commit_struct.Resolution,
     chosen_idx: usize,
     change: commit_struct.KeyPathChange,
-) !void {
+) !enum { placed, unroutable } {
     const edits = try structPickEdits(cc.arena, format, layers, res.definers, chosen_idx, change);
 
     if (space.configs.len > 1) {
-        const imp = try simulateStructImpact(cc, file, edits, space.configs);
+        // The simulation applies the real edits and restores every layer it
+        // touched, so a layer that will not accept the edit is caught HERE,
+        // before anything is written for keeps. Reporting it as un-routable
+        // beats letting it reach the write phase, where the whole file rolls
+        // back for one bad key.
+        const imp = simulateStructImpact(cc, file, edits, space.configs) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return .unroutable,
+        };
         for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
     }
 
@@ -1797,6 +1822,7 @@ fn recordStructPlacement(
 
     ra.affected[fidx] = true;
     ra.routed_count.* += 1;
+    return .placed;
 }
 
 /// The labels in `pick` that are not in `winner`: the configurations a `[p]`

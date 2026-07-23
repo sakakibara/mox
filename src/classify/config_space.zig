@@ -31,6 +31,13 @@ pub fn enumerate(
     /// original rule (`null` appears only when this machine is itself
     /// unbound). Pass `&.{}` to preserve that original rule for every axis.
     force_unbound: []const []const u8,
+    /// Axis names for which a representative of every value the sources do NOT
+    /// name must be enumerated -- an axis every machine binds, but to a value
+    /// this repo may never have mentioned (a Linux box for a tree that only
+    /// names `os=darwin`). One representative is sound AND complete: no overlay
+    /// can match a value no source names, so every such machine composes
+    /// identically, as a plain fall-through. Labelled `name=(other)`.
+    force_other: []const []const u8,
 ) ![]Configuration {
     // The axes the source compares, sorted for a stable label and a stable test.
     var compared: std.ArrayList([]const u8) = .empty;
@@ -46,6 +53,10 @@ pub fn enumerate(
     // dimension of the space: it is dropped from `names` below.
     var names: std.ArrayList([]const u8) = .empty;
     var value_sets: std.ArrayList([]const ?[]const u8) = .empty;
+    // Per dimension, the synthetic stand-in for "a value no source names", or
+    // null when the dimension has none. Only its label differs: it binds like
+    // any other value, and matches no overlay by construction.
+    var others: std.ArrayList(?[]const u8) = .empty;
     for (compared.items) |name| {
         var vals: std.ArrayList([]const u8) = .empty;
         const mine = this_bindings.get(name);
@@ -68,11 +79,17 @@ pub fn enumerate(
         var opt_vals: std.ArrayList(?[]const u8) = .empty;
         for (vals.items) |v| try opt_vals.append(arena, v);
         if (mine == null or contains(force_unbound, name)) try opt_vals.append(arena, null);
+        var other_val: ?[]const u8 = null;
+        if (contains(force_other, name)) {
+            other_val = try unusedValue(arena, vals.items);
+            try opt_vals.append(arena, other_val.?);
+        }
         // A lone value is necessarily this machine's own (an unbound axis always
         // contributes `null` as a second member): nothing to enumerate.
         if (opt_vals.items.len == 1) continue;
         try names.append(arena, name);
         try value_sets.append(arena, opt_vals.items);
+        try others.append(arena, other_val);
     }
 
     var out: std.ArrayList(Configuration) = .empty;
@@ -91,8 +108,14 @@ pub fn enumerate(
                 try bindings.put(name, v);
                 if (label.items.len != 0) try label.append(arena, '+');
                 try label.appendSlice(arena, name);
-                try label.append(arena, '=');
-                try label.appendSlice(arena, v);
+                if (others.items[i] != null and std.mem.eql(u8, v, others.items[i].?)) {
+                    // The synthetic value is an implementation detail; naming it
+                    // would read as a real machine value the user could look up.
+                    try label.appendSlice(arena, "=(other)");
+                } else {
+                    try label.append(arena, '=');
+                    try label.appendSlice(arena, v);
+                }
             } else {
                 // `bindings` started as a clone of THIS machine's bindings, so
                 // an unbound axis must be explicitly dropped -- otherwise a
@@ -150,6 +173,14 @@ fn advance(idx: []usize, sets: []const []const ?[]const u8) bool {
     return false;
 }
 
+/// A value no source names, so no overlay can match it. Built by extending
+/// "other" until it falls outside `vals` (the axis's whole named value set).
+fn unusedValue(arena: std.mem.Allocator, vals: []const []const u8) ![]const u8 {
+    var candidate: []const u8 = "other";
+    while (contains(vals, candidate)) candidate = try std.fmt.allocPrint(arena, "{s}_", .{candidate});
+    return candidate;
+}
+
 fn contains(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |h| {
         if (std.mem.eql(u8, h, needle)) return true;
@@ -179,7 +210,7 @@ test "enumerate: varies only axes the source compares by value" {
 
     const ax = try axesFixture(a, &.{ .{ "os", "darwin" }, .{ "os", "linux" } }, &.{"signing_key"});
 
-    const configs = try enumerate(a, &this, ax, &.{});
+    const configs = try enumerate(a, &this, ax, &.{}, &.{});
 
     // os=darwin and os=linux. Nothing else varies.
     try std.testing.expectEqual(@as(usize, 2), configs.len);
@@ -217,7 +248,7 @@ test "enumerate: two compared axes produce their cross product" {
         .{ "profile", "work" }, .{ "profile", "personal" },
     }, &.{});
 
-    const configs = try enumerate(a, &this, ax, &.{});
+    const configs = try enumerate(a, &this, ax, &.{}, &.{});
     try std.testing.expectEqual(@as(usize, 4), configs.len);
 }
 
@@ -230,7 +261,7 @@ test "enumerate: a file naming no axis yields exactly this machine" {
     try this.put("os", "darwin");
 
     const ax = try axesFixture(a, &.{}, &.{});
-    const configs = try enumerate(a, &this, ax, &.{});
+    const configs = try enumerate(a, &this, ax, &.{}, &.{});
 
     try std.testing.expectEqual(@as(usize, 1), configs.len);
     try std.testing.expect(configs[0].is_this_machine);
@@ -251,7 +282,7 @@ test "enumerate: an axis unset on this machine still yields exactly one match" {
         .{ "os", "darwin" },
     }, &.{});
 
-    const configs = try enumerate(a, &this, ax, &.{});
+    const configs = try enumerate(a, &this, ax, &.{}, &.{});
 
     var this_count: usize = 0;
     var this_config: ?Configuration = null;
