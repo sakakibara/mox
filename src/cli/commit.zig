@@ -913,8 +913,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
                 // per actually-routed edit owned by this file, so its emptiness
                 // is the real "was anything committed" signal -- distinct from
                 // `explained > 0`, which only says the mismatch is accounted
-                // for.
-                const has_routed = routed_orig[fidx].len > 0;
+                // for. A `[f]` route writes a fact rather than a source, so it
+                // has no `routed_orig` entry and must be counted here too: this
+                // branch leaves the file un-rolled-back, so `restoreUnkeptFacts`
+                // KEEPS that fact, and reporting "not committed" would deny a
+                // write that stands.
+                const has_routed = routed_orig[fidx].len > 0 or fact_backup[fidx].len > 0;
                 if (manual_hunks[fidx] > 0 and declined_hunks[fidx] > 0) {
                     if (has_routed) {
                         try ctx.err.print(
@@ -2267,13 +2271,11 @@ fn processHunk(
                             }
                         }
                     },
-                    else => {
-                        // [s]: skip.
-                        ra.manual_count.* += 1;
-                        ra.manual_hunks[fidx] += 1;
-                        ra.pending.* = true;
-                        try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
-                    },
+                    // [s]: a deliberate decline, like `[s]` everywhere else --
+                    // not an un-routable hunk. Counting it manual reported a
+                    // routable hunk the user chose to leave as one that "could
+                    // not be routed".
+                    else => ra.declined_hunks[fidx] += 1,
                 },
                 .abort => return .abort,
                 .abort_strict => return .abort_strict,

@@ -2731,6 +2731,37 @@ test "commit: structured secret-derived key is skipped, never routed" {
     _ = res;
 }
 
+test "commit: a fact route alongside a skip is reported committed, and the skip is not manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `export A=1` stays put so the two edits are separate hunks.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export EMAIL=<machine.email | default \"nobody@example.com\">\n" ++
+        "export A=1\nexport B=2\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export EMAIL=old@home.com", "export EMAIL=new@work.com");
+    try editLive(io, a, live, "export B=2", "export B=22");
+
+    // [f] routes the interpolated line to the fact; [s] leaves the plain one.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\ns\n");
+
+    // The fact was written and is kept, so the run must not claim nothing was
+    // committed -- and a deliberate [s] is a decline, never "could not be routed".
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "new@work.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "could not be routed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) were declined") != null);
+}
+
 test "commit: structured drift with no key change is reported, never silently dropped" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
