@@ -26,6 +26,11 @@ pub fn compose(
     file: ManagedFile,
     bindings: *const std.StringHashMap([]const u8),
     _: ?*const machine.state.MachineState,
+    /// Set to whether the winning layer is the base, for provenance: a Cat C
+    /// file's bytes come from exactly ONE layer, and which one it is cannot be
+    /// inferred from whether the file DECLARES overlays -- an overlay that does
+    /// not match this machine contributes nothing.
+    from_base: ?*bool,
 ) !?[]u8 {
     var candidates: std.ArrayList(AxisTuple) = .empty;
     defer candidates.deinit(arena);
@@ -42,6 +47,7 @@ pub fn compose(
     }
 
     const idx = match_mod.bestMatch(candidates.items, bindings) orelse return null;
+    if (from_base) |fb| fb.* = file.has_base and idx == 0;
     const bytes = try Io.Dir.cwd().readFileAlloc(io, paths.items[idx], arena, .limited(max_file_bytes));
     return bytes;
 }

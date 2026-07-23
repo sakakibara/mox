@@ -34,9 +34,13 @@ pub fn enumerate(
     /// Axis names for which a representative of every value the sources do NOT
     /// name must be enumerated -- an axis every machine binds, but to a value
     /// this repo may never have mentioned (a Linux box for a tree that only
-    /// names `os=darwin`). One representative is sound AND complete: no overlay
-    /// can match a value no source names, so every such machine composes
-    /// identically, as a plain fall-through. Labelled `name=(other)`.
+    /// names `os=darwin`). One representative is sound AND complete because
+    /// every axis test is exact equality against a named literal: two unnamed
+    /// values are therefore indistinguishable to every directive, so they
+    /// compose identically and one stands for all. Note this is NOT the same as
+    /// composing only the base -- a negated test (`when not os=darwin`) is
+    /// ENABLED here, which is exactly the behaviour such a machine gets.
+    /// Labelled `name=(other)`.
     force_other: []const []const u8,
 ) ![]Configuration {
     // The axes the source compares, sorted for a stable label and a stable test.
@@ -110,8 +114,10 @@ pub fn enumerate(
                 try label.appendSlice(arena, name);
                 if (others.items[i] != null and std.mem.eql(u8, v, others.items[i].?)) {
                     // The synthetic value is an implementation detail; naming it
-                    // would read as a real machine value the user could look up.
-                    try label.appendSlice(arena, "=(other)");
+                    // bare would read as a real machine value the user could
+                    // look up. `unusedValue` reserved this parenthesized form
+                    // too, so it cannot collide with a real value's label.
+                    try label.print(arena, "=({s})", .{v});
                 } else {
                     try label.append(arena, '=');
                     try label.appendSlice(arena, v);
@@ -187,10 +193,18 @@ fn advance(idx: []usize, sets: []const []const ?[]const u8) bool {
 }
 
 /// A value no source names, so no overlay can match it. Built by extending
-/// "other" until it falls outside `vals` (the axis's whole named value set).
+/// "other" until BOTH it and its parenthesized label form fall outside `vals`
+/// (the axis's whole named value set). The label matters as much as the value:
+/// labels key the guard's `allowed` set, so a source naming the literal value
+/// `(other)` would otherwise produce two configurations indistinguishable to
+/// it, and allowing one would allow the other.
 fn unusedValue(arena: std.mem.Allocator, vals: []const []const u8) ![]const u8 {
     var candidate: []const u8 = "other";
-    while (contains(vals, candidate)) candidate = try std.fmt.allocPrint(arena, "{s}_", .{candidate});
+    while (contains(vals, candidate) or
+        contains(vals, try std.fmt.allocPrint(arena, "({s})", .{candidate})))
+    {
+        candidate = try std.fmt.allocPrint(arena, "{s}_", .{candidate});
+    }
     return candidate;
 }
 

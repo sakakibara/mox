@@ -34,8 +34,11 @@ pub fn composeFile(
 /// single layer routes through Cat B and inherits the same per-line
 /// attribution; every other Cat A route and all of Cat C get one whole-file
 /// segment (structural / binary line attribution is out of scope), origin
-/// `.base` for a single-layer file and `.overlay` when overlays exist, or
-/// `.secret` when a resolved secret was inlined.
+/// `.base` when the output came from the base alone and `.overlay` when an
+/// overlay contributed, or `.secret` when a resolved secret was inlined. Both
+/// categories judge that by what actually composed, never by whether the file
+/// DECLARES overlays: one that does not match this machine contributes nothing,
+/// and its file still routes by line.
 ///
 /// `diag`, when non-null, receives the failing capture's text on a Cat A/B
 /// resolution error, so the caller can name which capture failed.
@@ -70,19 +73,20 @@ pub fn composeFileTracked(
         .a => return try catA.compose(arena, io, file, bindings, machine_state_opt, secrets, prov, diag),
         .b => return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag),
         .c => {
-            const bytes = (try catC.compose(arena, io, file, bindings, machine_state_opt)) orelse return null;
-            try wholeFileSegment(arena, prov, bytes, file);
+            var from_base = false;
+            const bytes = (try catC.compose(arena, io, file, bindings, machine_state_opt, &from_base)) orelse return null;
+            try wholeFileSegment(arena, prov, bytes, file, from_base);
             return bytes;
         },
     }
 }
 
 /// Attribute the whole of `bytes` to a single segment for a Cat C file.
-fn wholeFileSegment(arena: std.mem.Allocator, prov: ?*std.ArrayList(Segment), bytes: []const u8, file: ManagedFile) !void {
+fn wholeFileSegment(arena: std.mem.Allocator, prov: ?*std.ArrayList(Segment), bytes: []const u8, file: ManagedFile, from_base: bool) !void {
     const p = prov orelse return;
     const n = prov_mod.map.lineCount(bytes);
     if (n == 0) return;
-    const origin: prov_mod.map.Origin = if (file.has_base and file.overlays.len == 0)
+    const origin: prov_mod.map.Origin = if (from_base)
         .{ .base = .{ .line = 1 } }
     else
         .{ .overlay = .{ .path = if (file.source_base_abs.len > 0) file.source_base_abs else file.source_base_path } };

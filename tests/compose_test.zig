@@ -38,7 +38,7 @@ test "compose catC: most specific overlay wins" {
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     try bindings.put("os", "darwin");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
     try std.testing.expectEqualStrings("DARWIN", out);
 }
 
@@ -60,7 +60,7 @@ test "compose catC: falls back to base when no overlay matches" {
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     try bindings.put("os", "linux");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
     try std.testing.expectEqualStrings("BASE", out);
 }
 
@@ -85,7 +85,7 @@ test "compose catC: an overlay named for a dotted value matches this machine's e
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     try bindings.put("machine", "host.local");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
     try std.testing.expectEqualStrings("HOST_LOCAL", out);
 }
 
@@ -114,7 +114,7 @@ test "compose catC: an extension-bearing overlay still resolves by its stripped 
     try bindings.put("os", "darwin");
     try bindings.put("machine", "other.example");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
     try std.testing.expectEqualStrings("DARWIN", out);
 }
 
@@ -135,7 +135,7 @@ test "compose catC: orphan with no matching overlay is absent" {
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     try bindings.put("os", "linux");
 
-    const result = mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const result = mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null);
     try std.testing.expect((try result) == null);
 }
 
