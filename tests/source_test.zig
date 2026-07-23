@@ -19,6 +19,37 @@ fn srcPathAlloc(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path, "src" });
 }
 
+test "walk: returns files in a total order, not the filesystem's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Created in an order that is neither sorted nor reverse-sorted, so a walk
+    // that simply echoed creation or directory-iteration order would not match.
+    // Iteration order is the FILESYSTEM's -- APFS and ext4 hand back the same
+    // directory differently -- and every command walks this slice, so status
+    // and diff would list files, and commit would prompt for them, in a
+    // machine-dependent order.
+    try writeFile(io, tmp.dir, "src/.zshrc", "z\n");
+    try writeFile(io, tmp.dir, "src/.bashrc", "b\n");
+    try writeFile(io, tmp.dir, "src/.config/nvim/init.lua", "n\n");
+    try writeFile(io, tmp.dir, "src/.aliases", "a\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    try std.testing.expectEqual(@as(usize, 4), result.files.len);
+    var prev: []const u8 = "";
+    for (result.files) |f| {
+        try std.testing.expect(std.mem.lessThan(u8, prev, f.live_path));
+        prev = f.live_path;
+    }
+}
+
 test "walk: finds a single managed file with no .d directory" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

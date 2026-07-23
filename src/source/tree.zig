@@ -205,6 +205,10 @@ test "fragmentLess is a total order: equal tuples tiebreak on path" {
 ///
 /// `home_dir` is used to compute live paths. All returned strings are arena-owned;
 /// the arena must outlive the returned tree.
+fn livePathLess(_: void, a: ManagedFile, b: ManagedFile) bool {
+    return std.mem.lessThan(u8, a.live_path, b.live_path);
+}
+
 pub fn walk(
     arena: std.mem.Allocator,
     io: Io,
@@ -231,6 +235,13 @@ pub fn walk(
 
     // Stamp every walked file with the repo root (parent of `src/`).
     const out = try files.toOwnedSlice(arena);
+    // Directory iteration order is the filesystem's, not the tree's: APFS and
+    // ext4 hand back the same directory in different orders. Every command
+    // walks this slice, so without a total order `status` and `diff` would list
+    // files differently per machine and `commit` would prompt for them in a
+    // different sequence -- on a tool whose whole point is that machines agree.
+    // Live paths are unique, so ordering by them is total and stable.
+    std.mem.sort(ManagedFile, out, {}, livePathLess);
     for (out) |*f| f.repo_dir = repo_dir;
     return .{ .files = out, .exact_dirs = try exact.toOwnedSlice(arena) };
 }
