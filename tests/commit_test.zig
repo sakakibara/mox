@@ -2790,7 +2790,9 @@ test "commit: structured drift with no key change is reported, never silently dr
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expect(std.mem.indexOf(u8, res.out, "has no key path") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
-    // The drift is still there, and the report is what says so.
+    // Reported AND non-zero, the same as any other un-routable structured key:
+    // a `mox commit` gate must not pass on drift that was not committed.
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
 }
 
@@ -2922,6 +2924,30 @@ test "commit: a key the target layer cannot hold is reported, and writes nothing
     try std.testing.expectEqualStrings("z = 2\nfoo = \"scalar\"\n", try read(io, a, try h.srcOf("config.toml")));
     // The failure is scoped to its own file: an unrelated one still commits.
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export B=22") != null);
+}
+
+test "commit: an angle-bracket literal in a value is data, not a capture" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `Name <addr>` is ordinary package metadata. Refusing to route it -- and
+    // calling it secret-derived -- would strand the key permanently.
+    try writeRepo(io, &tmp, "repo/src/config.toml", "authors = [\"Sho <me@example.com>\"]\ntheme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"Sho <me@example.com>\"", "\"Sho <me@example.com>\", \"Co\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "interpolation- or secret-derived") == null);
+    const base = try read(io, a, try h.srcOf("config.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, base, "\"Co\"") != null);
 }
 
 test "commit: structured capture nested in an array is skipped, never routed" {

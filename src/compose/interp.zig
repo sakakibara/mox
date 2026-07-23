@@ -232,6 +232,35 @@ fn unescapeSecretUri(arena: std.mem.Allocator, raw: []const u8) std.mem.Allocato
 /// Check a template for forbidden patterns. Returns nothing on success. The
 /// duplicate-capture set is arena-owned, so it stays unbounded regardless of
 /// how many distinct captures a template carries.
+/// Namespace heads `expandTracked` resolves. A `<...>` whose inner text starts
+/// with none of these (and carries no fallback chain) is passed through
+/// literally outside template mode, so it is text, not a capture.
+const capture_namespaces = [_][]const u8{ "machine.", "entry.", "data.", "env." };
+
+/// Whether `template` holds a capture this module would EXPAND. `Sho
+/// <me@example.com>` holds none: a bare name resolves only in template mode
+/// (against a record), and against a loop scope, neither of which a structural
+/// compose has. Callers use this to refuse routing an edit back into source
+/// text that interpolates, which would bake a resolved fact or secret.
+pub fn containsCapture(template: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, template, i, '<')) |open| {
+        const close = captureCloseIndex(template, open) orelse {
+            i = open + 1;
+            continue;
+        };
+        const inner = template[open + 1 .. close];
+        if (std.mem.startsWith(u8, inner, "secret:")) return true;
+        // A fallback chain resolves whenever any member does.
+        if (std.mem.indexOf(u8, inner, " | ") != null) return true;
+        for (capture_namespaces) |ns| {
+            if (std.mem.startsWith(u8, inner, ns)) return true;
+        }
+        i = close + 1;
+    }
+    return false;
+}
+
 pub fn lint(arena: std.mem.Allocator, template: []const u8) LintError!void {
     var seen = std.StringHashMap(void).init(arena);
     var i: usize = 0;

@@ -21,6 +21,7 @@ const json = @import("json");
 const yaml = @import("yaml");
 const ini = @import("ini");
 const category = @import("../compose/category.zig");
+const interp = @import("../compose/interp.zig");
 
 const Io = std.Io;
 
@@ -701,18 +702,12 @@ fn iniCapture(v: ini.Value) bool {
     };
 }
 
-/// Whether `s` holds any non-empty `<...>` capture. Conservative on purpose: a
-/// structured value carrying a capture is interpolation- or secret-derived, and
-/// routing its resolved live value into source would bake a fact or secret. The
-/// never-bake-a-secret / never-guess-a-fact invariants win over precision here.
+/// Whether `s` holds a capture composition would expand. Delegated to the
+/// interpolation grammar itself so the two can never drift: matching any
+/// `<...>` would strand ordinary data (`authors = ["Sho <me@example.com>"]`)
+/// as permanently un-routable, and say it was secret-derived.
 fn hasCapture(s: []const u8) bool {
-    var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, s, i, '<')) |lt| {
-        const gt = std.mem.indexOfScalarPos(u8, s, lt + 1, '>') orelse return false;
-        if (gt > lt + 1) return true;
-        i = gt + 1;
-    }
-    return false;
+    return interp.containsCapture(s);
 }
 
 /// Render the scalar at `path` in `bytes` (parsed under `format`) as a short

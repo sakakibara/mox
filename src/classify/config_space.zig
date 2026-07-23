@@ -149,11 +149,24 @@ pub fn enumerate(
         // own value, so only an inherited binding is dropped.
         if (!is_this and !contains(names.items, "machine")) _ = bindings.remove("machine");
 
-        try out.append(arena, .{
-            .label = if (is_this) "" else try label.toOwnedSlice(arena),
-            .bindings = bindings,
-            .is_this_machine = is_this,
-        });
+        // The same rule as a filter, for when `machine` IS a varying axis: the
+        // odometer pairs every machine value with every other axis's values,
+        // and this machine's own hostname combined with a sibling's value on
+        // another axis names a machine that cannot exist. Enumerating it would
+        // put a duplicate, impossible row in a blast-radius confirm.
+        const impossible_self = !is_this and contains(names.items, "machine") and blk: {
+            const mine_machine = this_bindings.get("machine") orelse break :blk false;
+            const here = bindings.get("machine") orelse break :blk false;
+            break :blk std.mem.eql(u8, here, mine_machine);
+        };
+
+        if (!impossible_self) {
+            try out.append(arena, .{
+                .label = if (is_this) "" else try label.toOwnedSlice(arena),
+                .bindings = bindings,
+                .is_this_machine = is_this,
+            });
+        }
 
         if (names.items.len == 0) break;
         if (!advance(idx, value_sets.items)) break;
@@ -196,6 +209,56 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
 fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+test "enumerate: force_other adds one unnamed-value representative per axis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var this = std.StringHashMap([]const u8).init(a);
+    try this.put("os", "darwin");
+
+    // The tree names only this machine's own os, so without `force_other` the
+    // axis does not vary and the space is a single point -- the blind spot a
+    // promote to the base would slip through.
+    const ax = try axesFixture(a, &.{.{ "os", "darwin" }}, &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), (try enumerate(a, &this, ax, &.{}, &.{})).len);
+
+    const configs = try enumerate(a, &this, ax, &.{}, &.{"os"});
+    try std.testing.expectEqual(@as(usize, 2), configs.len);
+    var saw_other = false;
+    for (configs) |c| {
+        if (std.mem.eql(u8, c.label, "os=(other)")) {
+            saw_other = true;
+            try std.testing.expect(!c.is_this_machine);
+            // It binds a real value -- one no source names, so no overlay matches.
+            try std.testing.expect(!std.mem.eql(u8, c.bindings.get("os").?, "darwin"));
+        }
+    }
+    try std.testing.expect(saw_other);
+}
+
+test "enumerate: never pairs this machine's hostname with a sibling configuration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var this = std.StringHashMap([]const u8).init(a);
+    try this.put("os", "darwin");
+    try this.put("machine", "host-a");
+
+    const ax = try axesFixture(a, &.{ .{ "os", "darwin" }, .{ "machine", "host-a" } }, &.{});
+    const configs = try enumerate(a, &this, ax, &.{}, &.{ "os", "machine" });
+
+    // `machine=host-a+os=(other)` is not a machine that can exist: host-a IS
+    // this machine, and this machine's os is darwin.
+    for (configs) |c| {
+        if (c.is_this_machine) continue;
+        const m = c.bindings.get("machine") orelse continue;
+        try std.testing.expect(!std.mem.eql(u8, m, "host-a"));
+    }
 }
 
 test "enumerate: varies only axes the source compares by value" {

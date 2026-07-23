@@ -100,6 +100,14 @@ const StructImpact = struct {
     after: impact.Snapshot,
 };
 
+/// Outcome of simulating a placement: its impact, or the layer refusing the
+/// edit. A refusal is a routing outcome the user is told about, kept distinct
+/// from a real error so neither is reported as the other.
+const StructSim = union(enum) {
+    ok: StructImpact,
+    rejected,
+};
+
 /// The routing decision for a single hunk. `shared` on a line route marks a
 /// base-file or universal-fragment origin (subject to impact classification);
 /// an axis-gated fragment or private-layer origin is not shared.
@@ -348,7 +356,12 @@ fn fileSpace(
     file: mox.source.tree.ManagedFile,
 ) !FileSpace {
     const ax = try mox.source.axes.ofFile(arena, io, file);
-    const configs = try config_space.enumerate(arena, this_bindings, ax, &.{}, &.{});
+    // A base line edit reaches every machine with no override of that line,
+    // including one whose os/arch/machine value no source names -- the same
+    // blast radius the structured route enumerates. Without this a file that
+    // composes verbatim from its base reports "changes 0 configurations" for
+    // an edit that changes every unnamed machine.
+    const configs = try config_space.enumerate(arena, this_bindings, ax, &.{}, &derived_axes);
     return .{ .ax = ax, .configs = configs };
 }
 
@@ -1572,7 +1585,7 @@ fn simulateStructImpact(
     file: mox.source.tree.ManagedFile,
     edits: []const StructEdit,
     configs: []const Configuration,
-) !StructImpact {
+) !StructSim {
     const arena = cc.arena;
     const io = cc.io;
 
@@ -1592,30 +1605,41 @@ fn simulateStructImpact(
 
     const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
 
-    var apply_err: ?anyerror = null;
+    // A layer refusing the edit is a routing outcome, reported to the user. Any
+    // other failure -- a snapshot, a read, a restore -- is a real error and
+    // must stay one: conflating them would blame the chosen layer for, say, an
+    // unparseable sibling overlay it has nothing to do with.
+    var rejected = false;
     for (edits) |e| {
-        commit_struct.applyToLayer(arena, io, e.format, e.layer_abs, e.change) catch |er| {
-            apply_err = er;
+        commit_struct.applyToLayer(arena, io, e.format, e.layer_abs, e.change) catch {
+            rejected = true;
             break;
         };
     }
-    const after = if (apply_err == null)
+    var err: ?anyerror = null;
+    const after = if (!rejected)
         impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |er| blk: {
-            apply_err = er;
+            err = er;
             break :blk before;
         }
     else
         before;
 
-    // Restore every touched layer unconditionally, even on error, so a failed
-    // simulation never leaves a partial write behind.
+    // Restore every touched layer even on error, so a failed simulation never
+    // leaves a partial write behind. One restore failing must not abandon the
+    // rest: finish the sweep, then report the first failure.
     var it = origs.iterator();
-    while (it.next()) |kv| try restoreLayerBytes(io, kv.key_ptr.*, kv.value_ptr.*);
+    while (it.next()) |kv| {
+        restoreLayerBytes(io, kv.key_ptr.*, kv.value_ptr.*) catch |er| {
+            if (err == null) err = er;
+        };
+    }
 
-    if (apply_err) |er| return er;
+    if (err) |er| return er;
+    if (rejected) return .rejected;
 
     const imp = try impact.impact(arena, configs, before, after);
-    return .{ .affected = imp.affected, .before = before, .after = after };
+    return .{ .ok = .{ .affected = imp.affected, .before = before, .after = after } };
 }
 
 /// Per-key-change diff line for the prompt/report: the key path and its new
@@ -1652,6 +1676,15 @@ fn processStructFile(
     last_content: []const u8,
     live: []const u8,
 ) !HunkOutcome {
+    // A manual (un-routable) key and a user `[s]` skip are both "explained"
+    // mismatches (see `recordStructPlacement`'s doc comment): the file must
+    // still pass through the recompose-verify guard so either one leaves it
+    // correctly reported as uncommitted, rather than silently ignored the way
+    // an unaffected file is. Set before any early return, so a file this
+    // function gives up on reports the same way as one whose every key it
+    // reported individually -- rather than exiting 0 as if nothing happened.
+    ra.affected[fidx] = true;
+
     const changes = commit_struct.changedKeyPaths(cc.arena, format, last_content, live) catch |e| switch (e) {
         error.Unrepresentable => {
             // A same-length array reorder has no stable key-path identity.
@@ -1695,13 +1728,6 @@ fn processStructFile(
             return .cont;
         },
     };
-    // A manual (un-routable) key and a user `[s]` skip are both "explained"
-    // mismatches (see `recordStructPlacement`'s doc comment): the file must
-    // still pass through the recompose-verify guard so either one leaves it
-    // correctly reported as uncommitted, rather than silently ignored the way
-    // an unaffected file is.
-    ra.affected[fidx] = true;
-
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
 
     for (changes, 0..) |change, ki| {
@@ -1827,9 +1853,9 @@ fn recordStructPlacement(
         // before anything is written for keeps. Reporting it as un-routable
         // beats letting it reach the write phase, where the whole file rolls
         // back for one bad key.
-        const imp = simulateStructImpact(cc, file, edits, space.configs) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            else => return .unroutable,
+        const imp = switch (try simulateStructImpact(cc, file, edits, space.configs)) {
+            .ok => |i| i,
+            .rejected => return .unroutable,
         };
         for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
     }
@@ -1951,7 +1977,10 @@ fn pickLayer(
         }
         // Overwriting an interpolated entry would replace the template with
         // this machine's resolved value for every machine sharing the source.
-        if (commit_struct.capturedAt(format, layer.value, change.path)) {
+        // A REMOVAL writes no value, so it bakes nothing and stays available --
+        // and refusing it here would empty the menu, since a routable removal
+        // has exactly one definer and every other layer is refused above.
+        if (!change.removed and commit_struct.capturedAt(format, layer.value, change.path)) {
             try refused.append(cc.arena, try std.fmt.allocPrint(cc.arena, "{s} -- its entry is interpolated", .{name}));
             continue;
         }
@@ -2001,8 +2030,17 @@ fn pickLayer(
     // edit does not. A config with its own override of the key is in neither.
     const winner_edits = try structPickEdits(cc.arena, format, layers, res.definers, res.target, change);
     const pick_edits = try structPickEdits(cc.arena, format, layers, res.definers, picked, change);
-    const winner_imp = try simulateStructImpact(cc, file, winner_edits, configs);
-    const pick_imp = try simulateStructImpact(cc, file, pick_edits, configs);
+    // A layer that refuses the edit has no blast radius to confirm; the
+    // placement is recorded anyway so `recordStructPlacement` reports the
+    // refusal through the one path that reports it.
+    const winner_imp = switch (try simulateStructImpact(cc, file, winner_edits, configs)) {
+        .ok => |i| i,
+        .rejected => return .{ .picked = picked },
+    };
+    const pick_imp = switch (try simulateStructImpact(cc, file, pick_edits, configs)) {
+        .ok => |i| i,
+        .rejected => return .{ .picked = picked },
+    };
     const extra = try labelDifference(cc.arena, pick_imp.affected, winner_imp.affected);
     if (extra.len == 0) return .{ .picked = picked };
 
