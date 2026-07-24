@@ -4,6 +4,64 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-24
+
+### Added
+- Structured commit routing. A file composed by merging layers (`.toml`,
+  `.json`, `.yaml`, `.ini`, gitconfig) now commits per KEY instead of per line:
+  each changed key routes to the layer that defines it (`[y]`), `[p]` opens a
+  picker to place it in any viable layer -- promoting a key to a less specific
+  layer deletes the overrides that would shadow it on this machine -- and `[s]`
+  leaves it. A placement that reaches a machine configuration beyond the one
+  you chose (a promote other machines would compose) lists those configurations
+  with before/after values and asks first, enumerated over the repo-wide
+  configuration space so a machine revealed only by another file's overlay --
+  or one whose os/arch no source names at all -- is still seen. Every routed
+  edit passes the recompose-verify guard; a key derived from a secret or an
+  interpolation is never routed.
+- Interpolated-value edits route to the machine fact. Editing a line whose
+  value came from `<machine.X>` offers `[f]` (write the fact) and `[d]` (change
+  the source's `| default` instead); neither touches repo `src` with a resolved
+  value.
+- Interactive drift resolution in `mox apply`. A live file edited since mox
+  last wrote it now asks, per file on a terminal: `[o]verwrite` (discard the
+  live edit), `[c]ommit` (route the live edit back into its source, then leave
+  the file in sync), `[d]iff`, `[s]kip`, or `[O]`/`[S]` for the rest. Off a
+  terminal, and under `--yes`/`--dry-run`/`--force`, behaviour is exactly as
+  before.
+- Path scoping: `status`, `diff`, `apply`, and `commit` accept managed-file
+  paths (absolute, live, or src-relative) to limit the run, with shell
+  completion for managed files.
+- A straddling hunk -- one spanning several sources' lines -- can be split at
+  its provenance boundaries (`[x]`), each piece then routing on its own.
+- Color. `mox diff` renders colorized hunks; commit prompts are colorized,
+  self-explaining legends (`[y]es  [s]kip ...`). `--color auto|always|never`
+  and `NO_COLOR` are honoured.
+
+### Changed
+- Managed files enumerate in a stable name order everywhere -- `status` and
+  `diff` listings, `commit` prompts, generator output -- instead of the
+  filesystem's directory order, which differs between APFS and ext4.
+- Commit prompts are reworked around explicit keys: a routed hunk is `[y/s]`,
+  an unroutable one `[s/x]`, an interpolated one `[f/d/s]`, a structured key
+  `[y/p/s]`. Split is offered only where a hunk can actually be split.
+
+### Fixed
+- `mox diff` no longer fails on a generator source (`for ... into`) with
+  `IntoOnNonGenerator`; it diffs the files the generator produces, as `status`
+  already reported them.
+- A comment or layout edit to a structured file whose overlays do not match
+  this machine now routes by line and commits. Such a file composes verbatim
+  from its base, but was attributed to an overlay merge -- stranding those
+  edits as manual. Provenance recorded by an earlier mox is refreshed from the
+  current source when it provably describes the same content, so the fix
+  applies without re-running `apply` first.
+- A layer only another machine's configuration reads failing to parse no
+  longer aborts the whole commit with a bare error. The configuration is named
+  once with the failing file, treated as unverifiable-but-pre-broken, and an
+  edit that has nothing to do with it still commits; an edit that MAKES a
+  configuration stop composing still rolls back.
+
 ## [0.1.6] - 2026-07-21
 
 ### Added
