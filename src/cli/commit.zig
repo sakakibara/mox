@@ -567,13 +567,27 @@ pub fn commitImpl(
         // Only true drift (live != last-applied) is committable.
         if (std.mem.eql(u8, live, last_content)) continue;
 
-        const prov = (try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
+        var prov = (try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
             try ctx.out.print("  manual: {s} (no provenance recorded)\n", .{file.live_path});
             manual_count += 1;
             manual_hunks[fidx] += 1;
             pending = true;
             continue;
         };
+        // A structured file's persisted stamp may predate the current origin
+        // rule (a base whose overlays never matched used to be stamped
+        // `.overlay`), and routing by a stale stamp strands the file as manual
+        // until its next apply. Recompose the current source: when it
+        // reproduces the last-applied bytes exactly, the fresh stamp describes
+        // the same content the persisted one does, provably -- so prefer it.
+        // Any mismatch (source changed since the apply) keeps the persisted
+        // stamp, which is the only honest description of what live came from.
+        if (commit_struct.formatOfPath(file.source_base_path) != null) {
+            var fresh: std.ArrayList(Segment) = .empty;
+            if (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &fresh, null) catch null) |now| {
+                if (std.mem.eql(u8, now, last_content)) prov.segments = fresh.items;
+            }
+        }
 
         const a_lines = try mox.diff.lines.splitLines(ctx.alloc, last_content);
         const b_lines = try mox.diff.lines.splitLines(ctx.alloc, live);

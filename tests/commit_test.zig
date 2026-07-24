@@ -2883,6 +2883,40 @@ test "commit: an unparseable live structured file fails only itself" {
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export B=22") != null);
 }
 
+test "commit: a stale pre-fix overlay stamp is refreshed from source, not obeyed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Composes verbatim from the base on darwin; the current rule stamps it
+    // `.base`. An older mox stamped it `.overlay` because the file DECLARES an
+    // overlay -- simulate that persisted state, as an upgrade would find it.
+    try writeRepo(io, &tmp, "repo/src/config.toml", "# banner\ntheme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"blue\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    const stale = [_]mox.provenance.map.Segment{.{
+        .out_start = 0,
+        .out_len = 2,
+        .origin = .{ .overlay = .{ .path = try h.srcOf("config.toml") } },
+    }};
+    try mox.provenance.map.persist(a, io, h.state, live, &stale);
+
+    // A comment edit has no key path; obeying the stale stamp would strand it
+    // as manual until the drift is discarded. The refresh recomposes the
+    // current source, proves it reproduces the last-applied bytes, and routes
+    // by the fresh per-line stamp instead.
+    try editLive(io, a, live, "# banner", "# banner edited");
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("# banner edited\ntheme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
+}
+
 test "commit: a base whose only overlay does not match this machine routes by line" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
