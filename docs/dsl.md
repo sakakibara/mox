@@ -183,12 +183,15 @@ shell and `.ps1`. When a script sits in a gated subdir and also carries a header
 both must hold for it to run. A header that fails to parse is a hard error for
 that script, not a silent skip.
 
-## File attributes
+## File attributes and head directives
 
 Bodies carry no template language, but a managed file still has a mode, may be
 a symlink or seeded once, and may be owned only in part. mox has no filename
-prefix for any of these; the source file keeps its native name and the
-attributes git cannot carry live in `.mox/attributes.toml`.
+prefix for any of these. Filesystem metadata git cannot carry lives in
+`.mox/attributes.toml`; the ownership contract is content semantics and lives
+in the source file itself, as head directives.
+
+### Attributes (`.mox/attributes.toml`)
 
 - **Mode.** The target's mode is the source file's own permission bits: `chmod
   +x` the source and git carries the exec bit (git round-trips 0644 and 0755
@@ -202,47 +205,87 @@ attributes git cannot carry live in `.mox/attributes.toml`.
 - **Seed-once.** `mox add --seed-once` records `seed_once = true`. Apply writes
   the target only when it is absent and never overwrites, drift-checks, or
   commits an existing one -- for a machine-local skeleton the user then edits.
-- **Partial ownership.** `own = ["<key-path>", ...]` declares the key subtrees
-  mox manages inside a structured target; every byte outside them stays the
-  program's. A key-path is TOML dotted-key syntax, verbatim: bare segments
-  (`A-Za-z0-9_-`), `"..."`/`'...'`-quoted segments, whitespace allowed around
-  the dots (`projects."/tmp/example"`, `remote."my origin".url`). Segments
-  match on decoded key content, per the format's dialect: ini and gitconfig
-  sections and keys match case-insensitively, a gitconfig quoted subsection is
-  matched verbatim (case-sensitive), and a YAML declared segment is a string
-  key -- a non-string key may sit inside an owned subtree, never on the
-  declared path itself. An owned YAML scalar that does not render on one
-  line (a multiline string value) refuses the file rather than reflowing
-  it. `own` requires a structured target (TOML, JSON, YAML,
-  INI, gitconfig) and cannot combine with `symlink`, `seed_once`, or a
-  generator source. The composed source must lie entirely within the
-  declaration -- a composed leaf outside every declared path is a per-file
-  error -- and a declared path the source does not populate is enforced as
-  absent from the live file.
-- **Check hook.** `check = ["<repo-relative executable>", "arg", ...]`
-  validates every candidate partial write before it lands (apply and rollback
-  both run it). The executable is spawned directly with the argv given -- no
-  shell -- with cwd at the repo root; a `.ps1` checker runs under PowerShell
-  with the same dispatch as setup scripts. The candidate is materialized in a
-  private temp dir under the live file's basename, and the child gets
-  `MOX_CHECK_FILE` (the candidate's path) and `MOX_CHECK_DIR`. Exit 0 accepts;
-  any other exit, or a timeout, refuses the file and reports the hook's
-  output. The timeout defaults to 30s, overridden per run with
-  `MOX_CHECK_TIMEOUT_MS` (a value <= 0 disables it); on POSIX the hook leads
-  its own process group and the whole group is killed on timeout, on Windows
-  the hook process is terminated. The temp dir holds only the candidate: a
-  tool that resolves sibling files must be wrapped by the checker script.
-  `check` executes repo-authored code at apply time -- the same authority as
-  `scripts/`, with the same opt-out: under `--skip-scripts` the hook does not
-  run and the check-bearing file is not written.
 
-`.mox/attributes.toml` is maintained by mox (`add`, `mv`, `remove`), and the
-`own` and `check` fields are also yours to edit by hand -- a path added to
-`own` is first contact for that path: its live content is adopted when it
-already matches the source, and drift otherwise. `mox add --own` edits the
-file in place, preserving your formatting and comments; commands that re-key
-or drop entries rewrite it deterministically. Leave the mode, symlink, and
-seed-once fields to mox.
+`.mox/attributes.toml` is maintained by mox (`add`, `mv`, `remove`); commands
+that re-key or drop entries rewrite it deterministically.
+
+### Head directives (partial ownership)
+
+A structured source file declares its ownership contract in its LEADING
+comment block -- recognized after an optional shebang and before the first
+content line, one directive per line, in the file's comment marker (`#`
+everywhere, `//` for JSONC):
+
+```toml
+# mox: own tui.keymap.global
+# mox: own tui.keymap.composer
+# mox: check "scripts/check/codex-config"
+[tui.keymap.global]
+...
+```
+
+```jsonc
+// mox: disown model
+{ ... }
+```
+
+- **`own <path>`** (repeatable; the rest of the line is ONE key-path)
+  declares the key subtrees mox manages inside the target; every byte outside
+  them stays the program's.
+- **`disown <path>`** (repeatable) is the complement: mox manages the whole
+  file EXCEPT the declared subtrees -- for a file where the program's region
+  is the sparse one. The composed source may define nothing under a disowned
+  path, and a disowned path's live content is always preserved byte-for-byte,
+  present or not. `own` and `disown` are mutually exclusive per file.
+- **`check "<repo-relative exe>" ["arg" ...]`** (quoted argv items, once)
+  names a validation hook; see below.
+
+The directives never reach composed output: compose strips exactly the
+recognized lines from the base text, so the live file a program reads contains
+no mox syntax. Overlays cannot declare ownership; the contract is the file's,
+machine-independent, stated once at its head -- above any whole-file gate.
+
+A key-path is TOML dotted-key syntax, verbatim: bare segments
+(`A-Za-z0-9_-`), `"..."`/`'...'`-quoted segments, whitespace allowed around
+the dots (`projects."/tmp/example"`, `remote."my origin".url`). Segments
+match on decoded key content, per the format's dialect: ini and gitconfig
+sections and keys match case-insensitively, a gitconfig quoted subsection is
+matched verbatim (case-sensitive), and a YAML declared segment is a string
+key -- a non-string key may sit inside an owned subtree, never on the
+declared path itself. An owned YAML scalar that does not render on one
+line (a multiline string value) refuses the file rather than reflowing
+it. Ownership requires a structured target (TOML, JSON, YAML, INI,
+gitconfig) and cannot combine with `symlink`, `seed_once`, or a generator
+source. Under `own`, the composed source must lie entirely within the
+declaration -- a composed leaf outside every declared path is a per-file
+error -- and a declared path the source does not populate is enforced as
+absent from the live file. Under `disown`, enforced absence does not exist;
+the inverted check refuses a composed source that defines content under a
+disowned path.
+
+A change to the declared list is first contact for the affected content: an
+`own` path you add (or a `disown` path you remove) has its live content
+adopted when it already matches the source, and reported as drift otherwise;
+a `disown` path you add simply stops being compared.
+
+### Check hook
+
+`check "<repo-relative executable>" ["arg" ...]`
+validates every candidate partial write before it lands (apply and rollback
+both run it). The executable is spawned directly with the argv given -- no
+shell -- with cwd at the repo root; a `.ps1` checker runs under PowerShell
+with the same dispatch as setup scripts. The candidate is materialized in a
+private temp dir under the live file's basename, and the child gets
+`MOX_CHECK_FILE` (the candidate's path) and `MOX_CHECK_DIR`. Exit 0 accepts;
+any other exit, or a timeout, refuses the file and reports the hook's
+output. The timeout defaults to 30s, overridden per run with
+`MOX_CHECK_TIMEOUT_MS` (a value <= 0 disables it); on POSIX the hook leads
+its own process group and the whole group is killed on timeout, on Windows
+the hook process is terminated. The temp dir holds only the candidate: a
+tool that resolves sibling files must be wrapped by the checker script.
+`check` executes repo-authored code at apply time -- the same authority as
+`scripts/`, with the same opt-out: under `--skip-scripts` the hook does not
+run and the check-bearing file is not written.
 
 ## Concurrency and snapshots
 

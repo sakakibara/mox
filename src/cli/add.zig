@@ -275,7 +275,7 @@ pub fn addOwnFile(
     const mode = mox.apply.write.modeOf(st.permissions);
     const own_list = try std.mem.concat(arena, []const u8, &.{ own_raws, absent_raws });
     const source_text = try std.mem.concat(arena, u8, &.{
-        try headDirectiveLines(arena, format, own_list),
+        try headDirectiveLines(arena, format, "own", own_list),
         extracted,
     });
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
@@ -290,22 +290,124 @@ pub fn addOwnFile(
     };
 }
 
-/// The `mox: own` head-directive lines declaring `own_list`, in the
-/// format's comment marker.
+/// The head-directive lines declaring `list` under `keyword` (`own` or
+/// `disown`), in the format's comment marker.
 fn headDirectiveLines(
     arena: std.mem.Allocator,
     format: mox.source.format.Format,
-    own_list: []const []const u8,
+    keyword: []const u8,
+    list: []const []const u8,
 ) ![]const u8 {
     const marker = mox.source.tree.markerForFormat(format);
     var out: std.ArrayList(u8) = .empty;
-    for (own_list) |raw| {
+    for (list) |raw| {
         try out.appendSlice(arena, marker);
-        try out.appendSlice(arena, " mox: own ");
+        try out.appendSlice(arena, " mox: ");
+        try out.appendSlice(arena, keyword);
+        try out.append(arena, ' ');
         try out.appendSlice(arena, raw);
         try out.append(arena, '\n');
     }
     return out.toOwnedSlice(arena);
+}
+
+/// Take DISOWNED ownership of a live file: the whole live file minus the
+/// declared paths' raw byte spans becomes the source (comments outside the
+/// spans survive verbatim), prefixed with `mox: disown` head directives.
+/// Every declared path must be present live: disowning nothing is a typo,
+/// not a contract.
+pub fn addDisownFile(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    home: []const u8,
+    live_path: []const u8,
+    disown_raws: []const []const u8,
+) !OwnResult {
+    const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+        error.FileNotFound => return .{ .outcome = .not_found },
+        else => return e,
+    };
+    if (st.kind == .directory) return .{ .outcome = .is_directory };
+    if (st.kind == .sym_link) return .{ .outcome = .is_symlink };
+
+    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
+        rel
+    else if (isHomeItself(live_path, home))
+        return .{ .outcome = .is_home }
+    else
+        return .{ .outcome = .outside_home };
+    if (mox.source.path.keyEscapes(trimmed)) return .{ .outcome = .outside_home };
+    if (intoOverlayDir(trimmed)) return .{ .outcome = .into_overlay_dir };
+
+    const format = mox.source.format.formatOfPath(trimmed) orelse return .{ .outcome = .not_structured };
+
+    const src_path = try std.fs.path.join(arena, &.{ repo_dir, "src", trimmed });
+    if (Io.Dir.cwd().access(io, src_path, .{})) |_| {
+        return .{ .outcome = .already_managed, .src_path = src_path };
+    } else |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    }
+
+    const partial = mox.apply.partial;
+    var bad_raw: []const u8 = "";
+    const paths = parseOwnRaws(arena, disown_raws, &bad_raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
+    };
+
+    const live = try Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024));
+    var diag: partial.Diag = .{};
+    const loc = partial.locateSpans(arena, format, live, paths, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .outcome = .extract_failed, .detail = try arena.dupe(u8, diag.text()) },
+    };
+    for (paths, loc.spans) |p, span| {
+        if (span == null) {
+            return .{
+                .outcome = .extract_failed,
+                .detail = try std.fmt.allocPrint(arena, "{s}: not present in the live file", .{p.raw}),
+            };
+        }
+    }
+    const body = try partial.textWithoutSpans(arena, live, loc);
+
+    // The remainder must parse, define nothing under the declaration, and
+    // reproduce the live owned complement exactly (canonical-byte), or the
+    // capture is refused with nothing written.
+    const doc = partial.OwnedDoc.parse(arena, format, body) catch {
+        return .{ .outcome = .extract_failed, .detail = "extracted source does not parse" };
+    };
+    if (try partial.populatedDisownPath(arena, &doc, paths)) |spelled| {
+        return .{
+            .outcome = .extract_failed,
+            .detail = try std.fmt.allocPrint(arena, "extracted source still defines {s}", .{spelled}),
+        };
+    }
+    const live_doc = partial.OwnedDoc.parse(arena, format, live) catch {
+        return .{ .outcome = .extract_failed, .detail = "live file does not parse" };
+    };
+    const want = try mox.apply.canonical.canonicalComplement(arena, &live_doc, paths);
+    const got = try mox.apply.canonical.canonicalComplement(arena, &doc, paths);
+    if (!std.mem.eql(u8, want, got)) {
+        return .{ .outcome = .extract_failed, .detail = "extracted source does not reproduce the live owned content" };
+    }
+
+    if (std.fs.path.dirname(src_path)) |parent| {
+        Io.Dir.cwd().createDirPath(io, parent) catch {};
+    }
+    const mode = mox.apply.write.modeOf(st.permissions);
+    const source_text = try std.mem.concat(arena, u8, &.{
+        try headDirectiveLines(arena, format, "disown", disown_raws),
+        body,
+    });
+    try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
+
+    const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
+    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode });
+
+    return .{ .outcome = .added, .src_path = src_path };
 }
 
 fn parseOwnRaws(
@@ -333,6 +435,7 @@ const Spec = struct {
     force: cli.spec.Flag(.{ .help = "add even if the path matches an ignore rule" }),
     own: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable)" }),
     own_absent: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable)" }),
+    disown: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable)" }),
 };
 
 /// Every value the repeated `--<long>` option was given, in command-line
@@ -383,11 +486,17 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 
     const own_raws = try collectRepeated(ctx.alloc, ctx.argv, "own");
     const absent_raws = try collectRepeated(ctx.alloc, ctx.argv, "own-absent");
-    if (own_raws.len > 0 or absent_raws.len > 0) {
+    const disown_raws = try collectRepeated(ctx.alloc, ctx.argv, "disown");
+    if (disown_raws.len > 0 and (own_raws.len > 0 or absent_raws.len > 0)) {
+        try ctx.err.writeAll("mox add: --disown cannot combine with --own/--own-absent (own and disown are exclusive per file)\n");
+        return 1;
+    }
+    if (own_raws.len > 0 or absent_raws.len > 0 or disown_raws.len > 0) {
         if (a.seed_once) {
-            try ctx.err.writeAll("mox add: --own cannot combine with --seed-once (a seed-once target is never re-composed)\n");
+            try ctx.err.writeAll("mox add: --own/--disown cannot combine with --seed-once (a seed-once target is never re-composed)\n");
             return 1;
         }
+        if (disown_raws.len > 0) return runDisown(ctx, home, live_path, disown_raws);
         return runOwn(ctx, home, live_path, own_raws, absent_raws);
     }
 
@@ -500,10 +609,68 @@ fn runOwn(
     }
 }
 
+/// The `mox add --disown` flow: extract the complement, validate, report.
+fn runDisown(
+    ctx: *app.Ctx,
+    home: []const u8,
+    live_path: []const u8,
+    disown_raws: []const []const u8,
+) anyerror!u8 {
+    const context = ctx.context.?;
+    const r = try addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws);
+    switch (r.outcome) {
+        .added => {
+            try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ live_path, r.src_path, disown_raws.len });
+            buildInitialCoupling(ctx) catch {};
+            return 0;
+        },
+        .not_found => {
+            try ctx.err.print("mox add: {s}: not found\n", .{live_path});
+            return 1;
+        },
+        .outside_home => {
+            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ live_path, home });
+            return 1;
+        },
+        .is_home => {
+            try ctx.err.writeAll("mox add: cannot add HOME itself\n");
+            return 1;
+        },
+        .is_directory => {
+            try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
+            return 1;
+        },
+        .is_symlink => {
+            try ctx.err.print("mox add: {s}: is a symlink; --disown patches a document in place\n", .{live_path});
+            return 1;
+        },
+        .already_managed => {
+            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ live_path, r.src_path });
+            return 1;
+        },
+        .into_overlay_dir => {
+            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{live_path});
+            return 1;
+        },
+        .not_structured => {
+            try ctx.err.print("mox add: {s}: --disown requires a structured target (toml/json/yaml/ini/gitconfig)\n", .{live_path});
+            return 1;
+        },
+        .invalid_path => {
+            try ctx.err.print("mox add: {s}: disown path does not parse as a dotted key path\n", .{r.detail});
+            return 1;
+        },
+        .extract_failed => {
+            try ctx.err.print("mox add: {s}: cannot extract the owned complement: {s}\n", .{ live_path, r.detail });
+            return 1;
+        },
+    }
+}
+
 pub const command = app.command(Spec, .{
     .name = "add",
     .summary = "Start managing a live file as a base file in src/",
-    .usage = "mox add [--seed-once] [--own <key-path>]... [--own-absent <key-path>]... <path>",
+    .usage = "mox add [--seed-once] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... <path>",
     .group = .general,
     .needs_context = true,
 }, run);

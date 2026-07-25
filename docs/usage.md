@@ -90,9 +90,8 @@ A line whose value came from a fact (`<machine.email>`) offers `[f]` -- update
 the fact itself, in `facts.toml`, never the repo -- or `[d]` to change the
 source's `| default` instead. A value derived from a secret is never routed.
 
-For a file mox owns only part of, `commit` sees just the owned key-paths: an
-edit to an unowned key belongs to the program that also writes the file and is
-never routed. See [A file a program also writes](#a-file-a-program-also-writes).
+For a file mox owns only part of, `commit` sees just the owned content: an
+edit on the program's side of the contract is never routed. See [A file a program also writes](#a-file-a-program-also-writes).
 
 Every routed edit is verified before it sticks: mox recomposes the file under
 every configuration the sources express, and anything you did not choose to
@@ -195,20 +194,40 @@ credential paths (SSH keys, `*.pem`, Claude's credential files); `add` and
 
 Some live files are shared with the program that reads them: you manage a few
 keymap tables of `~/.codex/config.toml`, the program rewrites the rest at
-runtime. Whole-file management would see every program write as drift. Instead,
-declare which key-paths are *yours* -- per target, in `.mox/attributes.toml`:
+runtime. Whole-file management would see every program write as drift.
+Instead, declare which key-paths are *yours* -- in the source file itself, as
+head directives in its leading comment block:
 
 ```toml
-[".codex/config.toml"]
-own = ["tui.keymap.global", "tui.keymap.composer", "tui.keymap.editor"]
-check = ["scripts/check/codex-config"]
+# mox: own tui.keymap.global
+# mox: own tui.keymap.composer
+# mox: own tui.keymap.editor
+# mox: check "scripts/check/codex-config"
+[tui.keymap.global]
+...
 ```
 
 mox then manages only those subtrees, and never changes a byte outside them --
 verified before every write. The remainder is the program's: `apply` carries it
-through verbatim, and `status`, `diff`, and `commit` never even look at it. A
-declared path owns its whole subtree; the full path grammar and the rules an
-`own` target must satisfy are in [dsl.md](dsl.md#file-attributes).
+through verbatim, and `status`, `diff`, and `commit` never even look at it.
+
+When the PROGRAM's region is the sparse one -- a settings file where you
+manage nearly everything and the program writes a key or two back -- declare
+the complement instead:
+
+```jsonc
+// mox: disown model
+{
+  "theme": "dark",
+  ...
+}
+```
+
+Under `disown` the whole file is yours EXCEPT the declared subtrees: apply
+reasserts your keys and preserves the program's spans byte-for-byte, present
+or not. A declared path owns its whole subtree either way, the directives
+never reach the live file, and the full grammar and rules are in
+[dsl.md](dsl.md#file-attributes-and-head-directives).
 
 ### Taking ownership
 
@@ -220,45 +239,56 @@ mox add --own tui.keymap.global --own tui.keymap.composer \
 ```
 
 It extracts the named subtrees' raw bytes into a new source file (your comments
-inside them survive verbatim), records the `own` list in
-`.mox/attributes.toml`, and reports how much of the file remains the program's.
+inside them survive verbatim), writes the `mox: own` directive lines at its
+head -- the declaration and the content are created together, in one file --
+and reports how much of the file remains the program's.
 When the live layout forces it, the extraction reorders spans -- a root-level
 key is placed before the block tables so it parses the same -- and the capture
 is validated three ways before anything is written: it must parse, lie entirely
 within the declaration, and reproduce the live owned content exactly.
 
+`mox add --disown <key-path>` (repeatable, exclusive with `--own`) is the
+inverse: the whole live file minus the named subtrees becomes the source,
+prefixed with `mox: disown` lines -- comments outside the spans survive
+verbatim, and the same three-way validation runs against the owned
+complement.
+
 A named path absent from the live file is an error; a key you want kept *out*
-everywhere is declared with `--own-absent <key-path>` instead, and apply then
-enforces its absence. A plain `mox add` of a target that has an `own`
-declaration is refused (it is managed per key-path), and `add-tree` skips it.
+everywhere is declared with `--own-absent <key-path>` instead (own mode only),
+and apply then enforces its absence. A plain `mox add` of a target whose
+source head declares ownership is refused (it is managed per key-path), and
+`add-tree` skips it.
 
 ### The lifecycle
 
-- `mox apply` patches the declared subtrees to the composed content and
-  preserves every other byte exactly. A live file that does not parse is
-  refused rather than guessed at; a declared path the composed source does not
-  populate is removed from the live file (through the same drift rule below --
-  a value that changed there is drift, never a silent removal); a file whose
+- `mox apply` patches the owned content to the composed state and preserves
+  every protected byte exactly -- the declared subtrees under `own`, their
+  complement under `disown`. A live file that does not parse is refused
+  rather than guessed at; an `own` path the composed source does not populate
+  is removed from the live file (through the same drift rule below -- a value
+  that changed there is drift, never a silent removal); a file whose
   whole-file gate is off for this machine is untouched entirely.
-- `mox status` and `mox diff` judge only the owned subtree: `DRIFT` means an
-  owned path changed outside mox, and program writes outside the declaration
-  never surface. The diff is the canonical composed-owned content against the
-  live-owned content, labeled with the live path.
-- `mox commit` routes per key over the owned subtree, exactly like a layered
+- `mox status` and `mox diff` judge only the owned content: `DRIFT` means it
+  changed outside mox, and the program's writes on the protected side never
+  surface. The diff is the canonical composed content against the live
+  content, labeled with the live path.
+- `mox commit` routes per key over the owned content, exactly like a layered
   structured file.
 
-Drift protection follows the whole-file rule, per owned path: live owned
-content is compared against what mox last applied, and a mismatch asks (or is
-skipped and reported, off a terminal) instead of overwriting. First contact --
-no applied record yet, or a path newly added to `own` -- needs consent too:
-live content already matching the source is adopted without asking (`adopted`
-in the apply output); anything else is `DRIFT`, resolved through the usual
-`[o]verwrite / [c]ommit / [d]iff / [s]kip` prompt or `mox apply --force`. There
-is no way for mox to take over existing content without you seeing it.
+Drift protection follows the whole-file rule over the owned content: it is
+compared against what mox last applied, and a mismatch asks (or is skipped
+and reported, off a terminal) instead of overwriting. First contact -- no
+applied record yet, a path newly added to `own`, or one removed from
+`disown` -- needs consent too: live content already matching the source is
+adopted without asking (`adopted` in the apply output); anything else is
+`DRIFT`, resolved through the usual `[o]verwrite / [c]ommit / [d]iff /
+[s]kip` prompt or `mox apply --force`. A path newly added to `disown` simply
+stops being compared -- the protected set grew. There is no way for mox to
+take over existing content without you seeing it.
 
 ### Validating before the write
 
-The optional `check` attribute names a repo-relative executable (plus
+The optional `check` directive names a repo-relative executable (plus
 arguments) that must accept every candidate before it lands -- app-specific
 logic like "the program must parse this" stays in a small repo script:
 
@@ -272,7 +302,7 @@ The candidate is materialized in a private temp dir; the hook gets
 `MOX_CHECK_FILE` and `MOX_CHECK_DIR` and accepts with exit 0. Any other exit,
 or a timeout, refuses the file and reports the hook's output. The full
 contract -- spawn rules, timeout override, trust model -- is in
-[dsl.md](dsl.md#file-attributes). Under `--skip-scripts` the hook does not run
+[dsl.md](dsl.md#file-attributes-and-head-directives). Under `--skip-scripts` the hook does not run
 and a check-bearing file is not written: never an unvalidated install.
 
 ### Secrets in owned content
@@ -309,8 +339,8 @@ mox rollback <id>       # restore the live files from that snapshot
 
 A [partially owned file](#a-file-a-program-also-writes) is not whole-file
 restored -- that would clobber what the program wrote since the snapshot.
-Rollback re-patches the snapshot's owned subtree onto the *current* live file,
-through the same verification and `check` hook as apply.
+Rollback re-patches the snapshot's owned content onto the *current* live
+file, through the same verification and `check` hook as apply.
 
 `mox diff` before an apply, and `mox apply --dry-run`, both let you look before
 you leap.

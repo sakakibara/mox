@@ -1215,3 +1215,66 @@ test "export --resolved: a partial target bakes its canonical owned serializatio
     const baked = try read(io, a, try std.fs.path.join(a, &.{ out_dir, "app.toml" }));
     try std.testing.expectEqualStrings(want, baked);
 }
+
+test "add --disown: the live file minus the program's spans becomes the source, comments kept" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const live_content =
+        \\{
+        \\  // the user's theme
+        \\  "theme": "dark",
+        \\  "model": "test-model-4.1",
+        \\  "editor": "nvim"
+        \\}
+        \\
+    ;
+    try writeRepo(io, &tmp, "home/settings.json", live_content);
+    const live = try h.liveOf("settings.json");
+
+    const bad = try h.run(&.{ "mox", "add", "--disown", "model", "--own", "theme", live });
+    try std.testing.expectEqual(@as(u8, 1), bad.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err, "exclusive") != null);
+
+    const r = try h.run(&.{ "mox", "add", "--disown", "model", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "disown: 1 key-path") != null);
+
+    // The source is the raw complement under the declaration: the user's
+    // comment survives, the program's key is gone.
+    const src = try read(io, a, try h.srcOf("settings.json"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "// mox: disown model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "// the user's theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "model") != null); // the directive names it
+    try std.testing.expect(std.mem.indexOf(u8, src, "test-model-4.1") == null);
+
+    // First apply adopts cleanly and changes no live byte.
+    const apply = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), apply.rc);
+    try std.testing.expect(std.mem.indexOf(u8, apply.out, "adopted") != null);
+    try std.testing.expectEqualStrings(live_content, try read(io, a, live));
+}
+
+test "add --disown: a declared path absent from the live file is an error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/settings.json", "{\n  \"theme\": \"dark\"\n}\n");
+    const live = try h.liveOf("settings.json");
+
+    const r = try h.run(&.{ "mox", "add", "--disown", "model", live });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not present") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("settings.json")));
+}
