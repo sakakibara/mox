@@ -154,10 +154,17 @@ pub fn strip(arena: std.mem.Allocator, text: []const u8, marker: []const u8) err
         error.OutOfMemory => return error.OutOfMemory,
         else => return text,
     };
-    if (parsed.spans.len == 0) return text;
+    return stripSpans(arena, text, parsed.spans);
+}
+
+/// `text` with the given directive-line spans removed. The spans may come
+/// from parsing a bounded prefix of `text`; a recognized leading block ends
+/// within the parsed region, so its offsets index `text` directly.
+pub fn stripSpans(arena: std.mem.Allocator, text: []const u8, spans: []const Span) error{OutOfMemory}![]const u8 {
+    if (spans.len == 0) return text;
     var out: std.ArrayList(u8) = .empty;
     var cursor: usize = 0;
-    for (parsed.spans) |s| {
+    for (spans) |s| {
         try out.appendSlice(arena, text[cursor..s.start]);
         cursor = s.end;
     }

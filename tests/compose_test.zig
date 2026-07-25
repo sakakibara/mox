@@ -3741,6 +3741,42 @@ test "compose: ownership and a whole-file gate coexist in either order" {
     }
 }
 
+test "compose: a directive past the walk's head bound is inert content, never stripped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An `own` line past `max_head_bytes` of leading comments: the walk's
+    // bounded head read never sees it, so compose must not recognize (and
+    // strip) it either -- one recognition boundary, whole-file behavior on
+    // both sides, the line left as inert comment content.
+    var big: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (big.items.len < mox.source.tree.max_head_bytes) : (i += 1) {
+        try big.print(a, "# filler {d}\n", .{i});
+    }
+    try big.appendSlice(a, "# mox: own extra\n[extra]\nk = 1\n");
+    try writeFile(io, tmp.dir, "src/app.ini", big.items);
+    // The section-merge formats preserve comment lines, so the multi-layer
+    // output shows whether compose stripped the directive.
+    try writeFile(io, tmp.dir, "src/app.ini.d/os=darwin.ini", "[more]\nz = 2\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    try std.testing.expectEqual(@as(usize, 1), tree.files.len);
+    try std.testing.expectEqual(mox.source.head.Ownership.none, tree.files[0].ownership);
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &bindings, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: own extra") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[more]") != null);
+}
+
 test "compose: a gated partial file still routes remaining directives through Cat B when the gate is a region" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

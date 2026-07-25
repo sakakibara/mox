@@ -2846,6 +2846,36 @@ test "apply partial: a directive-only disown base takes all content from overlay
     try std.testing.expectEqualStrings(program, try read(io, a, live));
 }
 
+test "apply partial: a directive-only yaml base composes its owned content from overlays" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/app.yaml.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.yaml", .data = "# mox: own tui\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app.yaml.d/os=darwin.yaml",
+        .data = "tui:\n  submit: enter\n",
+    });
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try c.homePath("app.yaml");
+
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expectEqualStrings("tui:\n  submit: enter\n", try read(io, a, live));
+
+    // The program writes outside the owned path; apply preserves its bytes.
+    const program = "tui:\n  submit: enter\nstate:\n  count: 42\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expectEqualStrings(program, try read(io, a, live));
+}
+
 test "apply partial: a secret owned value is hashed in state and masked in snapshots" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -79,7 +79,9 @@ const Head = struct {
 /// once (ownership declarations, check argv, whole-file gate candidate),
 /// strip the consumed lines, and evaluate the gate. An overlay seed
 /// (`has_base == false`) is returned verbatim: a leading `mox:` line there
-/// is inert content, and a gate belongs on a base file.
+/// is inert content, and a gate belongs on a base file. Head recognition
+/// runs on the same `max_head_bytes` prefix the walk reads, so walk and
+/// compose classify a file identically by construction.
 fn readBaseHead(
     arena: std.mem.Allocator,
     io: Io,
@@ -90,13 +92,14 @@ fn readBaseHead(
 ) !Head {
     const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
     if (!file.has_base) return .{ .text = raw };
-    const parsed = source.head.parse(arena, raw, marker) catch |e| switch (e) {
+    const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
+    const parsed = source.head.parse(arena, head_text, marker) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         // The walk has already refused a malformed head; keep the text
         // intact so the failure surfaces with a source location downstream.
         else => return .{ .text = raw },
     };
-    const stripped = if (parsed.spans.len == 0) raw else try source.head.strip(arena, raw, marker);
+    const stripped = if (parsed.spans.len == 0) raw else try source.head.stripSpans(arena, raw, parsed.spans);
     if (parsed.gate == null) return .{ .text = stripped };
     // The candidate is a whole-file existence gate only when the DSL agrees:
     // the file must parse, and the gate must run to EOF (a matching `end`

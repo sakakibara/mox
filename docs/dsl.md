@@ -250,7 +250,9 @@ precede it.
 
 The base may consist of nothing BUT its leading block: ownership directives,
 an optional `check`, an optional whole-file gate, zero content. Overlays in
-`<name>.d/` then supply all owned content, per machine. This is the way to
+`<name>.d/` then supply all owned content, per machine. (This is general
+structured-merge behavior: a blank base -- or blank first layer -- of a
+multi-layer structured file composes from the remaining layers.) This is the way to
 declare ownership for a machine-gated file: the contract and the gate live in
 the base, the per-machine content in overlays, and a machine where the gate
 fails leaves the live file (and mox's records) completely untouched.
