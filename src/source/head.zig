@@ -12,11 +12,16 @@
 //!
 //! `own` and `disown` are mutually exclusive per file.
 //!
-//! Other comment lines in the leading block -- including other `mox:`
-//! directives such as a whole-file gate -- are left alone. The directives
-//! never reach composed output: compose strips exactly the recognized lines
-//! from the base layer text (`strip`), so the live file a program reads
-//! contains no mox syntax.
+//! The pass also RECORDS a whole-file gate candidate: a `when <expr>` line
+//! that would sit on line 1 of the stripped text (every byte before it is a
+//! consumed directive line). Whether it actually gates the file is the
+//! DSL's call -- a matching `end` later in the file makes it a region -- so
+//! the line is reported, never consumed here.
+//!
+//! Other comment lines in the leading block are left alone. The ownership
+//! directives never reach composed output: compose strips exactly the
+//! recognized lines from the base layer text (`strip`), so the live file a
+//! program reads contains no mox syntax.
 
 const std = @import("std");
 
@@ -25,6 +30,13 @@ pub const Ownership = enum { none, own, disown };
 /// Half-open byte range of one recognized directive line, trailing newline
 /// included.
 pub const Span = struct { start: usize, end: usize };
+
+/// A whole-file gate candidate found in the leading block.
+pub const Gate = struct {
+    /// Axis-expression text after the `when` keyword, as written.
+    expr: []const u8,
+    span: Span,
+};
 
 pub const Parsed = struct {
     ownership: Ownership = .none,
@@ -35,6 +47,12 @@ pub const Parsed = struct {
     check: []const []const u8 = &.{},
     /// Spans of every recognized directive line, in file order.
     spans: []const Span = &.{},
+    /// Whole-file gate candidate: the `when` line that is line 1 of the
+    /// stripped text. Null when no such line leads the block.
+    gate: ?Gate = null,
+    /// Offset of the first content line -- where the leading comment block
+    /// ends -- or `text.len` for an all-comment file.
+    block_end: usize = 0,
 };
 
 pub const ParseError = error{
@@ -58,12 +76,17 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
     var spans: std.ArrayList(Span) = .empty;
     var check: ?[]const []const u8 = null;
     var ownership: Ownership = .none;
+    var gate: ?Gate = null;
+    var block_end: usize = text.len;
 
     // A UTF-8 BOM belongs to the file, not the directive grammar: skip it
     // so the leading block is recognized, and leave it out of every span so
     // `strip` keeps it as the first remainder bytes.
     var pos: usize = if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) 3 else 0;
     var first_line = true;
+    // Offset up to which every byte is a consumed directive line, tracked
+    // from 0 so a BOM, shebang, blank, or plain comment breaks contiguity.
+    var covered: usize = 0;
     while (pos < text.len) {
         const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n');
         const line_end = if (nl) |n| n + 1 else text.len;
@@ -76,7 +99,10 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
         if (was_first and std.mem.startsWith(u8, line, "#!")) continue;
         const trimmed = std.mem.trimStart(u8, line, " \t");
         if (trimmed.len == 0) continue;
-        if (!std.mem.startsWith(u8, trimmed, marker)) break;
+        if (!std.mem.startsWith(u8, trimmed, marker)) {
+            block_end = line_start;
+            break;
+        }
 
         const args = directiveArgs(trimmed, marker) orelse continue;
         const kw_end = std.mem.indexOfAny(u8, args, " \t") orelse args.len;
@@ -89,24 +115,35 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
             if (rest.len == 0) return error.EmptyDirectivePath;
             try paths.append(arena, rest);
             try spans.append(arena, .{ .start = line_start, .end = line_end });
+            if (line_start == covered) covered = line_end;
         } else if (std.mem.eql(u8, keyword, "check")) {
             if (check != null) return error.DuplicateCheckDirective;
             check = try parseQuotedArgv(arena, rest);
             try spans.append(arena, .{ .start = line_start, .end = line_end });
+            if (line_start == covered) covered = line_end;
+        } else if (std.mem.eql(u8, keyword, "when")) {
+            // Gate candidate: only when it would sit on line 1 of the
+            // stripped text. Recorded, not consumed -- compose asks the DSL
+            // whether it truly gates the whole file.
+            if (gate == null and line_start == covered) {
+                gate = .{ .expr = rest, .span = .{ .start = line_start, .end = line_end } };
+            }
         }
-        // Any other verb (a whole-file gate, an include, ...) belongs to the
-        // DSL and stays in place.
+        // Any other verb (an include, ...) belongs to the DSL and stays in
+        // place.
     }
 
     if (ownership == .none) {
         if (check != null) return error.CheckWithoutOwnership;
-        return .{};
+        return .{ .gate = gate, .block_end = block_end };
     }
     return .{
         .ownership = ownership,
         .paths = try paths.toOwnedSlice(arena),
         .check = check orelse &.{},
         .spans = try spans.toOwnedSlice(arena),
+        .gate = gate,
+        .block_end = block_end,
     };
 }
 
@@ -275,6 +312,52 @@ test "parse: a UTF-8 BOM precedes the leading block; strip keeps it in place" {
     try testing.expectEqual(Ownership.own, p.ownership);
     try testing.expectEqualStrings("a", p.paths[0]);
     try testing.expectEqualStrings("\xEF\xBB\xBF[a]\nk = 1\n", try strip(a, text, "#"));
+}
+
+test "parse: gate candidate recognized in either order with ownership lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const own_first = try parse(a, "# mox: own a\n# mox: when tool=codex\n[a]\n", "#");
+    try testing.expectEqualStrings("tool=codex", own_first.gate.?.expr);
+
+    const gate_first = try parse(a, "# mox: when tool=codex\n# mox: own a\n[a]\n", "#");
+    try testing.expectEqualStrings("tool=codex", gate_first.gate.?.expr);
+    try testing.expectEqual(@as(usize, 0), gate_first.gate.?.span.start);
+
+    const alone = try parse(a, "# mox: when os=macos\n[gaps]\n", "#");
+    try testing.expectEqual(Ownership.none, alone.ownership);
+    try testing.expectEqualStrings("os=macos", alone.gate.?.expr);
+}
+
+test "parse: gate candidate needs line 1 of the stripped text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A plain comment, blank line, shebang, or BOM before the `when` line
+    // means it is not line 1 after stripping: no candidate.
+    try testing.expect((try parse(a, "# note\n# mox: when a=b\n[t]\n", "#")).gate == null);
+    try testing.expect((try parse(a, "\n# mox: when a=b\n[t]\n", "#")).gate == null);
+    try testing.expect((try parse(a, "#!/usr/bin/env t\n# mox: when a=b\nx\n", "#")).gate == null);
+    try testing.expect((try parse(a, "\xEF\xBB\xBF# mox: when a=b\n[t]\n", "#")).gate == null);
+    try testing.expect((try parse(a, "# mox: own a\n# note\n# mox: when a=b\n[a]\n", "#")).gate == null);
+
+    // Only the first `when` line can be the candidate.
+    const two = try parse(a, "# mox: when a=b\n# mox: when c=d\n[t]\n", "#");
+    try testing.expectEqualStrings("a=b", two.gate.?.expr);
+}
+
+test "parse: block_end is the first content line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "# mox: own a\n# note\n[a]\nk = 1\n";
+    const p = try parse(a, text, "#");
+    try testing.expectEqual(std.mem.indexOf(u8, text, "[a]").?, p.block_end);
+    const all_comment = try parse(a, "# mox: own a\n# note\n", "#");
+    try testing.expectEqual(@as(usize, "# mox: own a\n# note\n".len), all_comment.block_end);
 }
 
 test "strip: no directives leaves the text untouched, CRLF line survives" {

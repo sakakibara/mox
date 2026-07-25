@@ -293,20 +293,28 @@ pub fn composeTracked(
     diag: ?*interp.Diag,
 ) !?[]u8 {
     if (!file.has_base) return error.NoBase;
+    const base_raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
+    return composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, base_raw);
+}
+
+/// `composeTracked` with the base layer's text already in hand. Cat A routes
+/// a directive-bearing structured single layer here with its head processed
+/// by the leading-block pass (ownership and check lines stripped), so head
+/// handling happens exactly once, in that pass.
+pub fn composeTrackedContent(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    bindings: *const std.StringHashMap([]const u8),
+    machine_state_opt: ?*const machine.state.MachineState,
+    secrets: ?SecretCtx,
+    prov: ?*std.ArrayList(Segment),
+    diag: ?*interp.Diag,
+    base_content: []const u8,
+) !?[]u8 {
+    if (!file.has_base) return error.NoBase;
 
     const ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
-
-    const base_raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
-
-    // A partial file's head ownership directives are declaration, not DSL:
-    // strip exactly those lines before parsing, so they neither reach the
-    // directive parser nor composed output.
-    const base_content = if (file.own_paths.len == 0)
-        base_raw
-    else if (markerForFile(file.source_base_path, base_raw)) |m|
-        try source.head.strip(arena, base_raw, m)
-    else
-        base_raw;
 
     const marker = markerForFile(file.source_base_path, base_content) orelse {
         // No signal at all. Pass through verbatim — directiveless config

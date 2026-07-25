@@ -61,19 +61,52 @@ pub fn compose(
 
 const Format = enum { toml, gitconfig, yaml, json, ini };
 
-/// Read the base layer's text, with head ownership directives stripped for a
-/// partial file so no `mox:` declaration line can reach composed output (a
-/// single-layer file passes through verbatim, comments included).
-fn readBaseLayer(
+/// A base layer after the single leading-block pass: head directives parsed
+/// once, consumed lines stripped, whole-file gate evaluated.
+const Head = struct {
+    /// Base text with every consumed head-directive line removed (ownership,
+    /// check, and -- when it holds -- the whole-file gate line).
+    text: []const u8,
+    /// A leading whole-file gate evaluated false: the file is absent on this
+    /// machine.
+    absent: bool = false,
+    /// A leading whole-file gate held: `text` is the gate's body and composes
+    /// by the file's native category, never through Cat B.
+    gate_on: bool = false,
+};
+
+/// Read the base layer and run the ONE leading-block pass: parse the head
+/// once (ownership declarations, check argv, whole-file gate candidate),
+/// strip the consumed lines, and evaluate the gate. An overlay seed
+/// (`has_base == false`) is returned verbatim: a leading `mox:` line there
+/// is inert content, and a gate belongs on a base file.
+fn readBaseHead(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
     path: []const u8,
     marker: []const u8,
-) ![]const u8 {
+    bindings: *const std.StringHashMap([]const u8),
+) !Head {
     const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    if (!file.has_base or file.own_paths.len == 0) return raw;
-    return source.head.strip(arena, raw, marker);
+    if (!file.has_base) return .{ .text = raw };
+    const parsed = source.head.parse(arena, raw, marker) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The walk has already refused a malformed head; keep the text
+        // intact so the failure surfaces with a source location downstream.
+        else => return .{ .text = raw },
+    };
+    const stripped = if (parsed.spans.len == 0) raw else try source.head.strip(arena, raw, marker);
+    if (parsed.gate == null) return .{ .text = stripped };
+    // The candidate is a whole-file existence gate only when the DSL agrees:
+    // the file must parse, and the gate must run to EOF (a matching `end`
+    // later makes it a region, composed through Cat B).
+    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return .{ .text = stripped };
+    if (!dsl.axis.evaluate(expr, bindings)) return .{ .text = stripped, .absent = true };
+    // The gate line is line 1 of the stripped text by construction; consume
+    // exactly it.
+    const nl = std.mem.indexOfScalar(u8, stripped, '\n');
+    return .{ .text = if (nl) |n| stripped[n + 1 ..] else "", .gate_on = true };
 }
 
 fn formatOf(path: []const u8) ?Format {
@@ -111,27 +144,20 @@ fn composeToml(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try readBaseLayer(arena, io, file, layers[0], "#");
-    // A whole-file existence gate belongs on a base file; when there is no base,
-    // `layers[0]` is an overlay and its leading `# mox:` line is inert content.
-    const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "#", bindings)) {
-        .off => return null,
-        .on => |body| body,
-        .none => null,
-    } else null;
+    const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
+    if (hd.absent) return null;
 
     // Single-layer base with `# mox:` content directives routes through Cat B for
     // include / from / when. A whole-file gate composes its body structurally.
     // The pass-through preserves comments, blank lines, and key ordering.
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
-        if (containsMoxDirective(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
+        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
-    // Multi-layer merge: the gate (if any) is already evaluated for the skip;
-    // parse-then-emit drops its comment line, so the merge needs no strip.
-    var merged: toml.Value = try parseFile(arena, io, layers[0]);
+    // Multi-layer merge seeds from the head-processed base text, so no
+    // consumed directive line reaches the parser.
+    var merged: toml.Value = try toml.parse(arena, hd.text, .{});
     for (layers[1..]) |path| {
         const next = try parseFile(arena, io, path);
         merged = try toml_merge.mergeTables(arena, merged, next);
@@ -161,20 +187,15 @@ fn composeJson(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try readBaseLayer(arena, io, file, layers[0], "//");
-    const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "//", bindings)) {
-        .off => return null,
-        .on => |body| body,
-        .none => null,
-    } else null;
+    const hd = try readBaseHead(arena, io, file, layers[0], "//", bindings);
+    if (hd.absent) return null;
 
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
-        if (containsMoxDirectiveJson(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
+        if (!hd.gate_on and containsMoxDirectiveJson(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
-    var merged: json.Value = try parseJsonFile(arena, io, layers[0]);
+    var merged: json.Value = try json.parse(arena, hd.text, .{ .dialect = .jsonc });
     for (layers[1..]) |path| {
         const next = try parseJsonFile(arena, io, path);
         merged = try json_merge.deepMerge(arena, merged, next);
@@ -205,20 +226,15 @@ fn composeYaml(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try readBaseLayer(arena, io, file, layers[0], "#");
-    const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "#", bindings)) {
-        .off => return null,
-        .on => |body| body,
-        .none => null,
-    } else null;
+    const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
+    if (hd.absent) return null;
 
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
-        if (containsMoxDirective(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
+        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
-    var merged: yaml.Value = try parseYamlFile(arena, io, layers[0]);
+    var merged: yaml.Value = try yaml.parse(arena, hd.text, .{});
     for (layers[1..]) |path| {
         const next = try parseYamlFile(arena, io, path);
         merged = try yaml_merge.deepMerge(arena, merged, next);
@@ -249,22 +265,17 @@ fn composeSectionMerge(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try readBaseLayer(arena, io, file, layers[0], "#");
-    const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "#", bindings)) {
-        .off => return null,
-        .on => |body| body,
-        .none => null,
-    } else null;
+    const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
+    if (hd.absent) return null;
 
     if (layers.len == 1) {
-        if (gated) |body| return interpolate(arena, io, file, false, body, machine_state_opt, secrets, prov, diag);
-        if (containsMoxDirective(base)) return try catB.composeTracked(arena, io, file, bindings, machine_state_opt, secrets, prov, diag);
-        return interpolate(arena, io, file, false, base, machine_state_opt, secrets, prov, diag);
+        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
-    // Raw-line merge preserves comments, so a held gate must be stripped from
-    // the seed (unlike the parse-then-emit formats, which drop it).
-    var merged: []u8 = @constCast(gated orelse base);
+    // Raw-line merge preserves comments, so the head-processed seed matters
+    // here (the parse-then-emit formats would drop directive comments anyway).
+    var merged: []u8 = @constCast(hd.text);
     for (layers[1..]) |path| {
         const overlay = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
         merged = try ini_merge.merge(arena, merged, overlay, dialect);
@@ -286,28 +297,18 @@ fn containsMoxDirectiveJson(content: []const u8) bool {
     return std.mem.indexOf(u8, content, "// mox:") != null;
 }
 
-const Gate = union(enum) {
-    /// No leading whole-file gate; the caller decides (content directives -> Cat
-    /// B, plain content -> structural).
-    none,
-    /// A whole-file gate that fails: the file is absent.
-    off,
-    /// A whole-file gate that holds: compose this body (the gate line removed)
-    /// by the file's native category, not Cat B.
-    on: []const u8,
-};
-
-/// A leading `<marker> mox: when <expr>` with no matching `end` (gating to EOF)
-/// conditions a structured file's existence without turning it into Cat B text.
-fn wholeFileGate(arena: std.mem.Allocator, content: []const u8, marker: []const u8, bindings: *const std.StringHashMap([]const u8)) !Gate {
-    const parsed = dsl.driver.parseFile(arena, content, marker, null) catch return .none;
-    if (parsed.directives.len == 0) return .none;
+/// The leading whole-file gate's parsed axis expression, or null when the
+/// head's gate candidate does not gate the file: a `when` with no matching
+/// `end` (gating to EOF) on line 1 conditions a structured file's existence
+/// without turning it into Cat B text; anything else -- a parse failure
+/// anywhere in the file, a terminated region, a missing expression -- is the
+/// DSL's business.
+fn wholeFileGateExpr(arena: std.mem.Allocator, content: []const u8, marker: []const u8) ?*const dsl.ast.AxisExpr {
+    const parsed = dsl.driver.parseFile(arena, content, marker, null) catch return null;
+    if (parsed.directives.len == 0) return null;
     const first = parsed.directives[0];
-    if (first.kind != .when_gate or first.start_line > 1 or !first.kind.when_gate.to_eof) return .none;
-    const gate = first.kind.when_gate.when orelse return .none;
-    if (!dsl.axis.evaluate(gate, bindings)) return .off;
-    const nl = std.mem.indexOfScalar(u8, content, '\n') orelse return .{ .on = "" };
-    return .{ .on = content[nl + 1 ..] };
+    if (first.kind != .when_gate or first.start_line > 1 or !first.kind.when_gate.to_eof) return null;
+    return first.kind.when_gate.when;
 }
 
 /// Run the `<machine.X>` / `<data.X>` / `<secret:URI>` interpolation pass over a

@@ -3702,3 +3702,75 @@ test "compose: a partial file's head directives are stripped, pass-through kept 
     try std.testing.expectEqualStrings(body, out);
     try std.testing.expect(std.mem.indexOf(u8, out, "mox:") == null);
 }
+
+test "compose: ownership and a whole-file gate coexist in either order" {
+    const io = std.testing.io;
+
+    const body =
+        \\[tui.keymap.global]
+        \\submit = "enter"
+        \\
+    ;
+    const heads = [_][]const u8{
+        "# mox: own tui.keymap.global\n# mox: when tool=codex\n",
+        "# mox: when tool=codex\n# mox: own tui.keymap.global\n",
+    };
+    for (heads) |head| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const content = try std.mem.concat(a, u8, &.{ head, body });
+        try writeFile(io, tmp.dir, "src/.codex/config.toml", content);
+        const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+        defer std.testing.allocator.free(src_dir);
+        const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+        try std.testing.expectEqual(@as(usize, 1), tree.files[0].own_paths.len);
+
+        // Gate on: composed output is the body alone, both head lines gone.
+        var on = std.StringHashMap([]const u8).init(a);
+        try on.put("tool", "codex");
+        const out = (try mox.compose.composeFile(a, io, tree.files[0], &on, null, null)).?;
+        try std.testing.expectEqualStrings(body, out);
+
+        // Gate off: the file is absent on this machine.
+        var off = std.StringHashMap([]const u8).init(a);
+        try std.testing.expect((try mox.compose.composeFile(a, io, tree.files[0], &off, null, null)) == null);
+    }
+}
+
+test "compose: a gated partial file still routes remaining directives through Cat B when the gate is a region" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The leading `when` has a matching `end`, so it is a region, not an
+    // existence gate: the ownership line is stripped, the region composes.
+    try writeFile(io, tmp.dir, "src/.codex/config.toml",
+        \\# mox: own top
+        \\# mox: when os=linux
+        \\[top]
+        \\linux = true
+        \\# mox: end
+        \\
+    );
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+
+    var off = std.StringHashMap([]const u8).init(a);
+    try off.put("os", "darwin");
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &off, null, null)).?;
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+
+    var on = std.StringHashMap([]const u8).init(a);
+    try on.put("os", "linux");
+    const out_on = (try mox.compose.composeFile(a, io, tree.files[0], &on, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out_on, "linux = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_on, "mox:") == null);
+}
