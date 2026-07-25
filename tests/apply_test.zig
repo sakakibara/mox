@@ -2799,4 +2799,184 @@ test "apply: an own declaration the walk rejects reports the target by name" {
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "structured") != null);
+
+    // status and diff walk the same tree and report the same diagnosis.
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), s.rc);
+    try std.testing.expect(std.mem.indexOf(u8, s.err, "notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.err, "structured") != null);
+    const d = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 1), d.rc);
+    try std.testing.expect(std.mem.indexOf(u8, d.err, "notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.err, "structured") != null);
+}
+
+test "status partial: MISSING, clean, OUTDATED, DRIFT are decided on the owned subtree only" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    // No live file yet.
+    const missing = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), missing.rc);
+    try std.testing.expect(lineHasBoth(missing.out, "MISSING", "app.toml"));
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const clean = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), clean.rc);
+    try std.testing.expect(lineHasBoth(clean.out, "clean", "app.toml"));
+
+    // Program noise outside the owned paths never surfaces.
+    const noisy = try std.mem.concat(a, u8, &.{ try read(io, a, live), "\n[program]\nstate = 42\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = noisy });
+    const still_clean = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), still_clean.rc);
+    try std.testing.expect(lineHasBoth(still_clean.out, "clean", "app.toml"));
+
+    // The source moved on while live owned still matches the record.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    const outdated = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), outdated.rc);
+    try std.testing.expect(lineHasBoth(outdated.out, "OUTDATED", "app.toml"));
+
+    // Live owned content edited past the record.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 1\n" });
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), "k = 1", "k = 9");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+    const drift = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), drift.rc);
+    try std.testing.expect(lineHasBoth(drift.out, "DRIFT", "app.toml"));
+}
+
+test "status partial: first contact differing from composed is DRIFT, never OUTDATED" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    // No record exists; live owned content differs from composed.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\nk = 9\n" });
+    const r = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(lineHasBoth(r.out, "DRIFT", "app.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "OUTDATED") == null);
+
+    // Equal to composed adopts cleanly on the next apply: clean.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\nk = 1\n" });
+    const eq = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), eq.rc);
+    try std.testing.expect(lineHasBoth(eq.out, "clean", "app.toml"));
+}
+
+test "status partial: a secret record compares by hash and never prints the value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "status-s3cr3t-DO-NOT-LEAK-11aa22bb";
+    try writePartialFixture(io, &tmp, "[api]\ntoken = \"<secret:env:MY_STATUS_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_STATUS_SECRET", .value = secret_value }},
+    });
+    const live = try c.homePath("app.toml");
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const clean = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), clean.rc);
+    try std.testing.expect(lineHasBoth(clean.out, "clean", "app.toml"));
+
+    // A hand edit inside the secret-bearing owned path fails the hash compare.
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), secret_value, "leaked-by-hand");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+    const drift = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), drift.rc);
+    try std.testing.expect(lineHasBoth(drift.out, "DRIFT", "app.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, drift.out, secret_value) == null);
+    try std.testing.expect(std.mem.indexOf(u8, drift.err, secret_value) == null);
+}
+
+test "diff partial: shows only the owned subtree; program keys never appear" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const noisy = try std.mem.concat(a, u8, &.{ try read(io, a, live), "\n[program]\nstate = 42\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = noisy });
+
+    // The owned subtree matches; the program's bytes are not mox's to diff.
+    const quiet = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), quiet.rc);
+    try std.testing.expectEqualStrings("", quiet.out);
+
+    // The owned content changes: the diff is over the owned subtree as text,
+    // labeled with the live path, and still free of program keys.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    const r = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "app.toml (live)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "k = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "k = 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "program") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "state") == null);
+}
+
+test "diff partial: secret keys render masked on both sides" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "diff-s3cr3t-DO-NOT-LEAK-33cc44dd";
+    try writePartialFixture(
+        io,
+        &tmp,
+        "[api]\ntoken = \"<secret:env:MY_DIFF_SECRET>\"\n\n[ui]\ncolor = \"red\"\n",
+        "[\"app.toml\"]\nown = [\"api\", \"ui\"]\n",
+    );
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_DIFF_SECRET", .value = secret_value }},
+    });
+    const live = try c.homePath("app.toml");
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    // Identical owned content, secret included: masked sides compare equal.
+    const quiet = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), quiet.rc);
+    try std.testing.expectEqualStrings("", quiet.out);
+
+    // The whole [api] section is dropped from live: the composed side shows
+    // the section coming back, its body masked, the value nowhere.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[ui]\ncolor = \"red\"\n" });
+    const r = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "= api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, mox.apply.partial.secret_mask) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, secret_value) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "token") == null);
 }

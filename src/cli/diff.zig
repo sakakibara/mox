@@ -135,10 +135,22 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch |e| switch (e) {
+    var walk_diag: mox.source.tree.Diag = .{};
+    const base_tree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, m_state.home, &walk_diag) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox diff: source tree not found at {s}\n", .{src_dir});
             return 0;
+        },
+        error.OwnOnUnstructuredTarget,
+        error.OwnOnSymlink,
+        error.OwnOnSeedOnce,
+        error.OwnOnGenerator,
+        error.InvalidOwnPath,
+        => {
+            try ctx.err.print("mox diff: .mox/attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
+            });
+            return 1;
         },
         else => return e,
     };
@@ -204,6 +216,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         // Axis-gated off for this machine: nothing to compose, nothing to diff.
         const composed_bytes = composed orelse continue;
 
+        // A partial file diffs its owned subtree only: canonical composed-owned
+        // vs canonical live-owned, as text, labeled with the live path.
+        if (file.own_paths.len > 0) {
+            try diffPartial(ctx, context.paths.state_dir, sty, stat_mode, file, composed_bytes, prov.items, &total, &changed);
+            continue;
+        }
+
         try diffOne(ctx, context.paths.state_dir, sty, stat_mode, file.live_path, composed_bytes, prov.items, &total, &changed);
     }
 
@@ -264,6 +283,123 @@ fn diffOne(
         const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
         try ctx.out.writeAll(rendered);
     }
+}
+
+/// Diff one partial file's owned subtree: canonical composed-owned vs
+/// canonical live-owned, as text, labeled with the live path (D6). Keys in
+/// the secret set -- the record's, plus any path the current compose resolved
+/// a secret into -- are masked on BOTH sides before diffing, so a resolved
+/// value never reaches stdout. A composed document violating its declaration
+/// (D2) reports apply's ERROR line on stderr; diff stays read-only and keeps
+/// its exit contract.
+fn diffPartial(
+    ctx: *app.Ctx,
+    state_dir: []const u8,
+    sty: style.Style,
+    stat_mode: bool,
+    file: mox.source.tree.ManagedFile,
+    composed_bytes: []const u8,
+    prov_segments: []const mox.provenance.map.Segment,
+    total: *Stat,
+    changed: *usize,
+) !void {
+    const partial_mod = mox.apply.partial;
+    const canon_mod = mox.apply.canonical;
+    const owned_mod = mox.apply.owned;
+    const live_path = file.live_path;
+    const own_paths = file.own_paths;
+    // The walk only attaches own_paths to structured targets.
+    const format = mox.source.format.formatOfPath(file.source_base_path).?;
+
+    const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed_bytes) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => {
+            try ctx.err.print("  ERROR   {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
+            return;
+        },
+    };
+    if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
+        try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+        return;
+    }
+
+    const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => {
+            try ctx.err.print("  ERROR   {s} (live file does not parse as {s})\n", .{ live_path, @tagName(format) });
+            return;
+        },
+    };
+
+    var pdiag: partial_mod.Diag = .{};
+    const flags = partial_mod.secretPathFlags(ctx.alloc, format, composed_bytes, own_paths, prov_segments, &pdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ live_path, pdiag.text() });
+            return;
+        },
+    };
+    const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, live_path);
+    var secret_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
+    if (record) |r| try secret_paths.appendSlice(ctx.alloc, try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths));
+    for (own_paths, flags) |p, flagged| {
+        if (flagged and !owned_mod.pathInList(p.segments, secret_paths.items)) {
+            try secret_paths.append(ctx.alloc, p);
+        }
+    }
+    const spelled = try ctx.alloc.alloc([]const u8, secret_paths.items.len);
+    for (secret_paths.items, spelled) |p, *s| s.* = try canon_mod.pathSpell(ctx.alloc, p.segments);
+
+    const b_text = try maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, &owned, own_paths), spelled);
+    const a_text = try maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, &live_doc, own_paths), spelled);
+    if (std.mem.eql(u8, a_text, b_text)) return;
+
+    const a_lines = try mox.diff.lines.splitLines(ctx.alloc, a_text);
+    const b_lines = try mox.diff.lines.splitLines(ctx.alloc, b_text);
+    const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
+        error.TooManyLines => {
+            try ctx.err.print("mox diff: {s}: too large to diff\n", .{live_path});
+            return;
+        },
+        else => return e,
+    };
+    if (hunks.len == 0) return;
+
+    changed.* += 1;
+    const s = statOf(hunks);
+    total.added += s.added;
+    total.removed += s.removed;
+    if (stat_mode) {
+        try ctx.out.print(" {s} | +{d} -{d}\n", .{ live_path, s.added, s.removed });
+    } else {
+        // Both sides are already masked; no per-line secret info remains.
+        const none: []const bool = &.{};
+        const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, none, none, sty);
+        try ctx.out.writeAll(rendered);
+    }
+}
+
+/// A canonical blob with each named section's body replaced by the secret
+/// mask. The header line stays, so a section appearing or disappearing still
+/// shows; every key and value under it is hidden. Sections absent from the
+/// blob are left alone.
+fn maskOwnedSections(arena: std.mem.Allocator, blob: []const u8, spelled_paths: []const []const u8) ![]const u8 {
+    var text: []const u8 = blob;
+    for (spelled_paths) |sp| {
+        const sec = mox.apply.canonical.sectionOf(text, sp) orelse continue;
+        const start = @intFromPtr(sec.ptr) - @intFromPtr(text.ptr);
+        const header_len = (std.mem.indexOfScalar(u8, sec, '\n') orelse (sec.len - 1)) + 1;
+        text = try std.mem.concat(arena, u8, &.{
+            text[0 .. start + header_len],
+            "  " ++ mox.apply.partial.secret_mask ++ "\n",
+            text[start + sec.len ..],
+        });
+    }
+    return text;
 }
 
 pub const command = app.command(Spec, .{
@@ -334,6 +470,16 @@ test "renderFile: a hunk touching a secret line redacts both sides" {
         "+" ++ red ++ "\n";
     try testing.expectEqualStrings(expected, out);
     try testing.expect(std.mem.indexOf(u8, out, "s3cr3t") == null);
+}
+
+test "maskOwnedSections: named section bodies are masked, others left verbatim" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const blob = "= api\n  token = \"s3cr3t\"\n  user = \"me\"\n= ui\n  color = \"red\"\n";
+    const got = try maskOwnedSections(arena.allocator(), blob, &.{ "api", "absent" });
+    const want = "= api\n  " ++ mox.apply.partial.secret_mask ++ "\n= ui\n  color = \"red\"\n";
+    try testing.expectEqualStrings(want, got);
+    try testing.expect(std.mem.indexOf(u8, got, "s3cr3t") == null);
 }
 
 test "renderFile: colored output wraps removed lines red, added lines green, headers dim" {

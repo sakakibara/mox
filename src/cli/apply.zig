@@ -149,7 +149,7 @@ fn applyPass(
         error.InvalidOwnPath,
         => {
             try ctx.err.print("mox apply: .mox/attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", ownDiagText(e),
+                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
             });
             return 1;
         },
@@ -699,19 +699,6 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     try ctx.out.print("  {s} {s}\n", .{ if (in.create_once) "seeded" else "wrote", in.live_path });
 }
 
-/// The names an own-list walk rejection prints, so a bad attributes entry
-/// reads as a diagnosis instead of a bare error code.
-fn ownDiagText(e: anyerror) []const u8 {
-    return switch (e) {
-        error.OwnOnUnstructuredTarget => "own requires a structured target (toml/json/yaml/ini/gitconfig)",
-        error.OwnOnSymlink => "own cannot combine with symlink",
-        error.OwnOnSeedOnce => "own cannot combine with seed_once",
-        error.OwnOnGenerator => "own cannot apply to a generator source",
-        error.InvalidOwnPath => "own path does not parse as a dotted key path",
-        else => @errorName(e),
-    };
-}
-
 /// Inputs to `applyPartialFile`: the composed text plus everything the
 /// partial pipeline needs from the managed file and the apply flags.
 const PartialInput = struct {
@@ -742,6 +729,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const context = ctx.context.?;
     const partial_mod = mox.apply.partial;
     const canon_mod = mox.apply.canonical;
+    const owned_mod = mox.apply.owned;
     const live_path = in.file.live_path;
     const own_paths = in.file.own_paths;
     // The walk only attaches own_paths to structured targets.
@@ -808,68 +796,33 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     };
 
     const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
-    // A recorded raw that no longer parses cannot be located; it is treated
-    // as abandoned (dropped from the record scope).
-    const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try parseRawPaths(ctx.alloc, r.own_paths) else &.{};
+    const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
 
     const composed_canon = try canon_mod.canonicalOwned(ctx.alloc, &owned, own_paths);
-    const live_canon = try canon_mod.canonicalOwned(ctx.alloc, &live_doc, own_paths);
 
+    // A missing live file is a creation, classified as a plain write; an
+    // existing one takes the per-path drift rule against the owned record.
+    const class: owned_mod.Class = if (live == null)
+        .outdated
+    else
+        try owned_mod.classify(ctx.alloc, &owned, &live_doc, own_paths, record, record_paths);
+
+    if (class == .drift and !in.force) {
+        counts.drift += 1;
+        try ctx.err.print("  DRIFT   {s} (owned path {s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, class.drift });
+        return;
+    }
     // Live content already at the composed state (or a fresh target): the
     // drift rule is moot, exactly as whole-file `unchanged` precedes it.
-    const live_matches = live != null and std.mem.eql(u8, live_canon, composed_canon);
-
-    if (live != null and !live_matches) {
-        // Per-path drift over the union of record-time and current lists;
-        // paths only in the record list are abandoned and never compared.
-        var drifted: ?[]const u8 = null;
-        for (own_paths) |p| {
-            const spelled = try canon_mod.pathSpell(ctx.alloc, p.segments);
-            const one = [_]mox.source.tree.OwnPath{p};
-            const live_sec = try canon_mod.canonicalOwned(ctx.alloc, &live_doc, &one);
-            const in_record = record != null and pathInList(p.segments, record_paths);
-            if (in_record and record.?.secret) continue; // hash-compared below
-            const want = if (in_record)
-                canon_mod.sectionOf(record.?.canonical.?, spelled) orelse ""
-            else blk: {
-                // First contact for this path: only its composed content
-                // may be adopted silently.
-                break :blk try canon_mod.canonicalOwned(ctx.alloc, &owned, &one);
-            };
-            if (!std.mem.eql(u8, live_sec, want)) {
-                drifted = spelled;
-                break;
-            }
-        }
-        if (drifted == null) {
-            if (record) |r| {
-                if (r.secret) {
-                    // A secret-bearing record stores one hash over its whole
-                    // path scope; drift there is per file, not per path.
-                    const live_rec_canon = try canon_mod.canonicalOwned(ctx.alloc, &live_doc, record_paths);
-                    const live_hash = mox.apply.applied.contentHashHex(live_rec_canon);
-                    if (r.canonical_hash == null or !std.mem.eql(u8, &live_hash, &r.canonical_hash.?)) {
-                        drifted = "owned content";
-                    }
-                }
-            }
-        }
-        if (drifted) |spelled| {
-            if (!in.force) {
-                counts.drift += 1;
-                try ctx.err.print("  DRIFT   {s} (owned path {s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, spelled });
-                return;
-            }
-        }
-    }
+    const live_matches = class == .clean;
 
     const record_current = blk: {
         const r = record orelse break :blk false;
         if (r.secret != any_secret) break :blk false;
         const cur_raws = try ctx.alloc.alloc([]const u8, own_paths.len);
         for (own_paths, cur_raws) |p, *o| o.* = p.raw;
-        if (!sameRawSet(ctx.alloc, r.own_paths, cur_raws)) break :blk false;
-        if (!sameRawSet(ctx.alloc, r.secret_paths, secret_raws.items)) break :blk false;
+        if (!owned_mod.sameRawSet(ctx.alloc, r.own_paths, cur_raws)) break :blk false;
+        if (!owned_mod.sameRawSet(ctx.alloc, r.secret_paths, secret_raws.items)) break :blk false;
         if (r.secret) {
             const h = mox.apply.applied.contentHashHex(composed_canon);
             break :blk r.canonical_hash != null and std.mem.eql(u8, &h, &r.canonical_hash.?);
@@ -926,12 +879,12 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         // Snapshot the whole pre-write live file, with values under
         // secret-bearing owned paths (recorded or current) masked so the
         // snapshot never stores a resolved secret.
-        const recorded_secret: []const mox.source.tree.OwnPath = if (record) |r| try parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
+        const recorded_secret: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
         var current_secret: std.ArrayList(mox.source.tree.OwnPath) = .empty;
         for (own_paths, secret_flags) |p, flagged| {
             if (flagged) try current_secret.append(ctx.alloc, p);
         }
-        const mask_paths = try unionPaths(ctx.alloc, recorded_secret, current_secret.items);
+        const mask_paths = try owned_mod.unionPaths(ctx.alloc, recorded_secret, current_secret.items);
         const snap_content = partial_mod.maskSecretPaths(ctx.alloc, format, live_text, mask_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.MaskFailed => {
@@ -985,61 +938,6 @@ fn writeOwnedRecord(
         .own_paths = raws,
         .secret_paths = secret_raws,
     });
-}
-
-fn parseRawPaths(arena: std.mem.Allocator, raws: []const []const u8) ![]mox.source.tree.OwnPath {
-    var list: std.ArrayList(mox.source.tree.OwnPath) = .empty;
-    for (raws) |raw| {
-        const segs = mox.source.keypath.parse(arena, raw) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => continue,
-        };
-        try list.append(arena, .{ .raw = raw, .segments = segs });
-    }
-    return list.toOwnedSlice(arena);
-}
-
-fn pathInList(segments: []const []const u8, list: []const mox.source.tree.OwnPath) bool {
-    for (list) |p| {
-        if (p.segments.len != segments.len) continue;
-        var all = true;
-        for (p.segments, segments) |a, b| {
-            if (!std.mem.eql(u8, a, b)) all = false;
-        }
-        if (all) return true;
-    }
-    return false;
-}
-
-/// Set equality over raw path strings, order-independent.
-fn sameRawSet(arena: std.mem.Allocator, a: []const []const u8, b: []const []const u8) bool {
-    if (a.len != b.len) return false;
-    const as = arena.dupe([]const u8, a) catch return false;
-    const bs = arena.dupe([]const u8, b) catch return false;
-    std.mem.sort([]const u8, as, {}, stringLess);
-    std.mem.sort([]const u8, bs, {}, stringLess);
-    for (as, bs) |x, y| {
-        if (!std.mem.eql(u8, x, y)) return false;
-    }
-    return true;
-}
-
-fn stringLess(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
-}
-
-/// Concatenate two path lists, deduplicating by segments.
-fn unionPaths(
-    arena: std.mem.Allocator,
-    a: []const mox.source.tree.OwnPath,
-    b: []const mox.source.tree.OwnPath,
-) ![]mox.source.tree.OwnPath {
-    var out: std.ArrayList(mox.source.tree.OwnPath) = .empty;
-    for (a) |p| try out.append(arena, p);
-    for (b) |p| {
-        if (!pathInList(p.segments, out.items)) try out.append(arena, p);
-    }
-    return out.toOwnedSlice(arena);
 }
 
 /// Apply a GENERATOR file, or report it is not one. Returns false when `file`

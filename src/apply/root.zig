@@ -7,6 +7,7 @@ pub const exact = @import("exact.zig");
 pub const generated = @import("generated.zig");
 pub const partial = @import("partial.zig");
 pub const canonical = @import("canonical.zig");
+pub const owned = @import("owned.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -19,4 +20,5 @@ test {
     _ = generated;
     _ = partial;
     _ = canonical;
+    _ = owned;
 }

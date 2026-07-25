@@ -33,9 +33,21 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch |e| switch (e) {
+    var walk_diag: mox.source.tree.Diag = .{};
+    const base_tree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, m_state.home, &walk_diag) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox status: source tree not found at {s}\n", .{src_dir});
+            return 1;
+        },
+        error.OwnOnUnstructuredTarget,
+        error.OwnOnSymlink,
+        error.OwnOnSeedOnce,
+        error.OwnOnGenerator,
+        error.InvalidOwnPath,
+        => {
+            try ctx.err.print("mox status: .mox/attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
+            });
             return 1;
         },
         else => return e,
@@ -148,6 +160,15 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             continue;
         }
 
+        // A partial file is classified on its owned subtree only (D6);
+        // program activity outside the declared paths can never surface.
+        if (file.own_paths.len > 0) {
+            const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?);
+            if (cell.problem) problems += 1;
+            try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
+            continue;
+        }
+
         const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
             error.FileNotFound => null,
             // An unreadable or oversize live file is one file's problem, not a
@@ -166,6 +187,44 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
     }
     return if (problems > 0) 1 else 0;
+}
+
+/// The status cell for one partial file, per D6: MISSING only when the live
+/// file is absent; otherwise the extracted live owned subtree is compared
+/// canonically against the owned record (DRIFT) and the composed owned
+/// document (OUTDATED), clean when all equal. A composed document violating
+/// its declaration (D2), or an unparseable composed/live file, is ERROR --
+/// the same shapes apply refuses.
+fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8) !Cell {
+    const partial_mod = mox.apply.partial;
+    const owned_mod = mox.apply.owned;
+    const err_cell: Cell = .{ .label = "ERROR", .problem = true };
+    // The walk only attaches own_paths to structured targets.
+    const format = mox.source.format.formatOfPath(file.source_base_path).?;
+
+    const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => return err_cell,
+    };
+    if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, file.own_paths) != null) return err_cell;
+
+    const live: []const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => return cellFor(.fresh_write),
+        error.OutOfMemory => return e,
+        else => return err_cell,
+    };
+    const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => return err_cell,
+    };
+
+    const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, file.live_path);
+    const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
+    return switch (try owned_mod.classify(ctx.alloc, &owned, &live_doc, file.own_paths, record, record_paths)) {
+        .clean => cellFor(.unchanged),
+        .outdated => cellFor(.safe_overwrite),
+        .drift => cellFor(.drift),
+    };
 }
 
 pub const command = app.command(Spec, .{
