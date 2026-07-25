@@ -138,6 +138,17 @@ pub fn build(b: *std.Build) void {
     const apply_tests = b.addTest(.{ .root_module = apply_tests_mod });
     test_step.dependOn(&b.addRunArtifact(apply_tests).step);
 
+    // Partial-ownership differential tests at tests/partial_differential_test.zig.
+    const partial_diff_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/partial_differential_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    partial_diff_tests_mod.addImport("mox", lib_mod);
+    partial_diff_tests_mod.addImport("toml", toml_mod);
+    const partial_diff_tests = b.addTest(.{ .root_module = partial_diff_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(partial_diff_tests).step);
+
     // CLI test harness (shared by apply/commit/lifecycle) canaries at
     // tests/testutil.zig.
     const testutil_tests_mod = b.createModule(.{
