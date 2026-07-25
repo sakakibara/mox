@@ -185,10 +185,10 @@ that script, not a silent skip.
 
 ## File attributes
 
-Bodies carry no template language, but a managed file still has a mode, and may
-be a symlink or seeded once. mox has no filename prefix for any of these; the
-source file keeps its native name and the attributes git cannot carry live in a
-generated `.mox/attributes.toml`.
+Bodies carry no template language, but a managed file still has a mode, may be
+a symlink or seeded once, and may be owned only in part. mox has no filename
+prefix for any of these; the source file keeps its native name and the
+attributes git cannot carry live in `.mox/attributes.toml`.
 
 - **Mode.** The target's mode is the source file's own permission bits: `chmod
   +x` the source and git carries the exec bit (git round-trips 0644 and 0755
@@ -202,9 +202,45 @@ generated `.mox/attributes.toml`.
 - **Seed-once.** `mox add --seed-once` records `seed_once = true`. Apply writes
   the target only when it is absent and never overwrites, drift-checks, or
   commits an existing one -- for a machine-local skeleton the user then edits.
+- **Partial ownership.** `own = ["<key-path>", ...]` declares the key subtrees
+  mox manages inside a structured target; every byte outside them stays the
+  program's. A key-path is TOML dotted-key syntax, verbatim: bare segments
+  (`A-Za-z0-9_-`), `"..."`/`'...'`-quoted segments, whitespace allowed around
+  the dots (`projects."/tmp/example"`, `remote."my origin".url`). Segments
+  match on decoded key content, per the format's dialect: ini and gitconfig
+  sections and keys match case-insensitively, a gitconfig quoted subsection is
+  matched verbatim (case-sensitive), and a YAML declared segment is a string
+  key -- a non-string key may sit inside an owned subtree, never on the
+  declared path itself. `own` requires a structured target (TOML, JSON, YAML,
+  INI, gitconfig) and cannot combine with `symlink`, `seed_once`, or a
+  generator source. The composed source must lie entirely within the
+  declaration -- a composed leaf outside every declared path is a per-file
+  error -- and a declared path the source does not populate is enforced as
+  absent from the live file.
+- **Check hook.** `check = ["<repo-relative executable>", "arg", ...]`
+  validates every candidate partial write before it lands (apply and rollback
+  both run it). The executable is spawned directly with the argv given -- no
+  shell -- with cwd at the repo root; a `.ps1` checker runs under PowerShell
+  with the same dispatch as setup scripts. The candidate is materialized in a
+  private temp dir under the live file's basename, and the child gets
+  `MOX_CHECK_FILE` (the candidate's path) and `MOX_CHECK_DIR`. Exit 0 accepts;
+  any other exit, or a timeout, refuses the file and reports the hook's
+  output. The timeout defaults to 30s, overridden per run with
+  `MOX_CHECK_TIMEOUT_MS` (a value <= 0 disables it); on POSIX the hook leads
+  its own process group and the whole group is killed on timeout, on Windows
+  the hook process is terminated. The temp dir holds only the candidate: a
+  tool that resolves sibling files must be wrapped by the checker script.
+  `check` executes repo-authored code at apply time -- the same authority as
+  `scripts/`, with the same opt-out: under `--skip-scripts` the hook does not
+  run and the check-bearing file is not written.
 
-`.mox/attributes.toml` is generated and maintained by mox (`add`, `mv`); do not
-edit it by hand.
+`.mox/attributes.toml` is maintained by mox (`add`, `mv`, `remove`), and the
+`own` and `check` fields are also yours to edit by hand -- a path added to
+`own` is first contact for that path: its live content is adopted when it
+already matches the source, and drift otherwise. `mox add --own` edits the
+file in place, preserving your formatting and comments; commands that re-key
+or drop entries rewrite it deterministically. Leave the mode, symlink, and
+seed-once fields to mox.
 
 ## Concurrency and snapshots
 
