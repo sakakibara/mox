@@ -229,6 +229,21 @@ or not. A declared path owns its whole subtree either way, the directives
 never reach the live file, and the full grammar and rules are in
 [dsl.md](dsl.md#file-attributes-and-head-directives).
 
+For a file that should exist only where its tool does, make the base
+directive-only: the ownership lines plus a whole-file gate, no content, with
+the owned content coming from `<name>.d/` overlays:
+
+```toml
+# mox: own tui.keymap.global
+# mox: when tool=codex
+```
+
+with the keymap itself in `config.toml.d/os=darwin.toml` (or any overlay
+that matches the machine). On a machine where the gate fails, the live file
+and mox's records are untouched; where it holds, the matching overlays
+compose the owned content and apply patches it in. This is the pattern for
+declaring ownership over machine-gated files.
+
 ### Taking ownership
 
 `mox add --own` onboards a live file in one step:

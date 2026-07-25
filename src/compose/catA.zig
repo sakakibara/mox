@@ -195,8 +195,16 @@ fn composeJson(
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
-    var merged: json.Value = try json.parse(arena, hd.text, .{ .dialect = .jsonc });
-    for (layers[1..]) |path| {
+    // A blank seed (a directive-only base: nothing remains after the head
+    // pass) is not a parseable JSON document; the overlays supply all
+    // content, so the first one seeds the merge. TOML's empty-table parse
+    // gives the same semantics for free.
+    const blank = std.mem.trim(u8, hd.text, " \t\r\n").len == 0;
+    var merged: json.Value = if (blank)
+        try parseJsonFile(arena, io, layers[1])
+    else
+        try json.parse(arena, hd.text, .{ .dialect = .jsonc });
+    for (layers[if (blank) 2 else 1..]) |path| {
         const next = try parseJsonFile(arena, io, path);
         merged = try json_merge.deepMerge(arena, merged, next);
     }
@@ -234,8 +242,14 @@ fn composeYaml(
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
-    var merged: yaml.Value = try yaml.parse(arena, hd.text, .{});
-    for (layers[1..]) |path| {
+    // Same blank-seed rule as JSON: a directive-only base leaves no
+    // parseable document, so the first overlay seeds the merge.
+    const blank = std.mem.trim(u8, hd.text, " \t\r\n").len == 0;
+    var merged: yaml.Value = if (blank)
+        try parseYamlFile(arena, io, layers[1])
+    else
+        try yaml.parse(arena, hd.text, .{});
+    for (layers[if (blank) 2 else 1..]) |path| {
         const next = try parseYamlFile(arena, io, path);
         merged = try yaml_merge.deepMerge(arena, merged, next);
     }

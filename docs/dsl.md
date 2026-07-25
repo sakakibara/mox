@@ -243,7 +243,17 @@ everywhere, `//` for JSONC):
 The directives never reach composed output: compose strips exactly the
 recognized lines from the base text, so the live file a program reads contains
 no mox syntax. Overlays cannot declare ownership; the contract is the file's,
-machine-independent, stated once at its head -- above any whole-file gate.
+machine-independent, stated once at its head. A whole-file gate shares the
+same leading block, before or after the ownership lines -- the whole block is
+read in one pass, and the gate holds as long as only consumed directive lines
+precede it.
+
+The base may consist of nothing BUT its leading block: ownership directives,
+an optional `check`, an optional whole-file gate, zero content. Overlays in
+`<name>.d/` then supply all owned content, per machine. This is the way to
+declare ownership for a machine-gated file: the contract and the gate live in
+the base, the per-machine content in overlays, and a machine where the gate
+fails leaves the live file (and mox's records) completely untouched.
 
 A key-path is TOML dotted-key syntax, verbatim: bare segments
 (`A-Za-z0-9_-`), `"..."`/`'...'`-quoted segments, whitespace allowed around

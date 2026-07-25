@@ -2753,6 +2753,99 @@ test "apply partial: a gated-off file is untouched and gains no record" {
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
 }
 
+test "apply partial: a directive-only base composes its owned content from overlays" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The base declares ownership and the machine gate; zero content. The
+    // overlay supplies everything the owned paths hold.
+    try tmp.dir.createDirPath(io, "repo/src/app.toml.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui.keymap.global\n# mox: when os=darwin\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app.toml.d/os=darwin.toml",
+        .data = "[tui.keymap.global]\nsubmit = \"enter\"\n",
+    });
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try c.homePath("app.toml");
+
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"enter\"\n", try read(io, a, live));
+
+    // Idempotent: the second apply writes nothing.
+    const before = try mtimeNs(io, live);
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "unchanged") != null);
+    try std.testing.expectEqual(before, try mtimeNs(io, live));
+
+    // The program writes outside the owned path; apply preserves its bytes.
+    const program = "[tui.keymap.global]\nsubmit = \"enter\"\n\n[state]\ncount = 42\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
+    const r3 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expectEqualStrings(program, try read(io, a, live));
+}
+
+test "apply partial: a gated-off directive-only base leaves live and records untouched" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/app.toml.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n# mox: when os=linux\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml.d/os=linux.toml", .data = "[tui]\nk = 1\n" });
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try c.homePath("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[program]\nonly = true\n" });
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped") != null);
+    try std.testing.expectEqualStrings("[program]\nonly = true\n", try read(io, a, live));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
+}
+
+test "apply partial: a directive-only disown base takes all content from overlays" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/settings.json.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/settings.json", .data = "// mox: disown model\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/settings.json.d/os=darwin.json",
+        .data = "{ \"theme\": \"dark\" }\n",
+    });
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try c.homePath("settings.json");
+
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"dark\"\n}\n", try read(io, a, live));
+
+    // The program writes its disowned key; apply preserves it untouched.
+    const program = "{\n  \"theme\": \"dark\",\n  \"model\": \"opus\"\n}\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "unchanged") != null);
+    try std.testing.expectEqualStrings(program, try read(io, a, live));
+}
+
 test "apply partial: a secret owned value is hashed in state and masked in snapshots" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
