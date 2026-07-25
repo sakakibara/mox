@@ -2779,24 +2779,35 @@ fn jsonInsertRaw(
         return error.OwnedRenderFailed;
     }
 
-    // Deepest existing ancestor object along the declared path.
+    // Deepest existing ancestor object along the declared path. Ancestors
+    // the composed document does not populate are created around the
+    // spliced member, so the leaf keeps its declared path.
     var cur = doc.root;
-    for (p.segments[0 .. p.segments.len - 1]) |seg| {
+    var depth: usize = 0;
+    while (depth < p.segments.len - 1) {
         if (cur.data != .object) break;
         var next: ?@TypeOf(cur) = null;
         for (cur.data.object.items) |m| {
-            if (std.mem.eql(u8, m.key.decoded, seg)) next = m.value;
+            if (std.mem.eql(u8, m.key.decoded, p.segments[depth])) next = m.value;
         }
         cur = next orelse break;
+        depth += 1;
     }
     if (cur.data != .object) {
         diagSet(diag, "{s}: path runs through a non-object value", .{p.raw});
         return error.OwnedRenderFailed;
     }
+    var wrapped: []const u8 = member;
+    var lvl = p.segments.len - 1;
+    while (lvl > depth) : (lvl -= 1) {
+        wrapped = try std.mem.concat(arena, u8, &.{
+            try jsonKeyLiteral(arena, p.segments[lvl - 1]), ": {", wrapped, "}",
+        });
+    }
     const members = cur.data.object.items;
     if (members.len == 0) {
         return std.mem.concat(arena, u8, &.{
-            text[0 .. cur.outer.start + 1], member, text[cur.outer.end - 1 ..],
+            text[0 .. cur.outer.start + 1], wrapped, text[cur.outer.end - 1 ..],
         });
     }
     const last = members[members.len - 1];
@@ -2808,7 +2819,7 @@ fn jsonInsertRaw(
     const key_line = lineStartOf(text, last.key.outer.start);
     const indent = text[key_line..firstNonWs(text, key_line)];
     return std.mem.concat(arena, u8, &.{
-        text[0..value_end], ",\n", indent, member, text[value_end..],
+        text[0..value_end], ",\n", indent, wrapped, text[value_end..],
     });
 }
 
@@ -2842,6 +2853,9 @@ fn yamlInsertRaw(
         return error.OwnedRenderFailed;
     }
 
+    // Deepest existing ancestor mapping. Ancestors the composed document
+    // does not populate are created around the spliced member, so the leaf
+    // keeps its declared path.
     var cur = root;
     var depth: usize = 0;
     while (depth < p.segments.len - 1) {
@@ -2853,8 +2867,8 @@ fn yamlInsertRaw(
         cur = next orelse break;
         depth += 1;
     }
-    if (depth != p.segments.len - 1 or cur.data != .mapping) {
-        diagSet(diag, "{s}: the path's parent mapping does not exist in the composed document", .{p.raw});
+    if (cur.data != .mapping) {
+        diagSet(diag, "{s}: path runs through a non-mapping value", .{p.raw});
         return error.OwnedRenderFailed;
     }
     if (src.len > cur.outer.start and src[cur.outer.start] == '{') {
@@ -2869,27 +2883,169 @@ fn yamlInsertRaw(
     const last = members[members.len - 1];
     const key_line = lineStartOf(src, last.key.outer.start);
     const indent = src[key_line..firstNonWs(src, key_line)];
-    if (!std.mem.eql(u8, raw_indent, indent)) {
-        diagSet(diag, "{s}: live span indentation does not match the composed parent mapping", .{p.raw});
+    const at = lineEndOf(src, last.value.outer.end);
+    if (depth == p.segments.len - 1) {
+        if (!std.mem.eql(u8, raw_indent, indent)) {
+            diagSet(diag, "{s}: live span indentation does not match the composed parent mapping", .{p.raw});
+            return error.OwnedRenderFailed;
+        }
+        return insertWithSeparator(arena, text, at, raw_nl);
+    }
+    var chain: std.ArrayList(u8) = .empty;
+    var pad: []const u8 = indent;
+    for (p.segments[depth .. p.segments.len - 1]) |seg| {
+        try chain.appendSlice(arena, pad);
+        try chain.appendSlice(arena, try yamlScalarText(arena, .{ .string = seg }, diag));
+        try chain.appendSlice(arena, ":\n");
+        pad = try std.mem.concat(arena, u8, &.{ pad, "  " });
+    }
+    // The live span's lines must nest under the innermost created key.
+    if (raw_indent.len <= pad.len - 2) {
+        diagSet(diag, "{s}: live span indentation does not fit under the created parent chain", .{p.raw});
         return error.OwnedRenderFailed;
     }
-    const at = lineEndOf(src, last.value.outer.end);
-    return insertWithSeparator(arena, text, at, raw_nl);
+    try chain.appendSlice(arena, raw_nl);
+    return insertWithSeparator(arena, text, at, chain.items);
 }
 
 /// `text` minus every located span and wrapper region: the public remainder,
-/// for callers reconstructing a disown-mode owned complement (rollback's
-/// snapshot re-patch).
-pub fn textWithoutSpans(arena: std.mem.Allocator, text: []const u8, loc: Located) error{OutOfMemory}![]u8 {
+/// for callers reconstructing a disown-mode owned complement (`add --disown`
+/// extraction, rollback's snapshot re-patch). Unlike the raw remainder the
+/// invariant compares, this splice tidies the separator bytes the removal
+/// orphans: a suffix run of JSON members takes the now-dangling comma of the
+/// preceding member with it, a removed member's emptied line goes whole, and
+/// blank separation lines never stack or trail.
+pub fn textWithoutSpans(arena: std.mem.Allocator, format: Format, text: []const u8, loc: Located) error{OutOfMemory}![]u8 {
     var regions: std.ArrayList(Span) = .empty;
     for (loc.spans) |s| if (s) |sp| try regions.append(arena, sp);
     for (loc.wrappers) |w| try regions.append(arena, w);
-    return remainderOfRegions(arena, text, try regions.toOwnedSlice(arena));
+    std.mem.sort(Span, regions.items, {}, spanLess);
+    var merged: std.ArrayList(Span) = .empty;
+    for (regions.items) |r| {
+        if (merged.items.len > 0 and r.start <= merged.items[merged.items.len - 1].end) {
+            merged.items[merged.items.len - 1].end = @max(merged.items[merged.items.len - 1].end, r.end);
+        } else {
+            try merged.append(arena, r);
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    var cursor: usize = 0;
+    for (merged.items) |r0| {
+        var r = r0;
+        if (format == .json) {
+            jsonAbsorbDanglingComma(text, &r);
+            jsonAbsorbEmptiedLine(text, &r);
+        }
+        if (r.start > cursor) try out.appendSlice(arena, text[cursor..r.start]);
+        cursor = @max(cursor, r.end);
+        if (endsWithBlankLine(out.items)) cursor = skipBlankLines(text, cursor);
+    }
+    if (cursor < text.len) try out.appendSlice(arena, text[cursor..]);
+
+    // A removed final span leaves the blank separation before it trailing.
+    const last_end = if (merged.items.len > 0) merged.items[merged.items.len - 1].end else 0;
+    if (merged.items.len > 0 and std.mem.trim(u8, text[@min(last_end, text.len)..], " \t\r\n").len == 0) {
+        trimTrailingBlankLines(&out);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// When removing this member run leaves its object's remaining last member
+/// followed by a separator comma (the run was the object's suffix), the
+/// comma belongs to the removal.
+fn jsonAbsorbDanglingComma(text: []const u8, r: *Span) void {
+    var i = r.end;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\r' or text[i] == '\n')) i += 1;
+    if (i >= text.len or text[i] != '}') return;
+    var j = r.start;
+    while (j > 0) : (j -= 1) {
+        const c = text[j - 1];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+        if (c == ',') r.start = j - 1;
+        return;
+    }
+}
+
+/// A removed member that owned its whole line (only indentation before it,
+/// only whitespace after it) takes the line entire, newline included, so
+/// the next member slides into its place instead of leaving an emptied
+/// indentation-only line behind.
+fn jsonAbsorbEmptiedLine(text: []const u8, r: *Span) void {
+    const line_start = lineStartOf(text, r.start);
+    for (text[line_start..r.start]) |c| {
+        if (c != ' ' and c != '\t') return;
+    }
+    var i = r.end;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\r')) i += 1;
+    if (i >= text.len or text[i] != '\n') return;
+    r.start = line_start;
+    r.end = i + 1;
+}
+
+/// True when the spliced output so far ends on a completed blank line (or is
+/// still empty), so blank separation carried by the following remainder
+/// would stack.
+fn endsWithBlankLine(s: []const u8) bool {
+    if (s.len == 0) return true;
+    if (s[s.len - 1] != '\n') return false;
+    const body = s[0 .. s.len - 1];
+    const line_start = if (std.mem.lastIndexOfScalar(u8, body, '\n')) |i| i + 1 else 0;
+    return std.mem.trim(u8, body[line_start..], " \t\r").len == 0;
+}
+
+fn skipBlankLines(text: []const u8, pos: usize) usize {
+    var cursor = pos;
+    while (cursor < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, cursor, '\n') orelse break;
+        if (std.mem.trim(u8, text[cursor..nl], " \t\r").len != 0) break;
+        cursor = nl + 1;
+    }
+    return cursor;
+}
+
+fn trimTrailingBlankLines(out: *std.ArrayList(u8)) void {
+    var n = out.items.len;
+    while (n > 0 and out.items[n - 1] == '\n') {
+        const body = out.items[0 .. n - 1];
+        const line_start = if (std.mem.lastIndexOfScalar(u8, body, '\n')) |i| i + 1 else 0;
+        if (std.mem.trim(u8, body[line_start..], " \t\r").len != 0) break;
+        n = line_start;
+    }
+    out.shrinkRetainingCapacity(n);
+}
+
+/// A located span narrowed to its structural bounds: JSON members run
+/// key-start to value-end with at most one separator comma stripped from
+/// each side; line-format spans drop trailing blank lines and the final
+/// line terminator. Interior bytes -- trailing spaces on a content line
+/// included -- are compared exactly; only separator bytes the splice owns
+/// fall outside the bounds.
+fn structuralSpan(format: Format, bytes: []const u8) []const u8 {
+    if (format == .json) {
+        var s = std.mem.trim(u8, bytes, " \t\r\n");
+        if (s.len > 0 and s[0] == ',') s = std.mem.trimStart(u8, s[1..], " \t\r\n");
+        if (s.len > 0 and s[s.len - 1] == ',') s = std.mem.trimEnd(u8, s[0 .. s.len - 1], " \t\r\n");
+        return s;
+    }
+    var s = bytes;
+    while (s.len > 0 and s[s.len - 1] == '\n') {
+        const body = s[0 .. s.len - 1];
+        const line_start = if (std.mem.lastIndexOfScalar(u8, body, '\n')) |i| i + 1 else 0;
+        if (std.mem.trim(u8, body[line_start..], " \t\r").len != 0) break;
+        s = s[0..line_start];
+    }
+    if (s.len > 0 and s[s.len - 1] == '\n') {
+        s = s[0 .. s.len - 1];
+        if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
+    }
+    return s;
 }
 
 /// The disown-mode executable invariant, all three parts (see the section
-/// comment above). Trailing whitespace inside a protected span may be
-/// normalized by the splice; every other byte is pinned.
+/// comment above). Protected spans are compared at their structural bounds
+/// (`structuralSpan`): interior bytes are pinned exactly; only separator
+/// bytes the splice owns may differ.
 pub fn verifyDisownInvariant(
     arena: std.mem.Allocator,
     format: Format,
@@ -2925,7 +3081,6 @@ pub fn verifyDisownInvariant(
         error.LiveUnparseable => return error.CandidateUnparseable,
         else => return e,
     };
-    const span_trim: []const u8 = if (format == .json) " \t\r\n," else " \t\r\n";
     for (disown_paths, live_loc.spans, cand_loc.spans) |p, lsp, csp| {
         if ((lsp == null) != (csp == null)) {
             diagSet(diag, "{s}: disowned content was gained or lost", .{p.raw});
@@ -2933,17 +3088,25 @@ pub fn verifyDisownInvariant(
         }
         const l = lsp orelse continue;
         const c = csp.?;
-        const lb = if (format == .json) std.mem.trim(u8, live[l.start..l.end], span_trim) else std.mem.trimEnd(u8, live[l.start..l.end], span_trim);
-        const cb = if (format == .json) std.mem.trim(u8, candidate[c.start..c.end], span_trim) else std.mem.trimEnd(u8, candidate[c.start..c.end], span_trim);
+        const lb = structuralSpan(format, live[l.start..l.end]);
+        const cb = structuralSpan(format, candidate[c.start..c.end]);
         if (!std.mem.eql(u8, lb, cb)) {
             diagSet(diag, "{s}: disowned content was not preserved byte-for-byte", .{p.raw});
             return error.RemainderMismatch;
         }
     }
 
-    // (c) The candidate minus the disowned spans is the composed text.
+    // (c) The candidate minus the disowned spans is the composed text. The
+    // splice owns its separator bytes (a suffix run's dangling comma, an
+    // emptied member line, blank separation), so the remainder is also
+    // accepted with those absorbed -- the same cut the extraction makes.
     const rest = try remainderBytes(arena, candidate, cand_loc);
     if (std.mem.eql(u8, rest, composed_text)) return;
+    const tidied = try textWithoutSpans(arena, format, candidate, .{
+        .spans = cand_loc.spans,
+        .wrappers = cand_loc.wrappers,
+    });
+    if (std.mem.eql(u8, tidied, composed_text)) return;
     if (composed_text.len > 0 and composed_text[composed_text.len - 1] != '\n' and
         try separatorAttributedMatch(arena, candidate, cand_loc, composed_text)) return;
     diagSet(diag, "candidate changed bytes outside the disowned spans", .{});

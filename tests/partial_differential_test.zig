@@ -362,3 +362,156 @@ fn fileExists(io: Io, path: []const u8) bool {
     Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
+
+// Span-splice regressions: separator debris, structural byte identity, and
+// ancestor-chain creation in disown mode.
+
+const json = @import("json");
+
+fn rawsToPaths(a: std.mem.Allocator, raws: []const []const u8) ![]mox.source.tree.OwnPath {
+    const out = try a.alloc(mox.source.tree.OwnPath, raws.len);
+    for (raws, out) |raw, *o| {
+        o.* = .{ .raw = raw, .segments = try mox.source.keypath.parse(a, raw) };
+    }
+    return out;
+}
+
+fn complementOf(a: std.mem.Allocator, format: mox.apply.partial.Format, live: []const u8, raws: []const []const u8) ![]u8 {
+    const partial = mox.apply.partial;
+    var diag: partial.Diag = .{};
+    const loc = try partial.locateSpans(a, format, live, try rawsToPaths(a, raws), &diag);
+    return partial.textWithoutSpans(a, format, live, loc);
+}
+
+fn disownCycle(
+    a: std.mem.Allocator,
+    format: mox.apply.partial.Format,
+    live: []const u8,
+    raws: []const []const u8,
+    composed_text: []const u8,
+) ![]u8 {
+    const partial = mox.apply.partial;
+    const paths = try rawsToPaths(a, raws);
+    const composed_doc = try partial.OwnedDoc.parse(a, format, composed_text);
+    var diag: partial.Diag = .{};
+    const cand = partial.replaceDisowned(a, format, live, paths, composed_text, &diag) catch |e| {
+        std.debug.print("disown replace failed: {s} ({t})\n", .{ diag.text(), e });
+        return e;
+    };
+    partial.verifyDisownInvariant(a, format, live, cand, paths, composed_text, &composed_doc, &diag) catch |e| {
+        std.debug.print("disown verify failed: {s} ({t})\ncandidate:\n{s}\n", .{ diag.text(), e, cand });
+        return e;
+    };
+    return cand;
+}
+
+test "disown json: removing a suffix run of members leaves no dangling separator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const live = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"the model\": \"m1\"\n}\n";
+    const body = try complementOf(a, .json, live, &.{ "editor", "\"the model\"" });
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"dark\"\n}\n", body);
+    // The extracted source must be STRICT JSON: a dangling separator would
+    // still compose (jsonc) but poison every later splice.
+    _ = try json.parse(a, body, .{});
+
+    // The extraction round-trips: patching the live spans back into the
+    // body reproduces a file with every member restored.
+    const cand = try disownCycle(a, .json, live, &.{ "editor", "\"the model\"" }, body);
+    _ = try json.parse(a, cand, .{});
+    try std.testing.expect(std.mem.indexOf(u8, cand, "\"the model\": \"m1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cand, "\"editor\": \"nvim\"") != null);
+}
+
+test "disown json: a removed middle member takes its emptied line with it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const live = "{\n  \"a\": 1,\n  \"mid\": 2,\n  \"b\": 3\n}\n";
+    const body = try complementOf(a, .json, live, &.{"mid"});
+    try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"b\": 3\n}\n", body);
+    _ = try json.parse(a, body, .{});
+}
+
+test "disown extraction: removed spans leave no stacked or trailing blank lines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const mid = "[a]\nx = 1\n\n[sec]\nk = 1\n\n[b]\ny = 2\n";
+    try std.testing.expectEqualStrings(
+        "[a]\nx = 1\n\n[b]\ny = 2\n",
+        try complementOf(a, .toml, mid, &.{"sec"}),
+    );
+
+    const tail = "[a]\nx = 1\n\n[sec]\nk = 1\n";
+    try std.testing.expectEqualStrings(
+        "[a]\nx = 1\n",
+        try complementOf(a, .toml, tail, &.{"sec"}),
+    );
+}
+
+test "disown json: a missing ancestor chain is created around the live leaf, never reparented" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const composed = "{\n  \"theme\": \"dark\"\n}\n";
+    const live = "{\n  \"theme\": \"dark\",\n  \"survey\": {\n    \"state\": 1\n  }\n}\n";
+    const cand = try disownCycle(a, .json, live, &.{"survey.state"}, composed);
+    try std.testing.expectEqualStrings(
+        "{\n  \"theme\": \"dark\",\n  \"survey\": {\"state\": 1}\n}\n",
+        cand,
+    );
+}
+
+test "disown yaml: a missing ancestor chain is created around the live leaf" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const composed = "theme: dark\n";
+    const live = "theme: dark\nsurvey:\n  state: 1\n";
+    const cand = try disownCycle(a, .yaml, live, &.{"survey.state"}, composed);
+    try std.testing.expectEqualStrings("theme: dark\nsurvey:\n  state: 1\n", cand);
+}
+
+test "disown verify: a damaged trailing-space byte inside a protected span refuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const partial = mox.apply.partial;
+
+    const paths = try rawsToPaths(a, &.{"state"});
+    const composed = "[user]\nname = \"me\"\n";
+    const composed_doc = try partial.OwnedDoc.parse(a, .toml, composed);
+    // Two trailing spaces after the value are span content.
+    const live = "[user]\nname = \"me\"\n\n[state]\ncount = 42  \n";
+    var diag: partial.Diag = .{};
+
+    // Preserved byte-for-byte: accepted.
+    try partial.verifyDisownInvariant(
+        a,
+        .toml,
+        live,
+        "[user]\nname = \"me\"\n[state]\ncount = 42  \n",
+        paths,
+        composed,
+        &composed_doc,
+        &diag,
+    );
+    // One deleted trailing space refuses; a whitespace trim would launder it.
+    try std.testing.expectError(error.RemainderMismatch, partial.verifyDisownInvariant(
+        a,
+        .toml,
+        live,
+        "[user]\nname = \"me\"\n[state]\ncount = 42 \n",
+        paths,
+        composed,
+        &composed_doc,
+        &diag,
+    ));
+}

@@ -146,6 +146,7 @@ pub fn build(b: *std.Build) void {
     });
     partial_diff_tests_mod.addImport("mox", lib_mod);
     partial_diff_tests_mod.addImport("toml", toml_mod);
+    partial_diff_tests_mod.addImport("json", json_mod);
     const partial_diff_tests = b.addTest(.{ .root_module = partial_diff_tests_mod });
     test_step.dependOn(&b.addRunArtifact(partial_diff_tests).step);
 

@@ -371,7 +371,7 @@ pub fn addDisownFile(
             };
         }
     }
-    const body = try partial.textWithoutSpans(arena, live, loc);
+    const body = try partial.textWithoutSpans(arena, format, live, loc);
 
     // The remainder must parse, define nothing under the declaration, and
     // reproduce the live owned complement exactly (canonical-byte), or the

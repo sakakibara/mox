@@ -188,7 +188,7 @@ fn repatchPartial(
                 return false;
             },
         };
-        snap_owned_text = try partial.textWithoutSpans(ctx.alloc, snap_content, snap_loc);
+        snap_owned_text = try partial.textWithoutSpans(ctx.alloc, format, snap_content, snap_loc);
     }
     const snap_owned_doc = if (file.ownership == .disown)
         partial.OwnedDoc.parse(ctx.alloc, format, snap_owned_text) catch |e| switch (e) {
