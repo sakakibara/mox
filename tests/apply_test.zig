@@ -2658,6 +2658,25 @@ test "apply partial: a path added to own is first contact, never a silent overwr
     try std.testing.expect(std.mem.indexOf(u8, after, "x = 1") != null);
 }
 
+test "apply partial: an ini own declaration matches sections with the dialect's case rules" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.ini", .data = "[colors]\nfg = blue\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"app.ini\"]\nown = [\"COLORS\"]\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath("app.ini")), "fg = blue") != null);
+}
+
 test "apply partial: a composed leaf outside the declaration refuses the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -94,6 +94,22 @@ const live_remainder =
     \\
 ;
 
+/// `live_remainder` as the locator cuts it from the PATCHED file: a span
+/// ends at its table's last content line (mirroring the span-start rule),
+/// so the blank line that trailed the stale editor table stays in the
+/// remainder beside the one that preceded it.
+const patched_remainder =
+    \\model = "test-model"
+    \\
+    \\[projects."/tmp/example"]
+    \\trust_level = "trusted"
+    \\
+    \\
+    \\[hooks.state.example]
+    \\trusted_hash = "test-hash"
+    \\
+;
+
 const own_raws = [_][]const u8{ "tui.keymap.global", "tui.keymap.composer", "tui.keymap.editor" };
 
 fn writeFixture(io: Io, tmp: *std.testing.TmpDir, live: []const u8, attrs: []const u8) !void {
@@ -191,7 +207,7 @@ test "codex differential: force reassertion matches the script's keymap and rema
     try std.testing.expectEqualStrings("test-hash", doc.get("hooks.state.example.trusted_hash").?.string);
 
     // (2) Remainder byte-for-byte identical to live's non-keymap bytes.
-    try std.testing.expectEqualStrings(live_remainder, try remainderOf(a, patched));
+    try std.testing.expectEqualStrings(patched_remainder, try remainderOf(a, patched));
 
     // (3) Idempotency: the second apply writes nothing.
     const before = try mtimeNs(io, live);
@@ -333,7 +349,7 @@ test "codex differential: the check hook stub validates the candidate and the wr
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const patched = try read(io, a, live);
     try expectKeymapMatchesScript(a, patched);
-    try std.testing.expectEqualStrings(live_remainder, try remainderOf(a, patched));
+    try std.testing.expectEqualStrings(patched_remainder, try remainderOf(a, patched));
     // The hook really ran (its side-effect marker exists in state).
     try std.testing.expect(fileExists(io, try std.fs.path.join(a, &.{ c.state, "check-ran" })));
 }

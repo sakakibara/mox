@@ -195,18 +195,28 @@ fn yamlMapGet(map: []const yaml.Entry, k: []const u8) ?yaml.Value {
     return found;
 }
 
-/// Dialect-aware entry lookup. Stored section and key names are already
-/// case-folded by the parser; subsection names are stored verbatim. The
-/// declared segment matches by the role the entry has: section fold at the
-/// root, verbatim for a subsection, key fold for a scalar entry.
+/// One segment comparison, optionally case-folded -- the comparison every
+/// dialect-aware matcher (value lookup, declaration check) shares.
+fn segEqFold(stored: []const u8, declared: []const u8, fold: bool) bool {
+    return if (fold) std.ascii.eqlIgnoreCase(stored, declared) else std.mem.eql(u8, stored, declared);
+}
+
+/// Fold rule for one ini entry by its role: sections fold at the root, a
+/// nested section (gitconfig subsection) is verbatim, keys fold per the
+/// dialect. Stored section and key names are already case-folded by the
+/// parser; subsection names are stored verbatim.
+fn iniEntryFold(dialect: ini.Dialect, is_section: bool, depth: usize) bool {
+    return if (is_section)
+        depth == 0 and dialect.case_insensitive_sections
+    else
+        dialect.case_insensitive_keys;
+}
+
+/// Dialect-aware entry lookup: the declared segment matches by the role the
+/// entry has.
 fn iniFindEntry(section: ini.Section, dialect: ini.Dialect, seg: []const u8, depth: usize) ?ini.Value {
     for (section.entries) |e| {
-        const fold = if (e.value == .section)
-            depth == 0 and dialect.case_insensitive_sections
-        else
-            dialect.case_insensitive_keys;
-        const hit = if (fold) std.ascii.eqlIgnoreCase(e.key, seg) else std.mem.eql(u8, e.key, seg);
-        if (hit) return e.value;
+        if (segEqFold(e.key, seg, iniEntryFold(dialect, e.value == .section, depth))) return e.value;
     }
     return null;
 }
@@ -326,8 +336,6 @@ pub fn verifyInvariant(
     owned: *const OwnedDoc,
     diag: ?*Diag,
 ) VerifyError!void {
-    const live_cmp = if (format == .json) live else try ensureTrailingNewline(arena, live);
-
     const cand_root: AnyValue = switch (format) {
         .toml => .{ .toml = toml.parse(arena, candidate, .{}) catch |e| return verifyParseFail(e) },
         .json => .{ .json = json.parse(arena, candidate, .{ .dialect = .jsonc }) catch |e| return verifyParseFail(e) },
@@ -345,14 +353,14 @@ pub fn verifyInvariant(
         }
     }
 
-    const live_loc = try locateFull(arena, format, live_cmp, own_paths, diag);
+    const live_loc = try locateFull(arena, format, live, own_paths, diag);
     const cand_loc = locateFull(arena, format, candidate, own_paths, diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.LiveUnparseable => return error.CandidateUnparseable,
         else => return e,
     };
 
-    const live_rest = try remainderBytes(arena, live_cmp, live_loc);
+    const live_rest = try remainderBytes(arena, live, live_loc);
     const cand_rest = try remainderBytes(arena, candidate, cand_loc);
 
     if (live.len == 0 and format == .json) {
@@ -362,10 +370,35 @@ pub fn verifyInvariant(
         diagSet(diag, "remainder gained bytes beyond the created root object", .{});
         return error.RemainderMismatch;
     }
-    if (!std.mem.eql(u8, live_rest, cand_rest)) {
-        diagSet(diag, "candidate changed bytes outside the owned spans", .{});
-        return error.RemainderMismatch;
+    if (std.mem.eql(u8, live_rest, cand_rest)) return;
+    // A splice after live content with no final newline owns its separator
+    // newline: the live remainder keeps its missing final newline
+    // byte-exactly, and the one joining byte belongs to the owned region it
+    // introduces. Attribute one such byte and retry; anything else refuses.
+    if (live.len > 0 and live[live.len - 1] != '\n' and
+        try separatorAttributedMatch(arena, candidate, cand_loc, live_rest)) return;
+    diagSet(diag, "candidate changed bytes outside the owned spans", .{});
+    return error.RemainderMismatch;
+}
+
+/// True when attributing one separator newline to some owned region of the
+/// candidate makes the remainders byte-equal. Every region preceded by a
+/// newline is tried, and the moved byte must account for the entire
+/// difference, so nothing beyond the separator rule can pass here.
+fn separatorAttributedMatch(
+    arena: std.mem.Allocator,
+    candidate: []const u8,
+    loc: FullLocated,
+    live_rest: []const u8,
+) error{OutOfMemory}!bool {
+    const regions = try collectRegions(arena, loc);
+    for (regions, 0..) |r, i| {
+        if (r.start == 0 or candidate[r.start - 1] != '\n') continue;
+        const adjusted = try arena.dupe(Span, regions);
+        adjusted[i].start -= 1;
+        if (std.mem.eql(u8, live_rest, try remainderOfRegions(arena, candidate, adjusted))) return true;
     }
+    return false;
 }
 
 fn verifyParseFail(e: anyerror) VerifyError {
@@ -384,19 +417,22 @@ pub fn undeclaredLeaf(
     own_paths: []const OwnPath,
 ) error{OutOfMemory}!?[]const u8 {
     var path: std.ArrayList([]const u8) = .empty;
+    var folds: std.ArrayList(bool) = .empty;
     // A yaml document with no content parses to null at the root; it
     // defines nothing.
     if (owned.root == .yaml and owned.root.yaml == .null) return null;
-    return undeclaredWalk(arena, owned.root, own_paths, &path);
+    return undeclaredWalk(arena, owned.format, owned.root, own_paths, &path, &folds);
 }
 
 fn undeclaredWalk(
     arena: std.mem.Allocator,
+    format: Format,
     v: AnyValue,
     own_paths: []const OwnPath,
     path: *std.ArrayList([]const u8),
+    folds: *std.ArrayList(bool),
 ) error{OutOfMemory}!?[]const u8 {
-    if (pathAtOrUnderDeclared(own_paths, path.items)) return null;
+    if (pathAtOrUnderDeclaredFold(own_paths, path.items, folds.items)) return null;
     const is_container = switch (v) {
         .toml => |tv| tv == .table,
         .json => |jv| jv == .object,
@@ -411,16 +447,20 @@ fn undeclaredWalk(
             count = tv.table.count();
             for (tv.table.keys(), tv.table.values()) |k, sub| {
                 try path.append(arena, k);
+                try folds.append(arena, false);
                 defer _ = path.pop();
-                if (try undeclaredWalk(arena, .{ .toml = sub }, own_paths, path)) |hit| return hit;
+                defer _ = folds.pop();
+                if (try undeclaredWalk(arena, format, .{ .toml = sub }, own_paths, path, folds)) |hit| return hit;
             }
         },
         .json => |jv| {
             count = jv.object.count();
             for (jv.object.keys(), jv.object.values()) |k, sub| {
                 try path.append(arena, k);
+                try folds.append(arena, false);
                 defer _ = path.pop();
-                if (try undeclaredWalk(arena, .{ .json = sub }, own_paths, path)) |hit| return hit;
+                defer _ = folds.pop();
+                if (try undeclaredWalk(arena, format, .{ .json = sub }, own_paths, path, folds)) |hit| return hit;
             }
         },
         .yaml => |yv| {
@@ -428,23 +468,56 @@ fn undeclaredWalk(
             for (yv.map) |entry| {
                 if (entry.key != .string) return try diagPathSpell(arena, path.items);
                 try path.append(arena, entry.key.string);
+                try folds.append(arena, false);
                 defer _ = path.pop();
-                if (try undeclaredWalk(arena, .{ .yaml = entry.value }, own_paths, path)) |hit| return hit;
+                defer _ = folds.pop();
+                if (try undeclaredWalk(arena, format, .{ .yaml = entry.value }, own_paths, path, folds)) |hit| return hit;
             }
         },
         .ini => |iv| {
             count = iv.section.entries.len;
             for (iv.section.entries) |entry| {
+                const fold = iniEntryFold(iniDialect(format), entry.value == .section, path.items.len);
                 try path.append(arena, entry.key);
+                try folds.append(arena, fold);
                 defer _ = path.pop();
-                if (try undeclaredWalk(arena, .{ .ini = entry.value }, own_paths, path)) |hit| return hit;
+                defer _ = folds.pop();
+                if (try undeclaredWalk(arena, format, .{ .ini = entry.value }, own_paths, path, folds)) |hit| return hit;
             }
         },
     }
-    if (count == 0 and !pathStrictPrefixOfDeclared(own_paths, path.items)) {
+    if (count == 0 and !pathStrictPrefixOfDeclaredFold(own_paths, path.items, folds.items)) {
         return try diagPathSpell(arena, path.items);
     }
     return null;
+}
+
+/// `segsPrefix` with a per-position fold flag parallel to `stored` -- how a
+/// declared path matches a walked document path under the format's dialect
+/// (the same role rules `iniFindEntry` applies).
+fn segsPrefixFold(declared: []const []const u8, stored: []const []const u8, folds: []const bool) bool {
+    if (declared.len > stored.len) return false;
+    for (declared, stored[0..declared.len], folds[0..declared.len]) |d, s, fold| {
+        if (!segEqFold(s, d, fold)) return false;
+    }
+    return true;
+}
+
+fn pathAtOrUnderDeclaredFold(own_paths: []const OwnPath, stored: []const []const u8, folds: []const bool) bool {
+    for (own_paths) |p| if (segsPrefixFold(p.segments, stored, folds)) return true;
+    return false;
+}
+
+fn pathStrictPrefixOfDeclaredFold(own_paths: []const OwnPath, stored: []const []const u8, folds: []const bool) bool {
+    for (own_paths) |p| {
+        if (stored.len >= p.segments.len) continue;
+        var all = true;
+        for (stored, folds, p.segments[0..stored.len]) |s, fold, d| {
+            if (!segEqFold(s, d, fold)) all = false;
+        }
+        if (all) return true;
+    }
+    return false;
 }
 
 /// Diagnostic spelling of a key path: segments joined with `.`, quoted when
@@ -611,22 +684,41 @@ pub fn secretPathFlags(
     return flags;
 }
 
+/// The extracted source must parse on its own, so span concatenation runs
+/// over newline-terminated text (the live file is never written from it).
 fn ensureTrailingNewline(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (text.len == 0 or text[text.len - 1] == '\n') return text;
     return std.mem.concat(arena, u8, &.{ text, "\n" });
+}
+
+/// Splice `insertion` into `text` at `at`, joined with a separator newline
+/// when the preceding byte does not end a line. The separator belongs to
+/// the inserted owned content, never to the remainder: a live file with no
+/// final newline keeps that state byte-exactly.
+fn insertWithSeparator(arena: std.mem.Allocator, text: []const u8, at: usize, insertion: []const u8) ![]const u8 {
+    const sep: []const u8 = if (at > 0 and text[at - 1] != '\n') "\n" else "";
+    return std.mem.concat(arena, u8, &.{ text[0..at], sep, insertion, text[at..] });
 }
 
 /// Text minus the union of every located span and wrapper region. Regions
 /// of adjacent owned members may share separator bytes; the union is what
 /// the byte check owns.
 fn remainderBytes(arena: std.mem.Allocator, text: []const u8, loc: FullLocated) ![]u8 {
+    return remainderOfRegions(arena, text, try collectRegions(arena, loc));
+}
+
+fn collectRegions(arena: std.mem.Allocator, loc: FullLocated) ![]Span {
     var regions: std.ArrayList(Span) = .empty;
     for (loc.spans) |s| if (s) |sp| try regions.append(arena, sp);
     for (loc.wrappers) |w| try regions.append(arena, w);
-    std.mem.sort(Span, regions.items, {}, spanLess);
+    return regions.toOwnedSlice(arena);
+}
+
+fn remainderOfRegions(arena: std.mem.Allocator, text: []const u8, regions: []Span) ![]u8 {
+    std.mem.sort(Span, regions, {}, spanLess);
     var out: std.ArrayList(u8) = .empty;
     var cursor: usize = 0;
-    for (regions.items) |r| {
+    for (regions) |r| {
         if (r.start > cursor) try out.appendSlice(arena, text[cursor..r.start]);
         cursor = @max(cursor, r.end);
     }
@@ -740,13 +832,12 @@ fn tomlLocate(
     diag: ?*Diag,
 ) LocateError!FullLocated {
     const scan = try tomlScan(arena, live);
-    return tomlLocateScanned(arena, &scan, live, own_paths, diag);
+    return tomlLocateScanned(arena, &scan, own_paths, diag);
 }
 
 fn tomlLocateScanned(
     arena: std.mem.Allocator,
     scan: *const TomlScan,
-    live: []const u8,
     own_paths: []const OwnPath,
     diag: ?*Diag,
 ) LocateError!FullLocated {
@@ -819,7 +910,15 @@ fn tomlLocateScanned(
                     return error.OwnedPathDuplicate;
                 }
             }
-            span.* = .{ .start = scan.offs[f], .end = if (j < items.len) scan.offs[j] else live.len };
+            // Span end mirrors the span-start rule: the last kv or header
+            // line of the owned run ends it, so a trailing blank/comment run
+            // before the next header (or end of file) is remainder.
+            var last = f;
+            var m = f + 1;
+            while (m < j) : (m += 1) {
+                if (items[m] == .kv or items[m] == .header) last = m;
+            }
+            span.* = .{ .start = scan.offs[f], .end = scan.ends[last] };
             form.* = .block;
         } else if (kv_idx) |ki| {
             span.* = .{ .start = scan.offs[ki], .end = scan.ends[ki] };
@@ -863,10 +962,10 @@ fn tomlReplace(
     owned: *const OwnedDoc,
     diag: ?*Diag,
 ) ReplaceError![]u8 {
-    var text = try ensureTrailingNewline(arena, live);
+    var text: []const u8 = live;
     for (own_paths, 0..) |p, pi| {
         const scan = try tomlScan(arena, text);
-        const loc = try tomlLocateScanned(arena, &scan, text, own_paths, diag);
+        const loc = try tomlLocateScanned(arena, &scan, own_paths, diag);
         const sub = owned.subtreeAt(p.segments);
         const span = loc.spans[pi];
 
@@ -884,8 +983,7 @@ fn tomlReplace(
                         diagSet(diag, "{s}: live table cannot take a non-table owned value", .{p.raw});
                         return error.OwnedRenderFailed;
                     }
-                    const block = try tomlRenderBlock(arena, p.segments, value.table);
-                    break :blk try std.mem.concat(arena, u8, &.{ block, trailingBlankRun(text, sp) });
+                    break :blk try tomlRenderBlock(arena, p.segments, value.table);
                 },
                 else => unreachable,
             };
@@ -898,21 +996,21 @@ fn tomlReplace(
         // block at end of file when the parent has no header yet.
         if (value == .table) {
             const block = try tomlRenderBlock(arena, p.segments, value.table);
-            text = try std.mem.concat(arena, u8, &.{ text, block });
+            text = try insertWithSeparator(arena, text, text.len, block);
             continue;
         }
         const kv_line = try tomlRenderKv(arena, p.segments[p.segments.len - 1], value);
         const parent = p.segments[0 .. p.segments.len - 1];
         if (parent.len == 0) {
-            const at = tomlRootInsertOffset(&scan);
-            text = try spliceBytes(arena, text, .{ .start = at, .end = at }, kv_line);
+            text = try insertWithSeparator(arena, text, tomlRootInsertOffset(&scan), kv_line);
             continue;
         }
         if (tomlSectionInsertOffset(&scan, parent)) |at| {
-            text = try spliceBytes(arena, text, .{ .start = at, .end = at }, kv_line);
+            text = try insertWithSeparator(arena, text, at, kv_line);
         } else {
             const header = try tomlPathSpell(arena, parent);
-            text = try std.mem.concat(arena, u8, &.{ text, "[", header, "]\n", kv_line });
+            const block = try std.mem.concat(arena, u8, &.{ "[", header, "]\n", kv_line });
+            text = try insertWithSeparator(arena, text, text.len, block);
         }
     }
     return @constCast(text);
@@ -1105,7 +1203,7 @@ fn jsonLocate(
             }
             const mi = found orelse break;
             if (i == p.segments.len - 1) {
-                span.* = jsonMemberSpan(cur, mi);
+                span.* = jsonMemberSpan(live, cur, mi);
                 form.* = .member;
                 break;
             }
@@ -1113,34 +1211,50 @@ fn jsonLocate(
         }
     }
 
-    const wrappers = try jsonWrappers(arena, root, own_paths);
+    const wrappers = try jsonWrappers(arena, live, root, own_paths);
     return .{ .spans = spans, .forms = forms, .wrappers = wrappers };
 }
 
 /// Member span with the separator needed for a clean splice: trailing comma
-/// and trivia for a non-last member, leading comma for a last member, the
-/// container interior for a sole member. Mirrors the document model's own
-/// removal ranges.
-fn jsonMemberSpan(parent: anytype, idx: usize) Span {
+/// plus same-line trivia for a non-last member, leading comma for a last
+/// member, the container interior for a sole member.
+fn jsonMemberSpan(src: []const u8, parent: anytype, idx: usize) Span {
     const members = parent.data.object.items;
     if (members.len == 1) {
         return .{ .start = parent.outer.start + 1, .end = parent.outer.end - 1 };
     }
     if (idx + 1 < members.len) {
-        return .{ .start = members[idx].key.outer.start, .end = members[idx + 1].key.outer.start };
+        return .{ .start = members[idx].key.outer.start, .end = jsonMemberSpanEnd(src, members[idx].value.outer.end) };
     }
     return .{ .start = members[idx - 1].value.outer.end, .end = members[idx].value.outer.end };
 }
 
-fn jsonWrappers(arena: std.mem.Allocator, root: anytype, own_paths: []const OwnPath) ![]Span {
+/// End of a non-last member's span: its value, the separator comma, and the
+/// same-line trivia after the comma. The scan stops before a newline, so a
+/// standalone comment line between members stays with the remainder.
+fn jsonMemberSpanEnd(src: []const u8, value_end: usize) usize {
+    var i = value_end;
+    while (i < src.len and src[i] != ',') i += 1;
+    if (i < src.len) i += 1;
+    var j = i;
+    while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+    if (j + 1 < src.len and src[j] == '/' and src[j + 1] == '/') {
+        while (j < src.len and src[j] != '\n') j += 1;
+        return j;
+    }
+    return if (j < src.len and (src[j] == '\n' or src[j] == '\r')) i else j;
+}
+
+fn jsonWrappers(arena: std.mem.Allocator, src: []const u8, root: anytype, own_paths: []const OwnPath) ![]Span {
     var out: std.ArrayList(Span) = .empty;
     var path: std.ArrayList([]const u8) = .empty;
-    try jsonWrapperWalk(arena, root, own_paths, &path, &out);
+    try jsonWrapperWalk(arena, src, root, own_paths, &path, &out);
     return out.toOwnedSlice(arena);
 }
 
 fn jsonWrapperWalk(
     arena: std.mem.Allocator,
+    src: []const u8,
     node: anytype,
     own_paths: []const OwnPath,
     path: *std.ArrayList([]const u8),
@@ -1153,9 +1267,9 @@ fn jsonWrapperWalk(
         defer _ = path.pop();
         if (pathAtOrUnderDeclared(own_paths, path.items)) continue;
         if (try jsonFullyOwned(arena, m.value, own_paths, path)) {
-            try out.append(arena, jsonMemberSpan(node, mi));
+            try out.append(arena, jsonMemberSpan(src, node, mi));
         } else {
-            try jsonWrapperWalk(arena, m.value, own_paths, path, out);
+            try jsonWrapperWalk(arena, src, m.value, own_paths, path, out);
         }
     }
 }
@@ -1440,7 +1554,7 @@ fn yamlReplace(
     owned: *const OwnedDoc,
     diag: ?*Diag,
 ) ReplaceError![]u8 {
-    var text = try ensureTrailingNewline(arena, live);
+    var text: []const u8 = live;
     for (own_paths, 0..) |p, pi| {
         const loc = try yamlLocate(arena, text, own_paths, diag);
         const sub = owned.subtreeAt(p.segments);
@@ -1535,13 +1649,13 @@ fn yamlAppend(
     const scan = try yamlScan(arena, text);
     if (scan.empty or scan.doc.roots.len == 0) {
         const rendered = try yamlRenderChain(arena, "", p.segments, value, diag);
-        return std.mem.concat(arena, u8, &.{ text, rendered });
+        return insertWithSeparator(arena, text, text.len, rendered);
     }
     const src = scan.doc.source;
     const root = scan.doc.roots[0];
     if (root.data == .scalar and root.outer.start == root.outer.end) {
         const rendered = try yamlRenderChain(arena, "", p.segments, value, diag);
-        return std.mem.concat(arena, u8, &.{ text, rendered });
+        return insertWithSeparator(arena, text, text.len, rendered);
     }
     if (root.data != .mapping) {
         diagSet(diag, "{s}: root of the document is not a mapping", .{p.raw});
@@ -1575,7 +1689,7 @@ fn yamlAppend(
     const indent = src[key_line..firstNonWs(src, key_line)];
     const at = lineEndOf(src, last.value.outer.end);
     const rendered = try yamlRenderChain(arena, indent, p.segments[depth..], value, diag);
-    return spliceBytes(arena, text, .{ .start = at, .end = at }, rendered);
+    return insertWithSeparator(arena, text, at, rendered);
 }
 
 /// One scalar's YAML text, with the emitter's round-trip-safe quoting.
@@ -1919,7 +2033,7 @@ fn iniReplace(
     diag: ?*Diag,
 ) ReplaceError![]u8 {
     const dialect = iniDialect(format);
-    var text = try ensureTrailingNewline(arena, live);
+    var text: []const u8 = live;
     for (own_paths, 0..) |p, pi| {
         const scan = try iniScan(arena, format, text);
         const loc = try iniLocateScanned(arena, format, &scan, text, own_paths, diag);
@@ -1953,7 +2067,7 @@ fn iniReplace(
         // its parent section, creating the section block when absent.
         if (value == .section) {
             const block = try iniRenderBlock(arena, format, p.segments, value.section.*, diag);
-            text = try std.mem.concat(arena, u8, &.{ text, block });
+            text = try insertWithSeparator(arena, text, text.len, block);
             continue;
         }
         const kv_lines = try iniRenderKv(arena, format, p.segments[p.segments.len - 1], value, diag);
@@ -1968,15 +2082,16 @@ fn iniReplace(
                 if (line.kind == .header) break;
                 if (line.kind == .kv) at = line.end;
             }
-            text = try spliceBytes(arena, text, .{ .start = at, .end = at }, kv_lines);
+            text = try insertWithSeparator(arena, text, at, kv_lines);
             continue;
         }
         const parent_folded = try iniFoldDeclared(arena, dialect, parent, false);
         if (iniSectionInsertOffset(&scan, parent_folded)) |at| {
-            text = try spliceBytes(arena, text, .{ .start = at, .end = at }, kv_lines);
+            text = try insertWithSeparator(arena, text, at, kv_lines);
         } else {
             const header = try iniHeaderSpell(arena, parent);
-            text = try std.mem.concat(arena, u8, &.{ text, header, kv_lines });
+            const block = try std.mem.concat(arena, u8, &.{ header, kv_lines });
+            text = try insertWithSeparator(arena, text, text.len, block);
         }
     }
     return @constCast(text);
@@ -2575,6 +2690,54 @@ test "toml: leaf key replace and append in kv form" {
     try testing.expectEqualStrings("[tui]\ntheme = \"dark\"\nmodel = \"opus\"\n\n[zz]\nq = 1\n", appended);
 }
 
+test "toml: a live file with no final newline keeps its remainder byte-exact" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The unowned tail ends without a final newline; a reassert of the owned
+    // table must not normalize it.
+    const live = "[tui]\na = 1\n\n[program]\nstate = 1";
+    const cand = try testApply(arena, .toml, live, &.{"tui"}, "[tui]\na = 2\n");
+    try testing.expectEqualStrings("[tui]\na = 2\n\n[program]\nstate = 1", cand);
+}
+
+test "toml: an append after non-newline-terminated live content owns its separator newline" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cand = try testApply(arena, .toml, "state = 1", &.{"tui"}, "[tui]\na = 1\n");
+    try testing.expectEqualStrings("state = 1\n[tui]\na = 1\n", cand);
+}
+
+test "toml: a trailing comment run between an owned table and the next header is remainder" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live =
+        \\[tui]
+        \\a = 1
+        \\
+        \\# program comment
+        \\[profiles.fast]
+        \\speed = 1
+        \\
+    ;
+    const replaced = try testApply(arena, .toml, live, &.{"tui"}, "[tui]\na = 2\n");
+    const expected =
+        \\[tui]
+        \\a = 2
+        \\
+        \\# program comment
+        \\[profiles.fast]
+        \\speed = 1
+        \\
+    ;
+    try testing.expectEqualStrings(expected, replaced);
+
+    const removed = try testApply(arena, .toml, live, &.{"tui"}, "");
+    try testing.expectEqualStrings("\n# program comment\n[profiles.fast]\nspeed = 1\n", removed);
+}
+
 test "toml: dotted-key spelling of a declared table is refused" {
     try testLocateError(.toml, "[tui]\nkeymap.global.x = 1\n", &.{"tui.keymap.global"}, error.OwnedPathDottedSpelling);
 }
@@ -2640,6 +2803,23 @@ test "json: replace, nested member, append, and creation from empty" {
 
     const created = try testApply(arena, .json, "", &.{ "model", "z" }, "{\"model\": \"opus\", \"z\": 1}");
     try testing.expectEqualStrings("{\"model\": \"opus\", \"z\": 1}", created);
+}
+
+test "json: removing a non-last member keeps a standalone comment between members" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live =
+        \\{
+        \\  "a": 1,
+        \\  "gone": 1,
+        \\  // program comment
+        \\  "c": 3
+        \\}
+    ;
+    const cand = try testApply(arena, .json, live, &.{"gone"}, "{}");
+    try testing.expect(std.mem.indexOf(u8, cand, "// program comment") != null);
+    try testing.expect(std.mem.indexOf(u8, cand, "\"gone\"") == null);
 }
 
 test "json: a duplicate key on the declared path is refused" {
@@ -2896,6 +3076,23 @@ test "undeclaredLeaf: names a leaf outside the declaration, passes a covered doc
     try testing.expect(try undeclaredLeaf(arena, &empty, paths) == null);
 }
 
+test "undeclaredLeaf: ini declarations match with the dialect's case rules" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Generic ini: sections and keys fold, so a differently-cased declared
+    // section still covers the composed content.
+    const doc = try OwnedDoc.parse(arena, .ini, "[colors]\nfg = blue\n");
+    try testing.expect(try undeclaredLeaf(arena, &doc, try testOwn(arena, &.{"COLORS"})) == null);
+
+    // gitconfig: keys fold, subsections are verbatim.
+    const git = try OwnedDoc.parse(arena, .gitconfig, "[remote \"Origin\"]\nurl = x\n");
+    try testing.expect(try undeclaredLeaf(arena, &git, try testOwn(arena, &.{"REMOTE.\"Origin\".URL"})) == null);
+    const wrong_sub = try testOwn(arena, &.{"remote.\"origin\""});
+    try testing.expectEqualStrings("remote.Origin.url", (try undeclaredLeaf(arena, &git, wrong_sub)).?);
+}
+
 test "maskSecretPaths: masks every leaf value under the path, keeps the rest byte-for-byte" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -2953,7 +3150,6 @@ test "extract toml: block spans keep comments verbatim, root kv precedes blocks"
         \\[tui.keymap.global]
         \\# user note on submit
         \\submit = "enter"
-        \\
         \\
     ;
     try testing.expectEqualStrings(expected, got);

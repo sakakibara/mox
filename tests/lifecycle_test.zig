@@ -1008,9 +1008,11 @@ test "add --own: extracts raw spans with comments, preserves attribute comments,
     // model and state stay the program's; tui is an owned ancestor.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "2 top-level live entries remain unowned") != null);
 
-    // The source is the RAW span: the user's comment survives verbatim.
+    // The source is the RAW span: the user's comment survives verbatim. The
+    // span ends at the table's last content line, so the blank line that
+    // trailed it stays with the live remainder.
     const src = try read(io, a, try h.srcOf("app.toml"));
-    try std.testing.expectEqualStrings("[tui.keymap.global]\n# prefer plain enter\nsubmit = \"enter\"\n\n", src);
+    try std.testing.expectEqualStrings("[tui.keymap.global]\n# prefer plain enter\nsubmit = \"enter\"\n", src);
 
     const attrs = try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".mox", "attributes.toml" }));
     try std.testing.expect(std.mem.indexOf(u8, attrs, "# hand-maintained attributes") != null);
