@@ -218,6 +218,139 @@ fn killAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool
     }
 }
 
+/// Wall-clock bound on a partial file's `check` hook. Tighter than the setup-
+/// script default: a checker validates one file and runs on every apply.
+/// Override per-run with MOX_CHECK_TIMEOUT_MS; <= 0 disables it.
+pub const default_check_timeout_ms: i64 = 30_000;
+
+/// Read the check-hook timeout (ms) from the child environment, or the default.
+pub fn checkTimeoutMs(environ_map: ?*const EnvironMap) i64 {
+    const m = environ_map orelse return default_check_timeout_ms;
+    const v = m.get("MOX_CHECK_TIMEOUT_MS") orelse return default_check_timeout_ms;
+    if (v.len == 0) return default_check_timeout_ms;
+    return std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\r\n"), 10) catch default_check_timeout_ms;
+}
+
+/// Bytes of the child's combined output kept for the refusal report.
+const check_tail_bytes: usize = 4096;
+
+/// Outcome of one check-hook run. `refusal` is null on acceptance (exit 0)
+/// and names the reason otherwise; `tail` is the end of the child's combined
+/// stdout+stderr, for the refusal report.
+pub const CheckResult = struct {
+    refusal: ?[]const u8,
+    tail: []const u8,
+};
+
+/// Spawn one `check` argv directly (no shell) and wait for it, bounded.
+/// `check_argv[0]` is repo-relative; it is resolved against `repo_dir`, which
+/// is also the child's cwd. A `.ps1` checker runs under PowerShell with the
+/// same dispatch setup scripts use. The child's stdout and stderr both land
+/// in the file at `output_path` (created here), read back as the tail.
+///
+/// On POSIX the child leads its own process group (pgid 0 at spawn) and a
+/// timeout kills the whole group, so a checker that launches a server cannot
+/// orphan it. On Windows the intent is job-object termination of the tree;
+/// std exposes only per-process termination today, so the direct child is
+/// terminated.
+pub fn runCheck(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    check_argv: []const []const u8,
+    environ_map: *const EnvironMap,
+    output_path: []const u8,
+    timeout_ms: i64,
+) !CheckResult {
+    const exe = try std.fs.path.join(arena, &.{ repo_dir, check_argv[0] });
+    const out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
+    var out_open = true;
+    defer if (out_open) out_file.close(io);
+
+    var child = blk: {
+        if (std.mem.endsWith(u8, exe, ".ps1")) {
+            const first = try checkArgv(arena, try psArgv(arena, exe, ps_pwsh), check_argv[1..]);
+            break :blk std.process.spawn(io, checkSpawnOpts(first, environ_map, repo_dir, out_file)) catch |e| switch (e) {
+                error.FileNotFound => try std.process.spawn(
+                    io,
+                    checkSpawnOpts(try checkArgv(arena, try psArgv(arena, exe, ps_powershell), check_argv[1..]), environ_map, repo_dir, out_file),
+                ),
+                else => return e,
+            };
+        }
+        break :blk try std.process.spawn(io, checkSpawnOpts(try checkArgv(arena, &.{exe}, check_argv[1..]), environ_map, repo_dir, out_file));
+    };
+
+    var timed_out = false;
+    var killer: ?Io.Future(void) = null;
+    if (timeout_ms > 0) {
+        if (child.id) |id| {
+            const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } };
+            killer = io.async(killGroupAfter, .{ io, t, id, &timed_out });
+        }
+    }
+    const term = child.wait(io) catch |e| {
+        if (killer) |*k| _ = k.cancel(io);
+        return e;
+    };
+    if (killer) |*k| _ = k.cancel(io);
+
+    out_file.close(io);
+    out_open = false;
+    const tail = readTail(arena, io, output_path);
+
+    if (timed_out) {
+        return .{ .refusal = try std.fmt.allocPrint(arena, "timed out after {d}ms, killed", .{timeout_ms}), .tail = tail };
+    }
+    return switch (term) {
+        .exited => |code| .{
+            .refusal = if (code == 0) null else try std.fmt.allocPrint(arena, "exit {d}", .{code}),
+            .tail = tail,
+        },
+        else => .{ .refusal = "terminated abnormally", .tail = tail },
+    };
+}
+
+fn checkArgv(arena: std.mem.Allocator, head: []const []const u8, rest: []const []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, head.len + rest.len);
+    @memcpy(out[0..head.len], head);
+    @memcpy(out[head.len..], rest);
+    return out;
+}
+
+fn checkSpawnOpts(argv: []const []const u8, environ_map: *const EnvironMap, repo_dir: []const u8, out_file: Io.File) std.process.SpawnOptions {
+    var opts: std.process.SpawnOptions = .{
+        .argv = argv,
+        .cwd = .{ .path = repo_dir },
+        .environ_map = environ_map,
+        .stdin = .close,
+        .stdout = .{ .file = out_file },
+        .stderr = .{ .file = out_file },
+    };
+    if (builtin.os.tag != .windows) opts.pgid = 0;
+    return opts;
+}
+
+/// The group-kill counterpart of `killAfter`: same never-reaps contract, but
+/// the signal goes to the child's whole process group (its pgid equals its
+/// pid, set at spawn). Windows terminates the direct child; see `runCheck`.
+fn killGroupAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
+    timeout.sleep(io) catch return;
+    fired.* = true;
+    if (builtin.os.tag == .windows) {
+        _ = TerminateProcess(id, 1);
+    } else {
+        std.posix.kill(-id, .KILL) catch {};
+    }
+}
+
+/// The last `check_tail_bytes` of the file at `path`; empty when unreadable.
+fn readTail(arena: std.mem.Allocator, io: Io, path: []const u8) []const u8 {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch return "";
+    if (bytes.len <= check_tail_bytes) return bytes;
+    return bytes[bytes.len - check_tail_bytes ..];
+}
+
 fn runOne(
     arena: std.mem.Allocator,
     io: Io,

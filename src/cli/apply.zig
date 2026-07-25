@@ -312,6 +312,7 @@ fn applyPass(
                     .snap_id = snap_id,
                     .force = force,
                     .dry_run = dry_run,
+                    .skip_scripts = skip_scripts,
                 }, &counts, &snapshotted);
             } else {
                 try applyRegularFile(ctx, .{
@@ -709,15 +710,61 @@ const PartialInput = struct {
     snap_id: []const u8,
     force: bool,
     dry_run: bool,
+    skip_scripts: bool,
 };
 
-/// Validation-hook point for a partial candidate (`check` in attributes).
-/// The check fold spawns the declared argv against a candidate materialized
-/// in a private temp dir; until it lands, every candidate is accepted here.
-fn partialCheckAccepts(check_argv: []const []const u8, candidate: []const u8) bool {
-    _ = check_argv;
-    _ = candidate;
-    return true;
+/// Run a partial file's `check` hook (D7) against `candidate`, materialized
+/// in a private temp dir under the live basename. The child gets
+/// MOX_CHECK_FILE and MOX_CHECK_DIR, runs with cwd at the repo root, and is
+/// wall-clock bounded (MOX_CHECK_TIMEOUT_MS override). Returns true on
+/// acceptance; any other outcome reports the refusal (with the child's tail
+/// output), counts the failure, and returns false.
+fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, counts: *Counts) !bool {
+    const context = ctx.context.?;
+    // Keyed by live path: the state lock serializes applies, so no two runs
+    // race on it, and a crash's leftover is overwritten on the next apply.
+    const path_hash = mox.apply.applied.contentHashHex(live_path);
+    const check_dir = try std.fs.path.join(ctx.alloc, &.{
+        context.paths.state_dir, try std.mem.concat(ctx.alloc, u8, &.{ "check-", path_hash[0..16] }),
+    });
+    // The temp dir holds only the candidate (a checker may list it); the
+    // output capture sits beside it.
+    const out_path = try std.mem.concat(ctx.alloc, u8, &.{ check_dir, ".out" });
+    const cand_path = try std.fs.path.join(ctx.alloc, &.{ check_dir, std.fs.path.basename(live_path) });
+    const materialized = blk: {
+        std.Io.Dir.cwd().createDirPath(ctx.io, check_dir) catch break :blk false;
+        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cand_path, .data = candidate }) catch break :blk false;
+        break :blk true;
+    };
+    defer std.Io.Dir.cwd().deleteTree(ctx.io, check_dir) catch {};
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, out_path) catch {};
+    if (!materialized) {
+        try ctx.err.print("  ERROR   {s} (check {s} could not run: candidate not materialized)\n", .{ live_path, check_argv[0] });
+        counts.fail += 1;
+        return false;
+    }
+
+    var env_map = try context.env.createMap(ctx.alloc);
+    try env_map.put("MOX_CHECK_FILE", cand_path);
+    try env_map.put("MOX_CHECK_DIR", check_dir);
+    const timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&env_map);
+
+    const res = mox.apply.run_scripts.runCheck(ctx.alloc, ctx.io, context.paths.repo_dir, check_argv, &env_map, out_path, timeout_ms) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try ctx.err.print("  ERROR   {s} (check {s} could not run: {s})\n", .{ live_path, check_argv[0], @errorName(e) });
+            counts.fail += 1;
+            return false;
+        },
+    };
+    const why = res.refusal orelse return true;
+    try ctx.err.print("  ERROR   {s} (check {s} refused the candidate: {s})\n", .{ live_path, check_argv[0], why });
+    if (res.tail.len > 0) {
+        try ctx.err.print("mox apply:   check output:\n{s}", .{res.tail});
+        if (res.tail[res.tail.len - 1] != '\n') try ctx.err.writeAll("\n");
+    }
+    counts.fail += 1;
+    return false;
 }
 
 /// Write one partially owned file: compose is already done, so this runs
@@ -853,6 +900,14 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         return;
     }
 
+    // A check-bearing file must never be installed unvalidated: under
+    // --skip-scripts the hook does not run, so the write is skipped too.
+    if (in.skip_scripts and in.file.check_argv.len > 0) {
+        counts.skip += 1;
+        try ctx.out.print("  skipped {s} (check skipped)\n", .{live_path});
+        return;
+    }
+
     const candidate = partial_mod.replaceOwned(ctx.alloc, format, live_text, own_paths, &owned, &pdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -869,10 +924,8 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
             return;
         },
     };
-    if (!partialCheckAccepts(in.file.check_argv, candidate)) {
-        try ctx.err.print("  ERROR   {s} (check hook rejected the candidate)\n", .{live_path});
-        counts.fail += 1;
-        return;
+    if (in.file.check_argv.len > 0) {
+        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, counts)) return;
     }
 
     if (live != null) {

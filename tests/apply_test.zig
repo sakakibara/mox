@@ -2980,3 +2980,166 @@ test "diff partial: secret keys render masked on both sides" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, secret_value) == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "token") == null);
 }
+
+// The `check` hook (partial files): the declared argv runs directly against
+// a candidate materialized in a private temp dir; exit 0 installs the file,
+// anything else -- or a timeout -- refuses it.
+
+const check_rel = "scripts/check/hook" ++ script_ext;
+const check_attrs = "[\"app.toml\"]\nown = [\"tui\"]\ncheck = [\"" ++ check_rel ++ "\"]\n";
+
+fn tmpRoot(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    return std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+}
+
+fn writeChecker(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, content: []const u8) !void {
+    const root = try tmpRoot(a, io, tmp);
+    const abs = try std.fs.path.join(a, &.{ root, "repo", "scripts", "check", "hook" ++ script_ext });
+    try writeExecScript(io, tmp.dir, "repo/" ++ check_rel, content, abs);
+}
+
+/// A checker asserting the candidate contract -- MOX_CHECK_FILE exists under
+/// MOX_CHECK_DIR with the live basename and holds the owned content -- then
+/// logging the candidate path and accepting.
+fn acceptingChecker(a: std.mem.Allocator, log: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fmt.allocPrint(a,
+            \\if (-not (Test-Path -LiteralPath $env:MOX_CHECK_FILE)) {{ exit 1 }}
+            \\if ((Split-Path -Leaf $env:MOX_CHECK_FILE) -ne 'app.toml') {{ exit 1 }}
+            \\if (-not (Select-String -LiteralPath $env:MOX_CHECK_FILE -Pattern 'tui' -Quiet)) {{ exit 1 }}
+            \\if (-not (Test-Path -LiteralPath $env:MOX_CHECK_DIR)) {{ exit 1 }}
+            \\Add-Content -LiteralPath '{s}' -Value $env:MOX_CHECK_FILE
+            \\exit 0
+            \\
+        , .{log});
+    }
+    return std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\[ -f "$MOX_CHECK_FILE" ] || exit 1
+        \\case "$MOX_CHECK_FILE" in
+        \\"$MOX_CHECK_DIR"/app.toml) ;;
+        \\*) exit 1 ;;
+        \\esac
+        \\grep -q tui "$MOX_CHECK_FILE" || exit 1
+        \\printf '%s\n' "$MOX_CHECK_FILE" >> "{s}"
+        \\exit 0
+        \\
+    , .{log});
+}
+
+test "apply partial check: an accepting hook sees the candidate through its env and the file installs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "check-log.txt" });
+    try writeChecker(a, io, &tmp, try acceptingChecker(a, log));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("[tui]\nk = 1\n", try read(io, a, try c.homePath("app.toml")));
+    // The checker ran, its env assertions all held, and it saw the candidate.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, log), "app.toml") != null);
+}
+
+test "apply partial check: a rejecting hook refuses the file and reports its output" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    const reject: []const u8 = if (builtin.os.tag == .windows)
+        "Write-Output 'custom-rejection-detail'\nexit 3\n"
+    else
+        "#!/bin/sh\necho \"custom-rejection-detail\"\nexit 3\n";
+    try writeChecker(a, io, &tmp, reject);
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    // Creation path: the candidate is refused, so nothing lands live.
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "exit 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "custom-rejection-detail") != null);
+    try std.testing.expect(!exists(io, live));
+
+    // Update path: existing live content is left exactly as it was.
+    const program_live = "[tui]\nk = 9\n\n[program]\nstate = 1\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    const r2 = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 1), r2.rc);
+    try std.testing.expectEqualStrings(program_live, try read(io, a, live));
+}
+
+test "apply partial check: --skip-scripts runs no check and writes no check-bearing file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "check-log.txt" });
+    try writeChecker(a, io, &tmp, try acceptingChecker(a, log));
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    // --dry-run: no check execution, no write (existing behavior).
+    const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would create") != null);
+    try std.testing.expect(!exists(io, live));
+    try std.testing.expect(!exists(io, log));
+
+    // --skip-scripts: the check does not run AND the file is not written.
+    const skip = try c.run(&.{ "mox", "apply", "--skip-scripts" });
+    try std.testing.expectEqual(@as(u8, 0), skip.rc);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "(check skipped)") != null);
+    try std.testing.expect(!exists(io, live));
+    try std.testing.expect(!exists(io, log));
+
+    // A full apply validates and installs.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, live));
+    try std.testing.expect(exists(io, log));
+}
+
+test "apply partial check: a hanging hook is killed within the timeout bound" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    const hang: []const u8 = if (builtin.os.tag == .windows)
+        "Start-Sleep -Seconds 30\nexit 0\n"
+    else
+        "#!/bin/sh\nsleep 30\nexit 0\n";
+    try writeChecker(a, io, &tmp, hang);
+
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MOX_CHECK_TIMEOUT_MS", .value = "1500" }},
+    });
+    const started = Io.Clock.real.now(io).toSeconds();
+    const r = try c.run(&.{ "mox", "apply" });
+    const elapsed = Io.Clock.real.now(io).toSeconds() - started;
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "timed out") != null);
+    try std.testing.expect(!exists(io, try c.homePath("app.toml")));
+    // Killed by the 1500ms bound, not by the checker's 30s sleep ending.
+    try std.testing.expect(elapsed < 20);
+}
