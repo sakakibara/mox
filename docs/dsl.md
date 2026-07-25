@@ -254,7 +254,9 @@ matched verbatim (case-sensitive), and a YAML declared segment is a string
 key -- a non-string key may sit inside an owned subtree, never on the
 declared path itself. An owned YAML scalar that does not render on one
 line (a multiline string value) refuses the file rather than reflowing
-it. Ownership requires a structured target (TOML, JSON, YAML, INI,
+it. Reasserted owned content renders with LF line endings even in a CRLF
+live file; every remainder byte, CRLF included, is preserved untouched.
+Ownership requires a structured target (TOML, JSON, YAML, INI,
 gitconfig) and cannot combine with `symlink`, `seed_once`, or a generator
 source. Under `own`, the composed source must lie entirely within the
 declaration -- a composed leaf outside every declared path is a per-file

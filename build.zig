@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     apply_tests_mod.addImport("mox", lib_mod);
+    apply_tests_mod.addImport("json", json_mod);
     const apply_tests = b.addTest(.{ .root_module = apply_tests_mod });
     test_step.dependOn(&b.addRunArtifact(apply_tests).step);
 
@@ -240,6 +241,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lifecycle_tests_mod.addImport("mox", lib_mod);
+    lifecycle_tests_mod.addImport("json", json_mod);
     const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_tests_mod });
     test_step.dependOn(&b.addRunArtifact(lifecycle_tests).step);
 

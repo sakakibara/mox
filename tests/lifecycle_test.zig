@@ -1302,3 +1302,52 @@ test "add --disown: a declared path absent from the live file is an error" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not present") != null);
     try std.testing.expect(!exists(io, try h.srcOf("settings.json")));
 }
+
+const json_mod = @import("json");
+
+test "add --disown: a suffix run of members with a quoted key extracts and applies cleanly" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const live_content = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"the model\": \"m1\"\n}\n";
+    try writeRepo(io, &tmp, "home/settings.json", live_content);
+    const live = try h.liveOf("settings.json");
+
+    // Disowning the object's LAST TWO members must not leave the preceding
+    // member's separator dangling in the extracted source.
+    const r = try h.run(&.{ "mox", "add", "--disown", "editor", "--disown", "\"the model\"", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const src = try read(io, a, try h.srcOf("settings.json"));
+    try std.testing.expectEqualStrings(
+        "// mox: disown editor\n// mox: disown \"the model\"\n{\n  \"theme\": \"dark\"\n}\n",
+        src,
+    );
+
+    // With the program keys present, the first apply adopts byte-for-byte.
+    const adopt = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), adopt.rc);
+    try std.testing.expect(std.mem.indexOf(u8, adopt.out, "adopted") != null);
+    try std.testing.expectEqualStrings(live_content, try read(io, a, live));
+
+    // A reassert splices the live spans back in and the result is STRICT
+    // JSON -- no dangling separator ever reaches the live file.
+    try writeRepo(io, &tmp, "repo/src/settings.json", "// mox: disown editor\n// mox: disown \"the model\"\n{\n  \"theme\": \"light\"\n}\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const patched = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, patched, "\"theme\": \"light\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patched, "\"the model\": \"m1\"") != null);
+    _ = try json_mod.parse(a, patched, .{});
+
+    // With the program keys ABSENT the spans contribute nothing: the live
+    // file is exactly the composed text, still strict JSON.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "{\n  \"theme\": \"light\"\n}\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const absent = try read(io, a, live);
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"light\"\n}\n", absent);
+    _ = try json_mod.parse(a, absent, .{});
+}

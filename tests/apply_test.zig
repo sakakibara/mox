@@ -3700,3 +3700,107 @@ test "apply disown: a shrunk disown list on a secret record is first contact, ne
     try std.testing.expect(std.mem.indexOf(u8, after, "\"model\": \"m1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "disown-s3cr3t-two") != null);
 }
+
+const json_mod = @import("json");
+
+test "apply disown: a nested disowned path with an unpopulated ancestor survives the lifecycle" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The composed source never defines survey; the program creates it live
+    // mid-lifecycle. Reassertion must keep the leaf at its declared path.
+    try writeDisownFixture(io, &tmp, "// mox: disown survey.state\n{\n  \"theme\": \"dark\"\n}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"dark\"\n}\n", try read(io, a, live));
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"dark\",\n  \"survey\": {\n    \"state\": 1\n  }\n}\n",
+    });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "unchanged") != null);
+
+    try writeDisownFixture(io, &tmp, "// mox: disown survey.state\n{\n  \"theme\": \"light\"\n}\n");
+    const r3 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"theme\": \"light\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"state\": 1") != null);
+    // Strict JSON, and the leaf still lives at its declared path.
+    const parsed = try json_mod.parse(a, after, .{});
+    try std.testing.expect(parsed.object.get("survey").?.object.get("state") != null);
+
+    // The cycle is stable: another apply writes nothing.
+    const r4 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r4.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r4.out, "unchanged") != null);
+}
+
+test "apply disown: a composed source defining content under a disowned path refuses only that file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, "// mox: disown model\n{\n  \"theme\": \"dark\",\n  \"model\": \"x\"\n}\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v1\n" });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "defines content under disowned path model") != null);
+    try std.testing.expect(!exists(io, try c.homePath("settings.json")));
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try c.homePath("b.conf")));
+}
+
+test "rollback disown: a suffix run of disowned members re-patches through the snapshot splice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, "// mox: disown editor\n// mox: disown \"the model\"\n{\n  \"theme\": \"dark\"\n}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The program writes its keys as the object's suffix; the source moves
+    // on and reasserts (snapshot taken of the pre-write live file).
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"the model\": \"m-old\"\n}\n",
+    });
+    try writeDisownFixture(io, &tmp, "// mox: disown editor\n// mox: disown \"the model\"\n{\n  \"theme\": \"light\"\n}\n");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The program writes again AFTER the snapshot.
+    const later = try std.mem.replaceOwned(u8, a, try read(io, a, live), "m-old", "m-new");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = later });
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "re-patched") != null);
+
+    // The owned complement is back at its snapshot state around BOTH
+    // protected members, the program's later write survives, and the result
+    // is strict JSON.
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"theme\": \"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"editor\": \"nvim\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "m-new") != null);
+    _ = try json_mod.parse(a, after, .{});
+}
