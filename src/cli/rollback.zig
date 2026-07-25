@@ -32,7 +32,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     defer lk.release();
 
     // Tree info for the re-patch (own paths, check hook, format), best
-    // effort: a broken source tree or attributes file must not block the
+    // effort: a broken source tree must not block the
     // whole-file restores, so a failed walk leaves the map empty and only
     // the withheld partial targets report an error below.
     var partials: std.StringHashMap(mox.source.tree.ManagedFile) = .init(ctx.alloc);
@@ -46,8 +46,10 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             error.OwnOnSeedOnce,
             error.OwnOnGenerator,
             error.InvalidOwnPath,
+            error.InvalidCheckDirective,
+            error.CheckWithoutOwnership,
             => blk: {
-                try ctx.err.print("mox rollback: warning: .mox/attributes.toml: {s}: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{
+                try ctx.err.print("mox rollback: warning: ownership declaration: {s}: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{
                     walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
                 });
                 break :blk null;

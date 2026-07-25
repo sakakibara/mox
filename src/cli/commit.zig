@@ -414,8 +414,10 @@ pub fn commitImpl(
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
         error.InvalidOwnPath,
+        error.InvalidCheckDirective,
+        error.CheckWithoutOwnership,
         => {
-            try ctx.err.print("mox commit: .mox/attributes.toml: {s}: {s}\n", .{
+            try ctx.err.print("mox commit: ownership declaration: {s}: {s}\n", .{
                 walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
             });
             return 1;

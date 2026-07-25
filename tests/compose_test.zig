@@ -3673,3 +3673,32 @@ test "compose catB: three nested for loops resolve fields from all three scope f
     try std.testing.expect(std.mem.indexOf(u8, out, "A2-B-C") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "-B-C"));
 }
+
+test "compose: a partial file's head directives are stripped, pass-through kept byte-exact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Single layer: the composed text is the verbatim pass-through minus
+    // exactly the recognized directive lines; comments and layout survive.
+    const body =
+        \\# codex keymaps
+        \\[tui.keymap.global]
+        \\submit = "enter"
+        \\
+    ;
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "# mox: own tui.keymap.global\n# mox: check \"scripts/check/codex\"\n" ++ body);
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+
+    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    try std.testing.expectEqualStrings(body, out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mox:") == null);
+}

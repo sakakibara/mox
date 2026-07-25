@@ -3171,9 +3171,8 @@ test "commit: structured [y] routes to the winning overlay (gitconfig)" {
 // Partial ownership: a file with an `own` declaration commits per key over
 // its owned subtree, against the owned record.
 
-fn writePartialRepo(io: Io, tmp: *std.testing.TmpDir, source: []const u8, attributes: []const u8) !void {
+fn writePartialRepo(io: Io, tmp: *std.testing.TmpDir, source: []const u8) !void {
     try writeRepo(io, tmp, "repo/src/app.toml", source);
-    try writeRepo(io, tmp, "repo/.mox/attributes.toml", attributes);
 }
 
 test "commit partial: [y] routes an owned-key edit to the base and advances the owned record" {
@@ -3184,7 +3183,7 @@ test "commit partial: [y] routes an owned-key edit to the base and advances the 
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
@@ -3217,7 +3216,7 @@ test "commit partial: [y] routes an owned-key edit to the base and advances the 
     try std.testing.expect(std.mem.indexOf(u8, res.err, "count = 42") == null);
 
     // The edit landed in the base source; the live file kept its remainder.
-    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
     const live_after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, live_after, "count = 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, live_after, "submit = \"ctrl-enter\"") != null);
@@ -3237,7 +3236,7 @@ test "commit partial: [y] routes an overlay-won owned key to the overlay layer" 
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui]\ntheme = \"light\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\ntheme = \"light\"\n");
     try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\ntheme = \"dark\"\n");
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
 
@@ -3248,7 +3247,7 @@ test "commit partial: [y] routes an overlay-won owned key to the overlay layer" 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml.d/os=darwin.toml")), "solarized") != null);
-    try std.testing.expectEqualStrings("[tui]\ntheme = \"light\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui\n[tui]\ntheme = \"light\"\n", try read(io, a, try h.srcOf("app.toml")));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
 
@@ -3260,7 +3259,7 @@ test "commit partial: [p] promotes an owned key to base behind the repo-wide bla
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui]\ntheme = \"light\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\ntheme = \"light\"\n");
     try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\ntheme = \"dark\"\n");
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
 
@@ -3287,7 +3286,7 @@ test "commit partial: [s] leaves the key in the live file and the file uncommitt
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui]\ntheme = \"light\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\ntheme = \"light\"\n");
     try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\ntheme = \"dark\"\n");
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
 
@@ -3318,7 +3317,7 @@ test "commit partial: the guard rolls back a routed key when another edit change
     // the partial file back by exactly that configuration.
     try writeRepo(io, &tmp, "repo/src/.bashrc", "export SHELL_OK=1\n" ++
         "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
-    try writePartialRepo(io, &tmp, "[tui]\nkeys = \"a\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\nkeys = \"a\"\n");
     try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\nkeys = \"b\"\n");
     try writeRepo(io, &tmp, "repo/src/app.toml.d/os=linux.toml", "[tui]\ngreet = \"<machine.email>\"\n");
     try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"nobody@example.com\"\n");
@@ -3348,7 +3347,7 @@ test "commit partial: a sibling configuration's D2 violation rolls the file back
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui]\nk = \"a\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\nk = \"a\"\n");
     // The linux overlay defines a leaf outside the declaration: broken for
     // os=linux, invisible to a darwin apply -- commit's per-configuration D2
     // pass is what catches it.
@@ -3363,7 +3362,7 @@ test "commit partial: a sibling configuration's D2 violation rolls the file back
     try std.testing.expect(std.mem.indexOf(u8, res.err, "configuration os=linux") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "stray.s is outside the declared own paths") != null);
     // Rolled back: the base still holds the original value.
-    try std.testing.expectEqualStrings("[tui]\nk = \"a\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui\n[tui]\nk = \"a\"\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
 test "commit partial: a secret-bearing record is skipped with the secret contract" {
@@ -3375,7 +3374,7 @@ test "commit partial: a secret-bearing record is skipped with the secret contrac
     const a = arena.allocator();
 
     const secret_value = "commit-partial-s3cr3t-11aa22bb";
-    try writePartialRepo(io, &tmp, "[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own api\n[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n");
     const h = try setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_PARTIAL_SECRET", .value = secret_value }},
     });
@@ -3400,7 +3399,7 @@ test "commit partial: first-contact drift is reported, never routed" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const h = try setup(a, io, &tmp, .{});
     // No apply: the live file exists with differing owned content and no
     // owned record. Taking ownership is apply's job, with consent.
@@ -3413,7 +3412,7 @@ test "commit partial: first-contact drift is reported, never routed" {
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox apply") != null);
-    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"enter\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
 test "commit partial: a first-contact-only file exits nonzero outside report mode" {
@@ -3424,7 +3423,7 @@ test "commit partial: a first-contact-only file exits nonzero outside report mod
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const h = try setup(a, io, &tmp, .{});
     // No apply: differing live owned content with no owned record is first
     // contact, a manual outcome. It must reach the guard and report like any
@@ -3438,7 +3437,7 @@ test "commit partial: a first-contact-only file exits nonzero outside report mod
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") != null);
-    try std.testing.expectEqualStrings("[tui]\nk = 1\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui\n[tui]\nk = 1\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
 test "apply drift partial: [o] reasserts the owned span and keeps the remainder" {
@@ -3449,7 +3448,7 @@ test "apply drift partial: [o] reasserts the owned span and keeps the remainder"
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
@@ -3473,7 +3472,7 @@ test "apply drift partial: [d] shows the owned diff, [c] commits the owned edit 
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
@@ -3489,7 +3488,7 @@ test "apply drift partial: [d] shows the owned diff, [c] commits the owned edit 
     try std.testing.expect(std.mem.indexOf(u8, res.out, "Committing 1 live edit(s)") != null);
 
     // The live edit reached the base source and the record advanced.
-    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
     const re = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), re.rc);
@@ -3505,7 +3504,7 @@ test "apply drift partial: [c] on a secret-bearing record is refused inline, the
     const a = arena.allocator();
 
     const secret_value = "drift-partial-s3cr3t-33cc44dd";
-    try writePartialRepo(io, &tmp, "[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    try writePartialRepo(io, &tmp, "# mox: own api\n[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n");
     const h = try setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_PARTIAL_SECRET", .value = secret_value }},
     });
@@ -3529,8 +3528,7 @@ test "commit: an own declaration the walk rejects reports the target by name" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeRepo(io, &tmp, "repo/src/notes.txt", "hi\n");
-    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"notes.txt\"]\nown = [\"a\"]\n");
+    try writeRepo(io, &tmp, "repo/src/notes.txt", "# mox: own a\nhi\n");
     const h = try setup(a, io, &tmp, .{});
 
     const res = try h.run(&.{ "mox", "commit" });

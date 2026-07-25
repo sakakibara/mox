@@ -178,7 +178,7 @@ pub fn unionPaths(
     return out.toOwnedSlice(arena);
 }
 
-/// The names an own-list walk rejection prints, so a bad attributes entry
+/// The names an ownership walk rejection prints, so a bad head declaration
 /// reads as a diagnosis instead of a bare error code.
 pub fn ownDiagText(e: anyerror) []const u8 {
     return switch (e) {
@@ -187,6 +187,8 @@ pub fn ownDiagText(e: anyerror) []const u8 {
         error.OwnOnSeedOnce => "own cannot combine with seed_once",
         error.OwnOnGenerator => "own cannot apply to a generator source",
         error.InvalidOwnPath => "own path does not parse as a dotted key path",
+        error.InvalidCheckDirective => "check takes one or more double-quoted argv items, once",
+        error.CheckWithoutOwnership => "check requires an ownership declaration",
         else => @errorName(e),
     };
 }

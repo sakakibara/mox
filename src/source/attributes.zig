@@ -16,10 +16,9 @@
 //! `seed_once = true`: apply writes the target only when it is absent, then
 //! leaves the user's copy alone.
 //!
-//! Partial ownership is declared here too: `own` lists the key-paths mox
-//! manages inside a structured live file (TOML dotted-key syntax), and
-//! `check` an argv -- a repo-relative executable plus arguments -- that
-//! validates a candidate partial write before it lands.
+//! Partial ownership does NOT live here: a file's ownership contract is
+//! content semantics and is declared in the source file itself, as head
+//! directives in its leading comment block.
 //!
 //! ```toml
 //! [".ssh/config"]
@@ -30,10 +29,6 @@
 //!
 //! [".config/app.local"]
 //! seed_once = true
-//!
-//! [".codex/config.toml"]
-//! own = ["tui.keymap.global", "tui.keymap.composer"]
-//! check = ["scripts/check/codex-config"]
 //! ```
 
 const std = @import("std");
@@ -54,18 +49,12 @@ pub const Entry = struct {
     /// True when the target is seeded once: apply writes it only when it is
     /// absent, then never composes, drift-checks, or overwrites the user's copy.
     seed_once: bool = false,
-    /// Partial-ownership key-paths (TOML dotted-key strings). Empty means the
-    /// whole file is managed.
-    own: []const []const u8 = &.{},
-    /// Validation-hook argv for partial writes: a repo-relative executable and
-    /// its arguments. Empty means no hook.
-    check: []const []const u8 = &.{},
 };
 
 /// True when no field is recorded. Such an entry carries no information:
 /// `load` drops it and `write` emits no table for it.
 fn entryEmpty(e: Entry) bool {
-    return e.mode == null and !e.symlink and !e.seed_once and e.own.len == 0 and e.check.len == 0;
+    return e.mode == null and !e.symlink and !e.seed_once;
 }
 
 /// A loaded `.mox/attributes.toml`, keyed by target home-relative key. All
@@ -95,19 +84,6 @@ pub const Attributes = struct {
     pub fn seedOnce(self: *const Attributes, key: []const u8) bool {
         if (self.map.get(key)) |e| return e.seed_once;
         return false;
-    }
-
-    /// The declared partial-ownership key-paths for `key`, or empty when the
-    /// whole file is managed.
-    pub fn own(self: *const Attributes, key: []const u8) []const []const u8 {
-        if (self.map.get(key)) |e| return e.own;
-        return &.{};
-    }
-
-    /// The declared validation-hook argv for `key`, or empty when none.
-    pub fn check(self: *const Attributes, key: []const u8) []const []const u8 {
-        if (self.map.get(key)) |e| return e.check;
-        return &.{};
     }
 
     /// Set (or replace) `key`'s entry. `key` is duped into the arena.
@@ -160,8 +136,6 @@ pub const Attributes = struct {
             }
             if (entry.symlink) try out.appendSlice(self.arena, "symlink = true\n");
             if (entry.seed_once) try out.appendSlice(self.arena, "seed_once = true\n");
-            if (entry.own.len != 0) try writeStringArray(self.arena, &out, "own", entry.own);
-            if (entry.check.len != 0) try writeStringArray(self.arena, &out, "check", entry.check);
         }
 
         if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
@@ -171,30 +145,6 @@ pub const Attributes = struct {
 
 fn lessKey(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
-}
-
-/// Emit `name = ["a", "b"]` with each element quoted like a key.
-fn writeStringArray(arena: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, values: []const []const u8) !void {
-    try out.appendSlice(arena, name);
-    try out.appendSlice(arena, " = [");
-    for (values, 0..) |v, i| {
-        if (i != 0) try out.appendSlice(arena, ", ");
-        try writeQuoted(arena, out, v);
-    }
-    try out.appendSlice(arena, "]\n");
-}
-
-/// Decode a TOML array of strings, or null when the value is not an array or
-/// any element is not a string (the field is then skipped whole, like any
-/// wrong-typed field -- never a silently truncated list).
-fn stringList(arena: std.mem.Allocator, v: toml.Value) !?[]const []const u8 {
-    if (v != .array) return null;
-    const out = try arena.alloc([]const u8, v.array.items.len);
-    for (v.array.items, out) |item, *o| {
-        if (item != .string) return null;
-        o.* = item.string;
-    }
-    return out;
 }
 
 /// Emit `s` as a TOML basic (double-quoted) string. Control characters are
@@ -258,12 +208,6 @@ pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Attributes 
         }
         if (tbl.get("seed_once")) |sv| {
             if (sv == .boolean) e.seed_once = sv.boolean;
-        }
-        if (tbl.get("own")) |ov| {
-            if (try stringList(arena, ov)) |list| e.own = list;
-        }
-        if (tbl.get("check")) |cv| {
-            if (try stringList(arena, cv)) |list| e.check = list;
         }
         if (entryEmpty(e)) continue;
         try attrs.set(entry.key_ptr.*, e);
@@ -422,87 +366,6 @@ test "roundtrip: seed_once flag, alone and combined with mode and symlink" {
     try testing.expect(back.symlink(".ssh/id"));
     try testing.expectEqual(@as(u32, 0o600), back.mode(".ssh/id").?);
     try testing.expect(!back.seedOnce("nope"));
-}
-
-test "roundtrip: an entry with only own and check survives" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-
-    var attrs: Attributes = .{ .arena = a, .map = std.StringHashMap(Entry).init(a) };
-    try attrs.set(".codex/config.toml", .{
-        .own = &.{ "tui.keymap.global", "projects.\"/tmp/example\"" },
-        .check = &.{ "scripts/check/codex-config", "--strict" },
-    });
-    try attrs.set(".config/app/settings.json", .{ .own = &.{"model"} });
-    try attrs.write(io, repo);
-
-    const path = try std.fs.path.join(a, &.{ repo, ".mox", "attributes.toml" });
-    const written = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_bytes));
-    const expected =
-        \\[".codex/config.toml"]
-        \\own = ["tui.keymap.global", "projects.\"/tmp/example\""]
-        \\check = ["scripts/check/codex-config", "--strict"]
-        \\
-        \\[".config/app/settings.json"]
-        \\own = ["model"]
-        \\
-    ;
-    try testing.expectEqualStrings(expected, written);
-
-    var back = try load(a, io, repo);
-    const own_back = back.own(".codex/config.toml");
-    try testing.expectEqual(@as(usize, 2), own_back.len);
-    try testing.expectEqualStrings("tui.keymap.global", own_back[0]);
-    try testing.expectEqualStrings("projects.\"/tmp/example\"", own_back[1]);
-    const check_back = back.check(".codex/config.toml");
-    try testing.expectEqual(@as(usize, 2), check_back.len);
-    try testing.expectEqualStrings("scripts/check/codex-config", check_back[0]);
-    try testing.expectEqualStrings("--strict", check_back[1]);
-    try testing.expectEqual(@as(usize, 1), back.own(".config/app/settings.json").len);
-    try testing.expectEqual(@as(usize, 0), back.check(".config/app/settings.json").len);
-    try testing.expect(back.mode(".codex/config.toml") == null);
-    try testing.expectEqual(@as(usize, 0), back.own("nope").len);
-}
-
-test "load: a wrong-typed or mixed-type own/check field is skipped whole" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, ".mox");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".mox/attributes.toml",
-        .data =
-        \\[".a.toml"]
-        \\mode = "0600"
-        \\own = "not-an-array"
-        \\
-        \\[".b.toml"]
-        \\mode = "0600"
-        \\own = ["ok", 5]
-        \\
-        ,
-    });
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-
-    var attrs = try load(a, io, repo);
-    try testing.expectEqual(@as(usize, 0), attrs.own(".a.toml").len);
-    try testing.expectEqual(@as(usize, 0), attrs.own(".b.toml").len);
-    try testing.expectEqual(@as(u32, 0o600), attrs.mode(".a.toml").?);
-    try testing.expectEqual(@as(u32, 0o600), attrs.mode(".b.toml").?);
 }
 
 test "write: an empty map removes the file rather than leaving a stub" {

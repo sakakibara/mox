@@ -59,9 +59,10 @@ const keymap_block =
     \\
 ;
 
-const own_attrs =
-    \\[".codex/config.toml"]
-    \\own = ["tui.keymap.global", "tui.keymap.composer", "tui.keymap.editor"]
+const own_head =
+    \\# mox: own tui.keymap.global
+    \\# mox: own tui.keymap.composer
+    \\# mox: own tui.keymap.editor
     \\
 ;
 
@@ -112,14 +113,16 @@ const patched_remainder =
 
 const own_raws = [_][]const u8{ "tui.keymap.global", "tui.keymap.composer", "tui.keymap.editor" };
 
-fn writeFixture(io: Io, tmp: *std.testing.TmpDir, live: []const u8, attrs: []const u8) !void {
+fn writeFixture(io: Io, tmp: *std.testing.TmpDir, live: []const u8, source_head: []const u8) !void {
     try tmp.dir.createDirPath(io, "repo/src/.codex");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.codex/config.toml", .data = keymap_block });
-    try tmp.dir.createDirPath(io, "repo/.mox");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = attrs });
+    var source: [source_buf_len]u8 = undefined;
+    const text = std.fmt.bufPrint(&source, "{s}{s}", .{ source_head, keymap_block }) catch unreachable;
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.codex/config.toml", .data = text });
     try tmp.dir.createDirPath(io, "home/.codex");
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.codex/config.toml", .data = live });
 }
+
+const source_buf_len = keymap_block.len + 512;
 
 fn read(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
     return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
@@ -180,7 +183,7 @@ test "codex differential: force reassertion matches the script's keymap and rema
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeFixture(io, &tmp, live_fixture, own_attrs);
+    try writeFixture(io, &tmp, live_fixture, own_head);
     const c = try testutil.setup(a, io, &tmp, .{});
     const live = try c.homePath(".codex/config.toml");
 
@@ -209,6 +212,9 @@ test "codex differential: force reassertion matches the script's keymap and rema
     // (2) Remainder byte-for-byte identical to live's non-keymap bytes.
     try std.testing.expectEqualStrings(patched_remainder, try remainderOf(a, patched));
 
+    // The head declaration never reaches the live file.
+    try std.testing.expect(std.mem.indexOf(u8, patched, "mox:") == null);
+
     // (3) Idempotency: the second apply writes nothing.
     const before = try mtimeNs(io, live);
     const again = try c.run(&.{ "mox", "apply" });
@@ -228,7 +234,7 @@ test "codex differential: adoption path is clean when live owned content already
     // The script's own output state: program remainder plus the exact
     // keymap block. mox adopts it without changing a byte.
     const adopted_live = live_remainder ++ "\n" ++ keymap_block;
-    try writeFixture(io, &tmp, adopted_live, own_attrs);
+    try writeFixture(io, &tmp, adopted_live, own_head);
     const c = try testutil.setup(a, io, &tmp, .{});
     const live = try c.homePath(".codex/config.toml");
 
@@ -262,7 +268,7 @@ test "codex differential: a multiline-string decoy is patched with its bytes pre
         \\"""
         \\
     ;
-    try writeFixture(io, &tmp, decoy_live, own_attrs);
+    try writeFixture(io, &tmp, decoy_live, own_head);
     const c = try testutil.setup(a, io, &tmp, .{});
     const live = try c.homePath(".codex/config.toml");
 
@@ -312,9 +318,7 @@ test "codex differential: the check hook stub validates the candidate and the wr
     // real repo script wraps `codex app-server` with its expected-exit-1
     // transport contract; the stub keeps the same accept/refuse shape.)
     const check_rel = "scripts/check/codex-config" ++ script_ext;
-    const attrs = "[\".codex/config.toml\"]\n" ++
-        "own = [\"tui.keymap.global\", \"tui.keymap.composer\", \"tui.keymap.editor\"]\n" ++
-        "check = [\"" ++ check_rel ++ "\"]\n";
+    const head = own_head ++ "# mox: check \"" ++ check_rel ++ "\"\n";
     const checker: []const u8 = if (builtin.os.tag == .windows)
         \\if (-not (Test-Path -LiteralPath $env:MOX_CHECK_FILE)) { exit 1 }
         \\foreach ($t in '[tui.keymap.global]', '[tui.keymap.composer]', '[tui.keymap.editor]') {
@@ -336,7 +340,7 @@ test "codex differential: the check hook stub validates the candidate and the wr
         \\
     ;
 
-    try writeFixture(io, &tmp, live_fixture, attrs);
+    try writeFixture(io, &tmp, live_fixture, head);
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
     const abs = try std.fs.path.join(a, &.{ root, "repo", "scripts", "check", "codex-config" ++ script_ext });

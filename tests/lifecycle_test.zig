@@ -997,8 +997,8 @@ test "add --own: extracts raw spans with comments, preserves attribute comments,
         \\
     ;
     try writeRepo(io, &tmp, "home/app.toml", live_content);
-    // The attributes file is user-authored; its comments must survive the
-    // Document-model edit add --own performs.
+    // The attributes file is user-authored and carries no ownership; the
+    // declaration lands in the new source's head instead.
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "# hand-maintained attributes\n[\".ssh/config\"]\nmode = \"0600\"\n");
 
     const live = try h.liveOf("app.toml");
@@ -1008,16 +1008,16 @@ test "add --own: extracts raw spans with comments, preserves attribute comments,
     // model and state stay the program's; tui is an owned ancestor.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "2 top-level live entries remain unowned") != null);
 
-    // The source is the RAW span: the user's comment survives verbatim. The
-    // span ends at the table's last content line, so the blank line that
-    // trailed it stays with the live remainder.
+    // The source is the head declaration plus the RAW span: the user's
+    // comment survives verbatim. The span ends at the table's last content
+    // line, so the blank line that trailed it stays with the live remainder.
     const src = try read(io, a, try h.srcOf("app.toml"));
-    try std.testing.expectEqualStrings("[tui.keymap.global]\n# prefer plain enter\nsubmit = \"enter\"\n", src);
+    try std.testing.expectEqualStrings("# mox: own tui.keymap.global\n[tui.keymap.global]\n# prefer plain enter\nsubmit = \"enter\"\n", src);
 
     const attrs = try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".mox", "attributes.toml" }));
     try std.testing.expect(std.mem.indexOf(u8, attrs, "# hand-maintained attributes") != null);
     try std.testing.expect(std.mem.indexOf(u8, attrs, "mode = \"0600\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attrs, "own = [\"tui.keymap.global\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs, "own") == null);
 
     // Extracted == live owned content, so the first apply adopts cleanly and
     // changes no live byte.
@@ -1062,10 +1062,10 @@ test "add --own-absent: the declared path flows to enforced absence" {
 
     const r = try h.run(&.{ "mox", "add", "--own", "keep", "--own-absent", "gone", live });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    const attrs = try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".mox", "attributes.toml" }));
-    try std.testing.expect(std.mem.indexOf(u8, attrs, "own = [\"keep\", \"gone\"]") != null);
-    // The absent path contributed no content to the source.
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml")), "gone") == null);
+    const src = try read(io, a, try h.srcOf("app.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "# mox: own keep\n# mox: own gone\n") != null);
+    // The absent path contributed no content to the source body.
+    try std.testing.expect(std.mem.indexOf(u8, src, "[gone]") == null);
 
     // Live still holds [gone] and no record exists: first contact for the
     // enforced absence, so removal is drift until forced.
@@ -1091,12 +1091,12 @@ test "add: a whole-file add of a partially owned target is refused" {
 
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "home/app.toml", "[tui]\nk = 1\n");
-    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui\n[tui]\nk = 1\n");
 
     const r = try h.run(&.{ "mox", "add", try h.liveOf("app.toml") });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "partially owned") != null);
-    try std.testing.expect(!exists(io, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("# mox: own tui\n[tui]\nk = 1\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
 test "add-tree: a partially owned target is skipped with an explicit reason" {
@@ -1110,14 +1110,15 @@ test "add-tree: a partially owned target is skipped with an explicit reason" {
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "home/cfg/app.toml", "[tui]\nk = 1\n");
     try writeRepo(io, &tmp, "home/cfg/plain.txt", "text\n");
-    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"cfg/app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/cfg/app.toml", "# mox: own tui\n[tui]\nk = 1\n");
 
     const dir = try std.fs.path.join(a, &.{ h.home, "cfg" });
     const r = try h.run(&.{ "mox", "add-tree", dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "partially owned") != null);
     try std.testing.expect(exists(io, try h.srcOf("cfg/plain.txt")));
-    try std.testing.expect(!exists(io, try h.srcOf("cfg/app.toml")));
+    // The partial source keeps its declaration; nothing overwrote it.
+    try std.testing.expectEqualStrings("# mox: own tui\n[tui]\nk = 1\n", try read(io, a, try h.srcOf("cfg/app.toml")));
 }
 
 test "remove: --purge is refused on a partial target; plain remove forgets the owned record" {
@@ -1129,8 +1130,7 @@ test "remove: --purge is refused on a partial target; plain remove forgets the o
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/app.toml", "[tui]\nk = 1\n");
-    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui\n[tui]\nk = 1\n");
     _ = try h.run(&.{ "mox", "apply" });
 
     const live = try h.liveOf("app.toml");
@@ -1154,7 +1154,7 @@ test "remove: --purge is refused on a partial target; plain remove forgets the o
     try std.testing.expect(!exists(io, rec_path));
 }
 
-test "mv: re-keys the attributes entry and the owned record for a partial target" {
+test "mv: re-keys the owned record for a partial target" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1163,8 +1163,7 @@ test "mv: re-keys the attributes entry and the owned record for a partial target
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/app.toml", "[tui]\nk = 1\n");
-    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui\n[tui]\nk = 1\n");
     _ = try h.run(&.{ "mox", "apply" });
 
     const old_live = try h.liveOf("app.toml");
@@ -1176,9 +1175,9 @@ test "mv: re-keys the attributes entry and the owned record for a partial target
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "old live file keeps its owned content") != null);
 
-    const attrs = try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".mox", "attributes.toml" }));
-    try std.testing.expect(std.mem.indexOf(u8, attrs, "app2.toml") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attrs, "[\"app.toml\"]") == null);
+    // The declaration travels inside the renamed source file.
+    const moved = try read(io, a, try h.srcOf("app2.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, moved, "# mox: own tui") != null);
     try std.testing.expect(!exists(io, old_rec));
     try std.testing.expect(exists(io, new_rec));
 
@@ -1201,8 +1200,7 @@ test "export --resolved: a partial target bakes its canonical owned serializatio
 
     const h = try setup(a, io, &tmp, null);
     const source = "[tui]\nk = 1\n";
-    try writeRepo(io, &tmp, "repo/src/app.toml", source);
-    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui\n" ++ source);
 
     const out_dir = try std.fs.path.join(a, &.{ h.root, "baked" });
     const r = try h.run(&.{ "mox", "export", "--resolved", out_dir });
@@ -1216,28 +1214,4 @@ test "export --resolved: a partial target bakes its canonical owned serializatio
     const want = try mox.apply.canonical.canonicalOwned(a, &doc, &paths);
     const baked = try read(io, a, try std.fs.path.join(a, &.{ out_dir, "app.toml" }));
     try std.testing.expectEqualStrings(want, baked);
-}
-
-test "doctor: an own attribute with no source is an advisory" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/app.toml", "[tui]\nk = 1\n");
-    try writeRepo(
-        io,
-        &tmp,
-        "repo/.mox/attributes.toml",
-        "[\"app.toml\"]\nown = [\"tui\"]\n\n[\"ghost.toml\"]\nown = [\"tui\"]\n",
-    );
-
-    const r = try h.run(&.{ "mox", "doctor" });
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "orphan-own ghost.toml") != null);
-    // The declaration whose source exists is not flagged.
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "orphan-own app.toml") == null);
 }

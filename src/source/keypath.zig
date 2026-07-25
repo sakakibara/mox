@@ -1,6 +1,6 @@
 //! TOML dotted-key grammar for partial-ownership declarations.
 //!
-//! An `own` entry in `.mox/attributes.toml` names a key subtree with TOML's
+//! An `own` head directive names a key subtree with TOML's
 //! dotted-key syntax, verbatim: bare segments (`A-Za-z0-9_-`), basic
 //! (`"..."`) and literal (`'...'`) quoted segments, whitespace allowed
 //! around the dots (`projects."/tmp/example"`, `remote."my origin".url`).

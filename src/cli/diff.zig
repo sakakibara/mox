@@ -146,8 +146,10 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
         error.InvalidOwnPath,
+        error.InvalidCheckDirective,
+        error.CheckWithoutOwnership,
         => {
-            try ctx.err.print("mox diff: .mox/attributes.toml: {s}: {s}\n", .{
+            try ctx.err.print("mox diff: ownership declaration: {s}: {s}\n", .{
                 walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
             });
             return 1;

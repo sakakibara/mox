@@ -272,16 +272,17 @@ test "walk: refuses symlinks in source tree" {
     try std.testing.expectError(error.SymlinkInSource, result);
 }
 
-test "walk: own and check are parsed onto the managed file" {
+test "walk: own and check head directives are parsed onto the managed file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeFile(io, tmp.dir, "src/.codex/config.toml", "[tui.keymap.global]\n");
-    try writeFile(io, tmp.dir, ".mox/attributes.toml",
-        \\[".codex/config.toml"]
-        \\own = ["tui.keymap.global", "projects.\"/tmp/example\"", "remote.\"my origin\".url"]
-        \\check = ["scripts/check/codex-config", "--strict"]
+    try writeFile(io, tmp.dir, "src/.codex/config.toml",
+        \\# mox: own tui.keymap.global
+        \\# mox: own projects."/tmp/example"
+        \\# mox: own remote."my origin".url
+        \\# mox: check "scripts/check/codex-config" "--strict"
+        \\[tui.keymap.global]
         \\
     );
 
@@ -307,15 +308,15 @@ test "walk: own and check are parsed onto the managed file" {
     try std.testing.expectEqualStrings("--strict", f.check_argv[1]);
 }
 
-test "walk: own on a gated target (orphan .d, no base) is carried too" {
+test "walk: a gated partial file declares in its base head, above the gate" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeFile(io, tmp.dir, "src/.codex/config.toml.d/os=darwin.toml", "[tui.keymap.global]\n");
-    try writeFile(io, tmp.dir, ".mox/attributes.toml",
-        \\[".codex/config.toml"]
-        \\own = ["tui.keymap.global"]
+    try writeFile(io, tmp.dir, "src/.codex/config.toml",
+        \\# mox: own tui.keymap.global
+        \\# mox: when tool=codex
+        \\[tui.keymap.global]
         \\
     );
 
@@ -327,7 +328,7 @@ test "walk: own on a gated target (orphan .d, no base) is carried too" {
 
     const result = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
-    try std.testing.expect(!result.files[0].has_base);
+    try std.testing.expect(result.files[0].has_base);
     try std.testing.expectEqual(@as(usize, 1), result.files[0].own_paths.len);
     try std.testing.expectEqualStrings("tui.keymap.global", result.files[0].own_paths[0].raw);
 }
@@ -337,12 +338,7 @@ test "walk: own on an unstructured target is rejected, naming the target" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeFile(io, tmp.dir, "src/.zshrc", "export EDITOR=nvim\n");
-    try writeFile(io, tmp.dir, ".mox/attributes.toml",
-        \\[".zshrc"]
-        \\own = ["alias.ls"]
-        \\
-    );
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: own alias.ls\nexport EDITOR=nvim\n");
 
     const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(src_dir);
@@ -361,11 +357,10 @@ test "walk: own combined with seed_once or symlink is rejected" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeFile(io, tmp.dir, "src/.config/app/config.toml", "[a]\n");
+    try writeFile(io, tmp.dir, "src/.config/app/config.toml", "# mox: own a\n[a]\n");
     try writeFile(io, tmp.dir, ".mox/attributes.toml",
         \\[".config/app/config.toml"]
         \\seed_once = true
-        \\own = ["a"]
         \\
     );
 
@@ -385,7 +380,6 @@ test "walk: own combined with seed_once or symlink is rejected" {
     try writeFile(io, tmp.dir, ".mox/attributes.toml",
         \\[".config/app/config.toml"]
         \\symlink = true
-        \\own = ["a"]
         \\
     );
     try std.testing.expectError(
@@ -400,15 +394,11 @@ test "walk: own on a generator source is rejected" {
     defer tmp.cleanup();
 
     try writeFile(io, tmp.dir, "src/.config/git/ids.toml",
+        \\# mox: own entry
         \\# mox: for id in "data/ids.toml" into "<id.slug>.conf"
         \\[entry]
         \\slug = "<id.slug>"
         \\# mox: end
-        \\
-    );
-    try writeFile(io, tmp.dir, ".mox/attributes.toml",
-        \\[".config/git/ids.toml"]
-        \\own = ["entry"]
         \\
     );
 
@@ -429,12 +419,7 @@ test "walk: an own path the key grammar rejects names target and path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeFile(io, tmp.dir, "src/.codex/config.toml", "[tui]\n");
-    try writeFile(io, tmp.dir, ".mox/attributes.toml",
-        \\[".codex/config.toml"]
-        \\own = ["tui..global"]
-        \\
-    );
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "# mox: own tui..global\n[tui]\n");
 
     const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(src_dir);

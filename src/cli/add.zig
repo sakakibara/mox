@@ -1,6 +1,5 @@
 const std = @import("std");
 const cli = @import("cli");
-const toml = @import("toml");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 
@@ -14,8 +13,8 @@ pub const Outcome = enum {
     is_directory,
     already_managed,
     into_overlay_dir,
-    /// The target carries an `own` declaration: it is managed per key-path,
-    /// so a whole-file add would contradict the ownership contract.
+    /// The target's source head declares ownership: it is managed per
+    /// key-path, so a whole-file add would contradict the contract.
     partial_target,
 };
 
@@ -83,16 +82,15 @@ pub fn addFile(
     // A file inside a `<base>.d/` directory would be misread as an overlay.
     if (intoOverlayDir(trimmed)) return .{ .outcome = .into_overlay_dir };
 
-    // A target with an `own` declaration is partially owned; a whole-file
-    // capture of it would sweep the program's region into the source.
-    {
-        const attrs = try mox.source.attributes.load(arena, io, repo_dir);
-        if (attrs.own(trimmed).len > 0) return .{ .outcome = .partial_target };
-    }
-
     const src_path = try std.fs.path.join(arena, &.{ repo_dir, "src", trimmed });
 
     if (Io.Dir.cwd().access(io, src_path, .{})) |_| {
+        // A source head declaring ownership means the target is partially
+        // owned; a whole-file capture of it would sweep the program's
+        // region into the source.
+        if (try sourceDeclaresOwnership(arena, io, src_path, trimmed)) {
+            return .{ .outcome = .partial_target, .src_path = src_path };
+        }
         return .{ .outcome = .already_managed, .src_path = src_path };
     } else |e| switch (e) {
         error.FileNotFound => {},
@@ -126,6 +124,19 @@ pub fn addFile(
     const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
     try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode, .seed_once = seed_once });
     return .{ .outcome = .added, .src_path = src_path };
+}
+
+/// True when the managed source at `src_path` declares partial ownership in
+/// its head. A malformed head reads as declared: the walk refuses it anyway,
+/// and a whole-file add over it must not proceed.
+fn sourceDeclaresOwnership(arena: std.mem.Allocator, io: Io, src_path: []const u8, key: []const u8) !bool {
+    const format = mox.source.format.formatOfPath(key) orelse return false;
+    const content = Io.Dir.cwd().readFileAlloc(io, src_path, arena, .limited(64 * 1024 * 1024)) catch return false;
+    const parsed = mox.source.head.parse(arena, content, mox.source.tree.markerForFormat(format)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+    return parsed.ownership != .none;
 }
 
 /// Merge `fields` into the target's `.mox/attributes.toml` entry (loading the
@@ -176,11 +187,10 @@ pub const OwnResult = struct {
 
 /// Take partial ownership of a live file: extract the declared paths' raw
 /// byte spans into a new source file (comments inside owned content survive
-/// verbatim), record the `own` list in `.mox/attributes.toml` through the
-/// TOML document model (the file is user-authored; its formatting and
-/// comments are preserved), and report what remains the program's. Content
-/// paths must be present live; `absent_raws` declare enforced absence and
-/// contribute no content.
+/// verbatim), prefixed with `mox: own` head directives so the declaration
+/// and the content are created together in one file, and report what
+/// remains the program's. Content paths must be present live; `absent_raws`
+/// declare enforced absence and contribute no content.
 pub fn addOwnFile(
     arena: std.mem.Allocator,
     io: Io,
@@ -263,17 +273,39 @@ pub fn addOwnFile(
         Io.Dir.cwd().createDirPath(io, parent) catch {};
     }
     const mode = mox.apply.write.modeOf(st.permissions);
-    try mox.apply.write.writeAtomic(io, src_path, extracted, mode);
+    const own_list = try std.mem.concat(arena, []const u8, &.{ own_raws, absent_raws });
+    const source_text = try std.mem.concat(arena, u8, &.{
+        try headDirectiveLines(arena, format, own_list),
+        extracted,
+    });
+    try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
 
     const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    const own_list = try std.mem.concat(arena, []const u8, &.{ own_raws, absent_raws });
-    try writeOwnAttrEntry(arena, io, repo_dir, trimmed, own_list, recorded_mode);
+    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode });
 
     return .{
         .outcome = .added,
         .src_path = src_path,
         .unowned_top = partial.unownedTopLevelCount(&live_doc, all_paths),
     };
+}
+
+/// The `mox: own` head-directive lines declaring `own_list`, in the
+/// format's comment marker.
+fn headDirectiveLines(
+    arena: std.mem.Allocator,
+    format: mox.source.format.Format,
+    own_list: []const []const u8,
+) ![]const u8 {
+    const marker = mox.source.tree.markerForFormat(format);
+    var out: std.ArrayList(u8) = .empty;
+    for (own_list) |raw| {
+        try out.appendSlice(arena, marker);
+        try out.appendSlice(arena, " mox: own ");
+        try out.appendSlice(arena, raw);
+        try out.append(arena, '\n');
+    }
+    return out.toOwnedSlice(arena);
 }
 
 fn parseOwnRaws(
@@ -293,42 +325,6 @@ fn parseOwnRaws(
         o.* = .{ .raw = raw, .segments = segments };
     }
     return out;
-}
-
-/// Record the target's `own` list (and an uncarryable mode) by editing
-/// `.mox/attributes.toml` through the TOML document model: the file is
-/// user-authored, so its comments and formatting survive the edit.
-fn writeOwnAttrEntry(
-    arena: std.mem.Allocator,
-    io: Io,
-    repo_dir: []const u8,
-    key: []const u8,
-    own_list: []const []const u8,
-    mode: ?u32,
-) !void {
-    const path = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "attributes.toml" });
-    const existing: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |e| switch (e) {
-        error.FileNotFound => null,
-        else => return e,
-    };
-    var doc = if (existing) |text|
-        try toml.Document.parse(arena, text, .{})
-    else
-        try toml.Document.empty(arena, .{});
-
-    var arr: toml.Value.Array = .empty;
-    for (own_list) |p| try arr.append(arena, .{ .string = p });
-    try doc.setValueSegments(&.{ key, "own" }, .{ .array = arr });
-    if (mode) |m| {
-        const octal = try std.fmt.allocPrint(arena, "0{o}", .{m});
-        try doc.setValueSegments(&.{ key, "mode" }, .{ .string = octal });
-    }
-
-    var aw: Io.Writer.Allocating = .init(arena);
-    defer aw.deinit();
-    try doc.emit(&aw.writer);
-    if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
 }
 
 const Spec = struct {
@@ -432,7 +428,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             return 1;
         },
         .partial_target => {
-            try ctx.err.print("mox add: {s}: partially owned (an own declaration exists in .mox/attributes.toml); edit its source, or remove the declaration first\n", .{live_path});
+            try ctx.err.print("mox add: {s}: partially owned (its source head declares ownership); edit the source, or remove the declaration first\n", .{live_path});
             return 1;
         },
     }

@@ -296,7 +296,17 @@ pub fn composeTracked(
 
     const ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
 
-    const base_content = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
+    const base_raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
+
+    // A partial file's head ownership directives are declaration, not DSL:
+    // strip exactly those lines before parsing, so they neither reach the
+    // directive parser nor composed output.
+    const base_content = if (file.own_paths.len == 0)
+        base_raw
+    else if (markerForFile(file.source_base_path, base_raw)) |m|
+        try source.head.strip(arena, base_raw, m)
+    else
+        base_raw;
 
     const marker = markerForFile(file.source_base_path, base_content) orelse {
         // No signal at all. Pass through verbatim — directiveless config
@@ -322,7 +332,7 @@ pub fn composeTracked(
             return @as(?[]u8, try out.toOwnedSlice(arena));
         }
         try recordWholeBase(arena, prov, base_content);
-        return base_content;
+        return @constCast(base_content);
     };
 
     var parse_loc: dsl.driver.ParseLoc = .{};

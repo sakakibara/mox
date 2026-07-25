@@ -2449,11 +2449,9 @@ test "apply drift: non-interactive and --force keep their exact contracts" {
 // key-path; everything outside the declared paths belongs to the program
 // that also writes the file.
 
-fn writePartialFixture(io: Io, tmp: *std.testing.TmpDir, source: []const u8, attributes: []const u8) !void {
+fn writePartialFixture(io: Io, tmp: *std.testing.TmpDir, source: []const u8) !void {
     try tmp.dir.createDirPath(io, "repo/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = source });
-    try tmp.dir.createDirPath(io, "repo/.mox");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = attributes });
 }
 
 fn mtimeNs(io: Io, path: []const u8) !i96 {
@@ -2469,7 +2467,7 @@ test "apply partial: creates a missing live file and the second apply writes not
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
@@ -2494,7 +2492,7 @@ test "apply partial: adopts a matching live file, then patches around the progra
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
     const program_live =
@@ -2519,7 +2517,7 @@ test "apply partial: adopts a matching live file, then patches around the progra
     // Source changes; the owned span is replaced, every program byte kept.
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/app.toml",
-        .data = "[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n",
+        .data = "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n",
     });
     const r2 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
@@ -2545,7 +2543,7 @@ test "apply partial: first-contact drift is skipped, --force reasserts the sourc
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
     const drifted =
@@ -2584,8 +2582,7 @@ test "apply partial: enforced absence removes through the record and drifts past
     defer arena.deinit();
     const a = arena.allocator();
 
-    const attrs = "[\"app.toml\"]\nown = [\"keep\", \"gone\"]\n";
-    try writePartialFixture(io, &tmp, "[keep]\nk = 1\n\n[gone]\ng = 1\n", attrs);
+    try writePartialFixture(io, &tmp, "# mox: own keep\n# mox: own gone\n[keep]\nk = 1\n\n[gone]\ng = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
@@ -2593,13 +2590,13 @@ test "apply partial: enforced absence removes through the record and drifts past
 
     // The source stops populating `gone`; live matches the record there, so
     // enforced absence removes it cleanly.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[keep]\nk = 1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own keep\n# mox: own gone\n[keep]\nk = 1\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "[gone]") == null);
 
     // Re-populated: the recorded absence matches live absence, so the table
     // comes back without ceremony.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[keep]\nk = 1\n\n[gone]\ng = 2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own keep\n# mox: own gone\n[keep]\nk = 1\n\n[gone]\ng = 2\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "g = 2") != null);
 
@@ -2607,7 +2604,7 @@ test "apply partial: enforced absence removes through the record and drifts past
     // record, so removal is drift until forced.
     const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), "g = 2", "g = 99");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[keep]\nk = 1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own keep\n# mox: own gone\n[keep]\nk = 1\n" });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
@@ -2625,7 +2622,7 @@ test "apply partial: a path added to own is first contact, never a silent overwr
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[alpha]\nx = 1\n", "[\"app.toml\"]\nown = [\"alpha\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own alpha\n[alpha]\nx = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
@@ -2638,12 +2635,8 @@ test "apply partial: a path added to own is first contact, never a silent overwr
     // own grows to cover beta with DIFFERENT composed content: first contact
     // for beta alone -> drift, alpha stays record-compared.
     try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/.mox/attributes.toml",
-        .data = "[\"app.toml\"]\nown = [\"alpha\", \"beta\"]\n",
-    });
-    try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/app.toml",
-        .data = "[alpha]\nx = 1\n\n[beta]\ntheirs = false\n",
+        .data = "# mox: own alpha\n# mox: own beta\n[alpha]\nx = 1\n\n[beta]\ntheirs = false\n",
     });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
@@ -2667,9 +2660,7 @@ test "apply partial: an ini own declaration matches sections with the dialect's 
     const a = arena.allocator();
 
     try tmp.dir.createDirPath(io, "repo/src");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.ini", .data = "[colors]\nfg = blue\n" });
-    try tmp.dir.createDirPath(io, "repo/.mox");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"app.ini\"]\nown = [\"COLORS\"]\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.ini", .data = "# mox: own COLORS\n[colors]\nfg = blue\n" });
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
@@ -2685,7 +2676,7 @@ test "apply partial: a composed leaf outside the declaration refuses the file" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "stray = 1\n\n[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\nstray = 1\n\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
 
     const r = try c.run(&.{ "mox", "apply" });
@@ -2703,7 +2694,7 @@ test "apply partial: an unparseable live file refuses the patch" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "not [ = toml = [\n" });
@@ -2722,7 +2713,7 @@ test "apply partial: --dry-run reports would-create and drift without writing" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
@@ -2747,11 +2738,9 @@ test "apply partial: a gated-off file is untouched and gains no record" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Whole-file gate: only a non-matching axis overlay, no base.
-    try tmp.dir.createDirPath(io, "repo/src/app.toml.d");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml.d/os=linux.toml", .data = "[tui]\nk = 1\n" });
-    try tmp.dir.createDirPath(io, "repo/.mox");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"app.toml\"]\nown = [\"tui\"]\n" });
+    // Whole-file gate in the base head, below the ownership declaration.
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n# mox: when os=linux\n[tui]\nk = 1\n" });
 
     const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
     const live = try c.homePath("app.toml");
@@ -2773,7 +2762,7 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     const a = arena.allocator();
 
     const secret_value = "partial-s3cr3t-DO-NOT-LEAK-77aa88bb";
-    try writePartialFixture(io, &tmp, "[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own api\n[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n");
     const c = try testutil.setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_PARTIAL_SECRET", .value = secret_value }},
     });
@@ -2816,8 +2805,7 @@ test "apply partial: a shrunk own list on a secret record reasserts as outdated,
     try writePartialFixture(
         io,
         &tmp,
-        "[api]\ntoken = \"<secret:env:MY_SHRINK_SECRET>\"\n\n[b]\nx = 1\n",
-        "[\"app.toml\"]\nown = [\"api\", \"b\"]\n",
+        "# mox: own api\n# mox: own b\n[api]\ntoken = \"<secret:env:MY_SHRINK_SECRET>\"\n\n[b]\nx = 1\n",
     );
     const c = try testutil.setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_SHRINK_SECRET", .value = secret_value }},
@@ -2830,11 +2818,7 @@ test "apply partial: a shrunk own list on a secret record reasserts as outdated,
     // scope: a stale record, reasserted without consent -- never drift.
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/app.toml",
-        .data = "[api]\ntoken = \"<secret:env:MY_SHRINK_SECRET>\"\nextra = \"new\"\n",
-    });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/.mox/attributes.toml",
-        .data = "[\"app.toml\"]\nown = [\"api\"]\n",
+        .data = "# mox: own api\n[api]\ntoken = \"<secret:env:MY_SHRINK_SECRET>\"\nextra = \"new\"\n",
     });
     const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), "x = 1", "x = 999");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
@@ -2861,9 +2845,7 @@ test "apply: an own declaration the walk rejects reports the target by name" {
     const a = arena.allocator();
 
     try tmp.dir.createDirPath(io, "repo/src");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "text\n" });
-    try tmp.dir.createDirPath(io, "repo/.mox");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"notes.txt\"]\nown = [\"a\"]\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "# mox: own a\ntext\n" });
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
@@ -2890,7 +2872,7 @@ test "status partial: MISSING, clean, OUTDATED, DRIFT are decided on the owned s
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
@@ -2912,13 +2894,13 @@ test "status partial: MISSING, clean, OUTDATED, DRIFT are decided on the owned s
     try std.testing.expect(lineHasBoth(still_clean.out, "clean", "app.toml"));
 
     // The source moved on while live owned still matches the record.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
     const outdated = try c.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), outdated.rc);
     try std.testing.expect(lineHasBoth(outdated.out, "OUTDATED", "app.toml"));
 
     // Live owned content edited past the record.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 1\n" });
     const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), "k = 1", "k = 9");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
     const drift = try c.run(&.{ "mox", "status" });
@@ -2934,7 +2916,7 @@ test "status partial: first contact differing from composed is DRIFT, never OUTD
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
@@ -2961,7 +2943,7 @@ test "status partial: a secret record compares by hash and never prints the valu
     const a = arena.allocator();
 
     const secret_value = "status-s3cr3t-DO-NOT-LEAK-11aa22bb";
-    try writePartialFixture(io, &tmp, "[api]\ntoken = \"<secret:env:MY_STATUS_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own api\n[api]\ntoken = \"<secret:env:MY_STATUS_SECRET>\"\n");
     const c = try testutil.setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_STATUS_SECRET", .value = secret_value }},
     });
@@ -2990,7 +2972,7 @@ test "diff partial: shows only the owned subtree; program keys never appear" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
@@ -3005,7 +2987,7 @@ test "diff partial: shows only the owned subtree; program keys never appear" {
 
     // The owned content changes: the diff is over the owned subtree as text,
     // labeled with the live path, and still free of program keys.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
     const r = try c.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "app.toml (live)") != null);
@@ -3027,8 +3009,7 @@ test "diff partial: secret keys render masked on both sides" {
     try writePartialFixture(
         io,
         &tmp,
-        "[api]\ntoken = \"<secret:env:MY_DIFF_SECRET>\"\n\n[ui]\ncolor = \"red\"\n",
-        "[\"app.toml\"]\nown = [\"api\", \"ui\"]\n",
+        "# mox: own api\n# mox: own ui\n[api]\ntoken = \"<secret:env:MY_DIFF_SECRET>\"\n\n[ui]\ncolor = \"red\"\n",
     );
     const c = try testutil.setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_DIFF_SECRET", .value = secret_value }},
@@ -3057,7 +3038,7 @@ test "diff partial: secret keys render masked on both sides" {
 // anything else -- or a timeout -- refuses it.
 
 const check_rel = "scripts/check/hook" ++ script_ext;
-const check_attrs = "[\"app.toml\"]\nown = [\"tui\"]\ncheck = [\"" ++ check_rel ++ "\"]\n";
+const check_source = "# mox: own tui\n# mox: check \"" ++ check_rel ++ "\"\n[tui]\nk = 1\n";
 
 fn tmpRoot(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) ![]const u8 {
     const cwd = try std.process.currentPathAlloc(io, a);
@@ -3107,7 +3088,7 @@ test "apply partial check: an accepting hook sees the candidate through its env 
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    try writePartialFixture(io, &tmp, check_source);
     const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "check-log.txt" });
     try writeChecker(a, io, &tmp, try acceptingChecker(a, log));
 
@@ -3127,7 +3108,7 @@ test "apply partial check: a rejecting hook refuses the file and reports its out
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    try writePartialFixture(io, &tmp, check_source);
     const reject: []const u8 = if (builtin.os.tag == .windows)
         "Write-Output 'custom-rejection-detail'\nexit 3\n"
     else
@@ -3188,7 +3169,7 @@ test "apply partial check: the staging dir is private to the user" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    try writePartialFixture(io, &tmp, check_source);
     const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "mode-log.txt" });
     const checker = try std.fmt.allocPrint(a,
         \\#!/bin/sh
@@ -3212,7 +3193,7 @@ test "apply partial check: --skip-scripts runs no check and writes no check-bear
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    try writePartialFixture(io, &tmp, check_source);
     const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "check-log.txt" });
     try writeChecker(a, io, &tmp, try acceptingChecker(a, log));
 
@@ -3247,7 +3228,7 @@ test "apply partial check: a hanging hook is killed within the timeout bound" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    try writePartialFixture(io, &tmp, check_source);
     const hang: []const u8 = if (builtin.os.tag == .windows)
         "Start-Sleep -Seconds 30\nexit 0\n"
     else
@@ -3278,7 +3259,7 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
     const program_live = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 1\n\n[state]\ncount = 1\n";
@@ -3286,7 +3267,7 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
     // The source moves on; the write snapshots the pre-write live file.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = 2") != null);
 
@@ -3324,7 +3305,7 @@ test "rollback: a broken attributes file blocks neither whole-file restores nor 
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v1\n" });
     const c = try cliSetup(a, io, &tmp);
     const live_b = try c.homePath("b.conf");
@@ -3333,18 +3314,14 @@ test "rollback: a broken attributes file blocks neither whole-file restores nor 
 
     // Both sources move on; the second apply snapshots both live files.
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v2\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    // The attributes file breaks: own on an unstructured target fails the
-    // tree walk. Partial detection comes from the owned record, so the
-    // whole-file restore proceeds and the partial target is withheld, never
-    // whole-file clobbered.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "text\n" });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/.mox/attributes.toml",
-        .data = "[\"app.toml\"]\nown = [\"tui\"]\n\n[\"notes.txt\"]\nown = [\"x\"]\n",
-    });
+    // The source tree breaks: own declared in an unstructured target's head
+    // fails the tree walk. Partial detection comes from the owned record, so
+    // the whole-file restore proceeds and the partial target is withheld,
+    // never whole-file clobbered.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "# mox: own x\ntext\n" });
 
     const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
     const ids = try mox.apply.snapshot.list(a, io, snaps);
@@ -3367,7 +3344,7 @@ test "rollback partial: a secret-masked snapshot is refused, live untouched" {
     const a = arena.allocator();
 
     const secret_value = "rollback-s3cr3t-DO-NOT-LEAK-55ee66ff";
-    try writePartialFixture(io, &tmp, "[api]\ntoken = \"<secret:env:MY_ROLLBACK_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    try writePartialFixture(io, &tmp, "# mox: own api\n[api]\ntoken = \"<secret:env:MY_ROLLBACK_SECRET>\"\n");
     const c = try testutil.setup(a, io, &tmp, .{
         .extra_env = &.{.{ .name = "MY_ROLLBACK_SECRET", .value = secret_value }},
     });

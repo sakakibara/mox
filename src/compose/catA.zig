@@ -61,6 +61,21 @@ pub fn compose(
 
 const Format = enum { toml, gitconfig, yaml, json, ini };
 
+/// Read the base layer's text, with head ownership directives stripped for a
+/// partial file so no `mox:` declaration line can reach composed output (a
+/// single-layer file passes through verbatim, comments included).
+fn readBaseLayer(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    path: []const u8,
+    marker: []const u8,
+) ![]const u8 {
+    const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
+    if (!file.has_base or file.own_paths.len == 0) return raw;
+    return source.head.strip(arena, raw, marker);
+}
+
 fn formatOf(path: []const u8) ?Format {
     if (source.format.isGitConfigPath(path)) return .gitconfig;
     const Pair = struct { ext: []const u8, format: Format };
@@ -96,7 +111,7 @@ fn composeToml(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try Io.Dir.cwd().readFileAlloc(io, layers[0], arena, .limited(max_layer_bytes));
+    const base = try readBaseLayer(arena, io, file, layers[0], "#");
     // A whole-file existence gate belongs on a base file; when there is no base,
     // `layers[0]` is an overlay and its leading `# mox:` line is inert content.
     const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "#", bindings)) {
@@ -146,7 +161,7 @@ fn composeJson(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try Io.Dir.cwd().readFileAlloc(io, layers[0], arena, .limited(max_layer_bytes));
+    const base = try readBaseLayer(arena, io, file, layers[0], "//");
     const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "//", bindings)) {
         .off => return null,
         .on => |body| body,
@@ -190,7 +205,7 @@ fn composeYaml(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try Io.Dir.cwd().readFileAlloc(io, layers[0], arena, .limited(max_layer_bytes));
+    const base = try readBaseLayer(arena, io, file, layers[0], "#");
     const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "#", bindings)) {
         .off => return null,
         .on => |body| body,
@@ -234,7 +249,7 @@ fn composeSectionMerge(
     const layers = try collectMatchingLayers(arena, file, bindings);
     if (layers.len == 0) return null;
 
-    const base = try Io.Dir.cwd().readFileAlloc(io, layers[0], arena, .limited(max_layer_bytes));
+    const base = try readBaseLayer(arena, io, file, layers[0], "#");
     const gated: ?[]const u8 = if (file.has_base) switch (try wholeFileGate(arena, base, "#", bindings)) {
         .off => return null,
         .on => |body| body,

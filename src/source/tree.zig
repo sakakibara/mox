@@ -7,6 +7,7 @@ const dirent = @import("dirent.zig");
 const attributes = @import("attributes.zig");
 const keypath = @import("keypath.zig");
 const format_mod = @import("format.zig");
+const head = @import("head.zig");
 const dsl = @import("../dsl/root.zig");
 
 const Io = std.Io;
@@ -97,14 +98,14 @@ pub const Region = struct {
 /// One declared partial-ownership key-path, parsed at walk time so every
 /// consumer works from decoded segments rather than re-splitting the string.
 pub const OwnPath = struct {
-    /// The declaration exactly as written in `.mox/attributes.toml`.
+    /// The declaration exactly as written in the source head directive.
     raw: []const u8,
     /// Decoded segments: quotes stripped, escapes resolved.
     segments: []const []const u8,
 };
 
-/// Names the target (and offending `own` path) when the walk rejects an
-/// attributes entry. Fixed-size like `cli.scope.Diag`: no allocation on the
+/// Names the target (and offending `own` path) when the walk rejects a head
+/// declaration. Fixed-size like `cli.scope.Diag`: no allocation on the
 /// error path.
 pub const Diag = struct {
     buf: [1024]u8 = undefined,
@@ -167,12 +168,13 @@ pub const ManagedFile = struct {
     /// candidate. Seed-once semantics for files the user edits after first
     /// creation (e.g. a machine-local config skeleton).
     create_once: bool = false,
-    /// Partial-ownership key-paths from `.mox/attributes.toml` (`own`),
-    /// parsed and validated by the walk. Empty means the whole file is
-    /// managed. Non-empty only on structured targets that are neither
-    /// symlink, seed-once, nor generator sources; the walk rejects the rest.
+    /// Partial-ownership key-paths from the base file's head directives
+    /// (`# mox: own <path>` lines in the leading comment block), parsed and
+    /// validated by the walk. Empty means the whole file is managed.
+    /// Non-empty only on structured base targets that are neither symlink,
+    /// seed-once, nor generator sources; the walk rejects the rest.
     own_paths: []const OwnPath = &.{},
-    /// Validation-hook argv from `.mox/attributes.toml` (`check`): a
+    /// Validation-hook argv from the base head's `check` directive: a
     /// repo-relative executable and its arguments, run against a candidate
     /// partial write before it lands. Empty means no hook.
     check_argv: []const []const u8 = &.{},
@@ -262,10 +264,11 @@ pub fn walk(
     return walkDiag(arena, io, src_dir, home_dir, null);
 }
 
-/// `walk` with a diagnostic: when an attributes entry fails validation (an
-/// `own` list on an unstructured, symlink, seed-once, or generator target,
-/// or an own path the key grammar rejects), `diag` names the target -- and,
-/// for a path error, the offending path.
+/// `walk` with a diagnostic: when a base head's ownership declaration fails
+/// validation (directives on an unstructured, symlink, seed-once, or
+/// generator target, a path the key grammar rejects, or a malformed
+/// directive line), `diag` names the target -- and, for a path error, the
+/// offending path.
 pub fn walkDiag(
     arena: std.mem.Allocator,
     io: Io,
@@ -380,7 +383,7 @@ fn walkDir(
         else
             rel;
         const explicit_mode = attrs.mode(target_key);
-        const own_paths = try ownPathsChecked(arena, io, .{ .dir = dir, .name = name }, target_key, attrs, diag);
+        const decl = try headChecked(arena, io, .{ .dir = dir, .name = name }, target_key, attrs, diag);
         try files.append(arena, .{
             .source_base_path = rel,
             .source_base_abs = abs,
@@ -392,8 +395,8 @@ fn walkDir(
             .mode_explicit = explicit_mode != null,
             .is_symlink = attrs.symlink(target_key),
             .create_once = attrs.seedOnce(target_key),
-            .own_paths = own_paths,
-            .check_argv = attrs.check(target_key),
+            .own_paths = decl.own_paths,
+            .check_argv = decl.check_argv,
         });
     }
 
@@ -442,14 +445,9 @@ fn walkDir(
         defer dot_d_dir.close(io);
 
         const live = try path_mod.toLivePath(arena, rel, home_dir);
-        // A gated file (no base, only overlays) may still be partial: a
-        // whole-file gate that is off leaves the live file untouched, exactly
-        // like any other managed file. No base means no generator probe.
-        const target_key = if (std.mem.startsWith(u8, rel, "src/"))
-            rel["src/".len..]
-        else
-            rel;
-        const own_paths = try ownPathsChecked(arena, io, null, target_key, attrs, diag);
+        // No base means no head to declare ownership in: a gated file that
+        // is also partial carries its directives in a base whose whole-file
+        // gate conditions the machine, never in an overlay.
         try files.append(arena, .{
             .source_base_path = rel,
             .source_base_abs = "",
@@ -457,33 +455,78 @@ fn walkDir(
             .has_base = false,
             .overlays = overlays,
             .regions = regions,
-            .own_paths = own_paths,
-            .check_argv = attrs.check(target_key),
         });
     }
 }
 
 const BaseRef = struct { dir: Io.Dir, name: []const u8 };
 
-/// Validate and parse a target's `own` declaration. Empty stays empty; a
-/// non-empty list is rejected on an unstructured target, combined with
-/// `symlink` or `seed_once`, on a generator source, or when a path fails the
-/// key grammar -- `diag` names the target (and the offending path).
-fn ownPathsChecked(
+const Decl = struct {
+    own_paths: []const OwnPath = &.{},
+    check_argv: []const []const u8 = &.{},
+};
+
+/// The comment marker head directives use for a structured format: `#`
+/// everywhere except JSON, whose sources are JSONC (`//`).
+pub fn markerForFormat(format: format_mod.Format) []const u8 {
+    return if (format == .json) "//" else "#";
+}
+
+/// Markers probed on an unstructured base, so a head declaration there is a
+/// walk error rather than silently inert content.
+const probe_markers = [_][]const u8{ "#", "//", ";", "--" };
+
+/// Read and validate a base file's head declaration. No directives yields an
+/// empty declaration; a declaration is rejected on an unstructured target,
+/// combined with `symlink` or `seed_once`, on a generator source, on a
+/// malformed directive line, or when a path fails the key grammar -- `diag`
+/// names the target (and the offending path).
+fn headChecked(
     arena: std.mem.Allocator,
     io: Io,
-    base: ?BaseRef,
+    base: BaseRef,
     target_key: []const u8,
     attrs: *const attributes.Attributes,
     diag: ?*Diag,
-) ![]const OwnPath {
-    const own_list = attrs.own(target_key);
-    if (own_list.len == 0) return &.{};
+) !Decl {
+    const content = base.dir.readFileAlloc(io, base.name, arena, .limited(max_base_bytes)) catch return .{};
 
-    if (format_mod.formatOfPath(target_key) == null) {
-        setDiag(diag, target_key);
-        return error.OwnOnUnstructuredTarget;
-    }
+    const format = format_mod.formatOfPath(target_key) orelse {
+        // Directives on an unstructured target cannot take effect; refuse
+        // them loudly under every marker spelling they could arrive in.
+        for (probe_markers) |marker| {
+            const parsed = head.parse(arena, content, marker) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    setDiag(diag, target_key);
+                    return error.OwnOnUnstructuredTarget;
+                },
+            };
+            if (parsed.ownership != .none) {
+                setDiag(diag, target_key);
+                return error.OwnOnUnstructuredTarget;
+            }
+        }
+        return .{};
+    };
+
+    const parsed = head.parse(arena, content, markerForFormat(format)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EmptyDirectivePath => {
+            setDiag(diag, target_key);
+            return error.InvalidOwnPath;
+        },
+        error.InvalidCheckArgv, error.DuplicateCheckDirective => {
+            setDiag(diag, target_key);
+            return error.InvalidCheckDirective;
+        },
+        error.CheckWithoutOwnership => {
+            setDiag(diag, target_key);
+            return error.CheckWithoutOwnership;
+        },
+    };
+    if (parsed.ownership == .none) return .{};
+
     if (attrs.symlink(target_key)) {
         setDiag(diag, target_key);
         return error.OwnOnSymlink;
@@ -492,15 +535,15 @@ fn ownPathsChecked(
         setDiag(diag, target_key);
         return error.OwnOnSeedOnce;
     }
-    if (base) |b| {
-        if (try isGeneratorSource(arena, io, b)) {
-            setDiag(diag, target_key);
-            return error.OwnOnGenerator;
-        }
+    // The probe parses the DSL, which rejects head-directive lines as
+    // unknown verbs; probe the stripped body, exactly what compose sees.
+    if (isGeneratorContent(arena, try head.strip(arena, content, markerForFormat(format)))) {
+        setDiag(diag, target_key);
+        return error.OwnOnGenerator;
     }
 
-    const out = try arena.alloc(OwnPath, own_list.len);
-    for (own_list, out) |raw, *o| {
+    const out = try arena.alloc(OwnPath, parsed.paths.len);
+    for (parsed.paths, out) |raw, *o| {
         const segments = keypath.parse(arena, raw) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -513,21 +556,20 @@ fn ownPathsChecked(
         };
         o.* = .{ .raw = raw, .segments = segments };
     }
-    return out;
+    return .{ .own_paths = out, .check_argv = parsed.check };
 }
 
 fn setDiag(diag: ?*Diag, text: []const u8) void {
     if (diag) |d| d.set(text);
 }
 
-/// True when the base file is a generator (a `for ... into` DSL loop): it
+/// True when the base content is a generator (a `for ... into` DSL loop): it
 /// fans out to other live files, so there is no single document to partially
 /// own. Mirrors `compose.catB.composeGenerator`'s marker+parse probe,
 /// restricted to the comment markers the structured formats can carry (`#`,
 /// plus `;` -- ini). A parse failure is not a generator decision; the normal
 /// compose path reports it with a source location.
-fn isGeneratorSource(arena: std.mem.Allocator, io: Io, base: BaseRef) !bool {
-    const content = base.dir.readFileAlloc(io, base.name, arena, .limited(max_base_bytes)) catch return false;
+fn isGeneratorContent(arena: std.mem.Allocator, content: []const u8) bool {
     const markers = [_][]const u8{ "#", ";" };
     for (markers) |marker| {
         const parsed = dsl.driver.parseFile(arena, content, marker, null) catch continue;
