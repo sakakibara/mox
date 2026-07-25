@@ -58,11 +58,60 @@ If you instead hand-edited the **live** file (say `~/.zshrc` directly), pull tha
 change back into the source:
 
 ```sh
-mox commit ~/.zshrc
+mox commit ~/.zshrc      # status, diff, apply, and commit all take paths
 ```
 
-`commit` confirms each hunk and routes it to the right place -- a base line to
-`src/`, a fragment line to its fragment, a loop-row edit to its data source.
+`commit` confirms each change and routes it to the right place. A text file
+routes per hunk -- a base line to `src/`, a fragment line to its fragment, a
+loop-row edit to its data source:
+
+```
+.zshrc  hunk 1/1  ->  src/.zshrc (base)
+    - export EDITOR=vim
+    + export EDITOR=nvim
+  [Y]es  [s]kip  [q]uit  [?]help
+```
+
+A file composed by **merging layers** (TOML/JSON/YAML/INI/gitconfig) routes per
+**key** instead: each changed key goes to the layer that defines it -- edit the
+theme your `os=darwin` overlay set, and `[y]` writes the overlay, not the base.
+`[p]` picks a different layer; placing a key in a *less* specific layer promotes
+it, deleting the overrides that shadowed it here, and if that changes what any
+other machine composes, mox lists those configurations with before/after values
+and asks first:
+
+```
+config.toml  key 1/1  ->  write to os=darwin.toml
+    theme  ->  "solarized"
+  [Y]es  [p]ick  [s]kip  [q]uit  [?]help
+```
+
+A line whose value came from a fact (`<machine.email>`) offers `[f]` -- update
+the fact itself, in `facts.toml`, never the repo -- or `[d]` to change the
+source's `| default` instead. A value derived from a secret is never routed.
+
+Every routed edit is verified before it sticks: mox recomposes the file under
+every configuration the sources express, and anything you did not choose to
+affect composing differently rolls the file back.
+
+## When apply meets an edited live file
+
+`mox apply` never silently overwrites a live file you (or a program) edited
+since mox last wrote it. On a terminal it asks, per file:
+
+```
+DRIFT  ~/.config/nvim/pack-lock.json
+  [o]verwrite  [c]ommit  [d]iff  [s]kip  [O] all  [S] skip all  [q]uit
+```
+
+`[o]` discards the live edit and writes the composed output (snapshotted
+first). `[c]` keeps the live edit -- it runs `commit` on that file after the
+apply, so the change lands in its source and the file ends in sync. `[d]`
+shows the diff and asks again. Two drifted files wanting opposite outcomes
+resolve in one run.
+
+Off a terminal (scripts, CI) nothing is asked: drifted files are skipped,
+reported, and the run exits 1. `--force` overwrites them all without asking.
 
 ## A Mac-only (or per-profile) difference
 
