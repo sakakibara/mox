@@ -62,10 +62,49 @@ pub fn setMode(live_path: []const u8, mode: u32) !void {
     if (std.c.chmod(path_z, @intCast(mode)) != 0) return error.ChmodFailed;
 }
 
+/// Identity of a live file at apply's initial read, for the partial write's
+/// post-fsync recheck: any change to (inode, size, mtime) since the parse
+/// means an external writer raced the apply.
+pub const LiveStat = struct {
+    inode: Io.File.INode,
+    size: u64,
+    mtime_ns: i96,
+};
+
+/// Stat `live_path` without following a symlink, or null when absent (or
+/// unstattable -- the caller's recheck then refuses, the safe direction).
+pub fn liveStat(io: Io, live_path: []const u8) ?LiveStat {
+    const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch return null;
+    return .{ .inode = st.inode, .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
+
+const Recheck = union(enum) {
+    /// Whole-file path: the caller's own TOCTOU re-read guards the window.
+    none,
+    /// Partial creation: the live path must still be absent at rename time.
+    absent,
+    /// Partial patch: the live file must still match the initial read.
+    stat: LiveStat,
+};
+
 /// Write `content` to `live_path` atomically with the requested unix mode:
 /// write to a `.mox-tmp` sidecar, chmod, then rename to the target. Creates
 /// parent directories as needed.
 pub fn writeAtomic(io: Io, live_path: []const u8, content: []const u8, mode: u32) !void {
+    return writeAtomicImpl(io, live_path, content, mode, .none);
+}
+
+/// `writeAtomic` with the partial-apply race discipline: after the temp
+/// file's fsync, immediately before the rename, re-stat the live path and
+/// refuse (removing the temp file) when it changed since `expected` was
+/// captured -- a program's write during mox's window is never silently
+/// destroyed. `expected` null means the live path was absent at read time
+/// and must still be absent.
+pub fn writeAtomicPartial(io: Io, live_path: []const u8, content: []const u8, mode: u32, expected: ?LiveStat) !void {
+    return writeAtomicImpl(io, live_path, content, mode, if (expected) |e| .{ .stat = e } else .absent);
+}
+
+fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32, recheck: Recheck) !void {
     // Create parent directory if needed.
     if (std.fs.path.dirname(live_path)) |parent| {
         try Io.Dir.cwd().createDirPath(io, parent);
@@ -106,8 +145,79 @@ pub fn writeAtomic(io: Io, live_path: []const u8, content: []const u8, mode: u32
         return error.ChmodFailed;
     }
 
+    // Post-fsync, pre-rename recheck (partial targets only): the candidate
+    // was spliced from a parse of the live file, so any live change since
+    // that read would be overwritten unseen by the rename.
+    switch (recheck) {
+        .none => {},
+        .absent => {
+            if (liveStat(io, live_path) != null) {
+                Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+                return error.LiveChangedDuringWrite;
+            }
+        },
+        .stat => |expected| {
+            const now = liveStat(io, live_path) orelse {
+                Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+                return error.LiveChangedDuringWrite;
+            };
+            if (now.inode != expected.inode or now.size != expected.size or now.mtime_ns != expected.mtime_ns) {
+                Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+                return error.LiveChangedDuringWrite;
+            }
+        },
+    }
+
     // Atomic rename.
     try Io.Dir.rename(Io.Dir.cwd(), tmp_path, Io.Dir.cwd(), live_path, io);
+}
+
+test "writeAtomicPartial: refuses when the live file changed between read and rename" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const p = try std.fs.path.join(a, &.{ base, "target" });
+    try writeAtomic(io, p, "initial\n", 0o644);
+    const initial = liveStat(io, p).?;
+
+    // Unchanged live -> the write lands.
+    try writeAtomicPartial(io, p, "candidate one\n", 0o644, initial);
+    const after_first = try Io.Dir.cwd().readFileAlloc(io, p, a, .limited(4096));
+    try std.testing.expectEqualStrings("candidate one\n", after_first);
+
+    // The first write changed the stat identity; a second write against the
+    // stale expectation must refuse and leave the live bytes alone.
+    try std.testing.expectError(
+        error.LiveChangedDuringWrite,
+        writeAtomicPartial(io, p, "candidate two\n", 0o644, initial),
+    );
+    const still = try Io.Dir.cwd().readFileAlloc(io, p, a, .limited(4096));
+    try std.testing.expectEqualStrings("candidate one\n", still);
+    // The refused write's temp file is cleaned up.
+    const tmp_p = try std.mem.concat(a, u8, &.{ p, tmp_suffix });
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, tmp_p, .{}));
+
+    // A creation (expected absent) refuses when a file appeared meanwhile.
+    const created = try std.fs.path.join(a, &.{ base, "appears" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = created, .data = "raced\n" });
+    try std.testing.expectError(
+        error.LiveChangedDuringWrite,
+        writeAtomicPartial(io, created, "candidate\n", 0o644, null),
+    );
+    const raced = try Io.Dir.cwd().readFileAlloc(io, created, a, .limited(4096));
+    try std.testing.expectEqualStrings("raced\n", raced);
+
+    // A creation against a still-absent path lands.
+    const fresh = try std.fs.path.join(a, &.{ base, "fresh" });
+    try writeAtomicPartial(io, fresh, "made\n", 0o644, null);
+    const made = try Io.Dir.cwd().readFileAlloc(io, fresh, a, .limited(4096));
+    try std.testing.expectEqualStrings("made\n", made);
 }
 
 test "setMode: heals a drifted mode in place" {

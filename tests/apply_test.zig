@@ -2444,3 +2444,359 @@ test "apply drift: non-interactive and --force keep their exact contracts" {
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
 }
+
+// Partial ownership: a file with an `own` declaration is patched per
+// key-path; everything outside the declared paths belongs to the program
+// that also writes the file.
+
+fn writePartialFixture(io: Io, tmp: *std.testing.TmpDir, source: []const u8, attributes: []const u8) !void {
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = source });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = attributes });
+}
+
+fn mtimeNs(io: Io, path: []const u8) !i96 {
+    const st = try Io.Dir.cwd().statFile(io, path, .{});
+    return st.mtime.nanoseconds;
+}
+
+test "apply partial: creates a missing live file and the second apply writes nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "created") != null);
+    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"enter\"\n", try read(io, a, live));
+
+    // Idempotent second apply: reported unchanged, file not rewritten.
+    const before = try mtimeNs(io, live);
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "unchanged") != null);
+    try std.testing.expectEqual(before, try mtimeNs(io, live));
+}
+
+test "apply partial: adopts a matching live file, then patches around the program's bytes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const program_live =
+        \\# program header
+        \\model = "gpt"
+        \\
+        \\[tui.keymap.global]
+        \\submit = "enter"
+        \\
+        \\[state]
+        \\count = 42
+        \\
+    ;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+
+    // Live owned content already matches composed: adopted, zero byte change.
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "adopted") != null);
+    try std.testing.expectEqualStrings(program_live, try read(io, a, live));
+
+    // Source changes; the owned span is replaced, every program byte kept.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app.toml",
+        .data = "[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n",
+    });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    const expected =
+        \\# program header
+        \\model = "gpt"
+        \\
+        \\[tui.keymap.global]
+        \\submit = "ctrl-enter"
+        \\
+        \\[state]
+        \\count = 42
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, try read(io, a, live));
+}
+
+test "apply partial: first-contact drift is skipped, --force reasserts the source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const drifted =
+        \\theirs = 1
+        \\
+        \\[tui.keymap.global]
+        \\submit = "escape"
+        \\
+    ;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = drifted });
+
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.err, "tui.keymap.global") != null);
+    try std.testing.expectEqualStrings(drifted, try read(io, a, live));
+
+    const r2 = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expectEqualStrings(
+        "theirs = 1\n\n[tui.keymap.global]\nsubmit = \"enter\"\n",
+        try read(io, a, live),
+    );
+
+    // The record now exists, so the next apply is clean.
+    const r3 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r3.out, "unchanged") != null);
+}
+
+test "apply partial: enforced absence removes through the record and drifts past it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const attrs = "[\"app.toml\"]\nown = [\"keep\", \"gone\"]\n";
+    try writePartialFixture(io, &tmp, "[keep]\nk = 1\n\n[gone]\ng = 1\n", attrs);
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The source stops populating `gone`; live matches the record there, so
+    // enforced absence removes it cleanly.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[keep]\nk = 1\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "[gone]") == null);
+
+    // Re-populated: the recorded absence matches live absence, so the table
+    // comes back without ceremony.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[keep]\nk = 1\n\n[gone]\ng = 2\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "g = 2") != null);
+
+    // Live's `gone` content is edited; unpopulating now differs from the
+    // record, so removal is drift until forced.
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), "g = 2", "g = 99");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[keep]\nk = 1\n" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "g = 99") != null);
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "gone") == null);
+}
+
+test "apply partial: a path added to own is first contact, never a silent overwrite" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[alpha]\nx = 1\n", "[\"app.toml\"]\nown = [\"alpha\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The program (or user) grows a [beta] table mox does not own yet.
+    const with_beta = try std.mem.concat(a, u8, &.{ try read(io, a, live), "\n[beta]\ntheirs = true\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = with_beta });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // own grows to cover beta with DIFFERENT composed content: first contact
+    // for beta alone -> drift, alpha stays record-compared.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data = "[\"app.toml\"]\nown = [\"alpha\", \"beta\"]\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app.toml",
+        .data = "[alpha]\nx = 1\n\n[beta]\ntheirs = false\n",
+    });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "theirs = true") != null);
+
+    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "theirs = false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "x = 1") != null);
+}
+
+test "apply partial: a composed leaf outside the declaration refuses the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "stray = 1\n\n[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "stray") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "outside the declared own paths") != null);
+    try std.testing.expect(!exists(io, try c.homePath("app.toml")));
+}
+
+test "apply partial: an unparseable live file refuses the patch" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "not [ = toml = [\n" });
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "does not parse") != null);
+    try std.testing.expectEqualStrings("not [ = toml = [\n", try read(io, a, live));
+}
+
+test "apply partial: --dry-run reports would-create and drift without writing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+
+    const dry1 = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), dry1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry1.out, "would create") != null);
+    try std.testing.expect(!exists(io, live));
+
+    // Drifted owned content still reports DRIFT, and still writes nothing.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\nk = 9\n" });
+    const dry2 = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry2.err, "DRIFT") != null);
+    try std.testing.expectEqualStrings("[tui]\nk = 9\n", try read(io, a, live));
+}
+
+test "apply partial: a gated-off file is untouched and gains no record" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Whole-file gate: only a non-matching axis overlay, no base.
+    try tmp.dir.createDirPath(io, "repo/src/app.toml.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml.d/os=linux.toml", .data = "[tui]\nk = 1\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"app.toml\"]\nown = [\"tui\"]\n" });
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try c.homePath("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[program]\nonly = true\n" });
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped") != null);
+    try std.testing.expectEqualStrings("[program]\nonly = true\n", try read(io, a, live));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
+}
+
+test "apply partial: a secret owned value is hashed in state and masked in snapshots" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "partial-s3cr3t-DO-NOT-LEAK-77aa88bb";
+    try writePartialFixture(io, &tmp, "[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_PARTIAL_SECRET", .value = secret_value }},
+    });
+    const live = try c.homePath("app.toml");
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
+    // The record is a hash: no resolved secret anywhere in state.
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
+    try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
+
+    // A hand edit inside the secret-bearing owned path is drift (hash
+    // compare); --force reasserts, and the pre-write snapshot stores the
+    // edited value MASKED, never in cleartext.
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), secret_value, "leaked-by-hand");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+    const skip = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), skip.rc);
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
+    try std.testing.expect(!try treeContainsBytes(io, a, c.state, "leaked-by-hand"));
+    try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
+}
+
+test "apply: an own declaration the walk rejects reports the target by name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "text\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"notes.txt\"]\nown = [\"a\"]\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "structured") != null);
+}

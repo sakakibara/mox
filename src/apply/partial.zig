@@ -372,6 +372,204 @@ fn verifyParseFail(e: anyerror) VerifyError {
     return if (e == error.OutOfMemory) error.OutOfMemory else error.CandidateUnparseable;
 }
 
+/// D2 leaf rule: every leaf the composed document defines must sit under a
+/// declared path. Returns the spelled path of the first undeclared leaf, or
+/// null when the document lies within the declaration. A leaf is a
+/// non-container value, or an empty container that is not a pure
+/// intermediate on a declared route; intermediate containers implied by the
+/// syntax are traversal, not violations.
+pub fn undeclaredLeaf(
+    arena: std.mem.Allocator,
+    owned: *const OwnedDoc,
+    own_paths: []const OwnPath,
+) error{OutOfMemory}!?[]const u8 {
+    var path: std.ArrayList([]const u8) = .empty;
+    // A yaml document with no content parses to null at the root; it
+    // defines nothing.
+    if (owned.root == .yaml and owned.root.yaml == .null) return null;
+    return undeclaredWalk(arena, owned.root, own_paths, &path);
+}
+
+fn undeclaredWalk(
+    arena: std.mem.Allocator,
+    v: AnyValue,
+    own_paths: []const OwnPath,
+    path: *std.ArrayList([]const u8),
+) error{OutOfMemory}!?[]const u8 {
+    if (pathAtOrUnderDeclared(own_paths, path.items)) return null;
+    const is_container = switch (v) {
+        .toml => |tv| tv == .table,
+        .json => |jv| jv == .object,
+        .yaml => |yv| yv == .map,
+        .ini => |iv| iv == .section,
+    };
+    if (!is_container) return try diagPathSpell(arena, path.items);
+
+    var count: usize = 0;
+    switch (v) {
+        .toml => |tv| {
+            count = tv.table.count();
+            for (tv.table.keys(), tv.table.values()) |k, sub| {
+                try path.append(arena, k);
+                defer _ = path.pop();
+                if (try undeclaredWalk(arena, .{ .toml = sub }, own_paths, path)) |hit| return hit;
+            }
+        },
+        .json => |jv| {
+            count = jv.object.count();
+            for (jv.object.keys(), jv.object.values()) |k, sub| {
+                try path.append(arena, k);
+                defer _ = path.pop();
+                if (try undeclaredWalk(arena, .{ .json = sub }, own_paths, path)) |hit| return hit;
+            }
+        },
+        .yaml => |yv| {
+            count = yv.map.len;
+            for (yv.map) |entry| {
+                if (entry.key != .string) return try diagPathSpell(arena, path.items);
+                try path.append(arena, entry.key.string);
+                defer _ = path.pop();
+                if (try undeclaredWalk(arena, .{ .yaml = entry.value }, own_paths, path)) |hit| return hit;
+            }
+        },
+        .ini => |iv| {
+            count = iv.section.entries.len;
+            for (iv.section.entries) |entry| {
+                try path.append(arena, entry.key);
+                defer _ = path.pop();
+                if (try undeclaredWalk(arena, .{ .ini = entry.value }, own_paths, path)) |hit| return hit;
+            }
+        },
+    }
+    if (count == 0 and !pathStrictPrefixOfDeclared(own_paths, path.items)) {
+        return try diagPathSpell(arena, path.items);
+    }
+    return null;
+}
+
+/// Diagnostic spelling of a key path: segments joined with `.`, quoted when
+/// not bare. For messages only; canonical spelling lives in canonical.zig.
+fn diagPathSpell(arena: std.mem.Allocator, segments: []const []const u8) error{OutOfMemory}![]const u8 {
+    if (segments.len == 0) return "(root)";
+    var out: std.ArrayList(u8) = .empty;
+    for (segments, 0..) |seg, i| {
+        if (i > 0) try out.append(arena, '.');
+        var bare = seg.len > 0;
+        for (seg) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) bare = false;
+        }
+        if (bare) {
+            try out.appendSlice(arena, seg);
+        } else {
+            try out.append(arena, '"');
+            try out.appendSlice(arena, seg);
+            try out.append(arena, '"');
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Placeholder written over owned secret values in a pre-write snapshot.
+pub const secret_mask = "<mox:secret>";
+
+/// A copy of `live` with every leaf value under the given paths replaced by
+/// `secret_mask`, edited through the format's lossless Document model so
+/// the rest of the file survives byte-for-byte. A path with no live
+/// presence contributes nothing. Any shape the edit cannot address fails
+/// the mask (the caller must then refuse rather than snapshot cleartext).
+pub fn maskSecretPaths(
+    arena: std.mem.Allocator,
+    format: Format,
+    live: []const u8,
+    secret_paths: []const OwnPath,
+) error{ OutOfMemory, MaskFailed }![]u8 {
+    if (secret_paths.len == 0 or live.len == 0) return arena.dupe(u8, live);
+    const doc_vals = OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => return error.MaskFailed,
+    };
+
+    var leaves: std.ArrayList([]const []const u8) = .empty;
+    for (secret_paths) |p| {
+        const sub = doc_vals.subtreeAt(p.segments) orelse continue;
+        try collectLeafPaths(arena, sub, p.segments, &leaves);
+    }
+    if (leaves.items.len == 0) return arena.dupe(u8, live);
+
+    switch (format) {
+        .toml => {
+            var doc = toml.Document.parse(arena, live, .{}) catch return error.MaskFailed;
+            for (leaves.items) |lp| doc.setValueSegments(lp, .{ .string = secret_mask }) catch return error.MaskFailed;
+            return emitMasked(arena, &doc);
+        },
+        .json => {
+            var doc = json.Document.parse(arena, live, .{ .dialect = .jsonc }) catch return error.MaskFailed;
+            for (leaves.items) |lp| doc.setValueSegments(lp, .{ .string = secret_mask }) catch return error.MaskFailed;
+            return emitMasked(arena, &doc);
+        },
+        .yaml => {
+            var doc = yaml.Document.parse(arena, live, .{}) catch return error.MaskFailed;
+            for (leaves.items) |lp| doc.setValueSegments(lp, .{ .string = secret_mask }) catch return error.MaskFailed;
+            return emitMasked(arena, &doc);
+        },
+        .ini, .gitconfig => {
+            var doc = ini.Document.parse(arena, live, .{ .dialect = iniDialect(format) }) catch return error.MaskFailed;
+            for (leaves.items) |lp| doc.setValueSegments(lp, .{ .string = secret_mask }) catch return error.MaskFailed;
+            return emitMasked(arena, &doc);
+        },
+    }
+}
+
+/// Every leaf key path at or under `base` within `v`. A non-string yaml key
+/// cannot be addressed by the Document edit; fail rather than leave its
+/// value unmasked.
+fn collectLeafPaths(
+    arena: std.mem.Allocator,
+    v: AnyValue,
+    base: []const []const u8,
+    out: *std.ArrayList([]const []const u8),
+) error{ OutOfMemory, MaskFailed }!void {
+    const is_container = switch (v) {
+        .toml => |tv| tv == .table,
+        .json => |jv| jv == .object,
+        .yaml => |yv| yv == .map,
+        .ini => |iv| iv == .section,
+    };
+    if (!is_container) {
+        try out.append(arena, try arena.dupe([]const u8, base));
+        return;
+    }
+    switch (v) {
+        .toml => |tv| for (tv.table.keys(), tv.table.values()) |k, sub| {
+            try collectLeafPaths(arena, .{ .toml = sub }, try childPath(arena, base, k), out);
+        },
+        .json => |jv| for (jv.object.keys(), jv.object.values()) |k, sub| {
+            try collectLeafPaths(arena, .{ .json = sub }, try childPath(arena, base, k), out);
+        },
+        .yaml => |yv| for (yv.map) |entry| {
+            if (entry.key != .string) return error.MaskFailed;
+            try collectLeafPaths(arena, .{ .yaml = entry.value }, try childPath(arena, base, entry.key.string), out);
+        },
+        .ini => |iv| for (iv.section.entries) |entry| {
+            try collectLeafPaths(arena, .{ .ini = entry.value }, try childPath(arena, base, entry.key), out);
+        },
+    }
+}
+
+fn childPath(arena: std.mem.Allocator, base: []const []const u8, key: []const u8) error{OutOfMemory}![]const []const u8 {
+    const out = try arena.alloc([]const u8, base.len + 1);
+    @memcpy(out[0..base.len], base);
+    out[base.len] = key;
+    return out;
+}
+
+fn emitMasked(arena: std.mem.Allocator, doc: anytype) error{ OutOfMemory, MaskFailed }![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    doc.emit(&aw.writer) catch return error.MaskFailed;
+    return arena.dupe(u8, aw.written());
+}
+
 /// Which declared paths hold a resolved secret, from the composed TEXT's
 /// line provenance: a path is secret-bearing when any line of its span in
 /// the composed text is covered by a `.secret` segment. Returns a flag
@@ -2389,6 +2587,45 @@ test "ini: key entry appends into its existing section" {
 
 test "gitconfig: an entry on a section header line is refused" {
     try testLocateError(.gitconfig, "[alias] st = status\n", &.{"alias.st"}, error.OwnedPathUnaddressable);
+}
+
+test "undeclaredLeaf: names a leaf outside the declaration, passes a covered doc" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"tui.keymap.global"});
+
+    const covered = try OwnedDoc.parse(arena, .toml, "[tui.keymap.global]\na = 1\n");
+    try testing.expect(try undeclaredLeaf(arena, &covered, paths) == null);
+
+    // An intermediate table implied by the header is traversal; the stray
+    // leaf beside the owned one is the violation.
+    const stray = try OwnedDoc.parse(arena, .toml, "[tui.keymap.global]\na = 1\n\n[tui.other]\nb = 2\n");
+    try testing.expectEqualStrings("tui.other.b", (try undeclaredLeaf(arena, &stray, paths)).?);
+
+    // An empty composed document defines nothing.
+    const empty = try OwnedDoc.parse(arena, .toml, "");
+    try testing.expect(try undeclaredLeaf(arena, &empty, paths) == null);
+}
+
+test "maskSecretPaths: masks every leaf value under the path, keeps the rest byte-for-byte" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live =
+        \\# program comment
+        \\keep = "visible"
+        \\
+        \\[api]
+        \\token = "cleartext"
+        \\
+    ;
+    const paths = try testOwn(arena, &.{"api"});
+    const masked = try maskSecretPaths(arena, .toml, live, paths);
+    try testing.expect(std.mem.indexOf(u8, masked, "cleartext") == null);
+    try testing.expect(std.mem.indexOf(u8, masked, secret_mask) != null);
+    try testing.expect(std.mem.indexOf(u8, masked, "# program comment") != null);
+    try testing.expect(std.mem.indexOf(u8, masked, "keep = \"visible\"") != null);
 }
 
 test "secretPathFlags: a secret line inside one owned table flags exactly that path" {

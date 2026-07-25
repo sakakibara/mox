@@ -93,8 +93,13 @@ pub fn containsAnywhere(a: std.mem.Allocator, io: Io, root: []const u8, needle: 
     return false;
 }
 
+pub const EnvPair = struct { name: []const u8, value: []const u8 };
+
 pub const SetupOpts = struct {
     editor: ?[]const u8 = null,
+    /// Extra environment entries visible to the command under test (e.g. a
+    /// value an `env:` secret URI resolves).
+    extra_env: []const EnvPair = &.{},
     /// lifecycle_test.zig's fixtures assume `repo/src` exists up front;
     /// apply_test.zig/commit_test.zig create it themselves per-test (some
     /// exercise the "source tree not found" path), so this defaults off.
@@ -123,6 +128,7 @@ pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: Setup
     if (opts.editor) |e| try map.put("EDITOR", e);
     if (opts.os) |os| try map.put("MOX_OS", os);
     if (opts.arch) |arch| try map.put("MOX_ARCH", arch);
+    for (opts.extra_env) |e| try map.put(e.name, e.value);
     // The Env borrows the map, so it must outlive this call.
     const map_ptr = try a.create(std.process.Environ.Map);
     map_ptr.* = map;
