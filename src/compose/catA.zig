@@ -12,7 +12,6 @@ const ini_merge = @import("ini_merge.zig");
 const interp = @import("interp.zig");
 const catB = @import("catB.zig");
 const dsl = @import("../dsl/root.zig");
-const category = @import("category.zig");
 const prov_mod = @import("../provenance/root.zig");
 
 const Io = std.Io;
@@ -63,7 +62,7 @@ pub fn compose(
 const Format = enum { toml, gitconfig, yaml, json, ini };
 
 fn formatOf(path: []const u8) ?Format {
-    if (category.isGitConfigPath(path)) return .gitconfig;
+    if (source.format.isGitConfigPath(path)) return .gitconfig;
     const Pair = struct { ext: []const u8, format: Format };
     const table = [_]Pair{
         .{ .ext = ".toml", .format = .toml },

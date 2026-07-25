@@ -5,8 +5,15 @@ const path_mod = @import("path.zig");
 const junk = @import("junk.zig");
 const dirent = @import("dirent.zig");
 const attributes = @import("attributes.zig");
+const keypath = @import("keypath.zig");
+const format_mod = @import("format.zig");
+const dsl = @import("../dsl/root.zig");
 
 const Io = std.Io;
+
+/// Same base-file size cap the composer uses, so the generator probe sees
+/// exactly the files compose would.
+const max_base_bytes: usize = 64 * 1024 * 1024;
 
 /// An axis tuple like `os=darwin+profile=work`. Each entry is a (name, value) pair.
 pub const AxisTuple = struct {
@@ -87,6 +94,33 @@ pub const Region = struct {
     fragments: []const Fragment,
 };
 
+/// One declared partial-ownership key-path, parsed at walk time so every
+/// consumer works from decoded segments rather than re-splitting the string.
+pub const OwnPath = struct {
+    /// The declaration exactly as written in `.mox/attributes.toml`.
+    raw: []const u8,
+    /// Decoded segments: quotes stripped, escapes resolved.
+    segments: []const []const u8,
+};
+
+/// Names the target (and offending `own` path) when the walk rejects an
+/// attributes entry. Fixed-size like `cli.scope.Diag`: no allocation on the
+/// error path.
+pub const Diag = struct {
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+
+    pub fn set(self: *Diag, text: []const u8) void {
+        const n = @min(text.len, self.buf.len);
+        @memcpy(self.buf[0..n], text[0..n]);
+        self.len = n;
+    }
+
+    pub fn capture(self: *const Diag) ?[]const u8 {
+        return if (self.len == 0) null else self.buf[0..self.len];
+    }
+};
+
 /// One managed file in the source tree.
 pub const ManagedFile = struct {
     /// Path within `src/`, e.g. `src/.zshrc` or `src/.config/nvim/init.lua`.
@@ -133,6 +167,15 @@ pub const ManagedFile = struct {
     /// candidate. Seed-once semantics for files the user edits after first
     /// creation (e.g. a machine-local config skeleton).
     create_once: bool = false,
+    /// Partial-ownership key-paths from `.mox/attributes.toml` (`own`),
+    /// parsed and validated by the walk. Empty means the whole file is
+    /// managed. Non-empty only on structured targets that are neither
+    /// symlink, seed-once, nor generator sources; the walk rejects the rest.
+    own_paths: []const OwnPath = &.{},
+    /// Validation-hook argv from `.mox/attributes.toml` (`check`): a
+    /// repo-relative executable and its arguments, run against a candidate
+    /// partial write before it lands. Empty means no hook.
+    check_argv: []const []const u8 = &.{},
 };
 
 /// The complete scanned source tree.
@@ -216,6 +259,20 @@ pub fn walk(
     src_dir: []const u8,
     home_dir: []const u8,
 ) !ManagedTree {
+    return walkDiag(arena, io, src_dir, home_dir, null);
+}
+
+/// `walk` with a diagnostic: when an attributes entry fails validation (an
+/// `own` list on an unstructured, symlink, seed-once, or generator target,
+/// or an own path the key grammar rejects), `diag` names the target -- and,
+/// for a path error, the offending path.
+pub fn walkDiag(
+    arena: std.mem.Allocator,
+    io: Io,
+    src_dir: []const u8,
+    home_dir: []const u8,
+    diag: ?*Diag,
+) !ManagedTree {
     var files: std.ArrayList(ManagedFile) = .empty;
     errdefer files.deinit(arena);
     var exact: std.ArrayList([]const u8) = .empty;
@@ -232,7 +289,7 @@ pub fn walk(
     const repo_dir = std.fs.path.dirname(src_dir) orelse "";
     const attrs = try attributes.load(arena, io, repo_dir);
 
-    try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs);
+    try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs, diag);
 
     // Stamp every walked file with the repo root (parent of `src/`).
     const out = try files.toOwnedSlice(arena);
@@ -257,6 +314,7 @@ fn walkDir(
     abs_prefix: []const u8,
     home_dir: []const u8,
     attrs: *const attributes.Attributes,
+    diag: ?*Diag,
 ) !void {
     var file_names: std.ArrayList([]const u8) = .empty;
     var dir_names: std.ArrayList([]const u8) = .empty;
@@ -322,6 +380,7 @@ fn walkDir(
         else
             rel;
         const explicit_mode = attrs.mode(target_key);
+        const own_paths = try ownPathsChecked(arena, io, .{ .dir = dir, .name = name }, target_key, attrs, diag);
         try files.append(arena, .{
             .source_base_path = rel,
             .source_base_abs = abs,
@@ -333,6 +392,8 @@ fn walkDir(
             .mode_explicit = explicit_mode != null,
             .is_symlink = attrs.symlink(target_key),
             .create_once = attrs.seedOnce(target_key),
+            .own_paths = own_paths,
+            .check_argv = attrs.check(target_key),
         });
     }
 
@@ -347,7 +408,7 @@ fn walkDir(
                 .follow_symlinks = false,
             });
             defer sub.close(io);
-            try walkDir(arena, io, files, exact, sub, sub_rel, sub_abs, home_dir, attrs);
+            try walkDir(arena, io, files, exact, sub, sub_rel, sub_abs, home_dir, attrs, diag);
             continue;
         }
         if (paired.contains(name)) continue;
@@ -374,13 +435,21 @@ fn walkDir(
             // Recurse, then close. We can't use `defer .close()` here because
             // we need to release the handle before the recursive walk also
             // opens the same dir — Zig's Dir.openDir doesn't reuse handles.
-            try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs);
+            try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs, diag);
             dot_d_dir.close(io);
             continue;
         }
         defer dot_d_dir.close(io);
 
         const live = try path_mod.toLivePath(arena, rel, home_dir);
+        // A gated file (no base, only overlays) may still be partial: a
+        // whole-file gate that is off leaves the live file untouched, exactly
+        // like any other managed file. No base means no generator probe.
+        const target_key = if (std.mem.startsWith(u8, rel, "src/"))
+            rel["src/".len..]
+        else
+            rel;
+        const own_paths = try ownPathsChecked(arena, io, null, target_key, attrs, diag);
         try files.append(arena, .{
             .source_base_path = rel,
             .source_base_abs = "",
@@ -388,8 +457,85 @@ fn walkDir(
             .has_base = false,
             .overlays = overlays,
             .regions = regions,
+            .own_paths = own_paths,
+            .check_argv = attrs.check(target_key),
         });
     }
+}
+
+const BaseRef = struct { dir: Io.Dir, name: []const u8 };
+
+/// Validate and parse a target's `own` declaration. Empty stays empty; a
+/// non-empty list is rejected on an unstructured target, combined with
+/// `symlink` or `seed_once`, on a generator source, or when a path fails the
+/// key grammar -- `diag` names the target (and the offending path).
+fn ownPathsChecked(
+    arena: std.mem.Allocator,
+    io: Io,
+    base: ?BaseRef,
+    target_key: []const u8,
+    attrs: *const attributes.Attributes,
+    diag: ?*Diag,
+) ![]const OwnPath {
+    const own_list = attrs.own(target_key);
+    if (own_list.len == 0) return &.{};
+
+    if (format_mod.formatOfPath(target_key) == null) {
+        setDiag(diag, target_key);
+        return error.OwnOnUnstructuredTarget;
+    }
+    if (attrs.symlink(target_key)) {
+        setDiag(diag, target_key);
+        return error.OwnOnSymlink;
+    }
+    if (attrs.seedOnce(target_key)) {
+        setDiag(diag, target_key);
+        return error.OwnOnSeedOnce;
+    }
+    if (base) |b| {
+        if (try isGeneratorSource(arena, io, b)) {
+            setDiag(diag, target_key);
+            return error.OwnOnGenerator;
+        }
+    }
+
+    const out = try arena.alloc(OwnPath, own_list.len);
+    for (own_list, out) |raw, *o| {
+        const segments = keypath.parse(arena, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                if (diag) |d| {
+                    var buf: [1024]u8 = undefined;
+                    d.set(std.fmt.bufPrint(&buf, "{s}: {s}", .{ target_key, raw }) catch target_key);
+                }
+                return error.InvalidOwnPath;
+            },
+        };
+        o.* = .{ .raw = raw, .segments = segments };
+    }
+    return out;
+}
+
+fn setDiag(diag: ?*Diag, text: []const u8) void {
+    if (diag) |d| d.set(text);
+}
+
+/// True when the base file is a generator (a `for ... into` DSL loop): it
+/// fans out to other live files, so there is no single document to partially
+/// own. Mirrors `compose.catB.composeGenerator`'s marker+parse probe,
+/// restricted to the comment markers the structured formats can carry (`#`,
+/// plus `;` -- ini). A parse failure is not a generator decision; the normal
+/// compose path reports it with a source location.
+fn isGeneratorSource(arena: std.mem.Allocator, io: Io, base: BaseRef) !bool {
+    const content = base.dir.readFileAlloc(io, base.name, arena, .limited(max_base_bytes)) catch return false;
+    const markers = [_][]const u8{ "#", ";" };
+    for (markers) |marker| {
+        const parsed = dsl.driver.parseFile(arena, content, marker, null) catch continue;
+        for (parsed.directives) |d| {
+            if (d.kind == .for_loop and d.kind.for_loop.into != null) return true;
+        }
+    }
+    return false;
 }
 
 /// Inspect the source file's on-disk permissions and return a sensible mode.

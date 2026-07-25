@@ -271,3 +271,179 @@ test "walk: refuses symlinks in source tree" {
     const result = mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     try std.testing.expectError(error.SymlinkInSource, result);
 }
+
+test "walk: own and check are parsed onto the managed file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "[tui.keymap.global]\n");
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".codex/config.toml"]
+        \\own = ["tui.keymap.global", "projects.\"/tmp/example\"", "remote.\"my origin\".url"]
+        \\check = ["scripts/check/codex-config", "--strict"]
+        \\
+    );
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    const f = result.files[0];
+    try std.testing.expectEqual(@as(usize, 3), f.own_paths.len);
+    try std.testing.expectEqualStrings("tui.keymap.global", f.own_paths[0].raw);
+    try std.testing.expectEqual(@as(usize, 3), f.own_paths[0].segments.len);
+    try std.testing.expectEqualStrings("keymap", f.own_paths[0].segments[1]);
+    try std.testing.expectEqualStrings("projects.\"/tmp/example\"", f.own_paths[1].raw);
+    try std.testing.expectEqual(@as(usize, 2), f.own_paths[1].segments.len);
+    try std.testing.expectEqualStrings("/tmp/example", f.own_paths[1].segments[1]);
+    try std.testing.expectEqualStrings("my origin", f.own_paths[2].segments[1]);
+    try std.testing.expectEqual(@as(usize, 2), f.check_argv.len);
+    try std.testing.expectEqualStrings("scripts/check/codex-config", f.check_argv[0]);
+    try std.testing.expectEqualStrings("--strict", f.check_argv[1]);
+}
+
+test "walk: own on a gated target (orphan .d, no base) is carried too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.codex/config.toml.d/os=darwin.toml", "[tui.keymap.global]\n");
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".codex/config.toml"]
+        \\own = ["tui.keymap.global"]
+        \\
+    );
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    try std.testing.expect(!result.files[0].has_base);
+    try std.testing.expectEqual(@as(usize, 1), result.files[0].own_paths.len);
+    try std.testing.expectEqualStrings("tui.keymap.global", result.files[0].own_paths[0].raw);
+}
+
+test "walk: own on an unstructured target is rejected, naming the target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "export EDITOR=nvim\n");
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".zshrc"]
+        \\own = ["alias.ls"]
+        \\
+    );
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectError(error.OwnOnUnstructuredTarget, result);
+    try std.testing.expectEqualStrings(".zshrc", diag.capture().?);
+}
+
+test "walk: own combined with seed_once or symlink is rejected" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.config/app/config.toml", "[a]\n");
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".config/app/config.toml"]
+        \\seed_once = true
+        \\own = ["a"]
+        \\
+    );
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    try std.testing.expectError(
+        error.OwnOnSeedOnce,
+        mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag),
+    );
+    try std.testing.expectEqualStrings(".config/app/config.toml", diag.capture().?);
+
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".config/app/config.toml"]
+        \\symlink = true
+        \\own = ["a"]
+        \\
+    );
+    try std.testing.expectError(
+        error.OwnOnSymlink,
+        mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me"),
+    );
+}
+
+test "walk: own on a generator source is rejected" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.config/git/ids.toml",
+        \\# mox: for id in "data/ids.toml" into "<id.slug>.conf"
+        \\[entry]
+        \\slug = "<id.slug>"
+        \\# mox: end
+        \\
+    );
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".config/git/ids.toml"]
+        \\own = ["entry"]
+        \\
+    );
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectError(error.OwnOnGenerator, result);
+    try std.testing.expectEqualStrings(".config/git/ids.toml", diag.capture().?);
+}
+
+test "walk: an own path the key grammar rejects names target and path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "[tui]\n");
+    try writeFile(io, tmp.dir, ".mox/attributes.toml",
+        \\[".codex/config.toml"]
+        \\own = ["tui..global"]
+        \\
+    );
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectError(error.InvalidOwnPath, result);
+    try std.testing.expectEqualStrings(".codex/config.toml: tui..global", diag.capture().?);
+}

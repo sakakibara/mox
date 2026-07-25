@@ -1,4 +1,5 @@
 const std = @import("std");
+const format = @import("../source/format.zig");
 
 pub const Category = enum { a, b, c };
 
@@ -12,18 +13,10 @@ pub fn detect(filename: []const u8, content: []const u8) Category {
     // binary and skip its directives. Only files with no telling extension fall
     // back to a content sniff, where a NUL or a high density of control bytes
     // marks genuine binary.
-    if (isGitConfigPath(filename)) return .a;
+    if (format.isGitConfigPath(filename)) return .a;
     if (extensionCategory(filename)) |cat| return cat;
     if (looksBinary(content)) return .c;
     return .b;
-}
-
-/// XDG git config files carry no telling extension: `~/.config/git/config`
-/// plus the `.inc` includes git's `[include]`/`[includeIf]` mechanism points
-/// at (`personal.inc`, `id-<slug>.inc`). All are gitconfig syntax.
-pub fn isGitConfigPath(path: []const u8) bool {
-    if (std.mem.indexOf(u8, path, ".config/git/") == null) return false;
-    return std.mem.endsWith(u8, path, "/config") or std.mem.endsWith(u8, path, ".inc");
 }
 
 /// Sniff whether a file with no informative extension is binary. A NUL is a

@@ -20,12 +20,12 @@ const toml = @import("toml");
 const json = @import("json");
 const yaml = @import("yaml");
 const ini = @import("ini");
-const category = @import("../compose/category.zig");
+const source_format = @import("../source/format.zig");
 const interp = @import("../compose/interp.zig");
 
 const Io = std.Io;
 
-pub const Format = enum { toml, json, yaml, ini, gitconfig };
+pub const Format = source_format.Format;
 
 /// The composed-side value for a `KeyPathChange`, tagged by the format lib
 /// that produced it. Task 9 applies it back into source with the same lib.
@@ -448,30 +448,7 @@ fn emitDoc(arena: std.mem.Allocator, doc: anytype) ![]const u8 {
     return arena.dupe(u8, aw.written());
 }
 
-/// Detect the structured format of a managed-file source path, or null when it
-/// is not a Cat-A structured format. Mirrors the composer's extension table,
-/// with gitconfig recognized by path shape rather than extension.
-pub fn formatOfPath(path: []const u8) ?Format {
-    if (category.isGitConfigPath(path)) return .gitconfig;
-    const Pair = struct { ext: []const u8, format: Format };
-    const table = [_]Pair{
-        .{ .ext = ".toml", .format = .toml },
-        .{ .ext = ".yaml", .format = .yaml },
-        .{ .ext = ".yml", .format = .yaml },
-        .{ .ext = ".json", .format = .json },
-        .{ .ext = ".ini", .format = .ini },
-        .{ .ext = ".gitconfig", .format = .gitconfig },
-    };
-    var longest: ?Format = null;
-    var longest_len: usize = 0;
-    for (table) |entry| {
-        if (std.mem.endsWith(u8, path, entry.ext) and entry.ext.len > longest_len) {
-            longest = entry.format;
-            longest_len = entry.ext.len;
-        }
-    }
-    return longest;
-}
+pub const formatOfPath = source_format.formatOfPath;
 
 /// Parse one layer's bytes into a `Value` tagged by `format`, for the pure
 /// layer-selection walk. INI and gitconfig share ini-zig's `Value`.
@@ -1926,15 +1903,6 @@ test "resolveLayer: gitconfig nested key resolves through sections" {
     const res = try resolveLayer(a, .gitconfig, &layers, change);
     try testing.expectEqual(@as(usize, 1), res.target);
     try testing.expectEqual(@as(usize, 2), res.definers.len);
-}
-
-test "formatOfPath: recognizes structured formats and rejects others" {
-    try testing.expectEqual(Format.toml, formatOfPath("src/config.toml").?);
-    try testing.expectEqual(Format.json, formatOfPath("src/settings.json").?);
-    try testing.expectEqual(Format.yaml, formatOfPath("src/c.yaml").?);
-    try testing.expectEqual(Format.ini, formatOfPath("src/app.ini").?);
-    try testing.expectEqual(Format.gitconfig, formatOfPath("src/.gitconfig").?);
-    try testing.expect(formatOfPath("src/.zshrc") == null);
 }
 
 test "displayAt: renders the leaf scalar, or null when absent" {

@@ -6,6 +6,8 @@ pub const junk = @import("junk.zig");
 pub const dirent = @import("dirent.zig");
 pub const axes = @import("axes.zig");
 pub const attributes = @import("attributes.zig");
+pub const keypath = @import("keypath.zig");
+pub const format = @import("format.zig");
 pub const ignore = @import("ignore/root.zig");
 
 test {
