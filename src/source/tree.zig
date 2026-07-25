@@ -168,11 +168,15 @@ pub const ManagedFile = struct {
     /// candidate. Seed-once semantics for files the user edits after first
     /// creation (e.g. a machine-local config skeleton).
     create_once: bool = false,
-    /// Partial-ownership key-paths from the base file's head directives
-    /// (`# mox: own <path>` lines in the leading comment block), parsed and
-    /// validated by the walk. Empty means the whole file is managed.
-    /// Non-empty only on structured base targets that are neither symlink,
-    /// seed-once, nor generator sources; the walk rejects the rest.
+    /// Ownership mode from the base file's head directives: `.own` manages
+    /// only the declared subtrees, `.disown` manages the whole file EXCEPT
+    /// them. `.none` is a whole-file managed target.
+    ownership: head.Ownership = .none,
+    /// The declared key-paths (`own` or `disown` lines in the leading
+    /// comment block), parsed and validated by the walk. Empty exactly when
+    /// `ownership` is `.none`. Non-empty only on structured base targets
+    /// that are neither symlink, seed-once, nor generator sources; the walk
+    /// rejects the rest.
     own_paths: []const OwnPath = &.{},
     /// Validation-hook argv from the base head's `check` directive: a
     /// repo-relative executable and its arguments, run against a candidate
@@ -395,6 +399,7 @@ fn walkDir(
             .mode_explicit = explicit_mode != null,
             .is_symlink = attrs.symlink(target_key),
             .create_once = attrs.seedOnce(target_key),
+            .ownership = decl.ownership,
             .own_paths = decl.own_paths,
             .check_argv = decl.check_argv,
         });
@@ -462,6 +467,7 @@ fn walkDir(
 const BaseRef = struct { dir: Io.Dir, name: []const u8 };
 
 const Decl = struct {
+    ownership: head.Ownership = .none,
     own_paths: []const OwnPath = &.{},
     check_argv: []const []const u8 = &.{},
 };
@@ -516,6 +522,10 @@ fn headChecked(
             setDiag(diag, target_key);
             return error.InvalidOwnPath;
         },
+        error.OwnAndDisown => {
+            setDiag(diag, target_key);
+            return error.OwnAndDisown;
+        },
         error.InvalidCheckArgv, error.DuplicateCheckDirective => {
             setDiag(diag, target_key);
             return error.InvalidCheckDirective;
@@ -556,7 +566,7 @@ fn headChecked(
         };
         o.* = .{ .raw = raw, .segments = segments };
     }
-    return .{ .own_paths = out, .check_argv = parsed.check };
+    return .{ .ownership = parsed.ownership, .own_paths = out, .check_argv = parsed.check };
 }
 
 fn setDiag(diag: ?*Diag, text: []const u8) void {

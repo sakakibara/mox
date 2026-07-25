@@ -313,6 +313,7 @@ fn diffPartial(
     // The walk only attaches own_paths to structured targets.
     const format = mox.source.format.formatOfPath(file.source_base_path).?;
 
+    const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed_bytes) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
@@ -320,9 +321,15 @@ fn diffPartial(
             return;
         },
     };
-    if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
-        try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
-        return;
+    switch (mode) {
+        .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
+            try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+            return;
+        },
+        .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, own_paths)) |spelled| {
+            try ctx.err.print("  ERROR   {s} (composed source defines content under disowned path {s})\n", .{ live_path, spelled });
+            return;
+        },
     }
 
     const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -338,7 +345,11 @@ fn diffPartial(
     };
 
     var pdiag: partial_mod.Diag = .{};
-    const flags = partial_mod.secretPathFlags(ctx.alloc, format, composed_bytes, own_paths, prov_segments, &pdiag) catch |e| switch (e) {
+    const secret_scope: []const mox.source.tree.OwnPath = switch (mode) {
+        .own => own_paths,
+        .disown => try canon_mod.topLevelPaths(ctx.alloc, &owned),
+    };
+    const flags = partial_mod.secretPathFlags(ctx.alloc, format, composed_bytes, secret_scope, prov_segments, &pdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ live_path, pdiag.text() });
@@ -348,7 +359,7 @@ fn diffPartial(
     const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, live_path);
     var secret_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
     if (record) |r| try secret_paths.appendSlice(ctx.alloc, try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths));
-    for (own_paths, flags) |p, flagged| {
+    for (secret_scope, flags) |p, flagged| {
         if (flagged and !owned_mod.pathInList(p.segments, secret_paths.items)) {
             try secret_paths.append(ctx.alloc, p);
         }
@@ -356,8 +367,16 @@ fn diffPartial(
     const spelled = try ctx.alloc.alloc([]const u8, secret_paths.items.len);
     for (secret_paths.items, spelled) |p, *s| s.* = try canon_mod.pathSpell(ctx.alloc, p.segments);
 
-    const b_text = try maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, &owned, own_paths), spelled);
-    const a_text = try maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, &live_doc, own_paths), spelled);
+    const composed_x = switch (mode) {
+        .own => try canon_mod.canonicalOwned(ctx.alloc, &owned, own_paths),
+        .disown => try canon_mod.canonicalComplement(ctx.alloc, &owned, own_paths),
+    };
+    const live_x = switch (mode) {
+        .own => try canon_mod.canonicalOwned(ctx.alloc, &live_doc, own_paths),
+        .disown => try canon_mod.canonicalComplement(ctx.alloc, &live_doc, own_paths),
+    };
+    const b_text = try maskOwnedSections(ctx.alloc, composed_x, spelled);
+    const a_text = try maskOwnedSections(ctx.alloc, live_x, spelled);
     if (std.mem.eql(u8, a_text, b_text)) return;
 
     const a_lines = try mox.diff.lines.splitLines(ctx.alloc, a_text);

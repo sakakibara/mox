@@ -3368,3 +3368,225 @@ test "rollback partial: a secret-masked snapshot is refused, live untouched" {
     try std.testing.expectEqualStrings(before, try read(io, a, live));
     try std.testing.expect(std.mem.indexOf(u8, before, mox.apply.partial.secret_mask) == null);
 }
+
+// Disown mode: the whole file is owned EXCEPT the declared subtrees -- the
+// settings.json shape, where the user manages nearly everything and the
+// program writes a few keys back.
+
+fn writeDisownFixture(io: Io, tmp: *std.testing.TmpDir, source: []const u8) !void {
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/settings.json", .data = source });
+}
+
+const disown_source =
+    \\// mox: disown model
+    \\{
+    \\  "theme": "dark",
+    \\  "editor": "nvim"
+    \\}
+    \\
+;
+
+test "apply disown: creates, adopts the program's key, and never drifts on its writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, disown_source);
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+
+    // Creation: the live file is the composed text, no mox syntax in it.
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\"\n}\n", try read(io, a, live));
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "mox:") == null);
+
+    // The program writes its key: clean, nothing to do, no byte changes.
+    const program_live = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "unchanged") != null);
+    try std.testing.expectEqualStrings(program_live, try read(io, a, live));
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "clean") != null);
+
+    // The source moves on: the user keys reassert, the program's key
+    // survives byte-for-byte.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/settings.json",
+        .data = "// mox: disown model\n{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\"\n}\n",
+    });
+    const r3 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    const after = try read(io, a, live);
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n", after);
+
+    // A later program rewrite of its key still never drifts.
+    const rewritten = try std.mem.replaceOwned(u8, a, after, "test-model-4.1", "test-model-4.5");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = rewritten });
+    const r4 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r4.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r4.out, "unchanged") != null);
+    try std.testing.expectEqualStrings(rewritten, try read(io, a, live));
+}
+
+test "apply disown: a user-key live edit drifts and --force reasserts around the program's key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, disown_source);
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"hand-edited\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n",
+    });
+    const skip = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), skip.rc);
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "theme") != null);
+
+    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expectEqualStrings(
+        "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n",
+        try read(io, a, live),
+    );
+}
+
+test "apply disown: grown and shrunk disown lists keep first-contact consent" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp,
+        \\// mox: disown model
+        \\{
+        \\  "theme": "dark",
+        \\  "survey": {"seen": 1}
+        \\}
+        \\
+    );
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The program rewrites survey; the list GROWS to disown it (and the
+    // source drops it): the protected set grew, content there simply stops
+    // being compared -- no drift, no consent needed.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"dark\",\n  \"survey\": {\"seen\": 99},\n  \"model\": \"m1\"\n}\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/settings.json",
+        .data = "// mox: disown model\n// mox: disown survey\n{\n  \"theme\": \"dark\"\n}\n",
+    });
+    const grown = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), grown.rc);
+    try std.testing.expect(std.mem.indexOf(u8, grown.err, "DRIFT") == null);
+    const after_grown = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after_grown, "\"seen\": 99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_grown, "\"model\": \"m1\"") != null);
+
+    // The list SHRINKS: model becomes owned content the composed source
+    // does not define. Its live content is first contact -- drift, never a
+    // silent removal; --force removes it.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/settings.json",
+        .data = "// mox: disown survey\n{\n  \"theme\": \"dark\"\n}\n",
+    });
+    const shrunk = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), shrunk.rc);
+    try std.testing.expect(std.mem.indexOf(u8, shrunk.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shrunk.err, "model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "model") != null);
+
+    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "model") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"seen\": 99") != null);
+}
+
+test "diff disown: shows the owned complement only; the program's key never appears" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, disown_source);
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"edited\",\n  \"editor\": \"nvim\",\n  \"model\": \"private-model-x\"\n}\n",
+    });
+
+    const r = try c.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\"edited\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "private-model-x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "model") == null);
+}
+
+test "rollback disown: re-patches the owned complement and keeps the program's later writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, disown_source);
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // Program writes its key; the source moves on and reasserts (snapshot
+    // taken of the pre-write live file).
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"m-old\"\n}\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/settings.json",
+        .data = "// mox: disown model\n{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\"\n}\n",
+    });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The program writes again AFTER the snapshot.
+    const later = try std.mem.replaceOwned(u8, a, try read(io, a, live), "m-old", "m-new");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = later });
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "re-patched") != null);
+
+    // The owned complement is back at its snapshot state; the program's
+    // LATER write survives.
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"theme\": \"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "m-new") != null);
+}

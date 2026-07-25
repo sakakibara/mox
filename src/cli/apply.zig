@@ -852,6 +852,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     // The walk only attaches own_paths to structured targets.
     const format = mox.source.format.formatOfPath(in.file.source_base_path).?;
 
+    const mode: mox.apply.applied.Mode = if (in.file.ownership == .disown) .disown else .own;
     var pdiag: partial_mod.Diag = .{};
 
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, in.bytes) catch |e| switch (e) {
@@ -863,15 +864,29 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
 
-    // D2: every composed leaf must lie under a declared path, checked
+    // D2, in the file's mode: every composed leaf must lie under a declared
+    // path (own), or no declared path may be populated (disown), checked
     // before live is read or touched.
-    if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
-        try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
-        counts.fail += 1;
-        return;
+    switch (mode) {
+        .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
+            try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+            counts.fail += 1;
+            return;
+        },
+        .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, own_paths)) |spelled| {
+            try ctx.err.print("  ERROR   {s} (composed source defines content under disowned path {s})\n", .{ live_path, spelled });
+            counts.fail += 1;
+            return;
+        },
     }
 
-    const secret_flags = partial_mod.secretPathFlags(ctx.alloc, format, in.bytes, own_paths, in.prov_items, &pdiag) catch |e| switch (e) {
+    // Per-path secret granularity: the declared paths in own mode, the
+    // extraction's top-level sections in disown mode.
+    const secret_scope: []const mox.source.tree.OwnPath = switch (mode) {
+        .own => own_paths,
+        .disown => try canon_mod.topLevelPaths(ctx.alloc, &owned),
+    };
+    const secret_flags = partial_mod.secretPathFlags(ctx.alloc, format, in.bytes, secret_scope, in.prov_items, &pdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ live_path, pdiag.text() });
@@ -881,7 +896,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     };
     var any_secret = false;
     var secret_raws: std.ArrayList([]const u8) = .empty;
-    for (own_paths, secret_flags) |p, flagged| {
+    for (secret_scope, secret_flags) |p, flagged| {
         if (flagged) {
             any_secret = true;
             try secret_raws.append(ctx.alloc, p.raw);
@@ -915,14 +930,17 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
 
-    const composed_canon = try canon_mod.canonicalOwned(ctx.alloc, &owned, own_paths);
+    const composed_canon = switch (mode) {
+        .own => try canon_mod.canonicalOwned(ctx.alloc, &owned, own_paths),
+        .disown => try canon_mod.canonicalComplement(ctx.alloc, &owned, own_paths),
+    };
 
     // A missing live file is a creation, classified as a plain write; an
-    // existing one takes the per-path drift rule against the owned record.
+    // existing one takes the drift rule against the owned record.
     const class: owned_mod.Class = if (live == null)
         .outdated
     else
-        try owned_mod.classify(ctx.alloc, &owned, &live_doc, own_paths, record, record_paths);
+        try owned_mod.classifyMode(ctx.alloc, mode, &owned, &live_doc, own_paths, record, record_paths);
 
     if (class == .drift and !in.force) {
         const drift_what = try owned_mod.driftWhat(ctx.alloc, class.drift);
@@ -934,7 +952,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         // A secret-bearing record has no cleartext for commit to diff, so
         // `[c]` is refused inline rather than queued to be skipped later.
         const refuse_commit = record != null and record.?.secret;
-        const diff_text = try ownedDriftDiff(ctx, resolver.sty, live_path, &owned, &live_doc, own_paths, record, secret_flags);
+        const diff_text = try ownedDriftDiff(ctx, resolver.sty, mode, live_path, &owned, &live_doc, own_paths, secret_scope, record, secret_flags);
         switch (try resolver.askOwned(ctx, live_path, drift_what, diff_text, refuse_commit)) {
             // Falls through to the write below, exactly as --force does for
             // this file alone.
@@ -957,6 +975,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
 
     const record_current = blk: {
         const r = record orelse break :blk false;
+        if (r.mode != mode) break :blk false;
         if (r.secret != any_secret) break :blk false;
         const cur_raws = try ctx.alloc.alloc([]const u8, own_paths.len);
         for (own_paths, cur_raws) |p, *o| o.* = p.raw;
@@ -976,7 +995,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         } else {
             // Clean adoption: the live owned content is already the composed
             // content, so only the record is established; no byte changes.
-            try writeOwnedRecord(ctx, live_path, composed_canon, any_secret, own_paths, secret_raws.items);
+            try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items);
             try ctx.out.print("  adopted {s} (live owned content matches the source)\n", .{live_path});
         }
         return;
@@ -1000,7 +1019,10 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         return;
     }
 
-    const candidate = partial_mod.replaceOwned(ctx.alloc, format, live_text, own_paths, &owned, &pdiag) catch |e| switch (e) {
+    const candidate = switch (mode) {
+        .own => partial_mod.replaceOwned(ctx.alloc, format, live_text, own_paths, &owned, &pdiag),
+        .disown => partial_mod.replaceDisowned(ctx.alloc, format, live_text, own_paths, in.bytes, &pdiag),
+    } catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} ({s})\n", .{ live_path, pdiag.text() });
@@ -1008,7 +1030,10 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
             return;
         },
     };
-    partial_mod.verifyInvariant(ctx.alloc, format, live_text, candidate, own_paths, &owned, &pdiag) catch |e| switch (e) {
+    (switch (mode) {
+        .own => partial_mod.verifyInvariant(ctx.alloc, format, live_text, candidate, own_paths, &owned, &pdiag),
+        .disown => partial_mod.verifyDisownInvariant(ctx.alloc, format, live_text, candidate, own_paths, in.bytes, &owned, &pdiag),
+    }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (invariant check failed: {s})\n", .{ live_path, pdiag.text() });
@@ -1026,7 +1051,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         // snapshot never stores a resolved secret.
         const recorded_secret: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
         var current_secret: std.ArrayList(mox.source.tree.OwnPath) = .empty;
-        for (own_paths, secret_flags) |p, flagged| {
+        for (secret_scope, secret_flags) |p, flagged| {
             if (flagged) try current_secret.append(ctx.alloc, p);
         }
         const mask_paths = try owned_mod.unionPaths(ctx.alloc, recorded_secret, current_secret.items);
@@ -1060,7 +1085,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
 
-    try writeOwnedRecord(ctx, live_path, composed_canon, any_secret, own_paths, secret_raws.items);
+    try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items);
     counts.ok += 1;
     try ctx.out.print("  {s} {s}\n", .{ if (live == null) "created" else "wrote", live_path });
 }
@@ -1072,10 +1097,12 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
 fn ownedDriftDiff(
     ctx: *app.Ctx,
     sty: style.Style,
+    mode: mox.apply.applied.Mode,
     live_path: []const u8,
     owned: *const mox.apply.partial.OwnedDoc,
     live_doc: *const mox.apply.partial.OwnedDoc,
     own_paths: []const mox.source.tree.OwnPath,
+    secret_scope: []const mox.source.tree.OwnPath,
     record: ?mox.apply.applied.OwnedRecord,
     secret_flags: []const bool,
 ) ![]const u8 {
@@ -1083,7 +1110,7 @@ fn ownedDriftDiff(
     const owned_mod = mox.apply.owned;
     var secret_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
     if (record) |r| try secret_paths.appendSlice(ctx.alloc, try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths));
-    for (own_paths, secret_flags) |p, flagged| {
+    for (secret_scope, secret_flags) |p, flagged| {
         if (flagged and !owned_mod.pathInList(p.segments, secret_paths.items)) {
             try secret_paths.append(ctx.alloc, p);
         }
@@ -1091,8 +1118,16 @@ fn ownedDriftDiff(
     const spelled = try ctx.alloc.alloc([]const u8, secret_paths.items.len);
     for (secret_paths.items, spelled) |p, *s| s.* = try canon_mod.pathSpell(ctx.alloc, p.segments);
 
-    const a_text = try diff_mod.maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, live_doc, own_paths), spelled);
-    const b_text = try diff_mod.maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, owned, own_paths), spelled);
+    const live_x = switch (mode) {
+        .own => try canon_mod.canonicalOwned(ctx.alloc, live_doc, own_paths),
+        .disown => try canon_mod.canonicalComplement(ctx.alloc, live_doc, own_paths),
+    };
+    const composed_x = switch (mode) {
+        .own => try canon_mod.canonicalOwned(ctx.alloc, owned, own_paths),
+        .disown => try canon_mod.canonicalComplement(ctx.alloc, owned, own_paths),
+    };
+    const a_text = try diff_mod.maskOwnedSections(ctx.alloc, live_x, spelled);
+    const b_text = try diff_mod.maskOwnedSections(ctx.alloc, composed_x, spelled);
     if (std.mem.eql(u8, a_text, b_text)) return "";
 
     const a_lines = try mox.diff.lines.splitLines(ctx.alloc, a_text);
@@ -1110,6 +1145,7 @@ fn ownedDriftDiff(
 fn writeOwnedRecord(
     ctx: *app.Ctx,
     live_path: []const u8,
+    mode: mox.apply.applied.Mode,
     composed_canon: []const u8,
     any_secret: bool,
     own_paths: []const mox.source.tree.OwnPath,
@@ -1119,6 +1155,7 @@ fn writeOwnedRecord(
     const raws = try ctx.alloc.alloc([]const u8, own_paths.len);
     for (own_paths, raws) |p, *o| o.* = p.raw;
     try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, live_path, .{
+        .mode = mode,
         .canonical = if (any_secret) null else composed_canon,
         .canonical_hash = if (any_secret) mox.apply.applied.contentHashHex(composed_canon) else null,
         .secret = any_secret,

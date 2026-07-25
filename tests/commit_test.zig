@@ -3536,3 +3536,55 @@ test "commit: an own declaration the walk rejects reports the target by name" {
     try std.testing.expect(std.mem.indexOf(u8, res.err, "notes.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "own requires a structured target") != null);
 }
+
+test "commit disown: routes a user-key edit to the base; the program's key never surfaces" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/settings.json",
+        \\// mox: disown model
+        \\{
+        \\  "theme": "dark",
+        \\  "editor": "nvim"
+        \\}
+        \\
+    );
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The program writes its key, then the user edits an owned key live.
+    const live = try h.liveOf("settings.json");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n",
+    });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, live, "\"theme\": \"dark\"", "\"theme\": \"light\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled, 0 manual") != null);
+    // The disowned key never surfaces in commit output.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "test-model-4.1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "test-model-4.1") == null);
+
+    // The edit landed in the base source, head declaration intact, and the
+    // disowned key stayed out of the source.
+    const src = try read(io, a, try h.srcOf("settings.json"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "// mox: disown model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "\"theme\": \"light\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "test-model-4.1") == null);
+    // The live file kept the program's key.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "test-model-4.1") != null);
+
+    // The owned record advanced: status clean, re-apply writes nothing.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+    const re = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), re.rc);
+    try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
+}

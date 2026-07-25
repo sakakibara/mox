@@ -59,6 +59,101 @@ pub fn canonicalOwned(
     return out.toOwnedSlice(arena);
 }
 
+/// Disown-mode canonical extraction: the whole document minus the declared
+/// subtrees, rendered as one section per remaining TOP-LEVEL entry (sorted
+/// by spelled key). The same pinned rendering as `canonicalOwned`, so the
+/// blob splits with `sectionOf` and parses with `parseTree`. A non-container
+/// root renders as one section under the quoted empty key.
+pub fn canonicalComplement(
+    arena: std.mem.Allocator,
+    doc: *const OwnedDoc,
+    disown_paths: []const OwnPath,
+) Error![]u8 {
+    const pruned = try partial.withoutSubtrees(arena, doc, disown_paths);
+    var out: std.ArrayList(u8) = .empty;
+    switch (pruned.root) {
+        .toml => |tv| {
+            if (tv != .table) return renderScalarSection(arena, &out, pruned.root);
+            const keys = tv.table.keys();
+            const spells = try arena.alloc([]const u8, keys.len);
+            for (keys, spells) |k, *s| s.* = try keySpell(arena, k);
+            for (try sortedBySpell(arena, spells)) |i| {
+                try sectionHeader(arena, &out, spells[i]);
+                try renderBody(arena, &out, .{ .toml = tv.table.values()[i] }, 1);
+            }
+        },
+        .json => |jv| {
+            if (jv != .object) return renderScalarSection(arena, &out, pruned.root);
+            const keys = jv.object.keys();
+            const spells = try arena.alloc([]const u8, keys.len);
+            for (keys, spells) |k, *s| s.* = try keySpell(arena, k);
+            for (try sortedBySpell(arena, spells)) |i| {
+                try sectionHeader(arena, &out, spells[i]);
+                try renderBody(arena, &out, .{ .json = jv.object.values()[i] }, 1);
+            }
+        },
+        .yaml => |yv| {
+            if (yv == .null) return out.toOwnedSlice(arena);
+            if (yv != .map) return renderScalarSection(arena, &out, pruned.root);
+            const deduped = try yamlDedupe(arena, yv.map);
+            const spells = try arena.alloc([]const u8, deduped.len);
+            for (deduped, spells) |e, *s| s.* = e.spell;
+            for (try sortedBySpell(arena, spells)) |i| {
+                try sectionHeader(arena, &out, spells[i]);
+                try renderBody(arena, &out, .{ .yaml = deduped[i].value }, 1);
+            }
+        },
+        .ini => |iv| {
+            const deduped = try iniDedupe(arena, iv.section.*);
+            const spells = try arena.alloc([]const u8, deduped.len);
+            for (deduped, spells) |e, *s| s.* = e.spell;
+            for (try sortedBySpell(arena, spells)) |i| {
+                try sectionHeader(arena, &out, spells[i]);
+                try renderBody(arena, &out, .{ .ini = deduped[i].value }, 1);
+            }
+        },
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// One single-segment OwnPath per top-level string key of the document, raw
+/// spelled canonically. The disown-mode stand-in for the declared list
+/// wherever a consumer needs per-path granularity over the owned content
+/// (secret flags, snapshot masking) -- the extraction's sections are these.
+pub fn topLevelPaths(arena: std.mem.Allocator, doc: *const OwnedDoc) Error![]OwnPath {
+    var out: std.ArrayList(OwnPath) = .empty;
+    switch (doc.root) {
+        .toml => |tv| if (tv == .table) for (tv.table.keys()) |k| try appendTop(arena, &out, k),
+        .json => |jv| if (jv == .object) for (jv.object.keys()) |k| try appendTop(arena, &out, k),
+        .yaml => |yv| if (yv == .map) for (yv.map) |e| {
+            if (e.key == .string) try appendTop(arena, &out, e.key.string);
+        },
+        .ini => |iv| for (iv.section.entries) |e| try appendTop(arena, &out, e.key),
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn appendTop(arena: std.mem.Allocator, out: *std.ArrayList(OwnPath), key: []const u8) Error!void {
+    for (out.items) |p| {
+        if (std.mem.eql(u8, p.segments[0], key)) return;
+    }
+    const segs = try arena.alloc([]const u8, 1);
+    segs[0] = key;
+    try out.append(arena, .{ .raw = try pathSpell(arena, segs), .segments = segs });
+}
+
+fn sectionHeader(arena: std.mem.Allocator, out: *std.ArrayList(u8), spell: []const u8) Error!void {
+    try out.appendSlice(arena, "= ");
+    try out.appendSlice(arena, spell);
+    try out.append(arena, '\n');
+}
+
+fn renderScalarSection(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: AnyValue) Error![]u8 {
+    try sectionHeader(arena, out, "\"\"");
+    try renderBody(arena, out, v, 1);
+    return out.toOwnedSlice(arena);
+}
+
 /// The section for `spelled` (header line included) within a canonical
 /// serialization, or null when the blob has no such section. Sections start
 /// with `= ` at column 0 and body lines are always indented, so scanning
@@ -168,6 +263,107 @@ fn bFinalize(arena: std.mem.Allocator, n: *const BNode) TreeError!Node {
     const out = try arena.alloc(Node.Entry, n.entries.items.len);
     for (n.entries.items, out) |e, *o| o.* = .{ .key = e.key, .node = try bFinalize(arena, e.node) };
     return .{ .leaf = n.leaf, .entries = out };
+}
+
+/// Re-render a parsed canonical tree in the pinned format: one section per
+/// top-level entry, sorted by spelled key -- the shape `canonicalComplement`
+/// produces. Used to subtract newly disowned paths from a stored record
+/// blob so both sides of a drift comparison cover the same scope.
+pub fn renderTree(arena: std.mem.Allocator, root: Node) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    const spells = try arena.alloc([]const u8, root.entries.len);
+    for (root.entries, spells) |e, *s| s.* = try keySpell(arena, e.key);
+    for (try sortedBySpell(arena, spells)) |i| {
+        try sectionHeader(arena, &out, spells[i]);
+        try renderTreeBody(arena, &out, root.entries[i].node, 1);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn renderTreeBody(arena: std.mem.Allocator, out: *std.ArrayList(u8), node: Node, depth: usize) Error!void {
+    if (node.leaf) |text| {
+        try indent(arena, out, depth);
+        try out.appendSlice(arena, text);
+        try out.append(arena, '\n');
+        return;
+    }
+    if (node.entries.len == 0) {
+        try indent(arena, out, depth);
+        try out.appendSlice(arena, "{}\n");
+        return;
+    }
+    const spells = try arena.alloc([]const u8, node.entries.len);
+    for (node.entries, spells) |e, *s| s.* = try keySpell(arena, e.key);
+    for (try sortedBySpell(arena, spells)) |i| {
+        const child = node.entries[i].node;
+        try indent(arena, out, depth);
+        try out.appendSlice(arena, spells[i]);
+        if (child.leaf) |text| {
+            try out.appendSlice(arena, " = ");
+            try out.appendSlice(arena, text);
+            try out.append(arena, '\n');
+        } else if (child.entries.len == 0) {
+            try out.appendSlice(arena, ": {}\n");
+        } else {
+            try out.appendSlice(arena, ":\n");
+            try renderTreeBody(arena, out, child, depth + 1);
+        }
+    }
+}
+
+/// The tree with the declared subtrees removed, matching stored keys with
+/// the format's dialect rules. A container emptied by a removal is removed
+/// with it, mirroring `partial.withoutSubtrees`.
+pub fn treeWithout(
+    arena: std.mem.Allocator,
+    format: partial.Format,
+    root: Node,
+    paths: []const OwnPath,
+) Error!Node {
+    var stored: std.ArrayList([]const u8) = .empty;
+    const pruned = try treePruneInner(arena, format, root, paths, &stored, &.{});
+    return pruned orelse Node{ .leaf = null, .entries = &.{} };
+}
+
+fn treeDeclaredMatch(format: partial.Format, paths: []const OwnPath, stored: []const []const u8, containers: []const bool, exact: bool) bool {
+    for (paths) |p| {
+        if (exact and p.segments.len != stored.len) continue;
+        if (!exact and p.segments.len <= stored.len) continue;
+        var all = true;
+        const n = @min(p.segments.len, stored.len);
+        for (stored[0..n], containers[0..n], p.segments[0..n], 0..) |s, is_container, d, depth| {
+            if (!partial.segMatchesStored(format, s, d, is_container, depth)) all = false;
+        }
+        if (all) return true;
+    }
+    return false;
+}
+
+fn treePruneInner(
+    arena: std.mem.Allocator,
+    format: partial.Format,
+    node: Node,
+    paths: []const OwnPath,
+    stored: *std.ArrayList([]const u8),
+    container_flags: []const bool,
+) Error!?Node {
+    if (treeDeclaredMatch(format, paths, stored.items, container_flags, true)) return null;
+    if (node.leaf != null) return node;
+    if (!treeDeclaredMatch(format, paths, stored.items, container_flags, false)) return node;
+
+    var out: std.ArrayList(Node.Entry) = .empty;
+    var removed = false;
+    for (node.entries) |e| {
+        try stored.append(arena, e.key);
+        const flags = try arena.alloc(bool, container_flags.len + 1);
+        @memcpy(flags[0..container_flags.len], container_flags);
+        flags[container_flags.len] = e.node.leaf == null;
+        const kept = try treePruneInner(arena, format, e.node, paths, stored, flags);
+        _ = stored.pop();
+        if (kept) |k| try out.append(arena, .{ .key = e.key, .node = k }) else removed = true;
+    }
+    if (removed and out.items.len == 0 and node.entries.len != 0) return null;
+    return .{ .leaf = null, .entries = try out.toOwnedSlice(arena) };
 }
 
 /// One spelled key token at the start of `rest`, or null when `rest` does not
@@ -951,4 +1147,47 @@ test "parseTree: a non-canonical blob is Malformed, never a guess" {
     // An empty blob is a valid empty root.
     const empty = try parseTree(arena, "");
     try testing.expectEqual(@as(usize, 0), empty.entries.len);
+}
+
+test "canonicalComplement: whole document minus disowned, sectioned per top-level key" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try OwnedDoc.parse(arena, .json, "{\"theme\": \"dark\", \"model\": \"x\", \"editor\": {\"tab\": 2}}");
+    const paths = try testPaths(arena, &.{"model"});
+    const got = try canonicalComplement(arena, &doc, paths);
+    const want =
+        \\= editor
+        \\  tab = 2
+        \\= theme
+        \\  "dark"
+        \\
+    ;
+    try testing.expectEqualStrings(want, got);
+    // The complement blob parses with the same tree machinery commit uses.
+    const tree = try parseTree(arena, got);
+    try testing.expectEqualStrings("2", tree.find("editor").?.find("tab").?.leaf.?);
+}
+
+test "renderTree round-trips a complement blob; treeWithout subtracts by path" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try OwnedDoc.parse(arena, .toml, "[a]\nx = 1\ny = 2\n\n[b]\nk = \"v\"\n");
+    const blob = try canonicalComplement(arena, &doc, &.{});
+    const tree = try parseTree(arena, blob);
+    try testing.expectEqualStrings(blob, try renderTree(arena, tree));
+
+    const minus = try treeWithout(arena, .toml, tree, try testPaths(arena, &.{"a.x"}));
+    const want =
+        \\= a
+        \\  y = 2
+        \\= b
+        \\  k = "v"
+        \\
+    ;
+    try testing.expectEqualStrings(want, try renderTree(arena, minus));
+    // Removing a container's last leaf prunes the emptied framing too.
+    const gone = try treeWithout(arena, .toml, tree, try testPaths(arena, &.{"b"}));
+    try testing.expect(gone.find("b") == null);
 }

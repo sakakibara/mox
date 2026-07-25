@@ -2494,6 +2494,462 @@ fn valueHasMask(v: AnyValue) bool {
     return false;
 }
 
+// Disown mode: the roles invert. The owned document is the ENTIRE composed
+// source; the declared paths' spans in the live file are the protected
+// remainder. The candidate is the composed TEXT with the live disowned
+// spans spliced in at the format's placement point, and the invariant
+// verifies (a) the candidate minus the disowned subtrees equals the
+// composed document, (b) each disowned span survives byte-identically from
+// live to candidate, and (c) the candidate minus the disowned spans equals
+// the composed text byte-for-byte.
+
+/// D2 inverted: the first declared path the composed document populates
+/// (spelled), or null. Composed content under a disowned path can never be
+/// asserted; refusing names the contradiction.
+pub fn populatedDisownPath(
+    arena: std.mem.Allocator,
+    owned: *const OwnedDoc,
+    disown_paths: []const OwnPath,
+) error{OutOfMemory}!?[]const u8 {
+    for (disown_paths) |p| {
+        if (owned.subtreeAt(p.segments) != null) return try diagPathSpell(arena, p.segments);
+    }
+    return null;
+}
+
+/// The document with the declared subtrees removed. A container left empty
+/// by a removal (pure framing of disowned content) is removed with it; a
+/// container that was already empty stays.
+pub fn withoutSubtrees(
+    arena: std.mem.Allocator,
+    doc: *const OwnedDoc,
+    paths: []const OwnPath,
+) error{OutOfMemory}!OwnedDoc {
+    var stored: std.ArrayList([]const u8) = .empty;
+    var folds: std.ArrayList(bool) = .empty;
+    const pruned = try pruneValue(arena, doc.format, doc.root, paths, &stored, &folds);
+    const root = pruned orelse switch (doc.format) {
+        .toml => AnyValue{ .toml = .{ .table = .empty } },
+        .json => AnyValue{ .json = .{ .object = .empty } },
+        .yaml => AnyValue{ .yaml = .null },
+        .ini, .gitconfig => blk: {
+            const sec = try arena.create(ini.Section);
+            sec.* = .{ .entries = &.{} };
+            break :blk AnyValue{ .ini = .{ .section = sec } };
+        },
+    };
+    return .{ .format = doc.format, .root = root };
+}
+
+fn pathEqualsDeclaredFold(paths: []const OwnPath, stored: []const []const u8, folds: []const bool) bool {
+    for (paths) |p| {
+        if (p.segments.len == stored.len and segsPrefixFold(p.segments, stored, folds)) return true;
+    }
+    return false;
+}
+
+/// Returns null when this node is removed whole. Containers rebuild their
+/// entry lists; one emptied by a removal is dropped too.
+fn pruneValue(
+    arena: std.mem.Allocator,
+    format: Format,
+    v: AnyValue,
+    paths: []const OwnPath,
+    stored: *std.ArrayList([]const u8),
+    folds: *std.ArrayList(bool),
+) error{OutOfMemory}!?AnyValue {
+    if (pathEqualsDeclaredFold(paths, stored.items, folds.items)) return null;
+    if (!pathStrictPrefixOfDeclaredFold(paths, stored.items, folds.items)) return v;
+
+    switch (v) {
+        .toml => |tv| {
+            if (tv != .table) return v;
+            var out: toml.Value.Table = .empty;
+            var removed = false;
+            for (tv.table.keys(), tv.table.values()) |k, sub| {
+                try stored.append(arena, k);
+                try folds.append(arena, false);
+                const kept = try pruneValue(arena, format, .{ .toml = sub }, paths, stored, folds);
+                _ = stored.pop();
+                _ = folds.pop();
+                if (kept) |kv| try out.put(arena, k, kv.toml) else removed = true;
+            }
+            if (removed and out.count() == 0 and tv.table.count() != 0) return null;
+            return .{ .toml = .{ .table = out } };
+        },
+        .json => |jv| {
+            if (jv != .object) return v;
+            var out: json.ObjectMap = .empty;
+            var removed = false;
+            for (jv.object.keys(), jv.object.values()) |k, sub| {
+                try stored.append(arena, k);
+                try folds.append(arena, false);
+                const kept = try pruneValue(arena, format, .{ .json = sub }, paths, stored, folds);
+                _ = stored.pop();
+                _ = folds.pop();
+                if (kept) |kv| try out.put(arena, k, kv.json) else removed = true;
+            }
+            if (removed and out.count() == 0 and jv.object.count() != 0) return null;
+            return .{ .json = .{ .object = out } };
+        },
+        .yaml => |yv| {
+            if (yv != .map) return v;
+            var out: std.ArrayList(yaml.Entry) = .empty;
+            var removed = false;
+            for (yv.map) |entry| {
+                if (entry.key != .string) {
+                    try out.append(arena, entry);
+                    continue;
+                }
+                try stored.append(arena, entry.key.string);
+                try folds.append(arena, false);
+                const kept = try pruneValue(arena, format, .{ .yaml = entry.value }, paths, stored, folds);
+                _ = stored.pop();
+                _ = folds.pop();
+                if (kept) |kv| {
+                    try out.append(arena, .{ .key = entry.key, .value = kv.yaml });
+                } else removed = true;
+            }
+            if (removed and out.items.len == 0 and yv.map.len != 0) return null;
+            return .{ .yaml = .{ .map = try out.toOwnedSlice(arena) } };
+        },
+        .ini => |iv| {
+            if (iv != .section) return v;
+            var out: std.ArrayList(ini.value.Entry) = .empty;
+            var removed = false;
+            for (iv.section.entries) |entry| {
+                const fold = iniEntryFold(iniDialect(format), entry.value == .section, stored.items.len);
+                try stored.append(arena, entry.key);
+                try folds.append(arena, fold);
+                const kept = try pruneValue(arena, format, .{ .ini = entry.value }, paths, stored, folds);
+                _ = stored.pop();
+                _ = folds.pop();
+                if (kept) |kv| {
+                    try out.append(arena, .{ .key = entry.key, .value = kv.ini });
+                } else removed = true;
+            }
+            if (removed and out.items.len == 0 and iv.section.entries.len != 0) return null;
+            const sec = try arena.create(ini.Section);
+            sec.* = .{ .entries = try out.toOwnedSlice(arena) };
+            return .{ .ini = .{ .section = sec } };
+        },
+    }
+}
+
+/// Dialect-aware one-segment match against a stored key of the given role,
+/// shared with the canonical record tree's subtraction.
+pub fn segMatchesStored(format: Format, stored: []const u8, declared: []const u8, is_container: bool, depth: usize) bool {
+    const fold = switch (format) {
+        .ini, .gitconfig => iniEntryFold(iniDialect(format), is_container, depth),
+        else => false,
+    };
+    return segEqFold(stored, declared, fold);
+}
+
+/// True when the document holds the snapshot secret mask anywhere OUTSIDE
+/// the declared (disowned) subtrees -- the disown-mode twin of
+/// `ownedHasSecretMask`.
+pub fn complementHasSecretMask(
+    arena: std.mem.Allocator,
+    doc: *const OwnedDoc,
+    disown_paths: []const OwnPath,
+) error{OutOfMemory}!bool {
+    const pruned = try withoutSubtrees(arena, doc, disown_paths);
+    return valueHasMask(pruned.root);
+}
+
+/// Build the disown-mode candidate: the composed text with each disowned
+/// path's live span inserted at the format's placement point (raw bytes, so
+/// the program's content survives verbatim). A path with no live presence
+/// contributes nothing. Refusal shapes surface from the live locate.
+pub fn replaceDisowned(
+    arena: std.mem.Allocator,
+    format: Format,
+    live: []const u8,
+    disown_paths: []const OwnPath,
+    composed_text: []const u8,
+    diag: ?*Diag,
+) ReplaceError![]u8 {
+    if (live.len == 0) return arena.dupe(u8, composed_text);
+    const loc = try locateFull(arena, format, live, disown_paths, diag);
+    var text: []const u8 = composed_text;
+    for (disown_paths, loc.spans, loc.forms) |p, span_opt, form| {
+        const sp = span_opt orelse continue;
+        const raw = live[sp.start..sp.end];
+        text = switch (format) {
+            .toml => try tomlInsertRaw(arena, text, p, raw, form, diag),
+            .ini, .gitconfig => try iniInsertRaw(arena, format, text, p, raw, form, diag),
+            .json => try jsonInsertRaw(arena, text, p, raw, diag),
+            .yaml => try yamlInsertRaw(arena, text, p, raw, diag),
+        };
+    }
+    return @constCast(text);
+}
+
+fn tomlInsertRaw(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    p: OwnPath,
+    raw: []const u8,
+    form: Form,
+    diag: ?*Diag,
+) ReplaceError![]const u8 {
+    const raw_nl = try ensureTrailingNewline(arena, raw);
+    if (form == .block) return insertWithSeparator(arena, text, text.len, raw_nl);
+    const scan = tomlScan(arena, text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            diagSet(diag, "{s}: composed text does not parse for the splice", .{p.raw});
+            return error.OwnedRenderFailed;
+        },
+    };
+    const parent = p.segments[0 .. p.segments.len - 1];
+    if (parent.len == 0) {
+        return insertWithSeparator(arena, text, tomlRootInsertOffset(&scan), raw_nl);
+    }
+    if (tomlSectionInsertOffset(&scan, parent)) |at| {
+        return insertWithSeparator(arena, text, at, raw_nl);
+    }
+    const header = try tomlPathSpell(arena, parent);
+    const block = try std.mem.concat(arena, u8, &.{ "[", header, "]\n", raw_nl });
+    return insertWithSeparator(arena, text, text.len, block);
+}
+
+fn iniInsertRaw(
+    arena: std.mem.Allocator,
+    format: Format,
+    text: []const u8,
+    p: OwnPath,
+    raw: []const u8,
+    form: Form,
+    diag: ?*Diag,
+) ReplaceError![]const u8 {
+    const dialect = iniDialect(format);
+    const raw_nl = try ensureTrailingNewline(arena, raw);
+    if (form == .block) return insertWithSeparator(arena, text, text.len, raw_nl);
+    const scan = iniScan(arena, format, text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            diagSet(diag, "{s}: composed text does not parse for the splice", .{p.raw});
+            return error.OwnedRenderFailed;
+        },
+    };
+    const parent = p.segments[0 .. p.segments.len - 1];
+    if (parent.len == 0) {
+        if (!dialect.global_keys) {
+            diagSet(diag, "{s}: dialect does not allow keys outside a section", .{p.raw});
+            return error.OwnedRenderFailed;
+        }
+        var at: usize = scan.bom;
+        for (scan.lines) |line| {
+            if (line.kind == .header) break;
+            if (line.kind == .kv) at = line.end;
+        }
+        return insertWithSeparator(arena, text, at, raw_nl);
+    }
+    const parent_folded = try iniFoldDeclared(arena, dialect, parent, false);
+    if (iniSectionInsertOffset(&scan, parent_folded)) |at| {
+        return insertWithSeparator(arena, text, at, raw_nl);
+    }
+    const header = try iniHeaderSpell(arena, parent);
+    const block = try std.mem.concat(arena, u8, &.{ header, raw_nl });
+    return insertWithSeparator(arena, text, text.len, block);
+}
+
+fn jsonInsertRaw(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    p: OwnPath,
+    raw: []const u8,
+    diag: ?*Diag,
+) ReplaceError![]const u8 {
+    const member = std.mem.trim(u8, raw, " \t\r\n,");
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        return std.mem.concat(arena, u8, &.{ "{\n  ", member, "\n}\n" });
+    }
+    const doc = json.Document.parse(arena, text, .{ .dialect = .jsonc }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            diagSet(diag, "{s}: composed text does not parse for the splice", .{p.raw});
+            return error.OwnedRenderFailed;
+        },
+    };
+    if (doc.root.data != .object) {
+        diagSet(diag, "{s}: root of the composed document is not an object", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+
+    // Deepest existing ancestor object along the declared path.
+    var cur = doc.root;
+    for (p.segments[0 .. p.segments.len - 1]) |seg| {
+        if (cur.data != .object) break;
+        var next: ?@TypeOf(cur) = null;
+        for (cur.data.object.items) |m| {
+            if (std.mem.eql(u8, m.key.decoded, seg)) next = m.value;
+        }
+        cur = next orelse break;
+    }
+    if (cur.data != .object) {
+        diagSet(diag, "{s}: path runs through a non-object value", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+    const members = cur.data.object.items;
+    if (members.len == 0) {
+        return std.mem.concat(arena, u8, &.{
+            text[0 .. cur.outer.start + 1], member, text[cur.outer.end - 1 ..],
+        });
+    }
+    const last = members[members.len - 1];
+    const value_end = last.value.outer.end;
+    if (value_end < text.len and text[value_end] == ',') {
+        diagSet(diag, "{s}: composed object carries a trailing comma the splice cannot keep", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+    const key_line = lineStartOf(text, last.key.outer.start);
+    const indent = text[key_line..firstNonWs(text, key_line)];
+    return std.mem.concat(arena, u8, &.{
+        text[0..value_end], ",\n", indent, member, text[value_end..],
+    });
+}
+
+fn yamlInsertRaw(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    p: OwnPath,
+    raw: []const u8,
+    diag: ?*Diag,
+) ReplaceError![]const u8 {
+    const raw_nl = try ensureTrailingNewline(arena, raw);
+    const raw_indent = raw_nl[0..firstNonWs(raw_nl, 0)];
+    const scan = yamlScan(arena, text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            diagSet(diag, "{s}: composed text does not parse for the splice", .{p.raw});
+            return error.OwnedRenderFailed;
+        },
+    };
+    if (scan.empty or scan.doc.roots.len == 0) {
+        if (raw_indent.len != 0) {
+            diagSet(diag, "{s}: live span indentation does not fit an empty composed document", .{p.raw});
+            return error.OwnedRenderFailed;
+        }
+        return insertWithSeparator(arena, text, text.len, raw_nl);
+    }
+    const src = scan.doc.source;
+    const root = scan.doc.roots[0];
+    if (root.data != .mapping) {
+        diagSet(diag, "{s}: root of the composed document is not a mapping", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+
+    var cur = root;
+    var depth: usize = 0;
+    while (depth < p.segments.len - 1) {
+        if (cur.data != .mapping) break;
+        var next: ?@TypeOf(cur) = null;
+        for (cur.data.mapping.items) |m| {
+            if (std.mem.eql(u8, m.key.decoded, p.segments[depth])) next = m.value;
+        }
+        cur = next orelse break;
+        depth += 1;
+    }
+    if (depth != p.segments.len - 1 or cur.data != .mapping) {
+        diagSet(diag, "{s}: the path's parent mapping does not exist in the composed document", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+    if (src.len > cur.outer.start and src[cur.outer.start] == '{') {
+        diagSet(diag, "{s}: path runs through a flow-style mapping", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+    const members = cur.data.mapping.items;
+    if (members.len == 0) {
+        diagSet(diag, "{s}: the composed parent mapping has no block members to splice beside", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+    const last = members[members.len - 1];
+    const key_line = lineStartOf(src, last.key.outer.start);
+    const indent = src[key_line..firstNonWs(src, key_line)];
+    if (!std.mem.eql(u8, raw_indent, indent)) {
+        diagSet(diag, "{s}: live span indentation does not match the composed parent mapping", .{p.raw});
+        return error.OwnedRenderFailed;
+    }
+    const at = lineEndOf(src, last.value.outer.end);
+    return insertWithSeparator(arena, text, at, raw_nl);
+}
+
+/// `text` minus every located span and wrapper region: the public remainder,
+/// for callers reconstructing a disown-mode owned complement (rollback's
+/// snapshot re-patch).
+pub fn textWithoutSpans(arena: std.mem.Allocator, text: []const u8, loc: Located) error{OutOfMemory}![]u8 {
+    var regions: std.ArrayList(Span) = .empty;
+    for (loc.spans) |s| if (s) |sp| try regions.append(arena, sp);
+    for (loc.wrappers) |w| try regions.append(arena, w);
+    return remainderOfRegions(arena, text, try regions.toOwnedSlice(arena));
+}
+
+/// The disown-mode executable invariant, all three parts (see the section
+/// comment above). Trailing whitespace inside a protected span may be
+/// normalized by the splice; every other byte is pinned.
+pub fn verifyDisownInvariant(
+    arena: std.mem.Allocator,
+    format: Format,
+    live: []const u8,
+    candidate: []const u8,
+    disown_paths: []const OwnPath,
+    composed_text: []const u8,
+    composed_doc: *const OwnedDoc,
+    diag: ?*Diag,
+) VerifyError!void {
+    const cand_doc = OwnedDoc.parse(arena, format, candidate) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => return error.CandidateUnparseable,
+    };
+
+    // (a) Everything outside the disowned subtrees equals the composed
+    // document.
+    const cand_pruned = try withoutSubtrees(arena, &cand_doc, disown_paths);
+    const composed_pruned = try withoutSubtrees(arena, composed_doc, disown_paths);
+    if (!anyValueEql(cand_pruned.root, composed_pruned.root)) {
+        diagSet(diag, "candidate owned content does not match the composed document", .{});
+        return error.OwnedContentMismatch;
+    }
+
+    // (b) Each disowned span survives byte-identically live -> candidate.
+    const live_loc = if (live.len == 0)
+        FullLocated{ .spans = try arena.alloc(?Span, disown_paths.len), .forms = try arena.alloc(Form, disown_paths.len), .wrappers = &.{} }
+    else
+        try locateFull(arena, format, live, disown_paths, diag);
+    if (live.len == 0) @memset(live_loc.spans, null);
+    const cand_loc = locateFull(arena, format, candidate, disown_paths, diag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LiveUnparseable => return error.CandidateUnparseable,
+        else => return e,
+    };
+    const span_trim: []const u8 = if (format == .json) " \t\r\n," else " \t\r\n";
+    for (disown_paths, live_loc.spans, cand_loc.spans) |p, lsp, csp| {
+        if ((lsp == null) != (csp == null)) {
+            diagSet(diag, "{s}: disowned content was gained or lost", .{p.raw});
+            return error.RemainderMismatch;
+        }
+        const l = lsp orelse continue;
+        const c = csp.?;
+        const lb = if (format == .json) std.mem.trim(u8, live[l.start..l.end], span_trim) else std.mem.trimEnd(u8, live[l.start..l.end], span_trim);
+        const cb = if (format == .json) std.mem.trim(u8, candidate[c.start..c.end], span_trim) else std.mem.trimEnd(u8, candidate[c.start..c.end], span_trim);
+        if (!std.mem.eql(u8, lb, cb)) {
+            diagSet(diag, "{s}: disowned content was not preserved byte-for-byte", .{p.raw});
+            return error.RemainderMismatch;
+        }
+    }
+
+    // (c) The candidate minus the disowned spans is the composed text.
+    const rest = try remainderBytes(arena, candidate, cand_loc);
+    if (std.mem.eql(u8, rest, composed_text)) return;
+    if (composed_text.len > 0 and composed_text[composed_text.len - 1] != '\n' and
+        try separatorAttributedMatch(arena, candidate, cand_loc, composed_text)) return;
+    diagSet(diag, "candidate changed bytes outside the disowned spans", .{});
+    return error.RemainderMismatch;
+}
+
 const testing = std.testing;
 const keypath = @import("../source/keypath.zig");
 
@@ -3275,4 +3731,143 @@ test "secretPathFlags: a secret line inside one owned table flags exactly that p
     };
     const clean = try secretPathFlags(arena, .toml, composed, paths, &none, null);
     try testing.expect(!clean[0] and !clean[1]);
+}
+
+// Disown-mode tests
+
+fn testDisown(
+    arena: std.mem.Allocator,
+    format: Format,
+    live: []const u8,
+    raws: []const []const u8,
+    composed_text: []const u8,
+) ![]u8 {
+    const paths = try testOwn(arena, raws);
+    const composed_doc = try OwnedDoc.parse(arena, format, composed_text);
+    var diag: Diag = .{};
+    const cand = replaceDisowned(arena, format, live, paths, composed_text, &diag) catch |e| {
+        std.debug.print("disown replace failed: {s} ({t})\n", .{ diag.text(), e });
+        return e;
+    };
+    verifyDisownInvariant(arena, format, live, cand, paths, composed_text, &composed_doc, &diag) catch |e| {
+        std.debug.print("disown verify failed: {s} ({t})\ncandidate:\n{s}\n", .{ diag.text(), e, cand });
+        return e;
+    };
+    return cand;
+}
+
+test "disown json: the program's member survives byte-for-byte around reasserted content" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const composed = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\"\n}\n";
+    const live = "{\n  \"theme\": \"old\",\n  \"model\": \"test-model-4.1\"\n}\n";
+    const cand = try testDisown(arena, .json, live, &.{"model"}, composed);
+    try testing.expectEqualStrings(
+        "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n",
+        cand,
+    );
+}
+
+test "disown json: a missing live file yields exactly the composed text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const composed = "{\n  \"theme\": \"dark\"\n}\n";
+    const cand = try testDisown(arena, .json, "", &.{"model"}, composed);
+    try testing.expectEqualStrings(composed, cand);
+}
+
+test "disown toml: block and nested kv insertions, comments in the span preserved" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const composed = "[user]\nname = \"me\"\n";
+    const live = "[user]\nname = \"old\"\n\n[state]\n# program note\ncount = 42\n";
+    // The blank separator line before [state] was live remainder, not span
+    // content, so the appended block sits directly after the composed text.
+    const cand = try testDisown(arena, .toml, live, &.{"state"}, composed);
+    try testing.expectEqualStrings("[user]\nname = \"me\"\n[state]\n# program note\ncount = 42\n", cand);
+
+    // A disowned kv whose parent section exists in the composed text joins it.
+    const cand2 = try testDisown(arena, .toml, "[user]\nname = \"old\"\nseen = 9\n", &.{"user.seen"}, composed);
+    try testing.expectEqualStrings("[user]\nname = \"me\"\nseen = 9\n", cand2);
+}
+
+test "disown ini: the program's section is appended and matched case-insensitively" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const composed = "[colors]\nfg = red\n";
+    const live = "[colors]\nfg = blue\n[STATE]\ncount = 1\n";
+    const cand = try testDisown(arena, .ini, live, &.{"state"}, composed);
+    try testing.expectEqualStrings("[colors]\nfg = red\n[STATE]\ncount = 1\n", cand);
+}
+
+test "disown yaml: a top-level live member is appended after the composed mapping" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const composed = "theme: dark\n";
+    const live = "theme: old\nstate:\n  count: 1\n";
+    const cand = try testDisown(arena, .yaml, live, &.{"state"}, composed);
+    try testing.expectEqualStrings("theme: dark\nstate:\n  count: 1\n", cand);
+}
+
+test "disown verify: a smuggled owned byte and a mutated protected span both fail" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"state"});
+    const composed = "[user]\nname = \"me\"\n";
+    const composed_doc = try OwnedDoc.parse(arena, .toml, composed);
+    const live = "[user]\nname = \"me\"\n\n[state]\ncount = 42\n";
+    var diag: Diag = .{};
+
+    // Owned content beyond the composed document.
+    try testing.expectError(error.OwnedContentMismatch, verifyDisownInvariant(
+        arena,
+        .toml,
+        live,
+        "[user]\nname = \"me\"\nextra = 1\n\n[state]\ncount = 42\n",
+        paths,
+        composed,
+        &composed_doc,
+        &diag,
+    ));
+    // A protected span that changed between live and candidate.
+    try testing.expectError(error.RemainderMismatch, verifyDisownInvariant(
+        arena,
+        .toml,
+        live,
+        "[user]\nname = \"me\"\n\n[state]\ncount = 43\n",
+        paths,
+        composed,
+        &composed_doc,
+        &diag,
+    ));
+}
+
+test "disown D2: a composed document populating a disowned path is named" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"model"});
+    const doc = try OwnedDoc.parse(arena, .json, "{\"model\": \"x\", \"theme\": \"dark\"}");
+    try testing.expectEqualStrings("model", (try populatedDisownPath(arena, &doc, paths)).?);
+    const clean = try OwnedDoc.parse(arena, .json, "{\"theme\": \"dark\"}");
+    try testing.expect(try populatedDisownPath(arena, &clean, paths) == null);
+}
+
+test "withoutSubtrees: removes declared subtrees and prunes emptied framing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try OwnedDoc.parse(arena, .toml, "[a]\nb = 1\n\n[keep]\nk = 1\n\n[empty]\n");
+    const pruned = try withoutSubtrees(arena, &doc, try testOwn(arena, &.{"a.b"}));
+    // a lost its only entry to the removal: pure framing, pruned with it.
+    try testing.expect(pruned.root.toml.table.get("a") == null);
+    try testing.expect(pruned.root.toml.table.get("keep") != null);
+    // A container that was ALREADY empty is content, not framing.
+    try testing.expect(pruned.root.toml.table.get("empty") != null);
 }

@@ -51,6 +51,132 @@ pub fn classify(
     return .outdated;
 }
 
+/// Classification in the file's declared mode: `.own` compares the declared
+/// subtrees, `.disown` compares the whole document minus them. One entry
+/// point so every consumer (apply, status, diff, commit) stays a single
+/// code path parameterized by mode.
+pub fn classifyMode(
+    arena: std.mem.Allocator,
+    mode: applied.Mode,
+    owned: *const OwnedDoc,
+    live_doc: *const OwnedDoc,
+    paths: []const OwnPath,
+    record: ?applied.OwnedRecord,
+    record_paths: []const OwnPath,
+) error{OutOfMemory}!Class {
+    return switch (mode) {
+        .own => classify(arena, owned, live_doc, paths, record, record_paths),
+        .disown => classifyDisown(arena, owned, live_doc, paths, record, record_paths),
+    };
+}
+
+/// The disown-mode drift rule: canonical(live minus disowned) against the
+/// record's complement blob. Per path on the DISOWN side: a path newly
+/// disowned stops being compared (the protected set grew); a path REMOVED
+/// from the list becomes owned content -- first contact for consent, so
+/// live content there differing from composed is drift, never a silent
+/// reassert. A grown or shrunk list is reconciled by subtracting the newly
+/// disowned paths from the record blob so both sides cover one scope.
+pub fn classifyDisown(
+    arena: std.mem.Allocator,
+    owned: *const OwnedDoc,
+    live_doc: *const OwnedDoc,
+    disown_paths: []const OwnPath,
+    record: ?applied.OwnedRecord,
+    record_paths: []const OwnPath,
+) error{OutOfMemory}!Class {
+    const composed_x = try canonical.canonicalComplement(arena, owned, disown_paths);
+    const live_x = try canonical.canonicalComplement(arena, live_doc, disown_paths);
+    if (std.mem.eql(u8, live_x, composed_x)) return .clean;
+
+    const rec = record orelse return .{ .drift = firstDifferingSection(live_x, composed_x) };
+
+    if (rec.secret) {
+        // Stale scope: the hash covers a different disown list; outdated,
+        // reassert re-records under the current scope.
+        if (!samePathSet(disown_paths, record_paths)) return .outdated;
+        const live_hash = applied.contentHashHex(live_x);
+        if (rec.canonical_hash == null or !std.mem.eql(u8, &live_hash, &rec.canonical_hash.?)) {
+            return .{ .drift = null };
+        }
+        return .outdated;
+    }
+
+    for (record_paths) |r| {
+        if (pathInList(r.segments, disown_paths)) continue;
+        const one = [_]OwnPath{r};
+        const live_sec = try canonical.canonicalOwned(arena, live_doc, &one);
+        const composed_sec = try canonical.canonicalOwned(arena, owned, &one);
+        if (!std.mem.eql(u8, live_sec, composed_sec)) {
+            return .{ .drift = try canonical.pathSpell(arena, r.segments) };
+        }
+    }
+
+    const union_paths = try unionPaths(arena, disown_paths, record_paths);
+    const live_rest = try canonical.canonicalComplement(arena, live_doc, union_paths);
+    const record_rest = recordComplement(arena, owned.format, rec, record_paths, disown_paths) orelse
+        return .{ .drift = null };
+    if (std.mem.eql(u8, live_rest, record_rest)) return .outdated;
+    return .{ .drift = firstDifferingSection(live_rest, record_rest) };
+}
+
+/// The record's canonical blob restricted to the current scope: the paths
+/// newly added to the disown list are subtracted. Null when the stored blob
+/// cannot be parsed (conservative: reads as drift, never as clean).
+pub fn recordComplement(
+    arena: std.mem.Allocator,
+    format: partial.Format,
+    rec: applied.OwnedRecord,
+    record_paths: []const OwnPath,
+    disown_paths: []const OwnPath,
+) ?[]const u8 {
+    const blob = rec.canonical orelse return null;
+    var newly: std.ArrayList(OwnPath) = .empty;
+    for (disown_paths) |p| {
+        if (!pathInList(p.segments, record_paths)) newly.append(arena, p) catch return null;
+    }
+    if (newly.items.len == 0) return blob;
+    const tree = canonical.parseTree(arena, blob) catch return null;
+    const pruned = canonical.treeWithout(arena, format, tree, newly.items) catch return null;
+    return canonical.renderTree(arena, pruned) catch return null;
+}
+
+/// The name of the first top-level section that differs between two
+/// canonical blobs (present on one side only, or unequal), or null when
+/// only ordering artifacts differ. Names the drift for messages.
+pub fn firstDifferingSection(a: []const u8, b: []const u8) ?[]const u8 {
+    var it = sectionNames(a);
+    while (it.next()) |name| {
+        const sa = canonical.sectionOf(a, name).?;
+        const sb = canonical.sectionOf(b, name) orelse return name;
+        if (!std.mem.eql(u8, sa, sb)) return name;
+    }
+    var itb = sectionNames(b);
+    while (itb.next()) |name| {
+        if (canonical.sectionOf(a, name) == null) return name;
+    }
+    return null;
+}
+
+const SectionNames = struct {
+    blob: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *SectionNames) ?[]const u8 {
+        while (self.pos < self.blob.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.blob, self.pos, '\n') orelse self.blob.len;
+            const line = self.blob[self.pos..line_end];
+            self.pos = if (line_end < self.blob.len) line_end + 1 else self.blob.len;
+            if (line.len > 2 and std.mem.startsWith(u8, line, "= ")) return line[2..];
+        }
+        return null;
+    }
+};
+
+fn sectionNames(blob: []const u8) SectionNames {
+    return .{ .blob = blob };
+}
+
 /// What drifted: a spelled owned path, or a null path for the secret
 /// whole-scope hash comparison.
 pub const Drifted = struct { path: ?[]const u8 };
@@ -304,4 +430,71 @@ test "classify: a secret record with a stale path scope is outdated, never drift
     const raws = [_][]const u8{"api"};
     const live = "[api]\ntoken = \"old\"\n\n[b]\nx = 999\n";
     try testing.expect(try classifyToml(arena, "[api]\ntoken = \"new\"\n", live, &raws, rec) == .outdated);
+}
+
+fn classifyDisownToml(
+    arena: std.mem.Allocator,
+    composed: []const u8,
+    live: []const u8,
+    raws: []const []const u8,
+    record: ?applied.OwnedRecord,
+) !Class {
+    const owned_doc = try OwnedDoc.parse(arena, .toml, composed);
+    const live_doc = try OwnedDoc.parse(arena, .toml, live);
+    const paths = try testPaths(arena, raws);
+    const record_paths: []const OwnPath = if (record) |r| try parseRawPaths(arena, r.own_paths) else &.{};
+    return classifyDisown(arena, &owned_doc, &live_doc, paths, record, record_paths);
+}
+
+fn disownRecordOf(arena: std.mem.Allocator, composed: []const u8, raws: []const []const u8) !applied.OwnedRecord {
+    const doc = try OwnedDoc.parse(arena, .toml, composed);
+    return .{
+        .mode = .disown,
+        .canonical = try canonical.canonicalComplement(arena, &doc, try testPaths(arena, raws)),
+        .canonical_hash = null,
+        .secret = false,
+        .own_paths = raws,
+        .secret_paths = &.{},
+    };
+}
+
+test "classifyDisown: clean, outdated, and drifted owned content around a protected span" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raws = [_][]const u8{"state"};
+    const rec = try disownRecordOf(arena, "[user]\nname = \"me\"\n", &raws);
+    const live = "[user]\nname = \"me\"\n\n[state]\ncount = 42\n";
+
+    // Program activity inside the disowned span never surfaces.
+    try testing.expect(try classifyDisownToml(arena, "[user]\nname = \"me\"\n", live, &raws, rec) == .clean);
+    // Composed moved on while the owned content matches the record.
+    try testing.expect(try classifyDisownToml(arena, "[user]\nname = \"you\"\n", live, &raws, rec) == .outdated);
+    // The user's owned edit is drift, naming the top-level section.
+    const c = try classifyDisownToml(arena, "[user]\nname = \"me\"\n", "[user]\nname = \"edited\"\n\n[state]\ncount = 43\n", &raws, rec);
+    try testing.expectEqualStrings("user", c.drift.?);
+}
+
+test "classifyDisown: a grown disown list stops comparing; a shrunk one is first contact" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Record time: only state disowned; the record covers user and survey.
+    const old_raws = [_][]const u8{"state"};
+    const rec = try disownRecordOf(arena, "[user]\nname = \"me\"\n\n[survey]\nseen = 1\n", &old_raws);
+
+    // Disown GROWS to cover survey: the program rewrote it live, and the
+    // composed source dropped it (D2). Not drift -- it stopped being compared.
+    const grown = [_][]const u8{ "state", "survey" };
+    const live_grown = "[user]\nname = \"me\"\n\n[survey]\nseen = 99\n\n[state]\ncount = 1\n";
+    try testing.expect(try classifyDisownToml(arena, "[user]\nname = \"me\"\n", live_grown, &grown, rec) == .clean);
+
+    // Disown SHRINKS to nothing: state's live content becomes owned. The
+    // composed source does not define it, so removal is first contact --
+    // drift, never a silent reassert.
+    const none = [_][]const u8{};
+    const live_shrunk = "[user]\nname = \"me\"\n\n[state]\ncount = 42\n";
+    const c = try classifyDisownToml(arena, "[user]\nname = \"me\"\n", live_shrunk, &none, rec);
+    try testing.expectEqualStrings("state", c.drift.?);
 }

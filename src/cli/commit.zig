@@ -1244,11 +1244,15 @@ fn partialPerConfig(
                     },
                 };
                 if (result.violation == null) {
-                    if (try partial_mod.undeclaredLeaf(arena, &doc, file.own_paths)) |leaf| {
+                    if (file.ownership == .disown) {
+                        if (try partial_mod.populatedDisownPath(arena, &doc, file.own_paths)) |spelled| {
+                            result.violation = .{ .label = cfg.label, .leaf = spelled };
+                        }
+                    } else if (try partial_mod.undeclaredLeaf(arena, &doc, file.own_paths)) |leaf| {
                         result.violation = .{ .label = cfg.label, .leaf = leaf };
                     }
                 }
-                o.* = .{ .bytes = try mox.apply.canonical.canonicalOwned(arena, &doc, file.own_paths) };
+                o.* = .{ .bytes = try partialExtract(arena, file, &doc) };
             },
             else => o.* = src,
         }
@@ -1264,9 +1268,18 @@ fn partialLiveMatches(arena: std.mem.Allocator, file: mox.source.tree.ManagedFil
     const format = commit_struct.formatOfPath(file.source_base_path).?;
     const owned = partial_mod.OwnedDoc.parse(arena, format, composed) catch return false;
     const live_doc = partial_mod.OwnedDoc.parse(arena, format, live) catch return false;
-    const composed_canon = mox.apply.canonical.canonicalOwned(arena, &owned, file.own_paths) catch return false;
-    const live_canon = mox.apply.canonical.canonicalOwned(arena, &live_doc, file.own_paths) catch return false;
+    const composed_canon = partialExtract(arena, file, &owned) catch return false;
+    const live_canon = partialExtract(arena, file, &live_doc) catch return false;
     return std.mem.eql(u8, live_canon, composed_canon);
+}
+
+/// The file's canonical extraction in its declared mode: the owned subtrees
+/// (own), or the whole document minus the disowned ones (disown).
+fn partialExtract(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile, doc: *const mox.apply.partial.OwnedDoc) error{OutOfMemory}![]u8 {
+    return if (file.ownership == .disown)
+        mox.apply.canonical.canonicalComplement(arena, doc, file.own_paths)
+    else
+        mox.apply.canonical.canonicalOwned(arena, doc, file.own_paths);
 }
 
 /// Advance a partial file's OWNED record after a verified commit: canonical
@@ -1275,22 +1288,28 @@ fn partialLiveMatches(arena: std.mem.Allocator, file: mox.source.tree.ManagedFil
 fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed: []const u8, prov_items: []const Segment) !void {
     const context = ctx.context.?;
     const partial_mod = mox.apply.partial;
+    const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const format = commit_struct.formatOfPath(file.source_base_path).?;
     const owned = try partial_mod.OwnedDoc.parse(ctx.alloc, format, composed);
-    const canon = try mox.apply.canonical.canonicalOwned(ctx.alloc, &owned, file.own_paths);
+    const canon = try partialExtract(ctx.alloc, file, &owned);
     var pdiag: partial_mod.Diag = .{};
-    const flags = try partial_mod.secretPathFlags(ctx.alloc, format, composed, file.own_paths, prov_items, &pdiag);
+    const secret_scope: []const mox.source.tree.OwnPath = switch (mode) {
+        .own => file.own_paths,
+        .disown => try mox.apply.canonical.topLevelPaths(ctx.alloc, &owned),
+    };
+    const flags = try partial_mod.secretPathFlags(ctx.alloc, format, composed, secret_scope, prov_items, &pdiag);
     var any_secret = false;
     var secret_raws: std.ArrayList([]const u8) = .empty;
-    const raws = try ctx.alloc.alloc([]const u8, file.own_paths.len);
-    for (file.own_paths, raws, flags) |p, *o, flagged| {
-        o.* = p.raw;
+    for (secret_scope, flags) |p, flagged| {
         if (flagged) {
             any_secret = true;
             try secret_raws.append(ctx.alloc, p.raw);
         }
     }
+    const raws = try ctx.alloc.alloc([]const u8, file.own_paths.len);
+    for (file.own_paths, raws) |p, *o| o.* = p.raw;
     try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, .{
+        .mode = mode,
         .canonical = if (any_secret) null else canon,
         .canonical_hash = if (any_secret) mox.apply.applied.contentHashHex(canon) else null,
         .secret = any_secret,
@@ -2084,6 +2103,7 @@ fn processPartialFile(
     // by apply, so there is nothing to route back.
     const bytes = composed orelse return .cont;
 
+    const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const owned = partial_mod.OwnedDoc.parse(arena, format, bytes) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
@@ -2091,9 +2111,15 @@ fn processPartialFile(
             return .cont;
         },
     };
-    if (try partial_mod.undeclaredLeaf(arena, &owned, own_paths)) |leaf| {
-        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
-        return .cont;
+    switch (mode) {
+        .own => if (try partial_mod.undeclaredLeaf(arena, &owned, own_paths)) |leaf| {
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+            return .cont;
+        },
+        .disown => if (try partial_mod.populatedDisownPath(arena, &owned, own_paths)) |spelled| {
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed source defines content under disowned path {s})\n", .{ live_path, spelled });
+            return .cont;
+        },
     }
 
     const live = Io.Dir.cwd().readFileAlloc(cc.io, live_path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -2113,7 +2139,7 @@ fn processPartialFile(
 
     // Only owned drift is committable: clean has nothing to route, and
     // outdated is the source moving on, resolved by apply.
-    switch (try owned_mod.classify(arena, &owned, &live_doc, own_paths, record, record_paths)) {
+    switch (try owned_mod.classifyMode(arena, mode, &owned, &live_doc, own_paths, record, record_paths)) {
         .clean, .outdated => return .cont,
         .drift => {},
     }
@@ -2130,32 +2156,58 @@ fn processPartialFile(
         return .cont;
     }
 
-    // Record scope: paths in both the record-time and current own lists take
-    // the per-key diff below; a current-only path is per-path first contact.
-    var scope_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
-    for (own_paths) |p| {
-        if (owned_mod.pathInList(p.segments, record_paths)) {
-            try scope_paths.append(arena, p);
-            continue;
-        }
-        const one = [_]mox.source.tree.OwnPath{p};
-        const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
-        const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
-        if (!std.mem.eql(u8, live_sec, composed_sec)) {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
-        }
+    // Record scope in the file's mode. Own: paths in both the record-time
+    // and current lists take the per-key diff; a current-only path is
+    // per-path first contact. Disown, inverted: a path REMOVED from the
+    // disown list is first contact for its now-owned content, and the
+    // comparable scope is the complement of the union of both lists.
+    var last_blob_text: []const u8 = "";
+    var live_blob: []const u8 = "";
+    switch (mode) {
+        .own => {
+            var scope_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
+            for (own_paths) |p| {
+                if (owned_mod.pathInList(p.segments, record_paths)) {
+                    try scope_paths.append(arena, p);
+                    continue;
+                }
+                const one = [_]mox.source.tree.OwnPath{p};
+                const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
+                const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
+                if (!std.mem.eql(u8, live_sec, composed_sec)) {
+                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
+                }
+            }
+            var last_blob: std.ArrayList(u8) = .empty;
+            for (scope_paths.items) |p| {
+                const spelled = try canon_mod.pathSpell(arena, p.segments);
+                if (canon_mod.sectionOf(rec.canonical.?, spelled)) |sec| try last_blob.appendSlice(arena, sec);
+            }
+            last_blob_text = try last_blob.toOwnedSlice(arena);
+            live_blob = try canon_mod.canonicalOwned(arena, &live_doc, scope_paths.items);
+        },
+        .disown => {
+            for (record_paths) |r| {
+                if (owned_mod.pathInList(r.segments, own_paths)) continue;
+                const one = [_]mox.source.tree.OwnPath{r};
+                const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
+                const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
+                if (!std.mem.eql(u8, live_sec, composed_sec)) {
+                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, r.segments) });
+                }
+            }
+            last_blob_text = owned_mod.recordComplement(arena, owned.format, rec, record_paths, own_paths) orelse {
+                try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (owned record unreadable; run 'mox apply' to refresh it)\n", .{live_path});
+                return .cont;
+            };
+            const union_paths = try owned_mod.unionPaths(arena, own_paths, record_paths);
+            live_blob = try canon_mod.canonicalComplement(arena, &live_doc, union_paths);
+        },
     }
-
-    var last_blob: std.ArrayList(u8) = .empty;
-    for (scope_paths.items) |p| {
-        const spelled = try canon_mod.pathSpell(arena, p.segments);
-        if (canon_mod.sectionOf(rec.canonical.?, spelled)) |sec| try last_blob.appendSlice(arena, sec);
-    }
-    const live_blob = try canon_mod.canonicalOwned(arena, &live_doc, scope_paths.items);
     // Drift confined to first-contact paths: nothing per-key to route.
-    if (std.mem.eql(u8, last_blob.items, live_blob)) return .cont;
+    if (std.mem.eql(u8, last_blob_text, live_blob)) return .cont;
 
-    const diffres = ownedKeyDiff(arena, last_blob.items, live_blob, &live_doc) catch |e| switch (e) {
+    const diffres = ownedKeyDiff(arena, last_blob_text, live_blob, &live_doc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unrepresentable => {
             try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (a reordered array cannot be routed by key)\n", .{live_path});

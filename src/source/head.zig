@@ -3,9 +3,14 @@
 //! an optional shebang -- the whole-file gate's exact precedent).
 //!
 //! One directive per line:
-//!   `<marker> mox: own <path>`     -- repeatable; the rest of the line is
-//!                                     ONE key-path (TOML dotted-key syntax)
+//!   `<marker> mox: own <path>`    -- repeatable; the rest of the line is
+//!                                    ONE key-path (TOML dotted-key syntax)
+//!   `<marker> mox: disown <path>` -- repeatable; the complement mode: the
+//!                                    whole file is owned EXCEPT the
+//!                                    declared subtrees
 //!   `<marker> mox: check "<exe>" ["arg" ...]` -- quoted argv items
+//!
+//! `own` and `disown` are mutually exclusive per file.
 //!
 //! Other comment lines in the leading block -- including other `mox:`
 //! directives such as a whole-file gate -- are left alone. The directives
@@ -15,7 +20,7 @@
 
 const std = @import("std");
 
-pub const Ownership = enum { none, own };
+pub const Ownership = enum { none, own, disown };
 
 /// Half-open byte range of one recognized directive line, trailing newline
 /// included.
@@ -23,7 +28,8 @@ pub const Span = struct { start: usize, end: usize };
 
 pub const Parsed = struct {
     ownership: Ownership = .none,
-    /// Raw key-path strings, one per `own` line, in declaration order.
+    /// Raw key-path strings, one per `own`/`disown` line, in declaration
+    /// order.
     paths: []const []const u8 = &.{},
     /// `check` argv: a repo-relative executable and its arguments.
     check: []const []const u8 = &.{},
@@ -33,8 +39,10 @@ pub const Parsed = struct {
 
 pub const ParseError = error{
     OutOfMemory,
-    /// An `own` line with no path.
+    /// An `own` or `disown` line with no path.
     EmptyDirectivePath,
+    /// `own` and `disown` lines in the same head.
+    OwnAndDisown,
     /// A `check` line whose argv is not one or more double-quoted items.
     InvalidCheckArgv,
     /// More than one `check` line.
@@ -49,6 +57,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
     var paths: std.ArrayList([]const u8) = .empty;
     var spans: std.ArrayList(Span) = .empty;
     var check: ?[]const []const u8 = null;
+    var ownership: Ownership = .none;
 
     var pos: usize = 0;
     var first_line = true;
@@ -70,7 +79,10 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
         const kw_end = std.mem.indexOfAny(u8, args, " \t") orelse args.len;
         const keyword = args[0..kw_end];
         const rest = std.mem.trim(u8, args[kw_end..], " \t");
-        if (std.mem.eql(u8, keyword, "own")) {
+        if (std.mem.eql(u8, keyword, "own") or std.mem.eql(u8, keyword, "disown")) {
+            const mode: Ownership = if (keyword.len == 3) .own else .disown;
+            if (ownership != .none and ownership != mode) return error.OwnAndDisown;
+            ownership = mode;
             if (rest.len == 0) return error.EmptyDirectivePath;
             try paths.append(arena, rest);
             try spans.append(arena, .{ .start = line_start, .end = line_end });
@@ -83,12 +95,12 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
         // DSL and stays in place.
     }
 
-    if (paths.items.len == 0) {
+    if (ownership == .none) {
         if (check != null) return error.CheckWithoutOwnership;
         return .{};
     }
     return .{
-        .ownership = .own,
+        .ownership = ownership,
         .paths = try paths.toOwnedSlice(arena),
         .check = check orelse &.{},
         .spans = try spans.toOwnedSlice(arena),
@@ -218,11 +230,23 @@ test "parse: a directive after the first content line is not recognized" {
     try testing.expectEqual(Ownership.none, p.ownership);
 }
 
+test "parse: disown mode, and own+disown together refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parse(a, "// mox: disown model\n// mox: disown feedbackSurveyState\n{\n}\n", "//");
+    try testing.expectEqual(Ownership.disown, p.ownership);
+    try testing.expectEqual(@as(usize, 2), p.paths.len);
+    try testing.expectEqualStrings("model", p.paths[0]);
+    try testing.expectError(error.OwnAndDisown, parse(a, "# mox: own a\n# mox: disown b\n[a]\n", "#"));
+}
+
 test "parse: malformed heads are refused, never guessed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     try testing.expectError(error.EmptyDirectivePath, parse(a, "# mox: own\n[t]\n", "#"));
+    try testing.expectError(error.EmptyDirectivePath, parse(a, "# mox: disown\n[t]\n", "#"));
     try testing.expectError(error.InvalidCheckArgv, parse(a, "# mox: own a\n# mox: check bare\n", "#"));
     try testing.expectError(error.InvalidCheckArgv, parse(a, "# mox: own a\n# mox: check\n", "#"));
     try testing.expectError(error.DuplicateCheckDirective, parse(a, "# mox: own a\n# mox: check \"x\"\n# mox: check \"y\"\n", "#"));

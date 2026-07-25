@@ -143,7 +143,11 @@ fn repatchPartial(
             return false;
         },
     };
-    if (partial.ownedHasSecretMask(&snap_doc, file.own_paths)) {
+    const masked = switch (file.ownership) {
+        .disown => try partial.complementHasSecretMask(ctx.alloc, &snap_doc, file.own_paths),
+        else => partial.ownedHasSecretMask(&snap_doc, file.own_paths),
+    };
+    if (masked) {
         try ctx.err.print("  ERROR   {s} (snapshot masks a secret; placeholders are never written live -- re-apply the source instead)\n", .{live_path});
         failed.* += 1;
         return false;
@@ -171,7 +175,37 @@ fn repatchPartial(
         },
     };
 
-    const candidate = partial.replaceOwned(ctx.alloc, format, live_text, file.own_paths, &snap_doc, &pdiag) catch |e| switch (e) {
+    // Disown mode re-patches the snapshot's owned COMPLEMENT: the snapshot
+    // text minus its disowned spans plays the composed text's role, and the
+    // current live file's disowned spans are preserved.
+    var snap_owned_text: []const u8 = "";
+    if (file.ownership == .disown) {
+        const snap_loc = partial.locateSpans(ctx.alloc, format, snap_content, file.own_paths, &pdiag) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try ctx.err.print("  ERROR   {s} (snapshot: {s})\n", .{ live_path, pdiag.text() });
+                failed.* += 1;
+                return false;
+            },
+        };
+        snap_owned_text = try partial.textWithoutSpans(ctx.alloc, snap_content, snap_loc);
+    }
+    const snap_owned_doc = if (file.ownership == .disown)
+        partial.OwnedDoc.parse(ctx.alloc, format, snap_owned_text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.OwnedUnparseable => {
+                try ctx.err.print("  ERROR   {s} (snapshot owned content does not parse as {s})\n", .{ live_path, @tagName(format) });
+                failed.* += 1;
+                return false;
+            },
+        }
+    else
+        snap_doc;
+
+    const candidate = (switch (file.ownership) {
+        .disown => partial.replaceDisowned(ctx.alloc, format, live_text, file.own_paths, snap_owned_text, &pdiag),
+        else => partial.replaceOwned(ctx.alloc, format, live_text, file.own_paths, &snap_doc, &pdiag),
+    }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} ({s})\n", .{ live_path, pdiag.text() });
@@ -179,7 +213,10 @@ fn repatchPartial(
             return false;
         },
     };
-    partial.verifyInvariant(ctx.alloc, format, live_text, candidate, file.own_paths, &snap_doc, &pdiag) catch |e| switch (e) {
+    (switch (file.ownership) {
+        .disown => partial.verifyDisownInvariant(ctx.alloc, format, live_text, candidate, file.own_paths, snap_owned_text, &snap_owned_doc, &pdiag),
+        else => partial.verifyInvariant(ctx.alloc, format, live_text, candidate, file.own_paths, &snap_doc, &pdiag),
+    }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (invariant check failed: {s})\n", .{ live_path, pdiag.text() });

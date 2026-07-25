@@ -114,7 +114,12 @@ fn contentPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []con
 /// is decided against the canonical serialization of the owned subtrees
 /// stored here (or its hash when a secret resolved into the owned content --
 /// cleartext is never cached, mirroring the whole-file rule).
+pub const Mode = enum { own, disown };
+
 pub const OwnedRecord = struct {
+    /// Ownership mode at record time: `.own` records the declared subtrees,
+    /// `.disown` records the whole document minus them.
+    mode: Mode = .own,
     /// Canonical owned serialization at record time; null when `secret`.
     canonical: ?[]const u8,
     /// sha256 hex of the canonical serialization; set when `secret`.
@@ -140,6 +145,7 @@ pub fn recordOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live
     var root: json.ObjectMap = .empty;
     try root.put(arena, "v", .{ .integer = owned_version });
     try root.put(arena, "live_path", .{ .string = live_path });
+    try root.put(arena, "mode", .{ .string = @tagName(rec.mode) });
     try root.put(arena, "secret", .{ .bool = rec.secret });
     if (rec.secret) {
         const hash = rec.canonical_hash orelse return error.MissingCanonicalHash;
@@ -180,6 +186,9 @@ pub fn readOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_p
         .own_paths = own_list,
         .secret_paths = secret_list,
     };
+    if (stringOf(v.get("mode"))) |m| {
+        rec.mode = std.meta.stringToEnum(Mode, m) orelse return null;
+    }
     if (secret) {
         const hex = stringOf(v.get("canonical_sha256")) orelse return null;
         if (hex.len != hash_hex_len) return null;

@@ -145,12 +145,21 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
                     continue;
                 },
             };
-            if (try partial.undeclaredLeaf(ctx.alloc, &owned_doc, file.own_paths)) |leaf| {
+            if (file.ownership == .disown) {
+                if (try partial.populatedDisownPath(ctx.alloc, &owned_doc, file.own_paths)) |spelled| {
+                    try ctx.err.print("mox export: {s}: composed source defines content under disowned path {s}\n", .{ file.live_path, spelled });
+                    failed += 1;
+                    continue;
+                }
+            } else if (try partial.undeclaredLeaf(ctx.alloc, &owned_doc, file.own_paths)) |leaf| {
                 try ctx.err.print("mox export: {s}: composed leaf {s} is outside the declared own paths\n", .{ file.live_path, leaf });
                 failed += 1;
                 continue;
             }
-            const canon = try mox.apply.canonical.canonicalOwned(ctx.alloc, &owned_doc, file.own_paths);
+            const canon = if (file.ownership == .disown)
+                try mox.apply.canonical.canonicalComplement(ctx.alloc, &owned_doc, file.own_paths)
+            else
+                try mox.apply.canonical.canonicalOwned(ctx.alloc, &owned_doc, file.own_paths);
             const eff_mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null);
             if (diag.manager_secret) {
                 try ctx.err.print("mox export: {s}: baked a resolved op/pass secret (cleartext) at 0600\n", .{dest});

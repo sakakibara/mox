@@ -204,11 +204,15 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
     // The walk only attaches own_paths to structured targets.
     const format = mox.source.format.formatOfPath(file.source_base_path).?;
 
+    const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => return err_cell,
     };
-    if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, file.own_paths) != null) return err_cell;
+    switch (mode) {
+        .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, file.own_paths) != null) return err_cell,
+        .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, file.own_paths) != null) return err_cell,
+    }
 
     const live: []const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return cellFor(.fresh_write),
@@ -222,7 +226,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 
     const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, file.live_path);
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
-    return switch (try owned_mod.classify(ctx.alloc, &owned, &live_doc, file.own_paths, record, record_paths)) {
+    return switch (try owned_mod.classifyMode(ctx.alloc, mode, &owned, &live_doc, file.own_paths, record, record_paths)) {
         .clean => cellFor(.unchanged),
         .outdated => cellFor(.safe_overwrite),
         .drift => cellFor(.drift),
