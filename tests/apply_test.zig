@@ -2793,11 +2793,63 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
     try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
+    // The whole-scope hash comparison names the owned content, never a
+    // sentinel interpolated as a path name.
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "(owned content changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "owned path owned content") == null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, "leaked-by-hand"));
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
+}
+
+test "apply partial: a shrunk own list on a secret record reasserts as outdated, not drift" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "shrink-s3cr3t-DO-NOT-LEAK-99cc00dd";
+    try writePartialFixture(
+        io,
+        &tmp,
+        "[api]\ntoken = \"<secret:env:MY_SHRINK_SECRET>\"\n\n[b]\nx = 1\n",
+        "[\"app.toml\"]\nown = [\"api\", \"b\"]\n",
+    );
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_SHRINK_SECRET", .value = secret_value }},
+    });
+    const live = try c.homePath("app.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // own shrinks to [api] (b is abandoned), the user edits b live, and the
+    // composed secret scope moves on. The record's hash covers the old
+    // scope: a stale record, reasserted without consent -- never drift.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app.toml",
+        .data = "[api]\ntoken = \"<secret:env:MY_SHRINK_SECRET>\"\nextra = \"new\"\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data = "[\"app.toml\"]\nown = [\"api\"]\n",
+    });
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), "x = 1", "x = 999");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") == null);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "extra = \"new\"") != null);
+    // The abandoned b kept its live edit.
+    try std.testing.expect(std.mem.indexOf(u8, after, "x = 999") != null);
+    // The new record covers exactly the current own list.
+    const rec = (try mox.apply.applied.readOwned(a, io, c.state, live)).?;
+    try std.testing.expectEqual(@as(usize, 1), rec.own_paths.len);
+    try std.testing.expectEqualStrings("api", rec.own_paths[0]);
 }
 
 test "apply: an own declaration the walk rejects reports the target by name" {

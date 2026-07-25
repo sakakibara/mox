@@ -554,12 +554,12 @@ const DriftResolver = struct {
         self: *DriftResolver,
         ctx: *app.Ctx,
         live_path: []const u8,
-        drift_path: []const u8,
+        drift_what: []const u8,
         diff_text: []const u8,
         refuse_commit: bool,
     ) !DriftDecision {
         if (self.sticky) |d| return d;
-        try ctx.err.print("  DRIFT   {s} (owned path {s} changed)\n", .{ live_path, drift_path });
+        try ctx.err.print("  DRIFT   {s} ({s} changed)\n", .{ live_path, drift_what });
         while (true) {
             const line = try commit_mod.legend(self.arena, &drift_choices, 3, self.sty);
             switch (try prompt.ask(.interactive, &drift_choices, 3, line, self.input, ctx.out)) {
@@ -913,16 +913,17 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         try owned_mod.classify(ctx.alloc, &owned, &live_doc, own_paths, record, record_paths);
 
     if (class == .drift and !in.force) {
+        const drift_what = try owned_mod.driftWhat(ctx.alloc, class.drift);
         const resolver = in.resolver orelse {
             counts.drift += 1;
-            try ctx.err.print("  DRIFT   {s} (owned path {s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, class.drift });
+            try ctx.err.print("  DRIFT   {s} ({s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, drift_what });
             return;
         };
         // A secret-bearing record has no cleartext for commit to diff, so
         // `[c]` is refused inline rather than queued to be skipped later.
         const refuse_commit = record != null and record.?.secret;
         const diff_text = try ownedDriftDiff(ctx, resolver.sty, live_path, &owned, &live_doc, own_paths, record, secret_flags);
-        switch (try resolver.askOwned(ctx, live_path, class.drift, diff_text, refuse_commit)) {
+        switch (try resolver.askOwned(ctx, live_path, drift_what, diff_text, refuse_commit)) {
             // Falls through to the write below, exactly as --force does for
             // this file alone.
             .overwrite => counts.overwritten += 1,

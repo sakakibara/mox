@@ -25,12 +25,13 @@ pub const OwnedDoc = partial.OwnedDoc;
 /// composed owned document. `clean`: live owned equals composed owned (an
 /// absent record adopts on the next apply). `outdated`: live owned matches
 /// the record but the composed content moved on (apply reasserts without
-/// consent). `drift`: some owned path changed outside mox; the payload is
-/// its spelled path (or "owned content" for a secret whole-record compare).
+/// consent). `drift`: some owned path changed outside mox; the payload
+/// spells it, and is null for a secret record's whole-scope hash
+/// comparison, where drift is per file.
 pub const Class = union(enum) {
     clean,
     outdated,
-    drift: []const u8,
+    drift: ?[]const u8,
 };
 
 pub fn classify(
@@ -44,14 +45,18 @@ pub fn classify(
     const composed_canon = try canonical.canonicalOwned(arena, owned, own_paths);
     const live_canon = try canonical.canonicalOwned(arena, live_doc, own_paths);
     if (std.mem.eql(u8, live_canon, composed_canon)) return .clean;
-    if (try driftedPath(arena, owned, live_doc, own_paths, record, record_paths)) |spelled| {
-        return .{ .drift = spelled };
+    if (try driftedPath(arena, owned, live_doc, own_paths, record, record_paths)) |d| {
+        return .{ .drift = d.path };
     }
     return .outdated;
 }
 
-/// The first owned path whose live content changed outside mox, spelled, or
-/// null when every path is at its recorded (or, on first contact, composed)
+/// What drifted: a spelled owned path, or a null path for the secret
+/// whole-scope hash comparison.
+pub const Drifted = struct { path: ?[]const u8 };
+
+/// The first owned path whose live content changed outside mox, or null
+/// when every path is at its recorded (or, on first contact, composed)
 /// state. For a secret record the recorded scope is hash-compared as one
 /// unit after the per-path pass.
 pub fn driftedPath(
@@ -61,7 +66,7 @@ pub fn driftedPath(
     own_paths: []const OwnPath,
     record: ?applied.OwnedRecord,
     record_paths: []const OwnPath,
-) error{OutOfMemory}!?[]const u8 {
+) error{OutOfMemory}!?Drifted {
     for (own_paths) |p| {
         const spelled = try canonical.pathSpell(arena, p.segments);
         const one = [_]OwnPath{p};
@@ -75,20 +80,44 @@ pub fn driftedPath(
             // adopted silently.
             break :blk try canonical.canonicalOwned(arena, owned, &one);
         };
-        if (!std.mem.eql(u8, live_sec, want)) return spelled;
+        if (!std.mem.eql(u8, live_sec, want)) return .{ .path = spelled };
     }
     if (record) |r| {
         if (r.secret) {
+            // A record whose path set no longer matches the declaration is
+            // stale scope, not evidence of a live edit: its hash covers
+            // paths apply no longer owns, so the classification falls
+            // through to outdated and reassert re-records under the
+            // current scope (touching only current paths).
+            if (!samePathSet(own_paths, record_paths)) return null;
             // A secret-bearing record stores one hash over its whole path
             // scope; drift there is per file, not per path.
             const live_rec_canon = try canonical.canonicalOwned(arena, live_doc, record_paths);
             const live_hash = applied.contentHashHex(live_rec_canon);
             if (r.canonical_hash == null or !std.mem.eql(u8, &live_hash, &r.canonical_hash.?)) {
-                return "owned content";
+                return .{ .path = null };
             }
         }
     }
     return null;
+}
+
+/// The phrase a DRIFT message names the changed content with: the spelled
+/// owned path, or the whole owned scope for a secret record's per-file
+/// comparison.
+pub fn driftWhat(arena: std.mem.Allocator, drift: ?[]const u8) error{OutOfMemory}![]const u8 {
+    const p = drift orelse return "owned content";
+    return std.fmt.allocPrint(arena, "owned path {s}", .{p});
+}
+
+/// Segment-set equality of two path lists, order-independent (own lists
+/// never hold duplicates: overlapping declarations are refused).
+pub fn samePathSet(a: []const OwnPath, b: []const OwnPath) bool {
+    if (a.len != b.len) return false;
+    for (a) |p| {
+        if (!pathInList(p.segments, b)) return false;
+    }
+    return true;
 }
 
 /// Parse raw dotted-path strings (as stored in an owned record) back into
@@ -211,7 +240,7 @@ test "classify: clean, outdated, and drifted live owned content" {
     try testing.expect(try classifyToml(arena, "[tui]\nk = 2\n", live, &raws, rec) == .outdated);
     // Live owned changed past the record: drift, naming the path.
     const c = try classifyToml(arena, "[tui]\nk = 1\n", "[tui]\nk = 9\n", &raws, rec);
-    try testing.expectEqualStrings("tui", c.drift);
+    try testing.expectEqualStrings("tui", c.drift.?);
 }
 
 test "classify: no record differing from composed is drift (first contact), never outdated" {
@@ -220,7 +249,7 @@ test "classify: no record differing from composed is drift (first contact), neve
     const arena = arena_state.allocator();
     const raws = [_][]const u8{"tui"};
     const c = try classifyToml(arena, "[tui]\nk = 1\n", "[tui]\nk = 9\n", &raws, null);
-    try testing.expectEqualStrings("tui", c.drift);
+    try testing.expectEqualStrings("tui", c.drift.?);
     try testing.expect(try classifyToml(arena, "[tui]\nk = 1\n", "[tui]\nk = 1\n", &raws, null) == .clean);
 }
 
@@ -241,9 +270,36 @@ test "classify: a secret record hash-compares its whole recorded scope" {
     };
     // Live matches the recorded hash, composed changed: outdated.
     try testing.expect(try classifyToml(arena, "[api]\ntoken = \"rotated\"\n", composed, &raws, rec) == .outdated);
-    // Live changed past the hash: drift, per file.
+    // Live changed past the hash: drift, per file (a null path).
     const c = try classifyToml(arena, composed, "[api]\ntoken = \"leaked\"\n", &raws, rec);
-    try testing.expectEqualStrings("owned content", c.drift);
+    try testing.expect(c.drift == null);
     // Live matches composed exactly: clean regardless of the record.
     try testing.expect(try classifyToml(arena, composed, composed, &raws, rec) == .clean);
+}
+
+test "classify: a secret record with a stale path scope is outdated, never drift" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Record time: own = [api, b], secret, hash over both scopes.
+    const old_raws = [_][]const u8{ "api", "b" };
+    const old_composed = "[api]\ntoken = \"old\"\n\n[b]\nx = 1\n";
+    const old_doc = try OwnedDoc.parse(arena, .toml, old_composed);
+    const old_canon = try canonical.canonicalOwned(arena, &old_doc, try testPaths(arena, &old_raws));
+    const rec: applied.OwnedRecord = .{
+        .canonical = null,
+        .canonical_hash = applied.contentHashHex(old_canon),
+        .secret = true,
+        .own_paths = &old_raws,
+        .secret_paths = &.{"api"},
+    };
+
+    // Now: own shrank to [api], the secret rotated, and the abandoned b was
+    // edited live. The record's hash can no longer be honored (its scope
+    // covers a path mox no longer owns), so this is a stale record --
+    // outdated -- not a live edit inside the owned scope.
+    const raws = [_][]const u8{"api"};
+    const live = "[api]\ntoken = \"old\"\n\n[b]\nx = 999\n";
+    try testing.expect(try classifyToml(arena, "[api]\ntoken = \"new\"\n", live, &raws, rec) == .outdated);
 }
