@@ -2088,6 +2088,294 @@ fn iniRenderBlock(
     return out.toOwnedSlice(arena);
 }
 
+// Onboarding extraction (`mox add --own`)
+
+pub const ExtractError = LocateError || error{ OwnedPathMissing, OwnedRenderFailed };
+
+/// Assemble a source file's text from the live file's RAW BYTE SPANS of the
+/// declared paths, in declaration order, with the minimal structure the
+/// format needs so the result parses on its own (a nested leaf gains its
+/// parent header, JSON and YAML gain their ancestor containers). Comments
+/// and layout inside the spans survive verbatim. A declared path with no
+/// live presence is an error: absence is declared explicitly, never
+/// inferred. The caller validates the result (parse, declaration coverage,
+/// canonical equality with the live owned content) before writing it.
+pub fn extractOwnedSource(
+    arena: std.mem.Allocator,
+    format: Format,
+    live: []const u8,
+    own_paths: []const OwnPath,
+    diag: ?*Diag,
+) ExtractError![]u8 {
+    const text = try ensureTrailingNewline(arena, live);
+    const loc = try locateFull(arena, format, text, own_paths, diag);
+    for (own_paths, loc.spans) |p, span| {
+        if (span == null) {
+            diagSet(diag, "{s}: not present in the live file (declare enforced absence with --own-absent)", .{p.raw});
+            return error.OwnedPathMissing;
+        }
+    }
+    return switch (format) {
+        .toml, .ini, .gitconfig => extractHeaderForm(arena, format, text, own_paths, loc),
+        .json => extractJson(arena, text, own_paths, loc),
+        .yaml => extractYaml(arena, text, own_paths, loc, diag),
+    };
+}
+
+/// TOML and ini share the header-block shape: block spans carry their own
+/// headers verbatim; a root-level kv line goes first (after a block it would
+/// silently join the preceding table); a nested kv line gains a generated
+/// parent header, one per parent in first-use order.
+fn extractHeaderForm(
+    arena: std.mem.Allocator,
+    format: Format,
+    text: []const u8,
+    own_paths: []const OwnPath,
+    loc: FullLocated,
+) ExtractError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (own_paths, loc.spans, loc.forms) |p, span, form| {
+        if (form != .kv or p.segments.len != 1) continue;
+        try out.appendSlice(arena, text[span.?.start..span.?.end]);
+    }
+    var emitted: std.ArrayList([]const []const u8) = .empty;
+    for (own_paths, 0..) |p, i| {
+        const form = loc.forms[i];
+        if (form == .block) {
+            try out.appendSlice(arena, text[loc.spans[i].?.start..loc.spans[i].?.end]);
+            continue;
+        }
+        if (form != .kv or p.segments.len == 1) continue;
+        const parent = p.segments[0 .. p.segments.len - 1];
+        var seen = false;
+        for (emitted.items) |e| {
+            if (segsEq(e, parent)) seen = true;
+        }
+        if (seen) continue;
+        try emitted.append(arena, parent);
+        const header = switch (format) {
+            .toml => try std.mem.concat(arena, u8, &.{ "[", try tomlPathSpell(arena, parent), "]\n" }),
+            else => try iniHeaderSpell(arena, parent),
+        };
+        try out.appendSlice(arena, header);
+        // Every declared kv under the same parent joins this one header.
+        for (own_paths, loc.spans, loc.forms) |q, qspan, qform| {
+            if (qform != .kv or q.segments.len != p.segments.len) continue;
+            if (!segsEq(q.segments[0 .. q.segments.len - 1], parent)) continue;
+            try out.appendSlice(arena, text[qspan.?.start..qspan.?.end]);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Declaration tree for the container formats: leaves hold their raw span
+/// text, interior nodes are the generated ancestor containers. Overlapping
+/// declared paths are already rejected, so a leaf never gains children.
+const ExtractNode = struct {
+    seg: []const u8 = "",
+    children: std.ArrayList(*ExtractNode) = .empty,
+    span_text: ?[]const u8 = null,
+};
+
+fn extractTree(
+    arena: std.mem.Allocator,
+    own_paths: []const OwnPath,
+    span_texts: []const []const u8,
+) error{OutOfMemory}!*ExtractNode {
+    const root = try arena.create(ExtractNode);
+    root.* = .{};
+    for (own_paths, span_texts) |p, span_text| {
+        var cur = root;
+        for (p.segments[0 .. p.segments.len - 1]) |seg| {
+            var next: ?*ExtractNode = null;
+            for (cur.children.items) |c| {
+                if (std.mem.eql(u8, c.seg, seg)) next = c;
+            }
+            if (next == null) {
+                const n = try arena.create(ExtractNode);
+                n.* = .{ .seg = seg };
+                try cur.children.append(arena, n);
+                next = n;
+            }
+            cur = next.?;
+        }
+        const leaf = try arena.create(ExtractNode);
+        leaf.* = .{ .seg = p.segments[p.segments.len - 1], .span_text = span_text };
+        try cur.children.append(arena, leaf);
+    }
+    return root;
+}
+
+fn extractJson(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    own_paths: []const OwnPath,
+    loc: FullLocated,
+) ExtractError![]u8 {
+    const spans = try arena.alloc([]const u8, own_paths.len);
+    for (loc.spans, spans) |span, *s| {
+        // Member spans carry splice separators; the extracted member stands
+        // alone, so strip surrounding commas and whitespace.
+        s.* = std.mem.trim(u8, text[span.?.start..span.?.end], " \t\r\n,");
+    }
+    const root = try extractTree(arena, own_paths, spans);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "{\n");
+    try extractJsonNode(arena, &out, root);
+    try out.appendSlice(arena, "\n}\n");
+    return out.toOwnedSlice(arena);
+}
+
+fn extractJsonNode(arena: std.mem.Allocator, out: *std.ArrayList(u8), node: *const ExtractNode) ExtractError!void {
+    for (node.children.items, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(arena, ",\n");
+        if (c.span_text) |span| {
+            try out.appendSlice(arena, span);
+            continue;
+        }
+        try out.appendSlice(arena, try jsonKeyLiteral(arena, c.seg));
+        try out.appendSlice(arena, ": {");
+        try extractJsonNode(arena, out, c);
+        try out.append(arena, '}');
+    }
+}
+
+fn jsonKeyLiteral(arena: std.mem.Allocator, seg: []const u8) error{ OutOfMemory, OwnedRenderFailed }![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    json.encode(&aw.writer, .{ .string = seg }, .{}) catch return error.OwnedRenderFailed;
+    return arena.dupe(u8, aw.written());
+}
+
+fn extractYaml(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    own_paths: []const OwnPath,
+    loc: FullLocated,
+    diag: ?*Diag,
+) ExtractError![]u8 {
+    const spans = try arena.alloc([]const u8, own_paths.len);
+    for (loc.spans, spans) |span, *s| s.* = text[span.?.start..span.?.end];
+    const root = try extractTree(arena, own_paths, spans);
+    var out: std.ArrayList(u8) = .empty;
+    try extractYamlNode(arena, &out, root, 0, diag);
+    return out.toOwnedSlice(arena);
+}
+
+/// Generated ancestors indent one space per depth. A live block member at
+/// depth n starts at column >= n (each live level indents at least one), so
+/// its raw span is always deeper than its generated parent at column n-1.
+fn extractYamlNode(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    node: *const ExtractNode,
+    depth: usize,
+    diag: ?*Diag,
+) ExtractError!void {
+    for (node.children.items) |c| {
+        if (c.span_text) |span| {
+            try out.appendSlice(arena, span);
+            continue;
+        }
+        for (0..depth) |_| try out.append(arena, ' ');
+        try out.appendSlice(arena, try yamlScalarText(arena, .{ .string = c.seg }, diag));
+        try out.appendSlice(arena, ":\n");
+        try extractYamlNode(arena, out, c, depth + 1, diag);
+    }
+}
+
+/// Top-level live entries with no ownership relation to any declared path:
+/// neither at or under a declared path nor an ancestor of one. Reported by
+/// `mox add --own` as what stays the program's.
+pub fn unownedTopLevelCount(doc: *const OwnedDoc, own_paths: []const OwnPath) usize {
+    var count: usize = 0;
+    switch (doc.root) {
+        .toml => |v| {
+            if (v != .table) return 0;
+            for (v.table.keys()) |k| count += @intFromBool(rootKeyUnowned(own_paths, k));
+        },
+        .json => |v| {
+            if (v != .object) return 0;
+            for (v.object.keys()) |k| count += @intFromBool(rootKeyUnowned(own_paths, k));
+        },
+        .yaml => |v| {
+            if (v != .map) return 0;
+            for (v.map) |e| {
+                if (e.key != .string) {
+                    count += 1;
+                    continue;
+                }
+                count += @intFromBool(rootKeyUnowned(own_paths, e.key.string));
+            }
+        },
+        .ini => |v| {
+            for (v.section.entries) |e| count += @intFromBool(rootKeyUnowned(own_paths, e.key));
+        },
+    }
+    return count;
+}
+
+fn rootKeyUnowned(own_paths: []const OwnPath, key: []const u8) bool {
+    const one = [_][]const u8{key};
+    return !pathAtOrUnderDeclared(own_paths, &one) and !pathStrictPrefixOfDeclared(own_paths, &one);
+}
+
+/// True when any leaf under a declared path is the snapshot secret mask --
+/// evidence the text came from a secret-masked snapshot, whose placeholders
+/// must never be written live.
+pub fn ownedHasSecretMask(doc: *const OwnedDoc, own_paths: []const OwnPath) bool {
+    for (own_paths) |p| {
+        const sub = doc.subtreeAt(p.segments) orelse continue;
+        if (valueHasMask(sub)) return true;
+    }
+    return false;
+}
+
+fn valueHasMask(v: AnyValue) bool {
+    switch (v) {
+        .toml => |tv| switch (tv) {
+            .string => |s| return std.mem.eql(u8, s, secret_mask),
+            .table => |tbl| for (tbl.values()) |sub| {
+                if (valueHasMask(.{ .toml = sub })) return true;
+            },
+            .array => |arr| for (arr.items) |sub| {
+                if (valueHasMask(.{ .toml = sub })) return true;
+            },
+            else => {},
+        },
+        .json => |jv| switch (jv) {
+            .string => |s| return std.mem.eql(u8, s, secret_mask),
+            .object => |obj| for (obj.values()) |sub| {
+                if (valueHasMask(.{ .json = sub })) return true;
+            },
+            .array => |arr| for (arr) |sub| {
+                if (valueHasMask(.{ .json = sub })) return true;
+            },
+            else => {},
+        },
+        .yaml => |yv| switch (yv) {
+            .string => |s| return std.mem.eql(u8, s, secret_mask),
+            .map => |m| for (m) |e| {
+                if (valueHasMask(.{ .yaml = e.value })) return true;
+            },
+            .seq => |sq| for (sq) |sub| {
+                if (valueHasMask(.{ .yaml = sub })) return true;
+            },
+            else => {},
+        },
+        .ini => |iv| switch (iv) {
+            .string => |s| return std.mem.eql(u8, s, secret_mask),
+            .list => |items| for (items) |s| {
+                if (std.mem.eql(u8, s, secret_mask)) return true;
+            },
+            .section => |sec| for (sec.entries) |e| {
+                if (valueHasMask(.{ .ini = e.value })) return true;
+            },
+        },
+    }
+    return false;
+}
+
 const testing = std.testing;
 const keypath = @import("../source/keypath.zig");
 
@@ -2626,6 +2914,138 @@ test "maskSecretPaths: masks every leaf value under the path, keeps the rest byt
     try testing.expect(std.mem.indexOf(u8, masked, secret_mask) != null);
     try testing.expect(std.mem.indexOf(u8, masked, "# program comment") != null);
     try testing.expect(std.mem.indexOf(u8, masked, "keep = \"visible\"") != null);
+}
+
+fn testExtract(
+    arena: std.mem.Allocator,
+    format: Format,
+    live: []const u8,
+    raws: []const []const u8,
+) ![]u8 {
+    const paths = try testOwn(arena, raws);
+    var diag: Diag = .{};
+    return extractOwnedSource(arena, format, live, paths, &diag) catch |e| {
+        std.debug.print("extract failed: {s} ({t})\n", .{ diag.text(), e });
+        return e;
+    };
+}
+
+test "extract toml: block spans keep comments verbatim, root kv precedes blocks" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live =
+        \\model = "opus"
+        \\
+        \\[tui.keymap.global]
+        \\# user note on submit
+        \\submit = "enter"
+        \\
+        \\[program]
+        \\state = 1
+        \\
+    ;
+    // `model` is declared after the table; it still extracts before any
+    // header so the result parses with `model` at the root.
+    const got = try testExtract(arena, .toml, live, &.{ "tui.keymap.global", "model" });
+    const expected =
+        \\model = "opus"
+        \\[tui.keymap.global]
+        \\# user note on submit
+        \\submit = "enter"
+        \\
+        \\
+    ;
+    try testing.expectEqualStrings(expected, got);
+    const doc = try OwnedDoc.parse(arena, .toml, got);
+    try testing.expect(try undeclaredLeaf(arena, &doc, try testOwn(arena, &.{ "tui.keymap.global", "model" })) == null);
+}
+
+test "extract toml: a nested kv leaf gains its parent header, siblings share it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "[tui]\ntheme = \"dark\"\nmodel = \"opus\" # keep\nfont = 12\n";
+    const got = try testExtract(arena, .toml, live, &.{ "tui.model", "tui.font" });
+    try testing.expectEqualStrings("[tui]\nmodel = \"opus\" # keep\nfont = 12\n", got);
+}
+
+test "extract toml: a declared path absent from live is an error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"missing"});
+    var diag: Diag = .{};
+    try testing.expectError(
+        error.OwnedPathMissing,
+        extractOwnedSource(arena, .toml, "present = 1\n", paths, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "--own-absent") != null);
+}
+
+test "extract json: root and nested members reassemble into one parsing object" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "{\"model\": \"opus\", \"editor\": {\"fontSize\": 12, \"theme\": \"d\"}, \"x\": 0}";
+    const got = try testExtract(arena, .json, live, &.{ "model", "editor.fontSize" });
+    const doc = try OwnedDoc.parse(arena, .json, got);
+    const paths = try testOwn(arena, &.{ "model", "editor.fontSize" });
+    try testing.expect(try undeclaredLeaf(arena, &doc, paths) == null);
+    const model = doc.subtreeAt(&.{"model"}).?;
+    try testing.expectEqualStrings("opus", model.json.string);
+    const size = doc.subtreeAt(&.{ "editor", "fontSize" }).?;
+    try testing.expectEqual(@as(i64, 12), size.json.integer);
+}
+
+test "extract yaml: raw member lines reassemble under generated ancestors" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "top: a\nsec:\n  keep: v # note\n  other: 1\n";
+    const got = try testExtract(arena, .yaml, live, &.{ "sec.keep", "top" });
+    const doc = try OwnedDoc.parse(arena, .yaml, got);
+    const keep = doc.subtreeAt(&.{ "sec", "keep" }).?;
+    try testing.expectEqualStrings("v", keep.yaml.string);
+    const top = doc.subtreeAt(&.{"top"}).?;
+    try testing.expectEqualStrings("a", top.yaml.string);
+    try testing.expect(std.mem.indexOf(u8, got, "# note") != null);
+}
+
+test "extract ini: section block verbatim, key entry gains its section header" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "[colors]\n; keep this\nfg = red\n\n[user]\nname = me\nmail = m@x\n";
+    const got = try testExtract(arena, .ini, live, &.{ "colors", "user.name" });
+    try testing.expectEqualStrings("[colors]\n; keep this\nfg = red\n\n[user]\nname = me\n", got);
+}
+
+test "unownedTopLevelCount: counts entries with no ownership relation" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try OwnedDoc.parse(arena, .toml, "model = 1\n\n[tui.keymap]\nk = 1\n\n[hooks]\nh = 1\n");
+    const paths = try testOwn(arena, &.{"tui.keymap.global"});
+    // `tui` is an ancestor of the declared path; `model` and `hooks` are not.
+    try testing.expectEqual(@as(usize, 2), unownedTopLevelCount(&doc, paths));
+}
+
+test "ownedHasSecretMask: sees the mask under a declared path only" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const masked = try OwnedDoc.parse(
+        arena,
+        .toml,
+        "outside = \"<mox:secret>\"\n\n[api]\ntoken = \"<mox:secret>\"\n",
+    );
+    const clean = try OwnedDoc.parse(arena, .toml, "[api]\ntoken = \"real\"\n");
+    const paths = try testOwn(arena, &.{"api"});
+    try testing.expect(ownedHasSecretMask(&masked, paths));
+    try testing.expect(!ownedHasSecretMask(&clean, paths));
+    const other = try testOwn(arena, &.{"ui"});
+    try testing.expect(!ownedHasSecretMask(&masked, other));
 }
 
 test "secretPathFlags: a secret line inside one owned table flags exactly that path" {

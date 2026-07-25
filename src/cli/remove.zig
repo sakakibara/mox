@@ -44,6 +44,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         return 1;
     };
 
+    // A partial target's live file is mostly the program's: purging would
+    // delete the remainder mox never owned. Plain remove stops managing it.
+    if (purge and file.own_paths.len > 0) {
+        try ctx.err.print("mox remove: {s}: --purge is refused for a partially owned file (the live file's remainder is not mox's to delete; plain 'mox remove' stops managing it)\n", .{name});
+        return 1;
+    }
+
     const id = mox.apply.snapshot.idNow(ctx.io);
     const trash = try fileops.trashRoot(ctx.alloc, context.paths.state_dir, &id);
 
@@ -76,6 +83,14 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         var attrs = try mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir);
         if (attrs.remove(key)) try attrs.write(ctx.io, context.paths.repo_dir);
     }
+
+    // Forget every last-applied record for the path (content hash, content
+    // cache, symlink target, owned record) and its provenance: mox stopped
+    // tracking it, and a stale record would make a later re-add at the same
+    // path compare against state from the previous management era instead of
+    // going through first contact.
+    try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
 
     try ctx.out.print("Removed {s} (trashed to {s})\n", .{ file.source_base_path, trash });
 

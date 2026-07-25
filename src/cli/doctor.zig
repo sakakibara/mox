@@ -110,6 +110,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  tracked-and-ignored {s} (matches an ignore rule; it will not be applied -- remove one)\n", .{p});
     }
 
+    // Own declarations whose target has no source: the contract is declared
+    // but nothing composes for it, so apply never touches the live file.
+    for (orphanOwnAttributes(ctx.alloc, ctx.io, context.paths.repo_dir) catch &.{}) |key| {
+        advisories += 1;
+        try ctx.out.print("  orphan-own {s} (own declared in .mox/attributes.toml but no source exists under src/; 'mox add --own' the live file or remove the entry)\n", .{key});
+    }
+
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
     var problems = bad_prov.len;
@@ -275,6 +282,10 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
     var rebuilt: usize = 0;
     for (tree.files) |file| {
         if (file.is_symlink or file.create_once) continue;
+        // A partially owned target persists no line provenance by design
+        // (owned serializations have no live-line correspondence); the
+        // exclusion is deliberate, not a side effect of its absent record.
+        if (file.own_paths.len > 0) continue;
         // Only rebuild for files mox actually tracks (have an applied record).
         const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
         if (recorded == null) continue;
@@ -318,6 +329,35 @@ fn rescanCoupling(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const coupling_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, "coupling" });
     try mox.coupling.store.saveGraph(ctx.alloc, ctx.io, coupling_dir, &g);
     return g.map.count();
+}
+
+/// Attribute entries declaring `own` for a target with no source under
+/// `src/` (neither a base file nor a `<base>.d/` overlay dir). Sorted keys.
+fn orphanOwnAttributes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]const []const u8 {
+    const attrs = mox.source.attributes.load(arena, io, repo_dir) catch return &.{};
+    const src_root = try std.fs.path.join(arena, &.{ repo_dir, "src" });
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = attrs.map.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.own.len == 0) continue;
+        const key = kv.key_ptr.*;
+        const base = try mox.source.path.joinKeyOnto(arena, src_root, key);
+        const dot_d = try std.mem.concat(arena, u8, &.{ base, ".d" });
+        if (pathExists(io, base) or pathExists(io, dot_d)) continue;
+        try out.append(arena, key);
+    }
+    std.mem.sort([]const u8, out.items, {}, lessString);
+    return out.toOwnedSlice(arena);
+}
+
+fn pathExists(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn lessString(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
 }
 
 /// Source files present under `repo/src` but not tracked by git. Returns an

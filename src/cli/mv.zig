@@ -103,6 +103,14 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try attrs.write(ctx.io, context.paths.repo_dir);
     }
 
+    // The owned record is keyed by live path: re-key it so the next apply of
+    // the new path compares against the recorded owned state instead of
+    // treating it as first contact, and the old path leaves no stale record.
+    if (try mox.apply.applied.readOwned(ctx.alloc, ctx.io, context.paths.state_dir, old_live)) |owned_rec| {
+        try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, new_live, owned_rec);
+        try mox.apply.applied.forgetOwned(ctx.alloc, ctx.io, context.paths.state_dir, old_live);
+    }
+
     // A generator's produced-set manifest is keyed by the generator's live path,
     // not its source file, so a rename would leave the old leaves tracked under
     // the old key -- orphaned, never pruned. Re-key the manifest to the new live
@@ -131,6 +139,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     }
 
     try ctx.out.print("Moved {s} -> {s} (run 'mox apply' to update live files)\n", .{ file.source_base_path, new_base_rel });
+    if (file.own_paths.len > 0) {
+        // Same orphan rule as a whole-file mv, stated: mox stops managing
+        // the old path, it does not undo what it wrote there.
+        try ctx.out.print("  old live file keeps its owned content: {s}\n", .{old_live});
+    }
     return 0;
 }
 

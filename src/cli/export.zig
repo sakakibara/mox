@@ -131,6 +131,39 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             continue;
         };
 
+        // A partial target's deliverable is the owned contract, not a whole
+        // live file: export bakes the canonical owned serialization, after
+        // the same declaration check apply runs.
+        if (file.own_paths.len > 0) {
+            const partial = mox.apply.partial;
+            const format = mox.source.format.formatOfPath(file.source_base_path).?;
+            const owned_doc = partial.OwnedDoc.parse(ctx.alloc, format, bytes) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.OwnedUnparseable => {
+                    try ctx.err.print("mox export: {s}: composed source does not parse as {s}\n", .{ file.live_path, @tagName(format) });
+                    failed += 1;
+                    continue;
+                },
+            };
+            if (try partial.undeclaredLeaf(ctx.alloc, &owned_doc, file.own_paths)) |leaf| {
+                try ctx.err.print("mox export: {s}: composed leaf {s} is outside the declared own paths\n", .{ file.live_path, leaf });
+                failed += 1;
+                continue;
+            }
+            const canon = try mox.apply.canonical.canonicalOwned(ctx.alloc, &owned_doc, file.own_paths);
+            const eff_mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null);
+            if (diag.manager_secret) {
+                try ctx.err.print("mox export: {s}: baked a resolved op/pass secret (cleartext) at 0600\n", .{dest});
+            }
+            mox.apply.write.writeAtomic(ctx.io, dest, canon, eff_mode) catch |e| {
+                try ctx.err.print("mox export: {s}: write failed: {s}\n", .{ dest, @errorName(e) });
+                failed += 1;
+                continue;
+            };
+            written += 1;
+            continue;
+        }
+
         if (file.is_symlink) {
             const target = std.mem.trim(u8, bytes, " \t\r\n");
             if (std.fs.path.dirname(dest)) |parent| Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};

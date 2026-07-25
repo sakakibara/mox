@@ -775,8 +775,9 @@ const PartialInput = struct {
 /// MOX_CHECK_FILE and MOX_CHECK_DIR, runs with cwd at the repo root, and is
 /// wall-clock bounded (MOX_CHECK_TIMEOUT_MS override). Returns true on
 /// acceptance; any other outcome reports the refusal (with the child's tail
-/// output), counts the failure, and returns false.
-fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, counts: *Counts) !bool {
+/// output), bumps `fail_count`, and returns false. Public because rollback
+/// runs the same hook before re-patching a partial target.
+pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, fail_count: *usize) !bool {
     const context = ctx.context.?;
     // Keyed by live path: the state lock serializes applies, so no two runs
     // race on it, and a crash's leftover is overwritten on the next apply.
@@ -797,7 +798,7 @@ fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path:
     defer std.Io.Dir.cwd().deleteFile(ctx.io, out_path) catch {};
     if (!materialized) {
         try ctx.err.print("  ERROR   {s} (check {s} could not run: candidate not materialized)\n", .{ live_path, check_argv[0] });
-        counts.fail += 1;
+        fail_count.* += 1;
         return false;
     }
 
@@ -810,7 +811,7 @@ fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path:
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (check {s} could not run: {s})\n", .{ live_path, check_argv[0], @errorName(e) });
-            counts.fail += 1;
+            fail_count.* += 1;
             return false;
         },
     };
@@ -820,7 +821,7 @@ fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path:
         try ctx.err.print("mox apply:   check output:\n{s}", .{res.tail});
         if (res.tail[res.tail.len - 1] != '\n') try ctx.err.writeAll("\n");
     }
-    counts.fail += 1;
+    fail_count.* += 1;
     return false;
 }
 
@@ -1003,7 +1004,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
     if (in.file.check_argv.len > 0) {
-        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, counts)) return;
+        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, &counts.fail)) return;
     }
 
     if (live != null) {

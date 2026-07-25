@@ -3143,3 +3143,86 @@ test "apply partial check: a hanging hook is killed within the timeout bound" {
     // Killed by the 1500ms bound, not by the checker's 30s sleep ending.
     try std.testing.expect(elapsed < 20);
 }
+
+// Rollback on partial targets: the snapshot's owned subtree is re-patched
+// onto the CURRENT live file; the remainder is never whole-file clobbered.
+
+test "rollback partial: re-patches the owned subtree and keeps the program's later writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const program_live = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 1\n\n[state]\ncount = 1\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The source moves on; the write snapshots the pre-write live file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = 2") != null);
+
+    // The program writes AFTER the snapshot; rollback must not destroy it.
+    const grown = try std.mem.concat(a, u8, &.{ try read(io, a, live), "\n[after]\nnew = true\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = grown });
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "re-patched") != null);
+
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "k = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "k = 2") == null);
+    // The whole CURRENT remainder survives, including the post-snapshot write.
+    try std.testing.expect(std.mem.indexOf(u8, after, "model = \"gpt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "count = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "[after]\nnew = true") != null);
+
+    // The owned record is deliberately left stale: the next apply sees the
+    // restored owned content as drift, mirroring whole-file rollback.
+    const drift = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), drift.rc);
+    try std.testing.expect(std.mem.indexOf(u8, drift.err, "DRIFT") != null);
+}
+
+test "rollback partial: a secret-masked snapshot is refused, live untouched" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "rollback-s3cr3t-DO-NOT-LEAK-55ee66ff";
+    try writePartialFixture(io, &tmp, "[api]\ntoken = \"<secret:env:MY_ROLLBACK_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_ROLLBACK_SECRET", .value = secret_value }},
+    });
+    const live = try c.homePath("app.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // A hand edit inside the owned path, then a forced reassert: the
+    // pre-write snapshot stores the owned values MASKED.
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), secret_value, "edited-by-hand");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const before = try read(io, a, live);
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "masks a secret") != null);
+    // The refusal wrote nothing: no placeholder ever lands live.
+    try std.testing.expectEqualStrings(before, try read(io, a, live));
+    try std.testing.expect(std.mem.indexOf(u8, before, mox.apply.partial.secret_mask) == null);
+}

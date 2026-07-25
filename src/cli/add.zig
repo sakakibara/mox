@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli");
+const toml = @import("toml");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 
@@ -13,6 +14,9 @@ pub const Outcome = enum {
     is_directory,
     already_managed,
     into_overlay_dir,
+    /// The target carries an `own` declaration: it is managed per key-path,
+    /// so a whole-file add would contradict the ownership contract.
+    partial_target,
 };
 
 /// True when the target key names a file directly inside a `<base>.d/` overlay
@@ -79,6 +83,13 @@ pub fn addFile(
     // A file inside a `<base>.d/` directory would be misread as an overlay.
     if (intoOverlayDir(trimmed)) return .{ .outcome = .into_overlay_dir };
 
+    // A target with an `own` declaration is partially owned; a whole-file
+    // capture of it would sweep the program's region into the source.
+    {
+        const attrs = try mox.source.attributes.load(arena, io, repo_dir);
+        if (attrs.own(trimmed).len > 0) return .{ .outcome = .partial_target };
+    }
+
     const src_path = try std.fs.path.join(arena, &.{ repo_dir, "src", trimmed });
 
     if (Io.Dir.cwd().access(io, src_path, .{})) |_| {
@@ -139,11 +150,217 @@ fn recordAttrs(
     try attrs.write(io, repo_dir);
 }
 
+pub const OwnOutcome = enum {
+    added,
+    not_found,
+    outside_home,
+    is_home,
+    is_directory,
+    is_symlink,
+    already_managed,
+    into_overlay_dir,
+    not_structured,
+    invalid_path,
+    extract_failed,
+};
+
+pub const OwnResult = struct {
+    outcome: OwnOutcome,
+    /// Absolute source path (valid for `.added` and `.already_managed`).
+    src_path: []const u8 = "",
+    /// Names the offending path or extraction failure for the error outcomes.
+    detail: []const u8 = "",
+    /// Top-level live entries outside the declaration (valid for `.added`).
+    unowned_top: usize = 0,
+};
+
+/// Take partial ownership of a live file: extract the declared paths' raw
+/// byte spans into a new source file (comments inside owned content survive
+/// verbatim), record the `own` list in `.mox/attributes.toml` through the
+/// TOML document model (the file is user-authored; its formatting and
+/// comments are preserved), and report what remains the program's. Content
+/// paths must be present live; `absent_raws` declare enforced absence and
+/// contribute no content.
+pub fn addOwnFile(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    home: []const u8,
+    live_path: []const u8,
+    own_raws: []const []const u8,
+    absent_raws: []const []const u8,
+) !OwnResult {
+    const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+        error.FileNotFound => return .{ .outcome = .not_found },
+        else => return e,
+    };
+    if (st.kind == .directory) return .{ .outcome = .is_directory };
+    // Partial ownership patches a document in place; a symlinked live file
+    // has no document of its own to patch.
+    if (st.kind == .sym_link) return .{ .outcome = .is_symlink };
+
+    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
+        rel
+    else if (isHomeItself(live_path, home))
+        return .{ .outcome = .is_home }
+    else
+        return .{ .outcome = .outside_home };
+    if (mox.source.path.keyEscapes(trimmed)) return .{ .outcome = .outside_home };
+    if (intoOverlayDir(trimmed)) return .{ .outcome = .into_overlay_dir };
+
+    const format = mox.source.format.formatOfPath(trimmed) orelse return .{ .outcome = .not_structured };
+
+    const src_path = try std.fs.path.join(arena, &.{ repo_dir, "src", trimmed });
+    if (Io.Dir.cwd().access(io, src_path, .{})) |_| {
+        return .{ .outcome = .already_managed, .src_path = src_path };
+    } else |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    }
+
+    const partial = mox.apply.partial;
+    var bad_raw: []const u8 = "";
+    const content_paths = parseOwnRaws(arena, own_raws, &bad_raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
+    };
+    const absent_paths = parseOwnRaws(arena, absent_raws, &bad_raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
+    };
+    const all_paths = try std.mem.concat(arena, mox.source.tree.OwnPath, &.{ content_paths, absent_paths });
+
+    const live = try Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024));
+
+    var diag: partial.Diag = .{};
+    const extracted = partial.extractOwnedSource(arena, format, live, content_paths, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .outcome = .extract_failed, .detail = try arena.dupe(u8, diag.text()) },
+    };
+
+    // The extracted text must parse, lie entirely within the declaration,
+    // and reproduce the live owned content exactly (canonical-byte), or the
+    // capture is refused with nothing written.
+    const doc = partial.OwnedDoc.parse(arena, format, extracted) catch {
+        return .{ .outcome = .extract_failed, .detail = "extracted source does not parse" };
+    };
+    if (try partial.undeclaredLeaf(arena, &doc, all_paths)) |leaf| {
+        return .{
+            .outcome = .extract_failed,
+            .detail = try std.fmt.allocPrint(arena, "extracted leaf {s} falls outside the declaration", .{leaf}),
+        };
+    }
+    const live_doc = partial.OwnedDoc.parse(arena, format, live) catch {
+        return .{ .outcome = .extract_failed, .detail = "live file does not parse" };
+    };
+    const want = try mox.apply.canonical.canonicalOwned(arena, &live_doc, content_paths);
+    const got = try mox.apply.canonical.canonicalOwned(arena, &doc, content_paths);
+    if (!std.mem.eql(u8, want, got)) {
+        return .{ .outcome = .extract_failed, .detail = "extracted source does not reproduce the live owned content" };
+    }
+
+    if (std.fs.path.dirname(src_path)) |parent| {
+        Io.Dir.cwd().createDirPath(io, parent) catch {};
+    }
+    const mode = mox.apply.write.modeOf(st.permissions);
+    try mox.apply.write.writeAtomic(io, src_path, extracted, mode);
+
+    const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
+    const own_list = try std.mem.concat(arena, []const u8, &.{ own_raws, absent_raws });
+    try writeOwnAttrEntry(arena, io, repo_dir, trimmed, own_list, recorded_mode);
+
+    return .{
+        .outcome = .added,
+        .src_path = src_path,
+        .unowned_top = partial.unownedTopLevelCount(&live_doc, all_paths),
+    };
+}
+
+fn parseOwnRaws(
+    arena: std.mem.Allocator,
+    raws: []const []const u8,
+    bad: *[]const u8,
+) error{ OutOfMemory, InvalidOwnPath }![]mox.source.tree.OwnPath {
+    const out = try arena.alloc(mox.source.tree.OwnPath, raws.len);
+    for (raws, out) |raw, *o| {
+        const segments = mox.source.keypath.parse(arena, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                bad.* = raw;
+                return error.InvalidOwnPath;
+            },
+        };
+        o.* = .{ .raw = raw, .segments = segments };
+    }
+    return out;
+}
+
+/// Record the target's `own` list (and an uncarryable mode) by editing
+/// `.mox/attributes.toml` through the TOML document model: the file is
+/// user-authored, so its comments and formatting survive the edit.
+fn writeOwnAttrEntry(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    key: []const u8,
+    own_list: []const []const u8,
+    mode: ?u32,
+) !void {
+    const path = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "attributes.toml" });
+    const existing: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => return e,
+    };
+    var doc = if (existing) |text|
+        try toml.Document.parse(arena, text, .{})
+    else
+        try toml.Document.empty(arena, .{});
+
+    var arr: toml.Value.Array = .empty;
+    for (own_list) |p| try arr.append(arena, .{ .string = p });
+    try doc.setValueSegments(&.{ key, "own" }, .{ .array = arr });
+    if (mode) |m| {
+        const octal = try std.fmt.allocPrint(arena, "0{o}", .{m});
+        try doc.setValueSegments(&.{ key, "mode" }, .{ .string = octal });
+    }
+
+    var aw: Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
+}
+
 const Spec = struct {
     path: cli.spec.Pos([]const u8, .{ .help = "live file to start managing" }),
     seed_once: cli.spec.Flag(.{ .help = "seed the target once; never overwrite an existing one" }),
     force: cli.spec.Flag(.{ .help = "add even if the path matches an ignore rule" }),
+    own: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable)" }),
+    own_absent: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable)" }),
 };
+
+/// Every value the repeated `--<long>` option was given, in command-line
+/// order. cli-zig options are last-wins; the `own` declaration is a list, so
+/// the values are collected from the command's own argv (the Spec still
+/// declares the option for parsing, help, and completion).
+fn collectRepeated(alloc: std.mem.Allocator, argv: []const []const u8, long: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const t = argv[i];
+        if (!std.mem.startsWith(u8, t, "--")) continue;
+        const body = t[2..];
+        if (std.mem.eql(u8, body, long)) {
+            if (i + 1 < argv.len) {
+                try out.append(alloc, argv[i + 1]);
+                i += 1;
+            }
+        } else if (body.len > long.len and body[long.len] == '=' and std.mem.startsWith(u8, body, long)) {
+            try out.append(alloc, body[long.len + 1 ..]);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
@@ -166,6 +383,16 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox add: {s} matches an ignore rule; use --force to add it anyway\n", .{rel});
             return 1;
         }
+    }
+
+    const own_raws = try collectRepeated(ctx.alloc, ctx.argv, "own");
+    const absent_raws = try collectRepeated(ctx.alloc, ctx.argv, "own-absent");
+    if (own_raws.len > 0 or absent_raws.len > 0) {
+        if (a.seed_once) {
+            try ctx.err.writeAll("mox add: --own cannot combine with --seed-once (a seed-once target is never re-composed)\n");
+            return 1;
+        }
+        return runOwn(ctx, home, live_path, own_raws, absent_raws);
     }
 
     const result = try addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, a.seed_once);
@@ -204,13 +431,83 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{live_path});
             return 1;
         },
+        .partial_target => {
+            try ctx.err.print("mox add: {s}: partially owned (an own declaration exists in .mox/attributes.toml); edit its source, or remove the declaration first\n", .{live_path});
+            return 1;
+        },
+    }
+}
+
+/// The `mox add --own` flow: extract, validate, record, report.
+fn runOwn(
+    ctx: *app.Ctx,
+    home: []const u8,
+    live_path: []const u8,
+    own_raws: []const []const u8,
+    absent_raws: []const []const u8,
+) anyerror!u8 {
+    const context = ctx.context.?;
+    const r = try addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws);
+    switch (r.outcome) {
+        .added => {
+            try ctx.out.print("Added {s} -> {s} (own: {d} key-path(s))\n", .{ live_path, r.src_path, own_raws.len + absent_raws.len });
+            if (r.unowned_top > 0) {
+                try ctx.out.print("  {d} top-level live entr{s} remain{s} unowned (the program's region)\n", .{
+                    r.unowned_top,
+                    @as([]const u8, if (r.unowned_top == 1) "y" else "ies"),
+                    @as([]const u8, if (r.unowned_top == 1) "s" else ""),
+                });
+            }
+            buildInitialCoupling(ctx) catch {};
+            return 0;
+        },
+        .not_found => {
+            try ctx.err.print("mox add: {s}: not found\n", .{live_path});
+            return 1;
+        },
+        .outside_home => {
+            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ live_path, home });
+            return 1;
+        },
+        .is_home => {
+            try ctx.err.writeAll("mox add: cannot add HOME itself\n");
+            return 1;
+        },
+        .is_directory => {
+            try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
+            return 1;
+        },
+        .is_symlink => {
+            try ctx.err.print("mox add: {s}: is a symlink; --own patches a document in place\n", .{live_path});
+            return 1;
+        },
+        .already_managed => {
+            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ live_path, r.src_path });
+            return 1;
+        },
+        .into_overlay_dir => {
+            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{live_path});
+            return 1;
+        },
+        .not_structured => {
+            try ctx.err.print("mox add: {s}: --own requires a structured target (toml/json/yaml/ini/gitconfig)\n", .{live_path});
+            return 1;
+        },
+        .invalid_path => {
+            try ctx.err.print("mox add: {s}: own path does not parse as a dotted key path\n", .{r.detail});
+            return 1;
+        },
+        .extract_failed => {
+            try ctx.err.print("mox add: {s}: cannot extract the declared paths: {s}\n", .{ live_path, r.detail });
+            return 1;
+        },
     }
 }
 
 pub const command = app.command(Spec, .{
     .name = "add",
     .summary = "Start managing a live file as a base file in src/",
-    .usage = "mox add [--seed-once] <path>",
+    .usage = "mox add [--seed-once] [--own <key-path>]... [--own-absent <key-path>]... <path>",
     .group = .general,
     .needs_context = true,
 }, run);

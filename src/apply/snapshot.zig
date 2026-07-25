@@ -141,6 +141,13 @@ pub const Restored = struct {
     count: usize = 0,
 };
 
+/// A snapshot file whose live path the caller asked to withhold from the
+/// whole-file restore, with the snapshot's content for its own handling.
+pub const Withheld = struct {
+    live_path: []const u8,
+    content: []const u8,
+};
+
 /// Restore every file in snapshot `id` to its live path under `home`,
 /// preserving each snapshot file's mode. Returns how many files were
 /// restored; `error.SnapshotNotFound` when the id does not exist.
@@ -151,6 +158,22 @@ pub fn restore(
     id: []const u8,
     home: []const u8,
 ) !Restored {
+    return restoreExcept(arena, io, snapshots_dir, id, home, null, null);
+}
+
+/// `restore`, withholding every live path in `skip` from the whole-file
+/// write. A withheld file's snapshot content is collected into `skipped`
+/// instead; the caller decides what to do with it (rollback re-patches a
+/// partial target's owned subtree rather than clobbering the remainder).
+pub fn restoreExcept(
+    arena: std.mem.Allocator,
+    io: Io,
+    snapshots_dir: []const u8,
+    id: []const u8,
+    home: []const u8,
+    skip: ?*const std.StringHashMap(void),
+    skipped: ?*std.ArrayList(Withheld),
+) !Restored {
     const snap_dir_path = try std.fs.path.join(arena, &.{ snapshots_dir, id });
     var dir = Io.Dir.cwd().openDir(io, snap_dir_path, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound => return error.SnapshotNotFound,
@@ -159,7 +182,7 @@ pub fn restore(
     defer dir.close(io);
 
     var result: Restored = .{};
-    try restoreDir(arena, io, dir, snap_dir_path, "", home, &result);
+    try restoreDir(arena, io, dir, snap_dir_path, "", home, skip, skipped, &result);
     return result;
 }
 
@@ -170,6 +193,8 @@ fn restoreDir(
     abs_prefix: []const u8,
     rel_prefix: []const u8,
     home: []const u8,
+    skip: ?*const std.StringHashMap(void),
+    skipped: ?*std.ArrayList(Withheld),
     result: *Restored,
 ) !void {
     // Raw iterate() is sound here: a restore replays EVERY entry to disk, so
@@ -186,15 +211,19 @@ fn restoreDir(
                 var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
                 defer sub.close(io);
                 const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, entry.name });
-                try restoreDir(arena, io, sub, sub_abs, rel, home, result);
+                try restoreDir(arena, io, sub, sub_abs, rel, home, skip, skipped, result);
             },
             .file => {
                 const content = try dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024 * 1024));
+                const target = try source_path.joinKeyOnto(arena, home, rel);
+                if (skip != null and skip.?.contains(target)) {
+                    if (skipped) |out| try out.append(arena, .{ .live_path = target, .content = content });
+                    continue;
+                }
                 const mode = blk: {
                     const st = dir.statFile(io, entry.name, .{}) catch break :blk @as(u32, 0o644);
                     break :blk write_mod.modeOf(st.permissions);
                 };
-                const target = try source_path.joinKeyOnto(arena, home, rel);
                 try write_mod.writeAtomic(io, target, content, mode);
                 result.count += 1;
             },

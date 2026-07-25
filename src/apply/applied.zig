@@ -259,6 +259,13 @@ pub fn forget(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path
     Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
 }
 
+/// Delete only the owned record for `live_path`. `mox mv` re-keys the record
+/// to the new live path and drops the old one with this; the other records
+/// never exist for a partial target, so the full `forget` sweep is not needed.
+pub fn forgetOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !void {
+    Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
+}
+
 /// What currently occupies a live path, inspected without following symlinks.
 pub const SymSite = union(enum) {
     absent,

@@ -87,6 +87,12 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                         }
                     },
                     .already_managed => counts.skipped += 1,
+                    // A partially owned target is managed per key-path; a
+                    // whole-file capture would sweep the program's region in.
+                    .partial_target => {
+                        counts.skipped += 1;
+                        try ctx.out.print("  skipping {s} (partially owned; managed per key-path)\n", .{child});
+                    },
                     else => counts.skipped += 1,
                 }
             },
