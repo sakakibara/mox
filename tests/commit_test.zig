@@ -3528,13 +3528,31 @@ test "commit: an own declaration the walk rejects reports the target by name" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeRepo(io, &tmp, "repo/src/notes.txt", "# mox: own a\nhi\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own \"unterminated\n[t]\n");
     const h = try setup(a, io, &tmp, .{});
 
     const res = try h.run(&.{ "mox", "commit" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "notes.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "own requires a structured target") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "app.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "dotted key path") != null);
+}
+
+test "commit: a directive-looking line in an unstructured head skips only that file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/notes.md", "# mox: own x\nprose body\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    const res = try h.run(&.{ "mox", "commit" });
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "notes.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "structured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "nothing to commit") != null);
 }
 
 test "commit disown: routes a user-key edit to the base; the program's key never surfaces" {

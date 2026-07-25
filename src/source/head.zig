@@ -59,7 +59,10 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, marker: []const u8) Par
     var check: ?[]const []const u8 = null;
     var ownership: Ownership = .none;
 
-    var pos: usize = 0;
+    // A UTF-8 BOM belongs to the file, not the directive grammar: skip it
+    // so the leading block is recognized, and leave it out of every span so
+    // `strip` keeps it as the first remainder bytes.
+    var pos: usize = if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) 3 else 0;
     var first_line = true;
     while (pos < text.len) {
         const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n');
@@ -261,6 +264,17 @@ test "parse: quoted argv escapes and the whole rest of an own line as one path" 
     try testing.expectEqualStrings("remote.\"my origin\".url", p.paths[0]);
     try testing.expectEqualStrings("a \"b\"", p.check[0]);
     try testing.expectEqualStrings("c\\d", p.check[1]);
+}
+
+test "parse: a UTF-8 BOM precedes the leading block; strip keeps it in place" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "\xEF\xBB\xBF# mox: own a\n[a]\nk = 1\n";
+    const p = try parse(a, text, "#");
+    try testing.expectEqual(Ownership.own, p.ownership);
+    try testing.expectEqualStrings("a", p.paths[0]);
+    try testing.expectEqualStrings("\xEF\xBB\xBF[a]\nk = 1\n", try strip(a, text, "#"));
 }
 
 test "strip: no directives leaves the text untouched, CRLF line survives" {

@@ -409,7 +409,6 @@ pub fn commitImpl(
             try ctx.err.print("mox commit: source tree not found at {s}\n", .{src_dir});
             return 1;
         },
-        error.OwnOnUnstructuredTarget,
         error.OwnOnSymlink,
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
@@ -555,6 +554,12 @@ pub fn commitImpl(
     files: for (tree.files, 0..) |file, fidx| {
         if (scoped_live) |set| {
             if (!set.contains(file.live_path)) continue;
+        }
+        // A head declaration the walk could not honor: nothing of this file
+        // can be routed; skip it with the diagnosis and keep committing.
+        if (file.head_error.len > 0) {
+            try ctx.err.print("mox commit: {s}: skipped ({s})\n", .{ file.live_path, file.head_error });
+            continue;
         }
         if (file.is_symlink) continue;
         // Seed-once files carry no applied record and are user-owned after

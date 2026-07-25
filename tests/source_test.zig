@@ -333,12 +333,15 @@ test "walk: a gated partial file declares in its base head, above the gate" {
     try std.testing.expectEqualStrings("tui.keymap.global", result.files[0].own_paths[0].raw);
 }
 
-test "walk: own on an unstructured target is rejected, naming the target" {
+test "walk: a directive-looking head on an unstructured target is a per-file error, not a walk failure" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // Prose can spell a directive; the walk must carry on and let each
+    // command report the file itself.
     try writeFile(io, tmp.dir, "src/.zshrc", "# mox: own alias.ls\nexport EDITOR=nvim\n");
+    try writeFile(io, tmp.dir, "src/ok.toml", "[t]\nk = 1\n");
 
     const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(src_dir);
@@ -347,9 +350,16 @@ test "walk: own on an unstructured target is rejected, naming the target" {
     defer arena.deinit();
 
     var diag: mox.source.tree.Diag = .{};
-    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
-    try std.testing.expectError(error.OwnOnUnstructuredTarget, result);
-    try std.testing.expectEqualStrings(".zshrc", diag.capture().?);
+    const result = try mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectEqual(@as(usize, 2), result.files.len);
+    for (result.files) |f| {
+        if (std.mem.endsWith(u8, f.live_path, ".zshrc")) {
+            try std.testing.expect(f.head_error.len > 0);
+            try std.testing.expectEqual(mox.source.head.Ownership.none, f.ownership);
+        } else {
+            try std.testing.expectEqualStrings("", f.head_error);
+        }
+    }
 }
 
 test "walk: own combined with seed_once or symlink is rejected" {

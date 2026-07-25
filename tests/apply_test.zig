@@ -2844,23 +2844,49 @@ test "apply: an own declaration the walk rejects reports the target by name" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    // A structured target with an own path the key grammar rejects fails
+    // the whole walk: the declaration is unambiguously mox's and broken.
     try tmp.dir.createDirPath(io, "repo/src");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "# mox: own a\ntext\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own \"unterminated\n[t]\n" });
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "structured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "dotted key path") != null);
+}
 
-    // status and diff walk the same tree and report the same diagnosis.
+test "apply: a directive-looking line in an unstructured head fails only that file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Prose that happens to spell a directive: the .md file itself errors,
+    // everything else still applies, and the run exits 1.
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.md", .data = "# mox: own x\nprose body\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v1\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "structured") != null);
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try c.homePath("b.conf")));
+    try std.testing.expect(!exists(io, try c.homePath("notes.md")));
+
+    // status reports the file as its own ERROR; diff names it on stderr.
     const s = try c.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), s.rc);
-    try std.testing.expect(std.mem.indexOf(u8, s.err, "notes.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s.err, "structured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "ERROR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "notes.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "b.conf") != null);
     const d = try c.run(&.{ "mox", "diff" });
-    try std.testing.expectEqual(@as(u8, 1), d.rc);
-    try std.testing.expect(std.mem.indexOf(u8, d.err, "notes.txt") != null);
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(std.mem.indexOf(u8, d.err, "notes.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, d.err, "structured") != null);
 }
 
@@ -3317,11 +3343,11 @@ test "rollback: a broken attributes file blocks neither whole-file restores nor 
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    // The source tree breaks: own declared in an unstructured target's head
-    // fails the tree walk. Partial detection comes from the owned record, so
-    // the whole-file restore proceeds and the partial target is withheld,
-    // never whole-file clobbered.
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "# mox: own x\ntext\n" });
+    // The source tree breaks: an own path the key grammar rejects fails the
+    // tree walk. Partial detection comes from the owned record, so the
+    // whole-file restore proceeds and the partial target is withheld, never
+    // whole-file clobbered.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/bad.toml", .data = "# mox: own \"unterminated\n[t]\n" });
 
     const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
     const ids = try mox.apply.snapshot.list(a, io, snaps);
@@ -3589,4 +3615,88 @@ test "rollback disown: re-patches the owned complement and keeps the program's l
     const after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, after, "\"theme\": \"dark\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "m-new") != null);
+}
+
+test "apply partial: a BOM-prefixed source declares ownership and never leaks a directive" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The BOM belongs to the file: the directive after it must still be
+    // recognized, and compose keeps the BOM while stripping the directive.
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/theme.ini",
+        .data = "\xEF\xBB\xBF# mox: own colors\n[colors]\nfg = red\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("theme.ini");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "[colors]\nfg = red\n\n[state]\ncount = 1\n",
+    });
+
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "adopted") != null);
+
+    // The source moves on: the owned section reasserts, the program section
+    // survives, and no directive or BOM ever reaches the live file.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/theme.ini",
+        .data = "\xEF\xBB\xBF# mox: own colors\n[colors]\nfg = blue\n",
+    });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "blue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "count = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "mox:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\xEF\xBB\xBF") == null);
+}
+
+test "apply disown: a shrunk disown list on a secret record is first contact, never silent removal" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDisownFixture(io, &tmp, "// mox: disown model\n// mox: disown survey\n{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S1>\"\n}\n");
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{
+            .{ .name = "MY_DISOWN_S1", .value = "disown-s3cr3t-one" },
+            .{ .name = "MY_DISOWN_S2", .value = "disown-s3cr3t-two" },
+        },
+    });
+    const live = try c.homePath("settings.json");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The program writes both of its keys.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = live,
+        .data = "{\n  \"theme\": \"dark\",\n  \"token\": \"disown-s3cr3t-one\",\n  \"model\": \"m1\",\n  \"survey\": {\"seen\": 9}\n}\n",
+    });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The disown list SHRINKS past survey while the secret rotates. The
+    // program's survey content is newly owned first contact: consent is
+    // required, never a silent removal under the stale hash scope.
+    try writeDisownFixture(io, &tmp, "// mox: disown model\n{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S2>\"\n}\n");
+    const skip = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), skip.rc);
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.err, "survey") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "survey") != null);
+
+    // --force removes it, keeps the still-disowned model, rotates the secret.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "survey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"model\": \"m1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "disown-s3cr3t-two") != null);
 }

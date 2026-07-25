@@ -39,7 +39,6 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox status: source tree not found at {s}\n", .{src_dir});
             return 1;
         },
-        error.OwnOnUnstructuredTarget,
         error.OwnOnSymlink,
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
@@ -73,6 +72,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 
     var problems: usize = 0;
     for (files) |file| {
+        // A head declaration the walk could not honor is this file's error
+        // alone; every other file still reports.
+        if (file.head_error.len > 0) {
+            try ctx.out.print("  {s:<8} {s} ({s})\n", .{ "ERROR", file.live_path, file.head_error });
+            problems += 1;
+            continue;
+        }
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so status has nothing to report for it.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);

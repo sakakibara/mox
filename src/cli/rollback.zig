@@ -41,7 +41,6 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         var walk_diag: mox.source.tree.Diag = .{};
         const base_tree: ?mox.source.tree.ManagedTree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, context.paths.home, &walk_diag) catch |e| switch (e) {
             error.FileNotFound => null,
-            error.OwnOnUnstructuredTarget,
             error.OwnOnSymlink,
             error.OwnOnSeedOnce,
             error.OwnOnGenerator,

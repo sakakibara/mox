@@ -141,7 +141,6 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox diff: source tree not found at {s}\n", .{src_dir});
             return 0;
         },
-        error.OwnOnUnstructuredTarget,
         error.OwnOnSymlink,
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
@@ -177,6 +176,12 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     var changed: usize = 0;
 
     for (files) |file| {
+        // A head declaration the walk could not honor is this file's error
+        // alone; every other file still diffs.
+        if (file.head_error.len > 0) {
+            try ctx.err.print("mox diff: {s}: {s}\n", .{ file.live_path, file.head_error });
+            continue;
+        }
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so diff has nothing to compare it against.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);

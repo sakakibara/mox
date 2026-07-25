@@ -182,6 +182,11 @@ pub const ManagedFile = struct {
     /// repo-relative executable and its arguments, run against a candidate
     /// partial write before it lands. Empty means no hook.
     check_argv: []const []const u8 = &.{},
+    /// Non-empty when the base head carries a directive-looking line the
+    /// walk cannot honor (an unstructured target): the walk continues, and
+    /// each command reports this file as its own error instead of aborting
+    /// the whole run.
+    head_error: []const u8 = "",
 };
 
 /// The complete scanned source tree.
@@ -402,6 +407,7 @@ fn walkDir(
             .ownership = decl.ownership,
             .own_paths = decl.own_paths,
             .check_argv = decl.check_argv,
+            .head_error = decl.head_error,
         });
     }
 
@@ -470,7 +476,13 @@ const Decl = struct {
     ownership: head.Ownership = .none,
     own_paths: []const OwnPath = &.{},
     check_argv: []const []const u8 = &.{},
+    head_error: []const u8 = "",
 };
+
+/// Per-file diagnosis for a head declaration on an unstructured target. A
+/// prose line can look like a directive, so the walk must not die on it;
+/// the file itself reports the error and is skipped.
+pub const unstructured_head_error = "head directives require a structured target (toml/json/yaml/ini/gitconfig)";
 
 /// The comment marker head directives use for a structured format: `#`
 /// everywhere except JSON, whose sources are JSONC (`//`).
@@ -498,19 +510,16 @@ fn headChecked(
     const content = base.dir.readFileAlloc(io, base.name, arena, .limited(max_base_bytes)) catch return .{};
 
     const format = format_mod.formatOfPath(target_key) orelse {
-        // Directives on an unstructured target cannot take effect; refuse
-        // them loudly under every marker spelling they could arrive in.
+        // Directives on an unstructured target cannot take effect. A prose
+        // line may merely LOOK like one, so this is a per-file error (the
+        // walk continues), probed under every marker spelling.
         for (probe_markers) |marker| {
             const parsed = head.parse(arena, content, marker) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    setDiag(diag, target_key);
-                    return error.OwnOnUnstructuredTarget;
-                },
+                else => return .{ .head_error = unstructured_head_error },
             };
             if (parsed.ownership != .none) {
-                setDiag(diag, target_key);
-                return error.OwnOnUnstructuredTarget;
+                return .{ .head_error = unstructured_head_error };
             }
         }
         return .{};

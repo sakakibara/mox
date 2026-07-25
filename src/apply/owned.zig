@@ -92,9 +92,23 @@ pub fn classifyDisown(
     const rec = record orelse return .{ .drift = firstDifferingSection(live_x, composed_x) };
 
     if (rec.secret) {
-        // Stale scope: the hash covers a different disown list; outdated,
-        // reassert re-records under the current scope.
-        if (!samePathSet(disown_paths, record_paths)) return .outdated;
+        // Stale scope: the hash covers a different disown list. A path
+        // REMOVED from the list is first contact for its newly owned live
+        // content -- the composed cleartext is in hand, so compare per
+        // path and require consent for anything that differs; only then is
+        // the stale record itself outdated.
+        if (!samePathSet(disown_paths, record_paths)) {
+            for (record_paths) |r| {
+                if (pathInList(r.segments, disown_paths)) continue;
+                const one = [_]OwnPath{r};
+                const live_sec = try canonical.canonicalOwned(arena, live_doc, &one);
+                const composed_sec = try canonical.canonicalOwned(arena, owned, &one);
+                if (!std.mem.eql(u8, live_sec, composed_sec)) {
+                    return .{ .drift = try canonical.pathSpell(arena, r.segments) };
+                }
+            }
+            return .outdated;
+        }
         const live_hash = applied.contentHashHex(live_x);
         if (rec.canonical_hash == null or !std.mem.eql(u8, &live_hash, &rec.canonical_hash.?)) {
             return .{ .drift = null };
@@ -473,6 +487,42 @@ test "classifyDisown: clean, outdated, and drifted owned content around a protec
     // The user's owned edit is drift, naming the top-level section.
     const c = try classifyDisownToml(arena, "[user]\nname = \"me\"\n", "[user]\nname = \"edited\"\n\n[state]\ncount = 43\n", &raws, rec);
     try testing.expectEqualStrings("user", c.drift.?);
+}
+
+test "classifyDisown: a shrunk list on a secret record is first contact for the freed path" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Record time: state and survey disowned, the complement secret-bearing:
+    // the record is a hash over the complement scope.
+    const old_raws = [_][]const u8{ "state", "survey" };
+    const old_composed = "[api]\ntoken = \"old\"\n";
+    const old_doc = try OwnedDoc.parse(arena, .toml, old_composed);
+    const old_canon = try canonical.canonicalComplement(arena, &old_doc, try testPaths(arena, &old_raws));
+    const rec: applied.OwnedRecord = .{
+        .mode = .disown,
+        .canonical = null,
+        .canonical_hash = applied.contentHashHex(old_canon),
+        .secret = true,
+        .own_paths = &old_raws,
+        .secret_paths = &.{"api"},
+    };
+
+    // The list SHRINKS to [state] while the program owns live survey content
+    // and the secret rotates. The freed path is first contact: its live
+    // content differs from the composed document, so consent is required --
+    // the stale hash scope must not silently reassert over it.
+    const raws = [_][]const u8{"state"};
+    const composed = "[api]\ntoken = \"rotated\"\n";
+    const live = "[api]\ntoken = \"old\"\n\n[state]\ncount = 1\n\n[survey]\nseen = 99\n";
+    const c = try classifyDisownToml(arena, composed, live, &raws, rec);
+    try testing.expectEqualStrings("survey", c.drift.?);
+
+    // With nothing live under the freed path, only the stale scope remains:
+    // outdated, reasserted without consent.
+    const live_clean = "[api]\ntoken = \"old\"\n\n[state]\ncount = 1\n";
+    try testing.expect(try classifyDisownToml(arena, composed, live_clean, &raws, rec) == .outdated);
 }
 
 test "classifyDisown: a grown disown list stops comparing; a shrunk one is first contact" {

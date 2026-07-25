@@ -394,6 +394,27 @@ pub fn addDisownFile(
         return .{ .outcome = .extract_failed, .detail = "extracted source does not reproduce the live owned content" };
     }
 
+    // Round-trip gate: the extracted source must survive one dry patch
+    // cycle against the very live file it was cut from -- splice the
+    // disowned spans back in and run the full invariant. A source that
+    // cannot re-apply is refused here, with nothing written, instead of
+    // failing on every later apply.
+    {
+        var cyc_diag: partial.Diag = .{};
+        const cycle: anyerror![]u8 = blk: {
+            const cand = partial.replaceDisowned(arena, format, live, paths, body, &cyc_diag) catch |e| break :blk e;
+            partial.verifyDisownInvariant(arena, format, live, cand, paths, body, &doc, &cyc_diag) catch |e| break :blk e;
+            break :blk cand;
+        };
+        _ = cycle catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{
+                .outcome = .extract_failed,
+                .detail = try std.fmt.allocPrint(arena, "extracted source does not re-apply cleanly: {s}", .{cyc_diag.text()}),
+            },
+        };
+    }
+
     if (std.fs.path.dirname(src_path)) |parent| {
         Io.Dir.cwd().createDirPath(io, parent) catch {};
     }

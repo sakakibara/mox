@@ -147,7 +147,6 @@ fn applyPass(
             try ctx.err.writeAll("Run 'mox init' first.\n");
             return 1;
         },
-        error.OwnOnUnstructuredTarget,
         error.OwnOnSymlink,
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
@@ -199,6 +198,14 @@ fn applyPass(
     var gen_states: std.ArrayList(GenState) = .empty;
 
     for (files) |file| {
+        // A head declaration the walk could not honor is this file's error
+        // alone; everything else still applies.
+        if (file.head_error.len > 0) {
+            try ctx.err.print("  ERROR   {s} ({s})\n", .{ file.live_path, file.head_error });
+            counts.fail += 1;
+            continue;
+        }
+
         // A GENERATOR (`for ... into`) fans out to N files instead of writing
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are

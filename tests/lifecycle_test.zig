@@ -1260,6 +1260,30 @@ test "add --disown: the live file minus the program's spans becomes the source, 
     try std.testing.expectEqualStrings(live_content, try read(io, a, live));
 }
 
+test "add --disown: an extraction that cannot re-apply is refused with nothing written" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // The whole live file is the disowned subtree: the complement is empty,
+    // and an indented block span cannot be re-applied into an empty
+    // document. The add-time round-trip gate must refuse UP FRONT instead
+    // of writing a source that fails on every later apply.
+    try writeRepo(io, &tmp, "home/data.yaml", "survey:\n  state: 1\n");
+    const live = try h.liveOf("data.yaml");
+
+    const r = try h.run(&.{ "mox", "add", "--disown", "survey.state", live });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "does not re-apply cleanly") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("data.yaml")));
+    // The live file is untouched.
+    try std.testing.expectEqualStrings("survey:\n  state: 1\n", try read(io, a, live));
+}
+
 test "add --disown: a declared path absent from the live file is an error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

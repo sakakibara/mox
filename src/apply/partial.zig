@@ -2503,9 +2503,11 @@ fn valueHasMask(v: AnyValue) bool {
 // live to candidate, and (c) the candidate minus the disowned spans equals
 // the composed text byte-for-byte.
 
-/// D2 inverted: the first declared path the composed document populates
+/// D2 inverted: the first declared path the composed document contradicts
 /// (spelled), or null. Composed content under a disowned path can never be
-/// asserted; refusing names the contradiction.
+/// asserted, and a NON-container value at a strict ancestor pins the path
+/// shut -- its live content could never be spliced back. Both refuse here,
+/// at classification, never after a clean adoption at splice time.
 pub fn populatedDisownPath(
     arena: std.mem.Allocator,
     owned: *const OwnedDoc,
@@ -2513,6 +2515,17 @@ pub fn populatedDisownPath(
 ) error{OutOfMemory}!?[]const u8 {
     for (disown_paths) |p| {
         if (owned.subtreeAt(p.segments) != null) return try diagPathSpell(arena, p.segments);
+        var i: usize = 1;
+        while (i < p.segments.len) : (i += 1) {
+            const anc = owned.subtreeAt(p.segments[0..i]) orelse break;
+            const is_container = switch (anc) {
+                .toml => |tv| tv == .table,
+                .json => |jv| jv == .object,
+                .yaml => |yv| yv == .map,
+                .ini => |iv| iv == .section,
+            };
+            if (!is_container) return try diagPathSpell(arena, p.segments);
+        }
     }
     return null;
 }
@@ -4020,6 +4033,23 @@ test "disown D2: a composed document populating a disowned path is named" {
     try testing.expectEqualStrings("model", (try populatedDisownPath(arena, &doc, paths)).?);
     const clean = try OwnedDoc.parse(arena, .json, "{\"theme\": \"dark\"}");
     try testing.expect(try populatedDisownPath(arena, &clean, paths) == null);
+}
+
+test "disown D2: a non-container ancestor of a disowned path refuses at classification" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nested = try testOwn(arena, &.{"survey.state"});
+    // survey pinned to a scalar: the disowned leaf could never be spliced
+    // back, so the contradiction surfaces at D2, never at splice time.
+    const pinned = try OwnedDoc.parse(arena, .json, "{\"theme\": \"dark\", \"survey\": 5}");
+    try testing.expectEqualStrings("survey.state", (try populatedDisownPath(arena, &pinned, nested)).?);
+    // A container ancestor holding OWNED siblings is the normal shape.
+    const sibling = try OwnedDoc.parse(arena, .json, "{\"survey\": {\"kept\": 1}}");
+    try testing.expect(try populatedDisownPath(arena, &sibling, nested) == null);
+    // An unpopulated ancestor is fine: the chain is created at splice time.
+    const absent = try OwnedDoc.parse(arena, .json, "{\"theme\": \"dark\"}");
+    try testing.expect(try populatedDisownPath(arena, &absent, nested) == null);
 }
 
 test "withoutSubtrees: removes declared subtrees and prunes emptied framing" {
