@@ -33,6 +33,7 @@ const ini = @import("ini");
 
 const format_mod = @import("../source/format.zig");
 const tree_mod = @import("../source/tree.zig");
+const provmap = @import("../provenance/map.zig");
 
 pub const Format = format_mod.Format;
 pub const OwnPath = tree_mod.OwnPath;
@@ -369,6 +370,47 @@ pub fn verifyInvariant(
 
 fn verifyParseFail(e: anyerror) VerifyError {
     return if (e == error.OutOfMemory) error.OutOfMemory else error.CandidateUnparseable;
+}
+
+/// Which declared paths hold a resolved secret, from the composed TEXT's
+/// line provenance: a path is secret-bearing when any line of its span in
+/// the composed text is covered by a `.secret` segment. Returns a flag
+/// slice parallel to `own_paths`. Line indices are the provenance map's
+/// 0-based logical lines.
+pub fn secretPathFlags(
+    arena: std.mem.Allocator,
+    format: Format,
+    composed: []const u8,
+    own_paths: []const OwnPath,
+    segments: []const provmap.Segment,
+    diag: ?*Diag,
+) LocateError![]bool {
+    const flags = try arena.alloc(bool, own_paths.len);
+    @memset(flags, false);
+    if (!provmap.hasSecret(segments)) return flags;
+
+    const loc = try locateSpans(arena, format, composed, own_paths, diag);
+
+    // Byte offset where each logical line starts.
+    var starts: std.ArrayList(usize) = .empty;
+    try starts.append(arena, 0);
+    for (composed, 0..) |c, i| {
+        if (c == '\n' and i + 1 < composed.len) try starts.append(arena, i + 1);
+    }
+
+    for (segments) |s| {
+        if (s.origin != .secret) continue;
+        const first: usize = s.out_start;
+        if (first >= starts.items.len) continue;
+        const past: usize = s.out_start + s.out_len;
+        const byte_start = starts.items[first];
+        const byte_end = if (past < starts.items.len) starts.items[past] else composed.len;
+        for (loc.spans, flags) |span_opt, *flag| {
+            const span = span_opt orelse continue;
+            if (span.start < byte_end and byte_start < span.end) flag.* = true;
+        }
+    }
+    return flags;
 }
 
 fn ensureTrailingNewline(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -2347,4 +2389,34 @@ test "ini: key entry appends into its existing section" {
 
 test "gitconfig: an entry on a section header line is refused" {
     try testLocateError(.gitconfig, "[alias] st = status\n", &.{"alias.st"}, error.OwnedPathUnaddressable);
+}
+
+test "secretPathFlags: a secret line inside one owned table flags exactly that path" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const composed =
+        \\[plain]
+        \\x = "v"
+        \\
+        \\[api]
+        \\token = "resolved-secret"
+        \\
+    ;
+    const paths = try testOwn(arena, &.{ "plain", "api" });
+    // Line 4 (0-based) is `token = ...`, marked secret by compose.
+    const segments = [_]provmap.Segment{
+        .{ .out_start = 0, .out_len = 4, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 4, .out_len = 1, .origin = .secret },
+    };
+    const flags = try secretPathFlags(arena, .toml, composed, paths, &segments, null);
+    try testing.expect(!flags[0]);
+    try testing.expect(flags[1]);
+
+    // No secret segment: nothing flagged, no locate work needed.
+    const none = [_]provmap.Segment{
+        .{ .out_start = 0, .out_len = 5, .origin = .{ .base = .{ .line = 1 } } },
+    };
+    const clean = try secretPathFlags(arena, .toml, composed, paths, &none, null);
+    try testing.expect(!clean[0] and !clean[1]);
 }

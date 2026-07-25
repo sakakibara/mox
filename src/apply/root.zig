@@ -6,6 +6,7 @@ pub const snapshot = @import("snapshot.zig");
 pub const exact = @import("exact.zig");
 pub const generated = @import("generated.zig");
 pub const partial = @import("partial.zig");
+pub const canonical = @import("canonical.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -17,4 +18,5 @@ test {
     _ = exact;
     _ = generated;
     _ = partial;
+    _ = canonical;
 }

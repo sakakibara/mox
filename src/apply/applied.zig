@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const json = @import("json");
 
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -108,6 +109,116 @@ fn contentPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []con
     return std.fs.path.join(arena, &.{ state_dir, "applied-content", &name });
 }
 
+/// Last-applied state for a PARTIALLY owned live file. The whole-file
+/// hash/content records above never exist for a partial target; drift there
+/// is decided against the canonical serialization of the owned subtrees
+/// stored here (or its hash when a secret resolved into the owned content --
+/// cleartext is never cached, mirroring the whole-file rule).
+pub const OwnedRecord = struct {
+    /// Canonical owned serialization at record time; null when `secret`.
+    canonical: ?[]const u8,
+    /// sha256 hex of the canonical serialization; set when `secret`.
+    canonical_hash: ?[hash_hex_len]u8,
+    /// True when any owned path's composed value resolved a secret.
+    secret: bool,
+    /// The `own` declaration in force at record time, raw as written.
+    own_paths: []const []const u8,
+    /// The declared paths whose composed value resolved a secret, raw.
+    secret_paths: []const []const u8,
+};
+
+const owned_version: i128 = 1;
+
+/// Record the owned state mox just asserted at `live_path`, under
+/// `<state>/applied-owned/`.
+pub fn recordOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, rec: OwnedRecord) !void {
+    const path = try ownedPath(arena, state_dir, live_path);
+    if (std.fs.path.dirname(path)) |parent| {
+        try Io.Dir.cwd().createDirPath(io, parent);
+    }
+
+    var root: json.ObjectMap = .empty;
+    try root.put(arena, "v", .{ .integer = owned_version });
+    try root.put(arena, "live_path", .{ .string = live_path });
+    try root.put(arena, "secret", .{ .bool = rec.secret });
+    if (rec.secret) {
+        const hash = rec.canonical_hash orelse return error.MissingCanonicalHash;
+        try root.put(arena, "canonical_sha256", .{ .string = try arena.dupe(u8, &hash) });
+    } else {
+        try root.put(arena, "canonical", .{ .string = rec.canonical orelse return error.MissingCanonical });
+    }
+    try root.put(arena, "own_paths", .{ .array = try jsonStringArray(arena, rec.own_paths) });
+    try root.put(arena, "secret_paths", .{ .array = try jsonStringArray(arena, rec.secret_paths) });
+
+    var aw: Io.Writer.Allocating = .init(arena);
+    try json.encode(&aw.writer, .{ .object = root }, .{ .indent = 2 });
+    try aw.writer.writeByte('\n');
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
+}
+
+/// Read the owned record for `live_path`, or null when this path has never
+/// been recorded. A malformed record reads as absent (conservative: absent
+/// plus differing live content classifies as drift, never as clean).
+pub fn readOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?OwnedRecord {
+    const path = try ownedPath(arena, state_dir, live_path);
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    const v = json.parse(arena, bytes, .{}) catch return null;
+    if (v != .object) return null;
+    const secret = switch (v.get("secret") orelse return null) {
+        .bool => |b| b,
+        else => return null,
+    };
+    const own_list = (try stringArrayOf(arena, v.get("own_paths"))) orelse return null;
+    const secret_list = (try stringArrayOf(arena, v.get("secret_paths"))) orelse return null;
+    var rec: OwnedRecord = .{
+        .canonical = null,
+        .canonical_hash = null,
+        .secret = secret,
+        .own_paths = own_list,
+        .secret_paths = secret_list,
+    };
+    if (secret) {
+        const hex = stringOf(v.get("canonical_sha256")) orelse return null;
+        if (hex.len != hash_hex_len) return null;
+        var hash: [hash_hex_len]u8 = undefined;
+        @memcpy(&hash, hex);
+        rec.canonical_hash = hash;
+    } else {
+        rec.canonical = stringOf(v.get("canonical")) orelse return null;
+    }
+    return rec;
+}
+
+fn jsonStringArray(arena: std.mem.Allocator, items: []const []const u8) ![]json.Value {
+    const out = try arena.alloc(json.Value, items.len);
+    for (items, out) |s, *o| o.* = .{ .string = s };
+    return out;
+}
+
+fn stringOf(v: ?json.Value) ?[]const u8 {
+    const val = v orelse return null;
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn stringArrayOf(arena: std.mem.Allocator, v: ?json.Value) !?[]const []const u8 {
+    const val = v orelse return null;
+    if (val != .array) return null;
+    const out = try arena.alloc([]const u8, val.array.len);
+    for (val.array, out) |elem, *o| o.* = stringOf(elem) orelse return null;
+    return out;
+}
+
+fn ownedPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const u8) ![]u8 {
+    const name = contentHashHex(live_path);
+    return std.fs.path.join(arena, &.{ state_dir, "applied-owned", &name });
+}
+
 const max_symlink_target_bytes: usize = 64 * 1024;
 
 /// Record the symlink `target` mox last materialized at `live_path`, under
@@ -137,13 +248,15 @@ fn symlinkPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []con
 }
 
 /// Delete every last-applied record for `live_path` (content hash, content
-/// cache, and symlink target). Best-effort: an absent record is not an error.
-/// Used when mox stops tracking a path (a generator leaf pruned away) so a
-/// future unrelated file at the same path is not mistaken for mox-written.
+/// cache, symlink target, and owned record). Best-effort: an absent record is
+/// not an error. Used when mox stops tracking a path (a generator leaf pruned
+/// away) so a future unrelated file at the same path is not mistaken for
+/// mox-written.
 pub fn forget(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !void {
     Io.Dir.cwd().deleteFile(io, try recordPath(arena, state_dir, live_path)) catch {};
     Io.Dir.cwd().deleteFile(io, try contentPath(arena, state_dir, live_path)) catch {};
     Io.Dir.cwd().deleteFile(io, try symlinkPath(arena, state_dir, live_path)) catch {};
+    Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
 }
 
 /// What currently occupies a live path, inspected without following symlinks.
@@ -237,6 +350,71 @@ test "recordContent then readContent round-trips the exact bytes" {
     try std.testing.expectEqualStrings(content, got.?);
     // A path never recorded reads back null.
     try std.testing.expect(try readContent(a, io, state_dir, "/home/me/.other") == null);
+}
+
+test "recordOwned then readOwned round-trips a cleartext record, forget removes it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try stateDirAbs(a, io, &tmp.sub_path);
+
+    const canon = "= tui.keymap.global\n  submit = \"enter\"\n";
+    try recordOwned(a, io, state_dir, "/home/me/.codex/config.toml", .{
+        .canonical = canon,
+        .canonical_hash = null,
+        .secret = false,
+        .own_paths = &.{ "tui.keymap.global", "projects.\"/tmp/x\"" },
+        .secret_paths = &.{},
+    });
+
+    const got = (try readOwned(a, io, state_dir, "/home/me/.codex/config.toml")).?;
+    try std.testing.expect(!got.secret);
+    try std.testing.expectEqualStrings(canon, got.canonical.?);
+    try std.testing.expect(got.canonical_hash == null);
+    try std.testing.expectEqual(@as(usize, 2), got.own_paths.len);
+    try std.testing.expectEqualStrings("tui.keymap.global", got.own_paths[0]);
+    try std.testing.expectEqualStrings("projects.\"/tmp/x\"", got.own_paths[1]);
+    try std.testing.expectEqual(@as(usize, 0), got.secret_paths.len);
+    // A path never recorded reads back null.
+    try std.testing.expect(try readOwned(a, io, state_dir, "/home/me/.other") == null);
+
+    try forget(a, io, state_dir, "/home/me/.codex/config.toml");
+    try std.testing.expect(try readOwned(a, io, state_dir, "/home/me/.codex/config.toml") == null);
+}
+
+test "recordOwned: a secret-bearing record stores the hash and never the canonical text" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try stateDirAbs(a, io, &tmp.sub_path);
+
+    const canon = "= api\n  token = \"cleartext-secret\"\n";
+    try recordOwned(a, io, state_dir, "/home/me/app.toml", .{
+        .canonical = null,
+        .canonical_hash = contentHashHex(canon),
+        .secret = true,
+        .own_paths = &.{"api"},
+        .secret_paths = &.{"api"},
+    });
+
+    const got = (try readOwned(a, io, state_dir, "/home/me/app.toml")).?;
+    try std.testing.expect(got.secret);
+    try std.testing.expect(got.canonical == null);
+    const expected = contentHashHex(canon);
+    try std.testing.expectEqualStrings(&expected, &got.canonical_hash.?);
+    try std.testing.expectEqual(@as(usize, 1), got.secret_paths.len);
+    try std.testing.expectEqualStrings("api", got.secret_paths[0]);
+
+    // The stored record file itself never holds the canonical cleartext.
+    const rec_file = try ownedPath(a, state_dir, "/home/me/app.toml");
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, rec_file, a, .limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "cleartext-secret") == null);
 }
 
 test "recordSymlink then readSymlink round-trips the target" {
