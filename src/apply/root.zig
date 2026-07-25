@@ -5,6 +5,7 @@ pub const applied = @import("applied.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const exact = @import("exact.zig");
 pub const generated = @import("generated.zig");
+pub const partial = @import("partial.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -15,4 +16,5 @@ test {
     _ = snapshot;
     _ = exact;
     _ = generated;
+    _ = partial;
 }
