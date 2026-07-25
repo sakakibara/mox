@@ -362,6 +362,34 @@ test "walk: a directive-looking head on an unstructured target is a per-file err
     }
 }
 
+test "walk: the head read is bounded and a large base still declares ownership" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A base well past `max_head_bytes`: the walk reads only the leading
+    // region, so the declaration is recognized without loading the file.
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(a, "# mox: own tui\n[tui]\nk = 1\n\n[filler]\n");
+    var i: usize = 0;
+    while (big.items.len < mox.source.tree.max_head_bytes + 4096) : (i += 1) {
+        try big.print(a, "x{d} = {d}\n", .{ i, i });
+    }
+    try writeFile(io, tmp.dir, "src/big.toml", big.items);
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    const result = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    try std.testing.expectEqual(mox.source.head.Ownership.own, result.files[0].ownership);
+    try std.testing.expectEqual(@as(usize, 1), result.files[0].own_paths.len);
+}
+
 test "walk: own combined with seed_once or symlink is rejected" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

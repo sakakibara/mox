@@ -131,7 +131,9 @@ pub fn addFile(
 /// and a whole-file add over it must not proceed.
 fn sourceDeclaresOwnership(arena: std.mem.Allocator, io: Io, src_path: []const u8, key: []const u8) !bool {
     const format = mox.source.format.formatOfPath(key) orelse return false;
-    const content = Io.Dir.cwd().readFileAlloc(io, src_path, arena, .limited(64 * 1024 * 1024)) catch return false;
+    // Bounded like the walk's head read: a declaration lives in the leading
+    // block, never past `max_head_bytes`.
+    const content = mox.source.tree.readHead(arena, io, Io.Dir.cwd(), src_path) orelse return false;
     const parsed = mox.source.head.parse(arena, content, mox.source.tree.markerForFormat(format)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return true,

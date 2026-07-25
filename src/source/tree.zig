@@ -12,9 +12,13 @@ const dsl = @import("../dsl/root.zig");
 
 const Io = std.Io;
 
-/// Same base-file size cap the composer uses, so the generator probe sees
-/// exactly the files compose would.
-const max_base_bytes: usize = 64 * 1024 * 1024;
+/// Head reads are bounded to the leading region: only a base file's leading
+/// comment block carries head directives, so the walk reads at most this
+/// many bytes per base instead of whole files. A leading block exceeding the
+/// bound is unsupported -- a directive past it is not recognized -- which at
+/// 64KiB of leading comments is absurd in practice. The generator probe on
+/// an ownership-declaring base sees the same bounded prefix.
+pub const max_head_bytes: usize = 64 * 1024;
 
 /// An axis tuple like `os=darwin+profile=work`. Each entry is a (name, value) pair.
 pub const AxisTuple = struct {
@@ -491,7 +495,10 @@ pub fn markerForFormat(format: format_mod.Format) []const u8 {
 }
 
 /// Markers probed on an unstructured base, so a head declaration there is a
-/// walk error rather than silently inert content.
+/// walk error rather than silently inert content. Compose is loud only for
+/// a declaration in the file's own effective marker (the DSL rejects the
+/// unknown verb); one in any other spelling passes through silently into
+/// the live file, which is why this probe exists.
 const probe_markers = [_][]const u8{ "#", "//", ";", "--" };
 
 /// Read and validate a base file's head declaration. No directives yields an
@@ -507,7 +514,7 @@ fn headChecked(
     attrs: *const attributes.Attributes,
     diag: ?*Diag,
 ) !Decl {
-    const content = base.dir.readFileAlloc(io, base.name, arena, .limited(max_base_bytes)) catch return .{};
+    const content = readHead(arena, io, base.dir, base.name) orelse return .{};
 
     const format = format_mod.formatOfPath(target_key) orelse {
         // Directives on an unstructured target cannot take effect. A prose
@@ -580,6 +587,19 @@ fn headChecked(
 
 fn setDiag(diag: ?*Diag, text: []const u8) void {
     if (diag) |d| d.set(text);
+}
+
+/// Read at most `max_head_bytes` of `name` under `dir` -- the leading region
+/// a head declaration can occupy. Null when the file cannot be read (the
+/// caller treats that as no declaration; compose reports the real error).
+pub fn readHead(arena: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) ?[]const u8 {
+    var f = dir.openFile(io, name, .{}) catch return null;
+    defer f.close(io);
+    const buf = arena.alloc(u8, max_head_bytes) catch return null;
+    var reader_buf: [4096]u8 = undefined;
+    var reader = f.reader(io, &reader_buf);
+    const n = reader.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
 }
 
 /// True when the base content is a generator (a `for ... into` DSL loop): it
