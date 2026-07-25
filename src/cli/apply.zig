@@ -313,6 +313,7 @@ fn applyPass(
                     .force = force,
                     .dry_run = dry_run,
                     .skip_scripts = skip_scripts,
+                    .resolver = resolver_opt,
                 }, &counts, &snapshotted);
             } else {
                 try applyRegularFile(ctx, .{
@@ -546,6 +547,59 @@ const DriftResolver = struct {
         }
     }
 
+    /// Partial-file variant of `ask`: `[d]` shows the pre-rendered owned
+    /// canonical diff, and on a secret-bearing record `[c]` is refused inline
+    /// (commit would only skip the file later) and the prompt re-asks.
+    fn askOwned(
+        self: *DriftResolver,
+        ctx: *app.Ctx,
+        live_path: []const u8,
+        drift_path: []const u8,
+        diff_text: []const u8,
+        refuse_commit: bool,
+    ) !DriftDecision {
+        if (self.sticky) |d| return d;
+        try ctx.err.print("  DRIFT   {s} (owned path {s} changed)\n", .{ live_path, drift_path });
+        while (true) {
+            const line = try commit_mod.legend(self.arena, &drift_choices, 3, self.sty);
+            switch (try prompt.ask(.interactive, &drift_choices, 3, line, self.input, ctx.out)) {
+                .chosen => |i| switch (i) {
+                    0 => return .overwrite,
+                    1 => {
+                        if (refuse_commit) {
+                            try ctx.out.print("  cannot commit {s} (contains a secret; edit its source directly)\n", .{live_path});
+                            continue;
+                        }
+                        try self.queued.append(self.arena, live_path);
+                        return .commit;
+                    },
+                    2 => {
+                        if (diff_text.len == 0) {
+                            try ctx.out.writeAll("  (no visible difference; the owned changes are under secret paths)\n");
+                        } else {
+                            try ctx.out.writeAll(diff_text);
+                        }
+                        continue;
+                    },
+                    3 => return .skip,
+                    4 => {
+                        self.sticky = .overwrite;
+                        return .overwrite;
+                    },
+                    else => {
+                        self.sticky = .skip;
+                        return .skip;
+                    },
+                },
+                .abort, .abort_strict => {
+                    self.aborted = true;
+                    return .quit;
+                },
+                .report_only => return .skip,
+            }
+        }
+    }
+
     /// The same rendering `mox diff` produces, so a secret resolved into the
     /// composed bytes is redacted here exactly as it is there.
     fn showDiff(
@@ -711,6 +765,9 @@ const PartialInput = struct {
     force: bool,
     dry_run: bool,
     skip_scripts: bool,
+    /// Non-null on an interactive run: owned drift is resolved by asking.
+    /// Null keeps the non-interactive contract (skip and report).
+    resolver: ?*DriftResolver = null,
 };
 
 /// Run a partial file's `check` hook (D7) against `candidate`, materialized
@@ -855,9 +912,30 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         try owned_mod.classify(ctx.alloc, &owned, &live_doc, own_paths, record, record_paths);
 
     if (class == .drift and !in.force) {
-        counts.drift += 1;
-        try ctx.err.print("  DRIFT   {s} (owned path {s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, class.drift });
-        return;
+        const resolver = in.resolver orelse {
+            counts.drift += 1;
+            try ctx.err.print("  DRIFT   {s} (owned path {s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, class.drift });
+            return;
+        };
+        // A secret-bearing record has no cleartext for commit to diff, so
+        // `[c]` is refused inline rather than queued to be skipped later.
+        const refuse_commit = record != null and record.?.secret;
+        const diff_text = try ownedDriftDiff(ctx, resolver.sty, live_path, &owned, &live_doc, own_paths, record, secret_flags);
+        switch (try resolver.askOwned(ctx, live_path, class.drift, diff_text, refuse_commit)) {
+            // Falls through to the write below, exactly as --force does for
+            // this file alone.
+            .overwrite => counts.overwritten += 1,
+            .commit => {
+                counts.queued += 1;
+                try ctx.out.print("  queued {s} (will commit the live edit)\n", .{live_path});
+                return;
+            },
+            .quit => return,
+            .skip => {
+                counts.drift += 1;
+                return;
+            },
+        }
     }
     // Live content already at the composed state (or a fresh target): the
     // drift rule is moot, exactly as whole-file `unchanged` precedes it.
@@ -971,6 +1049,48 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     try writeOwnedRecord(ctx, live_path, composed_canon, any_secret, own_paths, secret_raws.items);
     counts.ok += 1;
     try ctx.out.print("  {s} {s}\n", .{ if (live == null) "created" else "wrote", live_path });
+}
+
+/// The `[d]` rendering for a partial file's drift prompt: canonical
+/// live-owned vs canonical composed-owned, masked per the union-secret rule
+/// (the record's secret set plus any path the current compose resolved a
+/// secret into) -- the same view `mox diff` shows for the file.
+fn ownedDriftDiff(
+    ctx: *app.Ctx,
+    sty: style.Style,
+    live_path: []const u8,
+    owned: *const mox.apply.partial.OwnedDoc,
+    live_doc: *const mox.apply.partial.OwnedDoc,
+    own_paths: []const mox.source.tree.OwnPath,
+    record: ?mox.apply.applied.OwnedRecord,
+    secret_flags: []const bool,
+) ![]const u8 {
+    const canon_mod = mox.apply.canonical;
+    const owned_mod = mox.apply.owned;
+    var secret_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
+    if (record) |r| try secret_paths.appendSlice(ctx.alloc, try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths));
+    for (own_paths, secret_flags) |p, flagged| {
+        if (flagged and !owned_mod.pathInList(p.segments, secret_paths.items)) {
+            try secret_paths.append(ctx.alloc, p);
+        }
+    }
+    const spelled = try ctx.alloc.alloc([]const u8, secret_paths.items.len);
+    for (secret_paths.items, spelled) |p, *s| s.* = try canon_mod.pathSpell(ctx.alloc, p.segments);
+
+    const a_text = try diff_mod.maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, live_doc, own_paths), spelled);
+    const b_text = try diff_mod.maskOwnedSections(ctx.alloc, try canon_mod.canonicalOwned(ctx.alloc, owned, own_paths), spelled);
+    if (std.mem.eql(u8, a_text, b_text)) return "";
+
+    const a_lines = try mox.diff.lines.splitLines(ctx.alloc, a_text);
+    const b_lines = try mox.diff.lines.splitLines(ctx.alloc, b_text);
+    const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
+        error.TooManyLines => return "",
+        else => return e,
+    };
+    if (hunks.len == 0) return "";
+    // Both sides are already masked; no per-line secret info remains.
+    const none: []const bool = &.{};
+    return diff_mod.renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, none, none, sty);
 }
 
 fn writeOwnedRecord(

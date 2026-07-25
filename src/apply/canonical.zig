@@ -30,6 +30,7 @@ const yaml = @import("yaml");
 const ini = @import("ini");
 
 const partial = @import("partial.zig");
+const keypath = @import("../source/keypath.zig");
 
 pub const OwnedDoc = partial.OwnedDoc;
 pub const AnyValue = partial.AnyValue;
@@ -81,6 +82,184 @@ pub fn sectionOf(blob: []const u8, spelled: []const u8) ?[]const u8 {
         start = line_end + 1;
     }
     return null;
+}
+
+/// Structural view of a canonical blob, parsed back from the pinned text:
+/// containers keyed by DECODED segment, leaves holding the pinned inline
+/// rendering. Commit diffs two canonical blobs through this per key; values
+/// re-enter the format libs from the live document, never from this text.
+pub const Node = struct {
+    /// Inline text when this node is a scalar leaf; null for a container.
+    leaf: ?[]const u8,
+    /// Container children; empty for a leaf and for an empty container.
+    entries: []const Entry,
+
+    pub const Entry = struct { key: []const u8, node: Node };
+
+    pub fn find(self: Node, key: []const u8) ?Node {
+        for (self.entries) |e| {
+            if (std.mem.eql(u8, e.key, key)) return e.node;
+        }
+        return null;
+    }
+};
+
+pub const TreeError = error{ OutOfMemory, Malformed };
+
+/// Parse a canonical blob (or any concatenation of its sections) back into
+/// one tree rooted at the document. Section paths nest into containers, so a
+/// section `= a.b` contributes the subtree `a` -> `b`. The grammar is the
+/// pinned rendering above and nothing more; any other shape is Malformed.
+pub fn parseTree(arena: std.mem.Allocator, blob: []const u8) TreeError!Node {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, blob, '\n');
+    while (it.next()) |line| try lines.append(arena, line);
+    // A trailing newline produces one empty phantom line.
+    while (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) _ = lines.pop();
+
+    var root: BNode = .{};
+    var i: usize = 0;
+    while (i < lines.items.len) {
+        const line = lines.items[i];
+        if (line.len < 3 or !std.mem.eql(u8, line[0..2], "= ")) return error.Malformed;
+        const segs = keypath.parse(arena, line[2..]) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Malformed,
+        };
+        i += 1;
+        const start = i;
+        while (i < lines.items.len and !std.mem.startsWith(u8, lines.items[i], "= ")) i += 1;
+        const node = try parseBlock(arena, lines.items[start..i], 1);
+        var cur = &root;
+        for (segs[0 .. segs.len - 1]) |seg| cur = try bChildContainer(arena, cur, seg);
+        if (bFind(cur, segs[segs.len - 1]) != null) return error.Malformed;
+        const leaf_node = try arena.create(BNode);
+        leaf_node.* = node;
+        try cur.entries.append(arena, .{ .key = segs[segs.len - 1], .node = leaf_node });
+    }
+    return bFinalize(arena, &root);
+}
+
+const BNode = struct {
+    leaf: ?[]const u8 = null,
+    entries: std.ArrayList(BEntry) = .empty,
+};
+const BEntry = struct { key: []const u8, node: *BNode };
+
+fn bFind(n: *BNode, key: []const u8) ?*BNode {
+    for (n.entries.items) |e| {
+        if (std.mem.eql(u8, e.key, key)) return e.node;
+    }
+    return null;
+}
+
+fn bChildContainer(arena: std.mem.Allocator, n: *BNode, key: []const u8) TreeError!*BNode {
+    if (bFind(n, key)) |child| {
+        if (child.leaf != null) return error.Malformed;
+        return child;
+    }
+    const child = try arena.create(BNode);
+    child.* = .{};
+    try n.entries.append(arena, .{ .key = key, .node = child });
+    return child;
+}
+
+fn bFinalize(arena: std.mem.Allocator, n: *const BNode) TreeError!Node {
+    const out = try arena.alloc(Node.Entry, n.entries.items.len);
+    for (n.entries.items, out) |e, *o| o.* = .{ .key = e.key, .node = try bFinalize(arena, e.node) };
+    return .{ .leaf = n.leaf, .entries = out };
+}
+
+/// One spelled key token at the start of `rest`, or null when `rest` does not
+/// begin with a bare or basic-quoted key.
+const Token = struct { spell: []const u8, rest: []const u8 };
+
+fn scanToken(rest: []const u8) ?Token {
+    if (rest.len == 0) return null;
+    if (rest[0] == '"') {
+        var i: usize = 1;
+        while (i < rest.len) : (i += 1) {
+            if (rest[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (rest[i] == '"') return .{ .spell = rest[0 .. i + 1], .rest = rest[i + 1 ..] };
+        }
+        return null;
+    }
+    var i: usize = 0;
+    while (i < rest.len and isBareKey(rest[i .. i + 1])) i += 1;
+    if (i == 0) return null;
+    return .{ .spell = rest[0..i], .rest = rest[i..] };
+}
+
+/// Decode one spelled key back to its raw segment. The spell was produced by
+/// `keySpell`, whose quoted form is exactly the one-segment key-path grammar.
+fn spellDecode(arena: std.mem.Allocator, spell: []const u8) TreeError![]const u8 {
+    const segs = keypath.parse(arena, spell) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Malformed,
+    };
+    if (segs.len != 1) return error.Malformed;
+    return segs[0];
+}
+
+fn leadingSpaces(line: []const u8) usize {
+    var n: usize = 0;
+    while (n < line.len and line[n] == ' ') n += 1;
+    return n;
+}
+
+/// Parse one section body (or nested block): either a single scalar line or
+/// a run of `key = value` / `key:` / `key: {}` entries at `depth`.
+fn parseBlock(arena: std.mem.Allocator, lines: []const []const u8, depth: usize) TreeError!BNode {
+    const width = depth * 2;
+    if (lines.len == 0) return error.Malformed;
+    if (leadingSpaces(lines[0]) != width) return error.Malformed;
+
+    const first = lines[0][width..];
+    if (std.mem.eql(u8, first, "{}")) {
+        if (lines.len != 1) return error.Malformed;
+        return .{};
+    }
+    const first_tok = scanToken(first);
+    const is_entries = if (first_tok) |t|
+        std.mem.startsWith(u8, t.rest, " = ") or std.mem.eql(u8, t.rest, ":") or std.mem.eql(u8, t.rest, ": {}")
+    else
+        false;
+    if (!is_entries) {
+        // A scalar body is always a single line.
+        if (lines.len != 1) return error.Malformed;
+        return .{ .leaf = first };
+    }
+
+    var node: BNode = .{};
+    var i: usize = 0;
+    while (i < lines.len) {
+        const line = lines[i];
+        if (leadingSpaces(line) != width) return error.Malformed;
+        const rest = line[width..];
+        const tok = scanToken(rest) orelse return error.Malformed;
+        const key = try spellDecode(arena, tok.spell);
+        if (bFind(&node, key) != null) return error.Malformed;
+        const child = try arena.create(BNode);
+        if (std.mem.startsWith(u8, tok.rest, " = ")) {
+            child.* = .{ .leaf = tok.rest[3..] };
+            i += 1;
+        } else if (std.mem.eql(u8, tok.rest, ": {}")) {
+            child.* = .{};
+            i += 1;
+        } else if (std.mem.eql(u8, tok.rest, ":")) {
+            i += 1;
+            const sub_start = i;
+            while (i < lines.len and leadingSpaces(lines[i]) > width) i += 1;
+            child.* = try parseBlock(arena, lines[sub_start..i], depth + 1);
+        } else {
+            return error.Malformed;
+        }
+        try node.entries.append(arena, .{ .key = key, .node = child });
+    }
+    return node;
 }
 
 fn pathIdxLess(paths: []const OwnPath, a: usize, b: usize) bool {
@@ -531,7 +710,6 @@ fn iniInline(arena: std.mem.Allocator, v: ini.Value) Error![]const u8 {
 // Tests
 
 const testing = std.testing;
-const keypath = @import("../source/keypath.zig");
 
 fn testPaths(arena: std.mem.Allocator, raws: []const []const u8) ![]OwnPath {
     const out = try arena.alloc(OwnPath, raws.len);
@@ -724,4 +902,53 @@ test "canonical: single-path serialization equals that path's section of the ful
     const full = try canonOf(arena, .toml, text, &.{ "a", "b" });
     const only_b = try canonOf(arena, .toml, text, &.{"b"});
     try testing.expectEqualStrings(only_b, sectionOf(full, "b").?);
+}
+
+test "parseTree: containers, scalars, quoted keys, and empty tables round-trip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text =
+        \\stray = "top"
+        \\[tui.keymap]
+        \\"a.b" = 1
+        \\empty = {}
+        \\[tui.keymap.sub]
+        \\deep = "x y"
+        \\
+    ;
+    const blob = try canonOf(arena, .toml, text, &.{ "tui.keymap", "stray" });
+    const root = try parseTree(arena, blob);
+
+    const stray = root.find("stray").?;
+    try testing.expectEqualStrings("\"top\"", stray.leaf.?);
+
+    const keymap = root.find("tui").?.find("keymap").?;
+    try testing.expect(keymap.leaf == null);
+    try testing.expectEqualStrings("1", keymap.find("a.b").?.leaf.?);
+    const empty = keymap.find("empty").?;
+    try testing.expect(empty.leaf == null);
+    try testing.expectEqual(@as(usize, 0), empty.entries.len);
+    try testing.expectEqualStrings("\"x y\"", keymap.find("sub").?.find("deep").?.leaf.?);
+}
+
+test "parseTree: a scalar section body that looks like a time is a leaf, not a container" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blob = try canonOf(arena, .toml, "[sched]\nstart = 12:30:00\narr = [1, 2]\n", &.{ "sched.start", "sched.arr" });
+    const root = try parseTree(arena, blob);
+    try testing.expectEqualStrings("12:30:00", root.find("sched").?.find("start").?.leaf.?);
+    try testing.expectEqualStrings("[1, 2]", root.find("sched").?.find("arr").?.leaf.?);
+}
+
+test "parseTree: a non-canonical blob is Malformed, never a guess" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.Malformed, parseTree(arena, "not canonical\n"));
+    try testing.expectError(error.Malformed, parseTree(arena, "= a\nno indent\n"));
+    // An empty blob is a valid empty root.
+    const empty = try parseTree(arena, "");
+    try testing.expectEqual(@as(usize, 0), empty.entries.len);
 }

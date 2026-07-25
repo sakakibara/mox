@@ -387,7 +387,7 @@ fn diffPartial(
 /// mask. The header line stays, so a section appearing or disappearing still
 /// shows; every key and value under it is hidden. Sections absent from the
 /// blob are left alone.
-fn maskOwnedSections(arena: std.mem.Allocator, blob: []const u8, spelled_paths: []const []const u8) ![]const u8 {
+pub fn maskOwnedSections(arena: std.mem.Allocator, blob: []const u8, spelled_paths: []const []const u8) ![]const u8 {
     var text: []const u8 = blob;
     for (spelled_paths) |sp| {
         const sec = mox.apply.canonical.sectionOf(text, sp) orelse continue;

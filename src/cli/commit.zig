@@ -403,9 +403,21 @@ pub fn commitImpl(
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch |e| switch (e) {
+    var walk_diag: mox.source.tree.Diag = .{};
+    const base_tree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, m_state.home, &walk_diag) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox commit: source tree not found at {s}\n", .{src_dir});
+            return 1;
+        },
+        error.OwnOnUnstructuredTarget,
+        error.OwnOnSymlink,
+        error.OwnOnSeedOnce,
+        error.OwnOnGenerator,
+        error.InvalidOwnPath,
+        => {
+            try ctx.err.print("mox commit: .mox/attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
+            });
             return 1;
         },
         else => return e,
@@ -546,6 +558,24 @@ pub fn commitImpl(
         // Seed-once files carry no applied record and are user-owned after
         // creation; there is nothing to route back to their source.
         if (file.create_once) continue;
+
+        // A partially owned file takes its own gate BEFORE the whole-file
+        // applied-record gates: those records never exist for it, and partial
+        // implies per-key routing -- the line route never applies.
+        if (file.own_paths.len > 0) {
+            switch (try processPartialFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, context.paths.state_dir, &skipped_secret)) {
+                .cont => {},
+                .abort => {
+                    aborted = true;
+                    break :files;
+                },
+                .abort_strict => {
+                    strict_abort = true;
+                    break :files;
+                },
+            }
+            continue;
+        }
 
         const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
         if (recorded == null) continue;
@@ -798,6 +828,13 @@ pub fn commitImpl(
         if (!affected[fidx] and !coupling_only[fidx]) continue;
         const space = spaces[fidx].?;
         baseline[fidx] = (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets)).per_config;
+        // A partial file's per-configuration snapshot is the CANONICAL OWNED
+        // serialization of that configuration's compose, so the guard compares
+        // owned content, never text layout. Pre-existing D2 violations are
+        // ignored here; only the post-write pass acts on them.
+        if (file.own_paths.len > 0) {
+            baseline[fidx] = (try partialPerConfig(ctx.alloc, space.configs, baseline[fidx], file)).per;
+        }
         // A sibling configuration whose source will not compose cannot be
         // verified against. Name it, the file, and why -- the guard then holds
         // it harmless (it was already broken) instead of the run dying on a
@@ -927,7 +964,21 @@ pub fn commitImpl(
                 try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
                 continue;
             }
-            const after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+            var after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+            if (file.own_paths.len > 0) {
+                const pc = try partialPerConfig(ctx.alloc, configs, after_per, file);
+                if (pc.violation) |v| {
+                    try ctx.err.print(
+                        "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
+                        .{ file.live_path, v.label, v.leaf },
+                    );
+                    mismatch = true;
+                    rolled_back[fidx] = true;
+                    try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
+                    continue;
+                }
+                after_per = pc.per;
+            }
             if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
                 try ctx.err.print(
                     "mox commit: {s}: coupled token update would change configuration {s}, which you did not choose to affect; not committed\n",
@@ -955,7 +1006,15 @@ pub fn commitImpl(
             );
             continue;
         }
-        if (!std.mem.eql(u8, composed.?, live)) {
+        // A partial file's this-machine identity check is canonical: the
+        // extracted live-owned document must equal the recomposed owned
+        // document byte-wise in canonical form. The live remainder belongs to
+        // the program and never participates.
+        const live_matches = if (file.own_paths.len == 0)
+            std.mem.eql(u8, composed.?, live)
+        else
+            partialLiveMatches(ctx.alloc, file, composed.?, live);
+        if (!live_matches) {
             mismatch = true;
             // A manual hunk and a hunk the user deliberately declined (`n`) or
             // skipped (`s`) are both DESIGNED outcomes -- the first has no safe
@@ -975,7 +1034,20 @@ pub fn commitImpl(
                 // as it would on the exact-match path below. Skipping it would
                 // disable the backstop for every mixed edit, which is precisely
                 // where a routing bug hides.
-                const after_mixed = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+                var after_mixed = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+                if (file.own_paths.len > 0) {
+                    const pc = try partialPerConfig(ctx.alloc, configs, after_mixed, file);
+                    if (pc.violation) |v| {
+                        rolled_back[fidx] = true;
+                        try restoreRouted(ctx.io, routed_orig[fidx]);
+                        try ctx.err.print(
+                            "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
+                            .{ file.live_path, v.label, v.leaf },
+                        );
+                        continue;
+                    }
+                    after_mixed = pc.per;
+                }
                 if (candidates.firstViolation(configs, baseline[fidx], after_mixed, &allowed[fidx])) |vi| {
                     rolled_back[fidx] = true;
                     try restoreRouted(ctx.io, routed_orig[fidx]);
@@ -1067,7 +1139,21 @@ pub fn commitImpl(
         }
         // No classification choice may silently change another configuration:
         // every sibling must recompose to its prior output unless allowed.
-        const after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+        var after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
+        if (file.own_paths.len > 0) {
+            const pc = try partialPerConfig(ctx.alloc, configs, after_per, file);
+            if (pc.violation) |v| {
+                mismatch = true;
+                rolled_back[fidx] = true;
+                try restoreRouted(ctx.io, routed_orig[fidx]);
+                try ctx.err.print(
+                    "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
+                    .{ file.live_path, v.label, v.leaf },
+                );
+                continue;
+            }
+            after_per = pc.per;
+        }
         if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
             mismatch = true;
             rolled_back[fidx] = true;
@@ -1078,12 +1164,18 @@ pub fn commitImpl(
             );
             continue;
         }
-        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, live);
-        // Never cache the cleartext of a secret-bearing composition.
-        if (!mox.provenance.map.hasSecret(prov2.items)) {
-            try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, live);
+        if (file.own_paths.len > 0) {
+            // The OWNED record advances; whole-file records never exist for a
+            // partial target, and partial files persist no line provenance.
+            try advanceOwnedRecord(ctx, file, composed.?, prov2.items);
+        } else {
+            try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, live);
+            // Never cache the cleartext of a secret-bearing composition.
+            if (!mox.provenance.map.hasSecret(prov2.items)) {
+                try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, live);
+            }
+            try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, prov2.items);
         }
-        try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, prov2.items);
         try ctx.out.print("  committed {s}\n", .{file.live_path});
         committed_count += 1;
     }
@@ -1117,6 +1209,92 @@ pub fn commitImpl(
         );
     }
     return if (mismatch or skipped_secret > 0) 1 else 0;
+}
+
+/// Per-configuration guard outputs for a partial file: each composed text is
+/// parsed and replaced by its canonical owned serialization, so the guard's
+/// comparisons are canonical-byte. `violation` carries the first
+/// configuration whose composed document defines a leaf outside the declared
+/// own paths (D2), with the offending leaf spelled.
+const PartialPerConfig = struct {
+    per: []const impact.ConfigOutput,
+    violation: ?struct { label: []const u8, leaf: []const u8 },
+};
+
+fn partialPerConfig(
+    arena: std.mem.Allocator,
+    configs: []const Configuration,
+    per: []const impact.ConfigOutput,
+    file: mox.source.tree.ManagedFile,
+) !PartialPerConfig {
+    const partial_mod = mox.apply.partial;
+    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const out = try arena.alloc(impact.ConfigOutput, per.len);
+    var result: PartialPerConfig = .{ .per = out, .violation = null };
+    for (per, configs, out) |src, cfg, *o| {
+        switch (src) {
+            .bytes => |b| {
+                const doc = partial_mod.OwnedDoc.parse(arena, format, b) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.OwnedUnparseable => {
+                        o.* = .{ .uncomposable = "composed output does not parse" };
+                        continue;
+                    },
+                };
+                if (result.violation == null) {
+                    if (try partial_mod.undeclaredLeaf(arena, &doc, file.own_paths)) |leaf| {
+                        result.violation = .{ .label = cfg.label, .leaf = leaf };
+                    }
+                }
+                o.* = .{ .bytes = try mox.apply.canonical.canonicalOwned(arena, &doc, file.own_paths) };
+            },
+            else => o.* = src,
+        }
+    }
+    return result;
+}
+
+/// The partial this-machine identity check: canonical live-owned equals
+/// canonical recomposed-owned over the current own paths. An unparseable
+/// side reads as a mismatch (the conservative direction).
+fn partialLiveMatches(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile, composed: []const u8, live: []const u8) bool {
+    const partial_mod = mox.apply.partial;
+    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const owned = partial_mod.OwnedDoc.parse(arena, format, composed) catch return false;
+    const live_doc = partial_mod.OwnedDoc.parse(arena, format, live) catch return false;
+    const composed_canon = mox.apply.canonical.canonicalOwned(arena, &owned, file.own_paths) catch return false;
+    const live_canon = mox.apply.canonical.canonicalOwned(arena, &live_doc, file.own_paths) catch return false;
+    return std.mem.eql(u8, live_canon, composed_canon);
+}
+
+/// Advance a partial file's OWNED record after a verified commit: canonical
+/// serialization (its hash when a secret resolved), the current own path
+/// list, and the secret path set, derived exactly as apply derives them.
+fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed: []const u8, prov_items: []const Segment) !void {
+    const context = ctx.context.?;
+    const partial_mod = mox.apply.partial;
+    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const owned = try partial_mod.OwnedDoc.parse(ctx.alloc, format, composed);
+    const canon = try mox.apply.canonical.canonicalOwned(ctx.alloc, &owned, file.own_paths);
+    var pdiag: partial_mod.Diag = .{};
+    const flags = try partial_mod.secretPathFlags(ctx.alloc, format, composed, file.own_paths, prov_items, &pdiag);
+    var any_secret = false;
+    var secret_raws: std.ArrayList([]const u8) = .empty;
+    const raws = try ctx.alloc.alloc([]const u8, file.own_paths.len);
+    for (file.own_paths, raws, flags) |p, *o, flagged| {
+        o.* = p.raw;
+        if (flagged) {
+            any_secret = true;
+            try secret_raws.append(ctx.alloc, p.raw);
+        }
+    }
+    try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, .{
+        .canonical = if (any_secret) null else canon,
+        .canonical_hash = if (any_secret) mox.apply.applied.contentHashHex(canon) else null,
+        .secret = any_secret,
+        .own_paths = raws,
+        .secret_paths = secret_raws.items,
+    });
 }
 
 /// True when `path` is the base source of a file whose write was rolled back,
@@ -1765,6 +1943,24 @@ fn processStructFile(
         return .cont;
     }
 
+    return routeStructChanges(cc, ra, file, fidx, space, format, changes);
+}
+
+/// Route a set of changed key paths into their source layers: the shared
+/// tail of the whole-file structured flow and the partial per-key flow.
+/// Each change is one prompt item with the full `[y/p/s]`/pick machinery;
+/// accepted edits are deferred to the write phase.
+fn routeStructChanges(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    space: FileSpace,
+    format: commit_struct.Format,
+    changes: []const commit_struct.KeyPathChange,
+) !HunkOutcome {
+    ra.affected[fidx] = true;
+
     const layers = structLayers(cc.arena, cc.io, file, cc.this_bindings, format) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
@@ -1844,6 +2040,300 @@ fn processStructFile(
         }
     }
     return .cont;
+}
+
+/// A partially owned file's commit gate (D9): decide committability from the
+/// owned record and the extracted live owned document, then hand the changed
+/// keys to the structured per-key routing. `last` is the record's canonical
+/// serialization and `live` the live document's, both restricted to the
+/// record-scope paths, so program activity outside the owned paths can never
+/// surface. A path newly added to `own` is per-path first contact: only
+/// apply may take ownership of its live content, so a difference there is
+/// reported, never routed.
+fn processPartialFile(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    spaces: []?FileSpace,
+    repo_dir: []const u8,
+    state_dir: []const u8,
+    skipped_secret: *usize,
+) !HunkOutcome {
+    const arena = cc.arena;
+    const partial_mod = mox.apply.partial;
+    const canon_mod = mox.apply.canonical;
+    const owned_mod = mox.apply.owned;
+    const live_path = file.live_path;
+    const own_paths = file.own_paths;
+    // The walk only attaches own_paths to structured targets.
+    const format = commit_struct.formatOfPath(file.source_base_path).?;
+
+    var prov: std.ArrayList(Segment) = .empty;
+    var cdiag: mox.compose.interp.Diag = .{};
+    const composed = mox.compose.composeFileTracked(arena, cc.io, file, cc.this_bindings, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try partialManual(cc, ra, fidx, "  manual: {s} (compose failed: {s})\n", .{ live_path, @errorName(e) });
+            return .cont;
+        },
+    };
+    // A whole-file gate off for this machine leaves the live file untouched
+    // by apply, so there is nothing to route back.
+    const bytes = composed orelse return .cont;
+
+    const owned = partial_mod.OwnedDoc.parse(arena, format, bytes) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => {
+            try partialManual(cc, ra, fidx, "  manual: {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
+            return .cont;
+        },
+    };
+    if (try partial_mod.undeclaredLeaf(arena, &owned, own_paths)) |leaf| {
+        try partialManual(cc, ra, fidx, "  manual: {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+        return .cont;
+    }
+
+    const live = Io.Dir.cwd().readFileAlloc(cc.io, live_path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return .cont,
+        else => return e,
+    };
+    const live_doc = partial_mod.OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OwnedUnparseable => {
+            try partialManual(cc, ra, fidx, "  manual: {s} could not be parsed as {s}; edit its source directly\n", .{ live_path, @tagName(format) });
+            return .cont;
+        },
+    };
+
+    const record = try mox.apply.applied.readOwned(arena, cc.io, state_dir, live_path);
+    const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(arena, r.own_paths) else &.{};
+
+    // Only owned drift is committable: clean has nothing to route, and
+    // outdated is the source moving on, resolved by apply.
+    switch (try owned_mod.classify(arena, &owned, &live_doc, own_paths, record, record_paths)) {
+        .clean, .outdated => return .cont,
+        .drift => {},
+    }
+
+    const rec = record orelse {
+        try partialManual(cc, ra, fidx, "  manual: {s} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --force' reasserts the source)\n", .{live_path});
+        return .cont;
+    };
+    if (rec.secret) {
+        // The record is a hash; there is no cleartext to diff against.
+        try cc.stdout.print("  skipped {s} (contains a secret; edit its source directly)\n", .{live_path});
+        skipped_secret.* += 1;
+        ra.pending.* = true;
+        return .cont;
+    }
+
+    // Record scope: paths in both the record-time and current own lists take
+    // the per-key diff below; a current-only path is per-path first contact.
+    var scope_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
+    for (own_paths) |p| {
+        if (owned_mod.pathInList(p.segments, record_paths)) {
+            try scope_paths.append(arena, p);
+            continue;
+        }
+        const one = [_]mox.source.tree.OwnPath{p};
+        const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
+        const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
+        if (!std.mem.eql(u8, live_sec, composed_sec)) {
+            try partialManual(cc, ra, fidx, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
+        }
+    }
+
+    var last_blob: std.ArrayList(u8) = .empty;
+    for (scope_paths.items) |p| {
+        const spelled = try canon_mod.pathSpell(arena, p.segments);
+        if (canon_mod.sectionOf(rec.canonical.?, spelled)) |sec| try last_blob.appendSlice(arena, sec);
+    }
+    const live_blob = try canon_mod.canonicalOwned(arena, &live_doc, scope_paths.items);
+    // Drift confined to first-contact paths: nothing per-key to route.
+    if (std.mem.eql(u8, last_blob.items, live_blob)) return .cont;
+
+    const diffres = ownedKeyDiff(arena, last_blob.items, live_blob, &live_doc) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unrepresentable => {
+            try partialManual(cc, ra, fidx, "  manual: {s} (a reordered array cannot be routed by key)\n", .{live_path});
+            return .cont;
+        },
+        error.Malformed => {
+            try partialManual(cc, ra, fidx, "  manual: {s} (owned record unreadable; run 'mox apply' to refresh it)\n", .{live_path});
+            return .cont;
+        },
+    };
+    for (diffres.unaddressable) |spelled| {
+        try partialManual(cc, ra, fidx, "  manual: {s} {s}: key is not addressable by a string key path\n", .{ live_path, spelled });
+    }
+    if (diffres.changes.len == 0) return .cont;
+
+    // Partial routing verifies over the repo-wide configuration space, like
+    // every structured route.
+    if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(arena, cc.io, cc.this_bindings, file, repo_dir);
+    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes);
+}
+
+fn partialManual(cc: *const ClassCtx, ra: *const RunAccum, fidx: usize, comptime fmt: []const u8, args: anytype) !void {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print(fmt, args);
+}
+
+/// A partial file's per-key changes: the canonical trees of the recorded and
+/// live owned serializations diffed key by key. Values for set changes come
+/// from the LIVE document (real format values, never re-parsed text); a
+/// changed entry that string segments cannot address (a non-string yaml key
+/// inside an owned subtree) lands in `unaddressable` instead.
+const OwnedKeyDiff = struct {
+    changes: []const commit_struct.KeyPathChange,
+    unaddressable: []const []const u8,
+};
+
+fn ownedKeyDiff(
+    arena: std.mem.Allocator,
+    last_blob: []const u8,
+    live_blob: []const u8,
+    live_doc: *const mox.apply.partial.OwnedDoc,
+) error{ OutOfMemory, Malformed, Unrepresentable }!OwnedKeyDiff {
+    const last_tree = try mox.apply.canonical.parseTree(arena, last_blob);
+    const live_tree = try mox.apply.canonical.parseTree(arena, live_blob);
+    var changes: std.ArrayList(commit_struct.KeyPathChange) = .empty;
+    var unaddressable: std.ArrayList([]const u8) = .empty;
+    try diffCanonNode(arena, &.{}, last_tree, live_tree, live_doc, &changes, &unaddressable);
+    return .{
+        .changes = try changes.toOwnedSlice(arena),
+        .unaddressable = try unaddressable.toOwnedSlice(arena),
+    };
+}
+
+fn diffCanonNode(
+    arena: std.mem.Allocator,
+    path: []const []const u8,
+    last: mox.apply.canonical.Node,
+    live: mox.apply.canonical.Node,
+    live_doc: *const mox.apply.partial.OwnedDoc,
+    changes: *std.ArrayList(commit_struct.KeyPathChange),
+    unaddressable: *std.ArrayList([]const u8),
+) error{ OutOfMemory, Malformed, Unrepresentable }!void {
+    const last_leaf = last.leaf != null;
+    const live_leaf = live.leaf != null;
+    if (!last_leaf and !live_leaf) {
+        for (last.entries) |le| {
+            const sub = try keyPathAppend(arena, path, le.key);
+            if (live.find(le.key)) |lv| {
+                try diffCanonNode(arena, sub, le.node, lv, live_doc, changes, unaddressable);
+            } else {
+                try changes.append(arena, .{ .path = sub, .new = null, .removed = true });
+            }
+        }
+        for (live.entries) |le| {
+            if (last.find(le.key) != null) continue;
+            try appendCanonSet(arena, try keyPathAppend(arena, path, le.key), live_doc, changes, unaddressable);
+        }
+        return;
+    }
+    if (last_leaf and live_leaf) {
+        if (std.mem.eql(u8, last.leaf.?, live.leaf.?)) return;
+        // A same-length array reorder has no stable key-path identity,
+        // exactly as in `changedKeyPaths`.
+        if (try canonArrayPermutation(arena, last.leaf.?, live.leaf.?)) return error.Unrepresentable;
+    }
+    // A shape change (leaf vs container) or a changed leaf: one whole-value
+    // change at this path. The root is always a container on both sides.
+    if (path.len == 0) return error.Malformed;
+    try appendCanonSet(arena, path, live_doc, changes, unaddressable);
+}
+
+fn appendCanonSet(
+    arena: std.mem.Allocator,
+    path: []const []const u8,
+    live_doc: *const mox.apply.partial.OwnedDoc,
+    changes: *std.ArrayList(commit_struct.KeyPathChange),
+    unaddressable: *std.ArrayList([]const u8),
+) error{OutOfMemory}!void {
+    const v = live_doc.subtreeAt(path) orelse {
+        try unaddressable.append(arena, try mox.apply.canonical.pathSpell(arena, path));
+        return;
+    };
+    try changes.append(arena, .{ .path = path, .new = anyToStructValue(v), .removed = false });
+}
+
+fn keyPathAppend(arena: std.mem.Allocator, prefix: []const []const u8, key: []const u8) error{OutOfMemory}![]const []const u8 {
+    const p = try arena.alloc([]const u8, prefix.len + 1);
+    @memcpy(p[0..prefix.len], prefix);
+    p[prefix.len] = key;
+    return p;
+}
+
+fn anyToStructValue(v: mox.apply.partial.AnyValue) commit_struct.Value {
+    return switch (v) {
+        .toml => |t| .{ .toml = t },
+        .json => |j| .{ .json = j },
+        .yaml => |y| .{ .yaml = y },
+        .ini => |i| .{ .ini = i },
+    };
+}
+
+/// True when both pinned inline texts are arrays holding the same element
+/// multiset in a different order.
+fn canonArrayPermutation(arena: std.mem.Allocator, a: []const u8, b: []const u8) error{OutOfMemory}!bool {
+    if (a.len < 2 or b.len < 2) return false;
+    if (a[0] != '[' or a[a.len - 1] != ']' or b[0] != '[' or b[b.len - 1] != ']') return false;
+    const ae = try canonArrayElems(arena, a);
+    const be = try canonArrayElems(arena, b);
+    if (ae.len != be.len) return false;
+    const used = try arena.alloc(bool, be.len);
+    @memset(used, false);
+    outer: for (ae) |x| {
+        for (be, 0..) |y, i| {
+            if (used[i]) continue;
+            if (std.mem.eql(u8, x, y)) {
+                used[i] = true;
+                continue :outer;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Split a pinned inline array rendering `[a, b, ...]` into its top-level
+/// element texts. Strings carry escapes and never raw brackets, so a
+/// depth/string scan is exact.
+fn canonArrayElems(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const inner = text[1 .. text.len - 1];
+    if (inner.len == 0) return out.toOwnedSlice(arena);
+    var depth: usize = 0;
+    var in_string = false;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) : (i += 1) {
+        const c = inner[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '[', '{' => depth += 1,
+            ']', '}' => depth -|= 1,
+            ',' => if (depth == 0) {
+                try out.append(arena, std.mem.trim(u8, inner[start..i], " "));
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    try out.append(arena, std.mem.trim(u8, inner[start..], " "));
+    return out.toOwnedSlice(arena);
 }
 
 /// The edits a placement of `change` at `layers[chosen]` performs: the write

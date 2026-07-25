@@ -3167,3 +3167,349 @@ test "commit: structured [y] routes to the winning overlay (gitconfig)" {
     // The base user.name is untouched.
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".gitconfig")), "base") != null);
 }
+
+// Partial ownership: a file with an `own` declaration commits per key over
+// its owned subtree, against the owned record.
+
+fn writePartialRepo(io: Io, tmp: *std.testing.TmpDir, source: []const u8, attributes: []const u8) !void {
+    try writeRepo(io, tmp, "repo/src/app.toml", source);
+    try writeRepo(io, tmp, "repo/.mox/attributes.toml", attributes);
+}
+
+test "commit partial: [y] routes an owned-key edit to the base and advances the owned record" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The program rewrites the file around the owned span.
+    const live = try h.liveOf("app.toml");
+    const program_live =
+        \\# program header
+        \\model = "gpt"
+        \\
+        \\[tui.keymap.global]
+        \\submit = "enter"
+        \\
+        \\[state]
+        \\count = 42
+        \\
+    ;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // User edits the owned key in place.
+    try editLive(io, a, live, "submit = \"enter\"", "submit = \"ctrl-enter\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled, 0 manual") != null);
+    // Program noise outside the owned paths never surfaces in commit.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "count = 42") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[state]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "count = 42") == null);
+
+    // The edit landed in the base source; the live file kept its remainder.
+    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
+    const live_after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, live_after, "count = 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live_after, "submit = \"ctrl-enter\"") != null);
+
+    // The owned record advanced: status is clean and a re-apply writes nothing.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+    const re = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), re.rc);
+    try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
+}
+
+test "commit partial: [y] routes an overlay-won owned key to the overlay layer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui]\ntheme = \"light\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\ntheme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml.d/os=darwin.toml")), "solarized") != null);
+    try std.testing.expectEqualStrings("[tui]\ntheme = \"light\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit partial: [p] promotes an owned key to base behind the repo-wide blast-radius confirm" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui]\ntheme = \"light\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\ntheme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // [p], base (candidate 1), confirm y: promoting reaches the fall-through
+    // sibling, which the confirm names with the key's before/after value.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "p\n1\ny\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=(other)") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml")), "theme = \"solarized\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml.d/os=darwin.toml")), "dark") == null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit partial: [s] leaves the key in the live file and the file uncommitted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui]\ntheme = \"light\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\ntheme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "s\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("[tui]\ntheme = \"dark\"\n", try read(io, a, try h.srcOf("app.toml.d/os=darwin.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) were declined") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+}
+
+test "commit partial: the guard rolls back a routed key when another edit changes an unallowed configuration's owned content" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // .bashrc routes a fact edit ([f]) that legitimately commits. The partial
+    // file's os=linux overlay interpolates the SAME fact into OWNED content,
+    // so the fact write changes os=linux's canonical owned bytes -- a change
+    // the [y] on the darwin overlay never allowlisted. The guard must roll
+    // the partial file back by exactly that configuration.
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export SHELL_OK=1\n" ++
+        "export EMAIL=<machine.email | default \"nobody@example.com\">\n");
+    try writePartialRepo(io, &tmp, "[tui]\nkeys = \"a\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[tui]\nkeys = \"b\"\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=linux.toml", "[tui]\ngreet = \"<machine.email>\"\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "email = \"nobody@example.com\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".bashrc"), "export EMAIL=nobody@example.com", "export EMAIL=team@work.com");
+    try editLive(io, a, try h.liveOf("app.toml"), "keys = \"b\"", "keys = \"c\"");
+
+    // .bashrc: [f]. app.toml: [y] to the winning darwin overlay.
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "f\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "os=linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "did not choose to affect") != null);
+
+    // The fact commit stands; the partial file's overlay edit was rolled back.
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "email = \"team@work.com\"") != null);
+    try std.testing.expectEqualStrings("[tui]\nkeys = \"b\"\n", try read(io, a, try h.srcOf("app.toml.d/os=darwin.toml")));
+}
+
+test "commit partial: a sibling configuration's D2 violation rolls the file back naming the configuration and leaf" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui]\nk = \"a\"\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    // The linux overlay defines a leaf outside the declaration: broken for
+    // os=linux, invisible to a darwin apply -- commit's per-configuration D2
+    // pass is what catches it.
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=linux.toml", "[stray]\ns = 1\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf("app.toml"), "k = \"a\"", "k = \"b\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "configuration os=linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "stray.s is outside the declared own paths") != null);
+    // Rolled back: the base still holds the original value.
+    try std.testing.expectEqualStrings("[tui]\nk = \"a\"\n", try read(io, a, try h.srcOf("app.toml")));
+}
+
+test "commit partial: a secret-bearing record is skipped with the secret contract" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "commit-partial-s3cr3t-11aa22bb";
+    try writePartialRepo(io, &tmp, "[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    const h = try setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_PARTIAL_SECRET", .value = secret_value }},
+    });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, secret_value, "edited-by-hand");
+
+    const res = try h.run(&.{ "mox", "commit" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "contains a secret; edit its source directly") != null);
+    // Nothing was routed and the edit never reached the source.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml")), "edited-by-hand") == null);
+}
+
+test "commit partial: first-contact drift is reported, never routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const h = try setup(a, io, &tmp, .{});
+    // No apply: the live file exists with differing owned content and no
+    // owned record. Taking ownership is apply's job, with consent.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try h.homePath("app.toml"),
+        .data = "[tui.keymap.global]\nsubmit = \"escape\"\n",
+    });
+
+    const res = try h.run(&.{ "mox", "commit" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox apply") != null);
+    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"enter\"\n", try read(io, a, try h.srcOf("app.toml")));
+}
+
+test "apply drift partial: [o] reasserts the owned span and keeps the remainder" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "# program header\nmodel = \"gpt\"\n\n[tui.keymap.global]\nsubmit = \"escape\"\n\n[state]\ncount = 42\n" });
+
+    const res = try h.runWithInput(&.{ "mox", "apply" }, "o\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "submit = \"enter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "# program header") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "count = 42") != null);
+}
+
+test "apply drift partial: [d] shows the owned diff, [c] commits the owned edit through the deferred pass" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui.keymap.global]\nsubmit = \"enter\"\n", "[\"app.toml\"]\nown = [\"tui.keymap.global\"]\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, "submit = \"enter\"", "submit = \"ctrl-enter\"");
+
+    // [d] shows the owned canonical diff, [c] queues, then commit's own
+    // per-key prompt takes [y].
+    const res = try h.runWithInput(&.{ "mox", "apply" }, "d\nc\ny\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "submit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "queued") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "Committing 1 live edit(s)") != null);
+
+    // The live edit reached the base source and the record advanced.
+    try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+    const re = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), re.rc);
+    try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
+}
+
+test "apply drift partial: [c] on a secret-bearing record is refused inline, then [o] is accepted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "drift-partial-s3cr3t-33cc44dd";
+    try writePartialRepo(io, &tmp, "[api]\ntoken = \"<secret:env:MY_PARTIAL_SECRET>\"\n", "[\"app.toml\"]\nown = [\"api\"]\n");
+    const h = try setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_PARTIAL_SECRET", .value = secret_value }},
+    });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, secret_value, "edited-by-hand");
+
+    const res = try h.runWithInput(&.{ "mox", "apply" }, "c\no\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "contains a secret; edit its source directly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
+}
+
+test "commit: an own declaration the walk rejects reports the target by name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/notes.txt", "hi\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"notes.txt\"]\nown = [\"a\"]\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    const res = try h.run(&.{ "mox", "commit" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "own requires a structured target") != null);
+}
