@@ -2074,7 +2074,7 @@ fn processPartialFile(
     const composed = mox.compose.composeFileTracked(arena, cc.io, file, cc.this_bindings, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try partialManual(cc, ra, fidx, "  manual: {s} (compose failed: {s})\n", .{ live_path, @errorName(e) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (compose failed: {s})\n", .{ live_path, @errorName(e) });
             return .cont;
         },
     };
@@ -2085,12 +2085,12 @@ fn processPartialFile(
     const owned = partial_mod.OwnedDoc.parse(arena, format, bytes) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try partialManual(cc, ra, fidx, "  manual: {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
             return .cont;
         },
     };
     if (try partial_mod.undeclaredLeaf(arena, &owned, own_paths)) |leaf| {
-        try partialManual(cc, ra, fidx, "  manual: {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
         return .cont;
     }
 
@@ -2101,7 +2101,7 @@ fn processPartialFile(
     const live_doc = partial_mod.OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try partialManual(cc, ra, fidx, "  manual: {s} could not be parsed as {s}; edit its source directly\n", .{ live_path, @tagName(format) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} could not be parsed as {s}; edit its source directly\n", .{ live_path, @tagName(format) });
             return .cont;
         },
     };
@@ -2117,7 +2117,7 @@ fn processPartialFile(
     }
 
     const rec = record orelse {
-        try partialManual(cc, ra, fidx, "  manual: {s} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --force' reasserts the source)\n", .{live_path});
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --force' reasserts the source)\n", .{live_path});
         return .cont;
     };
     if (rec.secret) {
@@ -2140,7 +2140,7 @@ fn processPartialFile(
         const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
         const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
         if (!std.mem.eql(u8, live_sec, composed_sec)) {
-            try partialManual(cc, ra, fidx, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
         }
     }
 
@@ -2156,16 +2156,16 @@ fn processPartialFile(
     const diffres = ownedKeyDiff(arena, last_blob.items, live_blob, &live_doc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unrepresentable => {
-            try partialManual(cc, ra, fidx, "  manual: {s} (a reordered array cannot be routed by key)\n", .{live_path});
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (a reordered array cannot be routed by key)\n", .{live_path});
             return .cont;
         },
         error.Malformed => {
-            try partialManual(cc, ra, fidx, "  manual: {s} (owned record unreadable; run 'mox apply' to refresh it)\n", .{live_path});
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (owned record unreadable; run 'mox apply' to refresh it)\n", .{live_path});
             return .cont;
         },
     };
     for (diffres.unaddressable) |spelled| {
-        try partialManual(cc, ra, fidx, "  manual: {s} {s}: key is not addressable by a string key path\n", .{ live_path, spelled });
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: key is not addressable by a string key path\n", .{ live_path, spelled });
     }
     if (diffres.changes.len == 0) return .cont;
 
@@ -2175,7 +2175,22 @@ fn processPartialFile(
     return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes);
 }
 
-fn partialManual(cc: *const ClassCtx, ra: *const RunAccum, fidx: usize, comptime fmt: []const u8, args: anytype) !void {
+/// A partial file's manual (un-routable) outcome. Marks the file affected
+/// -- and builds its configuration space -- so it flows through the
+/// recompose-verify guard and is reported as uncommitted with a nonzero
+/// exit, exactly like a whole-file structured manual hunk.
+fn partialManual(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    spaces: []?FileSpace,
+    repo_dir: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    ra.affected[fidx] = true;
+    if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
     ra.manual_count.* += 1;
     ra.manual_hunks[fidx] += 1;
     ra.pending.* = true;

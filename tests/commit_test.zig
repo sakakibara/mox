@@ -3416,6 +3416,31 @@ test "commit partial: first-contact drift is reported, never routed" {
     try std.testing.expectEqualStrings("[tui.keymap.global]\nsubmit = \"enter\"\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
+test "commit partial: a first-contact-only file exits nonzero outside report mode" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    const h = try setup(a, io, &tmp, .{});
+    // No apply: differing live owned content with no owned record is first
+    // contact, a manual outcome. It must reach the guard and report like any
+    // other unrouted edit -- exit 1, never a silent 0.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try h.homePath("app.toml"),
+        .data = "[tui]\nk = 9\n",
+    });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "not committed") != null);
+    try std.testing.expectEqualStrings("[tui]\nk = 1\n", try read(io, a, try h.srcOf("app.toml")));
+}
+
 test "apply drift partial: [o] reasserts the owned span and keeps the remainder" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

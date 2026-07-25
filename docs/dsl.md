@@ -211,7 +211,9 @@ attributes git cannot carry live in `.mox/attributes.toml`.
   sections and keys match case-insensitively, a gitconfig quoted subsection is
   matched verbatim (case-sensitive), and a YAML declared segment is a string
   key -- a non-string key may sit inside an owned subtree, never on the
-  declared path itself. `own` requires a structured target (TOML, JSON, YAML,
+  declared path itself. An owned YAML scalar that does not render on one
+  line (a multiline string value) refuses the file rather than reflowing
+  it. `own` requires a structured target (TOML, JSON, YAML,
   INI, gitconfig) and cannot combine with `symlink`, `seed_once`, or a
   generator source. The composed source must lie entirely within the
   declaration -- a composed leaf outside every declared path is a per-file

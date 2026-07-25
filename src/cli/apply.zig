@@ -55,6 +55,11 @@ fn applyPass(
     const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 1;
     defer lk.release();
 
+    // Stale check-hook staging holds candidate cleartext (a crash skipped
+    // the deferred cleanup); sweep before anything composes so a leftover
+    // never survives past this run.
+    mox.apply.run_scripts.sweepCheckDirs(ctx.alloc, ctx.io, context.paths.state_dir);
+
     // Drift is resolved by asking only on a real terminal with nothing already
     // deciding the outcome. `--force` resolves it before the prompt is reached;
     // `--dry-run` writes nothing; a non-TTY keeps the skip-and-report contract
@@ -790,7 +795,12 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     const out_path = try std.mem.concat(ctx.alloc, u8, &.{ check_dir, ".out" });
     const cand_path = try std.fs.path.join(ctx.alloc, &.{ check_dir, std.fs.path.basename(live_path) });
     const materialized = blk: {
-        std.Io.Dir.cwd().createDirPath(ctx.io, check_dir) catch break :blk false;
+        // The staging dir holds candidate cleartext (possibly a resolved
+        // secret): created private to the user, and re-tightened in case a
+        // crashed run's leftover dir is being adopted.
+        const perms: std.Io.File.Permissions = if (std.Io.File.Permissions.has_executable_bit) .fromMode(0o700) else .default_dir;
+        _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, check_dir, perms) catch break :blk false;
+        mox.apply.write.setMode(check_dir, 0o700) catch break :blk false;
         std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cand_path, .data = candidate }) catch break :blk false;
         break :blk true;
     };

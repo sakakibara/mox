@@ -234,6 +234,36 @@ pub fn checkTimeoutMs(environ_map: ?*const EnvironMap) i64 {
 /// Bytes of the child's combined output kept for the refusal report.
 const check_tail_bytes: usize = 4096;
 
+/// Remove leftover check-hook staging from the state dir: `check-*` dirs
+/// (they hold candidate cleartext, possibly with a resolved secret) and
+/// their `check-*.out` captures. A crash between materializing a candidate
+/// and the deferred cleanup would otherwise leave the cleartext on disk
+/// indefinitely; apply sweeps before composing, so a leftover never
+/// survives past the next run. Best-effort: an unreadable state dir is not
+/// this sweep's problem.
+pub fn sweepCheckDirs(arena: std.mem.Allocator, io: Io, state_dir: []const u8) void {
+    var dir = Io.Dir.cwd().openDir(io, state_dir, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    const Entry = struct { name: []const u8, is_dir: bool };
+    var stale: std.ArrayList(Entry) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch return) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "check-")) continue;
+        const is_dir = entry.kind == .directory;
+        if (!is_dir and !std.mem.endsWith(u8, entry.name, ".out")) continue;
+        const name = arena.dupe(u8, entry.name) catch return;
+        stale.append(arena, .{ .name = name, .is_dir = is_dir }) catch return;
+    }
+    for (stale.items) |e| {
+        if (e.is_dir) {
+            dir.deleteTree(io, e.name) catch {};
+        } else {
+            dir.deleteFile(io, e.name) catch {};
+        }
+    }
+}
+
 /// Outcome of one check-hook run. `refusal` is null on acceptance (exit 0)
 /// and names the reason otherwise; `tail` is the end of the child's combined
 /// stdout+stderr, for the refusal report.

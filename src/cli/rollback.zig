@@ -31,10 +31,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "rollback")) orelse return 1;
     defer lk.release();
 
-    // Current partial targets, from the walked tree: their snapshots take
-    // the re-patch path instead of the whole-file restore.
+    // Tree info for the re-patch (own paths, check hook, format), best
+    // effort: a broken source tree or attributes file must not block the
+    // whole-file restores, so a failed walk leaves the map empty and only
+    // the withheld partial targets report an error below.
     var partials: std.StringHashMap(mox.source.tree.ManagedFile) = .init(ctx.alloc);
-    var skip: std.StringHashMap(void) = .init(ctx.alloc);
     {
         const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
         var walk_diag: mox.source.tree.Diag = .{};
@@ -45,11 +46,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             error.OwnOnSeedOnce,
             error.OwnOnGenerator,
             error.InvalidOwnPath,
-            => {
-                try ctx.err.print("mox rollback: .mox/attributes.toml: {s}: {s}\n", .{
+            => blk: {
+                try ctx.err.print("mox rollback: warning: .mox/attributes.toml: {s}: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{
                     walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
                 });
-                return 1;
+                break :blk null;
             },
             else => return e,
         };
@@ -58,8 +59,19 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             for (tree.files) |f| {
                 if (f.own_paths.len == 0) continue;
                 try partials.put(f.live_path, f);
-                try skip.put(f.live_path, {});
             }
+        }
+    }
+
+    // Partial targets are detected by OWNED RECORD existence, not by the
+    // walked tree: the records were written by the same runs that took the
+    // snapshots, and unlike the tree they stay readable when the repo is
+    // broken -- a whole-file restore over a partial target must never
+    // happen just because the walk failed.
+    var skip: std.StringHashMap(void) = .init(ctx.alloc);
+    for (try snapshotLivePaths(ctx, id)) |lp| {
+        if ((try mox.apply.applied.readOwned(ctx.alloc, ctx.io, context.paths.state_dir, lp)) != null) {
+            try skip.put(lp, {});
         }
     }
 
@@ -75,12 +87,34 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     var repatched: usize = 0;
     var failed: usize = 0;
     for (withheld.items) |w| {
-        const file = partials.get(w.live_path).?;
+        const file = partials.get(w.live_path) orelse {
+            try ctx.err.print("  ERROR   {s} (partially owned, but its own declaration is unavailable; fix the source tree, then re-run)\n", .{w.live_path});
+            failed += 1;
+            continue;
+        };
         if (try repatchPartial(ctx, file, w.content, &failed)) repatched += 1;
     }
 
     try ctx.out.print("Restored {d} file(s) from snapshot {s}\n", .{ restored.count + repatched, id });
     return if (failed > 0) 1 else 0;
+}
+
+/// Live paths of every regular file captured in snapshot `id` (symlink
+/// snapshots are never partial targets). A missing snapshot yields none;
+/// `restoreExcept` reports it.
+fn snapshotLivePaths(ctx: *app.Ctx, id: []const u8) ![]const []const u8 {
+    const context = ctx.context.?;
+    var out: std.ArrayList([]const u8) = .empty;
+    const snap_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.snapshots_dir, id });
+    var dir = Io.Dir.cwd().openDir(ctx.io, snap_dir, .{ .iterate = true }) catch return out.toOwnedSlice(ctx.alloc);
+    defer dir.close(ctx.io);
+    var walker = try dir.walk(ctx.alloc);
+    defer walker.deinit();
+    while (walker.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        try out.append(ctx.alloc, try mox.source.path.joinKeyOnto(ctx.alloc, context.paths.home, entry.path));
+    }
+    return out.toOwnedSlice(ctx.alloc);
 }
 
 /// Re-patch one partial target's owned subtree from its snapshot onto the

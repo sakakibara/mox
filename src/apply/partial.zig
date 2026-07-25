@@ -83,7 +83,10 @@ pub const Located = struct {
     spans: []const ?Span,
     /// Container framing (section headers, wrapper members) whose content
     /// is provably all owned but which no single path's span covers. Used
-    /// by the remainder byte check only.
+    /// by the remainder byte check only. Accepted narrow blind spot: the
+    /// framing bytes themselves are excluded from that check, so a
+    /// discrepancy confined to a wrapper's own line (its spelling or a
+    /// same-line comment) would pass it.
     wrappers: []const Span,
 };
 

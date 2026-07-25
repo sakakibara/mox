@@ -3152,6 +3152,58 @@ test "apply partial check: a rejecting hook refuses the file and reports its out
     try std.testing.expectEqualStrings(program_live, try read(io, a, live));
 }
 
+test "apply: stale check staging in state is swept before composing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "x = 1\n" });
+    const c = try cliSetup(a, io, &tmp);
+
+    // A crashed run's leftovers: candidate cleartext and its output capture.
+    const stale_dir = try std.fs.path.join(a, &.{ c.state, "check-deadbeefdeadbeef" });
+    try Io.Dir.cwd().createDirPath(io, stale_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ stale_dir, "app.toml" }),
+        .data = "leaked = \"cleartext\"\n",
+    });
+    const stale_out = try std.mem.concat(a, u8, &.{ stale_dir, ".out" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_out, .data = "old output\n" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(!exists(io, stale_dir));
+    try std.testing.expect(!exists(io, stale_out));
+}
+
+test "apply partial check: the staging dir is private to the user" {
+    if (builtin.os.tag == .windows) return; // no unix modes to observe
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", check_attrs);
+    const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "mode-log.txt" });
+    const checker = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\m=$(stat -c %a "$MOX_CHECK_DIR" 2>/dev/null) || m=$(stat -f %Lp "$MOX_CHECK_DIR")
+        \\printf '%s\n' "$m" >> "{s}"
+        \\exit 0
+        \\
+    , .{log});
+    try writeChecker(a, io, &tmp, checker);
+
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("700", std.mem.trim(u8, try read(io, a, log), " \t\r\n"));
+}
+
 test "apply partial check: --skip-scripts runs no check and writes no check-bearing file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3262,6 +3314,48 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     const drift = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), drift.rc);
     try std.testing.expect(std.mem.indexOf(u8, drift.err, "DRIFT") != null);
+}
+
+test "rollback: a broken attributes file blocks neither whole-file restores nor the partial withhold" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n", "[\"app.toml\"]\nown = [\"tui\"]\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v1\n" });
+    const c = try cliSetup(a, io, &tmp);
+    const live_b = try c.homePath("b.conf");
+    const live_app = try c.homePath("app.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // Both sources move on; the second apply snapshots both live files.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "[tui]\nk = 2\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The attributes file breaks: own on an unstructured target fails the
+    // tree walk. Partial detection comes from the owned record, so the
+    // whole-file restore proceeds and the partial target is withheld, never
+    // whole-file clobbered.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "text\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data = "[\"app.toml\"]\nown = [\"tui\"]\n\n[\"notes.txt\"]\nown = [\"x\"]\n",
+    });
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const before_app = try read(io, a, live_app);
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, live_b));
+    try std.testing.expectEqualStrings(before_app, try read(io, a, live_app));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "warning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "declaration is unavailable") != null);
 }
 
 test "rollback partial: a secret-masked snapshot is refused, live untouched" {
