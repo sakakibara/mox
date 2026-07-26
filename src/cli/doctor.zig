@@ -165,6 +165,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  note: the source tree or scripts/ could not be read; the closed-axis-value check was skipped\n", .{});
     }
 
+    // scripts/ entries outside {pre, post}, and stage-directory names that
+    // contain '=' but fail to parse as an axis tuple: both never run, silently.
+    if (try scriptStageProblems(ctx.alloc, ctx.io, context.paths.repo_dir)) |stage_msgs| {
+        for (stage_msgs) |msg| {
+            advisories += 1;
+            try ctx.out.print("  {s}\n", .{msg});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: scripts/ could not be read; the script-stage check was skipped\n", .{});
+    }
+
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
     var problems = bad_prov.len;
@@ -420,6 +432,54 @@ fn isValidArchValue(v: []const u8) bool {
         if (std.mem.eql(u8, v, f.name)) return true;
     }
     return false;
+}
+
+/// Entries under `<repo>/scripts/` that never run, silently: a top-level
+/// entry named neither `pre` nor `post` (`run_scripts` reads only those two),
+/// and -- inside either stage -- a subdirectory name containing '=' whose
+/// tuple fails to parse (a plain-named subdirectory with no '=' is an
+/// exempt helper dir: `run_scripts` never runs it either, by design, so it is
+/// not flagged). Null means `scripts/` could not be read (the check could not
+/// run); a missing `scripts/` is not an error. Sorted, arena-owned messages.
+fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const []const u8 {
+    const scripts_dir = try std.fs.path.join(arena, &.{ repo_dir, "scripts" });
+    var dir = Io.Dir.cwd().openDir(io, scripts_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
+        error.FileNotFound => return &.{},
+        else => return null,
+    };
+    defer dir.close(io);
+
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try mox.source.dirent.sorted(arena, io, dir)) |entry| {
+        if (mox.source.junk.isJunk(entry.name)) continue;
+        if (std.mem.eql(u8, entry.name, "pre") or std.mem.eql(u8, entry.name, "post")) continue;
+        try out.append(arena, try std.fmt.allocPrint(
+            arena,
+            "unknown-stage scripts/{s} (only pre/ and post/ run; rename or remove it)",
+            .{entry.name},
+        ));
+    }
+
+    for ([_][]const u8{ "pre", "post" }) |stage| {
+        const stage_dir = try std.fs.path.join(arena, &.{ scripts_dir, stage });
+        var sdir = Io.Dir.cwd().openDir(io, stage_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return null,
+        };
+        defer sdir.close(io);
+        for (try mox.source.dirent.sorted(arena, io, sdir)) |entry| {
+            if (entry.kind != .directory or std.mem.indexOfScalar(u8, entry.name, '=') == null) continue;
+            _ = mox.source.tuple.parseFilename(arena, entry.name) catch {
+                try out.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "bad-stage-tuple scripts/{s}/{s} (does not parse as <axis>=<value>; it will never run -- plain-named helper dirs are exempt, but a name containing '=' must parse)",
+                    .{ stage, entry.name },
+                ));
+                continue;
+            };
+        }
+    }
+    return try out.toOwnedSlice(arena);
 }
 
 /// Whether every axis the file references is a compared axis (one `enumerate`
@@ -721,5 +781,51 @@ test "closedAxisValueProblems: a real os/arch value is not flagged" {
 
     const repo = try tmpAbs(a, io, &tmp, "repo");
     const bad = (try closedAxisValueProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 0), bad.len);
+}
+
+test "scriptStageProblems: flags an unknown top-level stage and an unparseable tuple, exempts plain helper dirs" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/helpers");
+    // Uppercase axis name: the filename grammar requires lowercase, so this
+    // fails to parse as a tuple at all (distinct from a valid-shaped tuple
+    // naming an out-of-vocabulary value, which the closed-axis-value check
+    // covers instead).
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/OS=darwin");
+    try tmp.dir.createDirPath(io, "repo/scripts/postt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/helpers/lib.sh", .data = "true\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/OS=darwin/x.sh", .data = "true\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/postt/x.sh", .data = "true\n" });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try scriptStageProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 2), bad.len);
+    try testing.expect(std.mem.indexOf(u8, bad[0], "unknown-stage scripts/postt") != null);
+    try testing.expect(std.mem.indexOf(u8, bad[1], "bad-stage-tuple scripts/pre/OS=darwin") != null);
+    // A plain-named helper dir (no '=') is exempt: never mentioned.
+    for (bad) |msg| try testing.expect(std.mem.indexOf(u8, msg, "helpers") == null);
+}
+
+test "scriptStageProblems: a well-formed pre/post tree has nothing to report" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/os=darwin");
+    try tmp.dir.createDirPath(io, "repo/scripts/post");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/os=darwin/x.sh", .data = "true\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/post/reload.sh", .data = "true\n" });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try scriptStageProblems(a, io, repo)).?;
     try testing.expectEqual(@as(usize, 0), bad.len);
 }
