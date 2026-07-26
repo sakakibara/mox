@@ -225,6 +225,15 @@ pub fn ofFile(arena: std.mem.Allocator, io: Io, file: source.tree.ManagedFile) !
     return ax;
 }
 
+/// Every axis `expr` references, without scanning a whole source tree --
+/// e.g. a single file's whole-file gate, handed back for inspection after a
+/// skip.
+pub fn ofAxisExpr(arena: std.mem.Allocator, expr: *const dsl.ast.AxisExpr) !Axes {
+    var ax = initAxes(arena);
+    try addAxisExpr(&ax, expr);
+    return ax;
+}
+
 /// `file`'s own compared axis NAMES, each carrying the REPO-WIDE value SET
 /// seen anywhere under `repo_dir` (`ofTree`) rather than just what `file`
 /// itself names. A machine revealed only by another file's overlay (an

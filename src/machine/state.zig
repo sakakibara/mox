@@ -237,6 +237,38 @@ pub fn osAxisValue(os_tag: std.Target.Os.Tag) []const u8 {
     };
 }
 
+/// True when `v` is `osAxisValue` of some real zig `Os.Tag` (macOS spelled
+/// `darwin`, per `osAxisValue`). The closed set an `os=` literal is ever
+/// actually compared against; shared by `mox doctor`'s repo-wide sweep and
+/// `mox apply`'s whole-file-gate advisory.
+pub fn isValidOsValue(v: []const u8) bool {
+    inline for (@typeInfo(std.Target.Os.Tag).@"enum".fields) |f| {
+        if (std.mem.eql(u8, v, osAxisValue(@enumFromInt(f.value)))) return true;
+    }
+    return false;
+}
+
+/// True when `v` names a real zig `Cpu.Arch` tag: the closed set an `arch=`
+/// literal is ever actually compared against.
+pub fn isValidArchValue(v: []const u8) bool {
+    inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |f| {
+        if (std.mem.eql(u8, v, f.name)) return true;
+    }
+    return false;
+}
+
+test "isValidOsValue/isValidArchValue: accept the real zig tags, reject typos" {
+    try std.testing.expect(isValidOsValue("darwin"));
+    try std.testing.expect(isValidOsValue("linux"));
+    try std.testing.expect(isValidOsValue("windows"));
+    try std.testing.expect(!isValidOsValue("macos"));
+    try std.testing.expect(!isValidOsValue("osx"));
+
+    try std.testing.expect(isValidArchValue("aarch64"));
+    try std.testing.expect(isValidArchValue("x86_64"));
+    try std.testing.expect(!isValidArchValue("arm64"));
+}
+
 test "capture: both HOME and USERPROFILE unset or empty errors instead of defaulting to cwd" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

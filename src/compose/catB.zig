@@ -381,21 +381,9 @@ pub fn composeTrackedContent(
     };
 
     // Whole-file when_gate: a `when ...` directive without a matching `end`
-    // (gating to EOF) controls whether the file materializes at all. The
-    // directive must be at the very top of the file — line 1, OR line 2 if
-    // line 1 is a shebang (so executable scripts can keep `#!` as line 1
-    // while still being whole-file gated) — AND it must actually run to EOF.
-    // A scoped `when ... end` block shares the `.when_gate` kind but is
-    // terminated; without the `to_eof` check a top-of-file scoped gate is
-    // misread as whole-file and its trailing content is silently dropped.
-    const top_line: u32 = if (std.mem.startsWith(u8, base_content, "#!")) 2 else 1;
-    if (parsed.directives.len > 0) {
-        const first = parsed.directives[0];
-        if (first.kind == .when_gate and first.start_line <= top_line and first.kind.when_gate.to_eof) {
-            if (first.kind.when_gate.when) |w| {
-                if (!dsl.axis.evaluate(w, bindings)) return null;
-            }
-        }
+    // (gating to EOF) controls whether the file materializes at all.
+    if (wholeFileGateExpr(base_content, parsed)) |w| {
+        if (!dsl.axis.evaluate(w, bindings)) return null;
     }
 
     var empty_record = std.StringHashMap(data_mod.value.Value).init(arena);
@@ -446,6 +434,39 @@ pub fn composeTrackedContent(
     if (prov) |p| prov_mod.map.truncateTo(p, prov_mod.map.lineCount(out.items));
 
     return try out.toOwnedSlice(arena);
+}
+
+/// The leading `when` directive's axis expression when it is a genuine
+/// whole-file existence gate: a `when ...` directive without a matching `end`
+/// (gating to EOF), at the very top of the file -- line 1, OR line 2 if line 1
+/// is a shebang (so executable scripts can keep `#!` as line 1 while still
+/// being whole-file gated). A scoped `when ... end` block shares the
+/// `.when_gate` kind but is terminated; without the `to_eof` check a
+/// top-of-file scoped gate would be misread as whole-file. Null for a
+/// directive-less file, a non-gate leading directive, a scoped gate, or a
+/// `when` with no expression (which never gates, unconditionally true).
+fn wholeFileGateExpr(base_content: []const u8, parsed: dsl.ast.ParsedFile) ?*const dsl.ast.AxisExpr {
+    if (parsed.directives.len == 0) return null;
+    const top_line: u32 = if (std.mem.startsWith(u8, base_content, "#!")) 2 else 1;
+    const first = parsed.directives[0];
+    if (first.kind != .when_gate or first.start_line > top_line or !first.kind.when_gate.to_eof) return null;
+    return first.kind.when_gate.when;
+}
+
+/// Public, non-evaluating counterpart to the whole-file gate check
+/// `composeTrackedContent` runs: the same detection, without deciding whether
+/// it holds. Used to advise on an out-of-vocabulary os=/arch= literal in the
+/// gate that just skipped a file, without re-implementing detection. Null
+/// when `file` has no base, cannot be read, or has no genuine whole-file gate.
+pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile) !?*const dsl.ast.AxisExpr {
+    if (!file.has_base or file.source_base_abs.len == 0) return null;
+    const base_content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const marker = markerForFile(file.source_base_path, base_content) orelse return null;
+    const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;
+    return wholeFileGateExpr(base_content, parsed);
 }
 
 /// One file produced by a generator (`for ... into`): the resolved live path,

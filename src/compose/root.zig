@@ -12,6 +12,7 @@ pub const yaml_merge = @import("yaml_merge.zig");
 pub const ini_merge = @import("ini_merge.zig");
 pub const composeFile = @import("compose.zig").composeFile;
 pub const composeFileTracked = @import("compose.zig").composeFileTracked;
+pub const wholeFileGateAxisExpr = @import("compose.zig").wholeFileGateAxisExpr;
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above

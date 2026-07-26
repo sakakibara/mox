@@ -366,10 +366,10 @@ fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u
     var bad_os = std.StringHashMap(void).init(arena);
     var bad_arch = std.StringHashMap(void).init(arena);
     for (ax.valuesFor("os")) |v| {
-        if (!isValidOsValue(v.value)) try bad_os.put(v.value, {});
+        if (!mox.machine.state.isValidOsValue(v.value)) try bad_os.put(v.value, {});
     }
     for (ax.valuesFor("arch")) |v| {
-        if (!isValidArchValue(v.value)) try bad_arch.put(v.value, {});
+        if (!mox.machine.state.isValidArchValue(v.value)) try bad_arch.put(v.value, {});
     }
 
     const scripts_dir = try std.fs.path.join(arena, &.{ repo_dir, "scripts" });
@@ -384,8 +384,8 @@ fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u
             if (entry.kind != .directory or std.mem.indexOfScalar(u8, entry.name, '=') == null) continue;
             const tuple = mox.source.tuple.parseFilename(arena, entry.name) catch continue;
             for (tuple.pairs) |p| {
-                if (std.mem.eql(u8, p.name, "os") and !isValidOsValue(p.value)) try bad_os.put(p.value, {});
-                if (std.mem.eql(u8, p.name, "arch") and !isValidArchValue(p.value)) try bad_arch.put(p.value, {});
+                if (std.mem.eql(u8, p.name, "os") and !mox.machine.state.isValidOsValue(p.value)) try bad_os.put(p.value, {});
+                if (std.mem.eql(u8, p.name, "arch") and !mox.machine.state.isValidArchValue(p.value)) try bad_arch.put(p.value, {});
             }
         }
     }
@@ -415,23 +415,6 @@ fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u
         ));
     }
     return try out.toOwnedSlice(arena);
-}
-
-/// True when `v` is `osAxisValue` of some real zig `Os.Tag` (macOS spelled
-/// `darwin`, per `osAxisValue`).
-fn isValidOsValue(v: []const u8) bool {
-    inline for (@typeInfo(std.Target.Os.Tag).@"enum".fields) |f| {
-        if (std.mem.eql(u8, v, mox.machine.state.osAxisValue(@enumFromInt(f.value)))) return true;
-    }
-    return false;
-}
-
-/// True when `v` names a real zig `Cpu.Arch` tag.
-fn isValidArchValue(v: []const u8) bool {
-    inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |f| {
-        if (std.mem.eql(u8, v, f.name)) return true;
-    }
-    return false;
 }
 
 /// Entries under `<repo>/scripts/` that never run, silently: a top-level
@@ -727,18 +710,6 @@ test "unrecordedModes: flags an exotic source mode not in attributes" {
 
     const cleared = (try unrecordedModes(a, io, repo, src)).?;
     try testing.expectEqual(@as(usize, 0), cleared.len);
-}
-
-test "isValidOsValue/isValidArchValue: accept the real zig tags, reject typos" {
-    try testing.expect(isValidOsValue("darwin"));
-    try testing.expect(isValidOsValue("linux"));
-    try testing.expect(isValidOsValue("windows"));
-    try testing.expect(!isValidOsValue("macos"));
-    try testing.expect(!isValidOsValue("osx"));
-
-    try testing.expect(isValidArchValue("aarch64"));
-    try testing.expect(isValidArchValue("x86_64"));
-    try testing.expect(!isValidArchValue("arm64"));
 }
 
 test "closedAxisValueProblems: flags an out-of-vocabulary os= gate and a script-dir arch= tuple" {

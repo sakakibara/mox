@@ -393,6 +393,7 @@ fn applyPass(
         } else {
             counts.skip += 1;
             try ctx.out.print("  skipped {s} (axis-gated off)\n", .{file.live_path});
+            try warnBadWholeFileGateAxis(ctx, file);
         }
     }
 
@@ -554,6 +555,30 @@ fn applyPass(
     }
     const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed;
     return if (total_fail > 0) 1 else 0;
+}
+
+/// A file just skipped as axis-gated off: when its whole-file gate names an
+/// `os=`/`arch=` literal outside the closed set `machine.state.capture` can
+/// ever bind (e.g. `macos` instead of `darwin`), warn -- such a gate can never
+/// match any real machine, silently. Scoped to the whole-file gate alone; a
+/// region gate or an overlay tuple is `mox doctor`'s repo-wide sweep to catch.
+/// Best-effort: any failure to re-read or re-parse the file it just skipped
+/// leaves the plain skip line as the only output.
+fn warnBadWholeFileGateAxis(ctx: *app.Ctx, file: mox.source.tree.ManagedFile) !void {
+    const expr = (mox.compose.wholeFileGateAxisExpr(ctx.alloc, ctx.io, file) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    }) orelse return;
+    const ax = try mox.source.axes.ofAxisExpr(ctx.alloc, expr);
+    for (ax.valuesFor("os")) |v| {
+        if (mox.machine.state.isValidOsValue(v.value)) continue;
+        const hint = if (std.mem.eql(u8, v.value, "macos")) " -- macos spells darwin" else "";
+        try ctx.err.print("mox apply:   bad-axis-value os={s} (not a recognized os; darwin/linux/windows are the common ones{s})\n", .{ v.value, hint });
+    }
+    for (ax.valuesFor("arch")) |v| {
+        if (mox.machine.state.isValidArchValue(v.value)) continue;
+        try ctx.err.print("mox apply:   bad-axis-value arch={s} (not a recognized arch; aarch64/x86_64 are the common ones)\n", .{v.value});
+    }
 }
 
 /// One generator's state carried from the compose+write pass to the deferred

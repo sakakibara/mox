@@ -7,6 +7,7 @@ const catC = @import("catC.zig");
 const interp = @import("interp.zig");
 const machine = @import("../machine/root.zig");
 const prov_mod = @import("../provenance/root.zig");
+const dsl = @import("../dsl/root.zig");
 
 const Io = std.Io;
 const ManagedFile = source.tree.ManagedFile;
@@ -79,6 +80,29 @@ pub fn composeFileTracked(
             return bytes;
         },
     }
+}
+
+/// The whole-file gate's axis expression that just decided `file` is absent
+/// on this machine, or null when `file` has no whole-file gate (unconditional,
+/// gated only by region/overlay, or Cat C -- which has no gate concept at
+/// all). Dispatches by the same category detection `composeFileTracked` uses,
+/// without evaluating: a caller advising on a skip already knows the file
+/// composed to null, and only wants the expression to inspect. Scoped to the
+/// whole-file gate alone; a region gate or an overlay tuple is `mox doctor`'s
+/// repo-wide sweep to catch, not a per-file apply-time advisory.
+pub fn wholeFileGateAxisExpr(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+) !?*const dsl.ast.AxisExpr {
+    if (!file.has_base) return null;
+    const sample = try peekFile(io, arena, file.source_base_abs);
+    const cat = category.detect(file.source_base_path, sample);
+    return switch (cat) {
+        .a => try catA.wholeFileGateAxisExpr(arena, io, file),
+        .b => try catB.wholeFileGateAxisExpr(arena, io, file),
+        .c => null,
+    };
 }
 
 /// Attribute the whole of `bytes` to a single segment for a Cat C file.

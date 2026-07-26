@@ -716,6 +716,46 @@ test "apply: a tracked-but-ignored source is skipped, not written" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "skipping") != null);
 }
 
+test "apply: a whole-file gate naming an out-of-vocabulary os= value warns on the skip" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `macos` never matches (the real axis value is `darwin`), so this file
+    // is gated off on every machine -- and always by way of the typo, not a
+    // real cross-machine difference.
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: when os=macos\n[gaps]\ninner = 8\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "os=macos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "macos spells darwin") != null);
+}
+
+test "apply: a whole-file gate naming a real os= value that just does not match warns nothing extra" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: when os=linux\n[gaps]\ninner = 8\n" });
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped") != null);
+    try std.testing.expectEqualStrings("", r.err);
+}
+
 test "apply: exact prune leaves an ignored live file alone" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

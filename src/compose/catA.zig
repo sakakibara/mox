@@ -328,6 +328,27 @@ fn wholeFileGateExpr(arena: std.mem.Allocator, content: []const u8, marker: []co
     return first.kind.when_gate.when;
 }
 
+/// Public, non-evaluating counterpart to `readBaseHead`'s gate detection: the
+/// same head-parse-then-strip pass, without deciding whether the gate holds.
+/// Used to advise on an out-of-vocabulary os=/arch= literal in the gate that
+/// just skipped a file, without re-implementing detection. Null when `file`
+/// has no base, its format is unrecognized, it cannot be read, or it has no
+/// genuine whole-file gate.
+pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile) !?*const dsl.ast.AxisExpr {
+    if (!file.has_base or file.source_base_abs.len == 0) return null;
+    const format = formatOf(file.source_base_path) orelse return null;
+    const marker: []const u8 = if (format == .json) "//" else "#";
+    const raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_layer_bytes));
+    const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
+    const parsed = source.head.parse(arena, head_text, marker) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed.gate == null) return null;
+    const stripped = if (parsed.spans.len == 0) raw else try source.head.stripSpans(arena, raw, parsed.spans);
+    return wholeFileGateExpr(arena, stripped, marker);
+}
+
 /// Run the `<machine.X>` / `<data.X>` / `<secret:URI>` interpolation pass over a
 /// Cat A composed output and record the file's whole-file provenance segment.
 /// No machine state means no interp: the bytes pass through unchanged, still
