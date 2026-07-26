@@ -135,6 +135,10 @@ fn applyPass(
         try ctx.err.writeAll("\n");
     }
 
+    // Resolved once per apply run (not per checked partial file): an
+    // unparseable override would otherwise warn once per file checked.
+    const check_timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&script_env, ctx.err);
+
     // Pre-stage scripts run before any file compose+write. Used for
     // bootstrap (package install, mise/brew/scoop setup, etc.). Scripts
     // run on every apply; expensive work is guarded inside the script via
@@ -369,6 +373,7 @@ fn applyPass(
                     .dry_run = dry_run,
                     .skip_scripts = skip_scripts,
                     .resolver = resolver_opt,
+                    .check_timeout_ms = check_timeout_ms,
                 }, &counts, &snapshotted);
             } else {
                 try applyRegularFile(ctx, .{
@@ -894,16 +899,19 @@ const PartialInput = struct {
     /// Non-null on an interactive run: owned drift is resolved by asking.
     /// Null keeps the non-interactive contract (skip and report).
     resolver: ?*DriftResolver = null,
+    /// The check hook's wall-clock bound, resolved once per apply run.
+    check_timeout_ms: i64,
 };
 
 /// Run a partial file's `check` hook (D7) against `candidate`, materialized
 /// in a private temp dir under the live basename. The child gets
 /// MOX_CHECK_FILE and MOX_CHECK_DIR, runs with cwd at the repo root, and is
-/// wall-clock bounded (MOX_CHECK_TIMEOUT_MS override). Returns true on
-/// acceptance; any other outcome reports the refusal (with the child's tail
-/// output), bumps `fail_count`, and returns false. Public because rollback
-/// runs the same hook before re-patching a partial target.
-pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, fail_count: *usize) !bool {
+/// bounded by `timeout_ms` (the caller resolves MOX_CHECK_TIMEOUT_MS once per
+/// run, not once per call, so a junk override warns exactly once). Returns
+/// true on acceptance; any other outcome reports the refusal (with the
+/// child's tail output), bumps `fail_count`, and returns false. Public
+/// because rollback runs the same hook before re-patching a partial target.
+pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize) !bool {
     const context = ctx.context.?;
     // Keyed by live path: the state lock serializes applies, so no two runs
     // race on it, and a crash's leftover is overwritten on the next apply.
@@ -936,7 +944,6 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     var env_map = try context.env.createMap(ctx.alloc);
     try env_map.put("MOX_CHECK_FILE", cand_path);
     try env_map.put("MOX_CHECK_DIR", check_dir);
-    const timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&env_map, ctx.err);
 
     const res = mox.apply.run_scripts.runCheck(ctx.alloc, ctx.io, context.paths.repo_dir, check_argv, &env_map, out_path, timeout_ms) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1186,7 +1193,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
     if (in.file.check_argv.len > 0) {
-        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, &counts.fail)) return;
+        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, in.check_timeout_ms, &counts.fail)) return;
     }
 
     if (live != null) {

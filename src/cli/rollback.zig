@@ -32,6 +32,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "rollback")) orelse return 1;
     defer lk.release();
 
+    // Resolved once per rollback run (not per re-patched partial file): an
+    // unparseable override would otherwise warn once per file re-patched.
+    var check_env_map = try context.env.createMap(ctx.alloc);
+    const check_timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&check_env_map, ctx.err);
+
     // Tree info for the re-patch (own paths, check hook, format), best
     // effort: a broken source tree must not block the
     // whole-file restores, so a failed walk leaves the map empty and only
@@ -104,7 +109,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             failed += 1;
             continue;
         };
-        if (try repatchPartial(ctx, file, w.content, &failed)) repatched += 1;
+        if (try repatchPartial(ctx, file, w.content, check_timeout_ms, &failed)) repatched += 1;
     }
 
     try ctx.out.print("Restored {d} file(s) from snapshot {s}\n", .{ restored.count + repatched, id });
@@ -141,6 +146,7 @@ fn repatchPartial(
     ctx: *app.Ctx,
     file: mox.source.tree.ManagedFile,
     snap_content: []const u8,
+    check_timeout_ms: i64,
     failed: *usize,
 ) !bool {
     const partial = mox.apply.partial;
@@ -249,7 +255,7 @@ fn repatchPartial(
     };
     // A rollback must not install content the file's own validator rejects.
     if (file.check_argv.len > 0) {
-        if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, failed)) return false;
+        if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, check_timeout_ms, failed)) return false;
     }
 
     // A live target absent here is legitimate (this partial target was never

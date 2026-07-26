@@ -3591,6 +3591,28 @@ fn acceptingChecker(a: std.mem.Allocator, log: []const u8) ![]const u8 {
     , .{log});
 }
 
+/// Like `acceptingChecker`, but accepts any live basename: used where more
+/// than one checked file shares a single checker script.
+fn acceptingAnyChecker(a: std.mem.Allocator, log: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fmt.allocPrint(a,
+            \\if (-not (Test-Path -LiteralPath $env:MOX_CHECK_FILE)) {{ exit 1 }}
+            \\if (-not (Select-String -LiteralPath $env:MOX_CHECK_FILE -Pattern 'tui' -Quiet)) {{ exit 1 }}
+            \\Add-Content -LiteralPath '{s}' -Value $env:MOX_CHECK_FILE
+            \\exit 0
+            \\
+        , .{log});
+    }
+    return std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\[ -f "$MOX_CHECK_FILE" ] || exit 1
+        \\grep -q tui "$MOX_CHECK_FILE" || exit 1
+        \\printf '%s\n' "$MOX_CHECK_FILE" >> "{s}"
+        \\exit 0
+        \\
+    , .{log});
+}
+
 test "apply partial check: an accepting hook sees the candidate through its env and the file installs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3757,6 +3779,37 @@ test "apply partial check: a hanging hook is killed within the timeout bound" {
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
     // Killed by the 1500ms bound, not by the checker's 30s sleep ending.
     try std.testing.expect(elapsed < 20);
+}
+
+test "apply partial check: an unparseable MOX_CHECK_TIMEOUT_MS warns exactly once across multiple checked files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = check_source });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app2.toml",
+        .data = "# mox: own tui\n# mox: check \"" ++ check_rel ++ "\"\n[tui]\nk = 1\n",
+    });
+    const log = try std.fs.path.join(a, &.{ try tmpRoot(a, io, &tmp), "check-log.txt" });
+    try writeChecker(a, io, &tmp, try acceptingAnyChecker(a, log));
+
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MOX_CHECK_TIMEOUT_MS", .value = "notanumber" }},
+    });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try c.homePath("app.toml")));
+    try std.testing.expect(exists(io, try c.homePath("app2.toml")));
+
+    // Two checked files, resolved once per apply run: the same (only) match.
+    const first = std.mem.indexOf(u8, r.err, "MOX_CHECK_TIMEOUT_MS=notanumber");
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(first, std.mem.lastIndexOf(u8, r.err, "MOX_CHECK_TIMEOUT_MS=notanumber"));
 }
 
 // Rollback on partial targets: the snapshot's owned subtree is re-patched
