@@ -181,7 +181,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const defined_envs = try envs.toOwnedSlice(arena);
     const env_values = try env_vals.toOwnedSlice(arena);
 
-    const brew_prefix = try detectBrewPrefix(arena, io, builtin.os.tag);
+    const brew_prefix = try detectBrewPrefix(arena, io, environ, builtin.os.tag, home);
 
     const xdg_config_home = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
     const xdg_cache_home = try resolveXdg(arena, environ, "XDG_CACHE_HOME", home, ".cache");
@@ -297,18 +297,113 @@ test "osAxisValue: macOS reports darwin, others pass through" {
     try std.testing.expectEqualStrings("windows", osAxisValue(.windows));
 }
 
-fn detectBrewPrefix(arena: std.mem.Allocator, io: Io, os_tag: std.Target.Os.Tag) ![]const u8 {
-    const candidates: []const []const u8 = if (os_tag == .macos)
-        &[_][]const u8{ "/opt/homebrew", "/usr/local" }
-    else
-        &[_][]const u8{ "/home/linuxbrew/.linuxbrew", "/usr/local" };
+/// Absolute path to `<tmp>/sub` via the canonical `<cwd>/.zig-cache/tmp/<id>`
+/// location, matching the pattern used across the other source-tree tests.
+fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []const u8) ![]u8 {
+    const io = std.testing.io;
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    if (sub.len == 0) return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
+    return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path, sub });
+}
 
-    for (candidates) |dir| {
-        const brew_bin = try std.fs.path.join(arena, &.{ dir, "bin", "brew" });
-        Io.Dir.cwd().access(io, brew_bin, .{}) catch continue;
-        return try arena.dupe(u8, dir);
+test "detectBrewPrefix: HOMEBREW_PREFIX is consulted ahead of the hardcoded candidates" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "custom/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "custom/bin/brew", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prefix = try tmpAbsPath(a, &tmp, "custom");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOMEBREW_PREFIX", prefix);
+    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .macos, "/home/x");
+    try std.testing.expectEqualStrings(prefix, got);
+}
+
+test "detectBrewPrefix: HOMEBREW_PREFIX pointing nowhere falls back to hardcoded candidates" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var map = EnvironMap.init(a);
+    try map.put("HOMEBREW_PREFIX", "/definitely/does/not/exist");
+    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .linux, "/home/x");
+    try std.testing.expectEqualStrings("", got);
+}
+
+test "detectBrewPrefix: a non-root <home>/.linuxbrew install is found on Linux" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".linuxbrew/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".linuxbrew/bin/brew", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = try tmpAbsPath(a, &tmp, "");
+    const want = try std.fs.path.join(a, &.{ home, ".linuxbrew" });
+
+    var map = EnvironMap.init(a);
+    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .linux, home);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+test "detectBrewPrefix: empty home skips the <home>/.linuxbrew candidate without erroring" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var map = EnvironMap.init(a);
+    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .linux, "");
+    try std.testing.expectEqualStrings("", got);
+}
+
+/// Detect the active Homebrew/Linuxbrew prefix. A caller-set `HOMEBREW_PREFIX`
+/// (brew's own `shellenv` export) names the install brew itself picked, so it
+/// is tried before any hardcoded guess -- an override of the default install
+/// location would otherwise never be found. Falls back to the conventional
+/// per-OS locations, including the non-root `<home>/.linuxbrew` install
+/// alongside the system-wide `/home/linuxbrew/.linuxbrew` one.
+fn detectBrewPrefix(
+    arena: std.mem.Allocator,
+    io: Io,
+    environ: Environ,
+    os_tag: std.Target.Os.Tag,
+    home: []const u8,
+) ![]const u8 {
+    if (envOr(arena, environ, "HOMEBREW_PREFIX")) |prefix| {
+        if (hasBrewBin(arena, io, prefix)) return try arena.dupe(u8, prefix);
+    }
+
+    var candidates: std.ArrayList([]const u8) = .empty;
+    if (os_tag == .macos) {
+        try candidates.appendSlice(arena, &.{ "/opt/homebrew", "/usr/local" });
+    } else {
+        try candidates.append(arena, "/home/linuxbrew/.linuxbrew");
+        if (home.len > 0) {
+            try candidates.append(arena, try std.fs.path.join(arena, &.{ home, ".linuxbrew" }));
+        }
+        try candidates.append(arena, "/usr/local");
+    }
+
+    for (candidates.items) |dir| {
+        if (hasBrewBin(arena, io, dir)) return try arena.dupe(u8, dir);
     }
     return try arena.dupe(u8, "");
+}
+
+fn hasBrewBin(arena: std.mem.Allocator, io: Io, dir: []const u8) bool {
+    const brew_bin = std.fs.path.join(arena, &.{ dir, "bin", "brew" }) catch return false;
+    Io.Dir.cwd().access(io, brew_bin, .{}) catch return false;
+    return true;
 }
 
 fn resolveXdg(
