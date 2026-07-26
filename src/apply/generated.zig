@@ -21,6 +21,7 @@ const applied = @import("applied.zig");
 const snapshot = @import("snapshot.zig");
 const write = @import("write.zig");
 const prov_map = @import("../provenance/root.zig").map;
+const dirent = @import("../source/dirent.zig");
 
 const max_content_bytes: usize = 64 * 1024 * 1024;
 
@@ -80,6 +81,60 @@ pub fn writeManifest(arena: std.mem.Allocator, io: Io, state_dir: []const u8, ge
 /// Drop the generator's manifest entirely (its source is being removed).
 pub fn deleteManifest(arena: std.mem.Allocator, io: Io, state_dir: []const u8, gen_live: []const u8) !void {
     Io.Dir.cwd().deleteFile(io, try manifestPath(arena, state_dir, gen_live)) catch {};
+}
+
+/// The manifest-file name (hash of the generator's live path) for membership
+/// checks against the on-disk manifest set.
+pub fn manifestName(gen_live: []const u8) [64]u8 {
+    return applied.contentHashHex(gen_live);
+}
+
+/// Prune ORPHANED manifests: every manifest in `<state>/generated/` whose
+/// name is not in `known` belongs to a generator that left the tree -- its
+/// source was deleted outside `mox remove`, or the file no longer parses as
+/// a generator. Each orphan's listed leaves are pruned against `keep`
+/// (snapshot-first, drift-refusing, exactly like a live generator's prune),
+/// then the manifest itself is dropped. Callers must skip this sweep on a
+/// scoped apply (an unwalked generator is not an orphan) and after a
+/// drift-prompt abort.
+pub fn sweepOrphans(
+    arena: std.mem.Allocator,
+    io: Io,
+    opts: Options,
+    known: *const std.StringHashMap(void),
+    keep: *const std.StringHashMap(void),
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !Result {
+    var result: Result = .{};
+    const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
+
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return result;
+
+    for (entries) |entry| {
+        if (entry.kind != .file) continue;
+        if (known.contains(entry.name)) continue;
+        const name = entry.name;
+        const path = try std.fs.path.join(arena, &.{ gen_dir_path, name });
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        var all_removed = true;
+        while (lines.next()) |line| {
+            const leaf = std.mem.trim(u8, line, " \t\r");
+            if (leaf.len == 0) continue;
+            if (keep.contains(leaf)) continue;
+            const before = result.refused;
+            try removeLeaf(arena, io, opts, leaf, stdout, stderr, &result);
+            if (result.refused > before) all_removed = false;
+        }
+        // Keep the manifest while any leaf was refused (drifted or
+        // unsnapshottable), so the next apply retries instead of orphaning
+        // the leaf itself.
+        if (all_removed and !opts.dry_run) {
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
+    }
+    return result;
 }
 
 /// Remove every prior-set path not in `keep`, snapshot-first. `keep` holds the

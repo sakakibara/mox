@@ -4252,3 +4252,81 @@ test "rollback disown: a suffix run of disowned members re-patches through the s
     try std.testing.expect(std.mem.indexOf(u8, after, "m-new") != null);
     _ = try json_mod.parse(a, after, .{});
 }
+
+test "apply generator sweep: deleting the generator source prunes its set and manifest" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenFixture(io, &tmp, &.{ "a", "b" });
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".config/id-a.inc")));
+
+    // Delete the SOURCE directly (git rm / editor), not via `mox remove`.
+    try tmp.dir.deleteFile(io, "repo/src/.config/gen.inc");
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
+    try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
+
+    // The manifest is gone with it: a third apply has nothing to say.
+    const again = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), again.rc);
+    try std.testing.expect(std.mem.indexOf(u8, again.out, "removed") == null);
+}
+
+test "apply generator sweep: a source that stops being a generator prunes the old set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenFixture(io, &tmp, &.{"a"});
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".config/id-a.inc")));
+
+    // The directive line is deleted; the file is now an ordinary managed file
+    // that materializes at its own path. Its old produced set must not linger.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.config/gen.inc", .data = "plain\n" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
+    try std.testing.expectEqualStrings("plain\n", try read(io, a, try c.homePath(".config/gen.inc")));
+}
+
+test "apply completions: stubs land at home; a dropped row prunes its stub" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.zcomp");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions zsh \"data/completions.toml\"\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/completions.toml", .data = "[[completions]]\nname = \"herdr\"\ncommand = \"herdr completion\"\n\n[[completions]]\nname = \"mox\"\ncommand = \"mox completion\"\nzsh_dispatch = \"_mox_complete\"\n" });
+    const c = try cliSetup(a, io, &tmp);
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const herdr = try read(io, a, try c.homePath(".zcomp/_herdr"));
+    try std.testing.expect(std.mem.indexOf(u8, herdr, "compdef _herdr herdr\n_herdr \"$@\"\n") != null);
+    try std.testing.expect(exists(io, try c.homePath(".zcomp/_mox")));
+    try std.testing.expect(!exists(io, try c.homePath(".zcomp/completions.gen")));
+
+    // Drop the mox row: its stub is pruned on the next apply.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/completions.toml", .data = "[[completions]]\nname = \"herdr\"\ncommand = \"herdr completion\"\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".zcomp/_herdr")));
+    try std.testing.expect(!exists(io, try c.homePath(".zcomp/_mox")));
+}

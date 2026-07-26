@@ -402,6 +402,34 @@ fn applyPass(
         if (!dry_run) try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, g.live_path, g.current);
     }
 
+    // Third pass: sweep manifests whose generator left the tree (source
+    // deleted outside `mox remove`, or the file no longer parses as a
+    // generator). Known = every walked generator this run, succeeded or
+    // failed, plus any file with a head error (its nature is undecided this
+    // run). Never on a scoped apply -- an unwalked generator is not an
+    // orphan -- and never after a drift-prompt abort.
+    if (!scoped and !resolver.aborted) {
+        var known: std.StringHashMap(void) = .init(ctx.alloc);
+        for (gen_states.items) |g| {
+            try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(g.live_path)), {});
+        }
+        for (files) |f| {
+            if (f.head_error.len > 0) {
+                try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(f.live_path)), {});
+            }
+        }
+        const swept = try mox.apply.generated.sweepOrphans(ctx.alloc, ctx.io, .{
+            .state_dir = context.paths.state_dir,
+            .snapshots_dir = context.paths.snapshots_dir,
+            .snap_id = snap_id,
+            .home = context.paths.home,
+            .force = force,
+            .dry_run = dry_run,
+        }, &known, &keep_set, ctx.out, ctx.err);
+        if (swept.removed > 0 and !dry_run) snapshotted = true;
+        counts.fail += swept.refused;
+    }
+
     // Exact-directory sweep: after every managed file is written, remove live
     // entries in `.mox-exact` directories that mox did not produce. The global
     // keep set is the managed set: a generated leaf (current, or a failed
