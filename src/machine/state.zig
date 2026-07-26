@@ -46,6 +46,10 @@ pub const MachineState = struct {
     /// User-supplied facts from `$XDG_CONFIG_HOME/mox/facts.toml`. Empty when
     /// the file is absent. A built-in field with the same name takes priority.
     custom_facts: []const Fact = &.{},
+    /// Top-level `facts.toml` keys dropped for a non-string value. Loud on
+    /// capture use (a gate naming the key just never matches); named here so
+    /// a caller can warn instead of leaving the drop silent too.
+    skipped_fact_keys: []const []const u8 = &.{},
 };
 
 /// Tools to probe via `$PATH` lookup. The presence of a name in
@@ -170,7 +174,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const pnpm_home = envOr(arena, environ, "PNPM_HOME") orelse try arena.dupe(u8, "");
 
     const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
-    const custom_facts = try facts_mod.load(arena, io, facts_path);
+    const facts_result = try facts_mod.load(arena, io, facts_path);
 
     return .{
         .os = os_str,
@@ -190,7 +194,8 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
         .xdg_cache_home = xdg_cache_home,
         .xdg_data_home = xdg_data_home,
         .xdg_state_home = xdg_state_home,
-        .custom_facts = custom_facts,
+        .custom_facts = facts_result.facts,
+        .skipped_fact_keys = facts_result.skipped,
     };
 }
 

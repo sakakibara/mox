@@ -12,8 +12,11 @@ const BareSpec = struct {};
 fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
     const context = ctx.context.?;
     const current = try mox.machine.facts.load(ctx.alloc, ctx.io, context.paths.facts_path);
-    for (current) |f| {
+    for (current.facts) |f| {
         try ctx.out.print("{s} = \"{s}\"\n", .{ f.name, f.value });
+    }
+    for (current.skipped) |key| {
+        try ctx.err.print("mox facts: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
     }
 
     const schema = try mox.machine.interview.loadSchema(ctx.alloc, ctx.io, context.paths.repo_dir);

@@ -78,6 +78,9 @@ fn applyPass(
 
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    for (m_state.skipped_fact_keys) |key| {
+        try ctx.err.print("mox apply: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
+    }
 
     // Facts interview: prompt for schema-declared facts that are not yet
     // bound, persist the answers, and re-capture so this apply already

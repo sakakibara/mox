@@ -1129,6 +1129,28 @@ test "apply: nothing about this machine is written outside it" {
     try std.testing.expect(std.mem.indexOf(u8, live, "canary@example.invalid") != null);
 }
 
+test "apply and facts: a non-string facts.toml value is dropped loudly, not silently" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const facts_path = try h.homePath(".config/mox/facts.toml");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "profile = 1\n" });
+
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "facts.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "profile") != null);
+
+    const facts_out = try h.run(&.{ "mox", "facts" });
+    try std.testing.expect(std.mem.indexOf(u8, facts_out.err, "profile") != null);
+}
+
 test "apply: a pre-script's axis-relevant change is visible to compose in the same apply" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -6,40 +6,52 @@ const state_mod = @import("state.zig");
 
 const max_facts_bytes: usize = 64 * 1024;
 
+/// `load`'s result: the usable facts plus the names of any top-level keys
+/// dropped for a non-string value, so a caller can warn instead of leaving
+/// the drop silent.
+pub const LoadResult = struct {
+    facts: []const state_mod.Fact,
+    /// Top-level keys whose value was not a string, in file order.
+    skipped: []const []const u8 = &.{},
+};
+
 /// Load custom machine facts from a TOML file.
 ///
-/// Top-level scalar string entries become facts. Non-string values
-/// (numbers, bools, arrays, nested tables) are silently skipped — facts
-/// are meant to feed into axis matching and `<machine.X>` substitution,
-/// both of which are stringly-typed.
+/// Top-level scalar string entries become facts. A non-string value (number,
+/// bool, array, nested table) is dropped -- facts feed into axis matching and
+/// `<machine.X>` substitution, both stringly-typed -- and named in `skipped`
+/// so the caller can warn: loud on capture use (a `when profile=work` gate
+/// simply never matches), it must not also be silent here.
 ///
-/// A missing file is not an error: returns an empty slice. This lets
+/// A missing file is not an error: returns an empty result. This lets
 /// `mox apply` work uniformly whether or not the user has configured facts.
-pub fn load(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const state_mod.Fact {
+pub fn load(arena: std.mem.Allocator, io: Io, path: []const u8) !LoadResult {
     const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_facts_bytes)) catch |e| switch (e) {
-        error.FileNotFound => return &.{},
+        error.FileNotFound => return .{ .facts = &.{} },
         else => return e,
     };
 
     const v = try toml.parse(arena, content, .{});
-    if (v != .table) return &.{};
+    if (v != .table) return .{ .facts = &.{} };
 
     var out: std.ArrayList(state_mod.Fact) = .empty;
+    var skipped: std.ArrayList([]const u8) = .empty;
     var it = v.table.iterator();
     while (it.next()) |entry| {
         switch (entry.value_ptr.*) {
             .string => |s| try out.append(arena, .{ .name = entry.key_ptr.*, .value = s }),
-            else => {},
+            else => try skipped.append(arena, entry.key_ptr.*),
         }
     }
-    return out.toOwnedSlice(arena);
+    return .{ .facts = try out.toOwnedSlice(arena), .skipped = try skipped.toOwnedSlice(arena) };
 }
 
 test "load: missing file returns empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const facts = try load(arena.allocator(), std.testing.io, "/nonexistent/path/facts.toml");
-    try std.testing.expectEqual(@as(usize, 0), facts.len);
+    const r = try load(arena.allocator(), std.testing.io, "/nonexistent/path/facts.toml");
+    try std.testing.expectEqual(@as(usize, 0), r.facts.len);
+    try std.testing.expectEqual(@as(usize, 0), r.skipped.len);
 }
 
 test "load: reads top-level scalar string entries" {
@@ -61,12 +73,13 @@ test "load: reads top-level scalar string entries" {
     });
     defer std.testing.allocator.free(facts_path);
 
-    const facts = try load(arena.allocator(), io, facts_path);
-    try std.testing.expectEqual(@as(usize, 3), facts.len);
+    const r = try load(arena.allocator(), io, facts_path);
+    try std.testing.expectEqual(@as(usize, 3), r.facts.len);
+    try std.testing.expectEqual(@as(usize, 0), r.skipped.len);
 
     var got_email: ?[]const u8 = null;
     var got_profile: ?[]const u8 = null;
-    for (facts) |f| {
+    for (r.facts) |f| {
         if (std.mem.eql(u8, f.name, "email")) got_email = f.value;
         if (std.mem.eql(u8, f.name, "profile")) got_profile = f.value;
     }
@@ -74,7 +87,7 @@ test "load: reads top-level scalar string entries" {
     try std.testing.expectEqualStrings("personal", got_profile.?);
 }
 
-test "load: skips non-string values" {
+test "load: skips non-string values, and names them in skipped" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -96,8 +109,13 @@ test "load: skips non-string values" {
     });
     defer std.testing.allocator.free(facts_path);
 
-    const facts = try load(arena.allocator(), io, facts_path);
-    try std.testing.expectEqual(@as(usize, 1), facts.len);
-    try std.testing.expectEqualStrings("name", facts[0].name);
-    try std.testing.expectEqualStrings("hello", facts[0].value);
+    const r = try load(arena.allocator(), io, facts_path);
+    try std.testing.expectEqual(@as(usize, 1), r.facts.len);
+    try std.testing.expectEqualStrings("name", r.facts[0].name);
+    try std.testing.expectEqualStrings("hello", r.facts[0].value);
+
+    try std.testing.expectEqual(@as(usize, 3), r.skipped.len);
+    try std.testing.expectEqualStrings("count", r.skipped[0]);
+    try std.testing.expectEqualStrings("enabled", r.skipped[1]);
+    try std.testing.expectEqualStrings("places", r.skipped[2]);
 }
