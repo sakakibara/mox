@@ -45,6 +45,36 @@ pub fn isHomeItself(live_path: []const u8, home: []const u8) bool {
     return std.mem.eql(u8, l, h);
 }
 
+/// `home` and `live_path`, realpath'd, for the home-membership check: a byte
+/// prefix comparison of the ORIGINAL strings wrongly refuses a live path that
+/// is textually different but resolves to the same location -- a
+/// case-insensitive filesystem (macOS) spelling one differently, or a
+/// symlinked HOME reached through the link on one side and the real
+/// directory on the other. Only `live_path`'s PARENT is resolved, never its
+/// own final component: a live symlink is captured through the link (its own
+/// position is the key), so resolving it away would key the capture by
+/// wherever it points instead of where it lives. Both `home` and the parent
+/// resolve together or neither does: comparing one canonicalized path
+/// against one still-symlinked path would be its own false mismatch, so a
+/// not-yet-created ancestor or an unsupported realpath falls back to the
+/// ORIGINAL pair, matching today's behavior instead of a mixed comparison.
+fn realHomePair(arena: std.mem.Allocator, io: Io, home: []const u8, live_path: []const u8) !struct {
+    home: []const u8,
+    live_path: []const u8,
+} {
+    const real_home = Io.Dir.realPathFileAbsoluteAlloc(io, home, arena) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .home = home, .live_path = live_path },
+    };
+    const parent = std.fs.path.dirname(live_path) orelse return .{ .home = home, .live_path = live_path };
+    const real_parent = Io.Dir.realPathFileAbsoluteAlloc(io, parent, arena) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .home = home, .live_path = live_path },
+    };
+    const real_live = try std.fs.path.join(arena, &.{ real_parent, std.fs.path.basename(live_path) });
+    return .{ .home = real_home, .live_path = real_live };
+}
+
 /// Copy one live file into `src/` as a base file. Returns an Outcome the
 /// caller renders. Junk filtering and recursion are the caller's concern (see
 /// add-tree). A mode git cannot carry (not 0644/0755) is recorded in
@@ -74,10 +104,13 @@ pub fn addFile(
     // Boundary-aware home membership, matching the attribute key derivation
     // (relUnder): a raw startsWith would let `/home/me` swallow `/home/meadow`,
     // and the recorded key and the add path would then disagree. `relUnder`
-    // returns null for HOME itself, so detect that separately.
-    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
+    // returns null for HOME itself, so detect that separately. Realpath'd
+    // first so a case-insensitive filesystem or a symlinked HOME does not
+    // refuse a live path that is textually different but really is inside.
+    const real = try realHomePair(arena, io, home, live_path);
+    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, real.home, real.live_path)) |rel|
         rel
-    else if (isHomeItself(live_path, home))
+    else if (isHomeItself(real.live_path, real.home))
         return .{ .outcome = .is_home }
     else
         return .{ .outcome = .outside_home };
@@ -237,9 +270,10 @@ pub fn addOwnFile(
     if (st.kind == .directory) return .{ .outcome = .is_directory };
     if (st.kind != .file) return .{ .outcome = .not_regular };
 
-    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
+    const real = try realHomePair(arena, io, home, live_path);
+    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, real.home, real.live_path)) |rel|
         rel
-    else if (isHomeItself(live_path, home))
+    else if (isHomeItself(real.live_path, real.home))
         return .{ .outcome = .is_home }
     else
         return .{ .outcome = .outside_home };
@@ -390,9 +424,10 @@ pub fn addDisownFile(
     if (st.kind == .directory) return .{ .outcome = .is_directory };
     if (st.kind != .file) return .{ .outcome = .not_regular };
 
-    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
+    const real = try realHomePair(arena, io, home, live_path);
+    const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, real.home, real.live_path)) |rel|
         rel
-    else if (isHomeItself(live_path, home))
+    else if (isHomeItself(real.live_path, real.home))
         return .{ .outcome = .is_home }
     else
         return .{ .outcome = .outside_home };
@@ -846,6 +881,32 @@ test "addFile: a sibling dir sharing a home prefix is outside_home, not mis-keye
 
     const r = try addFile(a, io, repo, home, sibling, false);
     try testing.expectEqual(Outcome.outside_home, r.outcome);
+}
+
+test "addFile: a symlinked HOME does not refuse a live path given via the real directory" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const repo = try std.fs.path.join(a, &.{ root, "repo" });
+    try tmp.dir.createDirPath(io, "realhome");
+    try tmp.dir.writeFile(io, .{ .sub_path = "realhome/.zshrc", .data = "x\n" });
+    try tmp.dir.symLink(io, "realhome", "linkhome", .{ .is_directory = true });
+
+    // HOME is configured as the symlink; the live path is given through the
+    // REAL directory (as a shell with symlinks resolved might report it). A
+    // byte-prefix check sees two different strings and wrongly refuses.
+    const home = try std.fs.path.join(a, &.{ root, "linkhome" });
+    const live = try std.fs.path.join(a, &.{ root, "realhome", ".zshrc" });
+
+    const r = try addFile(a, io, repo, home, live, false);
+    try testing.expectEqual(Outcome.added, r.outcome);
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ repo, "src", ".zshrc" }), r.src_path);
 }
 
 test "addFile: a '..' path that escapes the source tree is refused" {
