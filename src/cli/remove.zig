@@ -31,9 +31,32 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const live_path = try edit.liveTarget(ctx.alloc, name, context.paths.home);
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    const tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, context.paths.home) catch |e| switch (e) {
+    var walk_diag: mox.source.tree.Diag = .{};
+    const tree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, context.paths.home, &walk_diag) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox remove: source tree not found at {s}\n", .{src_dir});
+            return 1;
+        },
+        error.OwnOnSymlink,
+        error.OwnOnSeedOnce,
+        error.OwnOnGenerator,
+        error.OwnAndDisown,
+        error.OwnPathOverlap,
+        error.InvalidOwnPath,
+        error.InvalidCheckDirective,
+        error.CheckWithoutOwnership,
+        => {
+            try ctx.err.print("mox remove: ownership declaration: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
+            });
+            return 1;
+        },
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox remove: attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
             return 1;
         },
         else => return e,
@@ -80,7 +103,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // the same path (add merges, it does not clear a flag it was not given).
     {
         const key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, live_path);
-        var attrs = try mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir, null);
+        var attrs_diag: mox.source.attributes.Diag = .{};
+        var attrs = mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir, &attrs_diag) catch |e| switch (e) {
+            error.UnknownAttributeKey,
+            error.InvalidAttributeValue,
+            => {
+                try ctx.err.print("mox remove: attributes.toml: {s}: {s}\n", .{
+                    attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+                });
+                return 1;
+            },
+            else => return e,
+        };
         if (attrs.remove(key)) try attrs.write(ctx.io, context.paths.repo_dir);
     }
 

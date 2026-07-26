@@ -88,6 +88,7 @@ pub fn addFile(
     home: []const u8,
     live_path: []const u8,
     seed_once: bool,
+    attrs_diag: ?*mox.source.attributes.Diag,
 ) !Result {
     // lstat, not stat: a live symlink is captured as such, never followed.
     const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
@@ -146,7 +147,7 @@ pub fn addFile(
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const n = try Io.Dir.cwd().readLink(io, live_path, &buf);
         try mox.apply.write.writeAtomic(io, src_path, buf[0..n], 0o644);
-        try recordAttrs(arena, io, repo_dir, home, live_path, .{ .symlink = true, .seed_once = seed_once });
+        try recordAttrs(arena, io, repo_dir, home, live_path, .{ .symlink = true, .seed_once = seed_once }, attrs_diag);
         return .{ .outcome = .added, .src_path = src_path };
     }
 
@@ -161,7 +162,7 @@ pub fn addFile(
     // travel via git+stat), and the explicit seed-once intent. Keyed by the
     // portable home-relative key, never the native path.
     const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode, .seed_once = seed_once });
+    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode, .seed_once = seed_once }, attrs_diag);
     return .{ .outcome = .added, .src_path = src_path };
 }
 
@@ -190,10 +191,11 @@ fn recordAttrs(
     home: []const u8,
     live_path: []const u8,
     fields: mox.source.attributes.Entry,
+    attrs_diag: ?*mox.source.attributes.Diag,
 ) !void {
     if (fields.mode == null and !fields.symlink and !fields.seed_once) return;
     const key = try mox.source.path.liveKeyRelToHome(arena, home, live_path);
-    var attrs = try mox.source.attributes.load(arena, io, repo_dir, null);
+    var attrs = try mox.source.attributes.load(arena, io, repo_dir, attrs_diag);
     var entry = attrs.lookup(key) orelse mox.source.attributes.Entry{};
     if (fields.mode) |m| entry.mode = m;
     if (fields.symlink) entry.symlink = true;
@@ -244,6 +246,7 @@ pub fn addOwnFile(
     own_raws: []const []const u8,
     absent_raws: []const []const u8,
     gate: ?[]const u8,
+    attrs_diag: ?*mox.source.attributes.Diag,
 ) !OwnResult {
     const lst = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return .{ .outcome = .not_found },
@@ -344,7 +347,7 @@ pub fn addOwnFile(
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
 
     const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode });
+    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode }, attrs_diag);
 
     return .{
         .outcome = .added,
@@ -401,6 +404,7 @@ pub fn addDisownFile(
     live_path: []const u8,
     disown_raws: []const []const u8,
     gate: ?[]const u8,
+    attrs_diag: ?*mox.source.attributes.Diag,
 ) !OwnResult {
     const lst = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return .{ .outcome = .not_found },
@@ -521,7 +525,7 @@ pub fn addDisownFile(
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
 
     const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode });
+    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode }, attrs_diag);
 
     return .{ .outcome = .added, .src_path = src_path };
 }
@@ -647,7 +651,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         return runOwn(ctx, home, live_path, own_raws, absent_raws, a.gate);
     }
 
-    const result = try addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, a.seed_once);
+    var attrs_diag: mox.source.attributes.Diag = .{};
+    const result = addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, a.seed_once, &attrs_diag) catch |e| switch (e) {
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox add: attributes.toml: {s}: {s}\n", .{
+                attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
+        else => return e,
+    };
     switch (result.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s}\n", .{ live_path, result.src_path });
@@ -704,7 +719,18 @@ fn runOwn(
     gate: ?[]const u8,
 ) anyerror!u8 {
     const context = ctx.context.?;
-    const r = try addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws, gate);
+    var attrs_diag: mox.source.attributes.Diag = .{};
+    const r = addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws, gate, &attrs_diag) catch |e| switch (e) {
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox add: attributes.toml: {s}: {s}\n", .{
+                attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
+        else => return e,
+    };
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s} (own: {d} key-path(s))\n", .{ live_path, r.src_path, own_raws.len + absent_raws.len });
@@ -774,7 +800,18 @@ fn runDisown(
     gate: ?[]const u8,
 ) anyerror!u8 {
     const context = ctx.context.?;
-    const r = try addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws, gate);
+    var attrs_diag: mox.source.attributes.Diag = .{};
+    const r = addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws, gate, &attrs_diag) catch |e| switch (e) {
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox add: attributes.toml: {s}: {s}\n", .{
+                attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
+        else => return e,
+    };
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ live_path, r.src_path, disown_raws.len });
@@ -852,13 +889,13 @@ test "addFile: a directory is rejected with is_directory, not a raw error" {
     try tmp.dir.createDirPath(io, "home/adir");
     const adir = try std.fs.path.join(a, &.{ home, "adir" });
 
-    const r = try addFile(a, io, repo, home, adir, false);
+    const r = try addFile(a, io, repo, home, adir, false, null);
     try testing.expectEqual(Outcome.is_directory, r.outcome);
 
     // A regular file under home still adds.
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.zshrc", .data = "x\n" });
     const afile = try std.fs.path.join(a, &.{ home, ".zshrc" });
-    const ok = try addFile(a, io, repo, home, afile, false);
+    const ok = try addFile(a, io, repo, home, afile, false, null);
     try testing.expectEqual(Outcome.added, ok.outcome);
 }
 
@@ -879,7 +916,7 @@ test "addFile: a sibling dir sharing a home prefix is outside_home, not mis-keye
     try tmp.dir.writeFile(io, .{ .sub_path = "meadow/x", .data = "hi\n" });
     const sibling = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "meadow", "x" });
 
-    const r = try addFile(a, io, repo, home, sibling, false);
+    const r = try addFile(a, io, repo, home, sibling, false, null);
     try testing.expectEqual(Outcome.outside_home, r.outcome);
 }
 
@@ -904,7 +941,7 @@ test "addFile: a symlinked HOME does not refuse a live path given via the real d
     const home = try std.fs.path.join(a, &.{ root, "linkhome" });
     const live = try std.fs.path.join(a, &.{ root, "realhome", ".zshrc" });
 
-    const r = try addFile(a, io, repo, home, live, false);
+    const r = try addFile(a, io, repo, home, live, false, null);
     try testing.expectEqual(Outcome.added, r.outcome);
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ repo, "src", ".zshrc" }), r.src_path);
 }
@@ -929,7 +966,7 @@ test "addFile: a '..' path that escapes the source tree is refused" {
 
     // The path stats fine (it resolves to root/secret), but its derived key
     // carries `..` and must be refused rather than captured outside src/.
-    const r = try addFile(a, io, repo, home, escape, false);
+    const r = try addFile(a, io, repo, home, escape, false, null);
     try testing.expectEqual(Outcome.outside_home, r.outcome);
 }
 
@@ -963,19 +1000,19 @@ test "addFile: a restrictive mode is recorded in attributes; 0644/0755 are not" 
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.ssh/config", .data = "Host x\n" });
     const priv = try std.fs.path.join(a, &.{ home, ".ssh", "config" });
     chmod(priv, 0o600);
-    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, priv, false)).outcome);
+    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, priv, false, null)).outcome);
 
     // A 0755 live file: git+stat carry it, so nothing is recorded.
     try tmp.dir.writeFile(io, .{ .sub_path = "home/tool", .data = "#!/bin/sh\n" });
     const tool = try std.fs.path.join(a, &.{ home, "tool" });
     chmod(tool, 0o755);
-    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, tool, false)).outcome);
+    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, tool, false, null)).outcome);
 
     // A 0644 live file: nothing to record.
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.zshrc", .data = "x\n" });
     const rc = try std.fs.path.join(a, &.{ home, ".zshrc" });
     chmod(rc, 0o644);
-    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, rc, false)).outcome);
+    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, rc, false, null)).outcome);
 
     var attrs = try mox.source.attributes.load(a, io, repo, null);
     try testing.expectEqual(@as(u32, 0o600), attrs.mode(".ssh/config").?);
@@ -998,11 +1035,11 @@ test "addFile: --seed-once records seed_once; a plain add does not" {
     try tmp.dir.createDirPath(io, "home/.config");
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app.local", .data = "x\n" });
     const seeded = try std.fs.path.join(a, &.{ home, ".config", "app.local" });
-    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, seeded, true)).outcome);
+    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, seeded, true, null)).outcome);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.zshrc", .data = "x\n" });
     const plain = try std.fs.path.join(a, &.{ home, ".zshrc" });
-    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, plain, false)).outcome);
+    try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, plain, false, null)).outcome);
 
     var attrs = try mox.source.attributes.load(a, io, repo, null);
     try testing.expect(attrs.seedOnce(".config/app.local"));

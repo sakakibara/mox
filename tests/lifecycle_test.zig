@@ -442,6 +442,28 @@ test "remove --purge deletes the live file after snapshotting it" {
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ snap_gen, ".zshrc" })));
 }
 
+test "remove: an unknown attributes.toml key refuses with the friendly schema message, not a raw error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "content\n");
+    // A typo'd key (`seed_one` for `seed_once`): the raw zig error name
+    // (`UnknownAttributeKey`) must never reach the user.
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".zshrc\"]\nseed_one = true\n");
+
+    const r = try h.run(&.{ "mox", "remove", ".zshrc" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "attributes.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "seed_one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "schema") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownAttributeKey") == null);
+}
+
 test "add-tree: a coupling-graph persistence failure warns as add-tree, not add" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -587,6 +609,32 @@ test "add: a relative path resolves against HOME" {
     const r = try h.run(&.{ "mox", "add", "notes.txt" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+}
+
+test "add: an unknown attributes.toml key refuses with the friendly schema message, not a raw error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // A symlink capture unconditionally records into attributes.toml
+    // (`symlink = true`), so it always reaches the load this exercises.
+    const link = try h.homePath("link.conf");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/real.conf", .data = "x\n" });
+    try Io.Dir.cwd().symLink(io, "real.conf", link, .{});
+    // A typo'd key (`seed_one` for `seed_once`): the raw zig error name
+    // (`UnknownAttributeKey`) must never reach the user.
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"link.conf\"]\nseed_one = true\n");
+
+    const r = try h.run(&.{ "mox", "add", "link.conf" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "attributes.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "seed_one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "schema") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownAttributeKey") == null);
 }
 
 test "add: a coupling-graph persistence failure warns, but the add itself still succeeds" {

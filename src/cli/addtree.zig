@@ -110,7 +110,7 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                 }
                 // Bulk-adding a tree never seeds once; only single-file add
                 // exposes the intent.
-                const result = add.addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, child, false) catch {
+                const result = add.addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, child, false, null) catch {
                     counts.failed += 1;
                     continue;
                 };
