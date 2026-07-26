@@ -81,6 +81,12 @@ fn applyPass(
     for (m_state.skipped_fact_keys) |key| {
         try ctx.err.print("mox apply: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
     }
+    if (m_state.hostname_fallback) {
+        try ctx.err.writeAll("mox apply: hostname could not be determined; using \"unknown\"\n");
+    }
+    if (m_state.username_fallback) {
+        try ctx.err.writeAll("mox apply: username could not be determined; using \"unknown\"\n");
+    }
 
     // Facts interview: prompt for schema-declared facts that are not yet
     // bound, persist the answers, and re-capture so this apply already

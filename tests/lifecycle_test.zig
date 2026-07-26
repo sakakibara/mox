@@ -1171,6 +1171,37 @@ test "apply: nothing about this machine is written outside it" {
     try std.testing.expect(std.mem.indexOf(u8, live, "canary@example.invalid") != null);
 }
 
+test "apply: an unset USER/USERNAME warns instead of silently interpolating \"unknown\"" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "home");
+    try tmp.dir.createDirPath(io, "repo/src");
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ root, "home" });
+    const repo = try std.fs.path.join(a, &.{ root, "repo" });
+    const state = try std.fs.path.join(a, &.{ root, "state" });
+
+    // No USER/USERNAME entry at all -- unlike testutil.setup, which always
+    // defines USER, so this is the only way to reach the fallback.
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", home);
+    try map.put("MOX_REPO", repo);
+    try map.put("MOX_STATE_DIR", state);
+    const map_ptr = try a.create(std.process.Environ.Map);
+    map_ptr.* = map;
+    const h: Harness = .{ .a = a, .io = io, .env = .{ .map = map_ptr }, .root = root, .home = home, .repo = repo, .state = state };
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "username could not be determined") != null);
+}
+
 test "apply and facts: a non-string facts.toml value is dropped loudly, not silently" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

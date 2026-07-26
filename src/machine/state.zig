@@ -23,7 +23,16 @@ pub const MachineState = struct {
     os: []const u8,
     arch: []const u8,
     hostname: []const u8,
+    /// True when `hostname` could not be determined (gethostname failure on
+    /// POSIX, unset COMPUTERNAME on Windows) and fell back to the literal
+    /// "unknown": a `machine=` gate silently never matches and "unknown"
+    /// silently interpolates unless a caller warns on this.
+    hostname_fallback: bool = false,
     username: []const u8,
+    /// True when `username` could not be determined (USER/USERNAME both
+    /// unset) and fell back to the literal "unknown", same caveat as
+    /// `hostname_fallback`.
+    username_fallback: bool = false,
     home: []const u8,
     tools_on_path: []const []const u8,
     /// Same set as `tools_on_path` but with the first-hit absolute path
@@ -114,14 +123,24 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     // Windows has no gethostname/HOST_NAME_MAX under std.posix; the machine
     // name comes from the environment there, as the username and home do.
     var hostname_buf: [if (builtin.os.tag == .windows) 0 else std.posix.HOST_NAME_MAX]u8 = undefined;
+    var hostname_fallback = false;
     const hostname_slice: []const u8 = if (builtin.os.tag == .windows)
-        (envOr(arena, environ, "COMPUTERNAME") orelse "unknown")
+        (envOr(arena, environ, "COMPUTERNAME") orelse blk: {
+            hostname_fallback = true;
+            break :blk "unknown";
+        })
     else
-        (std.posix.gethostname(&hostname_buf) catch "unknown");
+        (std.posix.gethostname(&hostname_buf) catch blk: {
+            hostname_fallback = true;
+            break :blk "unknown";
+        });
 
+    var username_fallback = false;
     const username = envOr(arena, environ, "USER") orelse
-        envOr(arena, environ, "USERNAME") orelse
-        try arena.dupe(u8, "unknown");
+        envOr(arena, environ, "USERNAME") orelse blk: {
+        username_fallback = true;
+        break :blk try arena.dupe(u8, "unknown");
+    };
 
     const home = envOr(arena, environ, "HOME") orelse
         envOr(arena, environ, "USERPROFILE") orelse
@@ -180,7 +199,9 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
         .os = os_str,
         .arch = arch_str,
         .hostname = try arena.dupe(u8, hostname_slice),
+        .hostname_fallback = hostname_fallback,
         .username = username,
+        .username_fallback = username_fallback,
         .home = home,
         .tools_on_path = tools,
         .tool_paths = tool_paths,
@@ -226,6 +247,35 @@ test "capture: both HOME and USERPROFILE unset or empty errors instead of defaul
     // An empty value is unset too, same as absent.
     try map.put("HOME", "");
     try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }));
+}
+
+test "capture: USER and USERNAME unset falls back to \"unknown\" and flags username_fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+
+    const m = try capture(a, std.testing.io, Environ{ .map = &map });
+    try std.testing.expectEqualStrings("unknown", m.username);
+    try std.testing.expect(m.username_fallback);
+    // The real hostname resolves on every CI/dev machine; only the flag is
+    // asserted false here, since forcing a real gethostname failure needs no
+    // portable seam.
+    try std.testing.expect(!m.hostname_fallback);
+}
+
+test "capture: a defined USER is used verbatim, username_fallback stays false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+    try map.put("USER", "tester");
+
+    const m = try capture(a, std.testing.io, Environ{ .map = &map });
+    try std.testing.expectEqualStrings("tester", m.username);
+    try std.testing.expect(!m.username_fallback);
 }
 
 test "resolveXdg: an empty env value falls back to the home default" {
