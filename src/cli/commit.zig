@@ -3981,7 +3981,7 @@ pub fn legend(arena: std.mem.Allocator, choices: []const prompt.Choice, default_
     const out = &aw.writer;
     try out.writeAll("  ");
     for (choices, 0..) |c, i| {
-        try writeGlyph(out, c, i == default_index, sty);
+        try writeGlyph(out, c, i == default_index and !uppercaseCollides(choices, i), sty);
         try out.writeAll("  ");
     }
     try sty.bold(out);
@@ -3993,6 +3993,21 @@ pub fn legend(arena: std.mem.Allocator, choices: []const prompt.Choice, default_
     try sty.close(out);
     try out.writeAll("help ");
     return aw.toOwnedSlice();
+}
+
+/// True when uppercasing this choice's single-letter key would render it
+/// identically to a sibling's exact key (drift's default `s` next to the
+/// `S` skip-all): keys are matched case-sensitively first, so the default
+/// marker must not manufacture that ambiguity.
+fn uppercaseCollides(choices: []const prompt.Choice, idx: usize) bool {
+    const c = choices[idx];
+    if (c.key.len != 1 or !std.ascii.isAlphabetic(c.key[0])) return false;
+    const up = std.ascii.toUpper(c.key[0]);
+    for (choices, 0..) |o, j| {
+        if (j == idx) continue;
+        if (o.key.len == 1 and o.key[0] == up) return true;
+    }
+    return false;
 }
 
 /// Write one choice as `[K]abel` when the label starts with the key's own
@@ -4023,6 +4038,26 @@ pub const command = app.command(Spec, .{
 }, run);
 
 const testing = std.testing;
+
+test "legend: the default key never uppercases into a sibling's exact key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const choices = [_]prompt.Choice{
+        .{ .key = "o", .label = "overwrite" },
+        .{ .key = "s", .label = "skip" },
+        .{ .key = "S", .label = "skip all" },
+    };
+    const off = style.Style{ .on = false };
+    // Default `s` beside the exact-match `S`: `[S]kip` next to `[S]kip all`
+    // would be ambiguous, so the default stays lowercase.
+    const line = try legend(a, &choices, 1, off);
+    try testing.expect(std.mem.indexOf(u8, line, "[s]kip  ") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "[S]kip all") != null);
+    // Without a colliding sibling the default still renders uppercase.
+    const line2 = try legend(a, choices[0..2], 0, off);
+    try testing.expect(std.mem.indexOf(u8, line2, "[O]verwrite") != null);
+}
 
 test "reverseTemplate: extracts entry captures from a matching line" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

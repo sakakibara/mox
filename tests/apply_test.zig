@@ -2413,6 +2413,35 @@ test "apply drift: one run resolves two files in opposite directions" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
 }
 
+test "apply drift: [q] stops the run, reports the rest, and writes nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("a.conf"), .data = "keep = mine\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "mine\n" });
+
+    // `?` first, so the drift prompt's own quit wording is exercised; then q.
+    const res = try c.runWithInput(&.{ "mox", "apply" }, "?\nq\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    // a.conf hit the prompt; b.conf was never reached. Both are reported and
+    // counted drifted, and neither live file was touched.
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "DRIFT   ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "a.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "unresolved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "b.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 drifted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "stop the apply") != null);
+    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.homePath("a.conf")));
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
+}
+
 test "apply drift: non-interactive and --force keep their exact contracts" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

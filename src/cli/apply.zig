@@ -199,7 +199,16 @@ fn applyPass(
     // global and order-independent instead of "producers seen so far".
     var gen_states: std.ArrayList(GenState) = .empty;
 
-    for (files) |file| {
+    for (files, 0..) |file, file_i| {
+        // `q` at a drift prompt stops the run: everything not yet resolved
+        // is reported and counted drifted, and no further byte is written.
+        if (resolver.aborted) {
+            for (files[file_i..]) |rest| {
+                counts.drift += 1;
+                try ctx.err.print("  unresolved {s} (apply stopped at the drift prompt)\n", .{rest.live_path});
+            }
+            break;
+        }
         // A head declaration the walk could not honor is this file's error
         // alone; everything else still applies.
         if (file.head_error.len > 0) {
@@ -374,8 +383,11 @@ fn applyPass(
 
     // Second pass: prune each SUCCEEDED generator's dropped leaves against the
     // global keep, then record its current set. A failed generator prunes
-    // nothing and keeps its old manifest.
+    // nothing and keeps its old manifest. After a drift-prompt abort the keep
+    // set is incomplete, so pruning against it could delete live leaves --
+    // and an aborted run must not remove anything anyway.
     for (gen_states.items) |g| {
+        if (resolver.aborted) break;
         if (!g.succeeded) continue;
         const prune = try mox.apply.generated.pruneStale(ctx.alloc, ctx.io, .{
             .state_dir = context.paths.state_dir,
@@ -395,7 +407,7 @@ fn applyPass(
     // keep set is the managed set: a generated leaf (current, or a failed
     // generator's prior) is protected and never swept.
     var exact_result = mox.apply.exact.Result{};
-    if (!scoped and tree.exact_dirs.len > 0) {
+    if (!scoped and tree.exact_dirs.len > 0 and !resolver.aborted) {
         var managed_live: std.ArrayList([]const u8) = .empty;
         var kit = keep_set.keyIterator();
         while (kit.next()) |p| try managed_live.append(ctx.alloc, p.*);
@@ -421,7 +433,7 @@ fn applyPass(
         counts.fail += exact_result.refused;
     }
 
-    if (snapshotted) {
+    if (snapshotted and !resolver.aborted) {
         const keep = blk: {
             const v = context.env.getAlloc(ctx.alloc, "MOX_SNAPSHOT_RETENTION") catch break :blk @as(usize, 10);
             const parsed = std.fmt.parseInt(usize, v, 10) catch 10;
@@ -437,7 +449,7 @@ fn applyPass(
     // Post-stage scripts run after all files are written. Used for
     // service reloads, theme cache rebuilds, fish_update_completions, etc.
     const post_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "scripts", "post" });
-    const post_result = if (skip_scripts)
+    const post_result = if (skip_scripts or resolver.aborted)
         mox.apply.run_scripts.Result{}
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, post_dir, &bindings, &script_env, ctx.out, ctx.err);
@@ -464,7 +476,13 @@ fn applyPass(
             },
         );
     }
-    queued_out.* = resolver.queued;
+    // An aborted run starts no commit flow: a `[c]` answered before the quit
+    // is dropped loudly, its live edit untouched for the next run to route.
+    if (resolver.aborted and resolver.queued.items.len > 0) {
+        try ctx.out.print("  dropped {d} queued commit(s) (apply stopped); the live edits are untouched\n", .{resolver.queued.items.len});
+    } else {
+        queued_out.* = resolver.queued;
+    }
     const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed;
     return if (total_fail > 0) 1 else 0;
 }
@@ -506,6 +524,11 @@ const drift_choices = [_]prompt.Choice{
 
 const DriftDecision = enum { overwrite, commit, skip, quit };
 
+/// What `?` says `q` does at the drift prompt. Apply writes as it walks, so
+/// the shared "write nothing" wording would be false here: files resolved
+/// before the quit stay written.
+const drift_quit_help = "stop the apply; this and every remaining file is left as it is";
+
 /// Resolves one drifted file interactively. Sticky answers (`[O]`/`[S]`) are
 /// remembered here, and `[c]` paths accumulate for the deferred commit pass --
 /// apply holds the state lock, and the lock is not re-entrant, so commit cannot
@@ -529,9 +552,12 @@ const DriftResolver = struct {
     ) !DriftDecision {
         if (self.sticky) |d| return d;
         try ctx.err.print("  DRIFT   {s} (live file was edited)\n", .{live_path});
+        // The header goes to stderr, the legend to stdout; on a shared
+        // terminal only a flush here keeps the header above the prompt.
+        try ctx.err.flush();
         while (true) {
             const line = try commit_mod.legend(self.arena, &drift_choices, 3, self.sty);
-            switch (try prompt.ask(.interactive, &drift_choices, 3, line, self.input, ctx.out)) {
+            switch (try prompt.askWith(.interactive, &drift_choices, 3, line, self.input, ctx.out, drift_quit_help)) {
                 .chosen => |i| switch (i) {
                     0 => return .overwrite,
                     1 => {
@@ -576,9 +602,10 @@ const DriftResolver = struct {
     ) !DriftDecision {
         if (self.sticky) |d| return d;
         try ctx.err.print("  DRIFT   {s} ({s} changed)\n", .{ live_path, drift_what });
+        try ctx.err.flush();
         while (true) {
             const line = try commit_mod.legend(self.arena, &drift_choices, 3, self.sty);
-            switch (try prompt.ask(.interactive, &drift_choices, 3, line, self.input, ctx.out)) {
+            switch (try prompt.askWith(.interactive, &drift_choices, 3, line, self.input, ctx.out, drift_quit_help)) {
                 .chosen => |i| switch (i) {
                     0 => return .overwrite,
                     1 => {
@@ -700,7 +727,12 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
                     try ctx.out.print("  queued {s} (will commit the live edit)\n", .{in.live_path});
                     return;
                 },
-                .quit => return,
+                // The quit file itself stays unresolved: count it drifted so
+                // the abort exits 1 even when it was the only drifted file.
+                .quit => {
+                    counts.drift += 1;
+                    return;
+                },
                 .skip => {
                     counts.drift += 1;
                     if (in.resolver == null)
@@ -971,7 +1003,10 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
                 try ctx.out.print("  queued {s} (will commit the live edit)\n", .{live_path});
                 return;
             },
-            .quit => return,
+            .quit => {
+                counts.drift += 1;
+                return;
+            },
             .skip => {
                 counts.drift += 1;
                 return;
@@ -1240,6 +1275,11 @@ fn applyGenerator(
     // Current produced set for the manifest + global keep-set.
     var current: std.ArrayList([]const u8) = .empty;
     for (outputs) |o| {
+        // A drift-prompt quit stops the fan-out too; the aborted run skips
+        // the prune pass, so the unprocessed leaves are not swept.
+        if (resolver_opt) |r| {
+            if (r.aborted) break;
+        }
         // A generated output whose rendered path matches an ignore rule (itself
         // or a containing directory) is outside mox's management, same as any
         // other source: never written, never added to the keep set.
@@ -1346,6 +1386,72 @@ test "liveMatchesInitial: detects an interleaved external change before a write"
     try std.testing.expect(liveMatchesInitial(io, a, gone, null));
     // Was absent, now a file appeared -> refuse (do not clobber it).
     try std.testing.expect(!liveMatchesInitial(io, a, p, null));
+}
+
+/// Scripted drift-prompt input that, at the moment the prompt reads, checks
+/// whether the DRIFT header already reached the stderr FILE (was flushed
+/// past the writer's buffer), then answers `s`.
+const FlushProbe = struct {
+    reader: std.Io.Reader,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    err_path: []const u8,
+    header_flushed: bool = false,
+    done: bool = false,
+
+    fn init(io: std.Io, arena: std.mem.Allocator, err_path: []const u8, buffer: []u8) FlushProbe {
+        return .{
+            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .io = io,
+            .arena = arena,
+            .err_path = err_path,
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = w;
+        _ = limit;
+        const self: *FlushProbe = @alignCast(@fieldParentPtr("reader", r));
+        if (self.done) return error.EndOfStream;
+        self.done = true;
+        const content = std.Io.Dir.cwd().readFileAlloc(self.io, self.err_path, self.arena, .limited(1 << 20)) catch "";
+        self.header_flushed = std.mem.indexOf(u8, content, "DRIFT") != null;
+        const answer = "s\n";
+        @memcpy(r.buffer[0..answer.len], answer);
+        r.seek = 0;
+        r.end = answer.len;
+        return 0;
+    }
+};
+
+test "DriftResolver.ask flushes the DRIFT header to stderr before the prompt reads" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const err_path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "err" });
+
+    const err_file = try std.Io.Dir.cwd().createFile(io, err_path, .{});
+    defer err_file.close(io);
+    // A buffer larger than the header: nothing reaches the file without an
+    // explicit flush, exactly like the process stderr writer in main.
+    var err_buf: [4096]u8 = undefined;
+    var err_w: std.Io.File.Writer = .initStreaming(err_file, io, &err_buf);
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+
+    var ctx: app.Ctx = .{ .alloc = a, .io = io, .out = &out_aw.writer, .err = &err_w.interface };
+    var probe_buf: [64]u8 = undefined;
+    var probe: FlushProbe = .init(io, a, err_path, &probe_buf);
+    var resolver: DriftResolver = .{ .arena = a, .input = &probe.reader, .sty = .{ .on = false }, .state_dir = "" };
+
+    const d = try resolver.ask(&ctx, "/home/me/.zshrc", null, "composed\n", &.{});
+    try std.testing.expectEqual(DriftDecision.skip, d);
+    // The header must be readable at the file BEFORE the prompt consumed
+    // its answer, or a terminal shows the legend above the header.
+    try std.testing.expect(probe.header_flushed);
 }
 
 /// The current unix mode (permission bits) of `live_path`, or null when it is

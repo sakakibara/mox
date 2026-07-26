@@ -6,12 +6,14 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
 
+    // Streaming, not positional: a positional writer starts at byte 0, so
+    // `mox status >> log` would overwrite the log instead of appending.
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    var stdout_file_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    var stderr_file_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
     const argv_z = try init.minimal.args.toSlice(arena);

@@ -47,6 +47,11 @@ pub const Outcome = union(enum) {
     abort_strict,
 };
 
+/// What `?` says the universal `q` does. Right for every prompt whose
+/// command defers its writes past the prompt phase; a command that writes
+/// as it asks passes its own wording via `askWith`.
+pub const default_quit_help = "abort, write nothing";
+
 /// Print `question`, read one bounded line, and map it to a choice. `question`
 /// is the fully-rendered prompt shown just before reading (e.g. the caller's
 /// `renderChoices` output, or a literal like `"  [Y/n/m/q] "`). Empty input
@@ -58,6 +63,20 @@ pub fn ask(
     question: []const u8,
     input: *Io.Reader,
     out: *Io.Writer,
+) !Outcome {
+    return askWith(mode, choices, default_index, question, input, out, default_quit_help);
+}
+
+/// `ask` with the `?` help's description of `q` supplied by the caller, for
+/// commands whose abort semantics differ from the deferred-write default.
+pub fn askWith(
+    mode: Mode,
+    choices: []const Choice,
+    default_index: usize,
+    question: []const u8,
+    input: *Io.Reader,
+    out: *Io.Writer,
+    quit_help: []const u8,
 ) !Outcome {
     switch (mode) {
         .report_only => return .report_only,
@@ -78,7 +97,7 @@ pub fn ask(
         // `?` is the user orienting themselves, not a wrong guess: print what
         // every choice does and re-ask without spending an attempt.
         if (t.len == 1 and t[0] == '?') {
-            try printHelp(choices, out);
+            try printHelp(choices, out, quit_help);
             try out.flush();
             continue;
         }
@@ -100,13 +119,13 @@ pub fn ask(
 
 /// One line per choice (`key`, `label`, `help`), plus the universal `q`, so
 /// `?` explains every option without leaving the prompt.
-fn printHelp(choices: []const Choice, out: *Io.Writer) !void {
+fn printHelp(choices: []const Choice, out: *Io.Writer, quit_help: []const u8) !void {
     for (choices) |c| {
         try out.print("  [{s}] {s}", .{ c.key, c.label });
         if (c.help.len > 0) try out.print(" -- {s}", .{c.help});
         try out.writeAll("\n");
     }
-    try out.writeAll("  [q] quit -- abort, write nothing\n");
+    try out.print("  [q] quit -- {s}\n", .{quit_help});
 }
 
 /// Case-insensitive match of typed input against a choice key. Digit keys
