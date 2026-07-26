@@ -508,6 +508,51 @@ test "add-tree: a missing directory fails with not found instead of adding nothi
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not found") != null);
 }
 
+test "add-tree: a file argument is refused as not a directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+
+    const r = try h.run(&.{ "mox", "add-tree", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not a directory (use 'mox add' for a single file)") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
+}
+
+test "add-tree: rebuilds the coupling graph after a bulk add" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // `sharedalias` clears the tokenizer's length/entropy filters and occurs
+    // in both files, so it must survive the co-occurrence filter.
+    try tmp.dir.createDirPath(io, "home/.config/app");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/a.conf", .data = "name = sharedalias\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/b.conf", .data = "name = sharedalias\n" });
+
+    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // The graph was rebuilt once over the bulk add, so both new sources'
+    // tokens are indexed for the next commit's coupling pass.
+    const graph_path = try std.fs.path.join(a, &.{ h.state, "coupling", "graph.json" });
+    try std.testing.expect(exists(io, graph_path));
+    const graph = try read(io, a, graph_path);
+    try std.testing.expect(std.mem.indexOf(u8, graph, "sharedalias") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph, "a.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph, "b.conf") != null);
+}
+
 test "add: a relative path resolves against HOME" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

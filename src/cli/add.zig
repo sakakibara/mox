@@ -920,7 +920,7 @@ test "addFile: --seed-once records seed_once; a plain add does not" {
 
 /// Rebuild and persist the coupling graph over every base source file, keyed by
 /// absolute path (matching how `mox commit` and `mox doctor` build it).
-fn buildInitialCoupling(ctx: *app.Ctx) !void {
+pub fn buildInitialCoupling(ctx: *app.Ctx) !void {
     const context = ctx.context.?;
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     const tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, "") catch return;

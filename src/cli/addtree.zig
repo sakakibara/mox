@@ -36,17 +36,32 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
 
     // sortedPath maps a missing directory to an empty listing (a contract its
     // optional-dir callers rely on), so a mistyped top-level dir must be
-    // probed here or the walk would report success over nothing.
-    _ = Io.Dir.cwd().statFile(ctx.io, dir_abs, .{}) catch |e| switch (e) {
+    // probed here or the walk would report success over nothing. A file
+    // argument is refused for the same reason: opening it as a directory
+    // would surface a raw NotDir instead of pointing at 'mox add'.
+    const st = Io.Dir.cwd().statFile(ctx.io, dir_abs, .{}) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox add-tree: {s}: not found\n", .{dir_abs});
             return 1;
         },
+        error.NotDir => {
+            try ctx.err.print("mox add-tree: {s}: not a directory (use 'mox add' for a single file)\n", .{dir_abs});
+            return 1;
+        },
         else => return e,
     };
+    if (st.kind != .directory) {
+        try ctx.err.print("mox add-tree: {s}: not a directory (use 'mox add' for a single file)\n", .{dir_abs});
+        return 1;
+    }
 
     var counts: Counts = .{};
     try walk(ctx, dir_abs, &ruleset, &counts);
+
+    // Rebuild the coupling graph once over the whole bulk add, so the new
+    // files' tokens can couple with existing sources on the next commit
+    // (single-file add rebuilds for the same reason).
+    if (counts.added > 0) add.buildInitialCoupling(ctx) catch {};
 
     try ctx.out.print("Added {d} file(s); {d} skipped, {d} failed\n", .{ counts.added, counts.skipped, counts.failed });
     return if (counts.failed > 0) 1 else 0;
