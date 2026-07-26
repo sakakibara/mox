@@ -43,7 +43,7 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 | `remove when <axis>` | Drop the body when the axis matches; else keep it. |
 | `from "<region>"` | Like `replace from`, with no literal-body condition of its own. |
 | `when <axis>` | Emit the body only when the axis matches. |
-| `for <var> in <source> [when <axis>] [where <row>] [into "<path>"]` | Repeat the body once per data row; `into` writes one file per row instead of inlining. |
+| `for <var> in <source> [when <axis>] [where <row>] [into "<path>"]` | Repeat the body once per data row; `into` makes the file a generator (see Generator directives). |
 
 ## Axis expressions
 
@@ -90,15 +90,71 @@ Row predicates (`<row>`, used by `where` and an in-loop `when`):
 - a bare `axis` or `axis=value` - a machine-axis test.
 - `and`, `or`, `not`, `( ... )`. An unknown loop variable is an error.
 
-### `into` -- one file per row
+### Body lines and the comment marker
 
-A top-level `for ... into "<path-template>"` is a generator: it writes one file
-per row at the rendered path (relative to the source's target directory), and
-the source itself is not materialized. Each row's body composes like any loop
-body (nested `when`/`for` allowed), driven by the data source -- so machine-local
-data in the private layer decides what a machine generates. Removing a row from
-the data removes its file on the next apply (snapshot-first, recoverable).
-`into` is valid only on a top-level `for`.
+Each body line may be written commented, in the file's own marker: compose
+strips leading whitespace, then ONE marker, then one space or tab, and an
+uncommented line passes through unchanged. A body line that must EMIT a
+leading marker doubles it: `##compdef x` emits `#compdef x`. Both rules are
+locked by tests.
+
+## Generator directives
+
+A generator directive makes its source file a GENERATOR: the file emits one
+live file per data row into its own target directory and never materializes
+at its own path. A generator source holds exactly its directive and nothing
+else; stray top-level content is rejected. Its produced set is manifest-
+tracked: removing a row removes that row's file on the next apply, a false
+gate empties (and so prunes) the whole set, and a generator whose source
+leaves the tree has its set swept -- all snapshot-first, recoverable.
+
+### `for ... into` -- one file per row
+
+A top-level `for ... into "<path-template>"` writes one file per row at the
+rendered path. Each row's body composes like any loop body (nested
+`when`/`for` allowed), driven by the data source -- so machine-local data in
+the private layer decides what a machine generates. `into` is valid only on
+a top-level `for`.
+
+### `completions` -- lazy shell-completion stubs
+
+```
+# mox: completions fish "data/completions.toml"
+# mox: completions zsh "data/completions.toml" when not profile=minimal
+```
+
+One generator source per shell's native completion directory
+(`.config/fish/completions/`, a zsh fpath directory). The shell is a
+positional typed token validated against the supported set (`fish`, `zsh`)
+-- never a `key=value` argument, which would be surface-identical to an
+axis atom. Each applicable registry row emits one stub (`<name>.fish` /
+`_<name>`) that asks the INSTALLED tool for its completion script on the
+first completion request of a session: zero shell-startup cost via the
+shells' own lazy autoloading, and completions that always match the
+installed version. The registry is a TOML array of `[[completions]]` rows:
+
+- `name` (required): the completed command; first char `[A-Za-z0-9_]`,
+  then `[A-Za-z0-9_.-]`.
+- `command`: completion-emitting command prefix; the shell name is
+  appended (`herdr completion` -> `herdr completion fish`).
+- `fish` / `zsh`: full per-shell override for irregular CLIs
+  (`pip completion --zsh`); wins over `command`.
+- `shells`: allow-list of shells the row covers; the only way a requested
+  shell is skipped. A covered shell without a resolved command is an
+  error, so a forgotten shell can never be silent.
+- `zsh_dispatch`: completion function the zsh stub dispatches when the
+  generated script defines something other than `_<name>`.
+
+The zsh stub always ends `compdef <dispatch> <name>` then `<dispatch> "$@"`:
+inside `eval`, `funcstack[1]` is `(eval)`, so a generated script's trailing
+self-dispatch guard never fires, and a script that does not rebind the
+service would re-run the generator command on every request instead of once
+per session. The stubs' presence guards see PATH executables only (a tool
+provided purely as a function or alias never triggers its stub), and a stub
+serves exactly its declared `name` (variant names like `pip3.11` need their
+own rows). PowerShell/elvish/bash have no or different per-command lazy
+mechanisms and are out of scope; an unknown shell token names the accepted
+set.
 
 ## Captures
 

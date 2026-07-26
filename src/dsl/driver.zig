@@ -308,3 +308,14 @@ test "stripLoopBodyPrefix removes leading whitespace and comment marker" {
     // No marker -> return as-is
     try std.testing.expectEqualStrings("plain text", stripLoopBodyPrefix("plain text", "#"));
 }
+
+test "stripLoopBodyPrefix: strips one marker and one following space" {
+    try std.testing.expectEqualStrings("  abbr x", stripLoopBodyPrefix("#   abbr x", "#"));
+    try std.testing.expectEqualStrings("abbr x", stripLoopBodyPrefix("# abbr x", "#"));
+    try std.testing.expectEqualStrings("plain", stripLoopBodyPrefix("plain", "#"));
+}
+
+test "stripLoopBodyPrefix: a doubled marker emits one literal marker" {
+    try std.testing.expectEqualStrings("#compdef x", stripLoopBodyPrefix("##compdef x", "#"));
+    try std.testing.expectEqualStrings("-- text", stripLoopBodyPrefix("---- text", "--"));
+}

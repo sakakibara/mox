@@ -4053,3 +4053,31 @@ test "completions: content beside the directive falls through to the loud inline
     // Not a pure generator: composeGenerator declines it...
     try std.testing.expect(try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null) == null);
 }
+
+test "loop body: a doubled comment marker emits a literal marker line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.config/out.conf",
+        \\# mox: for e in "data/rows.toml" into "<e.k>.conf"
+        \\##header <e.k>
+        \\value
+        \\# mox: end
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/rows.toml",
+        \\[[rows]]
+        \\k = "a"
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    const gen = fileEndingWith(tree, ".config/out.conf");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+    try std.testing.expectEqualStrings("#header a\nvalue\n", outputs[0].content);
+}
