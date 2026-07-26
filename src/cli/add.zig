@@ -542,13 +542,21 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // The gate is written into the created source head, so a malformed
     // expression must be refused here, not discovered on the next walk.
     if (a.gate) |expr| {
-        _ = mox.dsl.axis.parseString(ctx.alloc, expr) catch |e| switch (e) {
+        const parsed = mox.dsl.axis.parseString(ctx.alloc, expr) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 try ctx.err.print("mox add: --gate: cannot parse `{s}`: {s}\n", .{ expr, @errorName(e) });
                 return 1;
             },
         };
+        // A gate that does not hold here means the file the user is looking
+        // at right now will be skipped by the next apply -- usually a typo
+        // or an unbound axis. Warn; the add itself still proceeds.
+        const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+        var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        if (!mox.dsl.axis.evaluate(parsed, &bindings)) {
+            try ctx.err.print("mox add: warning: gate `{s}` does not hold on this machine; the file will not apply here until the axis is bound\n", .{expr});
+        }
     }
     if (own_raws.len > 0 or absent_raws.len > 0 or disown_raws.len > 0) {
         if (a.seed_once) {

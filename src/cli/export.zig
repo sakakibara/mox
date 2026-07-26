@@ -209,7 +209,7 @@ pub const command = app.command(Spec, .{
     .name = "export",
     .summary = "Bake a flat resolved tree into a dir",
     .usage = "mox export --resolved [--as <tuple>] <out>",
-    .details = "Composes every file under <out>/<rel>.",
+    .details = "Composes every file under <out>/<rel>. A partially owned target exports its canonical owned serialization (the '= <path>' sections) -- the ownership contract, not a whole live file.",
     .group = .general,
     .needs_context = true,
 }, run);

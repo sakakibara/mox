@@ -64,9 +64,9 @@ pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.args.Diagnos
 }
 
 /// mox's help footer: the Environment section (`MOX_REPO`/`MOX_STATE_DIR`/
-/// `MOX_SNAPSHOT_RETENTION`/`HOME`/`USER`). These are env vars, not CLI
-/// flags, so cli-zig's generated per-command help has nowhere else to
-/// surface them.
+/// `MOX_SNAPSHOT_RETENTION`/`MOX_CHECK_TIMEOUT_MS`/`HOME`/`USER`). These are
+/// env vars, not CLI flags, so cli-zig's generated per-command help has
+/// nowhere else to surface them.
 pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void {
     _ = prog_name;
     try w.writeAll(
@@ -75,6 +75,7 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
         \\  MOX_REPO       Path to mox dotfiles repo (default: $XDG_DATA_HOME/mox/dotfiles)
         \\  MOX_STATE_DIR  Path to mox state (default: $XDG_STATE_HOME/mox)
         \\  MOX_SNAPSHOT_RETENTION  Snapshots to keep (default: 10)
+        \\  MOX_CHECK_TIMEOUT_MS  Wall-clock bound on check hooks in ms (default: 30000; <= 0 disables)
         \\  HOME, USER     Standard POSIX env
         \\
         \\See the project README for the full design spec.

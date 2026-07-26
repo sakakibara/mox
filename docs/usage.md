@@ -303,6 +303,15 @@ source head declares ownership is refused (it is managed per key-path), and
 - `mox commit` routes per key over the owned content, exactly like a layered
   structured file.
 
+Owned content in `diff` and `export` output is rendered in mox's canonical
+serialization: one `= <path>` header line per declared path, the subtree's
+keys sorted and indented under it (`key = value` for scalars, `key:` for
+nested tables). Each diff hunk is preceded by the `= <path>` header of the
+section it falls in, so a changed value always names its key. For a partial
+target, `mox export --resolved` writes exactly this serialization: the owned
+contract is the deliverable, never a whole live file that belongs partly to
+the program.
+
 Drift protection follows the whole-file rule over the owned content: it is
 compared against what mox last applied, and a mismatch asks (or is skipped
 and reported, off a terminal) instead of overwriting. First contact -- no

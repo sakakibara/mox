@@ -3232,6 +3232,36 @@ test "diff partial: secret keys render masked on both sides" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "token") == null);
 }
 
+test "apply partial: a CRLF live file splices and stays idempotent" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    // A live file the program wrote with CRLF line endings throughout.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\r\nk = 0\r\n\r\n[program]\r\nstate = 42\r\n" });
+
+    // First contact with differing owned content: reassert with --force.
+    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    const after = try read(io, a, live);
+    // The program's CRLF bytes survive verbatim; the owned span is patched.
+    try std.testing.expect(std.mem.indexOf(u8, after, "[program]\r\nstate = 42\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "k = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "k = 0") == null);
+
+    // The mixed-EOL result reads back clean: nothing rewritten, bytes stable.
+    const again = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), again.rc);
+    try std.testing.expect(std.mem.indexOf(u8, again.out, "unchanged") != null);
+    try std.testing.expectEqualStrings(after, try read(io, a, live));
+}
+
 test "diff partial: a change confined to secret paths prints the no-visible-difference note" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

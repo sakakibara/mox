@@ -1096,6 +1096,8 @@ test "add --own --gate: the gate line follows the directives and a matching mach
 
     const r = try h.run(&.{ "mox", "add", "--own", "tui", "--gate", "os=darwin", live });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // The gate holds on this machine: no warning.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "does not hold") == null);
     // The head is the ownership directives, then the whole-file gate.
     const src = try read(io, a, try h.srcOf("app.toml"));
     try std.testing.expect(std.mem.startsWith(u8, src, "# mox: own tui\n# mox: when os=darwin\n[tui]\n"));
@@ -1132,6 +1134,8 @@ test "add --own --gate: a machine where the gate fails leaves the live file unto
 
     const r = try h.run(&.{ "mox", "add", "--own", "tui", "--gate", "os=darwin", live });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // The add succeeds, but the user is told this machine will skip the file.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "gate `os=darwin` does not hold on this machine; the file will not apply here until the axis is bound") != null);
 
     const apply = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), apply.rc);
