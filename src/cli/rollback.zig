@@ -244,8 +244,14 @@ fn repatchPartial(
         if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, failed)) return false;
     }
 
+    // A live target absent here is legitimate (this partial target was never
+    // materialized); any other stat failure is a real anomaly and must not
+    // silently degrade the mode a rollback writes back.
     const mode = blk: {
-        const st = Io.Dir.cwd().statFile(ctx.io, live_target, .{}) catch break :blk @as(u32, 0o644);
+        const st = Io.Dir.cwd().statFile(ctx.io, live_target, .{}) catch |e| switch (e) {
+            error.FileNotFound => break :blk @as(u32, 0o644),
+            else => return e,
+        };
         break :blk mox.apply.write.modeOf(st.permissions);
     };
     mox.apply.write.writeAtomicPartial(ctx.io, live_target, candidate, mode, live_stat) catch |e| switch (e) {
@@ -320,8 +326,12 @@ test "snapshotLivePaths: a mid-walk read failure propagates instead of silently 
     // Two entries: the walk order is unspecified, so a failure after the
     // first one must be reported rather than mistaken for having reached
     // the end of a one-entry snapshot.
-    try mox.apply.snapshot.save(a, io, snaps, "id1", home, try std.fs.path.join(a, &.{ home, "a" }), "a content\n");
-    try mox.apply.snapshot.save(a, io, snaps, "id1", home, try std.fs.path.join(a, &.{ home, "b" }), "b content\n");
+    const live_a = try std.fs.path.join(a, &.{ home, "a" });
+    const live_b = try std.fs.path.join(a, &.{ home, "b" });
+    try mox.apply.write.writeAtomic(io, live_a, "a content\n", 0o644);
+    try mox.apply.write.writeAtomic(io, live_b, "b content\n", 0o644);
+    try mox.apply.snapshot.save(a, io, snaps, "id1", home, live_a, "a content\n");
+    try mox.apply.snapshot.save(a, io, snaps, "id1", home, live_b, "b content\n");
 
     read_calls_after_setup = 0;
     real_dir_read = io.vtable.dirRead;
@@ -350,7 +360,9 @@ test "snapshotLivePaths: a non-missing openDir failure propagates instead of rep
     const home = try std.fs.path.join(a, &.{ base, "home" });
     const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
 
-    try mox.apply.snapshot.save(a, io, snaps, "id1", home, try std.fs.path.join(a, &.{ home, "a" }), "a content\n");
+    const live_a = try std.fs.path.join(a, &.{ home, "a" });
+    try mox.apply.write.writeAtomic(io, live_a, "a content\n", 0o644);
+    try mox.apply.snapshot.save(a, io, snaps, "id1", home, live_a, "a content\n");
     const snap_dir = try std.fs.path.join(a, &.{ snaps, "id1" });
     try mox.apply.write.setMode(snap_dir, 0o000);
     defer mox.apply.write.setMode(snap_dir, 0o755) catch {};

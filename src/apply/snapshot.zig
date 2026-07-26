@@ -77,11 +77,8 @@ pub fn save(
     const rel = (try source_path.liveKeyUnderHome(arena, home, live_path)) orelse return error.LiveFileOutsideHome;
     const snapshot_root = try std.fs.path.join(arena, &.{ snapshots_dir, id });
     const dest = try source_path.joinKeyOnto(arena, snapshot_root, rel);
-    const mode = blk: {
-        const st = Io.Dir.cwd().statFile(io, live_path, .{}) catch break :blk @as(u32, 0o644);
-        break :blk write_mod.modeOf(st.permissions);
-    };
-    try write_mod.writeAtomic(io, dest, content, mode);
+    const st = try Io.Dir.cwd().statFile(io, live_path, .{});
+    try write_mod.writeAtomic(io, dest, content, write_mod.modeOf(st.permissions));
 }
 
 /// Save a live symlink into snapshot `id` as an ACTUAL symlink, so `mox rollback`
@@ -220,11 +217,8 @@ fn restoreDir(
                     if (skipped) |out| try out.append(arena, .{ .live_path = target, .content = content });
                     continue;
                 }
-                const mode = blk: {
-                    const st = dir.statFile(io, entry.name, .{}) catch break :blk @as(u32, 0o644);
-                    break :blk write_mod.modeOf(st.permissions);
-                };
-                try write_mod.writeAtomic(io, target, content, mode);
+                const st = try dir.statFile(io, entry.name, .{});
+                try write_mod.writeAtomic(io, target, content, write_mod.modeOf(st.permissions));
                 result.count += 1;
             },
             .sym_link => {
@@ -300,6 +294,64 @@ test "restore: a symlink whose readLink fails propagates instead of silently ski
 
     var vtable = io.vtable.*;
     vtable.dirReadLink = failingReadLinkFor("link").dirReadLink;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    try std.testing.expectError(error.Unexpected, restore(a, faulty, snaps, "id1", home));
+}
+
+var stat_fail_target: []const u8 = "";
+
+fn failingStatFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat {
+    _ = userdata;
+    _ = dir;
+    _ = opts;
+    if (std.mem.eql(u8, sub_path, stat_fail_target)) return error.Unexpected;
+    unreachable; // this fixture stats exactly one path
+}
+
+test "save: a live-file stat failure propagates instead of degrading the preserved mode to 0644" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
+    const live = try std.fs.path.join(a, &.{ home, ".secretrc" });
+    try write_mod.writeAtomic(io, live, "token\n", 0o600);
+
+    stat_fail_target = live;
+    var vtable = io.vtable.*;
+    vtable.dirStatFile = failingStatFile;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    try std.testing.expectError(error.Unexpected, save(a, faulty, snaps, "id1", home, live, "token\n"));
+}
+
+test "restore: a snapshot entry's stat failure propagates instead of degrading the restored mode to 0644" {
+    if (!Io.File.Permissions.has_executable_bit) return; // no unix modes to preserve
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
+    const live = try std.fs.path.join(a, &.{ home, ".secretrc" });
+    try write_mod.writeAtomic(io, live, "token\n", 0o600);
+    try save(a, io, snaps, "id1", home, live, "token\n");
+
+    stat_fail_target = ".secretrc";
+    var vtable = io.vtable.*;
+    vtable.dirStatFile = failingStatFile;
     const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
 
     try std.testing.expectError(error.Unexpected, restore(a, faulty, snaps, "id1", home));

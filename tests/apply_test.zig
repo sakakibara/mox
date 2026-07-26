@@ -3682,6 +3682,51 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     try std.testing.expect(std.mem.indexOf(u8, drift.err, "DRIFT") != null);
 }
 
+var repatch_stat_fail_target: []const u8 = "";
+var repatch_stat_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat = undefined;
+
+fn repatchFailingStatFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat {
+    if (std.mem.eql(u8, sub_path, repatch_stat_fail_target)) return error.Unexpected;
+    return repatch_stat_fail_real(userdata, dir, sub_path, opts);
+}
+
+test "rollback partial: a live-file stat failure during re-patch propagates instead of degrading the mode to 0644" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
+    var c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const program_live = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 1\n\n[state]\ncount = 1\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+
+    const before = try read(io, a, live);
+
+    // Every op but statFile on the live target forwards to the real io.
+    repatch_stat_fail_target = live;
+    repatch_stat_fail_real = io.vtable.dirStatFile;
+    var vtable = io.vtable.*;
+    vtable.dirStatFile = repatchFailingStatFile;
+    c.io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expect(r.rc != 0);
+    // The live file is untouched: a refused mode capture must not clobber it.
+    try std.testing.expectEqualStrings(before, try read(io, a, live));
+}
+
 test "rollback: a broken attributes file blocks neither whole-file restores nor the partial withhold" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
