@@ -151,7 +151,7 @@ pub const Directive = struct {
 };
 
 /// Shells the completions generator can emit stubs for.
-pub const Shell = enum { fish, zsh };
+pub const Shell = enum { fish, zsh, bash, powershell };
 
 /// The complete parsed result of a source file.
 pub const ParsedFile = struct {

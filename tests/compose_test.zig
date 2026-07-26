@@ -4009,7 +4009,7 @@ test "completions: an unknown shell in the shells list is rejected" {
         \\[[completions]]
         \\name = "tool"
         \\command = "tool completion"
-        \\shells = ["powershell"]
+        \\shells = ["tcsh"]
         \\
     );
 }
@@ -4080,4 +4080,47 @@ test "loop body: a doubled comment marker emits a literal marker line" {
     var bindings = std.StringHashMap([]const u8).init(a);
     const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
     try std.testing.expectEqualStrings("#header a\nvalue\n", outputs[0].content);
+}
+
+test "completions: bash and powershell stubs, byte-exact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.local/share/bash-completion/completions/completions.gen",
+        \\# mox: completions bash "data/completions.toml"
+        \\
+    );
+    try writeFile(io, tmp.dir, "src/.config/powershell/completions/completions.gen",
+        \\# mox: completions powershell "data/completions.toml"
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/completions.toml",
+        \\[[completions]]
+        \\name = "herdr"
+        \\command = "herdr completion"
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bash_out = try composeCompletionsAt(a, io, &tmp, "bash-completion/completions/completions.gen");
+    const bash_stub = outputEndingWith(bash_out, "bash-completion/completions/herdr").?;
+    try std.testing.expectEqualStrings(
+        "command -v herdr >/dev/null 2>&1 || return 0\n" ++
+            "eval \"$(herdr completion bash)\"\n",
+        bash_stub.content,
+    );
+
+    const ps_out = try composeCompletionsAt(a, io, &tmp, "powershell/completions/completions.gen");
+    const ps_stub = outputEndingWith(ps_out, "powershell/completions/herdr.ps1").?;
+    try std.testing.expectEqualStrings(
+        "Register-ArgumentCompleter -Native -CommandName herdr -ScriptBlock {\n" ++
+            "    param($wordToComplete, $commandAst, $cursorPosition)\n" ++
+            "    if (-not (Get-Command herdr -ErrorAction SilentlyContinue)) { return }\n" ++
+            "    herdr completion powershell | Out-String | Invoke-Expression\n" ++
+            "    (TabExpansion2 $commandAst.Extent.Text $cursorPosition).CompletionMatches\n" ++
+            "}\n",
+        ps_stub.content,
+    );
 }

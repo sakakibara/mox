@@ -656,6 +656,8 @@ fn resolveCompletionsRow(
     const override_key, const shell_word = switch (shell) {
         .fish => .{ "fish", "fish" },
         .zsh => .{ "zsh", "zsh" },
+        .bash => .{ "bash", "bash" },
+        .powershell => .{ "powershell", "powershell" },
     };
     const prefix: ?[]const u8 = switch (rec.get("command") orelse data_mod.value.Value{ .bool = false }) {
         .string => |s| s,
@@ -699,7 +701,7 @@ fn resolveCompletionsRow(
             },
         };
         for (listed) |s| {
-            if (!std.mem.eql(u8, s, "fish") and !std.mem.eql(u8, s, "zsh")) {
+            if (std.meta.stringToEnum(dsl.ast.Shell, s) == null) {
                 fail(diag, name);
                 return error.CompletionsShellsInvalid;
             }
@@ -765,6 +767,9 @@ fn composeCompletions(
         const rel = switch (comp.shell) {
             .fish => try std.fmt.allocPrint(arena, "{s}.fish", .{row.name}),
             .zsh => try std.fmt.allocPrint(arena, "_{s}", .{row.name}),
+            // bash-completion's lazy loader looks up the bare command name.
+            .bash => try arena.dupe(u8, row.name),
+            .powershell => try std.fmt.allocPrint(arena, "{s}.ps1", .{row.name}),
         };
         if ((try seen.getOrPut(rel)).found_existing) {
             if (diag) |d| d.set(rel);
@@ -786,6 +791,27 @@ fn composeCompletions(
                     "compdef {s} {s}\n" ++
                     "{s} \"$@\"\n",
                 .{ row.name, row.name, row.cmd, row.dispatch, row.name, row.dispatch },
+            ),
+            // Sourced on demand by bash-completion's per-command lazy loader,
+            // which retries the current request after the eval registers.
+            .bash => try std.fmt.allocPrint(
+                arena,
+                "command -v {s} >/dev/null 2>&1 || return 0\n" ++
+                    "eval \"$({s})\"\n",
+                .{ row.name, row.cmd },
+            ),
+            // Self-replacing lazy registration: the first request loads the
+            // generated script (whose Register-ArgumentCompleter replaces this
+            // one) and answers by re-entering TabExpansion2 against it.
+            .powershell => try std.fmt.allocPrint(
+                arena,
+                "Register-ArgumentCompleter -Native -CommandName {s} -ScriptBlock {{\n" ++
+                    "    param($wordToComplete, $commandAst, $cursorPosition)\n" ++
+                    "    if (-not (Get-Command {s} -ErrorAction SilentlyContinue)) {{ return }}\n" ++
+                    "    {s} | Out-String | Invoke-Expression\n" ++
+                    "    (TabExpansion2 $commandAst.Extent.Text $cursorPosition).CompletionMatches\n" ++
+                    "}}\n",
+                .{ row.name, row.name, row.cmd },
             ),
         };
 

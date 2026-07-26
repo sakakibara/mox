@@ -88,7 +88,7 @@ test "reject: glob in an axis value" {
 test "reject: completions with an unsupported shell" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const src = "# mox: completions powershell \"data/completions.toml\"";
+    const src = "# mox: completions tcsh \"data/completions.toml\"";
     try std.testing.expectError(
         error.UnknownShell,
         mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),

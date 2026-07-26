@@ -213,3 +213,88 @@ test "fish stub: sourced on demand, candidates come from the live tool" {
         return e;
     };
 }
+
+test "bash stub: sourcing registers the live tool completion" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const stub = try composeStub(a, io, &tmp, "bash", ".local/share/bash-completion/completions/completions.gen",
+        \\[[completions]]
+        \\name = "mytool"
+        \\command = "mytool completion"
+        \\
+    , "completions/mytool");
+    try writeFileAt(io, tmp.dir, "comp/mytool", stub);
+    try writeFileAt(io, tmp.dir, "bin/mytool",
+        \\#!/bin/sh
+        \\echo "_mytool(){ COMPREPLY=(onlymatch); }; complete -F _mytool mytool"
+        \\
+    );
+    try chmodExec(a, io, try absPath(a, io, &tmp, "bin/mytool"));
+
+    const bin = try absPath(a, io, &tmp, "bin");
+    const comp = try absPath(a, io, &tmp, "comp");
+    const script = try std.fmt.allocPrint(
+        a,
+        "PATH='{s}':$PATH; source '{s}/mytool' && complete -p mytool && _mytool && echo COMPREPLY=$COMPREPLY",
+        .{ bin, comp },
+    );
+    const out = (try runShell(a, io, &.{ "bash", "-c", script })) orelse return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, out, "complete -F _mytool mytool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "COMPREPLY=onlymatch") != null);
+}
+
+test "powershell stub: first completion request loads and answers" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const stub = try composeStub(a, io, &tmp, "powershell", ".config/powershell/completions/completions.gen",
+        \\[[completions]]
+        \\name = "mytool"
+        \\command = "mytool completion"
+        \\
+    , "completions/mytool.ps1");
+    try writeFileAt(io, tmp.dir, "comp/mytool.ps1", stub);
+    try writeFileAt(io, tmp.dir, "bin/mytool",
+        \\#!/bin/sh
+        \\cat <<PEOF
+        \\Register-ArgumentCompleter -Native -CommandName mytool -ScriptBlock {
+        \\    param(\$wordToComplete, \$commandAst, \$cursorPosition)
+        \\    [System.Management.Automation.CompletionResult]::new("onlymatch", "onlymatch", "ParameterValue", "onlymatch")
+        \\}
+        \\PEOF
+        \\
+    );
+    try chmodExec(a, io, try absPath(a, io, &tmp, "bin/mytool"));
+
+    const bin = try absPath(a, io, &tmp, "bin");
+    const comp = try absPath(a, io, &tmp, "comp");
+    const script = try std.fmt.allocPrint(a,
+        \\$env:PATH = '{s}:' + $env:PATH
+        \\. '{s}/mytool.ps1'
+        \\$r1 = (TabExpansion2 'mytool on' 9).CompletionMatches
+        \\if ($r1.CompletionText -contains 'onlymatch') {{ Write-Output FIRST-CALL-COMPLETED }} else {{ Write-Output FIRST-CALL-EMPTY }}
+        \\$r2 = (TabExpansion2 'mytool on' 9).CompletionMatches
+        \\if ($r2.CompletionText -contains 'onlymatch') {{ Write-Output SECOND-CALL-COMPLETED }} else {{ Write-Output SECOND-CALL-EMPTY }}
+        \\
+    , .{ bin, comp });
+    try writeFileAt(io, tmp.dir, "run.ps1", script);
+    const run_path = try absPath(a, io, &tmp, "run.ps1");
+
+    const out = (try runShell(a, io, &.{ "pwsh", "-NoProfile", "-File", run_path })) orelse return error.SkipZigTest;
+    std.testing.expect(std.mem.indexOf(u8, out, "FIRST-CALL-COMPLETED") != null) catch |e| {
+        std.debug.print("pwsh output:\n{s}\n", .{out});
+        return e;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, out, "SECOND-CALL-COMPLETED") != null);
+}

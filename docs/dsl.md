@@ -123,22 +123,28 @@ a top-level `for`.
 # mox: completions zsh "data/completions.toml" when not profile=minimal
 ```
 
-One generator source per shell's native completion directory
-(`.config/fish/completions/`, a zsh fpath directory). The shell is a
-positional typed token validated against the supported set (`fish`, `zsh`)
+One generator source per shell's completion directory: fish's
+`.config/fish/completions/`, a zsh fpath directory, bash-completion's lazy
+dir (`.local/share/bash-completion/completions/`), or a directory the
+PowerShell profile dot-sources. The shell is a positional typed token
+validated against the supported set (`fish`, `zsh`, `bash`, `powershell`)
 -- never a `key=value` argument, which would be surface-identical to an
-axis atom. Each applicable registry row emits one stub (`<name>.fish` /
-`_<name>`) that asks the INSTALLED tool for its completion script on the
-first completion request of a session: zero shell-startup cost via the
-shells' own lazy autoloading, and completions that always match the
-installed version. The registry is a TOML array of `[[completions]]` rows:
+axis atom. Each applicable registry row emits one stub (`<name>.fish`,
+`_<name>`, bare `<name>`, `<name>.ps1`) that asks the INSTALLED tool for
+its completion script on the first completion request of a session: no
+shell-startup work beyond PowerShell's one tiny registration, and
+completions that always match the installed version. fish, zsh, and bash
+ride their shells' own per-command lazy loading; the PowerShell stub is a
+self-replacing `Register-ArgumentCompleter` that loads the generated
+script on first request and answers it by re-entering `TabExpansion2`.
+The registry is a TOML array of `[[completions]]` rows:
 
 - `name` (required): the completed command; first char `[A-Za-z0-9_]`,
   then `[A-Za-z0-9_.-]`.
 - `command`: completion-emitting command prefix; the shell name is
   appended (`herdr completion` -> `herdr completion fish`).
-- `fish` / `zsh`: full per-shell override for irregular CLIs
-  (`pip completion --zsh`); wins over `command`.
+- `fish` / `zsh` / `bash` / `powershell`: full per-shell override for
+  irregular CLIs (`pip completion --zsh`); wins over `command`.
 - `shells`: allow-list of shells the row covers; the only way a requested
   shell is skipped. A covered shell without a resolved command is an
   error, so a forgotten shell can never be silent.
@@ -152,9 +158,8 @@ service would re-run the generator command on every request instead of once
 per session. The stubs' presence guards see PATH executables only (a tool
 provided purely as a function or alias never triggers its stub), and a stub
 serves exactly its declared `name` (variant names like `pip3.11` need their
-own rows). PowerShell/elvish/bash have no or different per-command lazy
-mechanisms and are out of scope; an unknown shell token names the accepted
-set.
+own rows). An unknown shell token is rejected with a diagnostic naming the
+accepted set.
 
 ## Captures
 

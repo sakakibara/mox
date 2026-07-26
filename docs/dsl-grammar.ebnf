@@ -17,11 +17,12 @@ line_dir      = "include" string [ "when" axis_expr ]
               | "completions" shell string [ "when" axis_expr ] ;
 
 (* The `completions` shell is a positional typed token, validated by the
-   parser against the supported set (`fish` | `zsh`) -- never a `key=value`
-   argument, which would be surface-identical to an axis atom. The directive
-   is a GENERATOR: valid only as a file's sole directive with no other
-   content; the file emits one completion stub per registry row into its
-   target directory and is not materialized itself. *)
+   parser against the supported set (`fish` | `zsh` | `bash` |
+   `powershell`) -- never a `key=value` argument, which would be
+   surface-identical to an axis atom. The directive is a GENERATOR: valid
+   only as a file's sole directive with no other content; the file emits
+   one completion stub per registry row into its target directory and is
+   not materialized itself. *)
 shell         = ident ;
 
 region_open   = "replace" ( string [ "when" axis_expr ] | "from" string )
