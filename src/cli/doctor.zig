@@ -152,6 +152,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  note: attributes.toml, machine state, or the source tree could not be read; the orphaned-attribute check was skipped\n", .{});
     }
 
+    // `os=`/`arch=` literals outside the closed set they are ever actually
+    // compared against: a gate or overlay naming one matches no machine mox
+    // can ever present, exactly like an unknown completions shell.
+    if (try closedAxisValueProblems(ctx.alloc, ctx.io, context.paths.repo_dir)) |bad| {
+        for (bad) |msg| {
+            advisories += 1;
+            try ctx.out.print("  {s}\n", .{msg});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: the source tree or scripts/ could not be read; the closed-axis-value check was skipped\n", .{});
+    }
+
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
     var problems = bad_prov.len;
@@ -323,6 +336,90 @@ fn orphanedAttributes(
     }
     std.mem.sort([]const u8, out.items, {}, lessString);
     return try out.toOwnedSlice(arena);
+}
+
+/// `os=`/`arch=` literals compared anywhere in the source tree (gates,
+/// overlay tuples) or under `scripts/{pre,post}` stage-directory tuples, that
+/// fall outside the closed set of values `machine.state.capture` can ever
+/// bind: `os` is a zig `Os.Tag` name (macOS spelled `darwin`); `arch` is a zig
+/// `Cpu.Arch` name. Such a literal matches no real machine, silently, the same
+/// class of bug an unknown completions shell is refused for. Null means the
+/// source tree or `scripts/` could not be read (the check could not run);
+/// deduplicated and sorted for a stable report. A dir name that fails tuple
+/// parsing is left to the scripts-stage check to report; this one only
+/// inspects tuples that DID parse.
+fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const []const u8 {
+    const ax = mox.source.axes.ofTree(arena, io, repo_dir) catch return null;
+
+    var bad_os = std.StringHashMap(void).init(arena);
+    var bad_arch = std.StringHashMap(void).init(arena);
+    for (ax.valuesFor("os")) |v| {
+        if (!isValidOsValue(v.value)) try bad_os.put(v.value, {});
+    }
+    for (ax.valuesFor("arch")) |v| {
+        if (!isValidArchValue(v.value)) try bad_arch.put(v.value, {});
+    }
+
+    const scripts_dir = try std.fs.path.join(arena, &.{ repo_dir, "scripts" });
+    for ([_][]const u8{ "pre", "post" }) |stage| {
+        const stage_dir = try std.fs.path.join(arena, &.{ scripts_dir, stage });
+        var sdir = Io.Dir.cwd().openDir(io, stage_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return null,
+        };
+        defer sdir.close(io);
+        for (try mox.source.dirent.sorted(arena, io, sdir)) |entry| {
+            if (entry.kind != .directory or std.mem.indexOfScalar(u8, entry.name, '=') == null) continue;
+            const tuple = mox.source.tuple.parseFilename(arena, entry.name) catch continue;
+            for (tuple.pairs) |p| {
+                if (std.mem.eql(u8, p.name, "os") and !isValidOsValue(p.value)) try bad_os.put(p.value, {});
+                if (std.mem.eql(u8, p.name, "arch") and !isValidArchValue(p.value)) try bad_arch.put(p.value, {});
+            }
+        }
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var os_keys: std.ArrayList([]const u8) = .empty;
+    var os_it = bad_os.keyIterator();
+    while (os_it.next()) |k| try os_keys.append(arena, k.*);
+    std.mem.sort([]const u8, os_keys.items, {}, lessString);
+    for (os_keys.items) |val| {
+        const hint = if (std.mem.eql(u8, val, "macos")) " -- macos spells darwin" else "";
+        try out.append(arena, try std.fmt.allocPrint(
+            arena,
+            "bad-axis-value os={s} (not a recognized os; darwin/linux/windows are the common ones{s})",
+            .{ val, hint },
+        ));
+    }
+    var arch_keys: std.ArrayList([]const u8) = .empty;
+    var arch_it = bad_arch.keyIterator();
+    while (arch_it.next()) |k| try arch_keys.append(arena, k.*);
+    std.mem.sort([]const u8, arch_keys.items, {}, lessString);
+    for (arch_keys.items) |val| {
+        try out.append(arena, try std.fmt.allocPrint(
+            arena,
+            "bad-axis-value arch={s} (not a recognized arch; aarch64/x86_64 are the common ones)",
+            .{val},
+        ));
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// True when `v` is `osAxisValue` of some real zig `Os.Tag` (macOS spelled
+/// `darwin`, per `osAxisValue`).
+fn isValidOsValue(v: []const u8) bool {
+    inline for (@typeInfo(std.Target.Os.Tag).@"enum".fields) |f| {
+        if (std.mem.eql(u8, v, mox.machine.state.osAxisValue(@enumFromInt(f.value)))) return true;
+    }
+    return false;
+}
+
+/// True when `v` names a real zig `Cpu.Arch` tag.
+fn isValidArchValue(v: []const u8) bool {
+    inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |f| {
+        if (std.mem.eql(u8, v, f.name)) return true;
+    }
+    return false;
 }
 
 /// Whether every axis the file references is a compared axis (one `enumerate`
@@ -570,4 +667,59 @@ test "unrecordedModes: flags an exotic source mode not in attributes" {
 
     const cleared = (try unrecordedModes(a, io, repo, src)).?;
     try testing.expectEqual(@as(usize, 0), cleared.len);
+}
+
+test "isValidOsValue/isValidArchValue: accept the real zig tags, reject typos" {
+    try testing.expect(isValidOsValue("darwin"));
+    try testing.expect(isValidOsValue("linux"));
+    try testing.expect(isValidOsValue("windows"));
+    try testing.expect(!isValidOsValue("macos"));
+    try testing.expect(!isValidOsValue("osx"));
+
+    try testing.expect(isValidArchValue("aarch64"));
+    try testing.expect(isValidArchValue("x86_64"));
+    try testing.expect(!isValidArchValue("arm64"));
+}
+
+test "closedAxisValueProblems: flags an out-of-vocabulary os= gate and a script-dir arch= tuple" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.createDirPath(io, "repo/scripts/post/arch=arm64");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when os=macos\nprogram = /darwin\n# mox: end\n",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/post/arch=arm64/reload.sh", .data = "echo hi\n" });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try closedAxisValueProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 2), bad.len);
+    try testing.expect(std.mem.indexOf(u8, bad[0], "os=macos") != null);
+    try testing.expect(std.mem.indexOf(u8, bad[0], "macos spells darwin") != null);
+    try testing.expect(std.mem.indexOf(u8, bad[1], "arch=arm64") != null);
+}
+
+test "closedAxisValueProblems: a real os/arch value is not flagged" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when os=darwin\nprogram = /darwin\n# mox: end\n",
+    });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try closedAxisValueProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 0), bad.len);
 }

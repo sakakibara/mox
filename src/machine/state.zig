@@ -204,7 +204,7 @@ fn envOr(arena: std.mem.Allocator, environ: Environ, key: []const u8) ?[]const u
 /// Canonical `os` axis value. Zig names macOS `.macos`, but the dotfiles
 /// ecosystem (uname, chezmoi, Go GOOS) calls it `darwin`; use that so overlays
 /// and `when os=...` expressions match what users already write.
-fn osAxisValue(os_tag: std.Target.Os.Tag) []const u8 {
+pub fn osAxisValue(os_tag: std.Target.Os.Tag) []const u8 {
     return switch (os_tag) {
         .macos => "darwin",
         else => @tagName(os_tag),
