@@ -3810,3 +3810,246 @@ test "compose: a gated partial file still routes remaining directives through Ca
     try std.testing.expect(std.mem.indexOf(u8, out_on, "linux = true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_on, "mox:") == null);
 }
+
+// -- completions generator --
+
+fn completionsTreeWrite(io: anytype, tmp: *std.testing.TmpDir, registry: []const u8) !void {
+    try writeFile(io, tmp.dir, "src/.config/fish/completions/completions.gen",
+        \\# mox: completions fish "data/completions.toml"
+        \\
+    );
+    try writeFile(io, tmp.dir, "src/.zcomp/completions.gen",
+        \\# mox: completions zsh "data/completions.toml"
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/completions.toml", registry);
+}
+
+fn composeCompletionsAt(a: std.mem.Allocator, io: anytype, tmp: *std.testing.TmpDir, suffix: []const u8) ![]mox.compose.catB.GeneratedFile {
+    const src_dir = try srcPathAlloc(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    const gen = fileEndingWith(tree, suffix);
+    var bindings = std.StringHashMap([]const u8).init(a);
+    return (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+}
+
+test "completions: fish and zsh stubs from one registry, byte-exact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try completionsTreeWrite(io, &tmp,
+        \\[[completions]]
+        \\name = "herdr"
+        \\command = "herdr completion"
+        \\
+        \\[[completions]]
+        \\name = "mox"
+        \\command = "mox completion"
+        \\zsh_dispatch = "_mox_complete"
+        \\
+        \\[[completions]]
+        \\name = "pip"
+        \\fish = "pip completion --fish"
+        \\zsh = "pip completion --zsh"
+        \\zsh_dispatch = "__pip"
+        \\
+        \\[[completions]]
+        \\name = "zonly"
+        \\command = "zonly completion"
+        \\shells = ["zsh"]
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fish_out = try composeCompletionsAt(a, io, &tmp, ".config/fish/completions/completions.gen");
+    try std.testing.expectEqual(@as(usize, 3), fish_out.len);
+    const fish_herdr = outputEndingWith(fish_out, ".config/fish/completions/herdr.fish").?;
+    try std.testing.expectEqualStrings(
+        "command -q herdr; and herdr completion fish | source\n",
+        fish_herdr.content,
+    );
+    const fish_pip = outputEndingWith(fish_out, ".config/fish/completions/pip.fish").?;
+    try std.testing.expectEqualStrings(
+        "command -q pip; and pip completion --fish | source\n",
+        fish_pip.content,
+    );
+    try std.testing.expect(outputEndingWith(fish_out, "zonly.fish") == null);
+
+    const zsh_out = try composeCompletionsAt(a, io, &tmp, ".zcomp/completions.gen");
+    try std.testing.expectEqual(@as(usize, 4), zsh_out.len);
+    const zsh_herdr = outputEndingWith(zsh_out, ".zcomp/_herdr").?;
+    try std.testing.expectEqualStrings(
+        "#compdef herdr\n" ++
+            "(( $+commands[herdr] )) || return 1\n" ++
+            "eval \"$(herdr completion zsh)\"\n" ++
+            "compdef _herdr herdr\n" ++
+            "_herdr \"$@\"\n",
+        zsh_herdr.content,
+    );
+    const zsh_mox = outputEndingWith(zsh_out, ".zcomp/_mox").?;
+    try std.testing.expect(std.mem.indexOf(u8, zsh_mox.content, "compdef _mox_complete mox\n_mox_complete \"$@\"\n") != null);
+    const zsh_pip = outputEndingWith(zsh_out, ".zcomp/_pip").?;
+    try std.testing.expect(std.mem.indexOf(u8, zsh_pip.content, "eval \"$(pip completion --zsh)\"\ncompdef __pip pip\n__pip \"$@\"\n") != null);
+    try std.testing.expect(outputEndingWith(zsh_out, "_zonly") != null);
+}
+
+test "completions: a false when gate yields zero outputs, not null" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.zcomp/completions.gen",
+        \\# mox: completions zsh "data/completions.toml" when profile=work
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/completions.toml",
+        \\[[completions]]
+        \\name = "herdr"
+        \\command = "herdr completion"
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out = try composeCompletionsAt(a, io, &tmp, ".zcomp/completions.gen");
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+fn expectCompletionsError(expected: anyerror, registry: []const u8) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try completionsTreeWrite(io, &tmp, registry);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    const gen = fileEndingWith(tree, ".zcomp/completions.gen");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try std.testing.expectError(
+        expected,
+        mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null),
+    );
+}
+
+test "completions: a row without a name is rejected" {
+    try expectCompletionsError(error.CompletionsNameInvalid,
+        \\[[completions]]
+        \\command = "herdr completion"
+        \\
+    );
+}
+
+test "completions: an option-like name is rejected" {
+    try expectCompletionsError(error.CompletionsNameInvalid,
+        \\[[completions]]
+        \\name = "-P"
+        \\command = "x completion"
+        \\
+    );
+}
+
+test "completions: a covered shell without a resolved command is rejected" {
+    // zsh requested, row only declares fish and does not exclude zsh.
+    try expectCompletionsError(error.CompletionsCommandMissing,
+        \\[[completions]]
+        \\name = "tool"
+        \\fish = "tool completion fish"
+        \\
+    );
+}
+
+test "completions: a control character in a command is rejected" {
+    try expectCompletionsError(error.CompletionsCommandInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\zsh = "tool completion\nrm -rf x"
+        \\fish = "tool completion fish"
+        \\
+    );
+}
+
+test "completions: an empty command override is rejected" {
+    try expectCompletionsError(error.CompletionsCommandInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\zsh = ""
+        \\fish = "tool completion fish"
+        \\
+    );
+}
+
+test "completions: a dispatch value that is not a function name is rejected" {
+    try expectCompletionsError(error.CompletionsDispatchInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\zsh_dispatch = "foo; rm -rf x"
+        \\
+    );
+}
+
+test "completions: zsh_dispatch without a zsh command is rejected" {
+    try expectCompletionsError(error.CompletionsDispatchInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\fish = "tool completion fish"
+        \\shells = ["fish"]
+        \\zsh_dispatch = "_tool_complete"
+        \\
+    );
+}
+
+test "completions: an unknown shell in the shells list is rejected" {
+    try expectCompletionsError(error.CompletionsShellsInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\shells = ["powershell"]
+        \\
+    );
+}
+
+test "completions: duplicate names are rejected" {
+    try expectCompletionsError(error.DuplicateGeneratedPath,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool other-completion"
+        \\
+    );
+}
+
+test "completions: content beside the directive falls through to the loud inline error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.zcomp/completions.gen",
+        \\# mox: completions zsh "data/completions.toml"
+        \\stray content
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/completions.toml",
+        \\[[completions]]
+        \\name = "herdr"
+        \\command = "herdr completion"
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    const gen = fileEndingWith(tree, ".zcomp/completions.gen");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    // Not a pure generator: composeGenerator declines it...
+    try std.testing.expect(try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null) == null);
+}

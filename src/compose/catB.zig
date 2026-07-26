@@ -189,6 +189,21 @@ pub const ComposeError = error{
     /// content, intercepted by the generator path; reaching inline emission
     /// means it shares the file with other content or directives.
     CompletionsOnNonGenerator,
+    /// A registry row's `name` is missing, not a string, or outside the
+    /// stub-safe charset (first char [A-Za-z0-9_], then [A-Za-z0-9_.-]).
+    CompletionsNameInvalid,
+    /// A shell the row covers has no resolved command, or the row declares
+    /// no command at all.
+    CompletionsCommandMissing,
+    /// A command value is empty or contains control characters that would
+    /// escape the stub's single-line shape.
+    CompletionsCommandInvalid,
+    /// `zsh_dispatch` is not a plain function name, or is declared with no
+    /// zsh command to generate the script it would dispatch.
+    CompletionsDispatchInvalid,
+    /// A `shells` allow-list is not a string list drawn from the supported
+    /// shells.
+    CompletionsShellsInvalid,
 };
 
 const max_file_bytes: usize = 64 * 1024 * 1024;
@@ -483,14 +498,19 @@ pub fn composeGenerator(
     // A parse error here is not a generator decision: let the normal compose
     // path re-parse and report it with a source location.
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;
-    if (parsed.directives.len != 1 or parsed.directives[0].kind != .for_loop) return null;
-    const loop = parsed.directives[0].kind.for_loop;
-    if (loop.into == null) return null;
-    // A generator is ONLY its `for ... into` block -- composeGenerator emits just
-    // the loop body per row, so any stray top-level content would be silently
-    // dropped. Fall through when the block is not the whole file; the normal
-    // path then rejects the for-into loudly (IntoOnNonGenerator).
+    if (parsed.directives.len != 1) return null;
     const d0 = parsed.directives[0];
+    // A generator is ONLY its directive -- any stray top-level content would
+    // be silently dropped. Fall through when the directive is not the whole
+    // file; the normal path then rejects it loudly (IntoOnNonGenerator /
+    // CompletionsOnNonGenerator).
+    if (d0.kind == .completions) {
+        if (hasContentOutside(base_content, d0.start_line, d0.end_line)) return null;
+        return try composeCompletions(arena, io, file, d0.kind.completions, d0.start_line, bindings, diag);
+    }
+    if (d0.kind != .for_loop) return null;
+    const loop = d0.kind.for_loop;
+    if (loop.into == null) return null;
     if (hasContentOutside(base_content, d0.start_line, d0.end_line)) return null;
     const template = loop.into.?;
 
@@ -569,6 +589,218 @@ pub fn composeGenerator(
             .prov = try prov.toOwnedSlice(arena),
             .contains_secret = contains_secret,
             .manager_secret = row_diag.manager_secret,
+        });
+    }
+
+    return try outputs.toOwnedSlice(arena);
+}
+
+/// One validated completions-registry row, resolved for a target shell.
+const CompletionsRow = struct {
+    name: []const u8,
+    cmd: []const u8,
+    /// zsh only: the completion function dispatched by the stub.
+    dispatch: []const u8,
+};
+
+fn validCompletionsName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const c0 = s[0];
+    if (!(std.ascii.isAlphanumeric(c0) or c0 == '_')) return false;
+    for (s[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-')) return false;
+    }
+    return true;
+}
+
+fn validDispatchName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const c0 = s[0];
+    if (!(std.ascii.isAlphabetic(c0) or c0 == '_')) return false;
+    for (s[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
+}
+
+fn validCommandValue(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < 0x20) return false;
+    return true;
+}
+
+/// Resolve and validate one registry row for `shell`. Returns null when the
+/// row's `shells` allow-list excludes the shell (a deliberate, explicit
+/// state); every other gap is an error, never a silent skip.
+fn resolveCompletionsRow(
+    arena: std.mem.Allocator,
+    rec: *const RecordMap,
+    shell: dsl.ast.Shell,
+    diag: ?*interp.Diag,
+) EmitError!?CompletionsRow {
+    const fail = struct {
+        fn set(d: ?*interp.Diag, text: []const u8) void {
+            if (d) |dd| dd.set(text);
+        }
+    }.set;
+
+    const name = switch (rec.get("name") orelse data_mod.value.Value{ .string = "" }) {
+        .string => |s| s,
+        else => "",
+    };
+    if (!validCompletionsName(name)) {
+        fail(diag, if (name.len > 0) name else "row without a name");
+        return error.CompletionsNameInvalid;
+    }
+
+    const override_key, const shell_word = switch (shell) {
+        .fish => .{ "fish", "fish" },
+        .zsh => .{ "zsh", "zsh" },
+    };
+    const prefix: ?[]const u8 = switch (rec.get("command") orelse data_mod.value.Value{ .bool = false }) {
+        .string => |s| s,
+        else => null,
+    };
+    const override: ?[]const u8 = switch (rec.get(override_key) orelse data_mod.value.Value{ .bool = false }) {
+        .string => |s| s,
+        else => null,
+    };
+    const zsh_cmd_declared = rec.get("zsh") != null or prefix != null;
+
+    // zsh_dispatch is validated on every shell's pass so a dead declaration
+    // (dispatch without any zsh command) fails even in a fish-only setup.
+    var dispatch: []const u8 = "";
+    if (rec.get("zsh_dispatch")) |dv| {
+        const ds = switch (dv) {
+            .string => |s| s,
+            else => "",
+        };
+        if (!validDispatchName(ds) or !zsh_cmd_declared) {
+            fail(diag, name);
+            return error.CompletionsDispatchInvalid;
+        }
+        dispatch = ds;
+    }
+    if (dispatch.len == 0) dispatch = try std.fmt.allocPrint(arena, "_{s}", .{name});
+
+    // A row that declares no command at all is dead weight, excluded or not.
+    if (prefix == null and rec.get("fish") == null and rec.get("zsh") == null) {
+        fail(diag, name);
+        return error.CompletionsCommandMissing;
+    }
+
+    if (rec.get("shells")) |sv| {
+        const listed: []const []const u8 = switch (sv) {
+            .array_of_strings => |arr| arr,
+            .string => |s| &.{s},
+            else => {
+                fail(diag, name);
+                return error.CompletionsShellsInvalid;
+            },
+        };
+        for (listed) |s| {
+            if (!std.mem.eql(u8, s, "fish") and !std.mem.eql(u8, s, "zsh")) {
+                fail(diag, name);
+                return error.CompletionsShellsInvalid;
+            }
+        }
+        var covered = false;
+        for (listed) |s| covered = covered or std.mem.eql(u8, s, shell_word);
+        if (!covered) return null;
+    }
+
+    const cmd = blk: {
+        if (override) |o| {
+            if (!validCommandValue(o)) {
+                fail(diag, name);
+                return error.CompletionsCommandInvalid;
+            }
+            break :blk o;
+        }
+        if (prefix) |p| {
+            if (!validCommandValue(p)) {
+                fail(diag, name);
+                return error.CompletionsCommandInvalid;
+            }
+            break :blk try std.fmt.allocPrint(arena, "{s} {s}", .{ p, shell_word });
+        }
+        fail(diag, name);
+        return error.CompletionsCommandMissing;
+    };
+
+    return .{ .name = name, .cmd = cmd, .dispatch = dispatch };
+}
+
+/// Compose a `completions` generator: one lazy stub per applicable registry
+/// row, in the fixed per-shell shape. The explicit compdef-plus-dispatch tail
+/// of the zsh stub is load-bearing: inside `eval`, funcstack[1] is "(eval)",
+/// so a generated script's trailing self-dispatch guard never fires, and a
+/// script that does not rebind the service would re-run the generator command
+/// on every request instead of once per session.
+fn composeCompletions(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    comp: @FieldType(dsl.ast.Directive.Kind, "completions"),
+    dir_line: u32,
+    bindings: *const std.StringHashMap([]const u8),
+    diag: ?*interp.Diag,
+) EmitError!?[]GeneratedFile {
+    var outputs: std.ArrayList(GeneratedFile) = .empty;
+    errdefer outputs.deinit(arena);
+
+    // A false gate produces zero files -- and prunes any prior set, exactly
+    // like an empty registry.
+    if (comp.when) |expr_ptr| {
+        if (!dsl.axis.evaluate(expr_ptr, bindings)) return try outputs.toOwnedSlice(arena);
+    }
+
+    const records = try loadGeneratorRows(arena, io, file, comp.registry, diag);
+    const base_dir = std.fs.path.dirname(file.live_path) orelse file.live_path;
+    var seen = std.StringHashMap(void).init(arena);
+
+    for (records) |*record_ptr| {
+        const row = (try resolveCompletionsRow(arena, record_ptr, comp.shell, diag)) orelse continue;
+
+        const rel = switch (comp.shell) {
+            .fish => try std.fmt.allocPrint(arena, "{s}.fish", .{row.name}),
+            .zsh => try std.fmt.allocPrint(arena, "_{s}", .{row.name}),
+        };
+        if ((try seen.getOrPut(rel)).found_existing) {
+            if (diag) |d| d.set(rel);
+            return error.DuplicateGeneratedPath;
+        }
+        const live_path = try source.path.joinKeyOnto(arena, base_dir, rel);
+
+        const content = switch (comp.shell) {
+            .fish => try std.fmt.allocPrint(
+                arena,
+                "command -q {s}; and {s} | source\n",
+                .{ row.name, row.cmd },
+            ),
+            .zsh => try std.fmt.allocPrint(
+                arena,
+                "#compdef {s}\n" ++
+                    "(( $+commands[{s}] )) || return 1\n" ++
+                    "eval \"$({s})\"\n" ++
+                    "compdef {s} {s}\n" ++
+                    "{s} \"$@\"\n",
+                .{ row.name, row.name, row.cmd, row.dispatch, row.name, row.dispatch },
+            ),
+        };
+
+        var prov: std.ArrayList(Segment) = .empty;
+        try prov.append(arena, .{
+            .out_start = 0,
+            .out_len = prov_mod.map.lineCount(content),
+            .origin = .{ .base = .{ .line = dir_line } },
+        });
+        try outputs.append(arena, .{
+            .live_path = live_path,
+            .content = content,
+            .prov = try prov.toOwnedSlice(arena),
+            .contains_secret = false,
+            .manager_secret = false,
         });
     }
 

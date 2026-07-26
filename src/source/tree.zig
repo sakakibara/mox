@@ -614,9 +614,10 @@ pub fn readHead(arena: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8)
     return buf[0..n];
 }
 
-/// True when the base content is a generator (a `for ... into` DSL loop): it
-/// fans out to other live files, so there is no single document to partially
-/// own. Mirrors `compose.catB.composeGenerator`'s marker+parse probe,
+/// True when the base content is a generator (a `for ... into` DSL loop or a
+/// `completions` directive): it fans out to other live files, so there is no
+/// single document to partially own. Mirrors `compose.catB.composeGenerator`'s
+/// marker+parse probe,
 /// restricted to the comment markers the structured formats can carry (`#`,
 /// plus `;` -- ini). A parse failure is not a generator decision; the normal
 /// compose path reports it with a source location.
@@ -626,6 +627,7 @@ fn isGeneratorContent(arena: std.mem.Allocator, content: []const u8) bool {
         const parsed = dsl.driver.parseFile(arena, content, marker, null) catch continue;
         for (parsed.directives) |d| {
             if (d.kind == .for_loop and d.kind.for_loop.into != null) return true;
+            if (d.kind == .completions) return true;
         }
     }
     return false;
