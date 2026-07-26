@@ -84,7 +84,7 @@ fn mapGet(entries: []const yaml.Entry, k: []const u8) ?yaml.Value {
     return null;
 }
 
-// ---- tests ----
+// Tests
 
 test "yaml merge: mappings recurse, sequences and scalars replace" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);

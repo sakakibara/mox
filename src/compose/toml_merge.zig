@@ -56,7 +56,7 @@ pub fn mergeTables(arena: std.mem.Allocator, base: toml.Value, overlay: toml.Val
     return .{ .table = result };
 }
 
-// ---- tests ----
+// Tests
 
 test "merge: scalar override" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

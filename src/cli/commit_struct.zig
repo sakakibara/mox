@@ -782,7 +782,7 @@ fn iniDisplay(arena: std.mem.Allocator, value: ini.Value, path: []const []const 
     };
 }
 
-// ---- tests ----
+// Tests
 
 const testing = std.testing;
 
@@ -1179,7 +1179,7 @@ test "gitconfig diff: whole multi-value replacement yields the nested path" {
     try testing.expectEqualStrings("refs/d", list[1]);
 }
 
-// ---- applyToLayer tests ----
+// ApplyToLayer tests
 
 fn layerPath(a: std.mem.Allocator, io: Io, tmp: *testing.TmpDir, name: []const u8) ![]const u8 {
     const cwd = try std.process.currentPathAlloc(io, a);

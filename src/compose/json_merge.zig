@@ -59,7 +59,7 @@ pub fn deepMerge(arena: std.mem.Allocator, base: json.Value, overlay: json.Value
     return .{ .object = result };
 }
 
-// ---- tests ----
+// Tests
 
 test "json merge: objects recurse, arrays and scalars replace" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
