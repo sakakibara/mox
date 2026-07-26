@@ -204,6 +204,9 @@ pub const ComposeError = error{
     /// A `shells` allow-list is not a string list drawn from the supported
     /// shells.
     CompletionsShellsInvalid,
+    /// A registry row has a key outside the schema (`name`, `command`, a
+    /// per-shell override, `shells`, `zsh_dispatch`).
+    CompletionsUnknownKey,
 };
 
 const max_file_bytes: usize = 64 * 1024 * 1024;
@@ -660,6 +663,25 @@ fn resolveCompletionsRow(
     if (!validCompletionsName(name)) {
         fail(diag, name);
         return error.CompletionsNameInvalid;
+    }
+
+    // Refuse a row key outside the schema outright: a typo'd field name
+    // (`shels` for `shells`) would otherwise silently do nothing rather than
+    // fail the row that meant it.
+    const known_keys = [_][]const u8{ "name", "command", "fish", "zsh", "bash", "powershell", "shells", "zsh_dispatch" };
+    var kit = rec.iterator();
+    while (kit.next()) |kv| {
+        var known = false;
+        for (known_keys) |k| {
+            if (std.mem.eql(u8, kv.key_ptr.*, k)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            fail(diag, name);
+            return error.CompletionsUnknownKey;
+        }
     }
 
     // Every per-shell field is TYPE-checked on every shell's pass: a

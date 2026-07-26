@@ -4014,6 +4014,16 @@ test "completions: an unknown shell in the shells list is rejected" {
     );
 }
 
+test "completions: a row key outside the schema is rejected" {
+    try expectCompletionsError(error.CompletionsUnknownKey,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\shels = ["fish"]
+        \\
+    );
+}
+
 test "completions: duplicate names are rejected" {
     try expectCompletionsError(error.DuplicateGeneratedPath,
         \\[[completions]]
