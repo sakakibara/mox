@@ -1386,7 +1386,7 @@ test "run_scripts: a hung script is killed within the configured timeout" {
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var script_env = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{});
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "200");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -1412,7 +1412,7 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var script_env = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{});
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "notanumber");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -1482,7 +1482,7 @@ test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
 
     var bindings = std.StringHashMap([]const u8).init(a);
     const facts = [_]mox.apply.run_scripts.Fact{.{ .name = "profile", .value = "work" }};
-    var script_env = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts);
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
@@ -1514,7 +1514,7 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
 
     var bindings = std.StringHashMap([]const u8).init(a);
     const facts = [_]mox.apply.run_scripts.Fact{};
-    var script_env = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts);
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "500");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);

@@ -120,7 +120,7 @@ fn applyPass(
     // script can branch on the same facts that gate the file layer.
     const script_facts = try ctx.alloc.alloc(mox.apply.run_scripts.Fact, m_state.custom_facts.len);
     for (m_state.custom_facts, 0..) |f, i| script_facts[i] = .{ .name = f.name, .value = f.value };
-    const script_env = try mox.apply.run_scripts.buildScriptEnv(
+    const script_env_result = try mox.apply.run_scripts.buildScriptEnv(
         ctx.alloc,
         context.env,
         context.paths.repo_dir,
@@ -128,6 +128,12 @@ fn applyPass(
         context.paths.home,
         script_facts,
     );
+    const script_env = script_env_result.map;
+    if (script_env_result.skipped.len > 0) {
+        try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
+        for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
+        try ctx.err.writeAll("\n");
+    }
 
     // Pre-stage scripts run before any file compose+write. Used for
     // bootstrap (package install, mise/brew/scoop setup, etc.). Scripts

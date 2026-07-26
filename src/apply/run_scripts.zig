@@ -71,6 +71,18 @@ pub const Result = struct {
 /// A machine fact exposed to scripts as `MOX_FACT_<UPPERCASE_NAME>`.
 pub const Fact = struct { name: []const u8, value: []const u8 };
 
+/// `buildScriptEnv`'s result: the child environment plus the names of any
+/// facts left out of it.
+pub const ScriptEnv = struct {
+    map: EnvironMap,
+    /// Fact names not exposed as MOX_FACT_* because their name cannot be
+    /// turned into a distinct env name: a non-ASCII byte can only sanitize to
+    /// `_`, destroying the name, and two names that sanitize to the SAME
+    /// MOX_FACT_* would otherwise silently collide (last write wins). Named
+    /// here so a caller can warn instead of leaving either failure silent.
+    skipped: []const []const u8 = &.{},
+};
+
 /// Build the child environment for setup scripts: the parent environment
 /// augmented with MOX_REPO, MOX_STATE_DIR, MOX_HOME (the live root), and every
 /// fact as MOX_FACT_<UPPERCASE_NAME>. Characters outside [A-Z0-9_] in a fact
@@ -82,15 +94,50 @@ pub fn buildScriptEnv(
     state_dir: []const u8,
     home: []const u8,
     facts: []const Fact,
-) !EnvironMap {
+) !ScriptEnv {
     var map = try parent.createMap(arena);
     try map.put("MOX_REPO", repo);
     try map.put("MOX_STATE_DIR", state_dir);
     try map.put("MOX_HOME", home);
-    for (facts) |f| {
-        try map.put(try factEnvName(arena, f.name), f.value);
+
+    // First pass: tally how many facts each sanitized name would collect. A
+    // non-ASCII name never reaches the tally (it is unencodable on its own,
+    // regardless of what else is present); an ASCII name's tally exceeding 1
+    // means a genuine collision with some OTHER fact's sanitized form.
+    var counts = std.StringHashMap(usize).init(arena);
+    const encoded = try arena.alloc(?[]const u8, facts.len);
+    for (facts, 0..) |f, i| {
+        if (!isAsciiName(f.name)) {
+            encoded[i] = null;
+            continue;
+        }
+        const enc = try factEnvName(arena, f.name);
+        encoded[i] = enc;
+        const gop = try counts.getOrPut(enc);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
     }
-    return map;
+
+    var skipped: std.ArrayList([]const u8) = .empty;
+    for (facts, 0..) |f, i| {
+        const enc = encoded[i] orelse {
+            try skipped.append(arena, f.name);
+            continue;
+        };
+        if (counts.get(enc).? > 1) {
+            try skipped.append(arena, f.name);
+            continue;
+        }
+        try map.put(enc, f.value);
+    }
+    return .{ .map = map, .skipped = try skipped.toOwnedSlice(arena) };
+}
+
+fn isAsciiName(name: []const u8) bool {
+    for (name) |c| {
+        if (c >= 0x80) return false;
+    }
+    return true;
 }
 
 fn factEnvName(arena: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -597,20 +644,55 @@ test "buildScriptEnv: injects mox vars and uppercased facts" {
     var parent = EnvironMap.init(a);
     try parent.put("MOX_TEST_PARENT", "kept");
 
-    var map = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
-    try testing.expectEqualStrings("/repo", map.get("MOX_REPO").?);
-    try testing.expectEqualStrings("/state", map.get("MOX_STATE_DIR").?);
-    try testing.expectEqualStrings("/home/me", map.get("MOX_HOME").?);
-    try testing.expectEqualStrings("work", map.get("MOX_FACT_PROFILE").?);
-    try testing.expectEqualStrings("gdrive", map.get("MOX_FACT_CLOUD_BACKEND").?);
+    var result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    try testing.expectEqualStrings("/repo", result.map.get("MOX_REPO").?);
+    try testing.expectEqualStrings("/state", result.map.get("MOX_STATE_DIR").?);
+    try testing.expectEqualStrings("/home/me", result.map.get("MOX_HOME").?);
+    try testing.expectEqualStrings("work", result.map.get("MOX_FACT_PROFILE").?);
+    try testing.expectEqualStrings("gdrive", result.map.get("MOX_FACT_CLOUD_BACKEND").?);
     // Parent environment is preserved.
-    try testing.expectEqualStrings("kept", map.get("MOX_TEST_PARENT").?);
+    try testing.expectEqualStrings("kept", result.map.get("MOX_TEST_PARENT").?);
+    try testing.expectEqual(@as(usize, 0), result.skipped.len);
 }
 
 test "factEnvName: non-identifier characters become underscores" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqualStrings("MOX_FACT_GDRIVE_ACCOUNT", try factEnvName(arena.allocator(), "gdrive.account"));
+}
+
+test "buildScriptEnv: a non-ASCII fact name is skipped, not garbled into underscores" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parent = EnvironMap.init(a);
+    // "nihongo" (Japanese for "Japanese language") as raw UTF-8 bytes.
+    const facts = [_]Fact{
+        .{ .name = "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", .value = "x" },
+        .{ .name = "profile", .value = "work" },
+    };
+    var result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    try testing.expectEqualStrings("work", result.map.get("MOX_FACT_PROFILE").?);
+    try testing.expectEqual(@as(usize, 1), result.skipped.len);
+    try testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", result.skipped[0]);
+}
+
+test "buildScriptEnv: two names that sanitize identically are both skipped, neither silently wins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parent = EnvironMap.init(a);
+    const facts = [_]Fact{
+        .{ .name = "cloud.backend", .value = "gdrive" },
+        .{ .name = "cloud-backend", .value = "dropbox" },
+        .{ .name = "profile", .value = "work" },
+    };
+    var result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    try testing.expect(result.map.get("MOX_FACT_CLOUD_BACKEND") == null);
+    try testing.expectEqualStrings("work", result.map.get("MOX_FACT_PROFILE").?);
+    try testing.expectEqual(@as(usize, 2), result.skipped.len);
+    try testing.expectEqualStrings("cloud.backend", result.skipped[0]);
+    try testing.expectEqualStrings("cloud-backend", result.skipped[1]);
 }
 
 test "directArgv: single-element argv" {
