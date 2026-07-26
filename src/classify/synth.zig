@@ -174,6 +174,7 @@ pub fn materialize(
     base_abs: []const u8,
     base_content: []const u8,
     plans: []const Plan,
+    err: *Io.Writer,
 ) !void {
     const prior = try Io.Dir.cwd().readFileAlloc(io, base_abs, arena, .limited(max_base_bytes));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_abs, .data = base_content });
@@ -185,7 +186,9 @@ pub fn materialize(
             Io.Dir.cwd().deleteFile(io, c.fragment) catch {};
             if (c.dir) |d| Io.Dir.cwd().deleteTree(io, d) catch {};
         }
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = base_abs, .data = prior }) catch {};
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = base_abs, .data = prior }) catch {
+            err.print("mox commit: {s}: could not restore original content; left edited\n", .{base_abs}) catch {};
+        };
     }
 
     for (plans) |plan| {
@@ -367,7 +370,8 @@ test "synthesized region recomposes to the fallback for one profile and the frag
     const base_content = try Io.Dir.cwd().readFileAlloc(io, base_abs, a, .limited(1 << 20));
     const plan = try planRegion(a, base_abs, base_content, "#", 1, 1, &.{"export KEY=new"}, "profile", "work");
     const spliced = "export A=1\n# mox: replace from \"profile\"\nexport KEY=old\n# mox: end\nexport B=2\n";
-    try materialize(a, io, base_abs, spliced, &.{plan});
+    var err_aw: Io.Writer.Allocating = .init(a);
+    try materialize(a, io, base_abs, spliced, &.{plan}, &err_aw.writer);
 
     // Rewalk so the new region is picked up, then compose per profile.
     const tree = try source.tree.walk(a, io, src_dir, "/home/me");
@@ -405,9 +409,56 @@ test "materialize: a failure writing the fragment restores the base and leaves n
 
     const plan = try planRegion(a, base_abs, original, "#", 1, 1, &.{"export KEY=new"}, "profile", "work");
     const spliced = "export A=1\n# mox: replace from \"profile\"\nexport KEY=old\n# mox: end\nexport B=2\n";
-    try testing.expectError(error.NotDir, materialize(a, io, base_abs, spliced, &.{plan}));
+    var err_aw: Io.Writer.Allocating = .init(a);
+    try testing.expectError(error.NotDir, materialize(a, io, base_abs, spliced, &.{plan}, &err_aw.writer));
 
     // All-or-nothing: the base never keeps a region whose fragment does not
     // exist, so it is back to its exact pre-call bytes.
     try testing.expectEqualStrings(original, try Io.Dir.cwd().readFileAlloc(io, base_abs, a, .limited(1 << 20)));
+}
+
+var materialize_fail_target: []const u8 = "";
+var materialize_fail_calls: usize = 0;
+var materialize_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File = undefined;
+
+fn materializeFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+    if (std.mem.eql(u8, sub_path, materialize_fail_target)) {
+        materialize_fail_calls += 1;
+        if (materialize_fail_calls == 2) return error.AccessDenied;
+    }
+    return materialize_fail_real(userdata, dir, sub_path, opts);
+}
+
+test "materialize: a failed base restore reports the un-restored path, not just the original failure" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "src");
+    const original = "export A=1\nexport KEY=old\nexport B=2\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/.zshrc", .data = original });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/.zshrc.d", .data = "not a directory\n" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const src_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "src" });
+    const base_abs = try std.fs.path.join(a, &.{ src_dir, ".zshrc" });
+
+    const plan = try planRegion(a, base_abs, original, "#", 1, 1, &.{"export KEY=new"}, "profile", "work");
+    const spliced = "export A=1\n# mox: replace from \"profile\"\nexport KEY=old\n# mox: end\nexport B=2\n";
+
+    // The 1st write of base_abs (the spliced content) must land; only the
+    // 2nd (the errdefer's restore) fails.
+    materialize_fail_target = base_abs;
+    materialize_fail_calls = 0;
+    materialize_fail_real = io.vtable.dirCreateFile;
+    var vtable = io.vtable.*;
+    vtable.dirCreateFile = materializeFailingCreateFile;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    var err_aw: Io.Writer.Allocating = .init(a);
+    try testing.expectError(error.NotDir, materialize(a, faulty, base_abs, spliced, &.{plan}, &err_aw.writer));
+
+    try testing.expect(std.mem.indexOf(u8, err_aw.writer.buffered(), base_abs) != null);
 }

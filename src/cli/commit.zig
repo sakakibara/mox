@@ -145,6 +145,7 @@ const ClassCtx = struct {
     secrets: mox.compose.catB.SecretCtx,
     hostname: []const u8,
     stdout: *Io.Writer,
+    err: *Io.Writer,
     input: *Io.Reader,
     ask_mode: prompt.Mode,
     report_mode: bool,
@@ -477,6 +478,7 @@ pub fn commitImpl(
         .secrets = secrets,
         .hostname = m_state.hostname,
         .stdout = ctx.out,
+        .err = ctx.err,
         .input = input,
         .ask_mode = ask_mode,
         .report_mode = report_mode,
@@ -891,7 +893,7 @@ pub fn commitImpl(
             });
         }
         const base_content = try splicedContent(ctx.alloc, ctx.io, base_abs, splices.items);
-        try mox.classify.synth.materialize(ctx.alloc, ctx.io, base_abs, base_content, plans.items);
+        try mox.classify.synth.materialize(ctx.alloc, ctx.io, base_abs, base_content, plans.items, ctx.err);
     }
     try applyCouplingEdits(ctx.alloc, ctx.io, coupling_edits);
     // Struct edits touch source layers, independent of facts; sequential
@@ -1623,7 +1625,9 @@ fn simulateCouplingImpact(
     for (file_edits) |ce| edited = try replaceToken(arena, edited, ce.old, ce.new);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = edited });
     const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch {};
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch {
+            try cc.err.print("mox commit: {s}: could not restore the transiently edited source; left edited\n", .{path});
+        };
         return e;
     };
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original });
@@ -4436,4 +4440,103 @@ test "resolveCoupling: a q-abort after a decline persists no decline" {
     try testing.expect(!res.save_declines);
     // No coupling edit was accepted either.
     try testing.expectEqual(@as(usize, 0), res.edits.len);
+}
+
+var coupling_restore_fail_target: []const u8 = "";
+var coupling_restore_fail_calls: usize = 0;
+var coupling_restore_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File = undefined;
+
+fn couplingRestoreFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+    if (std.mem.eql(u8, sub_path, coupling_restore_fail_target)) {
+        coupling_restore_fail_calls += 1;
+        if (coupling_restore_fail_calls == 2) return error.AccessDenied;
+    }
+    return coupling_restore_fail_real(userdata, dir, sub_path, opts);
+}
+
+test "simulateCouplingImpact: a failed post-simulation restore reports the un-restored path" {
+    const io = std.testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "src");
+    // The coupled token sits with token-boundary whitespace around it (an
+    // adjoining '=' is itself a token char) so the coupling rename actually
+    // replaces it. Post-rename, the axis value carries '@', which the DSL
+    // lexer rejects for every configuration -- including this machine's own.
+    const fixture = "common\n# mox: when profile= sharedtok\ngated\n# mox: end\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/.zshrc", .data = fixture });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const src_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "src" });
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    try testing.expectEqual(@as(usize, 1), tree.files.len);
+    const file = tree.files[0];
+    const path = file.source_base_abs;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("profile", "personal");
+    const configs = &[_]Configuration{.{ .label = "", .bindings = bindings, .is_this_machine = true }};
+
+    const m_state: mox.machine.state.MachineState = .{
+        .os = "linux",
+        .arch = "x86_64",
+        .hostname = "test",
+        .username = "tester",
+        .home = "/home/me",
+        .tools_on_path = &.{},
+        .defined_envs = &.{},
+        .brew_prefix = "",
+        .cargo_home = "",
+        .gopath = "",
+        .pnpm_home = "",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+    };
+    var secret_map = std.process.Environ.Map.init(a);
+    var secret_cache = mox.secret.cache.Cache.init(a);
+
+    // Every op but the SECOND create of `path` (the post-failure restore)
+    // forwards to the real io; the first create is the edited-content write
+    // and must land normally.
+    coupling_restore_fail_target = path;
+    coupling_restore_fail_calls = 0;
+    coupling_restore_fail_real = io.vtable.dirCreateFile;
+    var vtable = io.vtable.*;
+    vtable.dirCreateFile = couplingRestoreFailingCreateFile;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    var out_aw: Io.Writer.Allocating = .init(a);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    var reader = Io.Reader.fixed("");
+    var claims: Claims = .empty;
+    const cc: ClassCtx = .{
+        .arena = a,
+        .io = faulty,
+        .this_bindings = &bindings,
+        .m_state = &m_state,
+        .secrets = .{ .env = mox.env.Env{ .map = &secret_map }, .cache = &secret_cache },
+        .hostname = m_state.hostname,
+        .stdout = &out_aw.writer,
+        .err = &err_aw.writer,
+        .input = &reader,
+        .ask_mode = .assume_default,
+        .report_mode = false,
+        .interactive = false,
+        .sty = .{ .on = false },
+        .claims = &claims,
+    };
+
+    const file_edits = &[_]CouplingEdit{.{ .path = path, .old = "sharedtok", .new = "sharedtok@bad" }};
+    try testing.expectError(
+        error.UnexpectedCharacter,
+        simulateCouplingImpact(&cc, file, path, file_edits, configs),
+    );
+
+    try testing.expect(std.mem.indexOf(u8, err_aw.writer.buffered(), path) != null);
 }
