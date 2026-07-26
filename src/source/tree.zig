@@ -493,6 +493,15 @@ const Decl = struct {
 /// the file itself reports the error and is skipped.
 pub const unstructured_head_error = "head directives require a structured target (toml/json/yaml/ini/gitconfig)";
 
+/// A structured target's head names a wrong-marker probe hit: an own/disown/
+/// check declaration, or a whole-file `when` gate, spelled in a comment
+/// marker other than this format's own. Compose recognizes a directive only
+/// under the file's real marker, so one spelled any other way is inert --
+/// it passes into the live file as plain text, and a gate spelled this way
+/// never gates at all (every configuration composes it, the opposite of what
+/// it says).
+pub const wrong_marker_head_error = "a head directive or whole-file gate is spelled with a comment marker other than this file's own; it has no effect";
+
 /// The comment marker head directives use for a structured format: `#`
 /// everywhere except JSON, whose sources are JSONC (`//`).
 pub fn markerForFormat(format: format_mod.Format) []const u8 {
@@ -536,6 +545,25 @@ fn headChecked(
         }
         return .{};
     };
+
+    // A structured target has exactly one real marker (unlike the
+    // unstructured case above, where no marker is "correct"): probe every
+    // OTHER spelling for an own/disown/check declaration or a whole-file
+    // `when` gate that would be inert under the real one. Mirrors the
+    // unstructured probe's loop, but the signal is own/disown OR gate here,
+    // since a gate is a legitimate head construct on any target and only
+    // the WRONG marker makes it garbage.
+    const real_marker = markerForFormat(format);
+    for (probe_markers) |marker| {
+        if (std.mem.eql(u8, marker, real_marker)) continue;
+        const probed = head.parse(arena, content, marker) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .head_error = wrong_marker_head_error },
+        };
+        if (probed.ownership != .none or probed.gate != null) {
+            return .{ .head_error = wrong_marker_head_error };
+        }
+    }
 
     const parsed = head.parse(arena, content, markerForFormat(format)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

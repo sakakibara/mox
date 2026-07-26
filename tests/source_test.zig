@@ -362,6 +362,78 @@ test "walk: a directive-looking head on an unstructured target is a per-file err
     }
 }
 
+test "walk: an own declaration spelled in the wrong marker on a structured target is a per-file error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // toml's real marker is "#"; "--" is Lua's, not toml's, so compose would
+    // never recognize this line as a directive at all -- it would pass into
+    // the live file as a literal comment instead of declaring ownership.
+    try writeFile(io, tmp.dir, "src/.config/app/config.toml", "-- mox: own a\n[a]\nk = 1\n");
+    try writeFile(io, tmp.dir, "src/ok.toml", "[t]\nk = 1\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = try mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectEqual(@as(usize, 2), result.files.len);
+    for (result.files) |f| {
+        if (std.mem.endsWith(u8, f.live_path, "config.toml")) {
+            try std.testing.expect(f.head_error.len > 0);
+            try std.testing.expectEqual(mox.source.head.Ownership.none, f.ownership);
+        } else {
+            try std.testing.expectEqualStrings("", f.head_error);
+        }
+    }
+}
+
+test "walk: a whole-file gate spelled in the wrong marker on a structured target is a per-file error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A bare gate (no own/disown) that would otherwise pass headChecked
+    // clean, silently swallowed by compose's own re-parse under the real
+    // marker: the file emits unconditionally instead of only on a match --
+    // "both gate branches active."
+    try writeFile(io, tmp.dir, "src/.config/app/config.toml", "-- mox: when os=darwin\n[a]\nk = 1\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = try mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    try std.testing.expect(result.files[0].head_error.len > 0);
+}
+
+test "walk: an own declaration in the CORRECT marker on a structured target is unaffected by the wrong-marker probe" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.config/app/config.toml", "# mox: own a\n# mox: when os=darwin\n[a]\nk = 1\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    try std.testing.expectEqualStrings("", result.files[0].head_error);
+    try std.testing.expectEqual(mox.source.head.Ownership.own, result.files[0].ownership);
+}
+
 test "walk: the head read is bounded and a large base still declares ownership" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
