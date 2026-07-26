@@ -137,7 +137,9 @@ completions that always match the installed version. fish, zsh, and bash
 ride their shells' own per-command lazy loading; the PowerShell stub is a
 self-replacing `Register-ArgumentCompleter` that loads the generated
 script on first request and answers it by re-entering `TabExpansion2`.
-The registry is a TOML array of `[[completions]]` rows:
+The registry is a TOML array of `[[completions]]` rows (the array key
+is the registry filename stem, so `data/completions.toml` holds
+`[[completions]]`):
 
 - `name` (required): the completed command; first char `[A-Za-z0-9_]`,
   then `[A-Za-z0-9_.-]`.

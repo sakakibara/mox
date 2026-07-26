@@ -4124,3 +4124,91 @@ test "completions: bash and powershell stubs, byte-exact" {
         ps_stub.content,
     );
 }
+
+test "completions: a bash-only override row composes for bash" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.local/share/bash-completion/completions/completions.gen",
+        \\# mox: completions bash "data/completions.toml"
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/completions.toml",
+        \\[[completions]]
+        \\name = "tool"
+        \\bash = "tool completion bash"
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out = try composeCompletionsAt(a, io, &tmp, "completions/completions.gen");
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings(
+        "command -v tool >/dev/null 2>&1 || return 0\n" ++
+            "eval \"$(tool completion bash)\"\n",
+        out[0].content,
+    );
+}
+
+test "completions: a powershell-only override row composes for powershell" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.config/powershell/completions/completions.gen",
+        \\# mox: completions powershell "data/completions.toml"
+        \\
+    );
+    try writeFile(io, tmp.dir, "data/completions.toml",
+        \\[[completions]]
+        \\name = "tool"
+        \\powershell = "tool completion powershell"
+        \\
+    );
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out = try composeCompletionsAt(a, io, &tmp, "completions/completions.gen");
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expect(std.mem.indexOf(u8, out[0].content, "tool completion powershell | Out-String") != null);
+}
+
+test "completions: a mistyped per-shell override is an error, not an absent field" {
+    try expectCompletionsError(error.CompletionsCommandInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\zsh = 123
+        \\
+    );
+}
+
+test "completions: a mistyped command is an error" {
+    try expectCompletionsError(error.CompletionsCommandInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = true
+        \\
+    );
+}
+
+test "completions: an empty shells allow-list is rejected as dead weight" {
+    try expectCompletionsError(error.CompletionsShellsInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\shells = []
+        \\
+    );
+}
+
+test "completions: zsh_dispatch on a row whose shells exclude zsh is dead" {
+    try expectCompletionsError(error.CompletionsDispatchInvalid,
+        \\[[completions]]
+        \\name = "tool"
+        \\command = "tool completion"
+        \\shells = ["fish"]
+        \\zsh_dispatch = "_tool_complete"
+        \\
+    );
+}

@@ -198,6 +198,7 @@ fn applyPass(
     // recording happen AFTER all generators have composed. This makes the keep set
     // global and order-independent instead of "producers seen so far".
     var gen_states: std.ArrayList(GenState) = .empty;
+    var compose_failed: std.ArrayList([]const u8) = .empty;
 
     for (files, 0..) |file, file_i| {
         // `q` at a drift prompt stops the run: everything not yet resolved
@@ -250,9 +251,15 @@ fn applyPass(
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &prov, &diag) catch |e| {
             try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
+            if (e == error.UnknownShell)
+                try ctx.err.print("mox apply:   accepted shells: fish, zsh, bash, powershell\n", .{});
             if (diag.capture()) |cap|
                 try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
             counts.fail += 1;
+            // A file that fails to compose is undecided this run: it may be a
+            // generator with a transient syntax slip, and the orphan sweep
+            // must not treat its manifest as abandoned.
+            try compose_failed.append(ctx.alloc, file.live_path);
             continue;
         };
 
@@ -417,6 +424,9 @@ fn applyPass(
             if (f.head_error.len > 0) {
                 try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(f.live_path)), {});
             }
+        }
+        for (compose_failed.items) |p| {
+            try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(p)), {});
         }
         const swept = try mox.apply.generated.sweepOrphans(ctx.alloc, ctx.io, .{
             .state_dir = context.paths.state_dir,

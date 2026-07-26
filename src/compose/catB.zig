@@ -644,53 +644,53 @@ fn resolveCompletionsRow(
         }
     }.set;
 
-    const name = switch (rec.get("name") orelse data_mod.value.Value{ .string = "" }) {
-        .string => |s| s,
-        else => "",
+    const name = blk: {
+        const nv = rec.get("name") orelse {
+            fail(diag, "row without a name");
+            return error.CompletionsNameInvalid;
+        };
+        switch (nv) {
+            .string => |s| break :blk s,
+            else => {
+                fail(diag, "name is not a string");
+                return error.CompletionsNameInvalid;
+            },
+        }
     };
     if (!validCompletionsName(name)) {
-        fail(diag, if (name.len > 0) name else "row without a name");
+        fail(diag, name);
         return error.CompletionsNameInvalid;
     }
 
-    const override_key, const shell_word = switch (shell) {
-        .fish => .{ "fish", "fish" },
-        .zsh => .{ "zsh", "zsh" },
-        .bash => .{ "bash", "bash" },
-        .powershell => .{ "powershell", "powershell" },
-    };
-    const prefix: ?[]const u8 = switch (rec.get("command") orelse data_mod.value.Value{ .bool = false }) {
-        .string => |s| s,
-        else => null,
-    };
-    const override: ?[]const u8 = switch (rec.get(override_key) orelse data_mod.value.Value{ .bool = false }) {
-        .string => |s| s,
-        else => null,
-    };
-    const zsh_cmd_declared = rec.get("zsh") != null or prefix != null;
-
-    // zsh_dispatch is validated on every shell's pass so a dead declaration
-    // (dispatch without any zsh command) fails even in a fish-only setup.
-    var dispatch: []const u8 = "";
-    if (rec.get("zsh_dispatch")) |dv| {
-        const ds = switch (dv) {
-            .string => |s| s,
-            else => "",
-        };
-        if (!validDispatchName(ds) or !zsh_cmd_declared) {
-            fail(diag, name);
-            return error.CompletionsDispatchInvalid;
+    // Every per-shell field is TYPE-checked on every shell's pass: a
+    // mistyped override degrading to "absent" would be exactly the silent
+    // skip the schema forbids.
+    const override_keys = [_][]const u8{ "fish", "zsh", "bash", "powershell" };
+    var any_command_field = false;
+    for (override_keys) |k| {
+        if (rec.get(k)) |v| {
+            any_command_field = true;
+            if (v != .string) {
+                fail(diag, name);
+                return error.CompletionsCommandInvalid;
+            }
         }
-        dispatch = ds;
     }
-    if (dispatch.len == 0) dispatch = try std.fmt.allocPrint(arena, "_{s}", .{name});
+    const prefix: ?[]const u8 = if (rec.get("command")) |cv| switch (cv) {
+        .string => |s| s,
+        else => {
+            fail(diag, name);
+            return error.CompletionsCommandInvalid;
+        },
+    } else null;
 
     // A row that declares no command at all is dead weight, excluded or not.
-    if (prefix == null and rec.get("fish") == null and rec.get("zsh") == null) {
+    if (prefix == null and !any_command_field) {
         fail(diag, name);
         return error.CompletionsCommandMissing;
     }
 
+    var zsh_covered = true;
     if (rec.get("shells")) |sv| {
         const listed: []const []const u8 = switch (sv) {
             .array_of_strings => |arr| arr,
@@ -700,12 +700,54 @@ fn resolveCompletionsRow(
                 return error.CompletionsShellsInvalid;
             },
         };
+        // An empty allow-list deadens the row on every shell -- dead weight,
+        // same as declaring no command.
+        if (listed.len == 0) {
+            fail(diag, name);
+            return error.CompletionsShellsInvalid;
+        }
         for (listed) |s| {
             if (std.meta.stringToEnum(dsl.ast.Shell, s) == null) {
                 fail(diag, name);
                 return error.CompletionsShellsInvalid;
             }
         }
+        zsh_covered = false;
+        for (listed) |s| zsh_covered = zsh_covered or std.mem.eql(u8, s, "zsh");
+    }
+
+    const override_key, const shell_word = switch (shell) {
+        .fish => .{ "fish", "fish" },
+        .zsh => .{ "zsh", "zsh" },
+        .bash => .{ "bash", "bash" },
+        .powershell => .{ "powershell", "powershell" },
+    };
+    const override: ?[]const u8 = if (rec.get(override_key)) |v| v.string else null;
+
+    // zsh_dispatch is validated on every shell's pass so a dead declaration
+    // fails even in a fish-only setup: it needs a zsh command it could
+    // dispatch AND a shells set that lets a zsh stub exist at all.
+    const zsh_cmd_resolved = zsh_covered and (rec.get("zsh") != null or prefix != null);
+    var dispatch: []const u8 = "";
+    if (rec.get("zsh_dispatch")) |dv| {
+        const ds = switch (dv) {
+            .string => |s| s,
+            else => "",
+        };
+        if (!validDispatchName(ds) or !zsh_cmd_resolved) {
+            fail(diag, name);
+            return error.CompletionsDispatchInvalid;
+        }
+        dispatch = ds;
+    }
+    if (dispatch.len == 0) dispatch = try std.fmt.allocPrint(arena, "_{s}", .{name});
+
+    if (rec.get("shells")) |sv| {
+        const listed: []const []const u8 = switch (sv) {
+            .array_of_strings => |arr| arr,
+            .string => |s| &.{s},
+            else => unreachable,
+        };
         var covered = false;
         for (listed) |s| covered = covered or std.mem.eql(u8, s, shell_word);
         if (!covered) return null;

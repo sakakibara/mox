@@ -4330,3 +4330,106 @@ test "apply completions: stubs land at home; a dropped row prunes its stub" {
     try std.testing.expect(exists(io, try c.homePath(".zcomp/_herdr")));
     try std.testing.expect(!exists(io, try c.homePath(".zcomp/_mox")));
 }
+
+test "apply generator sweep: a parse-broken generator keeps its set until fixed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.zcomp");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions zsh \"data/completions.toml\"\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/completions.toml", .data = "[[completions]]\nname = \"tool\"\ncommand = \"tool completion\"\n" });
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".zcomp/_tool")));
+
+    // A one-character syntax slip: the file is undecided this run, so its
+    // produced set must survive the orphan sweep.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions zsh data/completions.toml\n",
+    });
+    const broken = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(broken.rc != 0);
+    try std.testing.expect(exists(io, try c.homePath(".zcomp/_tool")));
+
+    // Fixing the directive regenerates without churn.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions zsh \"data/completions.toml\"\n",
+    });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".zcomp/_tool")));
+}
+
+test "apply generator sweep: deleting a completions source prunes its stubs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.zcomp");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions zsh \"data/completions.toml\"\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/completions.toml", .data = "[[completions]]\nname = \"tool\"\ncommand = \"tool completion\"\n" });
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try c.homePath(".zcomp/_tool")));
+
+    try tmp.dir.deleteFile(io, "repo/src/.zcomp/completions.gen");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(!exists(io, try c.homePath(".zcomp/_tool")));
+}
+
+test "apply completions: stray content beside the directive is a loud error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.zcomp");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions zsh \"data/completions.toml\"\nstray\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/completions.toml", .data = "[[completions]]\nname = \"tool\"\ncommand = \"tool completion\"\n" });
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "CompletionsOnNonGenerator") != null);
+}
+
+test "apply completions: an unknown shell names the accepted set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.zcomp");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zcomp/completions.gen",
+        .data = "# mox: completions tcsh \"data/completions.toml\"\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownShell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted shells: fish, zsh, bash, powershell") != null);
+}
