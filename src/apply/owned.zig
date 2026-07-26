@@ -326,6 +326,8 @@ pub fn ownDiagText(e: anyerror) []const u8 {
         error.OwnOnSymlink => "own cannot combine with symlink",
         error.OwnOnSeedOnce => "own cannot combine with seed_once",
         error.OwnOnGenerator => "own cannot apply to a generator source",
+        error.OwnAndDisown => "own and disown cannot combine in one head",
+        error.OwnPathOverlap => "declared paths must address disjoint subtrees",
         error.InvalidOwnPath => "own path does not parse as a dotted key path",
         error.InvalidCheckDirective => "check takes one or more double-quoted argv items, once",
         error.CheckWithoutOwnership => "check requires an ownership declaration",

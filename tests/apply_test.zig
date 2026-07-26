@@ -2977,6 +2977,27 @@ test "apply: an own declaration the walk rejects reports the target by name" {
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "dotted key path") != null);
+
+    // own combined with disown is a named declaration error in every
+    // command that walks, never a raw internal error.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own a\n# mox: disown b\n[a]\n" });
+    const mixed_want = "ownership declaration: app.toml: own and disown cannot combine in one head";
+    inline for (.{ "apply", "status", "diff", "commit" }) |cmd| {
+        const m = try c.run(&.{ "mox", cmd });
+        try std.testing.expectEqual(@as(u8, 1), m.rc);
+        try std.testing.expect(std.mem.indexOf(u8, m.err, mixed_want) != null);
+    }
+    // rollback warns (whole-file restores must still work) and then fails
+    // on the missing snapshot.
+    const rb = try c.run(&.{ "mox", "rollback", "nope" });
+    try std.testing.expect(std.mem.indexOf(u8, rb.err, mixed_want) != null);
+
+    // Overlapping declared paths are refused at the walk, naming both.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n# mox: own tui.keymap\n[tui]\n" });
+    const ov = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), ov.rc);
+    try std.testing.expect(std.mem.indexOf(u8, ov.err, "ownership declaration: app.toml: tui: overlaps declared path tui.keymap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ov.err, "disjoint subtrees") != null);
 }
 
 test "apply: a directive-looking line in an unstructured head fails only that file" {

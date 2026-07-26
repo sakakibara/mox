@@ -412,6 +412,8 @@ pub fn commitImpl(
         error.OwnOnSymlink,
         error.OwnOnSeedOnce,
         error.OwnOnGenerator,
+        error.OwnAndDisown,
+        error.OwnPathOverlap,
         error.InvalidOwnPath,
         error.InvalidCheckDirective,
         error.CheckWithoutOwnership,

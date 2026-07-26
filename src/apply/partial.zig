@@ -253,8 +253,10 @@ fn lineEndOf(src: []const u8, i: usize) usize {
 }
 
 /// Declared paths must address disjoint subtrees: one path nested under
-/// another would locate the same bytes twice.
-fn checkPathOverlap(own_paths: []const OwnPath, diag: ?*Diag) LocateError!void {
+/// another (or a duplicate) would locate the same bytes twice. Public so
+/// the walk can refuse an overlapping declaration at parse time, before
+/// any command composes against it.
+pub fn checkPathOverlap(own_paths: []const OwnPath, diag: ?*Diag) LocateError!void {
     for (own_paths, 0..) |a, i| {
         for (own_paths[i + 1 ..]) |b| {
             if (segsPrefix(a.segments, b.segments) or segsPrefix(b.segments, a.segments)) {

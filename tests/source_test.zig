@@ -452,6 +452,34 @@ test "walk: own on a generator source is rejected" {
     try std.testing.expectEqualStrings(".config/git/ids.toml", diag.capture().?);
 }
 
+test "walk: overlapping or duplicate own paths are rejected, naming target and paths" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // One path nested under another: both would locate the same bytes.
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "# mox: own tui\n# mox: own tui.keymap\n[tui]\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectError(error.OwnPathOverlap, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, ".codex/config.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, "overlaps declared path") != null);
+
+    // An exact duplicate is the degenerate overlap.
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "# mox: own tui\n# mox: own tui\n[tui]\n");
+    try std.testing.expectError(
+        error.OwnPathOverlap,
+        mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me"),
+    );
+}
+
 test "walk: an own path the key grammar rejects names target and path" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

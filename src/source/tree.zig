@@ -9,6 +9,7 @@ const keypath = @import("keypath.zig");
 const format_mod = @import("format.zig");
 const head = @import("head.zig");
 const dsl = @import("../dsl/root.zig");
+const partial = @import("../apply/partial.zig");
 
 const Io = std.Io;
 
@@ -582,6 +583,17 @@ fn headChecked(
         };
         o.* = .{ .raw = raw, .segments = segments };
     }
+    // Overlapping or duplicate declarations would locate the same bytes
+    // twice; refuse them here so every command reports the target instead
+    // of failing mid-splice.
+    var overlap_diag: partial.Diag = .{};
+    partial.checkPathOverlap(out, &overlap_diag) catch {
+        if (diag) |d| {
+            var buf: [1024]u8 = undefined;
+            d.set(std.fmt.bufPrint(&buf, "{s}: {s}", .{ target_key, overlap_diag.text() }) catch target_key);
+        }
+        return error.OwnPathOverlap;
+    };
     return .{ .ownership = parsed.ownership, .own_paths = out, .check_argv = parsed.check };
 }
 

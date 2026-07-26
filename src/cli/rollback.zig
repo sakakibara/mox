@@ -44,6 +44,8 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             error.OwnOnSymlink,
             error.OwnOnSeedOnce,
             error.OwnOnGenerator,
+            error.OwnAndDisown,
+            error.OwnPathOverlap,
             error.InvalidOwnPath,
             error.InvalidCheckDirective,
             error.CheckWithoutOwnership,
