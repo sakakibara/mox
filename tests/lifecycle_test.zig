@@ -1739,6 +1739,48 @@ test "add: a FIFO is refused as not a regular file, never opened" {
     try std.testing.expect(std.mem.indexOf(u8, own.err, "not a regular file") != null);
 }
 
+test "add: refuses while another live process holds the lock" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+
+    // A live process (this test) already holds the lock.
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    const boot = mox.cli.lock.bootId(a, io);
+    const stamp = if (boot.len > 0) boot else "-";
+    const line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "mox.lock" }), .data = line });
+
+    const r = try h.run(&.{ "mox", "add", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "lock held") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
+}
+
+test "add-tree: a directory outside HOME is refused at the top level" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "elsewhere/x.conf", "x\n");
+    const outside = try std.fs.path.join(a, &.{ h.root, "elsewhere" });
+
+    const r = try h.run(&.{ "mox", "add-tree", outside });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "outside HOME") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Added") == null);
+}
+
 test "add-tree: captures a symlink, reports a FIFO as skipped with a reason" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
     const io = std.testing.io;

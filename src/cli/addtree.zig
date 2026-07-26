@@ -55,6 +55,20 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         return 1;
     }
 
+    // A tree outside HOME is refused at the top level, exactly as single add
+    // refuses the file: every child would fail the same membership check, and
+    // "Added 0 file(s)" over a real directory would read as success. HOME
+    // itself stays walkable (its children are all under HOME).
+    if (try mox.source.path.liveKeyUnderHome(ctx.alloc, context.paths.home, dir_abs)) |rel| {
+        if (mox.source.path.keyEscapes(rel)) {
+            try ctx.err.print("mox add-tree: {s}: outside HOME ({s})\n", .{ dir_abs, context.paths.home });
+            return 1;
+        }
+    } else if (!add.isHomeItself(dir_abs, context.paths.home)) {
+        try ctx.err.print("mox add-tree: {s}: outside HOME ({s})\n", .{ dir_abs, context.paths.home });
+        return 1;
+    }
+
     var counts: Counts = .{};
     try walk(ctx, dir_abs, &ruleset, &counts);
 

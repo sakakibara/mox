@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const edit = @import("edit.zig");
+const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
 
 const Io = std.Io;
@@ -551,6 +552,11 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     // A relative argument resolves against HOME, as every live-path sibling
     // (add-tree, edit, remove, mv) resolves its own.
     const live_path = try edit.liveTarget(ctx.alloc, a.path, home);
+
+    // add mutates the repo (source file, attributes, coupling graph), so it
+    // takes the single-writer lock like every other mutator.
+    const lk = (try lock_mod.acquireForCommand(ctx, "add")) orelse return 1;
+    defer lk.release();
 
     if (!a.force) {
         const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
