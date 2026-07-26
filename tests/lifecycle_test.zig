@@ -489,6 +489,53 @@ test "add-tree: ignore file refuses sensitive paths, adds the rest" {
     try std.testing.expect(!exists(io, try h.srcOf(".claude/projects/p.jsonl")));
 }
 
+test "add-tree: a missing directory fails with not found instead of adding nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const r = try h.run(&.{ "mox", "add-tree", ".config/no-such-dir" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not found") != null);
+}
+
+test "add: a relative path resolves against HOME" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+
+    const r = try h.run(&.{ "mox", "add", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+}
+
+test "add --own: a relative path resolves against HOME" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/app.toml", "keep = 1\n\n[mine]\nx = 2\n");
+
+    const r = try h.run(&.{ "mox", "add", "--own", "mine", "app.toml" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const src = try read(io, a, try h.srcOf("app.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "# mox: own mine") != null);
+}
+
 test "add: notes a secret-looking file that is not ignored" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

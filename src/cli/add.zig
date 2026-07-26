@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
+const edit = @import("edit.zig");
 const mox = @import("../root.zig");
 
 const Io = std.Io;
@@ -531,11 +532,13 @@ fn collectRepeated(alloc: std.mem.Allocator, argv: []const []const u8, long: []c
 
 fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    const live_path = a.path;
     const home = context.env.getAlloc(ctx.alloc, "HOME") catch {
         try ctx.err.writeAll("mox add: HOME not set\n");
         return 1;
     };
+    // A relative argument resolves against HOME, as every live-path sibling
+    // (add-tree, edit, remove, mv) resolves its own.
+    const live_path = try edit.liveTarget(ctx.alloc, a.path, home);
 
     if (!a.force) {
         const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);

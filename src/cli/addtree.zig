@@ -34,14 +34,19 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
 
-    var counts: Counts = .{};
-    walk(ctx, dir_abs, &ruleset, &counts) catch |e| switch (e) {
+    // sortedPath maps a missing directory to an empty listing (a contract its
+    // optional-dir callers rely on), so a mistyped top-level dir must be
+    // probed here or the walk would report success over nothing.
+    _ = Io.Dir.cwd().statFile(ctx.io, dir_abs, .{}) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.err.print("mox add-tree: {s}: not found\n", .{dir_abs});
             return 1;
         },
         else => return e,
     };
+
+    var counts: Counts = .{};
+    try walk(ctx, dir_abs, &ruleset, &counts);
 
     try ctx.out.print("Added {d} file(s); {d} skipped, {d} failed\n", .{ counts.added, counts.skipped, counts.failed });
     return if (counts.failed > 0) 1 else 0;
