@@ -139,6 +139,16 @@ pub fn build(b: *std.Build) void {
     const apply_tests = b.addTest(.{ .root_module = apply_tests_mod });
     test_step.dependOn(&b.addRunArtifact(apply_tests).step);
 
+    // Shell-level completions-stub tests at tests/completions_shell_test.zig.
+    const completions_shell_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/completions_shell_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    completions_shell_tests_mod.addImport("mox", lib_mod);
+    const completions_shell_tests = b.addTest(.{ .root_module = completions_shell_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(completions_shell_tests).step);
+
     // Partial-ownership differential tests at tests/partial_differential_test.zig.
     const partial_diff_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/partial_differential_test.zig"),
