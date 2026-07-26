@@ -8,6 +8,7 @@ on:
   schedule:
     # Nightly bounded run of the fuzz targets (tests/fuzz_test.zig).
     - cron: "0 4 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -70,6 +71,7 @@ jobs:
     # the nightly rather than hanging.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - name: install zig
