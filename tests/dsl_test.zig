@@ -127,6 +127,24 @@ test "integration: axis evaluator works through full re-export chain" {
     try std.testing.expect(mox.dsl.axis.evaluate(expr, &bindings));
 }
 
+test "integration: a directive's when-clause accepts a quoted UTF-8 axis value" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    // Japanese "nihongo" (日本語) as raw UTF-8 bytes -- Zig string literals
+    // don't interpret \u escapes, so the byte sequence is spelled directly.
+    const src = "gated\n" ++
+        "# mox: when profile=\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\"\n" ++
+        "content\n" ++
+        "# mox: end\n";
+    const parsed = try mox.dsl.driver.parseFile(fba.allocator(), src, "#", null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.directives.len);
+    const when = parsed.directives[0].kind.when_gate.when.?;
+
+    var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    try bindings.put("profile", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e");
+    try std.testing.expect(mox.dsl.axis.evaluate(when, &bindings));
+}
+
 test "integration: line_count counts last line when file ends with mox: end" {
     var allocator_buf: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);

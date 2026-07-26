@@ -88,6 +88,12 @@ fn isValidAxisName(name: []const u8) bool {
 fn isValidAxisValue(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |c| {
+        // A byte >= 0x80 is a UTF-8 lead or continuation byte, never one of
+        // the ASCII delimiters this grammar reserves (`+`, `=`, `.`), so a
+        // non-ASCII value (a Kanji `machine=` value, say) passes through
+        // unquoted -- filenames have no quoting syntax to borrow from the
+        // directive grammar's escape hatch.
+        if (c >= 0x80) continue;
         if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '+' or c == '-')) return false;
     }
     return true;
@@ -143,6 +149,15 @@ test "parseFilename: value with dots and dashes" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const t = try parseFilename(fba.allocator(), "tool=fdfind-2.0");
     try std.testing.expectEqualStrings("fdfind-2.0", t.pairs[0].value);
+}
+
+test "parseFilename: a UTF-8 value is accepted verbatim" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    // "nihongo" (Japanese for "Japanese language") as raw UTF-8 bytes.
+    const t = try parseFilename(fba.allocator(), "profile=\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.toml");
+    try std.testing.expectEqualStrings("profile", t.pairs[0].name);
+    try std.testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", t.pairs[0].value);
 }
 
 test "parseFilenameVerbatim: keeps a dotted value parseFilename would strip" {

@@ -85,6 +85,17 @@ test "reject: glob in an axis value" {
     );
 }
 
+test "reject: an unquoted non-ASCII axis value does not lex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // A bare token lexes ASCII-alphanumeric only; a non-ASCII fact value
+    // (e.g. a Kanji profile name) needs the quoted-string escape hatch.
+    try std.testing.expectError(
+        error.UnexpectedCharacter,
+        mox.dsl.parser.parseRegionOpener(arena.allocator(), "when profile=\xe6\x97\xa5", 1, false),
+    );
+}
+
 test "reject: completions with an unsupported shell" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

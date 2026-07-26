@@ -396,6 +396,22 @@ test "parse: bare axis presence and literal axis eq (machine forms)" {
     try std.testing.expectEqualStrings("macos", e.eq.value);
 }
 
+test "parse: a quoted literal axis eq accepts a UTF-8 value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // "nihongo" (Japanese for "Japanese language") as raw UTF-8 bytes.
+    const e = try parseString(a, "profile=\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\"");
+    try std.testing.expect(e.* == .eq);
+    try std.testing.expectEqualStrings("profile", e.eq.ref);
+    try std.testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", e.eq.value);
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("profile", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e");
+    const scope: []const Frame = &.{};
+    try std.testing.expect(try evaluate(a, e, scope, &bindings, null));
+}
+
 test "parse: complex `not entry.X or entry.X has Y`" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

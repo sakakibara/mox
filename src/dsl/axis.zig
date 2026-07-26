@@ -118,9 +118,12 @@ pub const Parser = struct {
         self.advance();
         // A reserved word (in/and/or/not/end/from/has/remove/...) is a keyword
         // only in operator position; on the right of `=` it is a plain value.
+        // A quoted string is also a plain value -- the escape hatch for a
+        // non-ASCII fact value (a bare token lexes ASCII-alphanumeric only).
         const value = switch (self.peek().kind) {
             .ident => |s| s,
             .keyword => |s| s,
+            .string => |s| s,
             else => return error.ExpectedAxisValue,
         };
         self.advance();
@@ -348,6 +351,30 @@ test "evaluate: env axis multi-value" {
     var b = std.StringHashMap([]const u8).init(fba.allocator());
     try b.put("env=WSL_DISTRO_NAME", "1");
     try std.testing.expect(evaluate(expr, &b));
+}
+
+test "parse: a quoted string is a plain axis value, UTF-8 included" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const a = fba.allocator();
+
+    const expr = try parseString(a, "profile=\"\xe6\x9d\xb1\xe4\xba\xac\"");
+    try std.testing.expect(expr.* == .eq);
+    try std.testing.expectEqualStrings("profile", expr.eq.axis);
+    try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", expr.eq.value);
+
+    var b = std.StringHashMap([]const u8).init(a);
+    try b.put("profile", "\xe6\x9d\xb1\xe4\xba\xac");
+    try std.testing.expect(evaluate(expr, &b));
+}
+
+test "parse: an unquoted non-ASCII axis value still fails to lex" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    try std.testing.expectError(
+        error.UnexpectedCharacter,
+        parseString(fba.allocator(), "profile=\xe6\x9d\xb1\xe4\xba\xac"),
+    );
 }
 
 test "parseString: trailing tokens after a valid prefix are rejected" {

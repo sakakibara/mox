@@ -56,8 +56,11 @@ tool=fd and not env=WSL
 (email and signing_key) or os=linux
 ```
 
-- `name=value` - exact equality. Values are bare tokens, never quoted, so
-  there is no glob or regex here.
+- `name=value` - exact equality. A value is a bare token (ASCII letters,
+  digits, `_`, `+`, `-`, `.`) or a quoted string; either way it is an exact
+  token, so there is no glob or regex here. Quoting is the escape hatch for
+  a value outside the bare-token set, e.g. a non-ASCII fact value
+  (`profile="日本語"`).
 - `name` (no `=`) - presence: true when the axis is bound to a non-empty value.
 - `and`, `or`, `not`, and `( ... )` grouping. `not` may repeat.
 

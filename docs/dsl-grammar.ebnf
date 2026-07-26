@@ -91,13 +91,15 @@ lower         = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j"
               | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t"
               | "u" | "v" | "w" | "x" | "y" | "z" ;
 
-(* Terminals. A value is a bare ident token, never a quoted string: axis
-   comparisons are exact equality against a fixed token, which is why glob
-   and regex axis values do not parse. *)
+(* Terminals. A value is a bare ident token or a quoted string; either way
+   axis comparisons are exact equality against a fixed value, which is why
+   glob and regex axis values do not parse. A bare ident is ASCII only
+   (letters, digits, "_", "+", "-", "."); a quoted string is the escape
+   hatch for a value outside that set, e.g. a non-ASCII fact value. *)
 marker        = ? host file's line-comment lead, e.g. "#" "--" "//" ? ;
 string        = '"' { ? any byte except '"' ? } '"' ;
 ident         = ident_start { ident_cont } ;
 ident_start   = letter | digit | "_" | "+" | "-" | "." ;
 ident_cont    = letter | digit | "_" | "+" | "-" | "." ;
-value         = ident ;
+value         = ident | string ;
 EOL           = ? end of line ? ;
