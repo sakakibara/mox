@@ -1542,7 +1542,7 @@ test "applyToLayer: ini add of a whole new section materializes it and keeps pri
 
     // A section that exists only on the composed side is diffed to a whole
     // `.section` value at the section's path (see walkIni).
-    var entries = [_]ini.value.Entry{
+    var entries = [_]ini.Entry{
         .{ .key = "name", .value = .{ .string = "alice" } },
         .{ .key = "email", .value = .{ .string = "a@b.c" } },
     };

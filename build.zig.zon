@@ -25,8 +25,8 @@
             .hash = "env-0.1.1-sTEXsnNyAADkVRj6KAJjvfbgZQZVq56Rg2I4CoTy63sG",
         },
         .ini = .{
-            .url = "https://github.com/sakakibara/ini-zig/archive/refs/tags/v0.5.0.tar.gz",
-            .hash = "ini-0.5.0-_bxUWVyGCgCgm7ie1QwWln9XtwRzoJ7vsm5ktdUAoF1O",
+            .url = "https://github.com/sakakibara/ini-zig/archive/refs/tags/v0.6.0.tar.gz",
+            .hash = "ini-0.6.0-_bxUWeOKCgDikWyXc6ko8PfMlhdd2qWB3jhAKxj3aGrG",
         },
     },
     .paths = .{

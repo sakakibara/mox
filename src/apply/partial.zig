@@ -1818,14 +1818,14 @@ fn iniScan(arena: std.mem.Allocator, format: Format, live: []const u8) LocateErr
         const raw = src[start..@intCast(tok.span.end)];
         switch (tok.kind) {
             .section_header => {
-                const parts = ini.parser.splitHeader(raw, dialect) catch return error.LiveUnparseable;
+                const parts = ini.splitHeader(raw, dialect) catch return error.LiveUnparseable;
                 var path: std.ArrayList([]const u8) = .empty;
                 try path.append(arena, try foldAlloc(arena, parts.name, dialect.case_insensitive_sections));
                 if (parts.subsection) |sub| try path.append(arena, try unescapeSubsection(arena, sub));
                 current = path.items;
                 var inline_key: ?[]const u8 = null;
                 if (parts.rest.len > 0 and std.mem.indexOfScalar(u8, dialect.comment_chars, parts.rest[0]) == null) {
-                    const key_end = ini.tokenizer.findAssign(parts.rest, dialect.assign_chars) orelse parts.rest.len;
+                    const key_end = ini.findAssign(parts.rest, dialect.assign_chars) orelse parts.rest.len;
                     const key = std.mem.trim(u8, parts.rest[0..key_end], " \t");
                     if (key.len > 0) inline_key = try foldAlloc(arena, key, dialect.case_insensitive_keys);
                 }
@@ -1838,7 +1838,7 @@ fn iniScan(arena: std.mem.Allocator, format: Format, live: []const u8) LocateErr
                 });
             },
             .key_value => {
-                const key_end = ini.tokenizer.findAssign(raw, dialect.assign_chars) orelse raw.len;
+                const key_end = ini.findAssign(raw, dialect.assign_chars) orelse raw.len;
                 const key = std.mem.trim(u8, raw[0..key_end], " \t");
                 var path: std.ArrayList([]const u8) = .empty;
                 try path.appendSlice(arena, current);
@@ -1861,7 +1861,7 @@ fn iniScan(arena: std.mem.Allocator, format: Format, live: []const u8) LocateErr
 }
 
 fn foldAlloc(arena: std.mem.Allocator, s: []const u8, fold: bool) ![]const u8 {
-    return if (fold) ini.parser.toLowerAlloc(arena, s) else s;
+    return if (fold) ini.toLowerAlloc(arena, s) else s;
 }
 
 /// Git subsection names escape `"` and `\` with a backslash; drop it.
@@ -2630,7 +2630,7 @@ fn pruneValue(
         },
         .ini => |iv| {
             if (iv != .section) return v;
-            var out: std.ArrayList(ini.value.Entry) = .empty;
+            var out: std.ArrayList(ini.Entry) = .empty;
             var removed = false;
             for (iv.section.entries) |entry| {
                 const fold = iniEntryFold(iniDialect(format), entry.value == .section, stored.items.len);
