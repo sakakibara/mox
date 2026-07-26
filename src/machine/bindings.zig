@@ -8,7 +8,14 @@ pub fn fromMachineState(arena: std.mem.Allocator, m: state_mod.MachineState) !st
     var b = std.StringHashMap([]const u8).init(arena);
     try b.put("os", m.os);
     try b.put("arch", m.arch);
-    try b.put("machine", m.hostname);
+    // `machine` binds the first label only: the FULL hostname is
+    // network-volatile on macOS (a laptop reports a different
+    // "Foo.attlocal.net"-style name per network), so binding it whole would
+    // make a `machine=`-gated region silently stop matching when the network
+    // changes. The full name is still available, as the separate `hostname`
+    // fact, for a caller that genuinely wants it.
+    try b.put("machine", firstLabel(m.hostname));
+    try b.put("hostname", m.hostname);
 
     for (m.tools_on_path) |t| {
         const key = try std.fmt.allocPrint(arena, "tool={s}", .{t});
@@ -38,6 +45,65 @@ pub fn fromMachineState(arena: std.mem.Allocator, m: state_mod.MachineState) !st
         try b.put(f.name, f.value);
     }
     return b;
+}
+
+/// The hostname up to (not including) its first `.`, or the whole string
+/// when it carries no dot. Exported so a caller that synthesizes a
+/// `machine=` narrowing (`mox commit`'s machine-local candidate) derives the
+/// same value this binding uses, instead of the raw hostname.
+pub fn firstLabel(hostname: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, hostname, '.') orelse return hostname;
+    return hostname[0..dot];
+}
+
+test "fromMachineState: machine binds the first hostname label, hostname keeps the full name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const m = state_mod.MachineState{
+        .os = "linux",
+        .arch = "aarch64",
+        .hostname = "Foo.attlocal.net",
+        .username = "u",
+        .home = "/h",
+        .tools_on_path = &.{},
+        .defined_envs = &.{},
+        .brew_prefix = "",
+        .cargo_home = "",
+        .gopath = "",
+        .pnpm_home = "",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+    };
+    var b = try fromMachineState(arena.allocator(), m);
+    try std.testing.expectEqualStrings("Foo", b.get("machine").?);
+    try std.testing.expectEqualStrings("Foo.attlocal.net", b.get("hostname").?);
+}
+
+test "fromMachineState: an undotted hostname binds identically to machine and hostname" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const m = state_mod.MachineState{
+        .os = "linux",
+        .arch = "aarch64",
+        .hostname = "plainhost",
+        .username = "u",
+        .home = "/h",
+        .tools_on_path = &.{},
+        .defined_envs = &.{},
+        .brew_prefix = "",
+        .cargo_home = "",
+        .gopath = "",
+        .pnpm_home = "",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+    };
+    var b = try fromMachineState(arena.allocator(), m);
+    try std.testing.expectEqualStrings("plainhost", b.get("machine").?);
+    try std.testing.expectEqualStrings("plainhost", b.get("hostname").?);
 }
 
 test "fromMachineState: basic" {

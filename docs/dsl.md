@@ -47,8 +47,11 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 
 ## Axis expressions
 
-Axes are machine facts: `os`, `arch`, `profile`, `machine`, and the
-multi-value `tool`, `env`, `path`. An axis expression is boolean over them:
+Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`, and
+the multi-value `tool`, `env`, `path`. `machine` is the first label of the
+hostname (e.g. `Foo` out of `Foo.attlocal.net`), stable across networks;
+`hostname` is the full name, for the rarer case that wants it. An axis
+expression is boolean over them:
 
 ```
 os=darwin

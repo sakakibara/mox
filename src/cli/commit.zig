@@ -143,7 +143,11 @@ const ClassCtx = struct {
     this_bindings: *const std.StringHashMap([]const u8),
     m_state: *const mox.machine.state.MachineState,
     secrets: mox.compose.catB.SecretCtx,
-    hostname: []const u8,
+    /// This machine's `machine`-axis value (the hostname's first label, same
+    /// as `bindings.fromMachineState` binds) -- what a machine-local
+    /// narrowing's synthesized `machine=` region must match, not the raw
+    /// hostname.
+    machine: []const u8,
     stdout: *Io.Writer,
     err: *Io.Writer,
     input: *Io.Reader,
@@ -484,7 +488,7 @@ pub fn commitImpl(
         .this_bindings = &bindings,
         .m_state = &m_state,
         .secrets = secrets,
-        .hostname = m_state.hostname,
+        .machine = mox.machine.bindings.firstLabel(m_state.hostname),
         .stdout = ctx.out,
         .err = ctx.err,
         .input = input,
@@ -1748,15 +1752,16 @@ fn containsOverlayOrigin(segments: []const Segment) bool {
 }
 
 /// Axes every real machine always binds (`src/machine/bindings.zig`'s
-/// `fromMachineState` sets os/arch/machine unconditionally, from `MachineState`
-/// fields no machine lacks). Their UNBOUND configuration is a phantom that must
-/// never be enumerated -- but a value the sources never name is not: a machine
-/// running an os this repo has never mentioned is real, and a promote reaches
-/// it. So a derived axis gets the `(other)` representative instead of the
-/// unbound one. Every other compared axis is an optional custom fact: a real
-/// sibling machine may leave it unset, and that fall-through configuration is
-/// what must be enumerated for the blast-radius check below to be sound.
-const derived_axes = [_][]const u8{ "os", "arch", "machine" };
+/// `fromMachineState` sets os/arch/machine/hostname unconditionally, from
+/// `MachineState` fields no machine lacks). Their UNBOUND configuration is a
+/// phantom that must never be enumerated -- but a value the sources never
+/// name is not: a machine running an os this repo has never mentioned is
+/// real, and a promote reaches it. So a derived axis gets the `(other)`
+/// representative instead of the unbound one. Every other compared axis is an
+/// optional custom fact: a real sibling machine may leave it unset, and that
+/// fall-through configuration is what must be enumerated for the
+/// blast-radius check below to be sound.
+const derived_axes = [_][]const u8{ "os", "arch", "machine", "hostname" };
 
 fn isDerivedAxis(name: []const u8) bool {
     for (derived_axes) |d| if (std.mem.eql(u8, d, name)) return true;
@@ -3321,7 +3326,7 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
 
     if (cc.report_mode) {
         try cc.stdout.writeAll(notice);
-        try writeCandidates(cc.arena, cc.stdout, cands, cc.hostname);
+        try writeCandidates(cc.arena, cc.stdout, cands, cc.machine);
         return .report;
     }
 
@@ -3335,7 +3340,7 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
     for (cands, 0..) |c, i| {
         try choices.append(cc.arena, .{
             .key = try std.fmt.allocPrint(cc.arena, "{d}", .{i + 1}),
-            .label = try candidateLabel(cc.arena, c, cc.hostname),
+            .label = try candidateLabel(cc.arena, c, cc.machine),
             .help = try candidateHelp(cc.arena, c),
         });
     }
@@ -3344,7 +3349,7 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
 
     var qw: Io.Writer.Allocating = .init(cc.arena);
     try qw.writer.writeAll(notice);
-    try writeCandidates(cc.arena, &qw.writer, cands, cc.hostname);
+    try writeCandidates(cc.arena, &qw.writer, cands, cc.machine);
     try qw.writer.writeAll("  ");
     try cc.sty.bold(&qw.writer);
     try qw.writer.writeAll("choose>");
@@ -3404,7 +3409,7 @@ fn classifyChoice(
 
     const is_base = file.has_base and std.mem.eql(u8, edit.path, file.source_base_abs);
     if (c.kind == .private or !is_base) {
-        try cc.stdout.print("  {s}: no automatic route to {s}; left uncommitted (edit the source manually)\n", .{ desc, try candidateLabel(cc.arena, c, cc.hostname) });
+        try cc.stdout.print("  {s}: no automatic route to {s}; left uncommitted (edit the source manually)\n", .{ desc, try candidateLabel(cc.arena, c, cc.machine) });
         return .unroutable;
     }
 
@@ -3413,10 +3418,11 @@ fn classifyChoice(
         return .unroutable;
     };
     const base_content = try Io.Dir.cwd().readFileAlloc(cc.io, edit.path, cc.arena, .limited(max_file_bytes));
-    // A machine-local narrowing gates on this machine's own hostname, which
-    // Candidate no longer carries (there is no machine axis to name).
+    // A machine-local narrowing gates on this machine's own `machine`-axis
+    // value (the hostname's first label), which Candidate no longer carries
+    // (there is no machine axis to name).
     const axis_name = if (c.kind == .machine_local) "machine" else c.axis_name;
-    const axis_value = if (c.kind == .machine_local) cc.hostname else c.axis_value;
+    const axis_value = if (c.kind == .machine_local) cc.machine else c.axis_value;
     // Some narrowings cannot be synthesized without damaging or losing data:
     // one that wraps line 1 displaces a shebang or a whole-file gate, one
     // whose region name the file already uses hands its fragment to that
@@ -3588,19 +3594,19 @@ fn editedContent(arena: std.mem.Allocator, content: []const u8, edit: LineEdit) 
 }
 
 /// Render one prompt/report line per candidate plus the manual/skip/quit tail.
-fn writeCandidates(arena: std.mem.Allocator, w: *Io.Writer, cands: []const candidates.Candidate, hostname: []const u8) !void {
+fn writeCandidates(arena: std.mem.Allocator, w: *Io.Writer, cands: []const candidates.Candidate, machine: []const u8) !void {
     for (cands, 0..) |c, i| {
-        try w.print("    [{d}] {s}\n", .{ i + 1, try candidateLabel(arena, c, hostname) });
+        try w.print("    [{d}] {s}\n", .{ i + 1, try candidateLabel(arena, c, machine) });
     }
     try w.writeAll("    [m] manual  [s] skip  [q] quit  [?] help\n");
 }
 
 /// Human-readable label for a candidate.
-fn candidateLabel(arena: std.mem.Allocator, c: candidates.Candidate, hostname: []const u8) ![]const u8 {
+fn candidateLabel(arena: std.mem.Allocator, c: candidates.Candidate, machine: []const u8) ![]const u8 {
     return switch (c.kind) {
         .universal => "universal",
         .axis => c.label,
-        .machine_local => try std.fmt.allocPrint(arena, "machine={s} (only here)", .{hostname}),
+        .machine_local => try std.fmt.allocPrint(arena, "machine={s} (only here)", .{machine}),
         .private => "private",
     };
 }
@@ -4535,7 +4541,7 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
         .this_bindings = &bindings,
         .m_state = &m_state,
         .secrets = .{ .env = mox.env.Env{ .map = &secret_map }, .cache = &secret_cache },
-        .hostname = m_state.hostname,
+        .machine = mox.machine.bindings.firstLabel(m_state.hostname),
         .stdout = &out_aw.writer,
         .err = &err_aw.writer,
         .input = &reader,

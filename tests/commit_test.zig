@@ -1455,7 +1455,7 @@ test "commit: --abort-on-prompt exits 2 off a terminal too, and writes nothing" 
     try std.testing.expectEqualSlices(u8, &before, &after);
 }
 
-test "commit: narrowing to this machine commits, even where the hostname carries a dot" {
+test "commit: narrowing to this machine uses the machine axis's first-label value, even when the raw hostname carries a dot" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1463,11 +1463,11 @@ test "commit: narrowing to this machine commits, even where the hostname carries
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The `machine` value is this host's name, which on macOS always ends in
-    // `.local`. A fragment is named for the value verbatim, so resolving it
-    // must not mistake that tail for a file extension -- otherwise the region
-    // never resolves, the recompose differs from live, and the machine-local
-    // candidate mox offers in every prompt can never be chosen successfully.
+    // The raw hostname on macOS always ends in `.local`, but the `machine`
+    // axis binds only its first label (network-volatile suffixes never
+    // matter), so a fragment named for it carries no dot even on such a
+    // host: the machine-local candidate mox offers in every prompt must
+    // still resolve, using the same first-label value everywhere.
     try writeSharedBaseFixture(io, &tmp);
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -1485,11 +1485,12 @@ test "commit: narrowing to this machine commits, even where the hostname carries
     try std.testing.expect(std.mem.indexOf(u8, res.err, "still differs from live") == null);
 
     // The base wraps the ORIGINAL line in a `machine` region; the edit lives in
-    // a fragment named for this machine, dot and all.
+    // a fragment named for this machine's first-label value.
     const src = try read(io, a, try h.srcOf(".zshrc"));
     try std.testing.expect(std.mem.indexOf(u8, src, "# mox: replace from \"machine\"") != null);
     const m_state = try mox.machine.state.capture(a, io, h.env);
-    const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/machine/{s}", .{m_state.hostname}));
+    const machine_value = mox.machine.bindings.firstLabel(m_state.hostname);
+    const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/machine/{s}", .{machine_value}));
     try std.testing.expectEqualStrings("export EDITOR=nvim\n", try read(io, a, frag));
 
     // The region resolves for THIS machine: recompose == live, so the applied
