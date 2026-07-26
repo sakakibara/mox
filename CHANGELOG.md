@@ -4,6 +4,42 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-28
+
+### Added
+- Completions generator directive: `# mox: completions <shell>
+  "data/completions.toml" [when <axis-expr>]` turns a source file into a
+  generator that emits one lazy completion stub per registry row into its
+  target directory -- fish, zsh, bash, and PowerShell. A stub asks the
+  INSTALLED tool for its completion script on the first completion
+  request of a session, riding each shell where a native per-command lazy
+  loader exists (fish completions dir, zsh fpath, bash-completion v2) and
+  a self-replacing Register-ArgumentCompleter on PowerShell -- so
+  completions cost nothing at shell startup and can never go stale
+  against the installed version. The zsh stub always rebinds and
+  dispatches explicitly: inside `eval`, a generated script never fires
+  its own trailing self-dispatch guard (funcstack[1] is `(eval)`), and
+  without the rebind a non-rebinding script would re-run its generator on
+  every request. Registry rows declare `name`, a `command` prefix or
+  full per-shell overrides, an optional `shells` allow-list, and
+  `zsh_dispatch` for scripts that register a differently-named
+  function; every gap is a row-named compose error, never a silent skip.
+  Stub shapes are byte-golden-tested and exercised in real shells
+  (zpty compsys sessions proving first-TAB completion, fish
+  `complete -C`, pwsh `TabExpansion2`).
+- Loop bodies: the marker-strip rule (one leading marker plus one space
+  is removed from a commented body line) and its doubled-marker escape
+  (`##x` emits `#x`) are now documented and test-locked.
+
+### Fixed
+- Apply now sweeps the manifests of generators that left the tree: a
+  generator source deleted directly (git rm, an editor) or stripped of
+  its directive used to leave every produced file live forever, with
+  only `mox remove` pruning the set. Orphaned sets are pruned
+  snapshot-first against the global keep set; a failed or parse-broken
+  generator keeps its manifest, and the sweep never runs on a scoped
+  apply or after a drift-prompt abort.
+
 ## [0.3.0] - 2026-07-26
 
 ### Added
