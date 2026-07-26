@@ -96,7 +96,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // re-run completes the move without orphaning the entry on the old key.
     const old_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, old_live);
     const new_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, new_live);
-    var attrs = try mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+    var attrs = try mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir, null);
     if (attrs.lookup(old_key)) |entry| {
         _ = attrs.remove(old_key);
         try attrs.set(new_key, entry);

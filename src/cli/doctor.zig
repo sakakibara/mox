@@ -314,7 +314,7 @@ fn orphanedAttributes(
     src_dir: []const u8,
     context: app.Context,
 ) !?[]const []const u8 {
-    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir) catch return null;
+    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir, null) catch return null;
     if (attrs.map.count() == 0) return &.{};
     const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
@@ -544,7 +544,7 @@ fn gitUntrackedSrc(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]c
 fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_dir: []const u8) !?[]const []const u8 {
     if (!Io.File.Permissions.has_executable_bit) return &.{};
 
-    const attrs = mox.source.attributes.load(arena, io, repo_dir) catch return null;
+    const attrs = mox.source.attributes.load(arena, io, repo_dir, null) catch return null;
     const tree = mox.source.tree.walk(arena, io, src_dir, "") catch return null;
 
     var out: std.ArrayList([]const u8) = .empty;

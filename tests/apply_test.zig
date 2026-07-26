@@ -1209,7 +1209,7 @@ test "add: a live symlink is captured as a regular source file plus a symlink fl
     try std.testing.expectEqualStrings("/opt/dotfiles/nvim", try read(io, a, src));
 
     // ... flagged `symlink = true`, keyed by the portable home-relative key.
-    var attrs = try mox.source.attributes.load(a, io, c.repo);
+    var attrs = try mox.source.attributes.load(a, io, c.repo, null);
     try std.testing.expect(attrs.symlink(".config/nvim"));
 }
 

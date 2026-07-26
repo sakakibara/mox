@@ -38,6 +38,48 @@ const Io = std.Io;
 
 const max_bytes: usize = 1024 * 1024;
 
+/// Schema string named in every `load` error, so a user sees the full
+/// contract rather than guessing from one bad field.
+const schema_text = "mode: string, symlink: bool, seed_once: bool";
+
+/// Names the target key and offending field a `load` error was raised for.
+/// Mirrors the `Diag` pattern used elsewhere in mox (fixed buffer, no
+/// allocation): `dsl`/`compose`/`source.tree` each define their own rather
+/// than share one, to avoid import cycles between leaf modules.
+pub const Diag = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn set(self: *Diag, text: []const u8) void {
+        const n = @min(text.len, self.buf.len);
+        @memcpy(self.buf[0..n], text[0..n]);
+        self.len = n;
+    }
+
+    pub fn capture(self: *const Diag) ?[]const u8 {
+        return if (self.len == 0) null else self.buf[0..self.len];
+    }
+};
+
+/// Human text for a `load` schema-violation error, naming the full schema so
+/// the fix is obvious without cross-referencing docs.
+pub fn diagText(e: anyerror) []const u8 {
+    return switch (e) {
+        error.UnknownAttributeKey => "unknown key (schema: " ++ schema_text ++ ")",
+        error.InvalidAttributeValue => "wrong-typed value (schema: " ++ schema_text ++ ")",
+        else => @errorName(e),
+    };
+}
+
+fn diagErr(diag: ?*Diag, key: []const u8, field: []const u8, err: anyerror) anyerror {
+    if (diag) |d| {
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "\"{s}\" ({s})", .{ key, field }) catch key;
+        d.set(text);
+    }
+    return err;
+}
+
 /// Per-target attributes. Only fields git cannot carry are recorded; a null
 /// field means "derive it natively" (mode from `stat`).
 pub const Entry = struct {
@@ -180,10 +222,13 @@ fn parseMode(s: []const u8) ?u32 {
 }
 
 /// Load `<repo_dir>/.mox/attributes.toml`. A missing file yields an empty map
-/// (not an error). A TOML parse error fails the load; within a well-formed
-/// file, an entry with an unexpected shape (non-table, or a field of the wrong
-/// type) is skipped so the rest still applies.
-pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Attributes {
+/// (not an error). A TOML parse error fails the load. Within a well-formed
+/// file, an entry key outside `{mode, symlink, seed_once}`, or a value of the
+/// wrong TOML type for its key (including a `mode` string that is not a valid
+/// octal literal), fails the load too -- silently dropping it would apply the
+/// wrong mode, or leave a mistyped `seed_once`/`symlink` intent doing nothing.
+/// `diag`, when non-null, names the offending target key and field.
+pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, diag: ?*Diag) !Attributes {
     var attrs: Attributes = .{ .arena = arena, .map = std.StringHashMap(Entry).init(arena) };
 
     const path = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "attributes.toml" });
@@ -200,14 +245,21 @@ pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Attributes 
         if (entry.value_ptr.* != .table) continue;
         const tbl = entry.value_ptr.table;
         var e: Entry = .{};
-        if (tbl.get("mode")) |mv| {
-            if (mv == .string) e.mode = parseMode(mv.string);
-        }
-        if (tbl.get("symlink")) |sv| {
-            if (sv == .boolean) e.symlink = sv.boolean;
-        }
-        if (tbl.get("seed_once")) |sv| {
-            if (sv == .boolean) e.seed_once = sv.boolean;
+        var fit = tbl.iterator();
+        while (fit.next()) |field| {
+            if (std.mem.eql(u8, field.key_ptr.*, "mode")) {
+                if (field.value_ptr.* != .string) return diagErr(diag, entry.key_ptr.*, "mode", error.InvalidAttributeValue);
+                e.mode = parseMode(field.value_ptr.string) orelse
+                    return diagErr(diag, entry.key_ptr.*, "mode", error.InvalidAttributeValue);
+            } else if (std.mem.eql(u8, field.key_ptr.*, "symlink")) {
+                if (field.value_ptr.* != .boolean) return diagErr(diag, entry.key_ptr.*, "symlink", error.InvalidAttributeValue);
+                e.symlink = field.value_ptr.boolean;
+            } else if (std.mem.eql(u8, field.key_ptr.*, "seed_once")) {
+                if (field.value_ptr.* != .boolean) return diagErr(diag, entry.key_ptr.*, "seed_once", error.InvalidAttributeValue);
+                e.seed_once = field.value_ptr.boolean;
+            } else {
+                return diagErr(diag, entry.key_ptr.*, field.key_ptr.*, error.UnknownAttributeKey);
+            }
         }
         if (entryEmpty(e)) continue;
         try attrs.set(entry.key_ptr.*, e);
@@ -220,7 +272,7 @@ const testing = std.testing;
 test "load: missing file yields an empty map" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var attrs = try load(arena.allocator(), testing.io, "/nonexistent/repo");
+    var attrs = try load(arena.allocator(), testing.io, "/nonexistent/repo", null);
     try testing.expectEqual(@as(usize, 0), attrs.map.count());
     try testing.expect(attrs.mode(".ssh/config") == null);
 }
@@ -249,7 +301,7 @@ test "parse: reads octal mode strings keyed by target key" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 
-    var attrs = try load(a, io, repo);
+    var attrs = try load(a, io, repo, null);
     try testing.expectEqual(@as(u32, 0o600), attrs.mode(".ssh/config").?);
     try testing.expectEqual(@as(u32, 0o444), attrs.mode(".local/share/x").?);
     try testing.expect(attrs.mode("nope") == null);
@@ -284,7 +336,7 @@ test "roundtrip: write then load recovers modes, deterministic sorted order" {
     ;
     try testing.expectEqualStrings(expected, written);
 
-    var back = try load(a, io, repo);
+    var back = try load(a, io, repo, null);
     try testing.expectEqual(@as(u32, 0o600), back.mode(".ssh/config").?);
     try testing.expectEqual(@as(u32, 0o444), back.mode(".bin/tool").?);
 }
@@ -319,7 +371,7 @@ test "roundtrip: symlink flag, alone and beside a mode" {
     ;
     try testing.expectEqualStrings(expected, written);
 
-    var back = try load(a, io, repo);
+    var back = try load(a, io, repo, null);
     try testing.expect(back.symlink(".config/nvim"));
     try testing.expect(back.mode(".config/nvim") == null);
     try testing.expect(back.symlink(".ssh/id"));
@@ -358,7 +410,7 @@ test "roundtrip: seed_once flag, alone and combined with mode and symlink" {
     ;
     try testing.expectEqualStrings(expected, written);
 
-    var back = try load(a, io, repo);
+    var back = try load(a, io, repo, null);
     try testing.expect(back.seedOnce(".config/app.local"));
     try testing.expect(back.mode(".config/app.local") == null);
     try testing.expect(!back.symlink(".config/app.local"));
@@ -405,6 +457,68 @@ test "parseMode: masks off setuid and over-0o777 bits" {
     try testing.expectEqual(@as(u32, 0o777), parseMode("7777").?);
 }
 
+test "load: an unknown key fails loudly instead of being dropped" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".mox/attributes.toml",
+        .data = "[\".config/app.local\"]\nseed_one = true\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    var diag: Diag = .{};
+    try testing.expectError(error.UnknownAttributeKey, load(a, io, repo, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.capture().?, "seed_one") != null);
+    try testing.expect(std.mem.indexOf(u8, diagText(error.UnknownAttributeKey), "schema") != null);
+}
+
+test "load: an unquoted (non-string) mode fails loudly instead of being dropped" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".mox/attributes.toml",
+        .data = "[\".ssh/config\"]\nmode = 600\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    var diag: Diag = .{};
+    try testing.expectError(error.InvalidAttributeValue, load(a, io, repo, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.capture().?, "mode") != null);
+}
+
+test "load: a mode string that is not valid octal fails loudly" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".mox/attributes.toml",
+        .data = "[\".ssh/config\"]\nmode = \"nope\"\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try testing.expectError(error.InvalidAttributeValue, load(a, io, repo, null));
+}
+
 test "roundtrip: a key with control chars (newline, tab) survives write and load" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -424,6 +538,6 @@ test "roundtrip: a key with control chars (newline, tab) survives write and load
     try attrs.set(key, .{ .mode = 0o600 });
     try attrs.write(io, repo);
 
-    var back = try load(a, io, repo);
+    var back = try load(a, io, repo, null);
     try testing.expectEqual(@as(u32, 0o600), back.mode(key).?);
 }

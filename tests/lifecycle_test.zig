@@ -606,7 +606,7 @@ test "add: a ./-spelled path records the canonical attribute key; apply restores
 
     // The mode is keyed by the canonical spelling the source walk derives,
     // not by the `./`-spelled add argument.
-    var attrs = try mox.source.attributes.load(a, io, h.repo);
+    var attrs = try mox.source.attributes.load(a, io, h.repo, null);
     try std.testing.expectEqual(@as(u32, 0o600), attrs.mode("priv.txt").?);
     try std.testing.expect(attrs.mode("./priv.txt") == null);
 
@@ -848,6 +848,27 @@ test "doctor: an untracked source is an advisory -- reported, and the rc stays 0
     // An advisory is something mox reports for a human to act on, never
     // something it remediates -- so it must not gate the exit code.
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "apply: an unknown attributes.toml key refuses loudly instead of silently dropping it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/app.local", "x\n");
+    // A typo'd key (`seed_one` for `seed_once`): silently dropping it would
+    // apply and overwrite what the user meant to protect.
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".config/app.local\"]\nseed_one = true\n");
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "attributes.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "seed_one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "schema") != null);
 }
 
 test "doctor --fix rebuilds malformed provenance for tracked files" {
@@ -1827,7 +1848,7 @@ test "add-tree: captures a symlink, reports a FIFO as skipped with a reason" {
     // The symlink was captured like single add captures it: a regular source
     // file holding the target string, flagged in attributes.
     try std.testing.expectEqualStrings("a.conf", try read(io, a, try h.srcOf(".config/app/link.conf")));
-    var attrs = try mox.source.attributes.load(a, io, h.repo);
+    var attrs = try mox.source.attributes.load(a, io, h.repo, null);
     try std.testing.expect(attrs.symlink(".config/app/link.conf"));
     try std.testing.expect(!exists(io, try h.srcOf(".config/app/pipe")));
 }

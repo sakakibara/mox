@@ -80,7 +80,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // the same path (add merges, it does not clear a flag it was not given).
     {
         const key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, live_path);
-        var attrs = try mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir);
+        var attrs = try mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir, null);
         if (attrs.remove(key)) try attrs.write(ctx.io, context.paths.repo_dir);
     }
 

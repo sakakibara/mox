@@ -304,7 +304,11 @@ pub fn walkDiag(
     // Repo root is the parent of `src/`; `.mox/attributes.toml` there records
     // the modes git cannot carry (0o600/0o444). It is authoritative for those.
     const repo_dir = std.fs.path.dirname(src_dir) orelse "";
-    const attrs = try attributes.load(arena, io, repo_dir);
+    var attrs_diag: attributes.Diag = .{};
+    const attrs = attributes.load(arena, io, repo_dir, &attrs_diag) catch |e| {
+        if (diag) |d| if (attrs_diag.capture()) |cap| d.set(cap);
+        return e;
+    };
 
     try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs, diag);
 

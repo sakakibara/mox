@@ -56,6 +56,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 });
                 break :blk null;
             },
+            error.UnknownAttributeKey,
+            error.InvalidAttributeValue,
+            => blk: {
+                try ctx.err.print("mox rollback: warning: attributes.toml: {s}: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{
+                    walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+                });
+                break :blk null;
+            },
             else => return e,
         };
         if (base_tree) |bt| {

@@ -160,7 +160,7 @@ fn recordAttrs(
 ) !void {
     if (fields.mode == null and !fields.symlink and !fields.seed_once) return;
     const key = try mox.source.path.liveKeyRelToHome(arena, home, live_path);
-    var attrs = try mox.source.attributes.load(arena, io, repo_dir);
+    var attrs = try mox.source.attributes.load(arena, io, repo_dir, null);
     var entry = attrs.lookup(key) orelse mox.source.attributes.Entry{};
     if (fields.mode) |m| entry.mode = m;
     if (fields.symlink) entry.symlink = true;
@@ -916,7 +916,7 @@ test "addFile: a restrictive mode is recorded in attributes; 0644/0755 are not" 
     chmod(rc, 0o644);
     try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, rc, false)).outcome);
 
-    var attrs = try mox.source.attributes.load(a, io, repo);
+    var attrs = try mox.source.attributes.load(a, io, repo, null);
     try testing.expectEqual(@as(u32, 0o600), attrs.mode(".ssh/config").?);
     try testing.expect(attrs.mode("tool") == null);
     try testing.expect(attrs.mode(".zshrc") == null);
@@ -943,7 +943,7 @@ test "addFile: --seed-once records seed_once; a plain add does not" {
     const plain = try std.fs.path.join(a, &.{ home, ".zshrc" });
     try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, plain, false)).outcome);
 
-    var attrs = try mox.source.attributes.load(a, io, repo);
+    var attrs = try mox.source.attributes.load(a, io, repo, null);
     try testing.expect(attrs.seedOnce(".config/app.local"));
     try testing.expect(!attrs.seedOnce(".zshrc"));
 }

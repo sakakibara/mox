@@ -161,6 +161,14 @@ fn applyPass(
             });
             return 1;
         },
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox apply: attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
         else => return e,
     };
 

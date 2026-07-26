@@ -53,6 +53,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             });
             return 1;
         },
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox status: attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
         else => return e,
     };
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
