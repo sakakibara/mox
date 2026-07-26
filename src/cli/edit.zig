@@ -79,11 +79,11 @@ pub fn tuplesEqual(a: AxisTuple, b: AxisTuple) bool {
 }
 
 const Spec = struct {
-    name: cli.spec.Pos([]const u8, .{ .help = "managed live path or src-relative name" }),
-    axis: cli.spec.Opt([]const u8, .{ .value_name = "tuple", .help = "edit the overlay/fragment for this axis tuple instead" }),
+    name: cli.Pos([]const u8, .{ .help = "managed live path or src-relative name" }),
+    axis: cli.Opt([]const u8, .{ .value_name = "tuple", .help = "edit the overlay/fragment for this axis tuple instead" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const name = a.name;
     const axis_str: ?[]const u8 = a.axis;

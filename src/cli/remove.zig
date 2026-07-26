@@ -16,11 +16,11 @@ const Io = std.Io;
 const max_file_bytes: usize = 64 * 1024 * 1024;
 
 const Spec = struct {
-    name: cli.spec.Pos([]const u8, .{ .help = "managed name to stop managing" }),
-    purge: cli.spec.Flag(.{ .help = "also delete the live file (snapshotted first)" }),
+    name: cli.Pos([]const u8, .{ .help = "managed name to stop managing" }),
+    purge: cli.Flag(.{ .help = "also delete the live file (snapshotted first)" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const name = a.name;
     const purge = a.purge;

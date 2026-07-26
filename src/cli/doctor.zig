@@ -42,12 +42,12 @@ pub fn findMalformedProvenance(arena: std.mem.Allocator, io: Io, state_dir: []co
 }
 
 const Spec = struct {
-    fix: cli.spec.Flag(.{ .help = "perform the safe rebuilds" }),
-    rebuild_provenance: cli.spec.Flag(.{ .help = "recompose every recorded file and re-record its provenance" }),
-    rebuild_coupling: cli.spec.Flag(.{ .help = "rescan source tokens and rebuild the coupling graph" }),
+    fix: cli.Flag(.{ .help = "perform the safe rebuilds" }),
+    rebuild_provenance: cli.Flag(.{ .help = "recompose every recorded file and re-record its provenance" }),
+    rebuild_coupling: cli.Flag(.{ .help = "rescan source tokens and rebuild the coupling graph" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const fix = a.fix;
     const rebuild_prov = fix or a.rebuild_provenance;

@@ -334,11 +334,11 @@ const Rename = struct {
 };
 
 const Spec = struct {
-    dry_run: cli.spec.Flag(.{ .help = "report only, exit 1 if edits remain" }),
-    yes: cli.spec.Flag(.{ .help = "take defaults without prompting" }),
-    abort_on_prompt: cli.spec.Flag(.{ .help = "strict CI: rc 2 on the first prompt" }),
-    color: cli.spec.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
-    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
+    dry_run: cli.Flag(.{ .help = "report only, exit 1 if edits remain" }),
+    yes: cli.Flag(.{ .help = "take defaults without prompting" }),
+    abort_on_prompt: cli.Flag(.{ .help = "strict CI: rc 2 on the first prompt" }),
+    color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
+    paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
 /// A file's own configuration space, built once from its source and reused
@@ -368,7 +368,7 @@ fn fileSpace(
     return .{ .ax = ax, .configs = configs };
 }
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return commitImpl(ctx, a.dry_run, a.yes, a.abort_on_prompt, a.color orelse .auto, a.paths);
 }
 

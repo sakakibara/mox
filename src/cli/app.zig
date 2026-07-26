@@ -53,7 +53,7 @@ pub var stdin_override: ?*std.Io.Reader = null;
 /// same process-global `std.Io.Threaded` populates it into at startup,
 /// rather than being passed in. On a `paths_mod.resolve` failure, `diag`
 /// carries a message and the error propagates.
-pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.args.Diagnostic) anyerror!Context {
+pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) anyerror!Context {
     _ = io;
     const env: Env = environ_override orelse Env.current();
     const paths = paths_mod.resolve(alloc, env) catch |err| {
@@ -106,7 +106,7 @@ fn moxResolveCompletion(alloc: std.mem.Allocator, key: []const u8, prev: ?[]cons
     return .{ .directive = .default, .candidates = out.toOwnedSlice(alloc) catch return none };
 }
 
-pub const MoxCli = cli.cli.Cli(.{
+pub const MoxCli = cli.App(.{
     .Context = Context,
     .Group = Group,
     .loadContext = loadContext,
@@ -201,7 +201,7 @@ pub const command_table = [_]Command{
 
 const SmokeSpec = struct {};
 
-fn smokeRun(ctx: *Ctx, _: cli.args.Args(SmokeSpec)) anyerror!u8 {
+fn smokeRun(ctx: *Ctx, _: cli.Args(SmokeSpec)) anyerror!u8 {
     try ctx.out.writeAll("smoke ok\n");
     return 0;
 }
@@ -223,7 +223,7 @@ test "MoxCli wiring: a command built via command() dispatches through run() and 
     try std.testing.expectEqualStrings("smoke ok\n", out_w.buffered());
 }
 
-fn smokeContextRun(ctx: *Ctx, _: cli.args.Args(SmokeSpec)) anyerror!u8 {
+fn smokeContextRun(ctx: *Ctx, _: cli.Args(SmokeSpec)) anyerror!u8 {
     const context = ctx.context.?;
     try ctx.out.print("state_dir={s}\n", .{context.paths.state_dir});
     return 0;

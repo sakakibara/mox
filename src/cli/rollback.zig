@@ -21,10 +21,10 @@ const Io = std.Io;
 /// owned values were secret-masked is refused -- placeholders are never
 /// written live; re-apply the source instead.
 const Spec = struct {
-    id: cli.spec.Pos([]const u8, .{ .help = "snapshot id (see 'mox snapshot list')" }),
+    id: cli.Pos([]const u8, .{ .help = "snapshot id (see 'mox snapshot list')" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const id = a.id;
 

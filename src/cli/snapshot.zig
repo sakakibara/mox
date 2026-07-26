@@ -6,7 +6,7 @@ const mox = @import("../root.zig");
 const Spec = struct {};
 
 /// `mox snapshot` / `mox snapshot list`: list snapshot ids, oldest first.
-fn list(ctx: *app.Ctx, _: cli.args.Args(Spec)) anyerror!u8 {
+fn list(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const ids = try mox.apply.snapshot.list(ctx.alloc, ctx.io, context.paths.snapshots_dir);
     if (ids.len == 0) {

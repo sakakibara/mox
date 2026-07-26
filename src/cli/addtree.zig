@@ -20,10 +20,10 @@ const Counts = struct {
 };
 
 const Spec = struct {
-    dir: cli.spec.Pos([]const u8, .{ .help = "live directory to start managing" }),
+    dir: cli.Pos([]const u8, .{ .help = "live directory to start managing" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const dir_abs = try edit.liveTarget(ctx.alloc, a.dir, context.paths.home);
 

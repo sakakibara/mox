@@ -11,13 +11,13 @@ const commit_mod = @import("commit.zig");
 const diff_mod = @import("diff.zig");
 
 pub const Spec = struct {
-    dry_run: cli.spec.Flag(.{ .help = "report only, write nothing" }),
-    force: cli.spec.Flag(.{ .help = "overwrite drifted files" }),
-    skip_scripts: cli.spec.Flag(.{ .help = "compose and write files, run no scripts" }),
-    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
+    dry_run: cli.Flag(.{ .help = "report only, write nothing" }),
+    force: cli.Flag(.{ .help = "overwrite drifted files" }),
+    skip_scripts: cli.Flag(.{ .help = "compose and write files, run no scripts" }),
+    paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
-pub fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts, a.paths);
 }
 

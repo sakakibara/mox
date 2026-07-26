@@ -180,12 +180,12 @@ pub fn secretMask(arena: std.mem.Allocator, count: usize, segments: []const mox.
 }
 
 const Spec = struct {
-    stat: cli.spec.Flag(.{ .help = "per-file added/removed summary instead of full hunks" }),
-    color: cli.spec.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
-    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
+    stat: cli.Flag(.{ .help = "per-file added/removed summary instead of full hunks" }),
+    color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
+    paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const stat_mode = a.stat;
     const sty = style.Style{ .on = style.enabled(

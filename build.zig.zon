@@ -17,8 +17,8 @@
             .hash = "yaml-0.4.0-MIhruAM0DACwZy0OjnLmCJk0lNXds6_XmHfZBYSgrLnG",
         },
         .cli = .{
-            .url = "https://github.com/sakakibara/cli-zig/archive/refs/tags/v0.1.2.tar.gz",
-            .hash = "cli-0.1.2-xmo03xd-BAD6wIBj_iubwhbHiM2aDe_A5hJvkuKKYeXR",
+            .url = "https://github.com/sakakibara/cli-zig/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "cli-0.2.0-xmo037V8BADr1yVYfrwlIJ77GpQUxjzHfVElgJPKdmzr",
         },
         .env = .{
             .url = "https://github.com/sakakibara/env-zig/archive/refs/tags/v0.1.1.tar.gz",

@@ -38,12 +38,12 @@ pub fn applyTupleOverride(arena: std.mem.Allocator, bindings: *std.StringHashMap
 }
 
 const Spec = struct {
-    resolved: cli.spec.Flag(.{ .help = "required: bake resolved output" }),
-    as: cli.spec.Opt([]const u8, .{ .value_name = "tuple", .help = "compose as if bound to this axis tuple" }),
-    out: cli.spec.Pos([]const u8, .{ .help = "output directory" }),
+    resolved: cli.Flag(.{ .help = "required: bake resolved output" }),
+    as: cli.Opt([]const u8, .{ .value_name = "tuple", .help = "compose as if bound to this axis tuple" }),
+    out: cli.Pos([]const u8, .{ .help = "output directory" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     if (!a.resolved) {
         try ctx.err.writeAll("mox export: usage: mox export --resolved [--as <tuple>] <out-dir>\n");

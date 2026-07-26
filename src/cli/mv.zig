@@ -15,11 +15,11 @@ const mox = @import("../root.zig");
 const Io = std.Io;
 
 const Spec = struct {
-    old: cli.spec.Pos([]const u8, .{ .help = "current managed name" }),
-    new: cli.spec.Pos([]const u8, .{ .help = "new managed name" }),
+    old: cli.Pos([]const u8, .{ .help = "current managed name" }),
+    new: cli.Pos([]const u8, .{ .help = "new managed name" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const old_name = a.old;
     const new_name = a.new;

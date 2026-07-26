@@ -174,11 +174,11 @@ pub fn syncRepo(git: Git, opts: Options, stdout: *Io.Writer, stderr: *Io.Writer)
 }
 
 const Spec = struct {
-    no_pull: cli.spec.Flag(.{ .help = "skip the pull half" }),
-    no_push: cli.spec.Flag(.{ .help = "skip the push half" }),
+    no_pull: cli.Flag(.{ .help = "skip the pull half" }),
+    no_push: cli.Flag(.{ .help = "skip the push half" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const opts = Options{
         .pull = !a.no_pull,

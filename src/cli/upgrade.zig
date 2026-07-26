@@ -28,8 +28,8 @@ const Io = std.Io;
 const testing = std.testing;
 
 const Spec = struct {
-    version: cli.spec.Pos([]const u8, .{ .optional = true, .help = "install this version instead of the latest release" }),
-    yes: cli.spec.Flag(.{ .help = "skip the confirmation prompt" }),
+    version: cli.Pos([]const u8, .{ .optional = true, .help = "install this version instead of the latest release" }),
+    yes: cli.Flag(.{ .help = "skip the confirmation prompt" }),
 };
 
 pub const command = app.command(Spec, .{
@@ -44,7 +44,7 @@ pub const command = app.command(Spec, .{
 const default_api_url = "https://api.github.com/repos/sakakibara/mox/releases/latest";
 const default_download_base = "https://github.com/sakakibara/mox/releases/download";
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const alloc = ctx.alloc;
     const io = ctx.io;
     const env = app.envOf(ctx);

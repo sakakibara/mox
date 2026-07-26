@@ -4,10 +4,10 @@ const app = @import("app.zig");
 const mox = @import("../root.zig");
 
 const Spec = struct {
-    uri: cli.spec.Pos([]const u8, .{ .help = "secret URI (env:, file://, op://, pass://, cmd:)" }),
+    uri: cli.Pos([]const u8, .{ .help = "secret URI (env:, file://, op://, pass://, cmd:)" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const u = mox.secret.uri.parse(a.uri) catch |e| {
         try ctx.err.print("mox secret: invalid URI: {s}\n", .{@errorName(e)});

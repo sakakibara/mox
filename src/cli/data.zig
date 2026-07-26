@@ -12,15 +12,15 @@ const max_bytes: usize = 4 * 1024 * 1024;
 pub const Format = enum { toml, json };
 
 const GetSpec = struct {
-    name: cli.spec.Pos([]const u8, .{ .help = "data source name (bare stem or *.toml path)" }),
-    format: cli.spec.Opt(Format, .{ .default = "toml", .value_name = "format", .help = "toml or json" }),
+    name: cli.Pos([]const u8, .{ .help = "data source name (bare stem or *.toml path)" }),
+    format: cli.Opt(Format, .{ .default = "toml", .value_name = "format", .help = "toml or json" }),
 };
 
 /// `mox data get <name> [--format=toml|json]`: print a TOML data source,
 /// resolving the private layer before the repo layer (private shadows repo).
 /// `<name>` is a bare stem (`.toml` appended) or an explicit `*.toml` path
 /// relative to the `data/` roots.
-fn get(ctx: *app.Ctx, a: cli.args.Args(GetSpec)) anyerror!u8 {
+fn get(ctx: *app.Ctx, a: cli.Args(GetSpec)) anyerror!u8 {
     const context = ctx.context.?;
     const name = a.name;
 

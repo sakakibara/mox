@@ -4,10 +4,10 @@ const app = @import("app.zig");
 const mox = @import("../root.zig");
 
 const HashSpec = struct {
-    files: cli.spec.Rest(.{ .help = "files to hash-check" }),
+    files: cli.Rest(.{ .help = "files to hash-check" }),
 };
 
-fn hash(ctx: *app.Ctx, a: cli.args.Args(HashSpec)) anyerror!u8 {
+fn hash(ctx: *app.Ctx, a: cli.Args(HashSpec)) anyerror!u8 {
     const context = ctx.context.?;
     if (a.files.len == 0) {
         try ctx.err.writeAll("mox trigger hash: usage: mox trigger hash <file>...\n");
@@ -20,10 +20,10 @@ fn hash(ctx: *app.Ctx, a: cli.args.Args(HashSpec)) anyerror!u8 {
 }
 
 const SeenVersionSpec = struct {
-    key: cli.spec.Pos([]const u8, .{ .help = "trigger key" }),
+    key: cli.Pos([]const u8, .{ .help = "trigger key" }),
 };
 
-fn seenVersion(ctx: *app.Ctx, a: cli.args.Args(SeenVersionSpec)) anyerror!u8 {
+fn seenVersion(ctx: *app.Ctx, a: cli.Args(SeenVersionSpec)) anyerror!u8 {
     const context = ctx.context.?;
     var state = try mox.trigger.state.State.loadOrEmpty(ctx.alloc, ctx.io, context.paths.triggers_path);
     const first_time = try state.checkSeenVersion(ctx.alloc, a.key);
@@ -32,11 +32,11 @@ fn seenVersion(ctx: *app.Ctx, a: cli.args.Args(SeenVersionSpec)) anyerror!u8 {
 }
 
 const EverySpec = struct {
-    key: cli.spec.Pos([]const u8, .{ .help = "trigger key" }),
-    interval: cli.spec.Pos(i64, .{ .help = "interval, in seconds" }),
+    key: cli.Pos([]const u8, .{ .help = "trigger key" }),
+    interval: cli.Pos(i64, .{ .help = "interval, in seconds" }),
 };
 
-fn every(ctx: *app.Ctx, a: cli.args.Args(EverySpec)) anyerror!u8 {
+fn every(ctx: *app.Ctx, a: cli.Args(EverySpec)) anyerror!u8 {
     const context = ctx.context.?;
     var state = try mox.trigger.state.State.loadOrEmpty(ctx.alloc, ctx.io, context.paths.triggers_path);
     const ready = try state.checkEvery(ctx.alloc, a.key, a.interval);
@@ -69,7 +69,7 @@ const every_cmd = app.command(EverySpec, .{
 }, every);
 
 fn triggerUsage(ctx: *app.Ctx) anyerror!u8 {
-    if (ctx.argv.len > 0 and !cli.spec.looksLikeFlag(ctx.argv[0])) {
+    if (ctx.argv.len > 0 and !cli.looksLikeFlag(ctx.argv[0])) {
         return app.usageError(ctx, "mox trigger: unknown subcommand '{s}'\n", .{ctx.argv[0]});
     }
     return app.usageError(ctx, "mox trigger: usage: mox trigger {{hash|seen-version|every}} ...\n", .{});

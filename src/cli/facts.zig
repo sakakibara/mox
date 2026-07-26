@@ -9,7 +9,7 @@ const BareSpec = struct {};
 
 /// `mox facts`: list current facts, then interview for any schema-declared
 /// facts that are still unanswered.
-fn run(ctx: *app.Ctx, _: cli.args.Args(BareSpec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
     const context = ctx.context.?;
     const current = try mox.machine.facts.load(ctx.alloc, ctx.io, context.paths.facts_path);
     for (current) |f| {
@@ -49,11 +49,11 @@ fn run(ctx: *app.Ctx, _: cli.args.Args(BareSpec)) anyerror!u8 {
 }
 
 const SetSpec = struct {
-    name: cli.spec.Pos([]const u8, .{ .help = "fact name" }),
-    value: cli.spec.Pos([]const u8, .{ .help = "fact value" }),
+    name: cli.Pos([]const u8, .{ .help = "fact name" }),
+    value: cli.Pos([]const u8, .{ .help = "fact value" }),
 };
 
-fn setRun(ctx: *app.Ctx, a: cli.args.Args(SetSpec)) anyerror!u8 {
+fn setRun(ctx: *app.Ctx, a: cli.Args(SetSpec)) anyerror!u8 {
     const context = ctx.context.?;
     const lk = (try lock_mod.acquireForCommand(ctx, "facts set")) orelse return 1;
     defer lk.release();

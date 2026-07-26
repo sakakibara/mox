@@ -33,12 +33,12 @@ pub fn actionFor(name: []const u8, purge_private: bool) Action {
 }
 
 const Spec = struct {
-    purge_private: cli.spec.Flag(.{ .help = "also delete the private layer" }),
-    purge_trash: cli.spec.Flag(.{ .help = "delete trash non-interactively" }),
-    purge_snapshots: cli.spec.Flag(.{ .help = "delete snapshots (pre-mox backups) non-interactively" }),
+    purge_private: cli.Flag(.{ .help = "also delete the private layer" }),
+    purge_trash: cli.Flag(.{ .help = "delete trash non-interactively" }),
+    purge_snapshots: cli.Flag(.{ .help = "delete snapshots (pre-mox backups) non-interactively" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const purge_private = a.purge_private;
 

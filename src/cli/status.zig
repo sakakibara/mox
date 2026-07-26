@@ -21,10 +21,10 @@ fn cellFor(disp: mox.apply.applied.Disposition) Cell {
 }
 
 const Spec = struct {
-    paths: cli.spec.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
+    paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);

@@ -511,13 +511,13 @@ fn parseOwnRaws(
 }
 
 const Spec = struct {
-    path: cli.spec.Pos([]const u8, .{ .help = "live file to start managing" }),
-    seed_once: cli.spec.Flag(.{ .help = "seed the target once; never overwrite an existing one" }),
-    force: cli.spec.Flag(.{ .help = "add even if the path matches an ignore rule" }),
-    own: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable)" }),
-    own_absent: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable)" }),
-    disown: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable)" }),
-    gate: cli.spec.Opt([]const u8, .{ .value_name = "axis-expr", .help = "gate the created partial source on this axis expression (with --own/--disown)" }),
+    path: cli.Pos([]const u8, .{ .help = "live file to start managing" }),
+    seed_once: cli.Flag(.{ .help = "seed the target once; never overwrite an existing one" }),
+    force: cli.Flag(.{ .help = "add even if the path matches an ignore rule" }),
+    own: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable)" }),
+    own_absent: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable)" }),
+    disown: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable)" }),
+    gate: cli.Opt([]const u8, .{ .value_name = "axis-expr", .help = "gate the created partial source on this axis expression (with --own/--disown)" }),
 };
 
 /// Every value the repeated `--<long>` option was given, in command-line
@@ -543,7 +543,7 @@ fn collectRepeated(alloc: std.mem.Allocator, argv: []const []const u8, long: []c
     return out.toOwnedSlice(alloc);
 }
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const home = context.env.getAlloc(ctx.alloc, "HOME") catch {
         try ctx.err.writeAll("mox add: HOME not set\n");

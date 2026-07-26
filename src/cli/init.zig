@@ -11,11 +11,11 @@ const Io = std.Io;
 const CloneFn = *const fn (std.mem.Allocator, Io, []const u8, []const u8) anyerror!void;
 
 const Spec = struct {
-    clone: cli.spec.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply')" }),
-    apply: cli.spec.Flag(.{ .help = "after cloning, apply immediately (write files, run scripts) instead of stopping to review" }),
+    clone: cli.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply')" }),
+    apply: cli.Flag(.{ .help = "after cloning, apply immediately (write files, run scripts) instead of stopping to review" }),
 };
 
-fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (a.clone) |url| {
         if (url.len == 0) {
             try ctx.err.writeAll("mox init: --clone requires a repository URL\n");
