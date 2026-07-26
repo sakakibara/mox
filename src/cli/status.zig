@@ -97,8 +97,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // own clean/OUTDATED/DRIFT/MISSING state, one line per produced path.
         {
             var gdiag: mox.compose.interp.Diag = .{};
-            if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch {
-                try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
+            if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
+                if (gdiag.capture()) |cap| {
+                    try ctx.out.print("  {s:<8} {s} (compose failed: {s}: {s})\n", .{ "ERROR", file.live_path, @errorName(e), cap });
+                } else {
+                    try ctx.out.print("  {s:<8} {s} (compose failed: {s})\n", .{ "ERROR", file.live_path, @errorName(e) });
+                }
                 problems += 1;
                 continue;
             }) |outputs| {
@@ -178,8 +182,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // Partial files carry their ownership inventory on every line, so the
         // whole set of partial contracts is visible in one status run.
         const annot = try ownAnnotation(ctx.alloc, file);
-        const composed = mox.compose.composeFile(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets) catch {
-            try ctx.out.print("  {s:<8} {s}{s}\n", .{ "ERROR", file.live_path, annot });
+        var diag: mox.compose.interp.Diag = .{};
+        const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, null, &diag) catch |e| {
+            if (diag.capture()) |cap| {
+                try ctx.out.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ "ERROR", file.live_path, annot, @errorName(e), cap });
+            } else {
+                try ctx.out.print("  {s:<8} {s}{s} (compose failed: {s})\n", .{ "ERROR", file.live_path, annot, @errorName(e) });
+            }
             problems += 1;
             continue;
         };

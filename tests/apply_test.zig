@@ -1597,6 +1597,53 @@ test "status: a symlink target is classified without following the link" {
     try std.testing.expect(std.mem.indexOf(u8, s3.out, "DRIFT") != null);
 }
 
+test "status: a whole-file compose failure reports the error name and failing item" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A typo'd data source: the same shape diff reports as
+    // "compose failed: DataSourceNotFound" plus the failing path.
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.zabbr", .data = "# mox: for entry in nope.toml\n" ++
+        "#   abbr <entry.key>\n" ++
+        "# mox: end\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "ERROR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, ".zabbr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "DataSourceNotFound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "nope.toml") != null);
+}
+
+test "status: a generator compose failure reports the error name and failing item" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/gen.inc",
+        .data = "# mox: for id in \"data/nope.toml\" into \"id-<id.slug>.inc\"\nkey=<id.slug>\n# mox: end\n",
+    });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "ERROR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "gen.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "DataSourceNotFound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "nope.toml") != null);
+}
+
 // -- generator (`for ... into`) fan-out + prune (data-safety critical) --
 
 /// A generator source at `src/.config/gen.inc` whose body is a single
