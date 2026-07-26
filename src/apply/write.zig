@@ -165,7 +165,10 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
         // Flush the data to disk before the rename so a crash cannot leave the
         // target (and, via snapshot.save, its snapshot) renamed-but-empty --
         // which would destroy both the live file and its only backup.
-        f.sync(io) catch {};
+        f.sync(io) catch |e| {
+            Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            return e;
+        };
     }
     // chmod after close to enforce the exact mode regardless of umask.
     // Zig 0.16's std.posix doesn't expose chmod; std.c.chmod is the
@@ -208,6 +211,37 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
 
     // Atomic rename.
     try Io.Dir.rename(Io.Dir.cwd(), tmp_path, Io.Dir.cwd(), live_path, io);
+}
+
+fn failingFileSync(userdata: ?*anyopaque, file: Io.File) Io.File.SyncError!void {
+    _ = userdata;
+    _ = file;
+    return error.InputOutput;
+}
+
+test "writeAtomic: a fsync failure removes the temp file and propagates, like the chmod path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const p = try std.fs.path.join(a, &.{ base, "target" });
+
+    // Every op but fileSync forwards to the real io; only sync is faulted.
+    var vtable = io.vtable.*;
+    vtable.fileSync = failingFileSync;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    try std.testing.expectError(error.InputOutput, writeAtomic(faulty, p, "data\n", 0o644));
+
+    // The tmp sidecar is removed, and nothing was ever renamed into place.
+    const tmp_p = try std.mem.concat(a, u8, &.{ p, tmp_suffix });
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, tmp_p, .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, p, .{}));
 }
 
 test "writeAtomicPartial: refuses when the live file changed between read and rename" {
