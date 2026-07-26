@@ -33,7 +33,12 @@ pub fn findMalformedProvenance(arena: std.mem.Allocator, io: Io, state_dir: []co
     // on every machine.
     for (try mox.source.dirent.sorted(arena, io, dir)) |entry| {
         if (entry.kind != .file) continue;
-        const content = dir.readFileAlloc(io, entry.name, arena, .limited(max_state_bytes)) catch continue;
+        // An unreadable record is as much a problem as an unparseable one --
+        // both mean apply cannot trust what it last recorded for this file.
+        const content = dir.readFileAlloc(io, entry.name, arena, .limited(max_state_bytes)) catch {
+            try out.append(arena, try std.fs.path.join(arena, &.{ prov_dir, entry.name }));
+            continue;
+        };
         if (mox.provenance.map.deserialize(arena, content)) |_| {} else |_| {
             try out.append(arena, try std.fs.path.join(arena, &.{ prov_dir, entry.name }));
         }
@@ -67,6 +72,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // but deliberately does not auto-remediate (untracked sources); they never
     // set the exit code, so the rc is consistent whether or not `--fix` ran.
     var advisories: usize = 0;
+    // A check that could not run at all (vs. one that ran and found nothing):
+    // counted separately so the summary never claims "healthy" over a report
+    // with a gap in it.
+    var skipped: usize = 0;
 
     // Source files not tracked by git. Null means the check could not run (the
     // repo is not a git working tree, or git is unavailable): note that, so a
@@ -77,45 +86,70 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             try ctx.out.print("  untracked {s} (source not tracked by git)\n", .{u});
         }
     } else {
+        skipped += 1;
         try ctx.out.print("  note: {s} is not a git working tree; the tracked-source check was skipped\n", .{context.paths.repo_dir});
     }
 
     // Source modes git cannot carry (not 0644/0755) that are not recorded in
     // `.mox/attributes.toml`: git collapses them on clone, so the mode is lost.
-    const unrecorded = unrecordedModes(ctx.alloc, ctx.io, context.paths.repo_dir, src_dir) catch &.{};
-    for (unrecorded) |key| {
-        advisories += 1;
-        try ctx.out.print("  unrecorded-mode {s} (source mode is not 0644/0755 and not in .mox/attributes.toml; lost on clone -- re-run 'mox add' or record it)\n", .{key});
+    if (try unrecordedModes(ctx.alloc, ctx.io, context.paths.repo_dir, src_dir)) |unrecorded| {
+        for (unrecorded) |key| {
+            advisories += 1;
+            try ctx.out.print("  unrecorded-mode {s} (source mode is not 0644/0755 and not in .mox/attributes.toml; lost on clone -- re-run 'mox add' or record it)\n", .{key});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: attributes.toml or the source tree could not be read; the unrecorded-mode check was skipped\n", .{});
     }
 
     // Sources that compose to null under every configuration in their own axis
     // space: gated off on every machine, so they never materialize anywhere --
     // almost always a contradictory or mistyped `# mox: when` gate.
-    for (try neverMaterializing(ctx.alloc, ctx.io, src_dir, context)) |dead| {
-        advisories += 1;
-        try ctx.out.print("  never-materializes {s} (composes to nothing under every configuration; check its whole-file gate)\n", .{dead});
+    if (try neverMaterializing(ctx.alloc, ctx.io, src_dir, context)) |dead_list| {
+        for (dead_list) |dead| {
+            advisories += 1;
+            try ctx.out.print("  never-materializes {s} (composes to nothing under every configuration; check its whole-file gate)\n", .{dead});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: machine state or the source tree could not be read; the never-materializes check was skipped\n", .{});
     }
 
     // Generators whose data source is missing or whose rows collide on a
     // rendered path: they would fail (or drop a file) at apply time.
-    for (try generatorProblems(ctx.alloc, ctx.io, src_dir, context)) |msg| {
-        advisories += 1;
-        try ctx.out.print("  generator {s}\n", .{msg});
+    if (try generatorProblems(ctx.alloc, ctx.io, src_dir, context)) |gen_msgs| {
+        for (gen_msgs) |msg| {
+            advisories += 1;
+            try ctx.out.print("  generator {s}\n", .{msg});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: machine state or the source tree could not be read; the generator check was skipped\n", .{});
     }
 
     // Tracked sources that also match an ignore rule: a contradiction the user
     // should resolve, since the source is tracked but will never be applied.
-    for (try trackedAndIgnored(ctx.alloc, ctx.io, src_dir, context)) |p| {
-        advisories += 1;
-        try ctx.out.print("  tracked-and-ignored {s} (matches an ignore rule; it will not be applied -- remove one)\n", .{p});
+    if (try trackedAndIgnored(ctx.alloc, ctx.io, src_dir, context)) |ignored| {
+        for (ignored) |p| {
+            advisories += 1;
+            try ctx.out.print("  tracked-and-ignored {s} (matches an ignore rule; it will not be applied -- remove one)\n", .{p});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: machine state, the source tree, or .moxignore could not be read; the tracked-and-ignored check was skipped\n", .{});
     }
 
     // Attributes entries whose key no managed target derives: the entry does
     // nothing (a removed/renamed target, or an uncanonical key spelling) and
     // can only mislead a reader of the record.
-    for (try orphanedAttributes(ctx.alloc, ctx.io, src_dir, context)) |key| {
-        advisories += 1;
-        try ctx.out.print("  orphaned-attribute {s} (no managed target derives this key; remove it from .mox/attributes.toml)\n", .{key});
+    if (try orphanedAttributes(ctx.alloc, ctx.io, src_dir, context)) |orphaned| {
+        for (orphaned) |key| {
+            advisories += 1;
+            try ctx.out.print("  orphaned-attribute {s} (no managed target derives this key; remove it from .mox/attributes.toml)\n", .{key});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: attributes.toml, machine state, or the source tree could not be read; the orphaned-attribute check was skipped\n", .{});
     }
 
     // Malformed provenance records (rebuildable).
@@ -144,6 +178,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // Advisories are soft (exit 0), but the report is not "healthy" when it
         // has items needing manual attention -- say so without contradicting.
         try ctx.out.print("mox doctor: {d} advisory item(s) need attention\n", .{advisories});
+    } else if (skipped > 0) {
+        // Soft like an advisory (exit 0): a skipped check is not itself a
+        // finding, but "healthy" would wrongly claim full coverage.
+        try ctx.out.print("mox doctor: {d} check(s) skipped (coverage incomplete)\n", .{skipped});
     } else {
         try ctx.out.writeAll("mox doctor: healthy\n");
     }
@@ -151,19 +189,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 }
 
 /// Source files that compose to null under every configuration in their own
-/// axis space -- gated off on every machine, so they never materialize. Any
-/// step that cannot run (no source tree, capture failure) yields no findings
-/// rather than an error, so doctor's other checks still report. Arena-owned
-/// display paths.
+/// axis space -- gated off on every machine, so they never materialize. Null
+/// means machine state or the source tree could not be read at all (the
+/// check could not run); the caller must not read that the same as "ran and
+/// found nothing". Arena-owned display paths.
 fn neverMaterializing(
     arena: std.mem.Allocator,
     io: Io,
     src_dir: []const u8,
     context: app.Context,
-) ![]const []const u8 {
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
+) !?[]const []const u8 {
+    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
     const this_bindings = try mox.machine.bindings.fromMachineState(arena, m_state);
-    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
+    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
 
     var out: std.ArrayList([]const u8) = .empty;
@@ -181,21 +219,22 @@ fn neverMaterializing(
         } else false;
         if (!materializes) try out.append(arena, file.source_base_path);
     }
-    return out.toOwnedSlice(arena);
+    return try out.toOwnedSlice(arena);
 }
 
 /// Generators that would fail (or silently drop a file) at apply: a missing
-/// data source, or two rows rendering the same path. Best-effort -- any step
-/// that cannot run yields no findings. Arena-owned display strings.
+/// data source, or two rows rendering the same path. Null means machine state
+/// or the source tree could not be read (the check could not run), distinct
+/// from running and finding nothing. Arena-owned display strings.
 fn generatorProblems(
     arena: std.mem.Allocator,
     io: Io,
     src_dir: []const u8,
     context: app.Context,
-) ![]const []const u8 {
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
+) !?[]const []const u8 {
+    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
     const bindings = try mox.machine.bindings.fromMachineState(arena, m_state);
-    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
+    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
 
     var out: std.ArrayList([]const u8) = .empty;
@@ -219,7 +258,7 @@ fn generatorProblems(
             else => continue,
         };
     }
-    return out.toOwnedSlice(arena);
+    return try out.toOwnedSlice(arena);
 }
 
 /// Tracked sources whose home-relative key matches an UNCONDITIONAL ignore
@@ -227,42 +266,45 @@ fn generatorProblems(
 /// directory: tracked-but-ignored-everywhere is a real contradiction mox
 /// surfaces rather than silently picking a side. A rule gated to other
 /// machines (`# mox: when os=windows`) is intentional per-machine gating, not
-/// a contradiction, so it is excluded here. Best-effort, like the other
-/// checks -- any step that cannot run yields no findings. Arena-owned live paths.
+/// a contradiction, so it is excluded here. Null means machine state, the
+/// source tree, or `.moxignore` could not be read (the check could not run),
+/// distinct from running and finding nothing. Arena-owned live paths.
 fn trackedAndIgnored(
     arena: std.mem.Allocator,
     io: Io,
     src_dir: []const u8,
     context: app.Context,
-) ![]const []const u8 {
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
-    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
+) !?[]const []const u8 {
+    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
+    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
-    const ruleset = mox.source.ignore.load.loadUnconditional(arena, io, context.paths.repo_dir) catch return &.{};
+    const ruleset = mox.source.ignore.load.loadUnconditional(arena, io, context.paths.repo_dir) catch return null;
 
     var out: std.ArrayList([]const u8) = .empty;
     for (tree.files) |file| {
         const rel = try mox.source.path.liveKeyRelToHome(arena, m_state.home, file.live_path);
         if (ruleset.isPathIgnored(rel, false)) try out.append(arena, file.live_path);
     }
-    return out.toOwnedSlice(arena);
+    return try out.toOwnedSlice(arena);
 }
 
 /// `.mox/attributes.toml` keys that no walked managed target derives (a
 /// target's key is its source path under `src/`, private layer included).
 /// Such an entry is dead: the walk never pairs it with a file, so its
-/// mode/symlink/seed-once intent silently applies to nothing. Best-effort --
-/// any step that cannot run yields no findings. Sorted, arena-owned keys.
+/// mode/symlink/seed-once intent silently applies to nothing. Null means
+/// attributes.toml, machine state, or the source tree could not be read (the
+/// check could not run), distinct from running and finding nothing. Sorted,
+/// arena-owned keys.
 fn orphanedAttributes(
     arena: std.mem.Allocator,
     io: Io,
     src_dir: []const u8,
     context: app.Context,
-) ![]const []const u8 {
-    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir) catch return &.{};
+) !?[]const []const u8 {
+    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir) catch return null;
     if (attrs.map.count() == 0) return &.{};
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
-    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
+    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
+    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
 
     var derived = std.StringHashMap(void).init(arena);
@@ -280,7 +322,7 @@ fn orphanedAttributes(
         if (!derived.contains(k.*)) try out.append(arena, k.*);
     }
     std.mem.sort([]const u8, out.items, {}, lessString);
-    return out.toOwnedSlice(arena);
+    return try out.toOwnedSlice(arena);
 }
 
 /// Whether every axis the file references is a compared axis (one `enumerate`
@@ -397,13 +439,16 @@ fn gitUntrackedSrc(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]c
 /// 0755) and which `.mox/attributes.toml` does not record. git collapses such a
 /// mode to 0644 on clone, so an unrecorded 0600/0444 source silently loses its
 /// mode. Returns portable target keys. POSIX only -- a filesystem with no
-/// executable bit (Windows) exposes no such modes, so the check is empty there.
-/// Best-effort: an unwalkable tree or unreadable file yields no finding.
-fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_dir: []const u8) ![]const []const u8 {
+/// executable bit (Windows) exposes no such modes, so the check is empty
+/// (not skipped) there. Null means attributes.toml or the source tree could
+/// not be read (the check could not run), distinct from running and finding
+/// nothing. An unreadable individual source file's mode is skipped, not a
+/// reason to abandon the rest of the walk.
+fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_dir: []const u8) !?[]const []const u8 {
     if (!Io.File.Permissions.has_executable_bit) return &.{};
 
-    const attrs = mox.source.attributes.load(arena, io, repo_dir) catch return &.{};
-    const tree = mox.source.tree.walk(arena, io, src_dir, "") catch return &.{};
+    const attrs = mox.source.attributes.load(arena, io, repo_dir) catch return null;
+    const tree = mox.source.tree.walk(arena, io, src_dir, "") catch return null;
 
     var out: std.ArrayList([]const u8) = .empty;
     for (tree.files) |file| {
@@ -418,7 +463,7 @@ fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_d
         if (attrs.mode(key) != null) continue;
         try out.append(arena, key);
     }
-    return out.toOwnedSlice(arena);
+    return try out.toOwnedSlice(arena);
 }
 
 pub const command = app.command(Spec, .{
@@ -461,6 +506,27 @@ test "findMalformedProvenance: detects an unparseable record" {
     try testing.expectEqual(@as(usize, 1), bad.len);
 }
 
+test "findMalformedProvenance: an unreadable record is a problem, not a silent skip" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "state/provenance");
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/provenance/deadbeef", .data = "{}" });
+    const rec_path = try tmpAbs(a, io, &tmp, "state/provenance/deadbeef");
+    chmod(rec_path, 0o000);
+    defer chmod(rec_path, 0o644);
+
+    const state_dir = try tmpAbs(a, io, &tmp, "state");
+    const bad = try findMalformedProvenance(a, io, state_dir);
+    try testing.expectEqual(@as(usize, 1), bad.len);
+}
+
 fn chmod(path: []const u8, mode: u32) void {
     var zbuf: [4096]u8 = undefined;
     @memcpy(zbuf[0..path.len], path);
@@ -490,7 +556,7 @@ test "unrecordedModes: flags an exotic source mode not in attributes" {
     chmod(try tmpAbs(a, io, &tmp, "repo/src/.zshrc"), 0o644);
 
     // A 0600 source with no attributes record is flagged; the 0644 one is not.
-    const flagged = try unrecordedModes(a, io, repo, src);
+    const flagged = (try unrecordedModes(a, io, repo, src)).?;
     try testing.expectEqual(@as(usize, 1), flagged.len);
     try testing.expectEqualStrings(".ssh/config", flagged[0]);
 
@@ -502,6 +568,6 @@ test "unrecordedModes: flags an exotic source mode not in attributes" {
     try attrs.set(".ssh/config", .{ .mode = 0o600 });
     try attrs.write(io, repo);
 
-    const cleared = try unrecordedModes(a, io, repo, src);
+    const cleared = (try unrecordedModes(a, io, repo, src)).?;
     try testing.expectEqual(@as(usize, 0), cleared.len);
 }

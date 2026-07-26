@@ -741,6 +741,25 @@ test "doctor: detects a malformed state file" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bad-provenance") != null);
 }
 
+test "doctor: a malformed attributes.toml skips the checks that read it, and the report is not healthy" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "not valid toml [[[\n");
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    // A read failure is not a rebuildable problem, so the rc stays soft.
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "check(s) skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "healthy") == null);
+}
+
 test "doctor: a conventional `.d` config dir is healthy, not an orphan" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
