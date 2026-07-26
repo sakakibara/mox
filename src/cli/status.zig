@@ -158,13 +158,16 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
             continue;
         }
+        // Partial files carry their ownership inventory on every line, so the
+        // whole set of partial contracts is visible in one status run.
+        const annot = try ownAnnotation(ctx.alloc, file);
         const composed = mox.compose.composeFile(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets) catch {
-            try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
+            try ctx.out.print("  {s:<8} {s}{s}\n", .{ "ERROR", file.live_path, annot });
             problems += 1;
             continue;
         };
         if (composed == null) {
-            try ctx.out.print("  {s:<8} {s}\n", .{ "GATED", file.live_path });
+            try ctx.out.print("  {s:<8} {s}{s}\n", .{ "GATED", file.live_path, annot });
             continue;
         }
 
@@ -173,7 +176,7 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         if (file.own_paths.len > 0) {
             const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?);
             if (cell.problem) problems += 1;
-            try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
+            try ctx.out.print("  {s:<8} {s}{s}\n", .{ cell.label, file.live_path, annot });
             continue;
         }
 
@@ -195,6 +198,15 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
     }
     return if (problems > 0) 1 else 0;
+}
+
+/// The ownership annotation appended to a partial file's status line:
+/// `  (own N)` / `  (disown N)` with N the declared path count. Empty for a
+/// whole-file target, so every other line is unchanged.
+fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![]const u8 {
+    if (file.own_paths.len == 0) return "";
+    const word: []const u8 = if (file.ownership == .disown) "disown" else "own";
+    return std.fmt.allocPrint(arena, "  ({s} {d})", .{ word, file.own_paths.len });
 }
 
 /// The status cell for one partial file, per D6: MISSING only when the live
@@ -261,4 +273,32 @@ test "cellFor: dispositions map to labels and problem flags" {
 
     try testing.expectEqualStrings("DRIFT", cellFor(.drift).label);
     try testing.expect(cellFor(.drift).problem);
+}
+
+test "ownAnnotation: own and disown counts, empty for whole-file targets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const paths = [_]mox.source.tree.OwnPath{
+        .{ .raw = "tui", .segments = &.{"tui"} },
+        .{ .raw = "model", .segments = &.{"model"} },
+    };
+
+    var file: mox.source.tree.ManagedFile = .{
+        .source_base_path = "src/app.toml",
+        .source_base_abs = "",
+        .live_path = "",
+        .has_base = true,
+        .overlays = &.{},
+        .regions = &.{},
+    };
+    try testing.expectEqualStrings("", try ownAnnotation(a, file));
+
+    file.ownership = .own;
+    file.own_paths = paths[0..2];
+    try testing.expectEqualStrings("  (own 2)", try ownAnnotation(a, file));
+
+    file.ownership = .disown;
+    file.own_paths = paths[0..1];
+    try testing.expectEqualStrings("  (disown 1)", try ownAnnotation(a, file));
 }

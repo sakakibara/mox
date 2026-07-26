@@ -3025,15 +3025,15 @@ test "status partial: MISSING, clean, OUTDATED, DRIFT are decided on the owned s
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
 
-    // No live file yet.
+    // No live file yet. Every partial line carries the ownership inventory.
     const missing = try c.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), missing.rc);
-    try std.testing.expect(lineHasBoth(missing.out, "MISSING", "app.toml"));
+    try std.testing.expect(lineHasBoth(missing.out, "MISSING", "app.toml  (own 1)"));
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     const clean = try c.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 0), clean.rc);
-    try std.testing.expect(lineHasBoth(clean.out, "clean", "app.toml"));
+    try std.testing.expect(lineHasBoth(clean.out, "clean", "app.toml  (own 1)"));
 
     // Program noise outside the owned paths never surfaces.
     const noisy = try std.mem.concat(a, u8, &.{ try read(io, a, live), "\n[program]\nstate = 42\n" });
@@ -3695,6 +3695,10 @@ test "diff disown: shows the owned complement only; the program's key never appe
     try std.testing.expect(std.mem.indexOf(u8, r.out, "\"dark\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "private-model-x") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "model") == null);
+
+    // The status line carries the disown inventory annotation.
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(lineHasBoth(s.out, "DRIFT", "settings.json  (disown 1)"));
 }
 
 test "rollback disown: re-patches the owned complement and keeps the program's later writes" {
