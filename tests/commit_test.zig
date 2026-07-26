@@ -110,6 +110,45 @@ test "commit: base-origin edit routes to src base and recompose is byte-identica
     try std.testing.expectEqual(@as(u8, 0), st.rc);
 }
 
+fn chmodPath(path: []const u8, mode: u32) void {
+    var zbuf: [4096]u8 = undefined;
+    @memcpy(zbuf[0..path.len], path);
+    zbuf[path.len] = 0;
+    _ = std.c.chmod(@ptrCast(&zbuf), @intCast(mode));
+}
+
+test "commit: a coupling-graph persistence failure warns, but the commit itself still succeeds" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport B=2\nexport C=3\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".zshrc"), "export B=2", "export B=22");
+
+    // An empty, read-only coupling dir: the pre-write loads see "nothing
+    // recorded yet" (FileNotFound, tolerated), but the post-commit rebuild's
+    // write into it is refused -- isolating the failure to the site under test.
+    const coupling_dir = try std.fs.path.join(a, &.{ h.state, "coupling" });
+    try Io.Dir.cwd().createDirPath(io, coupling_dir);
+    chmodPath(coupling_dir, 0o500);
+    defer chmodPath(coupling_dir, 0o700);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "mox commit: coupling graph not updated") != null);
+
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expectEqualStrings("export A=1\nexport B=22\nexport C=3\n", src);
+}
+
 test "commit: fragment edit routes to the fragment file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

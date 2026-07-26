@@ -1218,8 +1218,12 @@ pub fn commitImpl(
     try restoreUnkeptFacts(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items, fact_owners.items, fact_backup, rolled_back);
 
     // Re-index the coupling graph from the post-write sources so a later
-    // commit sees the current token layout.
-    mox.coupling.store.saveGraph(ctx.alloc, ctx.io, coupling_dir, &(try buildCouplingGraph(ctx.alloc, ctx.io, tree2))) catch {};
+    // commit sees the current token layout. A failure never undoes the
+    // commit that already succeeded, but must not be silent: a stale graph
+    // means a later rename prompts forever for a file that no longer needs it.
+    mox.coupling.store.saveGraph(ctx.alloc, ctx.io, coupling_dir, &(try buildCouplingGraph(ctx.alloc, ctx.io, tree2))) catch |e| {
+        try ctx.err.print("mox commit: coupling graph not updated: {s}\n", .{@errorName(e)});
+    };
 
     // The counts are what SURVIVED verification, never what was attempted: a
     // rejected file was rolled back, so nothing of it -- neither its own routing

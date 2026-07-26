@@ -442,6 +442,26 @@ test "remove --purge deletes the live file after snapshotting it" {
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ snap_gen, ".zshrc" })));
 }
 
+test "add-tree: a coupling-graph persistence failure warns as add-tree, not add" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try tmp.dir.createDirPath(io, "home/.config/app");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/a.conf", .data = "a\n" });
+
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "coupling" }), .data = "" });
+
+    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox add-tree: coupling graph not updated") != null);
+}
+
 test "add-tree: adds every non-junk file under a live dir, skipping junk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -567,6 +587,28 @@ test "add: a relative path resolves against HOME" {
     const r = try h.run(&.{ "mox", "add", "notes.txt" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+}
+
+test "add: a coupling-graph persistence failure warns, but the add itself still succeeds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+
+    // A plain FILE where the coupling dir belongs: saveGraph's createDirPath
+    // fails, so the rebuild this add triggers cannot persist.
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "coupling" }), .data = "" });
+
+    const r = try h.run(&.{ "mox", "add", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "coupling graph not updated") != null);
 }
 
 test "add --own: a relative path resolves against HOME" {

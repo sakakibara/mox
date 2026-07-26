@@ -621,7 +621,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             }
             // Rebuild the coupling graph so the new file's tokens can couple
             // with existing sources on the next commit.
-            buildInitialCoupling(ctx) catch {};
+            buildInitialCoupling(ctx, "add");
             return 0;
         },
         .not_found => {
@@ -680,7 +680,7 @@ fn runOwn(
                     @as([]const u8, if (r.unowned_top == 1) "s" else ""),
                 });
             }
-            buildInitialCoupling(ctx) catch {};
+            buildInitialCoupling(ctx, "add");
             return 0;
         },
         .not_found => {
@@ -743,7 +743,7 @@ fn runDisown(
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ live_path, r.src_path, disown_raws.len });
-            buildInitialCoupling(ctx) catch {};
+            buildInitialCoupling(ctx, "add");
             return 0;
         },
         .not_found => {
@@ -950,7 +950,18 @@ test "addFile: --seed-once records seed_once; a plain add does not" {
 
 /// Rebuild and persist the coupling graph over every base source file, keyed by
 /// absolute path (matching how `mox commit` and `mox doctor` build it).
-pub fn buildInitialCoupling(ctx: *app.Ctx) !void {
+/// `cmd_name` names the calling command (`add`, `add-tree`) for the warning
+/// line, since both share this rebuild. A failure never aborts the calling
+/// command -- the file is already added -- but it must not be silent: a
+/// stale coupling graph means a later rename prompts forever for a file
+/// that no longer needs it.
+pub fn buildInitialCoupling(ctx: *app.Ctx, cmd_name: []const u8) void {
+    buildInitialCouplingImpl(ctx) catch |e| {
+        ctx.err.print("mox {s}: coupling graph not updated: {s}\n", .{ cmd_name, @errorName(e) }) catch {};
+    };
+}
+
+fn buildInitialCouplingImpl(ctx: *app.Ctx) !void {
     const context = ctx.context.?;
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     const tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, "") catch return;
