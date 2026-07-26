@@ -234,7 +234,14 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
         .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, file.own_paths) != null) return err_cell,
     }
 
-    const live: []const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
+    // Read through a symlinked live path exactly as apply patches it: via the
+    // resolved target. A dangling link is the shape apply refuses, so ERROR,
+    // never MISSING (apply would not create it).
+    const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, file.live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => return err_cell,
+    };
+    const live: []const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return cellFor(.fresh_write),
         error.OutOfMemory => return e,
         else => return err_cell,

@@ -2564,6 +2564,112 @@ test "apply partial: adopts a matching live file, then patches around the progra
     try std.testing.expectEqualStrings(expected, try read(io, a, live));
 }
 
+test "apply partial: a symlinked live path patches the target and keeps the link" {
+    // Creating a symlink needs a POSIX-class filesystem.
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const target = try c.homePath("real-app.toml");
+    const program_live =
+        \\# program header
+        \\model = "gpt"
+        \\
+        \\[tui.keymap.global]
+        \\submit = "enter"
+        \\
+        \\[state]
+        \\count = 42
+        \\
+    ;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = target, .data = program_live });
+    try Io.Dir.cwd().symLink(io, "real-app.toml", live, .{});
+
+    // Live owned content matches composed: adopted through the link.
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "adopted") != null);
+    try std.testing.expectEqualStrings(program_live, try read(io, a, target));
+
+    // Source changes: the patch lands on the TARGET, the link survives, and
+    // every program byte outside the owned span is kept exactly.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/app.toml",
+        .data = "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n",
+    });
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    const expected =
+        \\# program header
+        \\model = "gpt"
+        \\
+        \\[tui.keymap.global]
+        \\submit = "ctrl-enter"
+        \\
+        \\[state]
+        \\count = 42
+        \\
+    ;
+    const link_st = try Io.Dir.cwd().statFile(io, live, .{ .follow_symlinks = false });
+    try std.testing.expect(link_st.kind == .sym_link);
+    try std.testing.expectEqualStrings(expected, try read(io, a, target));
+
+    // Idempotent: the next apply rewrites nothing.
+    const before = try mtimeNs(io, target);
+    const r3 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r3.out, "unchanged") != null);
+    try std.testing.expectEqual(before, try mtimeNs(io, target));
+
+    // status classifies through the link.
+    const rs = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), rs.rc);
+    try std.testing.expect(std.mem.indexOf(u8, rs.out, "clean") != null);
+}
+
+test "apply partial: a dangling symlinked live path refuses with the live untouched" {
+    // Creating a symlink needs a POSIX-class filesystem.
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    try Io.Dir.cwd().symLink(io, "no-such-target.toml", live, .{});
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "dangling symlink") != null);
+    // The link is untouched and its target was never created.
+    const st = try Io.Dir.cwd().statFile(io, live, .{ .follow_symlinks = false });
+    try std.testing.expect(st.kind == .sym_link);
+    var buf: [512]u8 = undefined;
+    const n = try Io.Dir.cwd().readLink(io, live, &buf);
+    try std.testing.expectEqualStrings("no-such-target.toml", buf[0..n]);
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, try c.homePath("no-such-target.toml"), .{ .follow_symlinks = false }),
+    );
+
+    // status reports the same refusal shape, never MISSING.
+    const rs = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), rs.rc);
+    try std.testing.expect(std.mem.indexOf(u8, rs.out, "ERROR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rs.out, "MISSING") == null);
+}
+
 test "apply partial: first-contact drift is skipped, --force reasserts the source" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

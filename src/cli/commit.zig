@@ -2140,7 +2140,16 @@ fn processPartialFile(
         },
     }
 
-    const live = Io.Dir.cwd().readFileAlloc(cc.io, live_path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+    // Read through a symlinked live path exactly as apply patches it: via the
+    // resolved target. A dangling link is the shape apply refuses.
+    const live_target = mox.apply.write.resolvePartialLive(arena, cc.io, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => {
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            return .cont;
+        },
+    };
+    const live = Io.Dir.cwd().readFileAlloc(cc.io, live_target, arena, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => return .cont,
         else => return e,
     };

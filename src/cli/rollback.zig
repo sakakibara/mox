@@ -154,10 +154,20 @@ fn repatchPartial(
         return false;
     }
 
+    // A symlinked live path is re-patched at its resolved target, same as
+    // apply's partial path; a dangling link is refused, live untouched.
+    const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => {
+            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            failed.* += 1;
+            return false;
+        },
+    };
     // Stat before the read so a write landing between the two refuses at
     // the post-fsync recheck, same as apply's partial path.
-    const pre_stat = mox.apply.write.liveStat(ctx.io, live_path);
-    const live: ?[]const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
+    const pre_stat = mox.apply.write.liveStat(ctx.io, live_target);
+    const live: ?[]const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => {
             try ctx.err.print("mox rollback: {s}: read failed: {s}\n", .{ live_path, @errorName(e) });
@@ -231,10 +241,10 @@ fn repatchPartial(
     }
 
     const mode = blk: {
-        const st = Io.Dir.cwd().statFile(ctx.io, live_path, .{}) catch break :blk @as(u32, 0o644);
+        const st = Io.Dir.cwd().statFile(ctx.io, live_target, .{}) catch break :blk @as(u32, 0o644);
         break :blk mox.apply.write.modeOf(st.permissions);
     };
-    mox.apply.write.writeAtomicPartial(ctx.io, live_path, candidate, mode, live_stat) catch |e| switch (e) {
+    mox.apply.write.writeAtomicPartial(ctx.io, live_target, candidate, mode, live_stat) catch |e| switch (e) {
         error.LiveChangedDuringWrite => {
             try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-rollback; re-run 'mox rollback')\n", .{live_path});
             failed.* += 1;

@@ -405,7 +405,16 @@ fn diffPartial(
         },
     }
 
-    const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
+    // Read through a symlinked live path exactly as apply patches it: via the
+    // resolved target. A dangling link is the shape apply refuses.
+    const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => {
+            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            return;
+        },
+    };
+    const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => "",
         else => return e,
     };

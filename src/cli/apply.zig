@@ -944,11 +944,23 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         }
     }
 
+    // A symlinked live path runs the whole pipeline against its FINAL target:
+    // the read follows the link, so the stat, the post-fsync recheck, and the
+    // rename must address that same inode -- renaming onto the link path would
+    // fork the file (a regular file over the link, stale bytes at the target).
+    const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => {
+            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            counts.fail += 1;
+            return;
+        },
+    };
     // Stat BEFORE the read: a write landing between the two moves the stat
     // identity past what the candidate was built from, so the post-fsync
     // recheck refuses (the safe direction) instead of missing it.
-    const pre_stat = mox.apply.write.liveStat(ctx.io, live_path);
-    const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
+    const pre_stat = mox.apply.write.liveStat(ctx.io, live_target);
+    const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => {
             try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ live_path, @errorName(e) });
@@ -1115,8 +1127,8 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         snapshotted.* = true;
     }
 
-    const eff_mode = mox.apply.write.secretRestrictedMode(in.manager_secret, in.file.mode_explicit, in.file.mode, currentMode(ctx.io, live_path));
-    mox.apply.write.writeAtomicPartial(ctx.io, live_path, candidate, eff_mode, live_stat) catch |e| switch (e) {
+    const eff_mode = mox.apply.write.secretRestrictedMode(in.manager_secret, in.file.mode_explicit, in.file.mode, currentMode(ctx.io, live_target));
+    mox.apply.write.writeAtomicPartial(ctx.io, live_target, candidate, eff_mode, live_stat) catch |e| switch (e) {
         error.LiveChangedDuringWrite => {
             try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{live_path});
             counts.fail += 1;

@@ -78,6 +78,24 @@ pub fn liveStat(io: Io, live_path: []const u8) ?LiveStat {
     return .{ .inode = st.inode, .size = st.size, .mtime_ns = st.mtime.nanoseconds };
 }
 
+pub const ResolveLiveError = error{ OutOfMemory, DanglingLink };
+
+/// The path a partial target's byte operations run against. A live path that
+/// is a symlink resolves to its FINAL target, so the read, the race stats,
+/// and the atomic rename all address one inode and the user's link
+/// arrangement survives the write -- renaming onto the link path itself would
+/// replace the link with a regular file while the target keeps stale bytes.
+/// A plain or absent live path is returned unchanged; a link whose target
+/// does not resolve is refused (`error.DanglingLink`).
+pub fn resolvePartialLive(alloc: std.mem.Allocator, io: Io, live_path: []const u8) ResolveLiveError![]const u8 {
+    const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch return live_path;
+    if (st.kind != .sym_link) return live_path;
+    return Io.Dir.cwd().realPathFileAlloc(io, live_path, alloc) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.DanglingLink,
+    };
+}
+
 const Recheck = union(enum) {
     /// Whole-file path: the caller's own TOCTOU re-read guards the window.
     none,
@@ -218,6 +236,72 @@ test "writeAtomicPartial: refuses when the live file changed between read and re
     try writeAtomicPartial(io, fresh, "made\n", 0o644, null);
     const made = try Io.Dir.cwd().readFileAlloc(io, fresh, a, .limited(4096));
     try std.testing.expectEqualStrings("made\n", made);
+}
+
+test "resolvePartialLive: resolves a live symlink to its target, refuses dangling" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const target = try std.fs.path.join(a, &.{ base, "real.toml" });
+    try writeAtomic(io, target, "x = 1\n", 0o644);
+
+    // A symlink (relative target) resolves to the target's real path.
+    const link = try std.fs.path.join(a, &.{ base, "link.toml" });
+    try Io.Dir.cwd().symLink(io, "real.toml", link, .{});
+    const resolved = try resolvePartialLive(a, io, link);
+    const want = try Io.Dir.cwd().realPathFileAlloc(io, target, a);
+    try std.testing.expectEqualStrings(want, resolved);
+
+    // A regular file and an absent path pass through unchanged.
+    try std.testing.expectEqualStrings(target, try resolvePartialLive(a, io, target));
+    const absent = try std.fs.path.join(a, &.{ base, "absent.toml" });
+    try std.testing.expectEqualStrings(absent, try resolvePartialLive(a, io, absent));
+
+    // A dangling link refuses.
+    const dangling = try std.fs.path.join(a, &.{ base, "dangling.toml" });
+    try Io.Dir.cwd().symLink(io, "missing.toml", dangling, .{});
+    try std.testing.expectError(error.DanglingLink, resolvePartialLive(a, io, dangling));
+}
+
+test "writeAtomicPartial: guards and replaces the resolved target of a symlinked live path" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const target = try std.fs.path.join(a, &.{ base, "cfg.toml" });
+    try writeAtomic(io, target, "orig\n", 0o644);
+    const link = try std.fs.path.join(a, &.{ base, "link-cfg.toml" });
+    try Io.Dir.cwd().symLink(io, "cfg.toml", link, .{});
+
+    // The patch lands on the target; the link survives and shows the new bytes.
+    const resolved = try resolvePartialLive(a, io, link);
+    const st0 = liveStat(io, resolved).?;
+    try writeAtomicPartial(io, resolved, "patched\n", 0o644, st0);
+    const link_st = try Io.Dir.cwd().statFile(io, link, .{ .follow_symlinks = false });
+    try std.testing.expect(link_st.kind == .sym_link);
+    try std.testing.expectEqualStrings("patched\n", try Io.Dir.cwd().readFileAlloc(io, link, a, .limited(4096)));
+    try std.testing.expectEqualStrings("patched\n", try Io.Dir.cwd().readFileAlloc(io, target, a, .limited(4096)));
+
+    // The TARGET mutated after the stat was captured (the write above): a
+    // stale expectation must refuse and leave the target's bytes alone.
+    try std.testing.expectError(
+        error.LiveChangedDuringWrite,
+        writeAtomicPartial(io, resolved, "later\n", 0o644, st0),
+    );
+    try std.testing.expectEqualStrings("patched\n", try Io.Dir.cwd().readFileAlloc(io, target, a, .limited(4096)));
 }
 
 test "setMode: heals a drifted mode in place" {
