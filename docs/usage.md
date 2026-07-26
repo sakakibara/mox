@@ -268,6 +268,19 @@ prefixed with `mox: disown` lines -- comments outside the spans survive
 verbatim, and the same three-way validation runs against the owned
 complement.
 
+A machine-gated partial file onboards in one command with `--gate
+<axis-expr>`:
+
+```sh
+mox add --own tui.keymap.global --gate "tool=codex" ~/.codex/config.toml
+```
+
+The created source head is the ownership directives followed by the
+whole-file `mox: when` gate line, so the file applies only where the
+expression holds and stays untouched everywhere else. The expression must
+parse; a malformed one is refused with the parser's diagnostic, and nothing
+is written.
+
 A named path absent from the live file is an error; a key you want kept *out*
 everywhere is declared with `--own-absent <key-path>` instead (own mode only),
 and apply then enforces its absence. A plain `mox add` of a target whose

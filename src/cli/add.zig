@@ -192,7 +192,9 @@ pub const OwnResult = struct {
 /// verbatim), prefixed with `mox: own` head directives so the declaration
 /// and the content are created together in one file, and report what
 /// remains the program's. Content paths must be present live; `absent_raws`
-/// declare enforced absence and contribute no content.
+/// declare enforced absence and contribute no content. `gate` (a validated
+/// axis expression) adds a whole-file `mox: when` gate line after the
+/// directives.
 pub fn addOwnFile(
     arena: std.mem.Allocator,
     io: Io,
@@ -201,6 +203,7 @@ pub fn addOwnFile(
     live_path: []const u8,
     own_raws: []const []const u8,
     absent_raws: []const []const u8,
+    gate: ?[]const u8,
 ) !OwnResult {
     const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return .{ .outcome = .not_found },
@@ -278,6 +281,7 @@ pub fn addOwnFile(
     const own_list = try std.mem.concat(arena, []const u8, &.{ own_raws, absent_raws });
     const source_text = try std.mem.concat(arena, u8, &.{
         try headDirectiveLines(arena, format, "own", own_list),
+        try gateLine(arena, format, gate),
         extracted,
     });
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
@@ -313,11 +317,25 @@ fn headDirectiveLines(
     return out.toOwnedSlice(arena);
 }
 
+/// The whole-file gate line `<marker> mox: when <expr>` for a source head,
+/// or nothing when no gate was requested. Placed directly after the
+/// ownership directives, where the head pass recognizes it as the gate
+/// candidate.
+fn gateLine(
+    arena: std.mem.Allocator,
+    format: mox.source.format.Format,
+    gate: ?[]const u8,
+) ![]const u8 {
+    const expr = gate orelse return "";
+    const marker = mox.source.tree.markerForFormat(format);
+    return std.fmt.allocPrint(arena, "{s} mox: when {s}\n", .{ marker, expr });
+}
+
 /// Take DISOWNED ownership of a live file: the whole live file minus the
 /// declared paths' raw byte spans becomes the source (comments outside the
 /// spans survive verbatim), prefixed with `mox: disown` head directives.
 /// Every declared path must be present live: disowning nothing is a typo,
-/// not a contract.
+/// not a contract. `gate` behaves as in `addOwnFile`.
 pub fn addDisownFile(
     arena: std.mem.Allocator,
     io: Io,
@@ -325,6 +343,7 @@ pub fn addDisownFile(
     home: []const u8,
     live_path: []const u8,
     disown_raws: []const []const u8,
+    gate: ?[]const u8,
 ) !OwnResult {
     const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return .{ .outcome = .not_found },
@@ -423,6 +442,7 @@ pub fn addDisownFile(
     const mode = mox.apply.write.modeOf(st.permissions);
     const source_text = try std.mem.concat(arena, u8, &.{
         try headDirectiveLines(arena, format, "disown", disown_raws),
+        try gateLine(arena, format, gate),
         body,
     });
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
@@ -459,6 +479,7 @@ const Spec = struct {
     own: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable)" }),
     own_absent: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable)" }),
     disown: cli.spec.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable)" }),
+    gate: cli.spec.Opt([]const u8, .{ .value_name = "axis-expr", .help = "gate the created partial source on this axis expression (with --own/--disown)" }),
 };
 
 /// Every value the repeated `--<long>` option was given, in command-line
@@ -514,13 +535,28 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.err.writeAll("mox add: --disown cannot combine with --own/--own-absent (own and disown are exclusive per file)\n");
         return 1;
     }
+    if (a.gate != null and own_raws.len == 0 and absent_raws.len == 0 and disown_raws.len == 0) {
+        try ctx.err.writeAll("mox add: --gate requires --own or --disown (it gates the created partial source)\n");
+        return 1;
+    }
+    // The gate is written into the created source head, so a malformed
+    // expression must be refused here, not discovered on the next walk.
+    if (a.gate) |expr| {
+        _ = mox.dsl.axis.parseString(ctx.alloc, expr) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try ctx.err.print("mox add: --gate: cannot parse `{s}`: {s}\n", .{ expr, @errorName(e) });
+                return 1;
+            },
+        };
+    }
     if (own_raws.len > 0 or absent_raws.len > 0 or disown_raws.len > 0) {
         if (a.seed_once) {
             try ctx.err.writeAll("mox add: --own/--disown cannot combine with --seed-once (a seed-once target is never re-composed)\n");
             return 1;
         }
-        if (disown_raws.len > 0) return runDisown(ctx, home, live_path, disown_raws);
-        return runOwn(ctx, home, live_path, own_raws, absent_raws);
+        if (disown_raws.len > 0) return runDisown(ctx, home, live_path, disown_raws, a.gate);
+        return runOwn(ctx, home, live_path, own_raws, absent_raws, a.gate);
     }
 
     const result = try addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, a.seed_once);
@@ -573,9 +609,10 @@ fn runOwn(
     live_path: []const u8,
     own_raws: []const []const u8,
     absent_raws: []const []const u8,
+    gate: ?[]const u8,
 ) anyerror!u8 {
     const context = ctx.context.?;
-    const r = try addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws);
+    const r = try addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws, gate);
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s} (own: {d} key-path(s))\n", .{ live_path, r.src_path, own_raws.len + absent_raws.len });
@@ -638,9 +675,10 @@ fn runDisown(
     home: []const u8,
     live_path: []const u8,
     disown_raws: []const []const u8,
+    gate: ?[]const u8,
 ) anyerror!u8 {
     const context = ctx.context.?;
-    const r = try addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws);
+    const r = try addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws, gate);
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ live_path, r.src_path, disown_raws.len });
@@ -693,7 +731,7 @@ fn runDisown(
 pub const command = app.command(Spec, .{
     .name = "add",
     .summary = "Start managing a live file as a base file in src/",
-    .usage = "mox add [--seed-once] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... <path>",
+    .usage = "mox add [--seed-once] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... [--gate <axis-expr>] <path>",
     .group = .general,
     .needs_context = true,
 }, run);

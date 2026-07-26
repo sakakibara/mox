@@ -1081,6 +1081,116 @@ test "add --own-absent: the declared path flows to enforced absence" {
     try std.testing.expect(std.mem.indexOf(u8, after, "k = 1") != null);
 }
 
+test "add --own --gate: the gate line follows the directives and a matching machine patches" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    const live_content = "[tui]\nsubmit = \"enter\"\n\n[state]\ncount = 1\n";
+    try writeRepo(io, &tmp, "home/app.toml", live_content);
+    const live = try h.liveOf("app.toml");
+
+    const r = try h.run(&.{ "mox", "add", "--own", "tui", "--gate", "os=darwin", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // The head is the ownership directives, then the whole-file gate.
+    const src = try read(io, a, try h.srcOf("app.toml"));
+    try std.testing.expect(std.mem.startsWith(u8, src, "# mox: own tui\n# mox: when os=darwin\n[tui]\n"));
+
+    // The gate holds here: first apply adopts, and a source change patches
+    // the owned span while the program's remainder survives byte-for-byte.
+    const adopt = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), adopt.rc);
+    try std.testing.expect(std.mem.indexOf(u8, adopt.out, "adopted") != null);
+
+    const changed = try std.mem.replaceOwned(u8, a, src, "\"enter\"", "\"tab\"");
+    try writeRepo(io, &tmp, "repo/src/app.toml", changed);
+    const apply = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), apply.rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "submit = \"tab\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "[state]\ncount = 1\n") != null);
+    // No directive line reaches the live file.
+    try std.testing.expect(std.mem.indexOf(u8, after, "mox:") == null);
+}
+
+test "add --own --gate: a machine where the gate fails leaves the live file untouched" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "linux" });
+    const live_content = "[tui]\nsubmit = \"enter\"\n";
+    try writeRepo(io, &tmp, "home/app.toml", live_content);
+    const live = try h.liveOf("app.toml");
+
+    const r = try h.run(&.{ "mox", "add", "--own", "tui", "--gate", "os=darwin", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    const apply = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), apply.rc);
+    try std.testing.expect(std.mem.indexOf(u8, apply.out, "skipped") != null);
+    try std.testing.expectEqualStrings(live_content, try read(io, a, live));
+    // No owned record exists for the gated-off target.
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "applied-owned" })));
+
+    // status reports the gated partial with its inventory annotation.
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "GATED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "app.toml  (own 1)") != null);
+}
+
+test "add --disown --gate: the jsonc gate line follows the disown directives" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/settings.json", "{\n  \"theme\": \"dark\",\n  \"model\": \"m\"\n}\n");
+    const live = try h.liveOf("settings.json");
+
+    const r = try h.run(&.{ "mox", "add", "--disown", "model", "--gate", "tool=codex", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const src = try read(io, a, try h.srcOf("settings.json"));
+    try std.testing.expect(std.mem.startsWith(u8, src, "// mox: disown model\n// mox: when tool=codex\n"));
+}
+
+test "add --gate: a malformed expression or a gate without ownership is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/app.toml", "[tui]\nk = 1\n");
+    const live = try h.liveOf("app.toml");
+
+    // A dropped `or`: refused with the parser's diagnostic, nothing written.
+    const bad = try h.run(&.{ "mox", "add", "--own", "tui", "--gate", "os=darwin os=linux", live });
+    try std.testing.expectEqual(@as(u8, 1), bad.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err, "os=darwin os=linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err, "UnexpectedTrailingTokens") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("app.toml")));
+
+    // --gate gates the created partial source; a whole-file add has none.
+    const alone = try h.run(&.{ "mox", "add", "--gate", "os=darwin", live });
+    try std.testing.expectEqual(@as(u8, 1), alone.rc);
+    try std.testing.expect(std.mem.indexOf(u8, alone.err, "--gate requires --own or --disown") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("app.toml")));
+}
+
 test "add: a whole-file add of a partially owned target is refused" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
