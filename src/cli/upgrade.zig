@@ -8,10 +8,11 @@
 //! explicit downgrade is allowed. Version selection and the tag compares
 //! (`latestTag`, `isNewer`, `versionsEqual`) are pure and unit tested directly
 //! against fixture JSON; the download/verify/extract/replace goes through
-//! `curl` and the filesystem, exercised end to end via `file://` fixtures and
-//! three env-var seams (`MOX_UPGRADE_API`, `MOX_UPGRADE_DOWNLOAD_BASE`,
-//! `MOX_UPGRADE_TARGET_BIN`) so tests never touch the real network or the real
-//! test binary.
+//! `curl` (falling back to `wget` when `curl` is absent, mirroring
+//! install.sh) and the filesystem, exercised end to end via `file://`
+//! fixtures and three env-var seams (`MOX_UPGRADE_API`,
+//! `MOX_UPGRADE_DOWNLOAD_BASE`, `MOX_UPGRADE_TARGET_BIN`) so tests never
+//! touch the real network or the real test binary.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -58,7 +59,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     else blk: {
         const api_url = try envOrDefault(alloc, env, "MOX_UPGRADE_API", default_api_url);
         const body = fetch(alloc, io, api_url) catch |err| switch (err) {
-            error.OutOfMemory, error.CurlNotFound => return err,
+            error.OutOfMemory, error.NoDownloader => return err,
             else => "",
         };
         break :blk (try latestTag(alloc, body)) orelse {
@@ -108,7 +109,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const archive_path = try std.fs.path.join(alloc, &.{ tmp_dir, archive_name });
 
     try ctx.out.print("mox {s} -> {s}: downloading {s}\n", .{ build_options.version, tag, asset });
-    if (!try curlDownload(alloc, io, url, archive_path)) {
+    if (!try downloadFile(alloc, io, url, archive_path)) {
         try ctx.err.print("mox upgrade: download failed: {s} ({s})\n", .{ tag, url });
         return 1;
     }
@@ -121,7 +122,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     try ctx.out.writeAll("mox upgrade: verifying checksum\n");
     const sums_url = try downloadUrl(alloc, download_base, tag, "SHA256SUMS");
     const sums_body = fetch(alloc, io, sums_url) catch |err| switch (err) {
-        error.OutOfMemory, error.CurlNotFound => return err,
+        error.OutOfMemory, error.NoDownloader => return err,
         else => {
             try ctx.err.print("mox upgrade: could not fetch checksums ({s})\n", .{sums_url});
             return 1;
@@ -186,14 +187,32 @@ fn envOrDefault(alloc: std.mem.Allocator, env: Env, key: []const u8, default: []
     return env.get(alloc, key) orelse default;
 }
 
-/// Thin wrapper around a `curl` subprocess capturing stdout; a nonzero exit
-/// (network error, 404, anything) surfaces as `error.FetchFailed` so `run` can
-/// fold it into the same degrade path as a malformed body.
+/// Runs the first `candidates` entry whose `argv[0]` resolves on PATH,
+/// mirroring install.sh's `curl, else wget, else die` fallback. A LATER
+/// candidate is tried only when the current one fails to spawn at all
+/// (`error.FileNotFound`, the tool itself missing); a tool that DID run and
+/// simply exited nonzero or failed some other way is final, never silently
+/// retried under a different tool. `error.NoDownloader` when every
+/// candidate's tool is missing.
+fn runFirstAvailable(alloc: std.mem.Allocator, io: Io, candidates: []const []const []const u8) !std.process.RunResult {
+    for (candidates) |argv| {
+        return std.process.run(alloc, io, .{ .argv = argv }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+    }
+    return error.NoDownloader;
+}
+
+/// Captures stdout from `curl`, falling back to `wget` when `curl` is absent.
+/// A nonzero exit (network error, 404, anything) surfaces as
+/// `error.FetchFailed` so `run` can fold it into the same degrade path as a
+/// malformed body.
 fn fetch(alloc: std.mem.Allocator, io: Io, url: []const u8) ![]const u8 {
-    const res = std.process.run(alloc, io, .{ .argv = &.{ "curl", "-fsSL", url } }) catch |err| switch (err) {
-        error.FileNotFound => return error.CurlNotFound,
-        else => return err,
-    };
+    const res = try runFirstAvailable(alloc, io, &.{
+        &.{ "curl", "-fsSL", url },
+        &.{ "wget", "-qO-", url },
+    });
     const ok = switch (res.term) {
         .exited => |c| c == 0,
         else => false,
@@ -202,13 +221,14 @@ fn fetch(alloc: std.mem.Allocator, io: Io, url: []const u8) ![]const u8 {
     return res.stdout;
 }
 
-/// Downloads `url` to `dest_path` via `curl -o`. Returns false on any nonzero
-/// curl exit; a missing `curl` surfaces as `error.CurlNotFound`.
-fn curlDownload(alloc: std.mem.Allocator, io: Io, url: []const u8, dest_path: []const u8) !bool {
-    const res = std.process.run(alloc, io, .{ .argv = &.{ "curl", "-fsSL", "-o", dest_path, url } }) catch |err| switch (err) {
-        error.FileNotFound => return error.CurlNotFound,
-        else => return err,
-    };
+/// Downloads `url` to `dest_path` via `curl -o`, falling back to `wget -O`
+/// when `curl` is absent. Returns false on any nonzero exit;
+/// `error.NoDownloader` when neither tool is present.
+fn downloadFile(alloc: std.mem.Allocator, io: Io, url: []const u8, dest_path: []const u8) !bool {
+    const res = try runFirstAvailable(alloc, io, &.{
+        &.{ "curl", "-fsSL", "-o", dest_path, url },
+        &.{ "wget", "-qO", dest_path, url },
+    });
     return switch (res.term) {
         .exited => |c| c == 0,
         else => false,
@@ -489,6 +509,60 @@ test "expectedDigest: finds the asset's line, handles a binary-mode star, misses
     // The `*` binary-mode marker is stripped from the filename before matching.
     try testing.expectEqualStrings("bbbb2222", expectedDigest(body, "mox-aarch64-macos.tar.gz").?);
     try testing.expect(expectedDigest(body, "mox-x86_64-windows.zip") == null);
+}
+
+/// A tiny always-present command that prints `ok` and exits 0, for exercising
+/// `runFirstAvailable`'s fallback without depending on `curl`/`wget` actually
+/// being installed on the test machine.
+fn okArgv() []const []const u8 {
+    return if (builtin.os.tag == .windows)
+        &.{ "cmd", "/c", "echo ok" }
+    else
+        &.{ "sh", "-c", "printf ok" };
+}
+
+/// Same shape, but exits 1 -- a tool that ran and failed, not one that's absent.
+fn failArgv() []const []const u8 {
+    return if (builtin.os.tag == .windows)
+        &.{ "cmd", "/c", "exit 1" }
+    else
+        &.{ "sh", "-c", "exit 1" };
+}
+
+test "runFirstAvailable: falls back to the next candidate only when a tool is missing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try runFirstAvailable(arena, testing.io, &.{
+        &.{"definitely-does-not-exist-mox-upgrade-test"},
+        okArgv(),
+    });
+    try testing.expect(res.term == .exited and res.term.exited == 0);
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "ok") != null);
+}
+
+test "runFirstAvailable: a tool that ran and failed is final, never falls back" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The second candidate WOULD succeed; it must never run, since the first
+    // one is present and its failure is the real answer, not "try the
+    // other tool."
+    const res = try runFirstAvailable(arena, testing.io, &.{ failArgv(), okArgv() });
+    try testing.expect(res.term == .exited and res.term.exited == 1);
+}
+
+test "runFirstAvailable: every candidate missing surfaces error.NoDownloader" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectError(error.NoDownloader, runFirstAvailable(arena, testing.io, &.{
+        &.{"definitely-does-not-exist-mox-upgrade-test-a"},
+        &.{"definitely-does-not-exist-mox-upgrade-test-b"},
+    }));
 }
 
 test "downloadUrl: joins base, tag, and asset with slashes" {
