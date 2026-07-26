@@ -201,6 +201,7 @@ test "impact: an edit inside a gated region affects only that configuration" {
     try testing.expect(hasLabel(configs, "os=linux"));
 
     var env_map = std.process.Environ.Map.init(a);
+    try env_map.put("HOME", "/home/me");
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
 
     const before = try snapshot(a, io, file, configs, &m_state, null);
@@ -245,6 +246,7 @@ test "impact: an edit outside any gated region affects every configuration" {
     try testing.expect(hasLabel(configs, "os=linux"));
 
     var env_map = std.process.Environ.Map.init(a);
+    try env_map.put("HOME", "/home/me");
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
 
     const before = try snapshot(a, io, file, configs, &m_state, null);

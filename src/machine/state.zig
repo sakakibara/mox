@@ -121,7 +121,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
 
     const home = envOr(arena, environ, "HOME") orelse
         envOr(arena, environ, "USERPROFILE") orelse
-        try arena.dupe(u8, "");
+        return error.HomeNotSet;
 
     // Load user-supplied extras early so we can extend the watch lists
     // before scanning. Extras file lives at the same XDG path as facts.
@@ -209,6 +209,18 @@ fn osAxisValue(os_tag: std.Target.Os.Tag) []const u8 {
         .macos => "darwin",
         else => @tagName(os_tag),
     };
+}
+
+test "capture: both HOME and USERPROFILE unset or empty errors instead of defaulting to cwd" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }));
+
+    // An empty value is unset too, same as absent.
+    try map.put("HOME", "");
+    try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }));
 }
 
 test "resolveXdg: an empty env value falls back to the home default" {
