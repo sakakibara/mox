@@ -229,7 +229,7 @@ fn restoreDir(
             },
             .sym_link => {
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const n = dir.readLink(io, entry.name, &buf) catch continue;
+                const n = try dir.readLink(io, entry.name, &buf);
                 const target = try source_path.joinKeyOnto(arena, home, rel);
                 if (std.fs.path.dirname(target)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
                 Io.Dir.cwd().deleteFile(io, target) catch {};
@@ -266,6 +266,43 @@ test "saveSymlink + restore round-trips a symlink, not a regular file" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try Io.Dir.cwd().readLink(io, link, &buf);
     try std.testing.expectEqualStrings("../actual/target", buf[0..n]);
+}
+
+fn failingReadLinkFor(target: []const u8) type {
+    return struct {
+        fn dirReadLink(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, buffer: []u8) Io.Dir.ReadLinkError!usize {
+            _ = userdata;
+            _ = dir;
+            _ = buffer;
+            if (std.mem.eql(u8, sub_path, target)) return error.Unexpected;
+            unreachable; // this fixture snapshots exactly one entry
+        }
+    };
+}
+
+test "restore: a symlink whose readLink fails propagates instead of silently skipping it" {
+    if (!Io.File.Permissions.has_executable_bit) return; // symlink create is privileged on Windows
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
+    const link = try std.fs.path.join(a, &.{ home, ".config", "link" });
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(link).?);
+
+    try saveSymlink(a, io, snaps, "id1", home, link, "../actual/target");
+
+    var vtable = io.vtable.*;
+    vtable.dirReadLink = failingReadLinkFor("link").dirReadLink;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    try std.testing.expectError(error.Unexpected, restore(a, faulty, snaps, "id1", home));
 }
 
 test "formatId renders a known epoch" {
