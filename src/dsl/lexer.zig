@@ -5,11 +5,11 @@ const Token = tokens_mod.Token;
 const TokenKind = tokens_mod.TokenKind;
 
 const KEYWORDS = [_][]const u8{
-    "include", "replace", "append", "prepend",
-    "remove",  "from",    "when",   "for",
-    "secret",  "in",      "and",    "or",
-    "not",     "end",     "where",  "has",
-    "into",
+    "include", "replace",     "append", "prepend",
+    "remove",  "from",        "when",   "for",
+    "secret",  "in",          "and",    "or",
+    "not",     "end",         "where",  "has",
+    "into",    "completions",
 };
 
 fn isKeyword(s: []const u8) bool {

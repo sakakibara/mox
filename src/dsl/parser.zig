@@ -29,6 +29,8 @@ pub const ParseError = error{
     UnexpectedTrailingTokens,
     ReservedLoopVariable,
     IntoOnNestedFor,
+    ExpectedShell,
+    UnknownShell,
 };
 
 /// Loop-variable names that shadow a fixed interpolation namespace: a frame so
@@ -133,6 +135,31 @@ pub fn parseLineDirective(arena: std.mem.Allocator, args: []const u8, line_no: u
             .end_line = line_no,
         };
     }
+    if (std.mem.eql(u8, verb, "completions")) {
+        const shell_word = switch (ps.peek().kind) {
+            .ident => |s| s,
+            else => return error.ExpectedShell,
+        };
+        ps.advance();
+        // Refuse `shell=fish`-style arguments outright: the shell is a typed
+        // positional token, never a key=value pair (which would be
+        // surface-identical to an axis atom).
+        if (ps.peek().kind == .eq) return error.ExpectedShell;
+        const shell = std.meta.stringToEnum(ast.Shell, shell_word) orelse
+            return error.UnknownShell;
+        const registry = try ps.expectString();
+        const when = try ps.parseOptionalWhen();
+        try ps.expectEof();
+        return .{
+            .kind = .{ .completions = .{
+                .shell = shell,
+                .registry = registry,
+                .when = when,
+            } },
+            .start_line = line_no,
+            .end_line = line_no,
+        };
+    }
     return error.NotALineDirective;
 }
 
@@ -156,6 +183,28 @@ test "parseLineDirective: secret" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const dir = try parseLineDirective(fba.allocator(), "secret \"op://foo\"", 1);
     try std.testing.expectEqualStrings("op://foo", dir.kind.secret.uri);
+}
+
+test "parseLineDirective: completions with shell, registry, and when" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const dir = try parseLineDirective(
+        fba.allocator(),
+        "completions zsh \"data/completions.toml\" when not profile=minimal",
+        3,
+    );
+    try std.testing.expect(dir.kind == .completions);
+    try std.testing.expectEqual(ast.Shell.zsh, dir.kind.completions.shell);
+    try std.testing.expectEqualStrings("data/completions.toml", dir.kind.completions.registry);
+    try std.testing.expect(dir.kind.completions.when != null);
+}
+
+test "parseLineDirective: completions without when" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const dir = try parseLineDirective(fba.allocator(), "completions fish \"data/completions.toml\"", 1);
+    try std.testing.expectEqual(ast.Shell.fish, dir.kind.completions.shell);
+    try std.testing.expect(dir.kind.completions.when == null);
 }
 
 test "parseLineDirective: replace is not a line directive" {

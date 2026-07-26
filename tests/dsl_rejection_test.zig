@@ -84,3 +84,56 @@ test "reject: glob in an axis value" {
         mox.dsl.parser.parseRegionOpener(arena.allocator(), "when os=lin*", 1, false),
     );
 }
+
+test "reject: completions with an unsupported shell" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "# mox: completions powershell \"data/completions.toml\"";
+    try std.testing.expectError(
+        error.UnknownShell,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}
+
+test "reject: completions without a shell token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "# mox: completions \"data/completions.toml\"";
+    try std.testing.expectError(
+        error.ExpectedShell,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}
+
+test "reject: completions without a registry path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "# mox: completions fish";
+    try std.testing.expectError(
+        error.ExpectedString,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}
+
+test "reject: completions with trailing tokens after the when clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "# mox: completions zsh \"data/completions.toml\" when os=darwin extra";
+    try std.testing.expectError(
+        error.UnexpectedTrailingTokens,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}
+
+test "reject: completions shell given as a key=value argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // The rejected design: `shell=fish` is surface-identical to an axis atom
+    // and collides with a custom fact named `shell`; the shell is a typed
+    // positional token instead.
+    const src = "# mox: completions shell=fish \"data/completions.toml\"";
+    try std.testing.expectError(
+        error.ExpectedShell,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}

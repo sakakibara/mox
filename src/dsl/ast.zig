@@ -138,8 +138,20 @@ pub const Directive = struct {
         secret: struct {
             uri: []const u8,
         },
+        /// `# mox: completions <shell> "<registry>" [when <expr>]` - generator
+        /// directive: the file emits one completion stub per registry row into
+        /// its target directory and is not materialized itself. The shell is a
+        /// typed positional token, validated at parse.
+        completions: struct {
+            shell: Shell,
+            registry: []const u8,
+            when: ?*const AxisExpr,
+        },
     };
 };
+
+/// Shells the completions generator can emit stubs for.
+pub const Shell = enum { fish, zsh };
 
 /// The complete parsed result of a source file.
 pub const ParsedFile = struct {

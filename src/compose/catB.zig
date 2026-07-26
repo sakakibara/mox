@@ -184,6 +184,11 @@ pub const ComposeError = error{
     GeneratedPathEscapes,
     /// Two generator rows rendered the same `into` path.
     DuplicateGeneratedPath,
+    /// A `completions` directive reached the normal (single-file) composer.
+    /// It is only valid as a file's sole top-level directive with no other
+    /// content, intercepted by the generator path; reaching inline emission
+    /// means it shares the file with other content or directives.
+    CompletionsOnNonGenerator,
 };
 
 const max_file_bytes: usize = 64 * 1024 * 1024;
@@ -744,6 +749,7 @@ fn emitDirective(
             try emitParsedBody(arena, io, em, file, bindings, ctx, secrets, w.body, parsed_body, inner);
         },
         .for_loop => |loop| try emitForLoop(arena, io, em, file, loop, bindings, ctx, secrets, nest),
+        .completions => return error.CompletionsOnNonGenerator,
         .secret => |s| {
             // A dedicated-manager secret marks the file for auto-0600 (set on
             // the resolve path before resolution; a failure aborts the compose).
