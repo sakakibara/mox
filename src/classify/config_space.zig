@@ -148,23 +148,30 @@ pub fn enumerate(
         }
 
         // A configuration other than this machine's IS another machine, so it
-        // cannot carry this machine's hostname: leaving `machine` bound to it
-        // makes a machine-local region ("only here") resolve in every sibling,
-        // which is the opposite of what it means. When `machine` is one of the
-        // varying axes the odometer has already given it that configuration's
-        // own value, so only an inherited binding is dropped.
-        if (!is_this and !contains(names.items, "machine")) _ = bindings.remove("machine");
+        // cannot carry this machine's per-machine-unique identity (`machine`,
+        // `hostname`): leaving one bound to it makes a machine-local region
+        // ("only here") resolve in every sibling, which is the opposite of
+        // what it means. When such an axis is one of the varying axes the
+        // odometer has already given it that configuration's own value, so
+        // only an inherited binding is dropped.
+        if (!is_this) {
+            for (per_machine_unique_axes) |axis| {
+                if (!contains(names.items, axis)) _ = bindings.remove(axis);
+            }
+        }
 
-        // The same rule as a filter, for when `machine` IS a varying axis: the
-        // odometer pairs every machine value with every other axis's values,
-        // and this machine's own hostname combined with a sibling's value on
-        // another axis names a machine that cannot exist. Enumerating it would
-        // put a duplicate, impossible row in a blast-radius confirm.
-        const impossible_self = !is_this and contains(names.items, "machine") and blk: {
-            const mine_machine = this_bindings.get("machine") orelse break :blk false;
-            const here = bindings.get("machine") orelse break :blk false;
-            break :blk std.mem.eql(u8, here, mine_machine);
-        };
+        // The same rule as a filter, for when a per-machine-unique axis IS a
+        // varying axis: the odometer pairs every one of its values with every
+        // other axis's values, and this machine's own value combined with a
+        // sibling's value on another axis names a machine that cannot exist.
+        // Enumerating it would put a duplicate, impossible row in a
+        // blast-radius confirm.
+        const impossible_self = !is_this and for (per_machine_unique_axes) |axis| {
+            if (!contains(names.items, axis)) continue;
+            const mine_here = this_bindings.get(axis) orelse continue;
+            const here = bindings.get(axis) orelse continue;
+            if (std.mem.eql(u8, here, mine_here)) break true;
+        } else false;
 
         if (!impossible_self) {
             try out.append(arena, .{
@@ -207,6 +214,10 @@ fn unusedValue(arena: std.mem.Allocator, vals: []const []const u8) ![]const u8 {
     }
     return candidate;
 }
+
+/// Axes derived from this machine's own identity, so their value is unique to
+/// this machine and must never be inherited by a sibling configuration.
+const per_machine_unique_axes = [_][]const u8{ "machine", "hostname" };
 
 fn contains(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |h| {
@@ -272,6 +283,27 @@ test "enumerate: never pairs this machine's hostname with a sibling configuratio
         if (c.is_this_machine) continue;
         const m = c.bindings.get("machine") orelse continue;
         try std.testing.expect(!std.mem.eql(u8, m, "host-a"));
+    }
+}
+
+test "enumerate: never pairs this machine's hostname axis with a sibling configuration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var this = std.StringHashMap([]const u8).init(a);
+    try this.put("os", "darwin");
+    try this.put("hostname", "host-a.local");
+
+    const ax = try axesFixture(a, &.{ .{ "os", "darwin" }, .{ "hostname", "host-a.local" } }, &.{});
+    const configs = try enumerate(a, &this, ax, &.{}, &.{ "os", "hostname" });
+
+    // `hostname=host-a.local+os=(other)` is not a machine that can exist:
+    // host-a.local IS this machine, and this machine's os is darwin.
+    for (configs) |c| {
+        if (c.is_this_machine) continue;
+        const h = c.bindings.get("hostname") orelse continue;
+        try std.testing.expect(!std.mem.eql(u8, h, "host-a.local"));
     }
 }
 
