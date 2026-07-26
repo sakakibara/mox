@@ -553,6 +553,18 @@ fn sortedBySpell(arena: std.mem.Allocator, spells: []const []const u8) Error![]u
     return order;
 }
 
+/// Pinned inline rendering of one value: the same text a canonical blob's
+/// leaf carries. Shared with the commit prompt so displayed values match
+/// the stored canonical form byte for byte.
+pub fn inlineText(arena: std.mem.Allocator, v: AnyValue) Error![]const u8 {
+    return switch (v) {
+        .toml => |tv| tomlInline(arena, tv),
+        .json => |jv| jsonInline(arena, jv),
+        .yaml => |yv| yamlInline(arena, yv),
+        .ini => |iv| iniInline(arena, iv),
+    };
+}
+
 fn renderBody(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: AnyValue, depth: usize) Error!void {
     switch (v) {
         .toml => |tv| try tomlBody(arena, out, tv, depth),

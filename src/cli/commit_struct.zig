@@ -22,6 +22,7 @@ const yaml = @import("yaml");
 const ini = @import("ini");
 const source_format = @import("../source/format.zig");
 const interp = @import("../compose/interp.zig");
+const canonical = @import("../apply/canonical.zig");
 
 const Io = std.Io;
 
@@ -42,7 +43,22 @@ pub const KeyPathChange = struct {
     path: []const []const u8,
     new: ?Value,
     removed: bool,
+    /// Canonical inline rendering of the value this change replaces or
+    /// removes, taken from the last-applied/record side; null for an
+    /// addition (and for producers with no old side in hand).
+    old_text: ?[]const u8 = null,
 };
+
+/// Canonical inline rendering of a change's value, for prompt display --
+/// the same pinned text a canonical blob's leaf carries.
+pub fn valueInline(arena: std.mem.Allocator, v: Value) ![]const u8 {
+    return canonical.inlineText(arena, switch (v) {
+        .toml => |t| .{ .toml = t },
+        .json => |j| .{ .json = j },
+        .yaml => |y| .{ .yaml = y },
+        .ini => |i| .{ .ini = i },
+    });
+}
 
 /// Diff `live_bytes` against `composed_bytes` under `format`, returning the
 /// changed key paths. Returns `error.Unrepresentable` when some difference
@@ -109,7 +125,7 @@ fn walkToml(
         if (composed.table.get(entry.key_ptr.*)) |cv| {
             try diffTomlValue(arena, path, entry.value_ptr.*, cv, out);
         } else {
-            try out.append(arena, .{ .path = path, .new = null, .removed = true });
+            try out.append(arena, .{ .path = path, .new = null, .removed = true, .old_text = try canonical.inlineText(arena, .{ .toml = entry.value_ptr.* }) });
         }
     }
     var cit = composed.table.iterator();
@@ -134,11 +150,11 @@ fn diffTomlValue(
     if (live_v == .array and composed_v == .array) {
         if (live_v.eql(composed_v)) return;
         if (try isPermutation(toml.Value, arena, live_v.array.items, composed_v.array.items, tomlEql)) return error.Unrepresentable;
-        try out.append(arena, .{ .path = path, .new = .{ .toml = composed_v }, .removed = false });
+        try out.append(arena, .{ .path = path, .new = .{ .toml = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .toml = live_v }) });
         return;
     }
     if (live_v.eql(composed_v)) return;
-    try out.append(arena, .{ .path = path, .new = .{ .toml = composed_v }, .removed = false });
+    try out.append(arena, .{ .path = path, .new = .{ .toml = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .toml = live_v }) });
 }
 
 fn tomlEql(a: toml.Value, b: toml.Value) bool {
@@ -158,7 +174,7 @@ fn walkJson(
         if (composed.object.get(entry.key_ptr.*)) |cv| {
             try diffJsonValue(arena, path, entry.value_ptr.*, cv, out);
         } else {
-            try out.append(arena, .{ .path = path, .new = null, .removed = true });
+            try out.append(arena, .{ .path = path, .new = null, .removed = true, .old_text = try canonical.inlineText(arena, .{ .json = entry.value_ptr.* }) });
         }
     }
     var cit = composed.object.iterator();
@@ -183,11 +199,11 @@ fn diffJsonValue(
     if (live_v == .array and composed_v == .array) {
         if (jsonEql(live_v, composed_v)) return;
         if (try isPermutation(json.Value, arena, live_v.array, composed_v.array, jsonEql)) return error.Unrepresentable;
-        try out.append(arena, .{ .path = path, .new = .{ .json = composed_v }, .removed = false });
+        try out.append(arena, .{ .path = path, .new = .{ .json = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .json = live_v }) });
         return;
     }
     if (jsonEql(live_v, composed_v)) return;
-    try out.append(arena, .{ .path = path, .new = .{ .json = composed_v }, .removed = false });
+    try out.append(arena, .{ .path = path, .new = .{ .json = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .json = live_v }) });
 }
 
 /// json.Value has no built-in `eql` (unlike toml/yaml), so this deep-compares
@@ -234,7 +250,7 @@ fn walkYaml(
         if (yaml.Value.mapGet(composed.map, key)) |cv| {
             try diffYamlValue(arena, path, entry.value, cv, out);
         } else {
-            try out.append(arena, .{ .path = path, .new = null, .removed = true });
+            try out.append(arena, .{ .path = path, .new = null, .removed = true, .old_text = try canonical.inlineText(arena, .{ .yaml = entry.value }) });
         }
     }
     for (composed.map) |entry| {
@@ -259,11 +275,11 @@ fn diffYamlValue(
     if (live_v == .seq and composed_v == .seq) {
         if (live_v.eql(composed_v)) return;
         if (try isPermutation(yaml.Value, arena, live_v.seq, composed_v.seq, yamlEql)) return error.Unrepresentable;
-        try out.append(arena, .{ .path = path, .new = .{ .yaml = composed_v }, .removed = false });
+        try out.append(arena, .{ .path = path, .new = .{ .yaml = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .yaml = live_v }) });
         return;
     }
     if (live_v.eql(composed_v)) return;
-    try out.append(arena, .{ .path = path, .new = .{ .yaml = composed_v }, .removed = false });
+    try out.append(arena, .{ .path = path, .new = .{ .yaml = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .yaml = live_v }) });
 }
 
 fn yamlEql(a: yaml.Value, b: yaml.Value) bool {
@@ -286,7 +302,7 @@ fn walkIni(
         if (composed.findValue(entry.key)) |cv| {
             try diffIniValue(arena, path, entry.value, cv, out);
         } else {
-            try out.append(arena, .{ .path = path, .new = null, .removed = true });
+            try out.append(arena, .{ .path = path, .new = null, .removed = true, .old_text = try canonical.inlineText(arena, .{ .ini = entry.value }) });
         }
     }
     for (composed.entries) |entry| {
@@ -310,11 +326,11 @@ fn diffIniValue(
     if (live_v == .list and composed_v == .list) {
         if (iniEql(live_v, composed_v)) return;
         if (try isPermutation([]const u8, arena, live_v.list, composed_v.list, strEql)) return error.Unrepresentable;
-        try out.append(arena, .{ .path = path, .new = .{ .ini = composed_v }, .removed = false });
+        try out.append(arena, .{ .path = path, .new = .{ .ini = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .ini = live_v }) });
         return;
     }
     if (iniEql(live_v, composed_v)) return;
-    try out.append(arena, .{ .path = path, .new = .{ .ini = composed_v }, .removed = false });
+    try out.append(arena, .{ .path = path, .new = .{ .ini = composed_v }, .removed = false, .old_text = try canonical.inlineText(arena, .{ .ini = live_v }) });
 }
 
 fn strEql(a: []const u8, b: []const u8) bool {

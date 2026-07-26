@@ -2365,6 +2365,52 @@ test "commit: structured overlay-won key routes [y] to the winning overlay layer
     try std.testing.expectEqual(@as(u8, 0), st.rc);
 }
 
+test "commit: a structured key prompt shows the old and new values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\nfont = \"mono\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "\"dark\"", "\"solarized\"");
+
+    // The prompt itself must show what accepting trades: the last-applied
+    // value out, the live value in, in canonical rendering.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "- \"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "+ \"solarized\"") != null);
+}
+
+test "commit partial: the per-key prompt shows the record and live values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\nsubmit = \"enter\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, "submit = \"enter\"", "submit = \"ctrl-enter\"");
+
+    // Old side from the owned record's canonical blob, new from live.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "- \"enter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "+ \"ctrl-enter\"") != null);
+}
+
 test "commit: structured key [s] skip leaves the source untouched and the file uncommitted" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

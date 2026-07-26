@@ -1181,9 +1181,7 @@ fn ownedDriftDiff(
         else => return e,
     };
     if (hunks.len == 0) return "";
-    // Both sides are already masked; no per-line secret info remains.
-    const none: []const bool = &.{};
-    return diff_mod.renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, none, none, sty);
+    return diff_mod.renderOwnedFile(ctx.alloc, live_path, a_lines, b_lines, hunks, sty);
 }
 
 fn writeOwnedRecord(

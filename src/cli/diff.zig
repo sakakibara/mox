@@ -50,6 +50,36 @@ pub fn renderFile(
     b_secret: []const bool,
     sty: style.Style,
 ) ![]u8 {
+    return renderImpl(arena, label, a_lines, b_lines, hunks, a_secret, b_secret, sty, false);
+}
+
+/// `renderFile` for canonical owned blobs: a hunk that does not itself start
+/// at a `= <path>` section header is preceded by the header of the section
+/// it falls in, printed as a context line, so a scalar-value hunk names its
+/// key path. Owned blobs arrive pre-masked, so no per-line secret info applies.
+pub fn renderOwnedFile(
+    arena: std.mem.Allocator,
+    label: []const u8,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    hunks: []const Hunk,
+    sty: style.Style,
+) ![]u8 {
+    const none: []const bool = &.{};
+    return renderImpl(arena, label, a_lines, b_lines, hunks, none, none, sty, true);
+}
+
+fn renderImpl(
+    arena: std.mem.Allocator,
+    label: []const u8,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    hunks: []const Hunk,
+    a_secret: []const bool,
+    b_secret: []const bool,
+    sty: style.Style,
+    section_context: bool,
+) ![]u8 {
     if (hunks.len == 0) return "";
     const redaction = mox.provenance.map.secret_redaction;
     var aw: Io.Writer.Allocating = .init(arena);
@@ -62,6 +92,13 @@ pub fn renderFile(
         try sty.dim(out);
         try out.print("@@ -{d},{d} +{d},{d} @@\n", .{ h.a_start + 1, h.a_len, h.b_start + 1, h.b_len });
         try sty.close(out);
+        if (section_context) {
+            if (sectionContextOf(a_lines, b_lines, h)) |header| {
+                try sty.dim(out);
+                try out.print(" {s}\n", .{header});
+                try sty.close(out);
+            }
+        }
         // Redact the whole hunk when a secret line sits on either side: the two
         // sides of a rotated/removed secret pair up here, and over-redacting a
         // mixed hunk in the DISPLAY is safe where leaking a value is not.
@@ -82,6 +119,35 @@ pub fn renderFile(
         }
     }
     return aw.toOwnedSlice();
+}
+
+/// The `= <path>` header of the section the hunk's first displayed line
+/// falls in, or null when the hunk itself starts at a header line (the
+/// context would only repeat it).
+fn sectionContextOf(a_lines: []const []const u8, b_lines: []const []const u8, h: Hunk) ?[]const u8 {
+    const first: []const u8 = if (h.b_len > 0)
+        b_lines[h.b_start]
+    else if (h.a_len > 0)
+        a_lines[h.a_start]
+    else
+        return null;
+    if (std.mem.startsWith(u8, first, "= ")) return null;
+    if (h.b_len > 0) {
+        if (headerBefore(b_lines, h.b_start)) |hd| return hd;
+    }
+    if (h.a_len > 0) {
+        if (headerBefore(a_lines, h.a_start)) |hd| return hd;
+    }
+    return null;
+}
+
+fn headerBefore(lines: []const []const u8, start: usize) ?[]const u8 {
+    var i = start;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.startsWith(u8, lines[i], "= ")) return lines[i];
+    }
+    return null;
 }
 
 /// A hunk touches a secret when any live-side line (per persisted provenance) or
@@ -384,7 +450,14 @@ fn diffPartial(
     };
     const b_text = try maskOwnedSections(ctx.alloc, composed_x, spelled);
     const a_text = try maskOwnedSections(ctx.alloc, live_x, spelled);
-    if (std.mem.eql(u8, a_text, b_text)) return;
+    if (std.mem.eql(u8, a_text, b_text)) {
+        // Drift confined to secret paths: both sides mask to the same bytes,
+        // and silence here would read as "no drift".
+        if (!std.mem.eql(u8, live_x, composed_x)) {
+            try ctx.out.print("{s}: (no visible difference; the owned changes are under secret paths)\n", .{live_path});
+        }
+        return;
+    }
 
     const a_lines = try mox.diff.lines.splitLines(ctx.alloc, a_text);
     const b_lines = try mox.diff.lines.splitLines(ctx.alloc, b_text);
@@ -404,9 +477,7 @@ fn diffPartial(
     if (stat_mode) {
         try ctx.out.print(" {s} | +{d} -{d}\n", .{ live_path, s.added, s.removed });
     } else {
-        // Both sides are already masked; no per-line secret info remains.
-        const none: []const bool = &.{};
-        const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, none, none, sty);
+        const rendered = try renderOwnedFile(ctx.alloc, live_path, a_lines, b_lines, hunks, sty);
         try ctx.out.writeAll(rendered);
     }
 }

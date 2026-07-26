@@ -1895,9 +1895,10 @@ fn simulateStructImpact(
     return .{ .ok = .{ .affected = imp.affected, .before = before, .after = after } };
 }
 
-/// Per-key-change diff line for the prompt/report: the key path and its new
-/// value or removal, plus the resolved route label.
-fn printKeyChange(sty: style.Style, out: *Io.Writer, change: commit_struct.KeyPathChange, label: []const u8) !void {
+/// Per-key-change diff lines for the prompt/report: the key path and its
+/// resolved route label, then the old and new values as `-`/`+` lines in
+/// canonical inline rendering, so the prompt shows what the answer trades.
+fn printKeyChange(arena: std.mem.Allocator, sty: style.Style, out: *Io.Writer, change: commit_struct.KeyPathChange, label: []const u8) !void {
     try out.writeAll("    ");
     for (change.path, 0..) |seg, i| {
         if (i > 0) try out.writeAll(".");
@@ -1911,6 +1912,16 @@ fn printKeyChange(sty: style.Style, out: *Io.Writer, change: commit_struct.KeyPa
     try sty.dim(out);
     try out.print("  ->  {s}\n", .{label});
     try sty.close(out);
+    if (change.old_text) |old| {
+        try sty.red(out);
+        try out.print("      - {s}\n", .{old});
+        try sty.close(out);
+    }
+    if (change.new) |v| {
+        try sty.green(out);
+        try out.print("      + {s}\n", .{try commit_struct.valueInline(arena, v)});
+        try sty.close(out);
+    }
 }
 
 /// Route a structured (Cat-A merged) file's hand-edits back into their source
@@ -2017,14 +2028,14 @@ fn routeStructChanges(
             ra.pending.* = true;
             ra.routed_count.* += 1;
             try cc.stdout.print("  would write {s} {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path) });
-            try printKeyChange(cc.sty, cc.stdout, change, winner_label);
+            try printKeyChange(cc.arena, cc.sty, cc.stdout, change, winner_label);
             continue;
         }
 
         var chosen: ?usize = res.target;
         if (cc.interactive) {
             try printHunkHeader(cc.stdout, cc.sty, rel, "key", ki + 1, changes.len, winner_label);
-            try printKeyChange(cc.sty, cc.stdout, change, winner_label);
+            try printKeyChange(cc.arena, cc.sty, cc.stdout, change, winner_label);
             const legend_line = try legend(cc.arena, &struct_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &struct_choices, 0, legend_line, cc.input, cc.stdout)) {
                 .chosen => |i| switch (i) {
@@ -2302,12 +2313,12 @@ fn diffCanonNode(
             if (live.find(le.key)) |lv| {
                 try diffCanonNode(arena, sub, le.node, lv, live_doc, changes, unaddressable);
             } else {
-                try changes.append(arena, .{ .path = sub, .new = null, .removed = true });
+                try changes.append(arena, .{ .path = sub, .new = null, .removed = true, .old_text = try canonNodeInline(arena, le.node) });
             }
         }
         for (live.entries) |le| {
             if (last.find(le.key) != null) continue;
-            try appendCanonSet(arena, try keyPathAppend(arena, path, le.key), live_doc, changes, unaddressable);
+            try appendCanonSet(arena, try keyPathAppend(arena, path, le.key), live_doc, null, changes, unaddressable);
         }
         return;
     }
@@ -2320,13 +2331,14 @@ fn diffCanonNode(
     // A shape change (leaf vs container) or a changed leaf: one whole-value
     // change at this path. The root is always a container on both sides.
     if (path.len == 0) return error.Malformed;
-    try appendCanonSet(arena, path, live_doc, changes, unaddressable);
+    try appendCanonSet(arena, path, live_doc, try canonNodeInline(arena, last), changes, unaddressable);
 }
 
 fn appendCanonSet(
     arena: std.mem.Allocator,
     path: []const []const u8,
     live_doc: *const mox.apply.partial.OwnedDoc,
+    old_text: ?[]const u8,
     changes: *std.ArrayList(commit_struct.KeyPathChange),
     unaddressable: *std.ArrayList([]const u8),
 ) error{OutOfMemory}!void {
@@ -2334,7 +2346,24 @@ fn appendCanonSet(
         try unaddressable.append(arena, try mox.apply.canonical.pathSpell(arena, path));
         return;
     };
-    try changes.append(arena, .{ .path = path, .new = anyToStructValue(v), .removed = false });
+    try changes.append(arena, .{ .path = path, .new = anyToStructValue(v), .removed = false, .old_text = old_text });
+}
+
+/// Inline rendering of a canonical-tree node: a leaf's pinned text as-is, a
+/// container as `{key = ..., ...}` -- the record side of a per-key prompt.
+fn canonNodeInline(arena: std.mem.Allocator, node: mox.apply.canonical.Node) error{OutOfMemory}![]const u8 {
+    if (node.leaf) |text| return text;
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '{');
+    for (node.entries, 0..) |e, i| {
+        if (i > 0) try out.appendSlice(arena, ", ");
+        const seg = [_][]const u8{e.key};
+        try out.appendSlice(arena, try mox.apply.canonical.pathSpell(arena, &seg));
+        try out.appendSlice(arena, " = ");
+        try out.appendSlice(arena, try canonNodeInline(arena, e.node));
+    }
+    try out.append(arena, '}');
+    return out.toOwnedSlice(arena);
 }
 
 fn keyPathAppend(arena: std.mem.Allocator, prefix: []const []const u8, key: []const u8) error{OutOfMemory}![]const []const u8 {

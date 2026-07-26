@@ -3232,6 +3232,55 @@ test "diff partial: secret keys render masked on both sides" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "token") == null);
 }
 
+test "diff partial: a change confined to secret paths prints the no-visible-difference note" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const secret_value = "diff-note-s3cr3t-11aa22bb";
+    try writePartialFixture(io, &tmp, "# mox: own api\n[api]\ntoken = \"<secret:env:MY_NOTE_SECRET>\"\n");
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MY_NOTE_SECRET", .value = secret_value }},
+    });
+    const live = try c.homePath("app.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The live value rotates in place: raw owned canonicals differ, but the
+    // masked sides agree -- the diff must say so instead of staying silent.
+    const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), secret_value, "rotated-elsewhere");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
+
+    const r = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "app.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "(no visible difference; the owned changes are under secret paths)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, secret_value) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "rotated-elsewhere") == null);
+}
+
+test "diff partial: a value hunk is preceded by its section header" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own alpha\n# mox: own tui\n[alpha]\na = 1\n\n[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // Only tui.k moves on, so the hunk alone would show a bare scalar line;
+    // the render names the enclosing section above it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own alpha\n# mox: own tui\n[alpha]\na = 1\n\n[tui]\nk = 2\n" });
+    const r = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, " = tui\n-  k = 1\n+  k = 2\n") != null);
+}
+
 // The `check` hook (partial files): the declared argv runs directly against
 // a candidate materialized in a private temp dir; exit 0 installs the file,
 // anything else -- or a timeout -- refuses it.
