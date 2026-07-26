@@ -1907,3 +1907,30 @@ test "commit: a FIFO at a recorded live path is skipped, never opened" {
     // The source is untouched.
     try std.testing.expectEqualStrings("ok\n", try read(io, a, try h.srcOf(".zshrc")));
 }
+
+test "doctor: an attributes entry no managed target derives is an advisory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.ssh/config", "Host x\n");
+    // One entry a managed target derives, one orphan (a `./`-era remnant).
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml",
+        \\["./old.conf"]
+        \\mode = "0600"
+        \\
+        \\[".ssh/config"]
+        \\mode = "0600"
+        \\
+    );
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "orphaned-attribute ./old.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "orphaned-attribute .ssh/config") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "advisory item(s)") != null);
+}

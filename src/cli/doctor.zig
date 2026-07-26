@@ -110,6 +110,14 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  tracked-and-ignored {s} (matches an ignore rule; it will not be applied -- remove one)\n", .{p});
     }
 
+    // Attributes entries whose key no managed target derives: the entry does
+    // nothing (a removed/renamed target, or an uncanonical key spelling) and
+    // can only mislead a reader of the record.
+    for (try orphanedAttributes(ctx.alloc, ctx.io, src_dir, context)) |key| {
+        advisories += 1;
+        try ctx.out.print("  orphaned-attribute {s} (no managed target derives this key; remove it from .mox/attributes.toml)\n", .{key});
+    }
+
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
     var problems = bad_prov.len;
@@ -237,6 +245,41 @@ fn trackedAndIgnored(
         const rel = try mox.source.path.liveKeyRelToHome(arena, m_state.home, file.live_path);
         if (ruleset.isPathIgnored(rel, false)) try out.append(arena, file.live_path);
     }
+    return out.toOwnedSlice(arena);
+}
+
+/// `.mox/attributes.toml` keys that no walked managed target derives (a
+/// target's key is its source path under `src/`, private layer included).
+/// Such an entry is dead: the walk never pairs it with a file, so its
+/// mode/symlink/seed-once intent silently applies to nothing. Best-effort --
+/// any step that cannot run yields no findings. Sorted, arena-owned keys.
+fn orphanedAttributes(
+    arena: std.mem.Allocator,
+    io: Io,
+    src_dir: []const u8,
+    context: app.Context,
+) ![]const []const u8 {
+    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir) catch return &.{};
+    if (attrs.map.count() == 0) return &.{};
+    const m_state = mox.machine.state.capture(arena, io, context.env) catch return &.{};
+    const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return &.{};
+    const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
+
+    var derived = std.StringHashMap(void).init(arena);
+    for (tree.files) |file| {
+        const key = if (std.mem.startsWith(u8, file.source_base_path, "src/"))
+            file.source_base_path["src/".len..]
+        else
+            file.source_base_path;
+        try derived.put(key, {});
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = attrs.map.keyIterator();
+    while (it.next()) |k| {
+        if (!derived.contains(k.*)) try out.append(arena, k.*);
+    }
+    std.mem.sort([]const u8, out.items, {}, lessString);
     return out.toOwnedSlice(arena);
 }
 
