@@ -40,10 +40,10 @@ pub fn matches(tuple: AxisTuple, bindings: *const std.StringHashMap([]const u8))
 /// The tuple to match a Cat A/C overlay against: its exact (verbatim
 /// filename) reading when that reading is present and satisfies `bindings`,
 /// else its extension-stripped reading. An axis value may itself contain a
-/// dot (a `machine` value is a hostname, and every macOS hostname ends in
-/// `.local`), so an overlay named `machine=host.local` must match this
-/// machine's own `host.local` binding exactly, while `os=darwin.toml` still
-/// falls back to `darwin` for editors that want the real extension.
+/// dot (a `hostname` value is the full dotted name, and every macOS hostname
+/// ends in `.local`), so an overlay named `hostname=host.local` must match
+/// this machine's own `host.local` binding exactly, while `os=darwin.toml`
+/// still falls back to `darwin` for editors that want the real extension.
 pub fn effectiveOverlayTuple(o: Overlay, bindings: *const std.StringHashMap([]const u8)) AxisTuple {
     if (o.exact_tuple) |e| {
         if (matches(e, bindings)) return e;

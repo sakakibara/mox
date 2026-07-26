@@ -1482,8 +1482,8 @@ fn pickFragmentFromRegion(
 ///
 /// A fragment named EXACTLY for the axis value wins over one that has to have a
 /// suffix stripped to reach it: an axis value may itself contain a dot, so
-/// `.d/machine/host.local` stands for `machine=host.local` and only falls back
-/// to `machine=host` if no fragment is named for the binding outright.
+/// `.d/hostname/host.local` stands for `hostname=host.local` and only falls
+/// back to `hostname=host` if no fragment is named for the binding outright.
 fn pickFragmentIndex(
     arena: std.mem.Allocator,
     fragments: []const Fragment,

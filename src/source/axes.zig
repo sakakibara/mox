@@ -26,7 +26,7 @@ fn isMultiValueAxis(name: []const u8) bool {
 /// One value a source compares an axis against.
 ///
 /// A Cat B fragment or Cat A/C overlay filename carries two candidate values
-/// -- `.d/os/darwin.sh` stands for `os=darwin`, but `.d/machine/host.local`
+/// -- `.d/os/darwin.sh` stands for `os=darwin`, but `.d/hostname/host.local`
 /// stands for the whole filename, since a hostname contains dots. Which one it
 /// is cannot be settled from the filename alone, so both travel: `value` is
 /// the stem and `exact` the verbatim filename. Everything else has a single

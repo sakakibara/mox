@@ -66,7 +66,7 @@ pub fn enumerate(
         const mine = this_bindings.get(name);
         for (ax.valuesFor(name)) |v| {
             // A fragment filename that carries a suffix names two candidate
-            // values (`host.local` is `machine=host.local` or `machine=host`
+            // values (`host.local` is `hostname=host.local` or `hostname=host`
             // plus an extension). This machine's own binding settles which,
             // exactly as compose does when it resolves the fragment.
             const resolved = if (v.exact) |e|

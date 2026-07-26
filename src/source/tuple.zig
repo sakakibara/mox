@@ -24,10 +24,10 @@ pub fn parseFilename(arena: std.mem.Allocator, filename: []const u8) ParseError!
 
 /// Parse an axis tuple from a filename WITHOUT stripping a trailing
 /// extension: the filename is the stem verbatim. A value may itself contain a
-/// dot (a `machine` value is a hostname, and every macOS hostname ends in
-/// `.local`), so this is the reading that stands for what was actually
-/// written whenever `parseFilename`'s extension heuristic strips a real
-/// dotted value instead of a real extension.
+/// dot (a `hostname` value is the full dotted name, and every macOS hostname
+/// ends in `.local`), so this is the reading that stands for what was
+/// actually written whenever `parseFilename`'s extension heuristic strips a
+/// real dotted value instead of a real extension.
 pub fn parseFilenameVerbatim(arena: std.mem.Allocator, filename: []const u8) ParseError!AxisTuple {
     return parseStem(arena, filename);
 }

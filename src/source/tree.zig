@@ -67,10 +67,10 @@ pub const Overlay = struct {
     tuple: AxisTuple,
     /// Tuple from the VERBATIM filename, set only when the filename carries
     /// something the extension heuristic treats as an extension. An axis value
-    /// may itself contain a dot (a `machine` value is a hostname, and every
-    /// macOS hostname ends in `.local`), so the filename is also a candidate
-    /// tuple in its own right -- and the one that wins, since it is what was
-    /// actually written.
+    /// may itself contain a dot (a `hostname` value is the full dotted name,
+    /// and every macOS hostname ends in `.local`), so the filename is also a
+    /// candidate tuple in its own right -- and the one that wins, since it is
+    /// what was actually written.
     exact_tuple: ?AxisTuple = null,
 };
 
@@ -83,10 +83,10 @@ pub const Fragment = struct {
     tuple: AxisTuple,
     /// Tuple from the VERBATIM filename, set only when the filename carries
     /// something `fragmentStem` treats as an extension. An axis value may
-    /// itself contain a dot (a `machine` value is a hostname, and every macOS
-    /// hostname ends in `.local`), so the filename is also a candidate value in
-    /// its own right -- and the one that wins, since it is what the value was
-    /// written as.
+    /// itself contain a dot (a `hostname` value is the full dotted name, and
+    /// every macOS hostname ends in `.local`), so the filename is also a
+    /// candidate value in its own right -- and the one that wins, since it is
+    /// what the value was written as.
     exact_tuple: ?AxisTuple = null,
 };
 
@@ -754,10 +754,10 @@ fn enumerateDotD(
                 else => return error.InvalidEntry,
             };
             // A value may itself contain a dot the extension heuristic strips
-            // (a `machine` value is a hostname, and every macOS hostname ends
-            // in `.local`); when it does, also parse the filename verbatim so
-            // the exact reading -- what was actually written -- is a
-            // candidate too.
+            // (a `hostname` value is the full dotted name, and every macOS
+            // hostname ends in `.local`); when it does, also parse the
+            // filename verbatim so the exact reading -- what was actually
+            // written -- is a candidate too.
             var exact: ?AxisTuple = null;
             if (!std.mem.eql(u8, tuple_mod.stripExtension(entry.name), entry.name)) {
                 exact = tuple_mod.parseFilenameVerbatim(arena, entry.name) catch |e| switch (e) {
