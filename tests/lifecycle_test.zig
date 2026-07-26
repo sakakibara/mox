@@ -464,6 +464,28 @@ test "remove: an unknown attributes.toml key refuses with the friendly schema me
     try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownAttributeKey") == null);
 }
 
+test "mv: an unknown attributes.toml key refuses with the friendly schema message, not a raw error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "content\n");
+    // A typo'd key (`seed_one` for `seed_once`): the raw zig error name
+    // (`UnknownAttributeKey`) must never reach the user.
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".zshrc\"]\nseed_one = true\n");
+
+    const r = try h.run(&.{ "mox", "mv", ".zshrc", ".bashrc" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "attributes.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "seed_one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "schema") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownAttributeKey") == null);
+}
+
 test "add-tree: a coupling-graph persistence failure warns as add-tree, not add" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -6,7 +6,7 @@ const Overlay = source.tree.Overlay;
 
 /// True if every (name=value) pair in `tuple` is satisfied by `bindings`.
 ///
-/// Single-value axes (os, arch, profile, machine) bind their name directly;
+/// Single-value axes (os, arch, profile, machine, hostname) bind their name directly;
 /// multi-value axes (tool, env, path) bind a compound `name=value` key with a
 /// sentinel. Overlay filenames need both readings, exactly as directive axis
 /// expressions do (`dsl/axis.zig` eqMatch) -- otherwise a `.d/tool=fd` overlay
