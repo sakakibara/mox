@@ -485,7 +485,10 @@ fn applyPass(
     if (snapshotted and !resolver.aborted) {
         const keep = blk: {
             const v = context.env.getAlloc(ctx.alloc, "MOX_SNAPSHOT_RETENTION") catch break :blk @as(usize, 10);
-            const parsed = std.fmt.parseInt(usize, v, 10) catch 10;
+            const parsed = std.fmt.parseInt(usize, v, 10) catch parse_err: {
+                try ctx.err.print("mox apply: MOX_SNAPSHOT_RETENTION={s}: not an integer; using default (10)\n", .{v});
+                break :parse_err 10;
+            };
             // Never prune below 1: this run just took a snapshot, and deleting
             // it in the same apply would leave the write non-rollbackable.
             break :blk @max(@as(usize, 1), parsed);
@@ -921,7 +924,7 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     var env_map = try context.env.createMap(ctx.alloc);
     try env_map.put("MOX_CHECK_FILE", cand_path);
     try env_map.put("MOX_CHECK_DIR", check_dir);
-    const timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&env_map);
+    const timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&env_map, ctx.err);
 
     const res = mox.apply.run_scripts.runCheck(ctx.alloc, ctx.io, context.paths.repo_dir, check_argv, &env_map, out_path, timeout_ms) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

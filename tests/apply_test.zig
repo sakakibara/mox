@@ -1397,6 +1397,62 @@ test "run_scripts: a hung script is killed within the configured timeout" {
     try std.testing.expectEqual(@as(usize, 1), result.failed);
 }
 
+test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls back to the default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    try writeExecScript(io, tmp.dir, "scripts/00-a.sh", "#!/bin/sh\ntrue\n", try std.fs.path.join(a, &.{ root, "scripts/00-a.sh" }));
+    try writeExecScript(io, tmp.dir, "scripts/01-b.sh", "#!/bin/sh\ntrue\n", try std.fs.path.join(a, &.{ root, "scripts/01-b.sh" }));
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var script_env = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{});
+    try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "notanumber");
+
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, &script_env, &out_aw.writer, &err_aw.writer);
+
+    try std.testing.expectEqual(@as(usize, 2), result.ran);
+    const err = err_aw.written();
+    const first = std.mem.indexOf(u8, err, "MOX_SCRIPT_TIMEOUT_MS=notanumber");
+    try std.testing.expect(first != null);
+    // Resolved once per stage, not once per script: the same (only) match.
+    try std.testing.expectEqual(first, std.mem.lastIndexOf(u8, err, "MOX_SCRIPT_TIMEOUT_MS=notanumber"));
+}
+
+test "checkTimeoutMs: an unparseable override warns and falls back to the default" {
+    const a = std.testing.allocator;
+    var map = std.process.Environ.Map.init(a);
+    defer map.deinit();
+    try map.put("MOX_CHECK_TIMEOUT_MS", "notanumber");
+
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    defer err_aw.deinit();
+    const got = mox.apply.run_scripts.checkTimeoutMs(&map, &err_aw.writer);
+    try std.testing.expectEqual(mox.apply.run_scripts.default_check_timeout_ms, got);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "MOX_CHECK_TIMEOUT_MS=notanumber") != null);
+}
+
+test "checkTimeoutMs: a well-formed override is used verbatim, no warning" {
+    const a = std.testing.allocator;
+    var map = std.process.Environ.Map.init(a);
+    defer map.deinit();
+    try map.put("MOX_CHECK_TIMEOUT_MS", "5000");
+
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    defer err_aw.deinit();
+    const got = mox.apply.run_scripts.checkTimeoutMs(&map, &err_aw.writer);
+    try std.testing.expectEqual(@as(i64, 5000), got);
+    try std.testing.expectEqualStrings("", err_aw.written());
+}
+
 test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2344,6 +2400,29 @@ test "apply drift: [o] discards the live edit and writes the composed output" {
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
     // The source is never touched by an overwrite.
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.srcOf("b.conf")));
+}
+
+test "apply: an unparseable MOX_SNAPSHOT_RETENTION warns and falls back to the default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "keep = source\n" });
+
+    const h = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_SNAPSHOT_RETENTION", .value = "notanumber" }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.homePath("a.conf"), .data = "damaged\n" });
+
+    // --force resolves drift by overwriting, which snapshots first and then
+    // prunes -- the site where MOX_SNAPSHOT_RETENTION is read.
+    const res = try h.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "MOX_SNAPSHOT_RETENTION=notanumber") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "using default") != null);
 }
 
 test "apply drift: [s] leaves the live edit alone, exactly as before" {

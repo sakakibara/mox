@@ -137,14 +137,18 @@ pub fn runStage(
         }
     }
 
+    // Resolved once per stage (not per script): an unparseable override would
+    // otherwise warn once per script in the stage.
+    const timeout_ms = scriptTimeoutMs(environ_map, stderr);
+
     var result: Result = .{};
     for (file_names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ scripts_dir, name });
-        runOne(arena, io, path, bindings, environ_map, stdout, stderr, &result);
+        runOne(arena, io, path, bindings, environ_map, timeout_ms, stdout, stderr, &result);
     }
     for (gated_dirs.items) |dname| {
         const sub_path = try std.fs.path.join(arena, &.{ scripts_dir, dname });
-        try runGatedDir(arena, io, sub_path, bindings, environ_map, stdout, stderr, &result);
+        try runGatedDir(arena, io, sub_path, bindings, environ_map, timeout_ms, stdout, stderr, &result);
     }
     return result;
 }
@@ -169,6 +173,7 @@ fn runGatedDir(
     dir_path: []const u8,
     bindings: *const std.StringHashMap([]const u8),
     environ_map: ?*const EnvironMap,
+    timeout_ms: i64,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     result: *Result,
@@ -189,16 +194,22 @@ fn runGatedDir(
     }
     for (names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ dir_path, name });
-        runOne(arena, io, path, bindings, environ_map, stdout, stderr, result);
+        runOne(arena, io, path, bindings, environ_map, timeout_ms, stdout, stderr, result);
     }
 }
 
-/// Read the per-script timeout (ms) from the child environment, or the default.
-fn scriptTimeoutMs(environ_map: ?*const EnvironMap) i64 {
+/// Read the per-script timeout (ms) from the child environment, or the
+/// default. A present but unparseable override warns once and falls back to
+/// the default, rather than silently ignoring the typo.
+fn scriptTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
     const m = environ_map orelse return default_script_timeout_ms;
     const v = m.get("MOX_SCRIPT_TIMEOUT_MS") orelse return default_script_timeout_ms;
     if (v.len == 0) return default_script_timeout_ms;
-    return std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\r\n"), 10) catch default_script_timeout_ms;
+    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+    return std.fmt.parseInt(i64, trimmed, 10) catch {
+        stderr.print("mox apply: MOX_SCRIPT_TIMEOUT_MS={s}: not an integer; using default ({d}ms)\n", .{ trimmed, default_script_timeout_ms }) catch {};
+        return default_script_timeout_ms;
+    };
 }
 
 /// Forcibly terminate the child after the timeout elapses (never reaps): the
@@ -223,12 +234,18 @@ fn killAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool
 /// Override per-run with MOX_CHECK_TIMEOUT_MS; <= 0 disables it.
 pub const default_check_timeout_ms: i64 = 30_000;
 
-/// Read the check-hook timeout (ms) from the child environment, or the default.
-pub fn checkTimeoutMs(environ_map: ?*const EnvironMap) i64 {
+/// Read the check-hook timeout (ms) from the child environment, or the
+/// default. A present but unparseable override warns once and falls back to
+/// the default, rather than silently ignoring the typo.
+pub fn checkTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
     const m = environ_map orelse return default_check_timeout_ms;
     const v = m.get("MOX_CHECK_TIMEOUT_MS") orelse return default_check_timeout_ms;
     if (v.len == 0) return default_check_timeout_ms;
-    return std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\r\n"), 10) catch default_check_timeout_ms;
+    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+    return std.fmt.parseInt(i64, trimmed, 10) catch {
+        stderr.print("mox apply: MOX_CHECK_TIMEOUT_MS={s}: not an integer; using default ({d}ms)\n", .{ trimmed, default_check_timeout_ms }) catch {};
+        return default_check_timeout_ms;
+    };
 }
 
 /// Bytes of the child's combined output kept for the refusal report.
@@ -387,6 +404,7 @@ fn runOne(
     path: []const u8,
     bindings: *const std.StringHashMap([]const u8),
     environ_map: ?*const EnvironMap,
+    timeout_ms: i64,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     result: *Result,
@@ -415,7 +433,6 @@ fn runOne(
 
     // Bound the wait: a background task terminates the child once the timeout
     // elapses, unblocking child.wait; cancel it if the script finishes first.
-    const timeout_ms = scriptTimeoutMs(environ_map);
     var timed_out = false;
     var killer: ?Io.Future(void) = null;
     if (timeout_ms > 0) {
