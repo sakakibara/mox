@@ -160,9 +160,20 @@ fn removeLeaf(
             try stdout.print("  removed {s} (generated, no longer produced)\n", .{live_path});
             return;
         },
-        // A regular file (confirmed not a symlink): the read below cannot follow
-        // a link. Fall through to the clean/drift check and snapshot.
+        // Not a symlink, directory, or absent entry: usually a regular file.
+        // The kind guard below refuses the special inodes this also covers.
         .other => {},
+    }
+
+    // A FIFO/socket/device where a leaf was: mox never wrote it, cannot back
+    // it up, and opening a FIFO to read would block -- refuse, never delete.
+    switch (write.guardLiveRead(io, live_path)) {
+        .readable, .absent => {},
+        .special => {
+            result.refused += 1;
+            try stderr.print("  {s}: generated leaf is not a regular file, not removing\n", .{live_path});
+            return;
+        },
     }
 
     const content = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(max_content_bytes)) catch |e| switch (e) {

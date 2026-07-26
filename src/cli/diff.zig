@@ -324,6 +324,12 @@ fn diffOne(
     total: *Stat,
     changed: *usize,
 ) !void {
+    // Kind guard BEFORE the open: a FIFO here would block the read and brick
+    // the whole diff.
+    if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) {
+        try ctx.err.print("mox diff: {s}: not a regular file; skipped\n", .{live_path});
+        return;
+    }
     const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => "",
         else => return e,
@@ -414,6 +420,12 @@ fn diffPartial(
             return;
         },
     };
+    // Kind guard BEFORE the open: a FIFO here would block the read and brick
+    // the whole diff.
+    if (mox.apply.write.guardLiveRead(ctx.io, live_target) == .special) {
+        try ctx.err.print("  ERROR   {s} (not a regular file)\n", .{live_path});
+        return;
+    }
     const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => "",
         else => return e,

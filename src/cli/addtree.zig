@@ -1,7 +1,7 @@
 //! `mox add-tree <dir>`: recursively start managing every non-junk regular
-//! file under a live directory, reusing the single-file add path. Already-
-//! managed files and junk (editor temp, OS metadata) are skipped. Under the
-//! lock.
+//! file and symlink under a live directory, reusing the single-file add path.
+//! Already-managed files, junk (editor temp, OS metadata), and non-regular
+//! entries (FIFO, socket, device) are counted as skipped. Under the lock.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -86,7 +86,9 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                 }
                 try walk(ctx, child, ruleset, counts);
             },
-            .file => {
+            // A symlink is captured like single add captures it: as a regular
+            // source file holding the target string, flagged in attributes.
+            .file, .sym_link => {
                 const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, child);
                 if (mox.source.junk.isJunk(entry.name) or ruleset.isIgnored(rel, false)) {
                     counts.skipped += 1;
@@ -113,10 +115,20 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                         counts.skipped += 1;
                         try ctx.out.print("  skipping {s} (partially owned; managed per key-path)\n", .{child});
                     },
+                    .not_regular => {
+                        counts.skipped += 1;
+                        try ctx.out.print("  skipping {s} (not a regular file)\n", .{child});
+                    },
                     else => counts.skipped += 1,
                 }
             },
-            else => {},
+            // A FIFO/socket/device is not capturable content and must never be
+            // opened (a FIFO read blocks): count it, with the reason, instead
+            // of pretending it was not there.
+            else => {
+                counts.skipped += 1;
+                try ctx.out.print("  skipping {s} (not a regular file)\n", .{child});
+            },
         }
     }
 }

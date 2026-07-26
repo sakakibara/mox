@@ -694,6 +694,16 @@ const RegularInput = struct {
 /// 1:1 write/snapshot/state machinery is not duplicated.
 fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotted: *bool) !void {
     const context = ctx.context.?;
+    // Kind guard BEFORE any open: a FIFO/socket/device at the live path would
+    // block or misfire the read below, so it is reported and never opened.
+    switch (mox.apply.write.guardLiveRead(ctx.io, in.live_path)) {
+        .readable, .absent => {},
+        .special => |k| {
+            try ctx.err.print("mox apply: {s}: not a regular file ({s}); not written\n", .{ in.live_path, @tagName(k) });
+            counts.fail += 1;
+            return;
+        },
+    }
     // A file whose composition inlined a resolved secret must NOT have its
     // cleartext cached: the applied-content drift cache and snapshots are
     // secret-aware. The hash record is still stored (preimage-resistant).
@@ -960,6 +970,16 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
             return;
         },
     };
+    // Kind guard BEFORE any open: a FIFO/socket/device at the (resolved) live
+    // path would block the read below, so it is reported and never opened.
+    switch (mox.apply.write.guardLiveRead(ctx.io, live_target)) {
+        .readable, .absent => {},
+        .special => |k| {
+            try ctx.err.print("  ERROR   {s} (not a regular file: {s})\n", .{ live_path, @tagName(k) });
+            counts.fail += 1;
+            return;
+        },
+    }
     // Stat BEFORE the read: a write landing between the two moves the stat
     // identity past what the candidate was built from, so the post-fsync
     // recheck refuses (the safe direction) instead of missing it.
@@ -1373,6 +1393,12 @@ fn redactedPriorContent(ctx: *app.Ctx, live_path: []const u8, content: []const u
 /// an interleaved external edit. An unreadable path or a re-read error counts as
 /// "changed" (conservative: refuse the write). Absent-and-was-absent matches.
 fn liveMatchesInitial(io: std.Io, arena: std.mem.Allocator, live_path: []const u8, initial: ?[]const u8) bool {
+    // An entry that became a special inode since the initial read counts as
+    // "changed" (refuse) without opening it -- a FIFO read would block here.
+    switch (mox.apply.write.guardLiveRead(io, live_path)) {
+        .special => return false,
+        .readable, .absent => {},
+    }
     const now: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => return false,
@@ -1495,7 +1521,14 @@ fn liveIsSymlink(io: std.Io, live_path: []const u8) bool {
 fn snapshotContentForSite(io: std.Io, arena: std.mem.Allocator, live_path: []const u8, site: mox.apply.applied.SymSite) []const u8 {
     return switch (site) {
         .symlink => |target| target,
-        else => std.Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024)) catch "",
+        // `.other` also covers a FIFO/socket/device, whose "content" is not
+        // readable bytes: like the exact sweep, a special inode carries
+        // nothing recoverable, and opening a FIFO would block -- check the
+        // kind first and read only a regular file.
+        else => switch (mox.apply.write.guardLiveRead(io, live_path)) {
+            .readable => std.Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024)) catch "",
+            .absent, .special => "",
+        },
     };
 }
 

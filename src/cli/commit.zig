@@ -588,6 +588,12 @@ pub fn commitImpl(
 
         const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
         if (recorded == null) continue;
+        // Kind guard BEFORE the open: a FIFO here would block the read and
+        // brick the whole commit.
+        if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
+            try ctx.err.print("mox commit: {s}: skipped (not a regular file)\n", .{file.live_path});
+            continue;
+        }
         const live = Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
             error.FileNotFound => continue,
             else => return e,
@@ -1002,7 +1008,13 @@ pub fn commitImpl(
             continue;
         }
 
-        const live = Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch "";
+        // Kind guard: a live path that became a special inode mid-commit reads
+        // as empty (a mismatch, so the routing is rolled back) without the
+        // blocking open a FIFO would force.
+        const live = switch (mox.apply.write.guardLiveRead(ctx.io, file.live_path)) {
+            .special => "",
+            .readable, .absent => Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch "",
+        };
         // The routing made the source uncomposable: nothing about the edit can
         // explain that, so it is a bug in the write. Put every source back.
         if (composed == null) {
@@ -2149,6 +2161,12 @@ fn processPartialFile(
             return .cont;
         },
     };
+    // Kind guard BEFORE the open: a FIFO here would block the read and brick
+    // the whole commit.
+    if (mox.apply.write.guardLiveRead(cc.io, live_target) == .special) {
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (not a regular file)\n", .{live_path});
+        return .cont;
+    }
     const live = Io.Dir.cwd().readFileAlloc(cc.io, live_target, arena, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => return .cont,
         else => return e,

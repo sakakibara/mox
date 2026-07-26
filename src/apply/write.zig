@@ -78,6 +78,26 @@ pub fn liveStat(io: Io, live_path: []const u8) ?LiveStat {
     return .{ .inode = st.inode, .size = st.size, .mtime_ns = st.mtime.nanoseconds };
 }
 
+/// What a live path holds immediately before a content read. `.readable`
+/// covers a regular file and any path whose stat fails for a reason the
+/// read's own error handling already reports; `.absent` is no entry (or a
+/// dangling link, which the read reports as FileNotFound); `.special` names
+/// an entry -- FIFO, socket, device, directory -- a content read must never
+/// open, because opening a FIFO blocks until a peer connects. Follows
+/// symlinks, exactly like the reads it guards.
+pub const ReadGuard = union(enum) { readable, absent, special: Io.File.Kind };
+
+/// Classify `live_path` for `ReadGuard`. Every live-read site calls this
+/// BEFORE opening, so a stray special inode is reported and skipped instead
+/// of wedging the whole command on a blocking open.
+pub fn guardLiveRead(io: Io, live_path: []const u8) ReadGuard {
+    const st = Io.Dir.cwd().statFile(io, live_path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return .absent,
+        else => return .readable,
+    };
+    return if (st.kind == .file) .readable else .{ .special = st.kind };
+}
+
 pub const ResolveLiveError = error{ OutOfMemory, DanglingLink };
 
 /// The path a partial target's byte operations run against. A live path that
@@ -302,6 +322,47 @@ test "writeAtomicPartial: guards and replaces the resolved target of a symlinked
         writeAtomicPartial(io, resolved, "later\n", 0o644, st0),
     );
     try std.testing.expectEqualStrings("patched\n", try Io.Dir.cwd().readFileAlloc(io, target, a, .limited(4096)));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "guardLiveRead: regular and absent proceed; a FIFO is special and never opened" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    const reg = try std.fs.path.join(a, &.{ base, "reg" });
+    try writeAtomic(io, reg, "x\n", 0o644);
+    try std.testing.expect(guardLiveRead(io, reg) == .readable);
+
+    const absent = try std.fs.path.join(a, &.{ base, "absent" });
+    try std.testing.expect(guardLiveRead(io, absent) == .absent);
+
+    // The guard itself must not open the FIFO: a stat is kind-only, so this
+    // classification returns immediately even with no peer attached.
+    const fifo = try std.fs.path.join(a, &.{ base, "pipe" });
+    const fifo_z = try a.dupeZ(u8, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_z, 0o644));
+    switch (guardLiveRead(io, fifo)) {
+        .special => |k| try std.testing.expectEqual(Io.File.Kind.named_pipe, k),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A symlink is followed, like the read it guards: a link to a regular
+    // file is readable, a link to the FIFO is special.
+    const link_reg = try std.fs.path.join(a, &.{ base, "link-reg" });
+    try Io.Dir.cwd().symLink(io, "reg", link_reg, .{});
+    try std.testing.expect(guardLiveRead(io, link_reg) == .readable);
+    const link_fifo = try std.fs.path.join(a, &.{ base, "link-pipe" });
+    try Io.Dir.cwd().symLink(io, "pipe", link_fifo, .{});
+    try std.testing.expect(guardLiveRead(io, link_fifo) == .special);
 }
 
 test "setMode: heals a drifted mode in place" {

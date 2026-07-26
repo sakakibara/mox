@@ -95,6 +95,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
                 continue;
             }) |outputs| {
                 for (outputs) |o| {
+                    // Kind guard BEFORE the open: a FIFO here would block the
+                    // read and brick the whole report.
+                    if (mox.apply.write.guardLiveRead(ctx.io, o.live_path) == .special) {
+                        try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", o.live_path });
+                        problems += 1;
+                        continue;
+                    }
                     const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, o.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
                         error.FileNotFound => null,
                         error.OutOfMemory => return e,
@@ -182,6 +189,13 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             continue;
         }
 
+        // Kind guard BEFORE the open: a FIFO here would block the read and
+        // brick the whole report.
+        if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
+            try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
+            problems += 1;
+            continue;
+        }
         const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
             error.FileNotFound => null,
             // An unreadable or oversize live file is one file's problem, not a
@@ -241,6 +255,9 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
         error.OutOfMemory => return error.OutOfMemory,
         error.DanglingLink => return err_cell,
     };
+    // Kind guard BEFORE the open: a FIFO here would block the read and brick
+    // the whole report.
+    if (mox.apply.write.guardLiveRead(ctx.io, live_target) == .special) return err_cell;
     const live: []const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return cellFor(.fresh_write),
         error.OutOfMemory => return e,

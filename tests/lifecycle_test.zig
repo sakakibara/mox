@@ -1672,3 +1672,196 @@ test "add --disown: a suffix run of members with a quoted key extracts and appli
     try std.testing.expectEqualStrings("{\n  \"theme\": \"light\"\n}\n", absent);
     _ = try json_mod.parse(a, absent, .{});
 }
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+/// Bounds every FIFO-guard e2e below. With the kind guard intact no command
+/// ever opens the FIFO, and this loop just polls `done`. If a regression made
+/// a command open the FIFO for reading, that open blocks waiting for a
+/// writer -- the loop connects one and closes it, so the blocked open
+/// returns, the read sees immediate EOF, and the test FAILS on its
+/// assertions instead of hanging CI. A hard wall-clock cap aborts the test
+/// process if the command still has not returned.
+fn fifoRelief(io: Io, path_z: [*:0]const u8, done: *std.atomic.Value(bool)) void {
+    var waited_ms: u64 = 0;
+    while (!done.load(.acquire)) {
+        const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
+        if (fd >= 0) _ = std.c.close(fd);
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+        waited_ms += 10;
+        if (waited_ms > 60_000) {
+            std.debug.print("fifoRelief: command still running after 60s; aborting\n", .{});
+            std.process.exit(1);
+        }
+    }
+}
+
+const FifoGuard = struct {
+    done: *std.atomic.Value(bool),
+    fut: Io.Future(void),
+
+    fn start(a: std.mem.Allocator, io: Io, fifo_abs: []const u8) !FifoGuard {
+        const done = try a.create(std.atomic.Value(bool));
+        done.* = .init(false);
+        const path_z = try a.dupeZ(u8, fifo_abs);
+        return .{ .done = done, .fut = io.async(fifoRelief, .{ io, path_z.ptr, done }) };
+    }
+
+    fn stop(self: *FifoGuard, io: Io) void {
+        self.done.store(true, .release);
+        self.fut.await(io);
+    }
+};
+
+test "add: a FIFO is refused as not a regular file, never opened" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const fifo = try h.homePath("pipe.toml");
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, fifo), 0o644));
+    var guard = try FifoGuard.start(a, io, fifo);
+    defer guard.stop(io);
+
+    const r = try h.run(&.{ "mox", "add", fifo });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not a regular file") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("pipe.toml")));
+
+    // The partial route refuses the same way, before any extraction read.
+    const own = try h.run(&.{ "mox", "add", "--own", "tui", fifo });
+    try std.testing.expectEqual(@as(u8, 1), own.rc);
+    try std.testing.expect(std.mem.indexOf(u8, own.err, "not a regular file") != null);
+}
+
+test "add-tree: captures a symlink, reports a FIFO as skipped with a reason" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.config/app/a.conf", "a\n");
+    const link = try h.homePath(".config/app/link.conf");
+    try Io.Dir.cwd().symLink(io, "a.conf", link, .{});
+    const fifo = try h.homePath(".config/app/pipe");
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, fifo), 0o644));
+    var guard = try FifoGuard.start(a, io, fifo);
+    defer guard.stop(io);
+
+    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Added 2 file(s); 1 skipped, 0 failed") != null);
+    const skip_line = try std.fmt.allocPrint(a, "skipping {s} (not a regular file)", .{fifo});
+    try std.testing.expect(std.mem.indexOf(u8, r.out, skip_line) != null);
+
+    // The symlink was captured like single add captures it: a regular source
+    // file holding the target string, flagged in attributes.
+    try std.testing.expectEqualStrings("a.conf", try read(io, a, try h.srcOf(".config/app/link.conf")));
+    var attrs = try mox.source.attributes.load(a, io, h.repo);
+    try std.testing.expect(attrs.symlink(".config/app/link.conf"));
+    try std.testing.expect(!exists(io, try h.srcOf(".config/app/pipe")));
+}
+
+test "apply: a FIFO at a live path is reported, never opened, and the run continues" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // A whole-file target whose live path is a FIFO, a partial target whose
+    // live path is a FIFO, and a healthy sibling that must still be written.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "# mox: own tui\n[tui]\nx = 1\n");
+    try writeRepo(io, &tmp, "repo/src/healthy.conf", "fine\n");
+    const fifo_whole = try h.homePath(".zshrc");
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, fifo_whole), 0o644));
+    try tmp.dir.createDirPath(io, "home/.config");
+    const fifo_partial = try h.homePath(".config/app.toml");
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, fifo_partial), 0o644));
+    var g1 = try FifoGuard.start(a, io, fifo_whole);
+    defer g1.stop(io);
+    var g2 = try FifoGuard.start(a, io, fifo_partial);
+    defer g2.stop(io);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not a regular file") != null);
+    // Both FIFO targets are reported individually, and neither was replaced.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ".zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml") != null);
+    const st = try Io.Dir.cwd().statFile(io, fifo_whole, .{ .follow_symlinks = false });
+    try std.testing.expect(st.kind == .named_pipe);
+    // The stray FIFOs did not brick the run: the sibling still landed.
+    try std.testing.expectEqualStrings("fine\n", try read(io, a, try h.liveOf("healthy.conf")));
+}
+
+test "status and diff: a FIFO at a live path is an ERROR line, never opened" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
+    try writeRepo(io, &tmp, "repo/src/healthy.conf", "fine\n");
+    const fifo = try h.homePath(".zshrc");
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, fifo), 0o644));
+    var guard = try FifoGuard.start(a, io, fifo);
+    defer guard.stop(io);
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), st.rc);
+    const err_line = try std.fmt.allocPrint(a, "ERROR    {s}", .{fifo});
+    try std.testing.expect(std.mem.indexOf(u8, st.out, err_line) != null);
+    // The healthy sibling still reports (MISSING: not applied yet).
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "healthy.conf") != null);
+
+    const df = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), df.rc);
+    try std.testing.expect(std.mem.indexOf(u8, df.err, "not a regular file") != null);
+    // The sibling still diffs (absent live vs composed).
+    try std.testing.expect(std.mem.indexOf(u8, df.out, "healthy.conf") != null);
+}
+
+test "commit: a FIFO at a recorded live path is skipped, never opened" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The applied regular file was replaced by a FIFO out from under mox.
+    const live = try h.liveOf(".zshrc");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, live), 0o644));
+    var guard = try FifoGuard.start(a, io, live);
+    defer guard.stop(io);
+
+    const r = try h.run(&.{ "mox", "commit" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "skipped (not a regular file)") != null);
+    // The source is untouched.
+    try std.testing.expectEqualStrings("ok\n", try read(io, a, try h.srcOf(".zshrc")));
+}

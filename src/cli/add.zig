@@ -12,6 +12,7 @@ pub const Outcome = enum {
     outside_home,
     is_home,
     is_directory,
+    not_regular,
     already_managed,
     into_overlay_dir,
     /// The target's source head declares ownership: it is managed per
@@ -37,7 +38,7 @@ pub const Result = struct {
 
 /// True when `live_path` names HOME itself (ignoring a trailing separator),
 /// which `relUnder` reports as null just like a path outside HOME.
-fn isHomeItself(live_path: []const u8, home: []const u8) bool {
+pub fn isHomeItself(live_path: []const u8, home: []const u8) bool {
     const l = std.mem.trimEnd(u8, live_path, "/\\");
     const h = std.mem.trimEnd(u8, home, "/\\");
     return std.mem.eql(u8, l, h);
@@ -65,6 +66,9 @@ pub fn addFile(
     // Single-file add refuses a directory (use add-tree to recurse); reading one
     // would otherwise surface a raw IsDir error.
     if (st.kind == .directory) return .{ .outcome = .is_directory };
+    // A FIFO/socket/device is refused BEFORE any open: reading a FIFO blocks
+    // until a peer connects, and none of these is capturable content.
+    if (st.kind != .file and st.kind != .sym_link) return .{ .outcome = .not_regular };
 
     // Boundary-aware home membership, matching the attribute key derivation
     // (relUnder): a raw startsWith would let `/home/me` swallow `/home/meadow`,
@@ -170,6 +174,7 @@ pub const OwnOutcome = enum {
     outside_home,
     is_home,
     is_directory,
+    not_regular,
     dangling_link,
     already_managed,
     into_overlay_dir,
@@ -211,6 +216,9 @@ pub fn addOwnFile(
         else => return e,
     };
     if (lst.kind == .directory) return .{ .outcome = .is_directory };
+    // A FIFO/socket/device is refused BEFORE any open: reading a FIFO blocks
+    // until a peer connects.
+    if (lst.kind != .file and lst.kind != .sym_link) return .{ .outcome = .not_regular };
     // A symlinked live path is captured through the link, matching apply:
     // the document lives at the FINAL target, the live path stays the link.
     // A dangling link has no document to capture.
@@ -226,6 +234,7 @@ pub fn addOwnFile(
     else
         lst;
     if (st.kind == .directory) return .{ .outcome = .is_directory };
+    if (st.kind != .file) return .{ .outcome = .not_regular };
 
     const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
         rel
@@ -363,6 +372,8 @@ pub fn addDisownFile(
         else => return e,
     };
     if (lst.kind == .directory) return .{ .outcome = .is_directory };
+    // Refused BEFORE any open, exactly as addOwnFile.
+    if (lst.kind != .file and lst.kind != .sym_link) return .{ .outcome = .not_regular };
     // Captured through the link, exactly as addOwnFile.
     const live_target = mox.apply.write.resolvePartialLive(arena, io, live_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -376,6 +387,7 @@ pub fn addDisownFile(
     else
         lst;
     if (st.kind == .directory) return .{ .outcome = .is_directory };
+    if (st.kind != .file) return .{ .outcome = .not_regular };
 
     const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
         rel
@@ -622,6 +634,10 @@ fn run(ctx: *app.Ctx, a: cli.args.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox add: {s}: is a directory (use 'mox add-tree' to add its contents)\n", .{live_path});
             return 1;
         },
+        .not_regular => {
+            try ctx.err.print("mox add: {s}: not a regular file\n", .{live_path});
+            return 1;
+        },
         .already_managed => {
             try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ live_path, result.src_path });
             return 1;
@@ -675,6 +691,10 @@ fn runOwn(
         },
         .is_directory => {
             try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
+            return 1;
+        },
+        .not_regular => {
+            try ctx.err.print("mox add: {s}: not a regular file\n", .{live_path});
             return 1;
         },
         .dangling_link => {
@@ -734,6 +754,10 @@ fn runDisown(
         },
         .is_directory => {
             try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
+            return 1;
+        },
+        .not_regular => {
+            try ctx.err.print("mox add: {s}: not a regular file\n", .{live_path});
             return 1;
         },
         .dangling_link => {
