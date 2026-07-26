@@ -2694,6 +2694,7 @@ test "apply partial: first-contact drift is skipped, --force reasserts the sourc
     try std.testing.expectEqual(@as(u8, 1), r1.rc);
     try std.testing.expect(std.mem.indexOf(u8, r1.err, "DRIFT") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1.err, "tui.keymap.global") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.err, "'mox commit' it or re-run with --force") != null);
     try std.testing.expectEqualStrings(drifted, try read(io, a, live));
 
     const r2 = try c.run(&.{ "mox", "apply", "--force" });

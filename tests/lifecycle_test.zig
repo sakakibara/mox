@@ -1027,6 +1027,59 @@ test "add --own: extracts raw spans with comments, preserves attribute comments,
     try std.testing.expectEqualStrings(live_content, try read(io, a, live));
 }
 
+test "add --own: a symlinked live path captures through the link; apply patches the target" {
+    // Creating a symlink needs a POSIX-class filesystem.
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const live_content =
+        \\model = "gpt"
+        \\
+        \\[tui.keymap.global]
+        \\submit = "enter"
+        \\
+    ;
+    try writeRepo(io, &tmp, "home/real-app.toml", live_content);
+    const live = try h.liveOf("app.toml");
+    const target = try h.liveOf("real-app.toml");
+    try Io.Dir.cwd().symLink(io, "real-app.toml", live, .{});
+
+    // Onboards through the link: the target's bytes are captured, the live
+    // path stays the link.
+    const r = try h.run(&.{ "mox", "add", "--own", "tui.keymap.global", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const src = try read(io, a, try h.srcOf("app.toml"));
+    try std.testing.expectEqualStrings("# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n", src);
+
+    // First apply adopts; a source change then patches the TARGET while the
+    // link survives.
+    const r1 = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n");
+    const r2 = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    const link_st = try Io.Dir.cwd().statFile(io, live, .{ .follow_symlinks = false });
+    try std.testing.expect(link_st.kind == .sym_link);
+    try std.testing.expectEqualStrings(
+        "model = \"gpt\"\n\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n",
+        try read(io, a, target),
+    );
+
+    // A dangling link still refuses, with nothing captured.
+    const dangling = try h.liveOf("dangling.toml");
+    try Io.Dir.cwd().symLink(io, "no-such.toml", dangling, .{});
+    const bad = try h.run(&.{ "mox", "add", "--own", "x", dangling });
+    try std.testing.expectEqual(@as(u8, 1), bad.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err, "dangling symlink") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("dangling.toml")));
+}
+
 test "add --own: a declared path absent from the live file is an error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

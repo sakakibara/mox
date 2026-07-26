@@ -1003,7 +1003,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         const drift_what = try owned_mod.driftWhat(ctx.alloc, class.drift);
         const resolver = in.resolver orelse {
             counts.drift += 1;
-            try ctx.err.print("  DRIFT   {s} ({s} changed; 'mox apply --force' reasserts the source)\n", .{ live_path, drift_what });
+            try ctx.err.print("  DRIFT   {s} ({s} changed; 'mox commit' it or re-run with --force)\n", .{ live_path, drift_what });
             return;
         };
         // A secret-bearing record has no cleartext for commit to diff, so

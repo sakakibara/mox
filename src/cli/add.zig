@@ -169,7 +169,7 @@ pub const OwnOutcome = enum {
     outside_home,
     is_home,
     is_directory,
-    is_symlink,
+    dangling_link,
     already_managed,
     into_overlay_dir,
     not_structured,
@@ -205,14 +205,26 @@ pub fn addOwnFile(
     absent_raws: []const []const u8,
     gate: ?[]const u8,
 ) !OwnResult {
-    const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+    const lst = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return .{ .outcome = .not_found },
         else => return e,
     };
+    if (lst.kind == .directory) return .{ .outcome = .is_directory };
+    // A symlinked live path is captured through the link, matching apply:
+    // the document lives at the FINAL target, the live path stays the link.
+    // A dangling link has no document to capture.
+    const live_target = mox.apply.write.resolvePartialLive(arena, io, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => return .{ .outcome = .dangling_link },
+    };
+    const st = if (lst.kind == .sym_link)
+        Io.Dir.cwd().statFile(io, live_target, .{ .follow_symlinks = false }) catch |e| switch (e) {
+            error.FileNotFound => return .{ .outcome = .dangling_link },
+            else => return e,
+        }
+    else
+        lst;
     if (st.kind == .directory) return .{ .outcome = .is_directory };
-    // Partial ownership patches a document in place; a symlinked live file
-    // has no document of its own to patch.
-    if (st.kind == .sym_link) return .{ .outcome = .is_symlink };
 
     const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
         rel
@@ -245,7 +257,7 @@ pub fn addOwnFile(
     };
     const all_paths = try std.mem.concat(arena, mox.source.tree.OwnPath, &.{ content_paths, absent_paths });
 
-    const live = try Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024));
+    const live = try Io.Dir.cwd().readFileAlloc(io, live_target, arena, .limited(64 * 1024 * 1024));
 
     var diag: partial.Diag = .{};
     const extracted = partial.extractOwnedSource(arena, format, live, content_paths, &diag) catch |e| switch (e) {
@@ -345,12 +357,24 @@ pub fn addDisownFile(
     disown_raws: []const []const u8,
     gate: ?[]const u8,
 ) !OwnResult {
-    const st = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+    const lst = Io.Dir.cwd().statFile(io, live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return .{ .outcome = .not_found },
         else => return e,
     };
+    if (lst.kind == .directory) return .{ .outcome = .is_directory };
+    // Captured through the link, exactly as addOwnFile.
+    const live_target = mox.apply.write.resolvePartialLive(arena, io, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingLink => return .{ .outcome = .dangling_link },
+    };
+    const st = if (lst.kind == .sym_link)
+        Io.Dir.cwd().statFile(io, live_target, .{ .follow_symlinks = false }) catch |e| switch (e) {
+            error.FileNotFound => return .{ .outcome = .dangling_link },
+            else => return e,
+        }
+    else
+        lst;
     if (st.kind == .directory) return .{ .outcome = .is_directory };
-    if (st.kind == .sym_link) return .{ .outcome = .is_symlink };
 
     const trimmed = if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel|
         rel
@@ -378,7 +402,7 @@ pub fn addDisownFile(
         error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
     };
 
-    const live = try Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024));
+    const live = try Io.Dir.cwd().readFileAlloc(io, live_target, arena, .limited(64 * 1024 * 1024));
     var diag: partial.Diag = .{};
     const loc = partial.locateSpans(arena, format, live, paths, &diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -650,8 +674,8 @@ fn runOwn(
             try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
             return 1;
         },
-        .is_symlink => {
-            try ctx.err.print("mox add: {s}: is a symlink; --own patches a document in place\n", .{live_path});
+        .dangling_link => {
+            try ctx.err.print("mox add: {s}: live path is a dangling symlink; fix or remove the link\n", .{live_path});
             return 1;
         },
         .already_managed => {
@@ -709,8 +733,8 @@ fn runDisown(
             try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
             return 1;
         },
-        .is_symlink => {
-            try ctx.err.print("mox add: {s}: is a symlink; --disown patches a document in place\n", .{live_path});
+        .dangling_link => {
+            try ctx.err.print("mox add: {s}: live path is a dangling symlink; fix or remove the link\n", .{live_path});
             return 1;
         },
         .already_managed => {
