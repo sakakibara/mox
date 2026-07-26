@@ -1638,7 +1638,9 @@ fn simulateCouplingImpact(
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = edited });
     const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
         Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch {
-            try cc.err.print("mox commit: {s}: could not restore the transiently edited source; left edited\n", .{path});
+            // A failed diagnostic write must not replace `e`: the snapshot
+            // failure is the error worth reporting.
+            cc.err.print("mox commit: {s}: could not restore the transiently edited source; left edited\n", .{path}) catch {};
         };
         return e;
     };
