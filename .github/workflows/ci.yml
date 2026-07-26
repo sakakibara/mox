@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main, master]
   schedule:
-    # Nightly bounded fuzz run of the DSL parse pipeline and ini_merge.
+    # Nightly bounded run of the fuzz targets (tests/fuzz_test.zig).
     - cron: "0 4 * * *"
 
 concurrency:
