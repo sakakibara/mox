@@ -4,6 +4,81 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-26
+
+### Added
+- Partial ownership: mox can now manage part of a file a program also
+  writes. Declare it in the source's leading comment block -- `# mox: own
+  <key-path>` (the file is yours only at those paths) or `# mox: disown
+  <key-path>` (the file is yours except those paths) -- and mox composes,
+  applies, drifts, and commits the owned subtrees with full semantics
+  (overlays, axes, captures, secrets, per-key commit routing with the
+  layer picker) while provably never changing a byte outside them: the
+  remainder is byte-compared on every write, in production. A live file
+  the program rewrites no longer reads as drift; an edit inside your
+  region still does, per key path. Supported for TOML, JSON, YAML, INI,
+  and gitconfig; shapes the span model cannot address (yaml anchors,
+  dotted-key spellings of an owned table) are refused by name, never
+  guessed at.
+- `# mox: check "<repo-relative exe>" [args]`: an optional validation hook
+  for partial files. The candidate is staged privately and the hook runs
+  with `MOX_CHECK_FILE`/`MOX_CHECK_DIR`; nonzero or a timeout
+  (`MOX_CHECK_TIMEOUT_MS`, default 30s, process-group kill) refuses the
+  write. `--skip-scripts` skips the hook AND the write, so nothing
+  unvalidated installs.
+- `mox add --own <path>` / `--disown <path>` (repeatable) onboard a live
+  file in one command: the named subtrees (or their complement) are
+  extracted raw -- comments intact -- into a new source headed by the
+  matching directives. `--own-absent <path>` declares enforced absence;
+  `--gate "<axis expr>"` writes a whole-file gate alongside, onboarding a
+  machine-gated file in one line (and warns when the gate does not hold
+  locally). A directive-only base (directives plus a gate, no content)
+  composes entirely from its overlays.
+- `mox status` annotates partial files with their ownership inventory
+  (`(own N)` / `(disown N)`), including gated-off ones.
+- Structured per-key commit prompts now show the old and new value under
+  each key, and structured/owned diffs label every hunk with its key-path
+  section, so a scalar change names its key.
+- `mox doctor` flags an attributes entry that no managed target derives.
+- Fuzz targets for the head-directive parser, the key-path grammar, and
+  the partial span engine run in the bounded suite and the nightly fuzz
+  step.
+
+### Changed
+- `mox remove` now forgets the applied-state records for the removed
+  target (all files, not only partial ones). Previously a re-added file
+  could inherit stale state; removal now means mox has genuinely stopped
+  tracking the path.
+- `mox rollback` on a partial target re-patches the snapshot's owned
+  subtree onto the current live file instead of restoring whole bytes, so
+  the program's writes since the snapshot survive; a secret-masked
+  snapshot is refused rather than written live.
+- At the apply drift prompt, `q` now stops the run, reports every
+  unresolved file, and exits nonzero -- previously it silently dropped
+  the remaining files and exited clean.
+
+### Fixed
+- `mox status >> log` (any command with a redirect) no longer overwrites
+  the target from byte zero: standard streams are opened in streaming
+  mode, so appends append.
+- A FIFO or other non-regular file at a live path no longer hangs mox:
+  every live read guards the file kind first and reports the path
+  instead.
+- `mox add` now takes the same single-writer lock as every other
+  mutating command, resolves relative paths against HOME like its
+  siblings, and records canonical keys for `./`-spelled paths --
+  previously such a path silently split the attributes key from the walk
+  key and a restrictive mode (0600) was lost on re-apply.
+- `mox add-tree` refuses a missing or non-directory argument and a
+  directory outside HOME (each was silently accepted before), captures
+  symlinks like single `add`, reports non-regular entries as skipped, and
+  rebuilds the coupling graph after a bulk add so the first commit can
+  offer coupled updates.
+- A symlinked live path under partial ownership is patched at its resolved
+  target -- the link survives and one inode is parsed, race-guarded, and
+  replaced -- instead of being silently replaced by a regular file while
+  the target kept stale content.
+
 ## [0.2.0] - 2026-07-24
 
 ### Added
