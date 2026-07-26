@@ -26,6 +26,11 @@ fn exists(io: Io, path: []const u8) bool {
     return true;
 }
 
+fn chmodPath(a: std.mem.Allocator, path: []const u8, mode: u32) !void {
+    const z = try a.dupeZ(u8, path);
+    _ = std.c.chmod(z.ptr, @intCast(mode));
+}
+
 /// Write an executable script at `sub` (relative to tmp) with mode 0o755.
 /// `abs` is its absolute path, needed because std.c.chmod takes an absolute
 /// NUL-terminated path.
@@ -534,6 +539,63 @@ test "add --own: a relative path resolves against HOME" {
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     const src = try read(io, a, try h.srcOf("app.toml"));
     try std.testing.expect(std.mem.indexOf(u8, src, "# mox: own mine") != null);
+}
+
+test "add: a ./-spelled path records the canonical attribute key; apply restores its mode" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/priv.txt", "secret\n");
+    const live = try h.homePath("priv.txt");
+    try chmodPath(a, live, 0o600);
+
+    const r = try h.run(&.{ "mox", "add", "./priv.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf("priv.txt")));
+
+    // The mode is keyed by the canonical spelling the source walk derives,
+    // not by the `./`-spelled add argument.
+    var attrs = try mox.source.attributes.load(a, io, h.repo);
+    try std.testing.expectEqual(@as(u32, 0o600), attrs.mode("priv.txt").?);
+    try std.testing.expect(attrs.mode("./priv.txt") == null);
+
+    // Losing the live file and re-applying restores the recorded 0600.
+    try Io.Dir.cwd().deleteFile(io, live);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const st = try Io.Dir.cwd().statFile(io, live, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+}
+
+test "edit/remove: a ./-spelled name resolves to the managed file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const marker = try std.fs.path.join(a, &.{ root, "edited-path" });
+    const editor = try FakeEditor.install(a, io, &tmp, root, marker);
+
+    const h = try setup(a, io, &tmp, editor.command);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "add", "notes.txt" })).rc);
+
+    const re = try h.run(&.{ "mox", "edit", "./notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), re.rc);
+    try std.testing.expectEqualStrings(try h.srcOf("notes.txt"), editedPath(try read(io, a, marker)));
+
+    const rr = try h.run(&.{ "mox", "remove", "./notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), rr.rc);
+    try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
 }
 
 test "add: notes a secret-looking file that is not ignored" {

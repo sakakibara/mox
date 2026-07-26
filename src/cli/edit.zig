@@ -15,11 +15,43 @@ const Io = std.Io;
 const AxisTuple = mox.source.tree.AxisTuple;
 
 /// Canonical absolute live path a `<name>` refers to. An absolute name is
-/// returned as-is; a relative name is resolved against `home` (src-relative
+/// used as given; a relative name is resolved against `home` (src-relative
 /// and home-relative coincide, since `src/X` materializes at `home/X`).
+/// `.` segments are dropped so `./X` and `X` derive the same key; `..`
+/// segments are kept, for key derivation to refuse.
 pub fn liveTarget(arena: std.mem.Allocator, name: []const u8, home: []const u8) ![]const u8 {
-    if (std.fs.path.isAbsolute(name)) return arena.dupe(u8, name);
-    return mox.source.path.joinKeyOnto(arena, home, name);
+    const raw = if (std.fs.path.isAbsolute(name))
+        name
+    else
+        try mox.source.path.joinKeyOnto(arena, home, name);
+    return dropDotSegments(arena, raw);
+}
+
+/// `path` with every `.` segment removed and separator runs collapsed.
+/// `/home/me/./x` and `/home/me/x` name the same file but compare unequal, so
+/// an uncanonical spelling would miss membership checks and record attribute
+/// keys the source walk never derives.
+fn dropDotSegments(arena: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < path.len and std.fs.path.isSep(path[i])) i += 1;
+    try out.appendSlice(arena, path[0..i]);
+    var pending_sep: u8 = std.fs.path.sep;
+    var wrote_segment = false;
+    while (i < path.len) {
+        const start = i;
+        while (i < path.len and !std.fs.path.isSep(path[i])) i += 1;
+        const seg = path[start..i];
+        const sep: u8 = if (i < path.len) path[i] else std.fs.path.sep;
+        while (i < path.len and std.fs.path.isSep(path[i])) i += 1;
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (wrote_segment) try out.append(arena, pending_sep);
+        try out.appendSlice(arena, seg);
+        wrote_segment = true;
+        pending_sep = sep;
+    }
+    if (out.items.len == 0) try out.append(arena, '.');
+    return out.toOwnedSlice(arena);
 }
 
 /// Render an axis tuple to its canonical filename form: pairs sorted by name
@@ -175,6 +207,27 @@ test "liveTarget: absolute name is returned verbatim, relative joins home" {
     try testing.expectEqualStrings("/home/me/.zshrc", try liveTarget(a, "/home/me/.zshrc", "/home/me"));
     const want = try std.fs.path.join(a, &.{ "/home/me", ".config", "nvim", "init.lua" });
     try testing.expectEqualStrings(want, try liveTarget(a, ".config/nvim/init.lua", "/home/me"));
+}
+
+test "liveTarget: `.` segments are dropped, `..` segments are kept" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try std.fs.path.join(a, &.{ "/home/me", "priv.txt" });
+    try testing.expectEqualStrings(plain, try liveTarget(a, "./priv.txt", "/home/me"));
+    try testing.expectEqualStrings(plain, try liveTarget(a, "priv.txt", "/home/me"));
+    const nested = try std.fs.path.join(a, &.{ "/home/me", ".config", "app.conf" });
+    try testing.expectEqualStrings(nested, try liveTarget(a, ".config/./app.conf", "/home/me"));
+    // A `./`-spelled absolute name canonicalizes to its plain spelling.
+    try testing.expectEqualStrings(
+        try liveTarget(a, "/home/me/.config/app.conf", "/home/me"),
+        try liveTarget(a, "/home/me/./.config/app.conf", "/home/me"),
+    );
+    // `.` alone resolves to home itself.
+    try testing.expectEqualStrings("/home/me", try liveTarget(a, ".", "/home/me"));
+    // `..` is preserved for key derivation to refuse, never resolved here.
+    const escape = try std.fs.path.join(a, &.{ "/home/me", "..", "secret" });
+    try testing.expectEqualStrings(escape, try liveTarget(a, "../secret", "/home/me"));
 }
 
 test "tupleFilename: renders sorted pairs joined by plus" {
