@@ -287,6 +287,11 @@ and apply then enforces its absence. A plain `mox add` of a target whose
 source head declares ownership is refused (it is managed per key-path), and
 `add-tree` skips it.
 
+Backing out of ownership is the head edit in reverse: delete the `mox: own`
+(or `mox: disown`) lines from the source, and the next `mox apply` returns
+the file to whole-file management -- the whole composed source becomes the
+contract, drift-checked as one file.
+
 ### The lifecycle
 
 - `mox apply` patches the owned content to the composed state and preserves

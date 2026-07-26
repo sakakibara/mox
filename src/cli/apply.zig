@@ -751,6 +751,9 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
                         try ctx.err.print("mox apply: {s}: could not enforce mode: {s}\n", .{ in.live_path, @errorName(e) });
                     };
                 }
+                // A stale owned record from a formerly partial path would make
+                // rollback withhold this file's whole-file restores forever.
+                try mox.apply.applied.forgetOwned(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path);
                 try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
                 if (!contains_secret) {
                     try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
@@ -792,6 +795,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
         return;
     };
     if (!in.create_once) {
+        try mox.apply.applied.forgetOwned(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path);
         try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
         if (!contains_secret) {
             try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
@@ -1208,6 +1212,10 @@ fn writeOwnedRecord(
     const context = ctx.context.?;
     const raws = try ctx.alloc.alloc([]const u8, own_paths.len);
     for (own_paths, raws) |p, *o| o.* = p.raw;
+    // The path is partial now: whole-file records and line provenance left by
+    // a prior whole-file era are dead state no partial consumer reads.
+    try mox.apply.applied.forgetWholeFile(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
     try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, live_path, .{
         .mode = mode,
         .canonical = if (any_secret) null else composed_canon,

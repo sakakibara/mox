@@ -3753,6 +3753,91 @@ test "rollback partial: a secret-masked snapshot is refused, live untouched" {
     try std.testing.expect(std.mem.indexOf(u8, before, mox.apply.partial.secret_mask) == null);
 }
 
+test "apply: un-declaring ownership drops the owned record and rollback whole-file restores" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const program_live = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 1\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    const rec_name = mox.apply.applied.contentHashHex(live);
+    const owned_rec = try std.fs.path.join(a, &.{ c.state, "applied-owned", &rec_name });
+    try std.testing.expect(exists(io, owned_rec));
+
+    // Ownership is un-declared: the head lines go, the source captures the
+    // whole live file, and the target returns to whole-file management.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = program_live });
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "unchanged") != null);
+    try std.testing.expect(!exists(io, owned_rec));
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ c.state, "applied", &rec_name })));
+
+    // The source moves on; the write snapshots the pre-write live file.
+    const v2 = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 2\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = v2 });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings(v2, try read(io, a, live));
+
+    // The stale owned record is gone, so rollback whole-file restores the
+    // snapshot instead of withholding it as a partial target.
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const r2 = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expectEqualStrings("", r2.err);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "Restored 1 file(s)") != null);
+    try std.testing.expectEqualStrings(program_live, try read(io, a, live));
+}
+
+test "apply partial: declaring ownership over a whole-file target drops its whole-file records" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    const rec_name = mox.apply.applied.contentHashHex(live);
+    const whole_rec = try std.fs.path.join(a, &.{ c.state, "applied", &rec_name });
+    const content_rec = try std.fs.path.join(a, &.{ c.state, "applied-content", &rec_name });
+    const prov_rec = try std.fs.path.join(a, &.{ c.state, "provenance", &rec_name });
+    const owned_rec = try std.fs.path.join(a, &.{ c.state, "applied-owned", &rec_name });
+    try std.testing.expect(exists(io, whole_rec));
+    try std.testing.expect(exists(io, content_rec));
+    try std.testing.expect(exists(io, prov_rec));
+
+    // The program grows the file, then ownership is declared over [tui]:
+    // live owned content matches composed, so the partial apply adopts.
+    const grown = "[tui]\nk = 1\n\n[state]\ncount = 42\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = grown });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 1\n" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "adopted") != null);
+
+    // The owned record replaces the whole-file state entirely: no whole-file
+    // record, content cache, or line provenance survives the transition.
+    try std.testing.expect(exists(io, owned_rec));
+    try std.testing.expect(!exists(io, whole_rec));
+    try std.testing.expect(!exists(io, content_rec));
+    try std.testing.expect(!exists(io, prov_rec));
+}
+
 // Disown mode: the whole file is owned EXCEPT the declared subtrees -- the
 // settings.json shape, where the user manages nearly everything and the
 // program writes a few keys back.

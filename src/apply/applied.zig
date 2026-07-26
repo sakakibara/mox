@@ -271,8 +271,20 @@ pub fn forget(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path
 /// Delete only the owned record for `live_path`. `mox mv` re-keys the record
 /// to the new live path and drops the old one with this; the other records
 /// never exist for a partial target, so the full `forget` sweep is not needed.
+/// Whole-file apply also calls this when it records a path: the record
+/// families are mutually exclusive per path, and a stale owned record makes
+/// rollback withhold the whole-file restore of a no-longer-partial target.
 pub fn forgetOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !void {
     Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
+}
+
+/// Delete only the whole-file records (content hash and content cache) for
+/// `live_path`. The inverse of `forgetOwned`'s exclusivity duty: partial
+/// apply calls this when it records ownership of a path whole-file
+/// management previously recorded.
+pub fn forgetWholeFile(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !void {
+    Io.Dir.cwd().deleteFile(io, try recordPath(arena, state_dir, live_path)) catch {};
+    Io.Dir.cwd().deleteFile(io, try contentPath(arena, state_dir, live_path)) catch {};
 }
 
 /// What currently occupies a live path, inspected without following symlinks.
