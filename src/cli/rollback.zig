@@ -4,6 +4,7 @@ const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const apply_cmd = @import("apply.zig");
 const mox = @import("../root.zig");
+const Env = @import("env").Env;
 
 const Io = std.Io;
 
@@ -109,11 +110,14 @@ fn snapshotLivePaths(ctx: *app.Ctx, id: []const u8) ![]const []const u8 {
     const context = ctx.context.?;
     var out: std.ArrayList([]const u8) = .empty;
     const snap_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.snapshots_dir, id });
-    var dir = Io.Dir.cwd().openDir(ctx.io, snap_dir, .{ .iterate = true }) catch return out.toOwnedSlice(ctx.alloc);
+    var dir = Io.Dir.cwd().openDir(ctx.io, snap_dir, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return out.toOwnedSlice(ctx.alloc),
+        else => return e,
+    };
     defer dir.close(ctx.io);
     var walker = try dir.walk(ctx.alloc);
     defer walker.deinit();
-    while (walker.next(ctx.io) catch null) |entry| {
+    while (try walker.next(ctx.io)) |entry| {
         if (entry.kind != .file) continue;
         try out.append(ctx.alloc, try mox.source.path.joinKeyOnto(ctx.alloc, context.paths.home, entry.path));
     }
@@ -267,3 +271,93 @@ pub const command = app.command(Spec, .{
     .group = .general,
     .needs_context = true,
 }, run);
+
+fn testCtx(a: std.mem.Allocator, io: Io, home: []const u8, snapshots_dir: []const u8, out: *Io.Writer, err: *Io.Writer) !app.Ctx {
+    const map_ptr = try a.create(std.process.Environ.Map);
+    map_ptr.* = std.process.Environ.Map.init(a);
+    return .{
+        .alloc = a,
+        .io = io,
+        .context = .{
+            .env = Env{ .map = map_ptr },
+            .paths = .{
+                .home = home,
+                .repo_dir = "",
+                .state_dir = "",
+                .private_dir = "",
+                .triggers_path = "",
+                .snapshots_dir = snapshots_dir,
+                .facts_path = "",
+            },
+        },
+        .out = out,
+        .err = err,
+    };
+}
+
+var read_calls_after_setup: usize = 0;
+var real_dir_read: *const fn (?*anyopaque, *Io.Dir.Reader, []Io.Dir.Entry) Io.Dir.Reader.Error!usize = undefined;
+
+fn failingDirReadAfterOne(userdata: ?*anyopaque, r: *Io.Dir.Reader, buffer: []Io.Dir.Entry) Io.Dir.Reader.Error!usize {
+    read_calls_after_setup += 1;
+    if (read_calls_after_setup > 1) return error.Unexpected;
+    return real_dir_read(userdata, r, buffer);
+}
+
+test "snapshotLivePaths: a mid-walk read failure propagates instead of silently truncating the set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
+
+    // Two entries: the walk order is unspecified, so a failure after the
+    // first one must be reported rather than mistaken for having reached
+    // the end of a one-entry snapshot.
+    try mox.apply.snapshot.save(a, io, snaps, "id1", home, try std.fs.path.join(a, &.{ home, "a" }), "a content\n");
+    try mox.apply.snapshot.save(a, io, snaps, "id1", home, try std.fs.path.join(a, &.{ home, "b" }), "b content\n");
+
+    read_calls_after_setup = 0;
+    real_dir_read = io.vtable.dirRead;
+    var vtable = io.vtable.*;
+    vtable.dirRead = failingDirReadAfterOne;
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    var out_aw: Io.Writer.Allocating = .init(a);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    var ctx = try testCtx(a, faulty, home, snaps, &out_aw.writer, &err_aw.writer);
+
+    try std.testing.expectError(error.Unexpected, snapshotLivePaths(&ctx, "id1"));
+}
+
+test "snapshotLivePaths: a non-missing openDir failure propagates instead of reporting no paths" {
+    if (!Io.File.Permissions.has_executable_bit) return; // no unix perms to lock out with
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
+
+    try mox.apply.snapshot.save(a, io, snaps, "id1", home, try std.fs.path.join(a, &.{ home, "a" }), "a content\n");
+    const snap_dir = try std.fs.path.join(a, &.{ snaps, "id1" });
+    try mox.apply.write.setMode(snap_dir, 0o000);
+    defer mox.apply.write.setMode(snap_dir, 0o755) catch {};
+
+    var out_aw: Io.Writer.Allocating = .init(a);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    var ctx = try testCtx(a, io, home, snaps, &out_aw.writer, &err_aw.writer);
+
+    try std.testing.expectError(error.AccessDenied, snapshotLivePaths(&ctx, "id1"));
+}
