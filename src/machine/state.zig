@@ -173,15 +173,21 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     var tool_watch: std.ArrayList([]const u8) = .empty;
     for (TOOL_WATCH_LIST) |t| try tool_watch.append(arena, t);
     for (extras.tools) |t| try tool_watch.append(arena, t);
-    const tool_paths = try path_lookup.findOnPathFull(arena, io, environ, tool_watch.items);
+
+    // One `$PATH` enumeration for the whole capture: the eager watch scan and
+    // the lazy probe share this same listing, instead of the probe building
+    // its own on first use.
+    const path_listing = try path_lookup.buildListing(arena, io, environ);
+    const tool_paths = try path_lookup.findOnPathFullFromListing(arena, path_listing, tool_watch.items);
     var tool_names_buf = try arena.alloc([]const u8, tool_paths.len);
     for (tool_paths, 0..) |tp, i| tool_names_buf[i] = tp.name;
 
     // A fresh probe every capture, so a re-capture (facts interview, the
-    // post-pre-script re-capture) starts with an empty memo and listing
-    // cache instead of carrying one over from before whatever just changed.
+    // post-pre-script re-capture) starts with an empty memo instead of
+    // carrying one over from before whatever just changed.
     const tool_probe = try arena.create(path_lookup.ToolProbe);
     tool_probe.* = path_lookup.ToolProbe.init(arena, io, environ);
+    tool_probe.seedListing(path_listing);
     const tools: []const []const u8 = tool_names_buf;
 
     // Built-in ENV_WATCH_LIST + user extras.

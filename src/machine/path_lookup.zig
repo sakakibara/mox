@@ -39,6 +39,17 @@ pub fn findOnPathFull(
     candidates: []const []const u8,
 ) ![]const Found {
     const listing = try buildListing(arena, io, environ);
+    return findOnPathFullFromListing(arena, listing, candidates);
+}
+
+/// Same as `findOnPathFull` but against a `Listing` the caller already built,
+/// so a caller that also needs the listing for something else (a `ToolProbe`
+/// to hand it to) does not trigger a second `$PATH` enumeration.
+pub fn findOnPathFullFromListing(
+    arena: std.mem.Allocator,
+    listing: Listing,
+    candidates: []const []const u8,
+) ![]const Found {
     var found: std.ArrayList(Found) = .empty;
     for (candidates) |name| {
         if (try listing.lookup(arena, name)) |path| {
@@ -134,6 +145,14 @@ pub const ToolProbe = struct {
         return .{ .arena = arena, .io = io, .environ = environ, .memo = std.StringHashMap(?[]const u8).init(arena) };
     }
 
+    /// Seed this probe with a `Listing` the caller already built (`capture`'s
+    /// eager tool-watch scan), so the first `path`/`present` call reuses it
+    /// instead of triggering its own `$PATH` enumeration -- one enumeration
+    /// per run, not two.
+    pub fn seedListing(self: *ToolProbe, listing: Listing) void {
+        self.listing = listing;
+    }
+
     /// Absolute path of `name` on `$PATH`, probing and memoizing on first ask.
     /// A memoization failure (out of memory) just means the next ask probes
     /// again; the answer returned this time is still correct.
@@ -148,15 +167,6 @@ pub const ToolProbe = struct {
     /// True when `name` resolves on `$PATH`.
     pub fn present(self: *ToolProbe, name: []const u8) bool {
         return self.path(name) != null;
-    }
-
-    /// Drop the memo and the listing cache: the next probe re-scans `$PATH`
-    /// from scratch. Used after a pre-script may have installed something
-    /// (or a facts interview answer may have changed `$PATH` indirectly),
-    /// so the very next gate that asks sees it in the same run.
-    pub fn reset(self: *ToolProbe) void {
-        self.memo.clearRetainingCapacity();
-        self.listing = null;
     }
 
     /// Adapt this prober to `dsl.resolver.Resolver.Probe`, so a `Resolver`
@@ -279,31 +289,6 @@ test "ToolProbe.present: an unwatched name is found on PATH and memoized" {
     // Memoized: asking again answers from the memo, not a re-scan.
     try std.testing.expect(probe.present("herdr"));
     try std.testing.expect(!probe.present("definitely-not-installed-xyz"));
-}
-
-test "ToolProbe.reset: a tool created after the first probe is invisible until reset" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "bin");
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const bin_dir = try tmpAbsPath(a, &tmp, "bin");
-
-    var map = std.process.Environ.Map.init(a);
-    try map.put("PATH", bin_dir);
-    var probe = ToolProbe.init(a, io, Env{ .map = &map });
-
-    try std.testing.expect(!probe.present("latecomer"));
-
-    // A "pre-script" drops the binary in after the listing cache was built.
-    try tmp.dir.writeFile(io, .{ .sub_path = "bin/latecomer", .data = "" });
-    try std.testing.expect(!probe.present("latecomer")); // still stale, memoized absent
-
-    probe.reset();
-    try std.testing.expect(probe.present("latecomer"));
 }
 
 test "ToolProbe: verbatim memo/listing keys, Windows folds case inside lookup, POSIX stays case-sensitive" {

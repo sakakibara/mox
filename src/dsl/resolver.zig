@@ -59,8 +59,10 @@ pub const Resolver = union(enum) {
     /// direct binding to probe for; `has` is the only path that ever
     /// probes). On the override arm this shadows only on a direct key hit --
     /// unlike `has`, which shadows on any touched key, direct or compound --
-    /// currently unreachable since every override producer writes direct
-    /// keys only.
+    /// currently unreachable since every producer that writes a compound key
+    /// always writes the matching direct key alongside it (`export --as`
+    /// binds both `axis` and `axis=value` for each tuple pair), so a direct-
+    /// only shadow never diverges from a touches-any-key one.
     pub fn lookup(self: Resolver, axis: []const u8) ?[]const u8 {
         return switch (self) {
             .live => |l| l.bindings.get(axis),
