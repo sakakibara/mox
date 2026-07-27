@@ -1306,6 +1306,125 @@ test "apply: nothing about this machine is written outside it" {
     try std.testing.expect(std.mem.indexOf(u8, live, "canary@example.invalid") != null);
 }
 
+test "facts probe: a present tool prints its path, exits 0" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const bin_dir = try std.fs.path.join(a, &.{ root, "bin" });
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/fd", .data = "" });
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "PATH", .value = bin_dir }},
+    });
+
+    const r = try h.run(&.{ "mox", "facts", "probe", "tool=fd" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.startsWith(u8, r.out, "present "));
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, r.out, "\n"), "fd"));
+}
+
+test "facts probe: an absent tool prints absent, exits 1" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const r = try h.run(&.{ "mox", "facts", "probe", "tool=definitely-not-installed-xyz" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings("absent\n", r.out);
+}
+
+test "facts probe: a present env var prints its value, exits 0" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "MOX_FACTS_PROBE_VAR", .value = "hello" }},
+    });
+    const r = try h.run(&.{ "mox", "facts", "probe", "env=MOX_FACTS_PROBE_VAR" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("present hello\n", r.out);
+}
+
+test "facts probe: an unset env var prints absent, exits 1" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const r = try h.run(&.{ "mox", "facts", "probe", "env=MOX_FACTS_PROBE_MISSING" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings("absent\n", r.out);
+}
+
+test "facts probe: a set-but-empty env var reads as unset, same as env= axis evaluation" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "MOX_FACTS_PROBE_EMPTY", .value = "" }},
+    });
+    const r = try h.run(&.{ "mox", "facts", "probe", "env=MOX_FACTS_PROBE_EMPTY" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings("absent\n", r.out);
+}
+
+test "facts probe: a malformed argument (no '=') is a usage error naming the syntax" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const r = try h.run(&.{ "mox", "facts", "probe", "fd" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "tool=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "env=") != null);
+}
+
+test "facts probe: an unknown axis is a usage error naming tool and env" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const r = try h.run(&.{ "mox", "facts", "probe", "path=brew_prefix" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "env") != null);
+}
+
 test "apply: an unset USER/USERNAME warns instead of silently interpolating \"unknown\"" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

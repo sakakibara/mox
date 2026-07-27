@@ -94,6 +94,51 @@ const set_cmd = app.command(SetSpec, .{
     .needs_context = true,
 }, setRun);
 
+const ProbeSpec = struct {
+    query: cli.Pos([]const u8, .{ .help = "tool=<name> or env=<name>" }),
+};
+
+const probe_usage = "mox facts probe: usage: mox facts probe tool=<name> | env=<name>\n";
+
+/// `mox facts probe <axis>=<name>`: probes live (the same `tool=`/`env=`
+/// resolution `apply`/`status` use, D6), the scriptable single-name
+/// diagnostic counterpart to status's probe-log section. Exits 0 when bound,
+/// 1 when not -- distinct from a usage error (2), so a caller can tell
+/// "asked and unbound" from "asked wrong".
+fn probeRun(ctx: *app.Ctx, a: cli.Args(ProbeSpec)) anyerror!u8 {
+    const context = ctx.context.?;
+    const eq = std.mem.indexOfScalar(u8, a.query, '=') orelse
+        return app.usageError(ctx, probe_usage, .{});
+    const axis = a.query[0..eq];
+    const name = a.query[eq + 1 ..];
+    if (name.len == 0) return app.usageError(ctx, probe_usage, .{});
+    const is_tool = std.mem.eql(u8, axis, "tool");
+    const is_env = std.mem.eql(u8, axis, "env");
+    if (!is_tool and !is_env) {
+        return app.usageError(ctx, "mox facts probe: unknown axis '{s}' (expected tool or env)\n", .{axis});
+    }
+
+    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    const found: ?[]const u8 = if (is_tool)
+        m_state.tool_probe.?.path(name)
+    else
+        m_state.env_probe.?.get(name);
+    if (found) |v| {
+        try ctx.out.print("present {s}\n", .{v});
+        return 0;
+    }
+    try ctx.out.writeAll("absent\n");
+    return 1;
+}
+
+const probe_cmd = app.command(ProbeSpec, .{
+    .name = "probe",
+    .summary = "Probe tool=/env= live; exit 0 when bound, 1 when not",
+    .usage = "mox facts probe tool=<name> | env=<name>",
+    .group = .general,
+    .needs_context = true,
+}, probeRun);
+
 pub const command = blk: {
     var c = app.command(BareSpec, .{
         .name = "facts",
@@ -101,6 +146,6 @@ pub const command = blk: {
         .group = .general,
         .needs_context = true,
     }, run);
-    c.subcommands = &.{set_cmd};
+    c.subcommands = &.{ set_cmd, probe_cmd };
     break :blk c;
 };
