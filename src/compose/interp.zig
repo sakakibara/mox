@@ -1179,7 +1179,15 @@ test "machine.tool_path: a name existing only in a data/paths.toml-registered di
     const home = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
     const cargo_home = try std.fs.path.join(a, &.{ home, "cargo" });
     const repo = try std.fs.path.join(a, &.{ home, "repo" });
-    const want = try std.fs.path.join(a, &.{ cargo_home, "bin", "only-in-cargo-home" });
+    // The registry's "dir" template writes its own trailing segment with a
+    // literal `/` (the portable spelling `data/paths.toml` recommends, since
+    // it never needs TOML-string escaping): expansion splices that verbatim
+    // after the native-separator `<machine.cargo_home>` value, so on Windows
+    // the resolved dir mixes separators. `std.fs.path.join` (path_lookup's
+    // final join with the tool's file name) does not rewrite an already-built
+    // component, so `want` must match that literal splice, not a fully
+    // re-joined path.
+    const want = try std.fmt.allocPrint(a, "{s}/bin" ++ std.fs.path.sep_str ++ "only-in-cargo-home", .{cargo_home});
 
     var map = std.process.Environ.Map.init(a);
     try map.put("HOME", home);
