@@ -1505,6 +1505,37 @@ test "checkTimeoutMs: a well-formed override is used verbatim, no warning" {
     try std.testing.expectEqualStrings("", err_aw.written());
 }
 
+test "fact_env: buildScriptEnv's skip set matches source.fact_env.project across a mixed name corpus" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const names = [_][]const u8{
+        "profile",
+        "gdrive.account",
+        "cloud-backend",
+        "cloud_backend", // sanitizes identically to "cloud-backend" -- a deliberate collision
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", // non-ASCII
+    };
+    var facts: [names.len]mox.apply.run_scripts.Fact = undefined;
+    for (names, 0..) |n, i| facts[i] = .{ .name = n, .value = "v" };
+
+    var parent = std.process.Environ.Map.init(a);
+    const built = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .map = &parent }, "/repo", "/state", "/home", &facts);
+    const projected = try mox.source.fact_env.project(a, &names);
+
+    for (names) |n| {
+        var was_skipped = false;
+        for (built.skipped) |s| {
+            if (std.mem.eql(u8, s, n)) was_skipped = true;
+        }
+        try std.testing.expectEqual(projected.get(n) == null, was_skipped);
+        if (projected.get(n)) |tok| {
+            try std.testing.expectEqualStrings("v", built.map.get(tok).?);
+        }
+    }
+}
+
 test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -10,6 +10,7 @@ pub const head = @import("head.zig");
 pub const keypath = @import("keypath.zig");
 pub const format = @import("format.zig");
 pub const ignore = @import("ignore/root.zig");
+pub const fact_env = @import("fact_env.zig");
 
 test {
     _ = tree;
@@ -18,6 +19,7 @@ test {
     _ = junk;
     _ = axes;
     _ = attributes;
+    _ = fact_env;
     _ = head;
     _ = ignore;
 }

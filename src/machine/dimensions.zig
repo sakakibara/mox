@@ -85,12 +85,25 @@ pub const ScriptRecord = struct {
     needs: ?[]const []const u8,
 };
 
+/// A per-file scan anomaly worth surfacing even though it doesn't fail the
+/// whole discovery run.
+pub const Diagnostic = struct {
+    /// Repo-relative path of the file the capture was seen in.
+    path: []const u8,
+    /// The `<machine.NAME>` field text that failed the fact-name charset
+    /// (`[a-z][a-z0-9_]*`): recorded nowhere as a dimension, but reported
+    /// here loudly rather than silently dropped.
+    name: []const u8,
+};
+
 pub const Discovery = struct {
     /// Every discovered dimension, sorted by name.
     dimensions: []const Dimension,
     /// Every scanned script, in scan order (scripts/pre then scripts/post,
     /// each subtree in sorted directory order).
     scripts: []const ScriptRecord,
+    /// Capture-charset anomalies, in scan order.
+    diagnostics: []const Diagnostic = &.{},
 };
 
 /// A `# mox: needs <name>...` name fails the fact-name charset
@@ -109,6 +122,7 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
         .dims = std.StringHashMap(DimWork).init(arena),
         .derived_names = std.StringHashMap(void).init(arena),
         .scripts = .empty,
+        .diagnostics = .empty,
     };
 
     for (try derived_facts.declaredNames(arena, io, repo_dir, "")) |n| {
@@ -147,6 +161,7 @@ const Discoverer = struct {
     dims: std.StringHashMap(DimWork),
     derived_names: std.StringHashMap(void),
     scripts: std.ArrayList(ScriptRecord),
+    diagnostics: std.ArrayList(Diagnostic),
 
     /// The dimension work-slot for `name`, creating it on first reference, or
     /// null when `name` is excluded by category (built-in, open axis,
@@ -320,6 +335,14 @@ const Discoverer = struct {
             // dimension name `dimFor` would even parse sensibly.
             if (std.mem.startsWith(u8, field, "tool_path.")) continue;
 
+            if (!source.tuple.isValidAxisName(field)) {
+                try self.diagnostics.append(self.arena, .{
+                    .path = source_key,
+                    .name = try self.arena.dupe(u8, field),
+                });
+                continue;
+            }
+
             const dw = (try self.dimFor(field)) orelse continue;
             dw.roles.captured = true;
             try dw.sources.put(source_key, {});
@@ -428,6 +451,15 @@ const Discoverer = struct {
 
     fn finalize(self: *Discoverer) !Discovery {
         var dims_out: std.ArrayList(Dimension) = .empty;
+
+        // Computed once over every discovered dimension name (not per-name):
+        // collision detection is corpus-wide, mirroring `buildScriptEnv`'s own
+        // two-pass tally over its whole fact list.
+        var all_names: std.ArrayList([]const u8) = .empty;
+        var name_it = self.dims.keyIterator();
+        while (name_it.next()) |k| try all_names.append(self.arena, k.*);
+        const projected = try source.fact_env.project(self.arena, try all_names.toOwnedSlice(self.arena));
+
         var it = self.dims.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
@@ -440,7 +472,7 @@ const Discoverer = struct {
                 .asking_condition = try computeAskingCondition(self.arena, dw),
                 .provenance = .{
                     .source_count = dw.sources.count(),
-                    .needing_scripts = try self.needingScripts(name),
+                    .needing_scripts = try self.needingScripts(name, projected),
                 },
             });
         }
@@ -451,16 +483,24 @@ const Discoverer = struct {
             }
         }.lessThan);
 
-        return .{ .dimensions = dims_slice, .scripts = try self.scripts.toOwnedSlice(self.arena) };
+        return .{
+            .dimensions = dims_slice,
+            .scripts = try self.scripts.toOwnedSlice(self.arena),
+            .diagnostics = try self.diagnostics.toOwnedSlice(self.arena),
+        };
     }
 
     /// Every script that effectively consumes `dim_name`: via `# mox: needs`
-    /// when the script declares one (direct name match), else via a
-    /// `MOX_FACT_<NAME>` token found in its text (matched against the same
-    /// sanitize rule `apply.run_scripts.buildScriptEnv` projects facts
-    /// through). Sorted, deduped by construction (one entry per script).
-    fn needingScripts(self: *Discoverer, dim_name: []const u8) ![]const []const u8 {
-        const token = try factEnvName(self.arena, dim_name);
+    /// when the script declares one (direct name match, unaffected by
+    /// `projected`), else via a `MOX_FACT_<NAME>` token found in its text --
+    /// but only when `dim_name` itself projects onto a distinct token in
+    /// `projected`. A name `buildScriptEnv` would skip (non-ASCII, or
+    /// colliding with another dimension's projection) never actually reaches a
+    /// script's environment, so a scanned-token match on it would link a
+    /// script to a fact that is never really there. Sorted, deduped by
+    /// construction (one entry per script).
+    fn needingScripts(self: *Discoverer, dim_name: []const u8, projected: std.StringHashMap([]const u8)) ![]const []const u8 {
+        const token = projected.get(dim_name);
         var out: std.ArrayList([]const u8) = .empty;
         for (self.scripts.items) |s| {
             const consumes = if (s.needs) |names| blk: {
@@ -469,8 +509,9 @@ const Discoverer = struct {
                 }
                 break :blk false;
             } else blk: {
+                const tok = token orelse break :blk false;
                 for (s.scanned_tokens) |t| {
-                    if (std.mem.eql(u8, t, token)) break :blk true;
+                    if (std.mem.eql(u8, t, tok)) break :blk true;
                 }
                 break :blk false;
             };
@@ -676,20 +717,6 @@ fn scanMoxFactTokens(arena: std.mem.Allocator, content: []const u8) ![]const []c
         }
     }
     return sortedKeys(arena, &set);
-}
-
-/// Project a dimension name onto its `MOX_FACT_<NAME>` environment token,
-/// mirroring `apply.run_scripts.buildScriptEnv`'s sanitize rule (alnum
-/// uppercased, anything else -> `_`) so a scanned token can be matched back
-/// to the dimension that would produce it.
-fn factEnvName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
-    const prefix = "MOX_FACT_";
-    const out = try arena.alloc(u8, prefix.len + name.len);
-    @memcpy(out[0..prefix.len], prefix);
-    for (name, 0..) |c, i| {
-        out[prefix.len + i] = if (std.ascii.isAlphanumeric(c)) std.ascii.toUpper(c) else '_';
-    }
-    return out;
 }
 
 fn sortedKeys(arena: std.mem.Allocator, set: *const std.StringHashMap(void)) ![]const []const u8 {
@@ -1317,6 +1344,88 @@ test "discover: a directory whose name is not an axis tuple is never descended i
     const repo = try tmpAbsPath(a, &tmp, "");
     const d = try discover(a, io, repo);
     try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
+}
+
+test "discover: two dimension names that sanitize to the same MOX_FACT_ token are not linked via a scanned token" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "Foo-Bar" and "foo_bar" both sanitize to MOX_FACT_FOO_BAR: buildScriptEnv
+    // would skip BOTH (a collision, not a pick), so a scanned-token match must
+    // not link either to the script.
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: when Foo-Bar=x\na = 1\n# mox: end\n" ++
+            "# mox: when foo_bar=y\nb = 1\n# mox: end\n",
+    );
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/00-both.sh",
+        "#!/bin/sh\necho \"$MOX_FACT_FOO_BAR\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const foo_bar = findDim(d, "Foo-Bar").?;
+    try std.testing.expectEqual(@as(usize, 0), foo_bar.provenance.needing_scripts.len);
+    const foo_bar2 = findDim(d, "foo_bar").?;
+    try std.testing.expectEqual(@as(usize, 0), foo_bar2.provenance.needing_scripts.len);
+}
+
+test "discover: an explicit `# mox: needs` link is unaffected by a token collision elsewhere" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: when Foo-Bar=x\na = 1\n# mox: end\n" ++
+            "# mox: when foo_bar=y\nb = 1\n# mox: end\n",
+    );
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/00-explicit.sh",
+        "#!/bin/sh\n# mox: needs foo_bar\necho hi\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const foo_bar2 = findDim(d, "foo_bar").?;
+    try std.testing.expectEqual(@as(usize, 1), foo_bar2.provenance.needing_scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/00-explicit.sh", foo_bar2.provenance.needing_scripts[0]);
+}
+
+test "discover: a capture field outside the fact-name charset is not a dimension and is reported loudly" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "x = <machine.Bad-Name>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "Bad-Name") == null);
+    try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
+    try std.testing.expectEqualStrings("src/.zshrc", d.diagnostics[0].path);
+    try std.testing.expectEqualStrings("Bad-Name", d.diagnostics[0].name);
 }
 
 test "discover: an empty repo (no src, no scripts) yields no dimensions and no scripts" {

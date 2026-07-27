@@ -44,6 +44,7 @@ const tuple_mod = @import("../source/tuple.zig");
 const match_mod = @import("../compose/match.zig");
 const dsl = @import("../dsl/root.zig");
 const dirent = @import("../source/dirent.zig");
+const fact_env = @import("../source/fact_env.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
@@ -100,54 +101,19 @@ pub fn buildScriptEnv(
     try map.put("MOX_STATE_DIR", state_dir);
     try map.put("MOX_HOME", home);
 
-    // First pass: tally how many facts each sanitized name would collect. A
-    // non-ASCII name never reaches the tally (it is unencodable on its own,
-    // regardless of what else is present); an ASCII name's tally exceeding 1
-    // means a genuine collision with some OTHER fact's sanitized form.
-    var counts = std.StringHashMap(usize).init(arena);
-    const encoded = try arena.alloc(?[]const u8, facts.len);
-    for (facts, 0..) |f, i| {
-        if (!isAsciiName(f.name)) {
-            encoded[i] = null;
-            continue;
-        }
-        const enc = try factEnvName(arena, f.name);
-        encoded[i] = enc;
-        const gop = try counts.getOrPut(enc);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-    }
+    const names = try arena.alloc([]const u8, facts.len);
+    for (facts, 0..) |f, i| names[i] = f.name;
+    const projected = try fact_env.project(arena, names);
 
     var skipped: std.ArrayList([]const u8) = .empty;
-    for (facts, 0..) |f, i| {
-        const enc = encoded[i] orelse {
+    for (facts) |f| {
+        const enc = projected.get(f.name) orelse {
             try skipped.append(arena, f.name);
             continue;
         };
-        if (counts.get(enc).? > 1) {
-            try skipped.append(arena, f.name);
-            continue;
-        }
         try map.put(enc, f.value);
     }
     return .{ .map = map, .skipped = try skipped.toOwnedSlice(arena) };
-}
-
-fn isAsciiName(name: []const u8) bool {
-    for (name) |c| {
-        if (c >= 0x80) return false;
-    }
-    return true;
-}
-
-fn factEnvName(arena: std.mem.Allocator, name: []const u8) ![]u8 {
-    const prefix = "MOX_FACT_";
-    const out = try arena.alloc(u8, prefix.len + name.len);
-    @memcpy(out[0..prefix.len], prefix);
-    for (name, 0..) |c, i| {
-        out[prefix.len + i] = if (std.ascii.isAlphanumeric(c)) std.ascii.toUpper(c) else '_';
-    }
-    return out;
 }
 
 /// Run every top-level regular file in `scripts_dir` lexicographically, then
@@ -653,12 +619,6 @@ test "buildScriptEnv: injects mox vars and uppercased facts" {
     // Parent environment is preserved.
     try testing.expectEqualStrings("kept", result.map.get("MOX_TEST_PARENT").?);
     try testing.expectEqual(@as(usize, 0), result.skipped.len);
-}
-
-test "factEnvName: non-identifier characters become underscores" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectEqualStrings("MOX_FACT_GDRIVE_ACCOUNT", try factEnvName(arena.allocator(), "gdrive.account"));
 }
 
 test "buildScriptEnv: a non-ASCII fact name is skipped, not garbled into underscores" {
