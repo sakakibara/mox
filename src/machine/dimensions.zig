@@ -10,9 +10,17 @@
 //!     observed literal value set (a `name = <var>.field` row predicate is
 //!     value-compared with an EMPTY observed set; `bound <var>.field` names no
 //!     axis and contributes nothing).
-//!   - captured: `<machine.NAME>` occurrences in a managed file's base content,
-//!     each with its `| default` and the innermost enclosing `# mox: when`
-//!     region(s) (recursively) combined with the whole-file gate, if any.
+//!   - captured: `<machine.NAME>` occurrences anywhere compose would actually
+//!     emit them -- a managed file's base content (recursing into every
+//!     nested `# mox: when`/`for` region), a directive's literal body, and
+//!     the fragment file an `include`/`append`/`prepend`/`replace`/`from`
+//!     target or a Cat B region names -- each with its `| default` and its
+//!     asking condition: the conjunction of enclosing conditions that are
+//!     both cleanly axis-expressible and required for emission (a
+//!     negated-gate body contributes `not <gate>`; a from-fallback body, a
+//!     for-loop's per-row emission, and a tuple-matched fragment pick are not
+//!     cleanly expressible and contribute nothing -- over-asking is safe,
+//!     under-asking is not).
 //!   - presence-only: a bare `when NAME` gate.
 //!
 //! Built-ins, the open probe axes, reserved axis names, and `data/facts.toml`-
@@ -274,27 +282,60 @@ const Discoverer = struct {
         }
     }
 
-    // -- capture scanning -----------------------------------------------
+    // -- capture + nested-directive traversal --------------------------------
 
-    /// Scan `content` (and, recursively, every nested `# mox: when` region's
-    /// body) for `<machine.NAME>` occurrences. `gate_stack` holds every
-    /// enclosing gate's condition on the path from the file root to this
-    /// scope, innermost last; a capture's condition is their conjunction.
-    ///
-    /// Only `when_gate` bodies are recursed into: a capture inside a
-    /// `replace`/`append`/`prepend`/`for` region is not scanned in this fold
-    /// (no fixture requires it, and their body's emission semantics are not
-    /// simply "always present under this gate").
-    fn scanCaptureScope(
-        self: *Discoverer,
-        content: []const u8,
+    /// Recursion state threaded through a file's directive tree. `gate_stack`
+    /// holds every enclosing condition that is both cleanly axis-expressible
+    /// and required for emission, innermost last -- a capture's condition is
+    /// their conjunction (the paper's conservative-ask law: anything not
+    /// cleanly expressible, e.g. which fragment a tuple match picks or a
+    /// for-loop's per-row emission, contributes NOTHING rather than narrowing
+    /// the condition, so under-asking never happens at the cost of an
+    /// occasional unneeded ask). `loop_vars` holds every enclosing for-loop's
+    /// variable name (innermost last); `in_for` mirrors `dsl.driver`'s
+    /// in-loop parser selection -- true once inside a `for` body, where a
+    /// standalone `when` uses the row-expr grammar instead of the axis one.
+    const Nest = struct {
+        file: source.tree.ManagedFile,
         marker: []const u8,
         gate_stack: []const *const AxisExpr,
-        source_key: []const u8,
-    ) !void {
-        const parsed = dsl.driver.parseFile(self.arena, content, marker, null) catch return;
-        const condition = try combineAnd(self.arena, gate_stack);
+        loop_vars: []const []const u8,
+        in_for: bool,
+        depth: u32,
+    };
 
+    /// Cap on `scanBody`/`recurseDirective` mutual recursion, mirroring
+    /// `compose.catB`'s own nesting cap: real dotfile nesting is shallow, this
+    /// only bounds a pathological or hostile structure so discovery
+    /// terminates instead of overflowing the stack.
+    const max_nest_depth: u32 = 128;
+
+    /// Explicit error set for the mutually-recursive `scanBody` <->
+    /// `recurseDirective` pair: an inferred set cannot resolve across the
+    /// recursion cycle. Every read/parse failure on the path between them is
+    /// already caught locally (a malformed nested body or missing fragment is
+    /// skipped, not propagated), so `OutOfMemory` is the only error either
+    /// can actually return.
+    const ScanError = std.mem.Allocator.Error;
+
+    /// Parse `content` as one directive-tree scope (a whole file, or a nested
+    /// region body) and scan its own content lines for `<machine.NAME>`
+    /// captures at `nest.gate_stack`'s condition. Each directive is then
+    /// dispatched to `recurseDirective`, which visits whichever nested bodies
+    /// and fragment files compose would actually emit, with the condition
+    /// each position warrants.
+    fn scanBody(self: *Discoverer, content: []const u8, source_key: []const u8, nest: Nest) ScanError!void {
+        if (nest.depth > max_nest_depth) return;
+        const parsed = if (nest.in_for)
+            dsl.driver.parseFileInLoop(self.arena, content, nest.marker, null) catch return
+        else
+            dsl.driver.parseFile(self.arena, content, nest.marker, null) catch return;
+
+        if (nest.depth == 0) {
+            for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key);
+        }
+
+        const condition = try combineAnd(self.arena, nest.gate_stack);
         var line_no: u32 = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
@@ -303,18 +344,120 @@ const Discoverer = struct {
             try self.scanCapturesInLine(line, condition, source_key);
         }
 
-        for (parsed.directives) |d| {
-            if (d.kind != .when_gate) continue;
-            const w = d.kind.when_gate;
-            // `row_when` (in-loop grammar) never appears here: this scan
-            // never recurses with the loop parser, so every when_gate reached
-            // here was parsed outside a loop and carries `when`.
-            const expr = w.when orelse continue;
-            var new_stack = try self.arena.alloc(*const AxisExpr, gate_stack.len + 1);
-            @memcpy(new_stack[0..gate_stack.len], gate_stack);
-            new_stack[gate_stack.len] = expr;
-            try self.scanCaptureScope(w.body, marker, new_stack, source_key);
+        for (parsed.directives) |d| try self.recurseDirective(d, source_key, nest);
+    }
+
+    /// Visit whichever nested bodies and fragment files a directive's REAL
+    /// compose-time emission reaches, at each position's asking condition: a
+    /// body/fragment emitted unconditionally (or gated only by conditions
+    /// already on `nest.gate_stack`) is scanned at `nest.gate_stack`
+    /// unchanged; one gated on this directive's own `when` gets that gate
+    /// pushed (positive for a fragment emitted when true, `not <gate>` for a
+    /// literal body that is the false-branch fallback); one selected by TUPLE
+    /// matching (a `from`/`replace ... from` pick) contributes nothing of its
+    /// own -- its content is already covered unconditionally by the Cat B
+    /// region scan in `scanManagedFile`, since which fragment compose picks
+    /// is a tuple match, not a single axis equality.
+    fn recurseDirective(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8, nest: Nest) ScanError!void {
+        switch (d.kind) {
+            .include => |inc| {
+                const stack = try appendIf(self.arena, nest.gate_stack, inc.when);
+                try self.scanFragmentTarget(nest.file, inc.path, stack, source_key);
+            },
+            .replace => |rep| {
+                if (rep.from != null) {
+                    try self.scanFlatText(rep.body, nest.gate_stack, source_key);
+                } else if (rep.when) |w| {
+                    const true_stack = try appendStack(self.arena, nest.gate_stack, w);
+                    try self.scanFragmentTarget(nest.file, rep.path.?, true_stack, source_key);
+                    const false_stack = try appendNot(self.arena, nest.gate_stack, w);
+                    try self.scanFlatText(rep.body, false_stack, source_key);
+                } else {
+                    try self.scanFlatText(rep.body, nest.gate_stack, source_key);
+                }
+            },
+            .append => |a| {
+                try self.scanFlatText(a.body, nest.gate_stack, source_key);
+                const stack = try appendIf(self.arena, nest.gate_stack, a.when);
+                try self.scanFragmentTarget(nest.file, a.path, stack, source_key);
+            },
+            .prepend => |p| {
+                const stack = try appendIf(self.arena, nest.gate_stack, p.when);
+                try self.scanFragmentTarget(nest.file, p.path, stack, source_key);
+                try self.scanFlatText(p.body, nest.gate_stack, source_key);
+            },
+            .remove => |r| {
+                const false_stack = try appendNot(self.arena, nest.gate_stack, r.when);
+                try self.scanFlatText(r.body, false_stack, source_key);
+            },
+            .from => |f| {
+                try self.scanFlatText(f.body, nest.gate_stack, source_key);
+            },
+            .when_gate => |w| {
+                if (nest.in_for) {
+                    const inner: Nest = .{
+                        .file = nest.file,
+                        .marker = nest.marker,
+                        .gate_stack = nest.gate_stack,
+                        .loop_vars = nest.loop_vars,
+                        .in_for = true,
+                        .depth = nest.depth + 1,
+                    };
+                    try self.scanBody(w.body, source_key, inner);
+                } else {
+                    const stack = try appendStack(self.arena, nest.gate_stack, w.when.?);
+                    const inner: Nest = .{
+                        .file = nest.file,
+                        .marker = nest.marker,
+                        .gate_stack = stack,
+                        .loop_vars = nest.loop_vars,
+                        .in_for = false,
+                        .depth = nest.depth + 1,
+                    };
+                    try self.scanBody(w.body, source_key, inner);
+                }
+            },
+            .for_loop => |loop| {
+                const loop_vars = try appendStr(self.arena, nest.loop_vars, loop.variable);
+                const inner: Nest = .{
+                    .file = nest.file,
+                    .marker = nest.marker,
+                    .gate_stack = nest.gate_stack,
+                    .loop_vars = loop_vars,
+                    .in_for = true,
+                    .depth = nest.depth + 1,
+                };
+                try self.scanBody(loop.body_template, source_key, inner);
+            },
+            .completions, .secret => {},
         }
+    }
+
+    /// Scan flat text -- a directive's own literal body, or a fragment file's
+    /// content, neither of which compose ever re-parses for directives -- for
+    /// `<machine.NAME>` captures at `stack`'s condition.
+    fn scanFlatText(self: *Discoverer, text: []const u8, stack: []const *const AxisExpr, source_key: []const u8) !void {
+        const condition = try combineAnd(self.arena, stack);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| try self.scanCapturesInLine(line, condition, source_key);
+    }
+
+    /// Read and scan an `include`/`append`/`prepend`/`replace`'s fragment
+    /// target, resolved the same way `compose.catB.emitFragmentByPath` does
+    /// (relative to the base file's own `<base>.d/`). A missing fragment is
+    /// apply's problem to report, not discovery's: skipped silently here, as
+    /// every other unreadable file in this scan already is.
+    fn scanFragmentTarget(
+        self: *Discoverer,
+        file: source.tree.ManagedFile,
+        rel_path: []const u8,
+        stack: []const *const AxisExpr,
+        source_key: []const u8,
+    ) !void {
+        const overlay_dir = try std.fmt.allocPrint(self.arena, "{s}.d", .{file.source_base_abs});
+        const abs = source.path.joinKeyOnto(self.arena, overlay_dir, rel_path) catch return;
+        const content = Io.Dir.cwd().readFileAlloc(self.io, abs, self.arena, .limited(max_file_bytes)) catch return;
+        try self.scanFlatText(content, stack, source_key);
     }
 
     fn scanCapturesInLine(self: *Discoverer, line: []const u8, condition: ?*const AxisExpr, source_key: []const u8) !void {
@@ -365,7 +508,15 @@ const Discoverer = struct {
                 dw.roles.value_compared = true;
                 try dw.sources.put(source_key, {});
             }
-            for (rg.fragments) |fr| try self.recordTuple(fr.tuple, source_key);
+            for (rg.fragments) |fr| {
+                try self.recordTuple(fr.tuple, source_key);
+                // A fragment's own captures are scanned unconditionally: which
+                // fragment compose picks is a tuple match, not a single axis
+                // equality, so the conservative-ask law has it contribute no
+                // condition of its own.
+                const frag_content = Io.Dir.cwd().readFileAlloc(self.io, fr.path, self.arena, .limited(max_file_bytes)) catch continue;
+                try self.scanFlatText(frag_content, &.{}, source_key);
+            }
         }
 
         if (!file.has_base or file.source_base_abs.len == 0) return;
@@ -379,10 +530,14 @@ const Discoverer = struct {
         };
         const content = if (head_parsed.spans.len == 0) raw else try source.head.stripSpans(self.arena, raw, head_parsed.spans);
 
-        const parsed = dsl.driver.parseFile(self.arena, content, marker, null) catch return;
-        for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key);
-
-        try self.scanCaptureScope(content, marker, &.{}, source_key);
+        try self.scanBody(content, source_key, .{
+            .file = file,
+            .marker = marker,
+            .gate_stack = &.{},
+            .loop_vars = &.{},
+            .in_for = false,
+            .depth = 0,
+        });
     }
 
     // -- scripts tree -------------------------------------------------------
@@ -562,6 +717,36 @@ fn combineOr(arena: std.mem.Allocator, a: ?*const AxisExpr, b: *const AxisExpr) 
     const node = try arena.create(AxisExpr);
     node.* = .{ .or_ = .{ .left = left, .right = b } };
     return node;
+}
+
+/// `stack` with `expr` appended (a fresh copy; `stack` itself is untouched).
+fn appendStack(arena: std.mem.Allocator, stack: []const *const AxisExpr, expr: *const AxisExpr) ![]const *const AxisExpr {
+    const out = try arena.alloc(*const AxisExpr, stack.len + 1);
+    @memcpy(out[0..stack.len], stack);
+    out[stack.len] = expr;
+    return out;
+}
+
+/// `stack` unchanged when `maybe_expr` is null (an ungated directive
+/// position), else `stack` with it appended.
+fn appendIf(arena: std.mem.Allocator, stack: []const *const AxisExpr, maybe_expr: ?*const AxisExpr) ![]const *const AxisExpr {
+    const expr = maybe_expr orelse return stack;
+    return appendStack(arena, stack, expr);
+}
+
+/// `stack` with `not expr` appended, for a directive's false-branch body.
+fn appendNot(arena: std.mem.Allocator, stack: []const *const AxisExpr, expr: *const AxisExpr) ![]const *const AxisExpr {
+    const node = try arena.create(AxisExpr);
+    node.* = .{ .not = expr };
+    return appendStack(arena, stack, node);
+}
+
+/// `list` with `item` appended (a fresh copy; `list` itself is untouched).
+fn appendStr(arena: std.mem.Allocator, list: []const []const u8, item: []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, list.len + 1);
+    @memcpy(out[0..list.len], list);
+    out[list.len] = item;
+    return out;
 }
 
 /// Null when the dimension has any value-compared or presence occurrence
@@ -1426,6 +1611,360 @@ test "discover: a capture field outside the fact-name charset is not a dimension
     try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
     try std.testing.expectEqualStrings("src/.zshrc", d.diagnostics[0].path);
     try std.testing.expectEqualStrings("Bad-Name", d.diagnostics[0].name);
+}
+
+// -- capture positions beyond a `when_gate` body (Finding 1) ----------------
+
+test "discover: an append body's capture is unconditioned (always emitted)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: append \"frag.sh\" when profile=work\n" ++
+            "x = <machine.append_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "append_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a prepend body's capture is unconditioned (always emitted)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: prepend \"frag.sh\" when profile=work\n" ++
+            "x = <machine.prepend_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "prepend_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a gate-false replace literal body's capture is conditioned on `not <gate>`" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: replace \"frag.sh\" when profile=work\n" ++
+            "x = <machine.replace_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "replace_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("profile", "personal");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+    try bindings.put("profile", "work");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: a remove body's capture is conditioned on `not <gate>`" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: remove when profile=work\n" ++
+            "x = <machine.remove_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "remove_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("profile", "personal");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+    try bindings.put("profile", "work");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: a `replace from` fallback body's capture is unconditioned (no fragment matched is not axis-expressible)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: replace from \"variant\"\n" ++
+            "x = <machine.fromfallback_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "fromfallback_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a top-level `from` fallback body's capture is unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: from \"variant\"\n" ++
+            "x = <machine.plainfrom_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "plainfrom_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a for-loop body's capture is unconditioned (per-row emission is not axis-expressible)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\"\n" ++
+            "# x <machine.for_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "for_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a Cat B region fragment's own capture is unconditioned (tuple matching contributes nothing)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/kind.lua", "local M = {}\nreturn M\n");
+    try writeFile(io, tmp.dir, "src/kind.lua.d/profile/work.lua", "M.kind = \"<machine.region_frag_dim>\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "region_frag_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: an include-target fragment's capture gets the include's own gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: include \"frag.sh\" when profile=work\n");
+    try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.include_dim>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "include_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("profile", "personal");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+    try bindings.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: an ungated include-target fragment's capture is unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: include \"frag.sh\"\n");
+    try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.include_ungated_dim>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "include_ungated_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: an append fragment target's capture gets the append's own gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: append \"frag.sh\" when profile=work\n" ++
+            "literal\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.append_frag_dim>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "append_frag_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+    try std.testing.expect(cond.* == .eq);
+    try std.testing.expectEqualStrings("profile", cond.eq.axis);
+    try std.testing.expectEqualStrings("work", cond.eq.value);
+}
+
+test "discover: a prepend fragment target's capture gets the prepend's own gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: prepend \"frag.sh\" when profile=work\n" ++
+            "literal\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.prepend_frag_dim>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "prepend_frag_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+    try std.testing.expect(cond.* == .eq);
+    try std.testing.expectEqualStrings("profile", cond.eq.axis);
+    try std.testing.expectEqualStrings("work", cond.eq.value);
+}
+
+test "discover: a gate-true replace fragment target's capture gets the replace's own gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: replace \"frag.sh\" when profile=work\n" ++
+            "literal\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.replace_frag_dim>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "replace_frag_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+    try std.testing.expect(cond.* == .eq);
+    try std.testing.expectEqualStrings("profile", cond.eq.axis);
+    try std.testing.expectEqualStrings("work", cond.eq.value);
+}
+
+// -- recursion is bounded (defensive; no fixture requires this depth) -------
+
+test "discover: pathologically deep nested when-gates do not hang or overflow the stack" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var content: std.ArrayList(u8) = .empty;
+    const depth = 500;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try content.appendSlice(a, "# mox: when deep_axis=val\n");
+    try content.appendSlice(a, "x = 1\n");
+    i = 0;
+    while (i < depth) : (i += 1) try content.appendSlice(a, "# mox: end\n");
+
+    try writeFile(io, tmp.dir, "src/.zshrc", content.items);
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    // Must return (not hang, not crash) regardless of the exact result.
+    _ = try discover(a, io, repo);
 }
 
 test "discover: an empty repo (no src, no scripts) yields no dimensions and no scripts" {
