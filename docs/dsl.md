@@ -181,7 +181,13 @@ accepted set.
 A capture `<...>` substitutes one value inside a region body or loop template.
 It is a plain lookup - no arithmetic, no transforms, no regex:
 
-- `<entry.field>` - a loop row field.
+- `<entry.field>` - a loop row field. When the field's string itself carries
+  captures (a data row authored as `dir = "<machine.brew_prefix>/bin"`), they
+  expand through this same mechanism -- but only one level deep: the result
+  of that nested expansion is spliced verbatim and never scanned again, so a
+  row value cannot chain into a second round of expansion. An unknown capture
+  inside a row value is a compose error with the same diagnostics as an
+  inline one; `| default` chains inside a row value resolve the same way too.
 - `<machine.field>` - a machine fact (`os`, `arch`, `home`, `brew_prefix`,
   `xdg_config_home`, `tool_path.<name>`, custom facts, ...).
 - `<env.NAME>` - a captured environment variable value.

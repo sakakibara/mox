@@ -294,6 +294,13 @@ pub fn lint(arena: std.mem.Allocator, template: []const u8) LintError!void {
 ///     strip, where most `<...>` are not captures (heredocs, shell redirs, etc.).
 ///   - `<machine.X>` / `<env.X>` resolve against `ctx.machine` when non-null;
 ///     an error otherwise.
+///   - `<entry.X>` splices a row field's formatted string, then expands any
+///     captures that string itself contains through this same machinery --
+///     exactly one level. A data row written as `dir = "<machine.brew_prefix
+///     >/bin"` composes to the real prefix, but the nested expansion's own
+///     result is spliced verbatim and never re-scanned, so a value chain
+///     (row data authored to reference another row's captures) cannot
+///     recurse.
 ///   - `<data.FILE.KEY>` / `<data.FILE.TABLE.KEY>` read a committed scalar from
 ///     `data/FILE.toml` (private layer shadows repo), using `ctx.io` +
 ///     `ctx.repo_dir` + `ctx.private_dir`. A missing file/key is an error
@@ -324,6 +331,22 @@ pub fn expandTracked(
     template: []const u8,
     record_opt: ?*const std.StringHashMap(data.value.Value),
     ctx: Ctx,
+) InterpError!Expansion {
+    return expandTrackedImpl(arena, template, record_opt, ctx, true);
+}
+
+/// `expandTracked`'s body. `expand_entry_values` gates whether a spliced
+/// `<entry.X>` row-field string is itself expanded for nested captures: the
+/// top-level call passes `true`, and the ONE nested call it may make passes
+/// `false`, so a row value can never trigger a second round of nested
+/// expansion -- the recursion depth is capped at one by construction, not by
+/// a counter.
+fn expandTrackedImpl(
+    arena: std.mem.Allocator,
+    template: []const u8,
+    record_opt: ?*const std.StringHashMap(data.value.Value),
+    ctx: Ctx,
+    expand_entry_values: bool,
 ) InterpError!Expansion {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
@@ -417,7 +440,18 @@ pub fn expandTracked(
                 const field = inner[6..];
                 if (r.get(field)) |v| {
                     const formatted = try v.format(arena);
-                    try out.appendSlice(arena, formatted);
+                    if (expand_entry_values) {
+                        // The row's own string may carry captures written
+                        // straight into TOML data (e.g. a data.toml value of
+                        // `<machine.brew_prefix>/bin`). Expand it through the
+                        // same machinery, one level only -- see
+                        // `expandTrackedImpl`'s doc comment for the bound.
+                        const nested = try expandTrackedImpl(arena, formatted, record_opt, ctx, false);
+                        try out.appendSlice(arena, nested.bytes);
+                        if (nested.secret) secret_seen = true;
+                    } else {
+                        try out.appendSlice(arena, formatted);
+                    }
                 } else if (default_opt) |d| {
                     try out.appendSlice(arena, d);
                 } else {
@@ -934,6 +968,60 @@ test "expand: <env.NAME> resolves any name through the live env probe" {
 
     const out = try expand(a, "<env.MOX_UNWATCHED_SET_VAR>", null, .{ .machine = &m });
     try std.testing.expectEqualStrings("hello", out);
+}
+
+test "expand: an entry value's own machine capture expands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    // A data-row string written as `<machine.brew_prefix>/bin` (the shape a
+    // `data/paths.toml` row takes) must render the real prefix, not the
+    // literal capture text.
+    try record.put("dir", .{ .string = "<machine.brew_prefix>/bin" });
+    const m = chainTestState();
+    const out = try expand(a, "<entry.dir>", &record, .{ .machine = &m });
+    try std.testing.expectEqualStrings("/opt/homebrew/bin", out);
+}
+
+test "expand: a default chain inside an entry value resolves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    try record.put("dir", .{ .string = "<env.NOPE | machine.brew_prefix>" });
+    const m = chainTestState();
+    const out = try expand(a, "<entry.dir>", &record, .{ .machine = &m });
+    try std.testing.expectEqualStrings("/opt/homebrew", out);
+}
+
+test "expand: an unknown capture inside an entry value errors like an inline one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    try record.put("dir", .{ .string = "<machine.nope>" });
+    const m = chainTestState();
+    var diag: Diag = .{};
+    const result = expand(a, "<entry.dir>", &record, .{ .machine = &m, .diag = &diag });
+    try std.testing.expectError(error.UnknownMachineField, result);
+    try std.testing.expectEqualStrings("machine.nope", diag.capture().?);
+}
+
+test "expand: an entry value's expanded capture is not itself re-scanned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    try record.put("dir", .{ .string = "<machine.quoted>" });
+    var m = chainTestState();
+    // A custom fact whose own value happens to be capture-shaped text. One
+    // level of expansion turns `<entry.dir>` into this literal string; it
+    // must NOT be scanned again for a second `<machine...>` expansion.
+    const facts = [_]machine.state.Fact{.{ .name = "quoted", .value = "<machine.brew_prefix>" }};
+    m.custom_facts = &facts;
+    const out = try expand(a, "<entry.dir>", &record, .{ .machine = &m });
+    try std.testing.expectEqualStrings("<machine.brew_prefix>", out);
 }
 
 test "expand: <env.NAME> set-but-empty through the probe stays unbound, default rescues it" {
