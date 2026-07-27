@@ -128,8 +128,8 @@ pub const scaffold_moxignore: []const u8 =
     \\
 ;
 
-/// True when a basename looks like a secret, for the non-blocking warn-on-add
-/// note (Task 8). Deliberately conservative.
+/// True when a basename looks like a secret, for the non-blocking
+/// warn-on-add note. Deliberately conservative.
 pub fn looksLikeSecret(basename: []const u8) bool {
     const exact = [_][]const u8{ ".credentials.json", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa" };
     for (exact) |e| if (std.mem.eql(u8, basename, e)) return true;

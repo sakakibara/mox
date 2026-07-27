@@ -11,7 +11,7 @@
 //! An array that differs from its counterpart only by element order (a
 //! permutation, with no stable per-element identity to say what "moved")
 //! cannot be expressed as a key-path set; the whole diff fails with
-//! `error.Unrepresentable`, which the commit route (Task 9/10) maps to a
+//! `error.Unrepresentable`, which the commit route maps to a
 //! manual hunk. Any other array difference -- added/removed/changed
 //! elements -- is one whole-array `KeyPathChange` at that path.
 
@@ -29,7 +29,8 @@ const Io = std.Io;
 pub const Format = source_format.Format;
 
 /// The composed-side value for a `KeyPathChange`, tagged by the format lib
-/// that produced it. Task 9 applies it back into source with the same lib.
+/// that produced it. The commit route applies it back into source with the
+/// same lib.
 pub const Value = union(enum) {
     toml: toml.Value,
     json: json.Value,

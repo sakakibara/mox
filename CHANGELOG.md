@@ -33,6 +33,10 @@ All notable changes to mox are documented here. The format follows
   passing unnoticed.
 
 ### Changed
+- A capture written inside a data-row string value now expands (one
+  level); previously it spliced as literal text. A literal angle
+  bracket sequence in a data value that happens to spell a capture now
+  resolves or errors instead of passing through verbatim.
 - **Breaking** for anyone gating on a dotted `machine=<value>`: `machine`
   no longer binds the raw hostname, only its first label: an overlay or
   fragment named for a full dotted hostname must be renamed to the first
@@ -71,7 +75,7 @@ All notable changes to mox are documented here. The format follows
 - `mox add`'s home-membership check now resolves both sides through
   `realpath`.
 
-## [0.4.0] - 2026-07-28
+## [0.4.0] - 2026-07-27
 
 ### Added
 - Completions generator directive: `# mox: completions <shell>
