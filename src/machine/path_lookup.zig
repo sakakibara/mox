@@ -38,7 +38,7 @@ pub fn findOnPathFull(
     environ: Environ,
     candidates: []const []const u8,
 ) ![]const Found {
-    const listing = try buildListing(arena, io, environ);
+    const listing = try buildListing(arena, io, environ, &.{});
     return findOnPathFullFromListing(arena, listing, candidates);
 }
 
@@ -86,45 +86,80 @@ pub const Listing = struct {
     }
 };
 
-/// Scan every `$PATH` directory once and index every entry found, keyed for
-/// `Listing.lookup`. Kept as a single full enumeration rather than probing
-/// per name: the watch list is ~75 names and a Windows PATH carries a
-/// PATHEXT of ~8, so per-name probing would be tens of thousands of stats per
-/// capture -- fast enough on POSIX to hide, slow enough on Windows to look
-/// like a hang. An empty or absent `$PATH` produces an empty listing.
-pub fn buildListing(arena: std.mem.Allocator, io: Io, environ: Environ) !Listing {
+/// Scan every `$PATH` directory once, then `extra_dirs` in order, and index
+/// every entry found, keyed for `Listing.lookup`. Kept as a single full
+/// enumeration rather than probing per name: the watch list is ~75 names and
+/// a Windows PATH carries a PATHEXT of ~8, so per-name probing would be tens
+/// of thousands of stats per capture -- fast enough on POSIX to hide, slow
+/// enough on Windows to look like a hang. An empty or absent `$PATH` scans no
+/// PATH directories but still scans `extra_dirs`.
+///
+/// `extra_dirs` -- this machine's tool-home bin directories (D2b) -- are
+/// scanned strictly after every `$PATH` directory: `scanDirInto` only ever
+/// inserts a name it has not already seen, so a `$PATH` hit always wins over
+/// a tool-home hit for the same name, unchanged from PATH-only behavior.
+pub fn buildListing(arena: std.mem.Allocator, io: Io, environ: Environ, extra_dirs: []const []const u8) !Listing {
     var entries = std.StringHashMap([]const u8).init(arena);
-    const path_env = environ.getAlloc(arena, "PATH") catch |e| switch (e) {
-        error.EnvironmentVariableMissing => return .{ .entries = entries },
-        else => return e,
-    };
     const exts = try executableExts(arena, environ);
 
+    const path_env = environ.getAlloc(arena, "PATH") catch |e| switch (e) {
+        error.EnvironmentVariableMissing => "",
+        else => return e,
+    };
     var dirs = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
     while (dirs.next()) |dir_path| {
         if (dir_path.len == 0) continue;
-        // Best-effort: a PATH dir that will not enumerate is skipped, not
-        // fatal. Sorted so a tie between two names folding to the same key
-        // (`git` and `git.exe`) resolves the same way on every machine,
-        // rather than by filesystem order.
-        const dir_entries = dirent.sortedPath(arena, io, dir_path, .{ .iterate = true }) catch continue;
-        for (dir_entries) |entry| {
-            if (entry.kind == .directory) continue;
-            const folded = try foldName(arena, entry.name);
-            if (!entries.contains(folded)) {
-                try entries.put(folded, try std.fs.path.join(arena, &.{ dir_path, entry.name }));
-            }
-            // On Windows, `git` is on disk as `git.exe`: index the stem too,
-            // when the extension is one the shell would have run, so a
-            // lookup for the bare name finds it.
-            if (try stemForExecutable(arena, folded, exts)) |stem| {
-                if (!entries.contains(stem)) {
-                    try entries.put(stem, try std.fs.path.join(arena, &.{ dir_path, entry.name }));
-                }
+        try scanDirInto(arena, io, &entries, dir_path, exts);
+    }
+    for (extra_dirs) |dir_path| {
+        try scanDirInto(arena, io, &entries, dir_path, exts);
+    }
+    return .{ .entries = entries };
+}
+
+/// Index every regular file directly inside `dir_path` into `entries`,
+/// keyed for `Listing.lookup`. Best-effort: a directory that does not exist
+/// or will not enumerate is silently skipped, not fatal -- shared by every
+/// PATH/tool-home/`$MOX_PATH` directory a `Listing` ever scans. Sorted so a
+/// tie between two names folding to the same key (`git` and `git.exe`)
+/// resolves the same way on every machine, rather than by filesystem order.
+fn scanDirInto(
+    arena: std.mem.Allocator,
+    io: Io,
+    entries: *std.StringHashMap([]const u8),
+    dir_path: []const u8,
+    exts: []const []const u8,
+) !void {
+    const dir_entries = dirent.sortedPath(arena, io, dir_path, .{ .iterate = true }) catch return;
+    for (dir_entries) |entry| {
+        if (entry.kind == .directory) continue;
+        const folded = try foldName(arena, entry.name);
+        if (!entries.contains(folded)) {
+            try entries.put(folded, try std.fs.path.join(arena, &.{ dir_path, entry.name }));
+        }
+        // On Windows, `git` is on disk as `git.exe`: index the stem too,
+        // when the extension is one the shell would have run, so a
+        // lookup for the bare name finds it.
+        if (try stemForExecutable(arena, folded, exts)) |stem| {
+            if (!entries.contains(stem)) {
+                try entries.put(stem, try std.fs.path.join(arena, &.{ dir_path, entry.name }));
             }
         }
     }
-    return .{ .entries = entries };
+}
+
+/// Scan `dirs` into an already-built `listing` in place, same precedence
+/// rule as `buildListing` (a name already present -- from `$PATH`, a tool
+/// home, or an earlier `extendListing` call -- is never overwritten). Used
+/// for the `$MOX_PATH` channel (D2b): directories a setup script names after
+/// this run's `Listing` already exists join the search space without
+/// rebuilding it.
+pub fn extendListing(arena: std.mem.Allocator, io: Io, environ: Environ, listing: *Listing, dirs: []const []const u8) !void {
+    if (dirs.len == 0) return;
+    const exts = try executableExts(arena, environ);
+    for (dirs) |dir_path| {
+        try scanDirInto(arena, io, &listing.entries, dir_path, exts);
+    }
 }
 
 /// Lazy, memoized `tool=` answers layered over `Listing`: the first probe of
@@ -169,6 +204,22 @@ pub const ToolProbe = struct {
         return self.path(name) != null;
     }
 
+    /// Widen the search space with `dirs` (the `$MOX_PATH` channel, D2b):
+    /// scanned into the existing `Listing` in place -- a name already found
+    /// via `$PATH` or a tool home is never overwritten, so this can only add
+    /// names, never change an existing answer. Building the listing first
+    /// (if this is the first call) rather than deferring to the next
+    /// `path`/`present` keeps the memo and the listing consistent: any
+    /// `dirs` name looked up right after this call sees it. Best-effort,
+    /// same as every other listing scan.
+    pub fn extend(self: *ToolProbe, dirs: []const []const u8) void {
+        if (dirs.len == 0) return;
+        _ = self.ensureListing();
+        if (self.listing) |*l| {
+            extendListing(self.arena, self.io, self.environ, l, dirs) catch {};
+        }
+    }
+
     /// Adapt this prober to `dsl.resolver.Resolver.Probe`, so a `Resolver`
     /// built over this machine's bindings can fall through to it for a
     /// `tool=` name the bindings do not already answer.
@@ -183,7 +234,7 @@ pub const ToolProbe = struct {
 
     fn ensureListing(self: *ToolProbe) Listing {
         if (self.listing == null) {
-            self.listing = buildListing(self.arena, self.io, self.environ) catch .{ .entries = std.StringHashMap([]const u8).init(self.arena) };
+            self.listing = buildListing(self.arena, self.io, self.environ, &.{}) catch .{ .entries = std.StringHashMap([]const u8).init(self.arena) };
         }
         return self.listing.?;
     }
@@ -345,4 +396,99 @@ test "Resolver via ToolProbe.probe(): fixed variant never probes, even for a nam
     const live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .probe = probe.probe() };
     const live_r: dsl.resolver.Resolver = .{ .live = &live };
     try std.testing.expect(live_r.has("tool", "reallyinstalled"));
+}
+
+test "buildListing: extra_dirs are searched too, but PATH wins a name collision" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pathbin");
+    try tmp.dir.createDirPath(io, "toolhome/bin");
+    // Same name in both: PATH's copy must be the one the listing indexes.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pathbin/shared", .data = "from-path" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "toolhome/bin/shared", .data = "from-toolhome" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "toolhome/bin/onlyhome", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path_bin = try tmpAbsPath(a, &tmp, "pathbin");
+    const tool_bin = try tmpAbsPath(a, &tmp, "toolhome/bin");
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("PATH", path_bin);
+    const listing = try buildListing(a, io, Env{ .map = &map }, &.{tool_bin});
+
+    const shared_path = (try listing.lookup(a, "shared")).?;
+    try std.testing.expect(std.mem.indexOf(u8, shared_path, "pathbin") != null);
+    const only_home_path = (try listing.lookup(a, "onlyhome")).?;
+    try std.testing.expect(std.mem.indexOf(u8, only_home_path, "toolhome") != null);
+}
+
+test "buildListing: an empty PATH still searches extra_dirs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "toolhome/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "toolhome/bin/onlyhome", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tool_bin = try tmpAbsPath(a, &tmp, "toolhome/bin");
+
+    var map = std.process.Environ.Map.init(a);
+    const listing = try buildListing(a, io, Env{ .map = &map }, &.{tool_bin});
+
+    try std.testing.expect((try listing.lookup(a, "onlyhome")) != null);
+}
+
+test "ToolProbe.extend: a directory named after construction joins the search space" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pathbin");
+    try tmp.dir.createDirPath(io, "later");
+    try tmp.dir.writeFile(io, .{ .sub_path = "later/latecomer", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path_bin = try tmpAbsPath(a, &tmp, "pathbin");
+    const later_dir = try tmpAbsPath(a, &tmp, "later");
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("PATH", path_bin);
+    var probe = ToolProbe.init(a, io, Env{ .map = &map });
+
+    // "latecomer" lives only in `later_dir`, which is not on PATH: reachable
+    // only once `extend` widens the search space.
+    probe.extend(&.{later_dir});
+    try std.testing.expect(probe.present("latecomer"));
+}
+
+test "ToolProbe.extend: a name already resolved via PATH is unaffected by a colliding extra dir" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pathbin");
+    try tmp.dir.createDirPath(io, "later");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pathbin/shared", .data = "from-path" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "later/shared", .data = "from-later" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path_bin = try tmpAbsPath(a, &tmp, "pathbin");
+    const later_dir = try tmpAbsPath(a, &tmp, "later");
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("PATH", path_bin);
+    var probe = ToolProbe.init(a, io, Env{ .map = &map });
+
+    const before = probe.path("shared").?;
+    probe.extend(&.{later_dir});
+    const after = probe.path("shared").?;
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "pathbin") != null);
 }

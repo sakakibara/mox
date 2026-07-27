@@ -224,10 +224,21 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     for (TOOL_WATCH_LIST) |t| try tool_watch.append(arena, t);
     for (extras.tools) |t| try tool_watch.append(arena, t);
 
-    // One `$PATH` enumeration for the whole capture: the eager watch scan and
-    // the lazy probe share this same listing, instead of the probe building
-    // its own on first use.
-    const path_listing = try path_lookup.buildListing(arena, io, environ);
+    // Tool-home detection runs ahead of the `$PATH` scan (D2b) so their bin
+    // directories can join the very same `Listing` build: a fresh Homebrew
+    // (or cargo/go/pnpm) install is visible to `tool=` the moment its home
+    // exists, not just once its shellenv line is itself applied and PATH
+    // grows on some LATER process's re-exec.
+    const brew_prefix = try detectBrewPrefix(arena, io, environ, builtin.os.tag, home);
+    const cargo_home = try resolveToolHome(arena, io, environ, "CARGO_HOME", home, ".cargo");
+    const gopath = try resolveToolHome(arena, io, environ, "GOPATH", home, "go");
+    const pnpm_home = envOr(arena, environ, "PNPM_HOME") orelse try arena.dupe(u8, "");
+    const tool_home_bin_dirs = try toolHomeBinDirs(arena, brew_prefix, cargo_home, gopath, pnpm_home);
+
+    // One `$PATH` (+ tool-home) enumeration for the whole capture: the eager
+    // watch scan and the lazy probe share this same listing, instead of the
+    // probe building its own on first use.
+    const path_listing = try path_lookup.buildListing(arena, io, environ, tool_home_bin_dirs);
     const tool_paths = try path_lookup.findOnPathFullFromListing(arena, path_listing, tool_watch.items);
     var tool_names_buf = try arena.alloc([]const u8, tool_paths.len);
     for (tool_paths, 0..) |tp, i| tool_names_buf[i] = tp.name;
@@ -266,16 +277,10 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const env_probe = try arena.create(EnvProbe);
     env_probe.* = EnvProbe.init(arena, environ);
 
-    const brew_prefix = try detectBrewPrefix(arena, io, environ, builtin.os.tag, home);
-
     const xdg_config_home = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
     const xdg_cache_home = try resolveXdg(arena, environ, "XDG_CACHE_HOME", home, ".cache");
     const xdg_data_home = try resolveXdg(arena, environ, "XDG_DATA_HOME", home, ".local/share");
     const xdg_state_home = try resolveXdg(arena, environ, "XDG_STATE_HOME", home, ".local/state");
-
-    const cargo_home = try resolveToolHome(arena, io, environ, "CARGO_HOME", home, ".cargo");
-    const gopath = try resolveToolHome(arena, io, environ, "GOPATH", home, "go");
-    const pnpm_home = envOr(arena, environ, "PNPM_HOME") orelse try arena.dupe(u8, "");
 
     const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
     const facts_result = try facts_mod.load(arena, io, facts_path);
@@ -559,6 +564,26 @@ fn resolveToolHome(
     return path;
 }
 
+/// This machine's tool-home bin directories, in the fixed order D2b
+/// specifies: `<brew_prefix>/bin`, `<cargo_home>/bin`, `<gopath>/bin`,
+/// `<pnpm_home>` (already a bin dir, unlike the other three). A fact that
+/// resolved empty (unset, or its detection rule found nothing) contributes
+/// no directory rather than joining "" into a bogus root-relative path.
+fn toolHomeBinDirs(
+    arena: std.mem.Allocator,
+    brew_prefix: []const u8,
+    cargo_home: []const u8,
+    gopath: []const u8,
+    pnpm_home: []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    if (brew_prefix.len > 0) try out.append(arena, try std.fs.path.join(arena, &.{ brew_prefix, "bin" }));
+    if (cargo_home.len > 0) try out.append(arena, try std.fs.path.join(arena, &.{ cargo_home, "bin" }));
+    if (gopath.len > 0) try out.append(arena, try std.fs.path.join(arena, &.{ gopath, "bin" }));
+    if (pnpm_home.len > 0) try out.append(arena, pnpm_home);
+    return out.toOwnedSlice(arena);
+}
+
 test "MachineState type is constructible" {
     const m = MachineState{
         .os = "linux",
@@ -585,6 +610,32 @@ test "capture returns nonempty hostname" {
     defer arena.deinit();
     const m = try capture(arena.allocator(), std.testing.io, Environ{ .process = std.testing.environ });
     try std.testing.expect(m.hostname.len > 0);
+}
+
+test "capture: a tool that exists only in cargo_home/bin, never on PATH, still resolves via tool_probe" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "cargo/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "cargo/bin/only-in-cargo-home", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = try tmpAbsPath(a, &tmp, "");
+    const cargo_home = try tmpAbsPath(a, &tmp, "cargo");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", home);
+    try map.put("CARGO_HOME", cargo_home);
+    // No PATH at all: the only way to reach the binary is the tool-home layer.
+
+    const m = try capture(a, io, Environ{ .map = &map });
+    try std.testing.expectEqualStrings(cargo_home, m.cargo_home);
+    // Not in TOOL_WATCH_LIST, so the eager scan never seeds it -- only the
+    // widened `Listing` (D2b) resolves it.
+    for (m.tools_on_path) |t| try std.testing.expect(!std.mem.eql(u8, t, "only-in-cargo-home"));
+    try std.testing.expect(m.tool_probe.?.present("only-in-cargo-home"));
 }
 
 test "EnvProbe.get: an unwatched name reads from the captured environ" {

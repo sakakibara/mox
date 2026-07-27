@@ -1388,6 +1388,69 @@ test "apply: a pre-script that installs an unwatched tool is gated on in the sam
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ bin_dir, "herdr" })));
 }
 
+test "apply: a pre-script that installs into cargo_home/bin (never on PATH) is gated on in the same apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "cargotool" is not in TOOL_WATCH_LIST and never touches $PATH: the
+    // only way this row materializes is the tool-home search-space layer
+    // (D2b) finding it under `$CARGO_HOME/bin`.
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
+        "# mox: when tool=cargotool\n" ++
+        "export HAS_CARGOTOOL=1\n" ++
+        "# mox: end\n");
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const cargo_home = try std.fs.path.join(a, &.{ root, "fakecargo" });
+    const cargo_bin = try std.fs.path.join(a, &.{ cargo_home, "bin" });
+
+    // CARGO_HOME must already exist for `resolveToolHome` to accept it (it
+    // access-checks the root); the pre-script is what creates `bin/` and
+    // drops the "installed" binary into it, mid-apply.
+    try tmp.dir.createDirPath(io, "fakecargo");
+
+    const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
+    const body = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(
+            a,
+            "New-Item -ItemType Directory -Force -Path \"{s}\" | Out-Null\nSet-Content -LiteralPath \"{s}\\cargotool\" -NoNewline -Value ''\n",
+            .{ cargo_bin, cargo_bin },
+        )
+    else
+        try std.fmt.allocPrint(a, "#!/bin/sh\nmkdir -p \"{s}\"\ntouch \"{s}/cargotool\"\n", .{ cargo_bin, cargo_bin });
+    const sub = try std.fmt.allocPrint(a, "repo/scripts/pre/00-cargotool{s}", .{ext});
+    const abs = try std.fs.path.join(a, &.{ root, sub });
+    try writeExecScript(io, &tmp, sub, body, abs);
+
+    // Real system PATH is preserved (so the script's own mkdir/touch still
+    // resolve) but never carries the cargo bin dir: the row can only
+    // materialize through the tool-home layer, not a widened PATH.
+    const real_path = (mox.env.Env{ .process = std.testing.environ }).getAlloc(a, "PATH") catch "";
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{
+            .{ .name = "CARGO_HOME", .value = cargo_home },
+            .{ .name = "PATH", .value = real_path },
+        },
+    });
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ cargo_bin, "cargotool" })));
+
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+
+    // The gate flipped within the same apply, and the binary really was
+    // dropped into cargo_home/bin -- never onto $PATH.
+    const live = try read(io, a, try h.liveOf(".testrc"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "export HAS_CARGOTOOL=1") != null);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ cargo_bin, "cargotool" })));
+    try std.testing.expect(std.mem.indexOf(u8, real_path, "fakecargo") == null);
+}
+
 // Partial-ownership lifecycle: onboarding via `add --own` and the partial
 // semantics of add-tree, remove, mv, export, and doctor.
 
