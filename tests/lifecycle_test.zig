@@ -1451,6 +1451,110 @@ test "apply: a pre-script that installs into cargo_home/bin (never on PATH) is g
     try std.testing.expect(std.mem.indexOf(u8, real_path, "fakecargo") == null);
 }
 
+test "apply: a pre-script names an arbitrary dir via $MOX_PATH; gates true same apply, post script sees it on PATH" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "mypathtool" lives in a directory that is neither on $PATH nor any
+    // detected tool home: only the explicit $MOX_PATH channel (D2b) can
+    // make it visible.
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
+        "# mox: when tool=mypathtool\n" ++
+        "export HAS_MYPATHTOOL=1\n" ++
+        "# mox: end\n");
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const target_dir = try std.fs.path.join(a, &.{ root, "arbitrary-install-dir" });
+    const marker = try std.fs.path.join(a, &.{ root, "post-saw-path.txt" });
+
+    const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
+    const pre_body = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(
+            a,
+            "New-Item -ItemType Directory -Force -Path \"{s}\" | Out-Null\n" ++
+                "Set-Content -LiteralPath \"{s}\\mypathtool\" -NoNewline -Value ''\n" ++
+                "Add-Content -LiteralPath $env:MOX_PATH -Value \"{s}\"\n",
+            .{ target_dir, target_dir, target_dir },
+        )
+    else
+        try std.fmt.allocPrint(
+            a,
+            "#!/bin/sh\nmkdir -p \"{s}\"\ntouch \"{s}/mypathtool\"\necho \"{s}\" >> \"$MOX_PATH\"\n",
+            .{ target_dir, target_dir, target_dir },
+        );
+    const pre_sub = try std.fmt.allocPrint(a, "repo/scripts/pre/00-moxpath{s}", .{ext});
+    const pre_abs = try std.fs.path.join(a, &.{ root, pre_sub });
+    try writeExecScript(io, &tmp, pre_sub, pre_body, pre_abs);
+
+    // A post script writes "yes"/"no" to a marker depending on whether the
+    // pre stage's $MOX_PATH addition shows up on ITS OWN PATH -- the
+    // "subsequent scripts" half of D2b's contract.
+    const post_body = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(
+            a,
+            "if ($env:PATH -split ';' -contains \"{s}\") {{ Set-Content -LiteralPath \"{s}\" -NoNewline -Value 'yes' }} else {{ Set-Content -LiteralPath \"{s}\" -NoNewline -Value 'no' }}\n",
+            .{ target_dir, marker, marker },
+        )
+    else
+        try std.fmt.allocPrint(
+            a,
+            "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{s}:\"*) echo yes > \"{s}\" ;;\n  *) echo no > \"{s}\" ;;\nesac\n",
+            .{ target_dir, marker, marker },
+        );
+    const post_sub = try std.fmt.allocPrint(a, "repo/scripts/post/00-checkpath{s}", .{ext});
+    const post_abs = try std.fs.path.join(a, &.{ root, post_sub });
+    try writeExecScript(io, &tmp, post_sub, post_body, post_abs);
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ target_dir, "mypathtool" })));
+
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+
+    // The gate flipped within the same apply...
+    const live = try read(io, a, try h.liveOf(".testrc"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "export HAS_MYPATHTOOL=1") != null);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ target_dir, "mypathtool" })));
+    // ...and the post script's own PATH carried the addition.
+    const saw = try read(io, a, marker);
+    try std.testing.expectEqualStrings("yes", std.mem.trimEnd(u8, saw, "\r\n"));
+}
+
+test "apply: a relative $MOX_PATH line is a loud per-line warning, not a silent skip" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+
+    const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
+    const body = if (builtin.os.tag == .windows)
+        "Add-Content -LiteralPath $env:MOX_PATH -Value 'not/absolute'\n"
+    else
+        "#!/bin/sh\necho 'not/absolute' >> \"$MOX_PATH\"\n";
+    const sub = try std.fmt.allocPrint(a, "repo/scripts/pre/00-badpath{s}", .{ext});
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const abs = try std.fs.path.join(a, &.{ root, sub });
+    try writeExecScript(io, &tmp, sub, body, abs);
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "MOX_PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "not/absolute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, ":1:") != null);
+}
+
 // Partial-ownership lifecycle: onboarding via `add --own` and the partial
 // semantics of add-tree, remove, mv, export, and doctor.
 

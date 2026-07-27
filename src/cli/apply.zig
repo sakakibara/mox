@@ -131,7 +131,7 @@ fn applyPass(
         context.paths.home,
         script_facts,
     );
-    const script_env = script_env_result.map;
+    var script_env = script_env_result.map;
     if (script_env_result.skipped.len > 0) {
         try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
         for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
@@ -141,6 +141,22 @@ fn applyPass(
     // Resolved once per apply run (not per checked partial file): an
     // unparseable override would otherwise warn once per file checked.
     const check_timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&script_env, ctx.err);
+
+    // $MOX_PATH (D2b): a private per-run file every script and check hook
+    // gets, for naming an install directory mox would otherwise never see
+    // (neither $PATH nor a detected tool home). Created empty up front --
+    // dies with the run, same private-temp-area treatment as the
+    // MOX_CHECK_FILE/MOX_CHECK_DIR staging below.
+    const mox_path_file = try mox.apply.mox_path.filePath(ctx.alloc, context.paths.state_dir);
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mox_path_file, .data = "" });
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, mox_path_file) catch {};
+    try script_env.put("MOX_PATH", mox_path_file);
+    var mox_path_reader: mox.apply.mox_path.Reader = .{ .path = mox_path_file };
+    // Every directory named via $MOX_PATH so far this run: threaded into
+    // check hooks below, which build their own env map straight from
+    // `context.env` rather than sharing `script_env`, so they see the same
+    // widened PATH later setup scripts do.
+    var mox_path_dirs: std.ArrayList([]const u8) = .empty;
 
     // Pre-stage scripts run before any file compose+write. Used for
     // bootstrap (package install, mise/brew/scoop setup, etc.). Scripts
@@ -161,6 +177,10 @@ fn applyPass(
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
     }
+    // $MOX_PATH additions the pre stage named: fold into this run's probe
+    // search space (on the FRESH state above, if it just recaptured) and
+    // into PATH for every later script and check hook.
+    try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs);
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     var walk_diag: mox.source.tree.Diag = .{};
@@ -378,6 +398,7 @@ fn applyPass(
                     .skip_scripts = skip_scripts,
                     .resolver = resolver_opt,
                     .check_timeout_ms = check_timeout_ms,
+                    .extra_path_dirs = mox_path_dirs.items,
                 }, &counts, &snapshotted);
             } else {
                 try applyRegularFile(ctx, .{
@@ -527,6 +548,10 @@ fn applyPass(
         mox.apply.run_scripts.Result{}
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, post_dir, &bindings, &script_env, ctx.out, ctx.err);
+    // $MOX_PATH additions the post stage named: no script or check hook runs
+    // after this in the same apply, but folding them in keeps the run's
+    // bookkeeping (probe search space, PATH) consistent regardless of stage.
+    try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs);
 
     // Only name the interactive outcomes when they happened: an ordinary apply
     // prints the line it always has.
@@ -559,6 +584,27 @@ fn applyPass(
     }
     const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed;
     return if (total_fail > 0) 1 else 0;
+}
+
+/// Fold whatever a just-finished stage appended to `$MOX_PATH` (D2b) into
+/// this run: widen `m_state`'s tool probe so a `tool=` gate sees it for the
+/// rest of the run, and prepend it to `script_env`'s `PATH` so a later
+/// script or check hook's own PATH lookups do too. `dirs_so_far` accumulates
+/// across stages so it can be handed to a partial file's check hook, which
+/// builds its own env map straight from `context.env` rather than sharing
+/// `script_env`. A stage with nothing new (the common case) touches neither.
+fn foldMoxPathAdditions(
+    ctx: *app.Ctx,
+    reader: *mox.apply.mox_path.Reader,
+    m_state: mox.machine.state.MachineState,
+    script_env: *std.process.Environ.Map,
+    dirs_so_far: *std.ArrayList([]const u8),
+) !void {
+    const new_dirs = try reader.readNew(ctx.alloc, ctx.io, ctx.err);
+    if (new_dirs.len == 0) return;
+    if (m_state.tool_probe) |tp| tp.extend(new_dirs);
+    try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), new_dirs));
+    try dirs_so_far.appendSlice(ctx.alloc, new_dirs);
 }
 
 /// A file just skipped as axis-gated off: when its whole-file gate names an
@@ -930,6 +976,10 @@ const PartialInput = struct {
     resolver: ?*DriftResolver = null,
     /// The check hook's wall-clock bound, resolved once per apply run.
     check_timeout_ms: i64,
+    /// Directories named via `$MOX_PATH` (D2b) by a stage that already ran
+    /// this apply, prepended onto the check hook's PATH. Empty outside
+    /// `mox apply` (rollback names no scripts, so it passes none).
+    extra_path_dirs: []const []const u8 = &.{},
 };
 
 /// Run a partial file's `check` hook (D7) against `candidate`, materialized
@@ -940,7 +990,9 @@ const PartialInput = struct {
 /// true on acceptance; any other outcome reports the refusal (with the
 /// child's tail output), bumps `fail_count`, and returns false. Public
 /// because rollback runs the same hook before re-patching a partial target.
-pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize) !bool {
+/// `extra_path_dirs` (D2b) is prepended onto the child's PATH -- empty for
+/// rollback, which names no scripts of its own.
+pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize, extra_path_dirs: []const []const u8) !bool {
     const context = ctx.context.?;
     // Keyed by live path: the state lock serializes applies, so no two runs
     // race on it, and a crash's leftover is overwritten on the next apply.
@@ -973,6 +1025,9 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     var env_map = try context.env.createMap(ctx.alloc);
     try env_map.put("MOX_CHECK_FILE", cand_path);
     try env_map.put("MOX_CHECK_DIR", check_dir);
+    if (extra_path_dirs.len > 0) {
+        try env_map.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, env_map.get("PATH"), extra_path_dirs));
+    }
 
     const res = mox.apply.run_scripts.runCheck(ctx.alloc, ctx.io, context.paths.repo_dir, check_argv, &env_map, out_path, timeout_ms) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1222,7 +1277,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
     if (in.file.check_argv.len > 0) {
-        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, in.check_timeout_ms, &counts.fail)) return;
+        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, in.check_timeout_ms, &counts.fail, in.extra_path_dirs)) return;
     }
 
     if (live != null) {

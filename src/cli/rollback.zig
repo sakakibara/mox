@@ -255,7 +255,7 @@ fn repatchPartial(
     };
     // A rollback must not install content the file's own validator rejects.
     if (file.check_argv.len > 0) {
-        if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, check_timeout_ms, failed)) return false;
+        if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, check_timeout_ms, failed, &.{})) return false;
     }
 
     // A live target absent here is legitimate (this partial target was never
