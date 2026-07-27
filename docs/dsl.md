@@ -67,6 +67,13 @@ tool=fd and not env=WSL
 - `name` (no `=`) - presence: true when the axis is bound to a non-empty value.
 - `and`, `or`, `not`, and `( ... )` grouping. `not` may repeat.
 
+`tool=<name>` resolves against `$PATH`, then this machine's detected tool-home
+bin directories when present (`<brew_prefix>/bin`, `<cargo_home>/bin`,
+`<gopath>/bin`, `<pnpm_home>`), then any directory a setup script named via
+`$MOX_PATH` (see Scripts, below) -- in that order, so a `$PATH` hit always
+wins. `<machine.tool_path.NAME>` interpolation resolves through the same
+search space.
+
 ## Loops
 
 `for <var> in <source>` iterates a TOML array. `<source>` is either a bare name
@@ -251,6 +258,16 @@ the first content line (at most 16 lines in); `#` is the comment marker for both
 shell and `.ps1`. When a script sits in a gated subdir and also carries a header,
 both must hold for it to run. A header that fails to parse is a hard error for
 that script, not a silent skip.
+
+Every script (both stages) and check hook also gets `MOX_PATH`, naming a
+writable file private to this run (deleted when the run ends). A script that
+installs a tool somewhere `tool=` would not otherwise see -- neither `$PATH`
+nor a detected tool home -- appends that directory there, one absolute path
+per line (modeled on GitHub Actions' `GITHUB_PATH`). After each stage, mox
+reads back whatever is new: it joins the `tool=` search space for the rest of
+the run and is prepended to `PATH` for every later script and check hook. A
+relative or otherwise malformed line is a stderr warning naming the file and
+line, never a silent skip.
 
 ## File attributes and head directives
 
