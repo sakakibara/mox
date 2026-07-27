@@ -294,13 +294,15 @@ pub fn lint(arena: std.mem.Allocator, template: []const u8) LintError!void {
 ///     strip, where most `<...>` are not captures (heredocs, shell redirs, etc.).
 ///   - `<machine.X>` / `<env.X>` resolve against `ctx.machine` when non-null;
 ///     an error otherwise.
-///   - `<entry.X>` splices a row field's formatted string, then expands any
-///     captures that string itself contains through this same machinery --
-///     exactly one level. A data row written as `dir = "<machine.brew_prefix
-///     >/bin"` composes to the real prefix, but the nested expansion's own
-///     result is spliced verbatim and never re-scanned, so a value chain
-///     (row data authored to reference another row's captures) cannot
-///     recurse.
+///   - A loop-bound value -- `<entry.X>` (or whatever name the enclosing
+///     `for` gave its variable) against a row field, or a bare `<url>`
+///     against a scalar array element -- splices the value's formatted
+///     string, then expands any captures that string itself contains
+///     through this same machinery, exactly one level. A data row written
+///     as `dir = "<machine.brew_prefix>/bin"` composes to the real prefix,
+///     but the nested expansion's own result is spliced verbatim and never
+///     re-scanned, so a value chain (row data authored to reference another
+///     row's captures) cannot recurse.
 ///   - `<data.FILE.KEY>` / `<data.FILE.TABLE.KEY>` read a committed scalar from
 ///     `data/FILE.toml` (private layer shadows repo), using `ctx.io` +
 ///     `ctx.repo_dir` + `ctx.private_dir`. A missing file/key is an error
@@ -335,10 +337,13 @@ pub fn expandTracked(
     return expandTrackedImpl(arena, template, record_opt, ctx, true);
 }
 
-/// `expandTracked`'s body. `expand_entry_values` gates whether a spliced
-/// `<entry.X>` row-field string is itself expanded for nested captures: the
-/// top-level call passes `true`, and the ONE nested call it may make passes
-/// `false`, so a row value can never trigger a second round of nested
+/// `expandTracked`'s body. `expand_row_values` gates whether a spliced row
+/// value -- a loop variable's field (`<entry.dir>`, `<id.dir>`, any name the
+/// `for` bound), its scalar element (`<url>` inside `for url in
+/// id.match_urls`), or the fixed `<entry.X>` splice against a bare
+/// `record_opt` outside any loop -- is itself expanded for nested captures.
+/// The top-level call passes `true`, and the ONE nested call it may make
+/// passes `false`, so a row value can never trigger a second round of nested
 /// expansion -- the recursion depth is capped at one by construction, not by
 /// a counter.
 fn expandTrackedImpl(
@@ -346,7 +351,7 @@ fn expandTrackedImpl(
     template: []const u8,
     record_opt: ?*const std.StringHashMap(data.value.Value),
     ctx: Ctx,
-    expand_entry_values: bool,
+    expand_row_values: bool,
 ) InterpError!Expansion {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
@@ -404,7 +409,19 @@ fn expandTrackedImpl(
             // never shadowed, since no loop is named for them).
             switch (try resolveScope(arena, ctx.scope, inner)) {
                 .value => |v| {
-                    try out.appendSlice(arena, v);
+                    if (expand_row_values) {
+                        // The loop-bound field or element may itself carry a
+                        // capture written straight into TOML data (e.g. a
+                        // data.toml value of `<machine.brew_prefix>/bin`).
+                        // Expand it through the same machinery, one level
+                        // only -- see this function's doc comment for the
+                        // bound.
+                        const nested = try expandTrackedImpl(arena, v, record_opt, ctx, false);
+                        try out.appendSlice(arena, nested.bytes);
+                        if (nested.secret) secret_seen = true;
+                    } else {
+                        try out.appendSlice(arena, v);
+                    }
                     i = close + 1;
                     continue;
                 },
@@ -440,7 +457,7 @@ fn expandTrackedImpl(
                 const field = inner[6..];
                 if (r.get(field)) |v| {
                     const formatted = try v.format(arena);
-                    if (expand_entry_values) {
+                    if (expand_row_values) {
                         // The row's own string may carry captures written
                         // straight into TOML data (e.g. a data.toml value of
                         // `<machine.brew_prefix>/bin`). Expand it through the
@@ -1022,6 +1039,63 @@ test "expand: an entry value's expanded capture is not itself re-scanned" {
     m.custom_facts = &facts;
     const out = try expand(a, "<entry.dir>", &record, .{ .machine = &m });
     try std.testing.expectEqualStrings("<machine.brew_prefix>", out);
+}
+
+// The tests above drive the record-only `<entry.X>` path (no `ctx.scope`
+// frame named "entry"). A real `for entry in "data/paths.toml"` loop instead
+// resolves `<entry.dir>` through `ctx.scope` (a `Frame` named "entry", set by
+// the loop itself) -- resolveScope intercepts it before the record-only path
+// is ever reached. The following lock that loop-scope path, which is what
+// production compose actually exercises.
+
+test "expand: a for-loop's row value expands its own machine capture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    try record.put("dir", .{ .string = "<machine.brew_prefix>/bin" });
+    const m = chainTestState();
+    const scope = [_]Frame{.{ .name = "entry", .value = .{ .record = &record } }};
+    const out = try expand(a, "<entry.dir>", &record, .{ .machine = &m, .scope = &scope });
+    try std.testing.expectEqualStrings("/opt/homebrew/bin", out);
+}
+
+test "expand: a for-loop's scalar array-element value expands its own capture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = chainTestState();
+    const scope = [_]Frame{.{ .name = "url", .value = .{ .scalar = "<machine.brew_prefix>/repo" } }};
+    const out = try expand(a, "<url>", null, .{ .machine = &m, .scope = &scope });
+    try std.testing.expectEqualStrings("/opt/homebrew/repo", out);
+}
+
+test "expand: a for-loop's row value's expanded capture is not re-scanned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    try record.put("dir", .{ .string = "<machine.quoted>" });
+    var m = chainTestState();
+    const facts = [_]machine.state.Fact{.{ .name = "quoted", .value = "<machine.brew_prefix>" }};
+    m.custom_facts = &facts;
+    const scope = [_]Frame{.{ .name = "entry", .value = .{ .record = &record } }};
+    const out = try expand(a, "<entry.dir>", &record, .{ .machine = &m, .scope = &scope });
+    try std.testing.expectEqualStrings("<machine.brew_prefix>", out);
+}
+
+test "expand: an unknown capture inside a for-loop's row value errors like an inline one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data.value.Value).init(a);
+    try record.put("dir", .{ .string = "<machine.nope>" });
+    const m = chainTestState();
+    const scope = [_]Frame{.{ .name = "entry", .value = .{ .record = &record } }};
+    var diag: Diag = .{};
+    const result = expand(a, "<entry.dir>", &record, .{ .machine = &m, .scope = &scope, .diag = &diag });
+    try std.testing.expectError(error.UnknownMachineField, result);
+    try std.testing.expectEqualStrings("machine.nope", diag.capture().?);
 }
 
 test "expand: <env.NAME> set-but-empty through the probe stays unbound, default rescues it" {
