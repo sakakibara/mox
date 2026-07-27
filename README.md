@@ -42,6 +42,9 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/instal
     init --clone https://github.com/<you>/dotfiles --apply
 ```
 
+The powershell form takes the same arguments directly, no `--`:
+`& ([scriptblock]::Create((irm .../install.ps1))) init --clone <url> --apply`.
+
 `MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror. Update in
 place with `mox upgrade` (it verifies the download against `SHA256SUMS`).
 
