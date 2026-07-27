@@ -301,6 +301,10 @@ fn seededThisAndState(
     var env_map = std.process.Environ.Map.init(a);
     try env_map.put("HOME", "/home/me");
     try env_map.put("PATH", bin_dir);
+    // Fixed to a value the fixture never names (darwin/linux): the "os=linux"
+    // sibling below must stay a real, labelled sibling and never collapse into
+    // this machine's own "" label, regardless of which OS actually runs the test.
+    try env_map.put("MOX_OS", "windows");
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
     var this = try machine.bindings.fromMachineState(a, m_state);
