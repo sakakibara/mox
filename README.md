@@ -39,11 +39,13 @@ bootstraps:
 
 ```sh
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)" -- \
-    init --clone https://github.com/<you>/dotfiles --apply
+    init --clone <you> --apply
 ```
 
-The powershell form takes the same arguments directly, no `--`:
-`& ([scriptblock]::Create((irm .../install.ps1))) init --clone <url> --apply`.
+`--clone <you>` is shorthand for `https://github.com/<you>/dotfiles`;
+`owner/repo`, `host/owner/repo`, full URLs, ssh remotes, and local paths
+all work too. The powershell form takes the same arguments directly, no
+`--`: `& ([scriptblock]::Create((irm .../install.ps1))) init --clone <you> --apply`.
 
 `MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror. Update in
 place with `mox upgrade` (it verifies the download against `SHA256SUMS`).

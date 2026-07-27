@@ -16,8 +16,10 @@ On a machine that already has your dotfiles repo published:
 
 ```sh
 # install mox, clone the repo, and apply -- in one line
+# (<you> expands to https://github.com/<you>/dotfiles; owner/repo,
+# host/owner/repo, full URLs, and ssh remotes work too)
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)" -- \
-    init --clone https://github.com/<you>/dotfiles --apply
+    init --clone <you> --apply
 ```
 
 Starting fresh with nothing yet:
