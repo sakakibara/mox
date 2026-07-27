@@ -936,6 +936,9 @@ test "facts interview: persist is guarded by the command lock" {
 /// (asked unconditioned, wave 0); `gdrive_account` is captured only under
 /// `holt_backend=gdrive`, and the two `onepassword_*` facts only under
 /// `profile=work` -- both wave-1-or-never, per the fixpoint asking law.
+/// `signing_work_key` is a bare PRESENCE fact conjoined with `profile=work`
+/// in the same gate (`when profile=work and signing_work_key`), proving the
+/// occurrence-condition law applies to a presence role, not only captures.
 fn writeConditionalCorpus(io: Io, tmp: *std.testing.TmpDir) !void {
     try tmp.dir.createDirPath(io, "repo/src/.config");
     try tmp.dir.writeFile(io, .{
@@ -948,6 +951,9 @@ fn writeConditionalCorpus(io: Io, tmp: *std.testing.TmpDir) !void {
         \\# mox: when profile=work
         \\onepassword_account = <machine.onepassword_account>
         \\onepassword_vault = <machine.onepassword_vault>
+        \\# mox: end
+        \\# mox: when profile=work and signing_work_key
+        \\signing_key_path = <machine.signing_key_path>
         \\# mox: end
         \\
         ,
@@ -972,12 +978,17 @@ test "apply interview: a personal/icloud answer path never asks gdrive_account o
     try std.testing.expect(std.mem.indexOf(u8, r.out, "gdrive_account") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_account") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_vault") == null);
+    // signing_work_key is conjoined with profile=work: a personal machine
+    // never asks it (the occurrence-condition law applied to a presence
+    // role, not just a capture).
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "signing_work_key") == null);
 
     const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
     try std.testing.expect(std.mem.indexOf(u8, facts, "profile = \"personal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, facts, "holt_backend") == null or std.mem.indexOf(u8, facts, "holt_backend = \"\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, facts, "gdrive_account") == null);
     try std.testing.expect(std.mem.indexOf(u8, facts, "onepassword_account") == null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "signing_work_key") == null);
 }
 
 test "apply interview: a work answer path asks gdrive_account/onepassword facts newly exposed in the same run" {
@@ -993,14 +1004,19 @@ test "apply interview: a work answer path asks gdrive_account/onepassword facts 
 
     // Wave 0: holt_backend=gdrive, profile=work. Wave 1 (fixpoint-exposed in
     // the same run): gdrive_account, onepassword_account, onepassword_vault,
-    // asked in name order.
+    // signing_work_key, asked in name order (signing_work_key's condition
+    // -- profile=work AND its own presence -- resolves once profile=work is
+    // bound; declined here so no wave-2 signing_key_path question follows).
     const r = try c.runWithInput(
         &.{ "mox", "apply" },
-        "gdrive\nwork\ndrive@example.com\nteam@example.com\nvault-x\n",
+        "gdrive\nwork\ndrive@example.com\nteam@example.com\nvault-x\n\n",
     );
     try std.testing.expect(std.mem.indexOf(u8, r.out, "gdrive_account") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_account") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_vault") != null);
+    // A work machine's profile=work makes signing_work_key's conjoined
+    // condition hold: it is asked (declined here), unlike the personal path.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "signing_work_key") != null);
 
     const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
     try std.testing.expect(std.mem.indexOf(u8, facts, "holt_backend = \"gdrive\"") != null);
@@ -1008,6 +1024,7 @@ test "apply interview: a work answer path asks gdrive_account/onepassword facts 
     try std.testing.expect(std.mem.indexOf(u8, facts, "gdrive_account = \"drive@example.com\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, facts, "onepassword_account = \"team@example.com\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, facts, "onepassword_vault = \"vault-x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "signing_work_key = \"\"") != null);
     _ = r.rc;
 }
 

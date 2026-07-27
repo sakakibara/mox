@@ -20,14 +20,20 @@
 //!     emit them -- a managed file's base content (recursing into every
 //!     nested `# mox: when`/`for` region), a directive's literal body, and
 //!     the fragment file an `include`/`append`/`prepend`/`replace`/`from`
-//!     target or a Cat B region names -- each with its `| default` and its
-//!     asking condition: the conjunction of enclosing conditions that are
-//!     both cleanly axis-expressible and required for emission (a
-//!     negated-gate body contributes `not <gate>`; a from-fallback body, a
-//!     for-loop's per-row emission, and a tuple-matched fragment pick are not
-//!     cleanly expressible and contribute nothing -- over-asking is safe,
-//!     under-asking is not).
+//!     target or a Cat B region names -- each with its `| default`.
 //!   - presence-only: a bare `when NAME` gate.
+//!
+//! Every occurrence of every role -- value-compared, presence, or captured
+//! alike -- carries an asking condition: the conjunction of enclosing
+//! conditions that are both cleanly axis-expressible and required for
+//! emission, AND its conjunction-sibling predicates within the same `and`
+//! (its own atom excluded; a sibling under an `or` contributes nothing, an
+//! atom there can be demanded alone). A negated-gate body contributes
+//! `not <gate>`; a from-fallback body, a for-loop's per-row emission, and a
+//! tuple-matched fragment pick are not cleanly expressible and contribute
+//! nothing -- over-asking is safe, under-asking is not. A dimension's
+//! `asking_condition` is the OR of every occurrence's condition, null the
+//! moment any single occurrence is itself unconditioned.
 //!
 //! Built-ins, the open probe axes, reserved axis names, and `data/facts.toml`-
 //! derived names are excluded by category, never by a hand-written name list.
@@ -100,11 +106,13 @@ pub const Dimension = struct {
     /// conflicting declarations for the same name resolve to no value here
     /// (see `Discovery.default_diagnostics`) rather than an arbitrary pick.
     declared_defaults: []const []const u8,
-    /// The OR of the enclosing-gate expressions of this dimension's CAPTURE
-    /// occurrences. Null when the dimension has any value-compared or
-    /// presence occurrence (the comparison itself is the demand -- D2), or
-    /// when any capture occurrence is unconditioned, or when it has no
-    /// capture occurrence at all.
+    /// The OR of every occurrence's condition, across ALL roles
+    /// (value-compared, presence, captured alike): each occurrence's own
+    /// enclosing gates conjoined with its conjunction-sibling predicates
+    /// (its own atom excluded). Null the moment any single occurrence is
+    /// itself unconditioned -- so a fact compared or captured unconditionally
+    /// even once, anywhere in the repo, is always asked (conservative-ask:
+    /// over-asking is safe, under-asking is the defect class).
     asking_condition: ?*const AxisExpr,
     provenance: Provenance,
 };
@@ -283,9 +291,10 @@ const DimWork = struct {
     roles: Roles = .{},
     observed_values: std.StringHashMap(void),
     capture_defaults: std.StringHashMap(void),
-    /// One entry per capture occurrence: its enclosing-gate condition, or
-    /// null when unconditioned. Order does not matter (OR is commutative).
-    capture_conditions: std.ArrayList(?*const AxisExpr),
+    /// One entry per occurrence -- value-compared, presence, or captured
+    /// alike -- of its condition, or null when that occurrence is itself
+    /// unconditioned. Order does not matter (OR is commutative).
+    occurrence_conditions: std.ArrayList(?*const AxisExpr),
     sources: std.StringHashMap(void),
 };
 
@@ -327,7 +336,7 @@ const Discoverer = struct {
             gop.value_ptr.* = .{
                 .observed_values = std.StringHashMap(void).init(self.arena),
                 .capture_defaults = std.StringHashMap(void).init(self.arena),
-                .capture_conditions = .empty,
+                .occurrence_conditions = .empty,
                 .sources = std.StringHashMap(void).init(self.arena),
             };
         }
@@ -342,29 +351,43 @@ const Discoverer = struct {
 
     // -- axis (value-compared / presence) scanning --------------------------
 
-    fn recordAxisExpr(self: *Discoverer, expr: *const AxisExpr, source_key: []const u8) !void {
+    /// Record every atom in `expr`, each with its own occurrence condition:
+    /// `ctx` (the enclosing gates already accumulated) AND, for an atom
+    /// nested under an `and_`, its conjunction-sibling atoms at every level
+    /// (its own atom excluded) -- an atom nested under an `or_` inherits
+    /// `ctx` unchanged, since a disjunction's other branch is never required
+    /// for THIS branch's own demand (the conservative-ask law: over-asking
+    /// is safe, so an atom under an `or` with no enclosing gate is
+    /// unconditioned). This applies uniformly to every role (value-compared,
+    /// presence): the comparison is no longer assumed to be its own,
+    /// unconditioned demand -- a gate or comparison nested inside another or
+    /// conjoined with a sibling predicate is exactly as conditioned as a
+    /// capture would be at the same position.
+    fn recordAxisExpr(self: *Discoverer, expr: *const AxisExpr, source_key: []const u8, ctx: ?*const AxisExpr) !void {
         switch (expr.*) {
             .eq => |e| {
                 if (try self.dimFor(e.axis)) |dw| {
                     dw.roles.value_compared = true;
                     try dw.observed_values.put(try self.arena.dupe(u8, e.value), {});
                     try dw.sources.put(source_key, {});
+                    try dw.occurrence_conditions.append(self.arena, ctx);
                 }
             },
             .present => |n| {
                 if (try self.dimFor(n)) |dw| {
                     dw.roles.presence = true;
                     try dw.sources.put(source_key, {});
+                    try dw.occurrence_conditions.append(self.arena, ctx);
                 }
             },
-            .not => |inner| try self.recordAxisExpr(inner, source_key),
+            .not => |inner| try self.recordAxisExpr(inner, source_key, ctx),
             .and_ => |a| {
-                try self.recordAxisExpr(a.left, source_key);
-                try self.recordAxisExpr(a.right, source_key);
+                try self.recordAxisExpr(a.left, source_key, try combineAndSibling(self.arena, ctx, a.right));
+                try self.recordAxisExpr(a.right, source_key, try combineAndSibling(self.arena, ctx, a.left));
             },
             .or_ => |o| {
-                try self.recordAxisExpr(o.left, source_key);
-                try self.recordAxisExpr(o.right, source_key);
+                try self.recordAxisExpr(o.left, source_key, ctx);
+                try self.recordAxisExpr(o.right, source_key, ctx);
             },
         }
     }
@@ -384,7 +407,19 @@ const Discoverer = struct {
         return true;
     }
 
-    fn recordRowExpr(self: *Discoverer, expr: *const dsl.ast.RowExpr, source_key: []const u8, loop_vars: []const []const u8) !void {
+    /// `ctx` is the enclosing-gate condition (same contract as
+    /// `recordAxisExpr`'s `ctx`), threaded through unchanged by `and_`/`or_`/
+    /// `not`: a row predicate's own conjunction siblings are NOT folded into
+    /// a leaf's condition here, unlike `recordAxisExpr` -- they evaluate
+    /// per-row against a loop frame at compose time (a `<var>.field`
+    /// comparison, not a static axis), so a sibling row predicate has no
+    /// `AxisExpr` shape to conjoin with `ctx` in the first place. Only the
+    /// machine-axis leaves this grammar can still produce (`present`/`has`/
+    /// `eq`/`axis_with_field` on a bare, undotted ref) get an occurrence
+    /// condition at all, and it is exactly `ctx` -- over-asking-safe, same
+    /// as this grammar's condition contract before this fix, just now
+    /// actually wired to the enclosing gate stack instead of always null.
+    fn recordRowExpr(self: *Discoverer, expr: *const dsl.ast.RowExpr, source_key: []const u8, loop_vars: []const []const u8, ctx: ?*const AxisExpr) !void {
         switch (expr.*) {
             // `<axis>=<var>.field`: the axis name is static even though the
             // compared value is a row field known only at compose time, so it
@@ -393,6 +428,7 @@ const Discoverer = struct {
                 if (try self.dimFor(a.axis)) |dw| {
                     dw.roles.value_compared = true;
                     try dw.sources.put(source_key, {});
+                    try dw.occurrence_conditions.append(self.arena, ctx);
                 }
             },
             // `bound <var>.field` names no axis statically (the bound name is
@@ -408,6 +444,7 @@ const Discoverer = struct {
                 if (try self.dimFor(ref)) |dw| {
                     dw.roles.presence = true;
                     try dw.sources.put(source_key, {});
+                    try dw.occurrence_conditions.append(self.arena, ctx);
                 }
             },
             .has => |h| {
@@ -416,6 +453,7 @@ const Discoverer = struct {
                     dw.roles.value_compared = true;
                     try dw.observed_values.put(try self.arena.dupe(u8, h.value), {});
                     try dw.sources.put(source_key, {});
+                    try dw.occurrence_conditions.append(self.arena, ctx);
                 }
             },
             .eq => |e| {
@@ -424,16 +462,17 @@ const Discoverer = struct {
                     dw.roles.value_compared = true;
                     try dw.observed_values.put(try self.arena.dupe(u8, e.value), {});
                     try dw.sources.put(source_key, {});
+                    try dw.occurrence_conditions.append(self.arena, ctx);
                 }
             },
-            .not => |inner| try self.recordRowExpr(inner, source_key, loop_vars),
+            .not => |inner| try self.recordRowExpr(inner, source_key, loop_vars, ctx),
             .and_ => |a| {
-                try self.recordRowExpr(a.left, source_key, loop_vars);
-                try self.recordRowExpr(a.right, source_key, loop_vars);
+                try self.recordRowExpr(a.left, source_key, loop_vars, ctx);
+                try self.recordRowExpr(a.right, source_key, loop_vars, ctx);
             },
             .or_ => |o| {
-                try self.recordRowExpr(o.left, source_key, loop_vars);
-                try self.recordRowExpr(o.right, source_key, loop_vars);
+                try self.recordRowExpr(o.left, source_key, loop_vars, ctx);
+                try self.recordRowExpr(o.right, source_key, loop_vars, ctx);
             },
         }
     }
@@ -442,19 +481,24 @@ const Discoverer = struct {
     /// nesting depth it visits -- a nested `# mox: when` inside a
     /// `when`/`for`/`append`/... body is honored by compose's own recursive
     /// emit, so a fact compared only there is as real a dimension as one
-    /// compared at the top level.
-    fn recordDirectiveAxes(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8, loop_vars: []const []const u8) !void {
+    /// compared at the top level. `nest.gate_stack`'s conjunction (`ctx`)
+    /// becomes the base occurrence condition for every atom this directive's
+    /// own axis/row expression records -- a directive's `when` a level
+    /// deeper than its enclosing gate carries that outer gate too, same as a
+    /// capture at the same position already did.
+    fn recordDirectiveAxes(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8, nest: Nest) !void {
+        const ctx = try combineAnd(self.arena, nest.gate_stack);
         switch (d.kind) {
-            .include => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
-            .replace => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
-            .append => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
-            .prepend => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
-            .remove => |k| try self.recordAxisExpr(k.when, source_key),
+            .include => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx),
+            .replace => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx),
+            .append => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx),
+            .prepend => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx),
+            .remove => |k| try self.recordAxisExpr(k.when, source_key, ctx),
             .when_gate => |k| {
                 if (k.when) |w|
-                    try self.recordAxisExpr(w, source_key)
+                    try self.recordAxisExpr(w, source_key, ctx)
                 else if (k.row_when) |r|
-                    try self.recordRowExpr(r, source_key, loop_vars);
+                    try self.recordRowExpr(r, source_key, nest.loop_vars, ctx);
             },
             .for_loop => |k| {
                 // `when` is a pre-row axis gate: it evaluates before any row
@@ -468,13 +512,13 @@ const Discoverer = struct {
                 // treats a loop variable appearing inside the loop's BODY.
                 // Recording it with the enclosing (variable-less) `loop_vars`
                 // would misread it as a phantom axis dimension.
-                if (k.when) |w| try self.recordAxisExpr(w, source_key);
+                if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx);
                 if (k.where) |r| {
-                    const row_scope = try appendStr(self.arena, loop_vars, k.variable);
-                    try self.recordRowExpr(r, source_key, row_scope);
+                    const row_scope = try appendStr(self.arena, nest.loop_vars, k.variable);
+                    try self.recordRowExpr(r, source_key, row_scope, ctx);
                 }
             },
-            .completions => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
+            .completions => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx),
             .from, .secret, .default => {},
         }
     }
@@ -507,12 +551,17 @@ const Discoverer = struct {
         });
     }
 
+    /// An overlay/fragment filename tuple's pairs are always unconditioned
+    /// occurrences: a `.d/os=linux` variant's existence demands `os`
+    /// regardless of any gate (there is no enclosing `nest` at this scan
+    /// site to inherit a condition from).
     fn recordTuple(self: *Discoverer, tuple: source.tree.AxisTuple, source_key: []const u8) !void {
         for (tuple.pairs) |p| {
             if (try self.dimFor(p.name)) |dw| {
                 dw.roles.value_compared = true;
                 try dw.observed_values.put(try self.arena.dupe(u8, p.value), {});
                 try dw.sources.put(source_key, {});
+                try dw.occurrence_conditions.append(self.arena, null);
             }
         }
     }
@@ -568,7 +617,7 @@ const Discoverer = struct {
         else
             dsl.driver.parseFile(self.arena, content, nest.marker, null) catch return;
 
-        for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key, nest.loop_vars);
+        for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key, nest);
         for (parsed.directives) |d| try self.recordDeclaredDefault(d, source_key);
 
         const condition = try combineAnd(self.arena, nest.gate_stack);
@@ -725,7 +774,7 @@ const Discoverer = struct {
             const dw = (try self.dimFor(field)) orelse continue;
             dw.roles.captured = true;
             try dw.sources.put(source_key, {});
-            try dw.capture_conditions.append(self.arena, condition);
+            try dw.occurrence_conditions.append(self.arena, condition);
             if (split.default) |def| try dw.capture_defaults.put(try self.arena.dupe(u8, def), {});
         }
     }
@@ -743,6 +792,7 @@ const Discoverer = struct {
             if (try self.dimFor(rg.name)) |dw| {
                 dw.roles.value_compared = true;
                 try dw.sources.put(source_key, {});
+                try dw.occurrence_conditions.append(self.arena, null);
             }
             for (rg.fragments) |fr| {
                 try self.recordTuple(fr.tuple, source_key);
@@ -819,7 +869,7 @@ const Discoverer = struct {
         const head = scanScriptHead(content);
         if (head.when) |expr_src| {
             if (dsl.axis.parseString(self.arena, expr_src)) |expr| {
-                try self.recordAxisExpr(expr, rel_path);
+                try self.recordAxisExpr(expr, rel_path, null);
             } else |_| {
                 // A malformed head expression is the apply-time run's problem
                 // to report; discovery keeps the raw text and contributes no
@@ -1036,6 +1086,16 @@ fn combineOr(arena: std.mem.Allocator, a: ?*const AxisExpr, b: *const AxisExpr) 
     return node;
 }
 
+/// `ctx` with `sibling` conjoined -- `recordAxisExpr`'s conjunction-sibling
+/// rule: when recording one side of an `and_`, the OTHER side becomes an
+/// extra required condition for every atom the first side records.
+fn combineAndSibling(arena: std.mem.Allocator, ctx: ?*const AxisExpr, sibling: *const AxisExpr) !?*const AxisExpr {
+    const c = ctx orelse return sibling;
+    const node = try arena.create(AxisExpr);
+    node.* = .{ .and_ = .{ .left = c, .right = sibling } };
+    return node;
+}
+
 /// `stack` with `expr` appended (a fresh copy; `stack` itself is untouched).
 fn appendStack(arena: std.mem.Allocator, stack: []const *const AxisExpr, expr: *const AxisExpr) ![]const *const AxisExpr {
     const out = try arena.alloc(*const AxisExpr, stack.len + 1);
@@ -1066,15 +1126,14 @@ fn appendStr(arena: std.mem.Allocator, list: []const []const u8, item: []const u
     return out;
 }
 
-/// Null when the dimension has any value-compared or presence occurrence
-/// (per D2, that comparison IS the demand, unconditionally), when it has no
-/// capture occurrence at all, or when any capture occurrence is itself
-/// unconditioned. Otherwise the OR of every capture occurrence's condition.
+/// Null the moment any single occurrence (across every role: value-compared,
+/// presence, captured) is itself unconditioned, or when the dimension somehow
+/// has no occurrence at all. Otherwise the OR of every occurrence's
+/// condition.
 fn computeAskingCondition(arena: std.mem.Allocator, dw: *const DimWork) !?*const AxisExpr {
-    if (dw.roles.value_compared or dw.roles.presence) return null;
-    if (dw.capture_conditions.items.len == 0) return null;
+    if (dw.occurrence_conditions.items.len == 0) return null;
     var combined: ?*const AxisExpr = null;
-    for (dw.capture_conditions.items) |maybe_cond| {
+    for (dw.occurrence_conditions.items) |maybe_cond| {
         const cond = maybe_cond orelse return null;
         combined = try combineOr(arena, combined, cond);
     }
@@ -1518,6 +1577,150 @@ test "discover: the same name gate-compared elsewhere yields a null asking_condi
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
+}
+
+// -- occurrence conditions apply to every role (value-compared, presence), --
+// -- not only captures; conjunction siblings condition each other -----------
+
+test "discover: a top-level solo eq atom is unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when use_1password_ssh_agent=true\nx = 1\n# mox: end\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "use_1password_ssh_agent").?;
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a conjunction-sibling presence occurrence is conditioned on the other conjunct" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig",
+        "# mox: when profile=work and signing_work_key\nx = 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "signing_work_key").?;
+    try std.testing.expect(dim.roles.presence);
+    const cond = dim.asking_condition.?;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("profile", "personal");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+    try bindings.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: both sides of a top-level `or` are unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when a_fact or b_fact\nx = 1\n# mox: end\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "a_fact").?.asking_condition == null);
+    try std.testing.expect(findDim(d, "b_fact").?.asking_condition == null);
+}
+
+test "discover: an or-branch nested in an and inherits the and's other conjunct, not each other" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig",
+        "# mox: when profile=work and (a_fact or b_fact)\nx = 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    for ([_][]const u8{ "a_fact", "b_fact" }) |name| {
+        const dim = findDim(d, name).?;
+        const cond = dim.asking_condition.?;
+        var bindings = std.StringHashMap([]const u8).init(a);
+        var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+        try bindings.put("profile", "personal");
+        try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+        try bindings.put("profile", "work");
+        try std.testing.expect(dsl.axis.evaluate(cond, &r));
+    }
+}
+
+test "discover: an occurrence nested inside another directive's own gate inherits it (value-compared, not just captured)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig",
+        "# mox: when profile=work\n# mox: when holt_backend=gdrive\nx = 1\n# mox: end\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "holt_backend").?;
+    try std.testing.expect(dim.roles.value_compared);
+    const cond = dim.asking_condition.?;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("profile", "personal");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+    try bindings.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: a fact conditioned here but ALSO used unguarded elsewhere yields a null asking_condition" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig",
+        "# mox: when profile=work and signing_work_key\nx = 1\n# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when signing_work_key\ny = 1\n# mox: end\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "signing_work_key").?.asking_condition == null);
 }
 
 test "discover: multiple captures under different gates OR together" {

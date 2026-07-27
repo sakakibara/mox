@@ -3,17 +3,26 @@
 //!
 //! A dimension is asked when it is unbound (an existing binding, even the
 //! empty string, is a persisted decline and is never re-asked) and its
-//! `asking_condition` -- the OR of its capture occurrences' enclosing gates,
-//! null for a value-compared or presence-only dimension, whose comparison
-//! IS the demand -- evaluates true against the bindings accumulated so far
-//! this run (axes, existing facts, and earlier answers in the same walk).
-//! Dimensions are asked in FIXPOINT waves: everything eligible right now is
-//! asked, then the walk re-evaluates every remaining dimension's condition
-//! against the freshly widened bindings and asks whatever that newly
-//! exposed, repeating until nothing more becomes eligible. This is how a
-//! personal/icloud machine's answers never expose `gdrive_account` or a
-//! work-profile-gated fact, while a work answer exposes them in the same
-//! run. Within one wave, dimensions are asked in name order.
+//! `asking_condition` -- the OR of every occurrence's condition, across
+//! every role, null the moment any single occurrence is itself unconditioned
+//! -- evaluates true against the bindings accumulated so far this run (axes,
+//! existing facts, and earlier answers in the same walk). Dimensions are
+//! asked in FIXPOINT waves: everything eligible right now is asked, then the
+//! walk re-evaluates every remaining dimension's condition against the
+//! freshly widened bindings and asks whatever that newly exposed, repeating
+//! until nothing more becomes eligible. This is how a personal/icloud
+//! machine's answers never expose `gdrive_account` or a work-profile-gated
+//! fact, while a work answer exposes them in the same run.
+//!
+//! Within an eligible round, a dimension whose condition still names an
+//! unbound, unresolved dimension is DEFERRED rather than asked immediately:
+//! a negated condition (`not profile=work`) is vacuously true while `profile`
+//! itself is still unbound, so without deferral it could be asked before the
+//! very fact it negates -- deferral holds it until that fact is bound (then
+//! it is asked or skipped, correctly, on the next round) or exhausted. A
+//! round where every eligible dimension defers on another (an unresolvable
+//! cycle) falls back to asking the whole eligible set at once rather than
+//! stalling forever. Within one wave, dimensions are asked in name order.
 //!
 //! Each prompt shows an advisory choice list (`observed_values`, `
 //! capture_defaults`, and `declared_defaults`, unioned and sorted -- free
@@ -82,15 +91,31 @@ pub fn walkDimensions(
     var answers: std.ArrayList(state_mod.Fact) = .empty;
 
     while (true) {
-        var wave: std.ArrayList(dimensions.Dimension) = .empty;
+        var eligible: std.ArrayList(dimensions.Dimension) = .empty;
         for (dims) |d| {
             if (resolver.lookup(d.name) != null) continue;
             if (d.asking_condition) |cond| {
                 if (!dsl.axis.evaluate(cond, &resolver)) continue;
             }
+            try eligible.append(arena, d);
+        }
+        if (eligible.items.len == 0) break;
+
+        // Deferral: a conditioned dimension whose condition still names an
+        // unbound, unresolved dimension is withheld this round -- a
+        // negated condition (`not profile=work`) is vacuously true while
+        // `profile` itself is unbound, so without this it could jump ahead
+        // of the very fact it negates. A round where every eligible
+        // dimension defers on another (a cycle no ordering can resolve)
+        // falls back to the raw eligible set instead of stalling forever:
+        // asking (or declining) every member at once breaks the cycle and
+        // guarantees termination.
+        var wave: std.ArrayList(dimensions.Dimension) = .empty;
+        for (eligible.items) |d| {
+            if (try isDeferred(arena, d, dims, &resolver)) continue;
             try wave.append(arena, d);
         }
-        if (wave.items.len == 0) break;
+        if (wave.items.len == 0) wave = eligible;
         std.mem.sort(dimensions.Dimension, wave.items, {}, dimNameLess);
 
         for (wave.items) |d| {
@@ -234,6 +259,53 @@ pub fn writeUnboundNotice(out: *Io.Writer, prefix: []const u8, names: []const []
     try out.print("{s}unbound facts:", .{prefix});
     for (names) |n| try out.print(" {s}", .{n});
     try out.print("\n{s}Answer interactively (mox apply / mox facts) or set directly (mox facts set <name> <value>).\n", .{prefix});
+}
+
+/// True when `d`'s condition names some fact `f` (other than itself) that is
+/// both unbound and still a real, unresolved dimension in `dims` -- `d` is
+/// withheld this round so a vacuously-true negated condition never jumps
+/// ahead of the fact it negates (see `walkDimensions`'s wave computation).
+fn isDeferred(
+    arena: std.mem.Allocator,
+    d: dimensions.Dimension,
+    dims: []const dimensions.Dimension,
+    resolver: *const dsl.resolver.Resolver,
+) !bool {
+    const cond = d.asking_condition orelse return false;
+    var names: std.ArrayList([]const u8) = .empty;
+    try referencedNames(arena, cond, &names);
+    for (names.items) |f| {
+        if (std.mem.eql(u8, f, d.name)) continue;
+        if (resolver.lookup(f) != null) continue;
+        if (dimNamed(dims, f) != null) return true;
+    }
+    return false;
+}
+
+/// Every axis name an `AxisExpr` condition's `eq`/`present` leaves reference,
+/// appended in tree order (duplicates are harmless -- callers only check
+/// membership).
+fn referencedNames(arena: std.mem.Allocator, expr: *const dsl.ast.AxisExpr, out: *std.ArrayList([]const u8)) !void {
+    switch (expr.*) {
+        .eq => |e| try out.append(arena, e.axis),
+        .present => |n| try out.append(arena, n),
+        .not => |inner| try referencedNames(arena, inner, out),
+        .and_ => |a| {
+            try referencedNames(arena, a.left, out);
+            try referencedNames(arena, a.right, out);
+        },
+        .or_ => |o| {
+            try referencedNames(arena, o.left, out);
+            try referencedNames(arena, o.right, out);
+        },
+    }
+}
+
+fn dimNamed(dims: []const dimensions.Dimension, name: []const u8) ?dimensions.Dimension {
+    for (dims) |d| {
+        if (std.mem.eql(u8, d.name, name)) return d;
+    }
+    return null;
 }
 
 fn dimNameLess(_: void, a: dimensions.Dimension, b: dimensions.Dimension) bool {
@@ -393,6 +465,85 @@ fn eqExpr(arena: std.mem.Allocator, axis: []const u8, value: []const u8) !*const
     const e = try arena.create(dsl.ast.AxisExpr);
     e.* = .{ .eq = .{ .axis = axis, .value = value } };
     return e;
+}
+
+fn notExpr(arena: std.mem.Allocator, inner: *const dsl.ast.AxisExpr) !*const dsl.ast.AxisExpr {
+    const e = try arena.create(dsl.ast.AxisExpr);
+    e.* = .{ .not = inner };
+    return e;
+}
+
+test "walkDimensions: a negated condition is deferred while the fact it negates is still unbound and askable -- asked after, skipped when the fact resolves true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gate = try eqExpr(a, "profile", "work");
+    const neg = try notExpr(a, gate);
+    const dims = [_]dimensions.Dimension{
+        testDim("personal_only_thing", .{ .captured = true, .asking_condition = neg }),
+        testDim("profile", .{ .value_compared = true, .observed_values = &.{"work"} }),
+    };
+
+    // profile answers "work": the vacuously-true "not profile=work" (true
+    // while profile is still unbound) must not have jumped the gun and
+    // asked personal_only_thing before profile resolved -- once resolved,
+    // its condition goes false and it is skipped entirely.
+    {
+        var bindings = std.StringHashMap([]const u8).init(a);
+        var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+        var r: dsl.resolver.Resolver = .{ .live = &live };
+        var input = Io.Reader.fixed("work\n");
+        var out_buf: [4096]u8 = undefined;
+        var out: Io.Writer = .fixed(&out_buf);
+        const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+        try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
+        try std.testing.expectEqualStrings("profile", outcome.answers[0].name);
+    }
+    // profile answers "" (declined, not "work"): deferred while profile was
+    // unbound, then asked once profile resolves false, in that order.
+    {
+        var bindings = std.StringHashMap([]const u8).init(a);
+        var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+        var r: dsl.resolver.Resolver = .{ .live = &live };
+        var input = Io.Reader.fixed("\nside-value\n");
+        var out_buf: [4096]u8 = undefined;
+        var out: Io.Writer = .fixed(&out_buf);
+        const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+        try std.testing.expectEqual(@as(usize, 2), outcome.answers.len);
+        try std.testing.expectEqualStrings("profile", outcome.answers[0].name);
+        try std.testing.expectEqualStrings("personal_only_thing", outcome.answers[1].name);
+        try std.testing.expectEqualStrings("side-value", outcome.answers[1].value);
+    }
+}
+
+test "walkDimensions: a mutual negated-condition cycle still terminates -- both eventually asked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Neither fact's condition can ever resolve without the other one first
+    // -- deferral alone would stall forever; the cycle-breaker must ask both
+    // once no further progress is otherwise possible.
+    const present_b = try arena.allocator().create(dsl.ast.AxisExpr);
+    present_b.* = .{ .present = "fact_b" };
+    const not_b = try notExpr(a, present_b);
+    const present_a = try arena.allocator().create(dsl.ast.AxisExpr);
+    present_a.* = .{ .present = "fact_a" };
+    const not_a = try notExpr(a, present_a);
+
+    const dims = [_]dimensions.Dimension{
+        testDim("fact_a", .{ .captured = true, .asking_condition = not_b }),
+        testDim("fact_b", .{ .captured = true, .asking_condition = not_a }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+    var input = Io.Reader.fixed("va\nvb\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+    try std.testing.expectEqual(@as(usize, 2), outcome.answers.len);
 }
 
 test "walkDimensions: fixpoint exposure -- a work answer asks the gated dimension in the same run, personal never does" {
