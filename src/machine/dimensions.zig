@@ -374,8 +374,22 @@ const Discoverer = struct {
                     try self.recordRowExpr(r, source_key, loop_vars);
             },
             .for_loop => |k| {
+                // `when` is a pre-row axis gate: it evaluates before any row
+                // is bound, so the loop's own variable is not in scope for
+                // it, and `loop_vars` is passed unchanged. `where` evaluates
+                // PER ROW, with the loop's own frame already bound
+                // (composeGenerator/evalRow prepend `loop.variable` before
+                // evaluating it) -- so a bare reference to the loop variable
+                // itself (`where entry`) is that row's own presence check,
+                // not a machine axis, exactly like `bareAxisRef` already
+                // treats a loop variable appearing inside the loop's BODY.
+                // Recording it with the enclosing (variable-less) `loop_vars`
+                // would misread it as a phantom axis dimension.
                 if (k.when) |w| try self.recordAxisExpr(w, source_key);
-                if (k.where) |r| try self.recordRowExpr(r, source_key, loop_vars);
+                if (k.where) |r| {
+                    const row_scope = try appendStr(self.arena, loop_vars, k.variable);
+                    try self.recordRowExpr(r, source_key, row_scope);
+                }
             },
             .completions => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
             .from, .secret, .default => {},
@@ -1809,7 +1823,7 @@ test "discover: a capture field outside the fact-name charset is not a dimension
     try std.testing.expectEqualStrings("Bad-Name", d.diagnostics[0].name);
 }
 
-// -- capture positions beyond a `when_gate` body (Finding 1) ----------------
+// -- capture positions beyond a `when_gate` body -----------------------------
 
 test "discover: an append body's capture is unconditioned (always emitted)" {
     const io = std.testing.io;
@@ -2138,7 +2152,7 @@ test "discover: a gate-true replace fragment target's capture gets the replace's
     try std.testing.expectEqualStrings("work", cond.eq.value);
 }
 
-// -- axis roles at full depth (Finding 4) ------------------------------------
+// -- axis roles at full depth -------------------------------------------------
 
 test "discover: an axis compared only in a `when` nested inside a for body is still value-compared" {
     const io = std.testing.io;
@@ -2240,6 +2254,51 @@ test "discover: a `for` loop's own `when` clause nested inside a when-gate is st
     const dim = findDim(d, "nested_for_axis").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqualStrings("val", dim.observed_values[0]);
+}
+
+test "discover: a for loop's own `where` referencing its own loop variable is not a phantom axis" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `where entry` is a bare, undotted reference to the loop's OWN
+    // variable: compose evaluates it with the loop's own frame already
+    // bound (composeGenerator/evalRow prepend it before evalRow runs), so
+    // it is that row's own presence check, not a machine axis.
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\" where entry\n# x 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "entry") == null);
+}
+
+test "discover: a for loop's own `where` referencing a genuine machine fact is still recorded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\" where signing_key\n# x 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "signing_key").?;
+    try std.testing.expect(dim.roles.presence);
 }
 
 // -- declared defaults (`# mox: default`) ------------------------------------
