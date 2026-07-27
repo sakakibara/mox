@@ -67,6 +67,7 @@ fn fuzzAxis(_: void, smith: *Smith) anyerror!void {
     // Bindings from the same bytes: whitespace-split tokens become `k=v`
     // (compound axis) or bare-`k` presence entries.
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var it = std.mem.tokenizeAny(u8, input, " \t\r\n");
     while (it.next()) |tok| {
         if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
@@ -76,7 +77,7 @@ fn fuzzAxis(_: void, smith: *Smith) anyerror!void {
             bindings.put(tok, "1") catch {};
         }
     }
-    _ = mox.dsl.axis.evaluate(expr, &bindings);
+    _ = mox.dsl.axis.evaluate(expr, &bindings_r);
 }
 
 /// Drive the template capture engine over arbitrary bytes: lint, then (when it

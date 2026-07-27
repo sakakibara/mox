@@ -141,6 +141,12 @@ const ClassCtx = struct {
     arena: std.mem.Allocator,
     io: Io,
     this_bindings: *const std.StringHashMap([]const u8),
+    /// Same underlying bindings as `this_bindings`, wrapped for the
+    /// evaluation surfaces (compose, overlay/fragment matching) that take a
+    /// resolver rather than a raw map. `this_bindings` itself stays raw for
+    /// `config_space.enumerate`/`candidates.compute`, which manipulate the
+    /// map directly (clone, remove, iterate) and are not evaluation surfaces.
+    resolver: *const mox.dsl.resolver.Resolver,
     m_state: *const mox.machine.state.MachineState,
     secrets: mox.compose.catB.SecretCtx,
     /// This machine's `machine`-axis value (the hostname's first label, same
@@ -403,6 +409,7 @@ pub fn commitImpl(
     // recompose (later in this same run) sees the new value.
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
@@ -486,6 +493,7 @@ pub fn commitImpl(
         .arena = ctx.alloc,
         .io = ctx.io,
         .this_bindings = &bindings,
+        .resolver = &axis_resolver,
         .m_state = &m_state,
         .secrets = secrets,
         .machine = mox.machine.bindings.firstLabel(m_state.hostname),
@@ -643,7 +651,7 @@ pub fn commitImpl(
         // stamp, which is the only honest description of what live came from.
         if (commit_struct.formatOfPath(file.source_base_path) != null) {
             var fresh: std.ArrayList(Segment) = .empty;
-            if (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &fresh, null) catch null) |now| {
+            if (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &fresh, null) catch null) |now| {
                 if (std.mem.eql(u8, now, last_content)) prov.segments = fresh.items;
             }
         }
@@ -970,7 +978,7 @@ pub fn commitImpl(
         const configs = spaces[fidx].?.configs;
         const file2 = findByLive(tree2, file.live_path) orelse file;
         var prov2: std.ArrayList(Segment) = .empty;
-        const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file2, &bindings, &m_state, secrets, &prov2, null) catch |e| {
+        const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file2, &axis_resolver, &m_state, secrets, &prov2, null) catch |e| {
             try ctx.err.print("mox commit: {s}: recompose failed; not committed: {s}\n", .{ file.live_path, @errorName(e) });
             mismatch = true;
             rolled_back[fidx] = true;
@@ -1832,7 +1840,7 @@ fn structLayers(
     arena: std.mem.Allocator,
     io: Io,
     file: mox.source.tree.ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const mox.dsl.resolver.Resolver,
     format: commit_struct.Format,
 ) ![]const commit_struct.StructLayer {
     const paths = try mox.compose.catA.matchingLayerPaths(arena, file, bindings);
@@ -2035,7 +2043,7 @@ fn routeStructChanges(
 ) !HunkOutcome {
     ra.affected[fidx] = true;
 
-    const layers = structLayers(cc.arena, cc.io, file, cc.this_bindings, format) catch |e| switch (e) {
+    const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             ra.manual_count.* += 1;
@@ -2145,7 +2153,7 @@ fn processPartialFile(
 
     var prov: std.ArrayList(Segment) = .empty;
     var cdiag: mox.compose.interp.Diag = .{};
-    const composed = mox.compose.composeFileTracked(arena, cc.io, file, cc.this_bindings, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| switch (e) {
+    const composed = mox.compose.composeFileTracked(arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (compose failed: {s})\n", .{ live_path, @errorName(e) });
@@ -4535,10 +4543,12 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
     var err_aw: Io.Writer.Allocating = .init(a);
     var reader = Io.Reader.fixed("");
     var claims: Claims = .empty;
+    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const cc: ClassCtx = .{
         .arena = a,
         .io = faulty,
         .this_bindings = &bindings,
+        .resolver = &axis_resolver,
         .m_state = &m_state,
         .secrets = .{ .env = mox.env.Env{ .map = &secret_map }, .cache = &secret_cache },
         .machine = mox.machine.bindings.firstLabel(m_state.hostname),

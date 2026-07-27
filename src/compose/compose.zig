@@ -23,7 +23,7 @@ pub fn composeFile(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
 ) !?[]u8 {
@@ -47,7 +47,7 @@ pub fn composeFileTracked(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),

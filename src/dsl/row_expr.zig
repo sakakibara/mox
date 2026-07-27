@@ -23,10 +23,12 @@ const ast = @import("ast.zig");
 const tokens_mod = @import("tokens.zig");
 const lexer = @import("lexer.zig");
 const axis_mod = @import("axis.zig");
+const resolver_mod = @import("resolver.zig");
 const data_value = @import("../data/value.zig");
 
 const RowExpr = ast.RowExpr;
 const Token = tokens_mod.Token;
+const Resolver = resolver_mod.Resolver;
 
 /// A loop-variable binding in the scope: a record loop binds a table row, an
 /// array-element loop binds a scalar string. Shared with `compose/interp`,
@@ -237,7 +239,7 @@ pub fn evaluate(
     arena: std.mem.Allocator,
     expr: *const RowExpr,
     scope: []const Frame,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const Resolver,
     unknown_var: ?*[]const u8,
 ) EvalError!bool {
     return switch (expr.*) {
@@ -261,7 +263,7 @@ fn noteUnknown(unknown_var: ?*[]const u8, name: []const u8) EvalError {
 fn presentRef(
     ref: []const u8,
     scope: []const Frame,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const Resolver,
     unknown_var: ?*[]const u8,
 ) EvalError!bool {
     const r = splitRef(ref);
@@ -281,7 +283,7 @@ fn memberRef(
     ref: []const u8,
     value: []const u8,
     scope: []const Frame,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const Resolver,
     unknown_var: ?*[]const u8,
 ) EvalError!bool {
     const r = splitRef(ref);
@@ -314,7 +316,7 @@ fn axisWithField(
     axis: []const u8,
     field_ref: []const u8,
     scope: []const Frame,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const Resolver,
     unknown_var: ?*[]const u8,
 ) EvalError!bool {
     const r = splitRef(field_ref);
@@ -407,9 +409,10 @@ test "parse: a quoted literal axis eq accepts a UTF-8 value" {
     try std.testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", e.eq.value);
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("profile", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e");
     const scope: []const Frame = &.{};
-    try std.testing.expect(try evaluate(a, e, scope, &bindings, null));
+    try std.testing.expect(try evaluate(a, e, scope, &bindings_r, null));
 }
 
 test "parse: complex `not entry.X or entry.X has Y`" {
@@ -432,9 +435,10 @@ test "evaluate: present false when field unset" {
     defer arena.deinit();
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells");
-    try std.testing.expect(!try evaluate(arena.allocator(), e, &scope, &bindings, null));
+    try std.testing.expect(!try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
 }
 
 test "evaluate: present true when field set" {
@@ -443,9 +447,10 @@ test "evaluate: present true when field set" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("shells", .{ .string = "zsh" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells");
-    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
 }
 
 test "evaluate: unknown loop variable errors and records the name" {
@@ -453,12 +458,13 @@ test "evaluate: unknown loop variable errors and records the name" {
     defer arena.deinit();
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "id.shells");
     var unknown: []const u8 = "";
     try std.testing.expectError(
         error.UnknownLoopVariable,
-        evaluate(arena.allocator(), e, &scope, &bindings, &unknown),
+        evaluate(arena.allocator(), e, &scope, &bindings_r, &unknown),
     );
     try std.testing.expectEqualStrings("id", unknown);
 }
@@ -469,14 +475,15 @@ test "evaluate: a bare axis resolves against bindings, not the row" {
     const a = arena.allocator();
     var record = std.StringHashMap(data_value.Value).init(a);
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("os", "macos");
     const scope = entryScope(&record);
     const present_e = try parseString(a, "os");
-    try std.testing.expect(try evaluate(a, present_e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(a, present_e, &scope, &bindings_r, null));
     const eq_e = try parseString(a, "os=macos");
-    try std.testing.expect(try evaluate(a, eq_e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(a, eq_e, &scope, &bindings_r, null));
     const miss_e = try parseString(a, "os=linux");
-    try std.testing.expect(!try evaluate(a, miss_e, &scope, &bindings, null));
+    try std.testing.expect(!try evaluate(a, miss_e, &scope, &bindings_r, null));
 }
 
 test "evaluate: an outer frame resolves from an inner scope" {
@@ -486,13 +493,14 @@ test "evaluate: an outer frame resolves from an inner scope" {
     var outer = std.StringHashMap(data_value.Value).init(a);
     try outer.put("tag", .{ .string = "t" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &bindings };
     // Innermost first: `url` scalar shadows nothing; `outer` still reaches the record.
     const scope = [_]Frame{
         .{ .name = "url", .value = .{ .scalar = "x" } },
         .{ .name = "outer", .value = .{ .record = &outer } },
     };
     const e = try parseString(a, "outer.tag");
-    try std.testing.expect(try evaluate(a, e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(a, e, &scope, &bindings_r, null));
 }
 
 test "evaluate: has on string field equality" {
@@ -501,11 +509,12 @@ test "evaluate: has on string field equality" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("shells", .{ .string = "zsh" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells has \"zsh\"");
-    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
     const e2 = try parseString(arena.allocator(), "entry.shells has \"fish\"");
-    try std.testing.expect(!try evaluate(arena.allocator(), e2, &scope, &bindings, null));
+    try std.testing.expect(!try evaluate(arena.allocator(), e2, &scope, &bindings_r, null));
 }
 
 test "evaluate: has on array field membership" {
@@ -517,11 +526,12 @@ test "evaluate: has on array field membership" {
     items[1] = "fish";
     try record.put("shells", .{ .array_of_strings = items });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells has \"zsh\"");
-    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
     const e2 = try parseString(arena.allocator(), "entry.shells has \"bash\"");
-    try std.testing.expect(!try evaluate(arena.allocator(), e2, &scope, &bindings, null));
+    try std.testing.expect(!try evaluate(arena.allocator(), e2, &scope, &bindings_r, null));
 }
 
 test "evaluate: axis_with_field looks up substituted axis" {
@@ -530,10 +540,11 @@ test "evaluate: axis_with_field looks up substituted axis" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("when", .{ .string = "fd" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("tool=fd", "1");
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "tool=entry.when");
-    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
 }
 
 test "evaluate: axis_with_field returns false when binding absent" {
@@ -542,10 +553,11 @@ test "evaluate: axis_with_field returns false when binding absent" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("when", .{ .string = "zk" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("tool=fd", "1");
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "tool=entry.when");
-    try std.testing.expect(!try evaluate(arena.allocator(), e, &scope, &bindings, null));
+    try std.testing.expect(!try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
 }
 
 test "evaluate: axis_with_field matches an over-256-byte field value" {
@@ -556,8 +568,9 @@ test "evaluate: axis_with_field matches an over-256-byte field value" {
     var record = std.StringHashMap(data_value.Value).init(a);
     try record.put("when", .{ .string = long });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("tool=" ++ long, "1");
     const scope = entryScope(&record);
     const e = try parseString(a, "tool=entry.when");
-    try std.testing.expect(try evaluate(a, e, &scope, &bindings, null));
+    try std.testing.expect(try evaluate(a, e, &scope, &bindings_r, null));
 }

@@ -2,9 +2,11 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const tokens_mod = @import("tokens.zig");
 const lexer = @import("lexer.zig");
+const resolver_mod = @import("resolver.zig");
 
 const AxisExpr = ast.AxisExpr;
 const Token = tokens_mod.Token;
+const Resolver = resolver_mod.Resolver;
 
 pub const ParseError = error{
     ExpectedAxisName,
@@ -145,40 +147,24 @@ pub fn parseString(arena: std.mem.Allocator, src: []const u8) !*const AxisExpr {
     return expr;
 }
 
-/// Evaluate an axis expression against a bindings map.
-/// `bindings` maps axis name (e.g., "os") to value (e.g., "darwin").
+/// Evaluate an axis expression against a resolver.
 /// Missing axes evaluate as false for `eq` comparisons.
-pub fn evaluate(expr: *const AxisExpr, bindings: *const std.StringHashMap([]const u8)) bool {
+pub fn evaluate(expr: *const AxisExpr, resolver: *const Resolver) bool {
     return switch (expr.*) {
-        .eq => |e| eqMatch(e.axis, e.value, bindings),
-        .present => |name| presentMatch(name, bindings),
-        .not => |inner| !evaluate(inner, bindings),
-        .and_ => |a| evaluate(a.left, bindings) and evaluate(a.right, bindings),
-        .or_ => |o| evaluate(o.left, bindings) or evaluate(o.right, bindings),
+        .eq => |e| eqMatch(e.axis, e.value, resolver),
+        .present => |name| presentMatch(name, resolver),
+        .not => |inner| !evaluate(inner, resolver),
+        .and_ => |a| evaluate(a.left, resolver) and evaluate(a.right, resolver),
+        .or_ => |o| evaluate(o.left, resolver) or evaluate(o.right, resolver),
     };
 }
 
-pub fn presentMatch(name: []const u8, bindings: *const std.StringHashMap([]const u8)) bool {
-    if (bindings.get(name)) |v| return v.len > 0;
-    return false;
+pub fn presentMatch(name: []const u8, resolver: *const Resolver) bool {
+    return resolver.presence(name);
 }
 
-pub fn eqMatch(axis_name: []const u8, value: []const u8, bindings: *const std.StringHashMap([]const u8)) bool {
-    // Single-value axes (os, arch, profile, machine, ...): direct lookup
-    if (bindings.get(axis_name)) |got| return std.mem.eql(u8, got, value);
-
-    // Multi-value axes (tool, env, path): the binding key is the compound
-    // "name=value". Compare against each key without materializing that string,
-    // so an over-long axis binding still matches instead of silently missing.
-    var it = bindings.keyIterator();
-    while (it.next()) |k| {
-        const key = k.*;
-        if (key.len == axis_name.len + 1 + value.len and
-            key[axis_name.len] == '=' and
-            std.mem.startsWith(u8, key, axis_name) and
-            std.mem.eql(u8, key[axis_name.len + 1 ..], value)) return true;
-    }
-    return false;
+pub fn eqMatch(axis_name: []const u8, value: []const u8, resolver: *const Resolver) bool {
+    return resolver.has(axis_name, value);
 }
 
 test "parse: deeply nested parens returns error instead of crashing" {
@@ -210,8 +196,9 @@ test "evaluate: simple equality" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "os=darwin");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
-    try std.testing.expect(evaluate(expr, &bindings));
+    try std.testing.expect(evaluate(expr, &bindings_r));
 }
 
 test "evaluate: not negates" {
@@ -219,8 +206,9 @@ test "evaluate: not negates" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "not os=windows");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
-    try std.testing.expect(evaluate(expr, &bindings));
+    try std.testing.expect(evaluate(expr, &bindings_r));
 }
 
 test "evaluate: missing axis returns false" {
@@ -228,7 +216,8 @@ test "evaluate: missing axis returns false" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "tool=fdfind");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
-    try std.testing.expect(!evaluate(expr, &bindings));
+    var bindings_r: Resolver = .{ .live = &bindings };
+    try std.testing.expect(!evaluate(expr, &bindings_r));
 }
 
 test "evaluate: complex (a and b) or c" {
@@ -236,9 +225,10 @@ test "evaluate: complex (a and b) or c" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "os=darwin and profile=work or os=linux");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
     try bindings.put("profile", "work");
-    try std.testing.expect(evaluate(expr, &bindings));
+    try std.testing.expect(evaluate(expr, &bindings_r));
 }
 
 test "evaluate: complex with linux fallback" {
@@ -246,8 +236,9 @@ test "evaluate: complex with linux fallback" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "os=darwin and profile=work or os=linux");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
-    try std.testing.expect(evaluate(expr, &bindings));
+    try std.testing.expect(evaluate(expr, &bindings_r));
 }
 
 test "parse simple equality" {
@@ -280,8 +271,9 @@ test "evaluate: multi-value axis tool=fd matches via compound key" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "tool=fd");
     var b = std.StringHashMap([]const u8).init(fba.allocator());
+    var b_r: Resolver = .{ .live = &b };
     try b.put("tool=fd", "1");
-    try std.testing.expect(evaluate(expr, &b));
+    try std.testing.expect(evaluate(expr, &b_r));
 }
 
 test "evaluate: multi-value axis tool=rg fails when not present" {
@@ -289,8 +281,9 @@ test "evaluate: multi-value axis tool=rg fails when not present" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "tool=rg");
     var b = std.StringHashMap([]const u8).init(fba.allocator());
+    var b_r: Resolver = .{ .live = &b };
     try b.put("tool=fd", "1");
-    try std.testing.expect(!evaluate(expr, &b));
+    try std.testing.expect(!evaluate(expr, &b_r));
 }
 
 test "evaluate: an over-256-byte multi-value binding still matches" {
@@ -300,8 +293,9 @@ test "evaluate: an over-256-byte multi-value binding still matches" {
     const long = "x" ** 300;
     const expr = try parseString(a, "env=" ++ long);
     var b = std.StringHashMap([]const u8).init(a);
+    var b_r: Resolver = .{ .live = &b };
     try b.put("env=" ++ long, "1");
-    try std.testing.expect(evaluate(expr, &b));
+    try std.testing.expect(evaluate(expr, &b_r));
 }
 
 test "evaluate: bare name is presence check (true when bound non-empty)" {
@@ -309,8 +303,9 @@ test "evaluate: bare name is presence check (true when bound non-empty)" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "email");
     var b = std.StringHashMap([]const u8).init(fba.allocator());
+    var b_r: Resolver = .{ .live = &b };
     try b.put("email", "x@y.com");
-    try std.testing.expect(evaluate(expr, &b));
+    try std.testing.expect(evaluate(expr, &b_r));
 }
 
 test "evaluate: bare name presence false when unbound" {
@@ -318,7 +313,8 @@ test "evaluate: bare name presence false when unbound" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "email");
     var b = std.StringHashMap([]const u8).init(fba.allocator());
-    try std.testing.expect(!evaluate(expr, &b));
+    var b_r: Resolver = .{ .live = &b };
+    try std.testing.expect(!evaluate(expr, &b_r));
 }
 
 test "evaluate: bare name presence false when bound to empty" {
@@ -326,8 +322,9 @@ test "evaluate: bare name presence false when bound to empty" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "email");
     var b = std.StringHashMap([]const u8).init(fba.allocator());
+    var b_r: Resolver = .{ .live = &b };
     try b.put("email", "");
-    try std.testing.expect(!evaluate(expr, &b));
+    try std.testing.expect(!evaluate(expr, &b_r));
 }
 
 test "parse: a reserved word is usable as an axis value" {
@@ -349,8 +346,9 @@ test "evaluate: env axis multi-value" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try parseString(fba.allocator(), "env=WSL_DISTRO_NAME");
     var b = std.StringHashMap([]const u8).init(fba.allocator());
+    var b_r: Resolver = .{ .live = &b };
     try b.put("env=WSL_DISTRO_NAME", "1");
-    try std.testing.expect(evaluate(expr, &b));
+    try std.testing.expect(evaluate(expr, &b_r));
 }
 
 test "parse: a quoted string is a plain axis value, UTF-8 included" {
@@ -364,8 +362,9 @@ test "parse: a quoted string is a plain axis value, UTF-8 included" {
     try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", expr.eq.value);
 
     var b = std.StringHashMap([]const u8).init(a);
+    var b_r: Resolver = .{ .live = &b };
     try b.put("profile", "\xe6\x9d\xb1\xe4\xba\xac");
-    try std.testing.expect(evaluate(expr, &b));
+    try std.testing.expect(evaluate(expr, &b_r));
 }
 
 test "parse: an unquoted non-ASCII axis value still fails to lex" {
@@ -385,7 +384,8 @@ test "parseString: trailing tokens after a valid prefix are rejected" {
     // A parenthesized whole expression still parses.
     const e = try parseString(arena.allocator(), "(os=darwin or os=linux)");
     var b = std.StringHashMap([]const u8).init(arena.allocator());
+    var b_r: Resolver = .{ .live = &b };
     defer b.deinit();
     try b.put("os", "linux");
-    try std.testing.expect(evaluate(e, &b));
+    try std.testing.expect(evaluate(e, &b_r));
 }

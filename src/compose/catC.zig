@@ -2,6 +2,7 @@ const std = @import("std");
 const source = @import("../source/root.zig");
 const match_mod = @import("match.zig");
 const machine = @import("../machine/root.zig");
+const dsl = @import("../dsl/root.zig");
 
 const Io = std.Io;
 const ManagedFile = source.tree.ManagedFile;
@@ -24,7 +25,7 @@ pub fn compose(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     _: ?*const machine.state.MachineState,
     /// Set to whether the winning layer is the base, for provenance: a Cat C
     /// file's bytes come from exactly ONE layer, and which one it is cannot be

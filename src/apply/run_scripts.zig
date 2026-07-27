@@ -158,7 +158,7 @@ pub fn runStage(
     arena: std.mem.Allocator,
     io: Io,
     scripts_dir: []const u8,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     environ_map: ?*const EnvironMap,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -205,7 +205,7 @@ pub fn runStage(
 fn axisDirMatches(
     arena: std.mem.Allocator,
     name: []const u8,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
 ) !bool {
     const tuple = tuple_mod.parseFilename(arena, name) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -218,7 +218,7 @@ fn runGatedDir(
     arena: std.mem.Allocator,
     io: Io,
     dir_path: []const u8,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     environ_map: ?*const EnvironMap,
     timeout_ms: i64,
     stdout: *std.Io.Writer,
@@ -449,7 +449,7 @@ fn runOne(
     arena: std.mem.Allocator,
     io: Io,
     path: []const u8,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     environ_map: ?*const EnvironMap,
     timeout_ms: i64,
     stdout: *std.Io.Writer,
@@ -770,11 +770,12 @@ test "axisDirMatches: gated by binding; non-axis dirs ignored" {
     var bindings = std.StringHashMap([]const u8).init(a);
     try bindings.put("os", "windows");
     try bindings.put("profile", "work");
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
 
-    try testing.expect(try axisDirMatches(a, "os=windows", &bindings));
-    try testing.expect(try axisDirMatches(a, "os=windows+profile=work", &bindings));
-    try testing.expect(!try axisDirMatches(a, "os=darwin", &bindings));
+    try testing.expect(try axisDirMatches(a, "os=windows", &bindings_r));
+    try testing.expect(try axisDirMatches(a, "os=windows+profile=work", &bindings_r));
+    try testing.expect(!try axisDirMatches(a, "os=darwin", &bindings_r));
     // A plain directory name is not an axis tuple: ignored, not an error.
-    try testing.expect(!try axisDirMatches(a, "windows", &bindings));
-    try testing.expect(!try axisDirMatches(a, "helpers", &bindings));
+    try testing.expect(!try axisDirMatches(a, "windows", &bindings_r));
+    try testing.expect(!try axisDirMatches(a, "helpers", &bindings_r));
 }

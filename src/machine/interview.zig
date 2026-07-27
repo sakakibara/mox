@@ -83,25 +83,28 @@ fn stringField(v: toml.Value, key: []const u8) ?[]const u8 {
 /// Walk the schema in order against `base_bindings`. Already-bound facts
 /// are skipped; a false `when` skips; the rest are prompted through
 /// `input`/`prompt_out` when present, or reported as unanswered when not.
+/// Answers accumulate in an override layer over `base_bindings` (the facts
+/// interview's working set, D4) rather than a full copy: a later `when` sees
+/// both this run's earlier answers and every base binding, in one lookup.
 pub fn walk(
     arena: std.mem.Allocator,
     schema: []const SchemaFact,
-    base_bindings: *const std.StringHashMap([]const u8),
+    base_bindings: *const dsl.resolver.Resolver,
     input: ?*Io.Reader,
     prompt_out: ?*Io.Writer,
 ) !Outcome {
     var working = std.StringHashMap([]const u8).init(arena);
-    var base_it = base_bindings.iterator();
-    while (base_it.next()) |e| try working.put(e.key_ptr.*, e.value_ptr.*);
+    var override: dsl.resolver.Resolver.Override = .{ .map = &working, .inner = base_bindings };
+    var resolver: dsl.resolver.Resolver = .{ .override = &override };
 
     var answers: std.ArrayList(state_mod.Fact) = .empty;
     var unanswered: std.ArrayList(SchemaFact) = .empty;
 
     for (schema) |fact| {
-        if (working.contains(fact.name)) continue;
+        if (resolver.lookup(fact.name) != null) continue;
         if (fact.when) |expr_src| {
             const expr = try dsl.axis.parseString(arena, expr_src);
-            if (!dsl.axis.evaluate(expr, &working)) continue;
+            if (!dsl.axis.evaluate(expr, &resolver)) continue;
         }
         const in = input orelse {
             try unanswered.append(arena, fact);
@@ -268,10 +271,11 @@ test "walk: bound facts skipped, dependent when follows earlier answer" {
         .{ .name = "email", .prompt = "email" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
     var input = Io.Reader.fixed("gdrive\nme@example.com\nada@example.com\n");
-    const outcome = try walk(arena.allocator(), &schema, &bindings, &input, null);
+    const outcome = try walk(arena.allocator(), &schema, &bindings_r, &input, null);
 
     try std.testing.expectEqual(@as(usize, 3), outcome.answers.len);
     try std.testing.expectEqualStrings("cloud_backend", outcome.answers[0].name);
@@ -290,9 +294,10 @@ test "walk: empty answer takes the default; false when skips dependent" {
         .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
 
     var input = Io.Reader.fixed("\n");
-    const outcome = try walk(arena.allocator(), &schema, &bindings, &input, null);
+    const outcome = try walk(arena.allocator(), &schema, &bindings_r, &input, null);
 
     try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
     try std.testing.expectEqualStrings("icloud", outcome.answers[0].value);
@@ -307,8 +312,9 @@ test "walk: non-interactive reports unanswered, hides dependents of unanswered g
         .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const outcome = try walk(arena.allocator(), &schema, &bindings, null, null);
+    const outcome = try walk(arena.allocator(), &schema, &bindings_r, null, null);
     try std.testing.expectEqual(@as(usize, 0), outcome.answers.len);
     try std.testing.expectEqual(@as(usize, 1), outcome.unanswered.len);
     try std.testing.expectEqualStrings("cloud_backend", outcome.unanswered[0].name);
@@ -430,11 +436,12 @@ test "ask: EOF on a no-default fact errors instead of hanging" {
         .{ .name = "email", .prompt = "email" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
 
     var input = Io.Reader.fixed("");
     try std.testing.expectError(
         error.InterviewInputClosed,
-        walk(arena.allocator(), &schema, &bindings, &input, null),
+        walk(arena.allocator(), &schema, &bindings_r, &input, null),
     );
 }
 
@@ -446,11 +453,12 @@ test "ask: blank-line answers on a no-default fact are bounded, not infinite" {
         .{ .name = "email", .prompt = "email" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
 
     const blanks = "\n" ** (max_ask_attempts + 5);
     var input = Io.Reader.fixed(blanks);
     try std.testing.expectError(
         error.InterviewInputStalled,
-        walk(arena.allocator(), &schema, &bindings, &input, null),
+        walk(arena.allocator(), &schema, &bindings_r, &input, null),
     );
 }

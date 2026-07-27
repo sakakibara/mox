@@ -36,9 +36,10 @@ test "compose catC: most specific overlay wins" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expectEqualStrings("DARWIN", out);
 }
 
@@ -58,9 +59,10 @@ test "compose catC: falls back to base when no overlay matches" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expectEqualStrings("BASE", out);
 }
 
@@ -83,9 +85,10 @@ test "compose catC: an overlay named for a dotted value matches this machine's e
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("machine", "host.local");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expectEqualStrings("HOST_LOCAL", out);
 }
 
@@ -111,10 +114,11 @@ test "compose catC: an extension-bearing overlay still resolves by its stripped 
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
     try bindings.put("machine", "other.example");
 
-    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expectEqualStrings("DARWIN", out);
 }
 
@@ -133,9 +137,10 @@ test "compose catC: orphan with no matching overlay is absent" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const result = mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const result = mox.compose.catC.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect((try result) == null);
 }
 
@@ -153,8 +158,9 @@ test "compose catB: simple file with no directives passes through" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("export EDITOR=nvim\n", out.?);
 }
@@ -177,9 +183,10 @@ test "compose catB: include directive substitutes fragment when axis matches" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("env", "WSL");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "WSLENV=USERPROFILE") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "shellcheck") == null);
@@ -202,8 +209,9 @@ test "compose catB: include drops when axis doesn't match" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "WSL") == null);
 }
@@ -230,9 +238,10 @@ test "compose catB: replace from shorthand picks matching fragment" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "M.kind = \"work\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "diagnostic") == null);
@@ -264,21 +273,24 @@ test "compose catB: a fragment named exactly for a dotted axis value wins over a
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
 
     var dotted = std.StringHashMap([]const u8).init(a);
+    var dotted_r: mox.dsl.resolver.Resolver = .{ .live = &dotted };
     try dotted.put("machine", "host.local");
-    const dotted_out = (try mox.compose.catB.compose(a, io, tree.files[0], &dotted, null)).?;
+    const dotted_out = (try mox.compose.catB.compose(a, io, tree.files[0], &dotted_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, dotted_out, "export WHO=laptop") != null);
 
     // And the undotted machine still resolves its own fragment, not the dotted
     // one's stem.
     var plain = std.StringHashMap([]const u8).init(a);
+    var plain_r: mox.dsl.resolver.Resolver = .{ .live = &plain };
     try plain.put("machine", "host");
-    const plain_out = (try mox.compose.catB.compose(a, io, tree.files[0], &plain, null)).?;
+    const plain_out = (try mox.compose.catB.compose(a, io, tree.files[0], &plain_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, plain_out, "export WHO=desktop") != null);
 
     // A machine named for neither falls back to the region's own body.
     var other = std.StringHashMap([]const u8).init(a);
+    var other_r: mox.dsl.resolver.Resolver = .{ .live = &other };
     try other.put("machine", "elsewhere");
-    const other_out = (try mox.compose.catB.compose(a, io, tree.files[0], &other, null)).?;
+    const other_out = (try mox.compose.catB.compose(a, io, tree.files[0], &other_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, other_out, "export WHO=nobody") != null);
 }
 
@@ -297,9 +309,10 @@ test "compose catB: when_gate at file start suppresses output when expr fails" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out == null);
 }
 
@@ -318,9 +331,10 @@ test "compose catB: when_gate at file start emits content when expr matches" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "alias hide") != null);
 }
@@ -345,9 +359,10 @@ test "compose catB: scoped when...end on line 1 gates only its region, keeps tra
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "always present line") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "mac-only line") == null);
@@ -368,9 +383,10 @@ test "compose catB: .psm1 gated on os=windows composes to nothing under darwin" 
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out == null);
 }
 
@@ -389,9 +405,10 @@ test "compose catB: .psm1 gated on os=windows composes its content under windows
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "windows");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "function Protect-String") != null);
 }
@@ -411,9 +428,10 @@ test "compose catB: .cmd gated with rem marker composes to nothing under darwin"
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out == null);
 }
 
@@ -432,9 +450,10 @@ test "compose catB: .cmd gated with rem marker composes its content under window
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "windows");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "echo hello") != null);
 }
@@ -456,9 +475,10 @@ test "compose catB: .bat gated with rem marker (scoped when...end)" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "always present line") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "windows-only line") == null);
@@ -478,8 +498,9 @@ test "composeFile: dispatches Cat C for .png" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("BASE", out.?);
 }
@@ -498,8 +519,9 @@ test "composeFile: dispatches Cat B for .lua" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "local M") != null);
 }
@@ -518,8 +540,9 @@ test "composeFile: dispatches Cat A toml and produces valid output" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "name = \"foo\"") != null);
 }
@@ -538,8 +561,9 @@ test "composeFile: dispatches Cat A gitconfig with single layer pass-through" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("[user]\n\tname = foo\n", out.?);
 }
@@ -559,9 +583,10 @@ test "composeFile: Cat A gitconfig with overlays section-merges" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("[user]\n\tname = mac\n", out.?);
 }
@@ -583,9 +608,10 @@ test "compose catB: Dockerfile (un-dotted basename) resolves comment marker" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("env", "X");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "RUN apk add curl") != null);
 }
@@ -607,9 +633,10 @@ test "compose catB: fragment without trailing newline gets one added" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("env", "X");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "no newline at end\nafter") != null);
 }
@@ -631,6 +658,7 @@ test "compose catB: secret directive resolves env: scheme" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     var cache = mox.secret.cache.Cache.init(arena.allocator());
 
@@ -641,7 +669,7 @@ test "compose catB: secret directive resolves env: scheme" {
         arena.allocator(),
         io,
         tree.files[0],
-        &bindings,
+        &bindings_r,
         null,
         .{ .env = Env{ .map = &map }, .cache = &cache },
     );
@@ -665,8 +693,9 @@ test "compose catB: secret directive emits placeholder with trailing newline" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     // Placeholder should be on its own line, not glued to "name".
     try std.testing.expect(std.mem.indexOf(u8, out.?, "<SECRET:op://Personal/email>\nname") != null);
@@ -690,6 +719,7 @@ test "compose catB: inline <secret:URI> resolves mid-line and marks the line .se
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var cache = mox.secret.cache.Cache.init(a);
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_SECRET", "hunter2");
@@ -700,7 +730,7 @@ test "compose catB: inline <secret:URI> resolves mid-line and marks the line .se
         a,
         io,
         tree.files[0],
-        &bindings,
+        &bindings_r,
         &m_state,
         .{ .env = Env{ .map = &map }, .cache = &cache },
         &prov,
@@ -736,6 +766,7 @@ test "compose catB: a directiveless file's inline secret marks only its own line
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var cache = mox.secret.cache.Cache.init(a);
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_SECRET", "hunter2");
@@ -746,7 +777,7 @@ test "compose catB: a directiveless file's inline secret marks only its own line
         a,
         io,
         tree.files[0],
-        &bindings,
+        &bindings_r,
         &m_state,
         .{ .env = Env{ .map = &map }, .cache = &cache },
         &prov,
@@ -787,6 +818,7 @@ test "compose catB: an included fragment's inline secret marks only its own line
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var cache = mox.secret.cache.Cache.init(a);
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_SECRET", "hunter2");
@@ -797,7 +829,7 @@ test "compose catB: an included fragment's inline secret marks only its own line
         a,
         io,
         tree.files[0],
-        &bindings,
+        &bindings_r,
         &m_state,
         .{ .env = Env{ .map = &map }, .cache = &cache },
         &prov,
@@ -835,8 +867,9 @@ test "compose catB: for-loop expands TOML records" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "abbr ll=ls -l") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "abbr gs=git status") != null);
@@ -862,8 +895,9 @@ test "compose catB: a for-loop over a missing data source names the path" {
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var diag: mox.compose.interp.Diag = .{};
-    try std.testing.expectError(error.DataSourceNotFound, mox.compose.catB.composeTracked(a, io, tree.files[0], &bindings, null, null, null, &diag));
+    try std.testing.expectError(error.DataSourceNotFound, mox.compose.catB.composeTracked(a, io, tree.files[0], &bindings_r, null, null, null, &diag));
     const cap = diag.capture() orelse return error.TestExpectedDiag;
     try std.testing.expect(std.mem.indexOf(u8, cap, "nope.toml") != null);
 }
@@ -886,9 +920,10 @@ test "compose catB: for-loop with when filter (machine doesn't match) suppresses
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     // env=WSL not bound -- loop should be suppressed.
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "abbr") == null);
 }
@@ -914,6 +949,7 @@ test "compose catB: repo-relative loop data source resolves private layer first"
     const priv_root = try std.fs.path.join(a, &.{ tmp_root, "private" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const file_priv = mox.source.tree.ManagedFile{
         .source_base_path = "src/.zabbr",
@@ -925,7 +961,7 @@ test "compose catB: repo-relative loop data source resolves private layer first"
         .repo_dir = tmp_root,
         .private_dir = priv_root,
     };
-    const out_priv = (try mox.compose.catB.compose(a, io, file_priv, &bindings, null)).?;
+    const out_priv = (try mox.compose.catB.compose(a, io, file_priv, &bindings_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out_priv, "abbr priv=P") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_priv, "abbr repo=R") == null);
 
@@ -939,7 +975,7 @@ test "compose catB: repo-relative loop data source resolves private layer first"
         .repo_dir = tmp_root,
         .private_dir = "",
     };
-    const out_repo = (try mox.compose.catB.compose(a, io, file_repo, &bindings, null)).?;
+    const out_repo = (try mox.compose.catB.compose(a, io, file_repo, &bindings_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out_repo, "abbr repo=R") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_repo, "abbr priv=P") == null);
 }
@@ -1002,10 +1038,11 @@ test "compose catB: data captures render scalars, private shadows repo, default 
     const priv_root = try std.fs.path.join(a, &.{ tmp_root, "private" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const m_state = dataTestMachine();
     const file = dataTestFile(base_abs, tmp_root, priv_root);
 
-    const out = (try mox.compose.catB.compose(a, io, file, &bindings, &m_state)).?;
+    const out = (try mox.compose.catB.compose(a, io, file, &bindings_r, &m_state)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "pub=AAAApub") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "count=7") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "flag=true") != null);
@@ -1030,19 +1067,20 @@ test "compose catB: missing data key is fatal, but a non-scalar is fatal even wi
     const tmp_root = try std.fs.path.join(a, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     const base_abs = try std.fs.path.join(a, &.{ tmp_root, "src", ".zshrc" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const m_state = dataTestMachine();
 
     try writeFile(io, tmp.dir, "src/.zshrc", "x=<data.signing.absent>\n");
     try std.testing.expectError(
         error.UnknownDataKey,
-        mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings, &m_state),
+        mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings_r, &m_state),
     );
 
     // A non-scalar value never falls back to a default -- it is a type error.
     try writeFile(io, tmp.dir, "src/.zshrc", "y=<data.signing.list | default \"z\">\n");
     try std.testing.expectError(
         error.NonScalarData,
-        mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings, &m_state),
+        mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings_r, &m_state),
     );
 }
 
@@ -1060,13 +1098,14 @@ test "compose: a missing data capture names the failing capture in the diagnosti
     const tmp_root = try std.fs.path.join(a, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     const base_abs = try std.fs.path.join(a, &.{ tmp_root, "src", ".zshrc" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const m_state = dataTestMachine();
     const file = dataTestFile(base_abs, tmp_root, "");
 
     var diag: mox.compose.interp.Diag = .{};
     try std.testing.expectError(
         error.UnknownDataKey,
-        mox.compose.composeFileTracked(a, io, file, &bindings, &m_state, null, null, &diag),
+        mox.compose.composeFileTracked(a, io, file, &bindings_r, &m_state, null, null, &diag),
     );
     try std.testing.expectEqualStrings("data.signing.absent", diag.capture().?);
 }
@@ -1086,9 +1125,10 @@ test "compose catB: a hyphenated data table and key are captured" {
     const tmp_root = try std.fs.path.join(a, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     const base_abs = try std.fs.path.join(a, &.{ tmp_root, "src", ".zshrc" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const m_state = dataTestMachine();
 
-    const out = (try mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings, &m_state)).?;
+    const out = (try mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings_r, &m_state)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "top=SECRET123") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "deep=KEYBYTES") != null);
 }
@@ -1109,8 +1149,9 @@ test "compose catB: a null machine leaves machine and env captures verbatim (gat
     const tmp_root = try std.fs.path.join(a, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     const base_abs = try std.fs.path.join(a, &.{ tmp_root, "src", ".zshrc" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = (try mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings, null)).?;
+    const out = (try mox.compose.catB.compose(a, io, dataTestFile(base_abs, tmp_root, ""), &bindings_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "host=<machine.hostname>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "proxy=<env.HTTPS_PROXY>") != null);
 }
@@ -1133,6 +1174,7 @@ test "compose catB: machine.brew_prefix interpolation in fragment" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("env=X", "1");
 
     const m_state = mox.machine.state.MachineState{
@@ -1153,7 +1195,7 @@ test "compose catB: machine.brew_prefix interpolation in fragment" {
         .xdg_state_home = "",
     };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "/opt/homebrew/bin/brew shellenv") != null);
 }
@@ -1176,6 +1218,7 @@ test "compose catB: a directive fallback body interpolates machine captures" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
     const m_state = mox.machine.state.MachineState{
@@ -1196,7 +1239,7 @@ test "compose catB: a directive fallback body interpolates machine captures" {
         .xdg_state_home = "",
     };
 
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state)).?;
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "export H=\"/home/u/bin\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<machine.home>") == null);
 }
@@ -1218,6 +1261,7 @@ test "compose catB: machine.os interpolation in for-loop body" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const m_state = mox.machine.state.MachineState{
         .os = "linux",
@@ -1237,7 +1281,7 @@ test "compose catB: machine.os interpolation in for-loop body" {
         .xdg_state_home = "",
     };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "linux: foo") != null);
 }
@@ -1261,8 +1305,9 @@ test "composeFile: handles files larger than 4 KB" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqual(@as(usize, 8191), out.?.len);
 }
@@ -1283,9 +1328,10 @@ test "compose catA toml: base + axis overlay deep-merge" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
 
     // Re-parse the composed output and verify the merge.
@@ -1315,9 +1361,10 @@ test "compose catA toml: no matching overlay falls back to base" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     // profile not bound — overlay should not match.
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     const parsed = try mox.toml.parse(arena.allocator(), out.?, .{});
     try std.testing.expectEqualStrings("20", parsed.table.get("tools").?.table.get("node").?.string);
@@ -1339,9 +1386,10 @@ test "compose catA toml: orphan (no base) with single matching overlay" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "horizontal") != null);
 }
@@ -1361,9 +1409,10 @@ test "compose catA toml: orphan with no matching overlay is absent" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect((try result) == null);
 }
 
@@ -1382,9 +1431,10 @@ test "compose catA toml: a leading whole-file gate composes structurally when it
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "macos");
 
-    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "inner = 8  # tight") != null);
 }
@@ -1404,9 +1454,10 @@ test "compose catA toml: a leading whole-file gate makes the file absent when it
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect((try result) == null);
 }
 
@@ -1427,9 +1478,10 @@ test "compose catA toml: a leading whole-file gate composes with deep-merging ov
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
 
     var on = std.StringHashMap([]const u8).init(arena.allocator());
+    var on_r: mox.dsl.resolver.Resolver = .{ .live = &on };
     try on.put("os", "macos");
     try on.put("arch", "arm64");
-    const merged = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &on, null, null)).?;
+    const merged = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &on_r, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, merged, "# mox: when") == null);
     const parsed = try mox.toml.parse(arena.allocator(), merged, .{});
     const gaps = parsed.table.get("gaps").?.table;
@@ -1437,9 +1489,10 @@ test "compose catA toml: a leading whole-file gate composes with deep-merging ov
     try std.testing.expectEqual(@as(i64, 1), gaps.get("outer").?.integer);
 
     var off = std.StringHashMap([]const u8).init(arena.allocator());
+    var off_r: mox.dsl.resolver.Resolver = .{ .live = &off };
     try off.put("os", "linux");
     try off.put("arch", "arm64");
-    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off, null, null);
+    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off_r, null, null);
     try std.testing.expect((try result) == null);
 }
 
@@ -1461,9 +1514,10 @@ test "compose catA toml: a leading gate on an orphan overlay is inert, not a who
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
 
     var b = std.StringHashMap([]const u8).init(arena.allocator());
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &b };
     try b.put("os", "macos");
     try b.put("arch", "arm64");
-    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &b, null, null)).?;
+    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &b_r, null, null)).?;
     const parsed = try mox.toml.parse(arena.allocator(), out, .{});
     try std.testing.expectEqual(@as(i64, 1), parsed.table.get("a").?.table.get("x").?.integer);
     try std.testing.expectEqual(@as(i64, 2), parsed.table.get("b").?.table.get("y").?.integer);
@@ -1484,17 +1538,19 @@ test "compose catA gitconfig: a leading whole-file gate is stripped in a multi-l
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
 
     var on = std.StringHashMap([]const u8).init(arena.allocator());
+    var on_r: mox.dsl.resolver.Resolver = .{ .live = &on };
     try on.put("os", "macos");
     try on.put("arch", "arm64");
-    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &on, null, null)).?;
+    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &on_r, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[user]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[core]") != null);
 
     var off = std.StringHashMap([]const u8).init(arena.allocator());
+    var off_r: mox.dsl.resolver.Resolver = .{ .live = &off };
     try off.put("os", "linux");
     try off.put("arch", "arm64");
-    try std.testing.expect((try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off, null, null)) == null);
+    try std.testing.expect((try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off_r, null, null)) == null);
 }
 
 test "compose catA toml: a terminated whole-file when...end region is not an existence gate" {
@@ -1513,16 +1569,18 @@ test "compose catA toml: a terminated whole-file when...end region is not an exi
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
 
     var on = std.StringHashMap([]const u8).init(arena.allocator());
+    var on_r: mox.dsl.resolver.Resolver = .{ .live = &on };
     try on.put("os", "macos");
-    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &on, null, null)).?;
+    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &on_r, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox: end") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "inner = 8") != null);
 
     // Region gated off: the file still materializes (empty), it is not absent.
     var off = std.StringHashMap([]const u8).init(arena.allocator());
+    var off_r: mox.dsl.resolver.Resolver = .{ .live = &off };
     try off.put("os", "linux");
-    const gated = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off, null, null);
+    const gated = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off_r, null, null);
     try std.testing.expect(gated != null);
     try std.testing.expectEqual(@as(usize, 0), gated.?.len);
 }
@@ -1546,9 +1604,10 @@ test "compose catB: extensionless file with #! shebang infers # marker" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(
         "#!/usr/bin/env zsh\necho darwin-only\n",
@@ -1572,9 +1631,10 @@ test "compose catB: extensionless file with #! shebang gates off when axis fails
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out == null);
 }
 
@@ -1595,6 +1655,7 @@ test "compose catB: directiveless unknown-extension file with <machine.X> interp
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const facts = [_]mox.machine.state.Fact{
         .{ .name = "email", .value = "x@y.com" },
@@ -1619,7 +1680,7 @@ test "compose catB: directiveless unknown-extension file with <machine.X> interp
         .custom_facts = &facts,
     };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(
         "x@y.com namespaces=\"git\" ssh-ed25519 AAA\n",
@@ -1643,8 +1704,9 @@ test "compose catB: directiveless file with unknown extension passes through" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("*.log\n*.swp\n.DS_Store\n", out.?);
 }
@@ -1664,8 +1726,9 @@ test "compose catB: directiveless ssh-style basename (no extension) passes throu
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(
         "Host *\n  StrictHostKeyChecking accept-new\n  AddKeysToAgent yes\n",
@@ -1691,6 +1754,7 @@ test "compose catB: <machine.X> in base file content interpolates" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const facts = [_]mox.machine.state.Fact{
         .{ .name = "locale", .value = "en_US.UTF-8" },
@@ -1715,7 +1779,7 @@ test "compose catB: <machine.X> in base file content interpolates" {
         .custom_facts = &facts,
     };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(
         "export LANG=\"en_US.UTF-8\"\n" ++
@@ -1744,6 +1808,7 @@ test "compose catB: <machine.X> resolves a custom fact (Gap 4)" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "personal");
 
     const facts = [_]mox.machine.state.Fact{
@@ -1768,7 +1833,7 @@ test "compose catB: <machine.X> resolves a custom fact (Gap 4)" {
         .custom_facts = &facts,
     };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("kind = \"personal\"\n", out.?);
 }
@@ -1795,8 +1860,9 @@ test "compose catB: for-loop where-clause filters rows by field membership" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "gamma") != null);
@@ -1825,8 +1891,9 @@ test "compose catB: for-loop where-clause supports `not entry.X` for unset/empty
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "default-applies") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "zsh-only") != null);
@@ -1855,10 +1922,11 @@ test "compose catB: for-loop where-clause `tool=entry.X` substitutes then axis-c
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("tool=fd", "1");
     // tool=zk NOT in bindings — simulates "zk binary not on PATH"
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "always") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "have-fd") != null);
@@ -1881,6 +1949,7 @@ test "compose catA toml: <machine.X> in base content interpolates" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const facts = [_]mox.machine.state.Fact{.{ .name = "email", .value = "test@example.com" }};
     const m_state = mox.machine.state.MachineState{
@@ -1902,7 +1971,7 @@ test "compose catA toml: <machine.X> in base content interpolates" {
         .custom_facts = &facts,
     };
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "test@example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<machine.email>") == null);
 }
@@ -1925,9 +1994,10 @@ test "compose catA toml: file with mox directives is processed Cat-B-style" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, null, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "node = \"latest\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "idiomatic_version_file_enable_tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox:") == null);
@@ -1954,6 +2024,7 @@ test "compose catA gitconfig: file with mox directives is processed Cat-B-style"
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("has_signing_key", "true");
 
     const facts = [_]mox.machine.state.Fact{
@@ -1980,7 +2051,7 @@ test "compose catA gitconfig: file with mox directives is processed Cat-B-style"
         .custom_facts = &facts,
     };
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "email = ada@example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "signingkey = ssh-ed25519 AAA") != null);
     // The directive line itself should not appear in the output.
@@ -2010,6 +2081,7 @@ test "compose catA gitconfig: single layer passes through verbatim" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const facts = [_]mox.machine.state.Fact{.{ .name = "email", .value = "ada@example.com" }};
     const m_state = mox.machine.state.MachineState{
@@ -2031,7 +2103,7 @@ test "compose catA gitconfig: single layer passes through verbatim" {
         .custom_facts = &facts,
     };
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state, null, null, null)).?;
     const expected =
         "[init]\n" ++
         "\tdefaultBranch = main\n" ++
@@ -2065,8 +2137,9 @@ test "compose catA toml: single base, no overlays passes through verbatim" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(original, out.?);
 }
@@ -2087,9 +2160,10 @@ test "compose catA json: base + axis overlay deep-merge" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
 
     // Pretty emit is deterministic: base key order, overlay-only keys
@@ -2124,9 +2198,10 @@ test "compose catA json: no matching overlay falls back to base" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     // profile not bound -- overlay should not match; base passes through.
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("{\"editor\": {\"tabSize\": 4}}\n", out.?);
 }
@@ -2147,9 +2222,10 @@ test "compose catA json: orphan (no base) with single matching overlay" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "Default") != null);
 }
@@ -2169,9 +2245,10 @@ test "compose catA json: orphan with no matching overlay is absent" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect((try result) == null);
 }
 
@@ -2199,8 +2276,9 @@ test "compose catA json: single base, no overlays passes through verbatim" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(original, out.?);
 }
@@ -2220,6 +2298,7 @@ test "compose catA json: <machine.X> in base content interpolates" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const facts = [_]mox.machine.state.Fact{.{ .name = "email", .value = "test@example.com" }};
     const m_state = mox.machine.state.MachineState{
@@ -2241,7 +2320,7 @@ test "compose catA json: <machine.X> in base content interpolates" {
         .custom_facts = &facts,
     };
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "test@example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<machine.email>") == null);
 }
@@ -2266,9 +2345,10 @@ test "compose catA json: file with mox directives is processed Cat-B-style" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, null, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "\"formatOnSave\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"zoomLevel\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "// mox:") == null);
@@ -2299,9 +2379,10 @@ test "compose catA json: jsonc layers merge to plain JSON output" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
 
     const expected =
@@ -2330,9 +2411,10 @@ test "compose catA yaml: base + axis overlay deep-merge" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
 
     // Block emit is deterministic: base key order, overlay-only keys
@@ -2364,9 +2446,10 @@ test "compose catA yaml: no matching overlay falls back to base" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     // profile not bound -- overlay should not match; base passes through.
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("editor:\n  tabSize: 4\n", out.?);
 }
@@ -2387,9 +2470,10 @@ test "compose catA yaml: orphan (no base) with single matching overlay" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "Default") != null);
 }
@@ -2409,9 +2493,10 @@ test "compose catA yaml: orphan with no matching overlay is absent" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
-    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const result = mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect((try result) == null);
 }
 
@@ -2437,8 +2522,9 @@ test "compose catA yaml: single base, no overlays passes through verbatim" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings(original, out.?);
 }
@@ -2458,6 +2544,7 @@ test "compose catA yaml: <machine.X> in base content interpolates" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     const facts = [_]mox.machine.state.Fact{.{ .name = "email", .value = "test@example.com" }};
     const m_state = mox.machine.state.MachineState{
@@ -2479,7 +2566,7 @@ test "compose catA yaml: <machine.X> in base content interpolates" {
         .custom_facts = &facts,
     };
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, &m_state, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "test@example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<machine.email>") == null);
 }
@@ -2502,9 +2589,10 @@ test "compose catA yaml: file with mox directives is processed Cat-B-style" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings, null, null, null, null)).?;
+    const out = (try mox.compose.catA.compose(arena.allocator(), io, tree.files[0], &bindings_r, null, null, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "formatOnSave: true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zoomLevel: 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox:") == null);
@@ -2528,9 +2616,10 @@ test "compose catA yaml: layers merge re-emit drops comments" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
 
     const expected =
@@ -2561,8 +2650,9 @@ test "compose catB: file with mox directive in unknown extension infers marker" 
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "INCLUDED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "# mox:") == null);
@@ -2583,9 +2673,10 @@ test "composeFile: XDG ~/.config/git/config routes to gitconfig section-merge" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "work");
 
-    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null);
+    const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("[user]\n\tname = foo\n\temail = w@example.com\n", out.?);
 }
@@ -2609,10 +2700,11 @@ test "provenance: segments cover every output line exactly once (when-gate to EO
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
     var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
-    const out = try mox.compose.catB.composeTracked(arena.allocator(), io, tree.files[0], &bindings, null, null, &prov, null);
+    const out = try mox.compose.catB.composeTracked(arena.allocator(), io, tree.files[0], &bindings_r, null, null, &prov, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("#!/usr/bin/env zsh\necho darwin-only\n", out.?);
 
@@ -2648,9 +2740,10 @@ test "compose catB: blank line at the start of a when region survives" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "macos");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("A\n\nB\nC\n", out.?);
 }
@@ -2675,9 +2768,10 @@ test "compose catB: an empty matched when region emits nothing, not a blank line
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "macos");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("A\nC\n", out.?);
 }
@@ -2702,9 +2796,10 @@ test "compose catB: CRLF base round-trips as CRLF through a gated region" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "macos");
 
-    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null);
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
     try std.testing.expectEqualStrings("A\r\nB\r\nC\r\n", out.?);
 }
@@ -2731,13 +2826,14 @@ test "compose catA toml: an inline secret marks only its own line" {
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var cache = mox.secret.cache.Cache.init(a);
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_SECRET", "hunter2");
     const m_state = dataTestMachine();
 
     var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
-    const out = (try mox.compose.catA.compose(a, io, tree.files[0], &bindings, &m_state, .{ .env = Env{ .map = &map }, .cache = &cache }, &prov, null)).?;
+    const out = (try mox.compose.catA.compose(a, io, tree.files[0], &bindings_r, &m_state, .{ .env = Env{ .map = &map }, .cache = &cache }, &prov, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "api_key = \"hunter2\"") != null);
 
     const redacted = try mox.provenance.map.redactSecretLines(a, out, prov.items);
@@ -2772,7 +2868,8 @@ test "compose catB: for-in-for over a record's array field interpolates both loo
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "[includeIf \"url:github.com/me\"]\n\tpath = id-personal.inc") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[includeIf \"url:gitlab.com/me\"]\n\tpath = id-personal.inc") != null);
@@ -2801,7 +2898,8 @@ test "compose catB: for-in-for over two file data sources, both vars interpolate
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     // Cartesian product: a:x a:y b:x b:y (commented body prefix-stripped).
     try std.testing.expect(std.mem.indexOf(u8, out, "  a:x") != null);
@@ -2837,7 +2935,8 @@ test "compose catB: when-in-for gates per row on a row field and its negation" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "[user personal]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[user work]") != null);
@@ -2867,7 +2966,8 @@ test "compose catB: an uncommented for-loop body passes through verbatim" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "[section]\nkey = one") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[section]\nkey = two") != null);
@@ -2898,6 +2998,7 @@ test "compose catB: a nested inline secret marks only its own line" {
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var cache = mox.secret.cache.Cache.init(a);
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_SECRET", "hunter2");
@@ -2908,7 +3009,7 @@ test "compose catB: a nested inline secret marks only its own line" {
         a,
         io,
         tree.files[0],
-        &bindings,
+        &bindings_r,
         &m_state,
         .{ .env = Env{ .map = &map }, .cache = &cache },
         &prov,
@@ -2946,7 +3047,8 @@ test "compose catB: where still filters rows in a nested-body loop" {
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "name = keep") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tag = t1") != null);
@@ -2973,13 +3075,15 @@ test "compose catB: for inside a top-level when composes when the gate passes" {
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
 
     var on = std.StringHashMap([]const u8).init(arena.allocator());
+    var on_r: mox.dsl.resolver.Resolver = .{ .live = &on };
     try on.put("os", "darwin");
-    const out_on = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &on, null)).?;
+    const out_on = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &on_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out_on, "  item one") != null);
 
     var off = std.StringHashMap([]const u8).init(arena.allocator());
+    var off_r: mox.dsl.resolver.Resolver = .{ .live = &off };
     try off.put("os", "linux");
-    const out_off = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &off, null)).?;
+    const out_off = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &off_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out_off, "item") == null);
 }
 
@@ -3008,11 +3112,12 @@ test "compose catB: pathologically deep nesting terminates with RecursionTooDeep
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
     try std.testing.expectError(
         error.RecursionTooDeep,
-        mox.compose.catB.compose(a, io, tree.files[0], &bindings, null),
+        mox.compose.catB.compose(a, io, tree.files[0], &bindings_r, null),
     );
 }
 
@@ -3037,7 +3142,8 @@ test "compose catB: inner-loop variable shadows an equally-named outer field ref
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "L=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "L=2") != null);
@@ -3068,7 +3174,8 @@ test "compose catB: a nested when resolves an OUTER frame field, not just the in
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     // Row A has keep -> emitted; row B lacks keep -> its (absent-field) gate is
     // false, so it is skipped, not errored.
@@ -3098,10 +3205,11 @@ test "compose catB: a typo'd loop variable in an in-loop when errors and names i
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var diag: mox.compose.interp.Diag = .{};
     try std.testing.expectError(
         error.UnknownLoopVariable,
-        mox.compose.catB.composeTracked(a, io, tree.files[0], &bindings, null, null, null, &diag),
+        mox.compose.catB.composeTracked(a, io, tree.files[0], &bindings_r, null, null, null, &diag),
     );
     const cap = diag.capture() orelse return error.TestExpectedDiag;
     try std.testing.expectEqualStrings("idz", cap);
@@ -3131,13 +3239,15 @@ test "compose catB: an in-loop when mixes a machine axis with a row field" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
 
     var mac = std.StringHashMap([]const u8).init(a);
+    var mac_r: mox.dsl.resolver.Resolver = .{ .live = &mac };
     try mac.put("os", "macos");
-    const out_on = (try mox.compose.catB.compose(a, io, tree.files[0], &mac, null)).?;
+    const out_on = (try mox.compose.catB.compose(a, io, tree.files[0], &mac_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out_on, "signingkey = K") != null);
 
     var lin = std.StringHashMap([]const u8).init(a);
+    var lin_r: mox.dsl.resolver.Resolver = .{ .live = &lin };
     try lin.put("os", "linux");
-    const out_off = (try mox.compose.catB.compose(a, io, tree.files[0], &lin, null)).?;
+    const out_off = (try mox.compose.catB.compose(a, io, tree.files[0], &lin_r, null)).?;
     // Axis fails on linux -> the gate is false even though the row field exists.
     try std.testing.expect(std.mem.indexOf(u8, out_off, "signingkey") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_off, "[user personal]") != null);
@@ -3174,6 +3284,7 @@ test "compose catB: a typo'd loop-source field errors; an empty array yields zer
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     var typo_file: mox.source.tree.ManagedFile = undefined;
     var empty_file: mox.source.tree.ManagedFile = undefined;
@@ -3185,14 +3296,14 @@ test "compose catB: a typo'd loop-source field errors; an empty array yields zer
     var diag: mox.compose.interp.Diag = .{};
     try std.testing.expectError(
         error.LoopSourceFieldNotFound,
-        mox.compose.catB.composeTracked(a, io, typo_file, &bindings, null, null, null, &diag),
+        mox.compose.catB.composeTracked(a, io, typo_file, &bindings_r, null, null, null, &diag),
     );
     const cap = diag.capture() orelse return error.TestExpectedDiag;
     try std.testing.expectEqualStrings("match_urlz", cap);
 
     // The empty-array file composes cleanly: the inner loop emits nothing, but
     // the surrounding body ("here") survives.
-    const out = (try mox.compose.catB.compose(a, io, empty_file, &bindings, null)).?;
+    const out = (try mox.compose.catB.compose(a, io, empty_file, &bindings_r, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "here") != null);
 }
 
@@ -3214,9 +3325,10 @@ test "compose catB: a for-loop variable that shadows a fixed namespace is reject
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try std.testing.expectError(
         error.ReservedLoopVariable,
-        mox.compose.catB.compose(a, io, tree.files[0], &bindings, null),
+        mox.compose.catB.compose(a, io, tree.files[0], &bindings_r, null),
     );
 }
 
@@ -3288,8 +3400,9 @@ test "generator: N rows -> N files at rendered paths, with a when-in-body condit
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/git/ids.inc");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null)).?;
     try std.testing.expectEqual(@as(usize, 2), outputs.len);
 
     // Paths are rendered relative to the generator's own target dir.
@@ -3336,8 +3449,9 @@ test "generator: a nested for inside a generated file composes per element" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null)).?;
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
     try std.testing.expect(std.mem.indexOf(u8, outputs[0].content, "url = one") != null);
     try std.testing.expect(std.mem.indexOf(u8, outputs[0].content, "url = two") != null);
@@ -3365,8 +3479,9 @@ test "generator: zero rows -> zero outputs (empty, not null)" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const outputs = try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null);
+    const outputs = try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null);
     try std.testing.expect(outputs != null);
     try std.testing.expectEqual(@as(usize, 0), outputs.?.len);
 }
@@ -3401,10 +3516,11 @@ test "generator: two rows rendering the same path are rejected" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     try std.testing.expectError(
         error.DuplicateGeneratedPath,
-        mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null),
+        mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null),
     );
 }
 
@@ -3435,10 +3551,11 @@ test "generator: a rendered path escaping the target dir is rejected" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     try std.testing.expectError(
         error.GeneratedPathEscapes,
-        mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null),
+        mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null),
     );
 }
 
@@ -3457,7 +3574,8 @@ test "generator: a plain (non-generator) file returns null" {
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
-    try std.testing.expect((try mox.compose.catB.composeGenerator(a, io, tree.files[0], &bindings, null, null, null)) == null);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    try std.testing.expect((try mox.compose.catB.composeGenerator(a, io, tree.files[0], &bindings_r, null, null, null)) == null);
 }
 
 test "generator: an inline secret in a produced file redacts only its own line and flags contains_secret" {
@@ -3492,12 +3610,13 @@ test "generator: an inline secret in a produced file redacts only its own line a
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var cache = mox.secret.cache.Cache.init(a);
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_SECRET", "hunter2");
     const m_state = dataTestMachine();
 
-    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, &m_state, .{ .env = Env{ .map = &map }, .cache = &cache }, null)).?;
+    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, &m_state, .{ .env = Env{ .map = &map }, .cache = &cache }, null)).?;
     try std.testing.expectEqual(@as(usize, 1), outputs.len);
     const o = outputs[0];
     try std.testing.expect(std.mem.indexOf(u8, o.content, "token = hunter2") != null);
@@ -3548,8 +3667,9 @@ test "generator: provenance covers every output line exactly once with a when-ex
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null)).?;
     try std.testing.expectEqual(@as(usize, 2), outputs.len);
 
     for (outputs) |o| {
@@ -3597,10 +3717,11 @@ test "generator: an empty rendered path is rejected" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     try std.testing.expectError(
         error.GeneratedPathEscapes,
-        mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null),
+        mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null),
     );
 }
 
@@ -3634,10 +3755,11 @@ test "generator: a backslash-delimited parent escape in a rendered path is rejec
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/x.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
     try std.testing.expectError(
         error.GeneratedPathEscapes,
-        mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null),
+        mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null),
     );
 }
 
@@ -3667,7 +3789,8 @@ test "compose catB: three nested for loops resolve fields from all three scope f
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
 
     try std.testing.expect(std.mem.indexOf(u8, out, "A1-B-C") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "A2-B-C") != null);
@@ -3697,8 +3820,9 @@ test "compose: a partial file's head directives are stripped, pass-through kept 
 
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
 
-    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expectEqualStrings(body, out);
     try std.testing.expect(std.mem.indexOf(u8, out, "mox:") == null);
 }
@@ -3731,13 +3855,15 @@ test "compose: ownership and a whole-file gate coexist in either order" {
 
         // Gate on: composed output is the body alone, both head lines gone.
         var on = std.StringHashMap([]const u8).init(a);
+        var on_r: mox.dsl.resolver.Resolver = .{ .live = &on };
         try on.put("tool", "codex");
-        const out = (try mox.compose.composeFile(a, io, tree.files[0], &on, null, null)).?;
+        const out = (try mox.compose.composeFile(a, io, tree.files[0], &on_r, null, null)).?;
         try std.testing.expectEqualStrings(body, out);
 
         // Gate off: the file is absent on this machine.
         var off = std.StringHashMap([]const u8).init(a);
-        try std.testing.expect((try mox.compose.composeFile(a, io, tree.files[0], &off, null, null)) == null);
+        var off_r: mox.dsl.resolver.Resolver = .{ .live = &off };
+        try std.testing.expect((try mox.compose.composeFile(a, io, tree.files[0], &off_r, null, null)) == null);
     }
 }
 
@@ -3771,8 +3897,9 @@ test "compose: a directive past the walk's head bound is inert content, never st
     try std.testing.expectEqual(mox.source.head.Ownership.none, tree.files[0].ownership);
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
-    const out = (try mox.compose.composeFile(a, io, tree.files[0], &bindings, null, null)).?;
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &bindings_r, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox: own extra") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[more]") != null);
 }
@@ -3800,13 +3927,15 @@ test "compose: a gated partial file still routes remaining directives through Ca
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
 
     var off = std.StringHashMap([]const u8).init(a);
+    var off_r: mox.dsl.resolver.Resolver = .{ .live = &off };
     try off.put("os", "darwin");
-    const out = (try mox.compose.composeFile(a, io, tree.files[0], &off, null, null)).?;
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &off_r, null, null)).?;
     try std.testing.expectEqual(@as(usize, 0), out.len);
 
     var on = std.StringHashMap([]const u8).init(a);
+    var on_r: mox.dsl.resolver.Resolver = .{ .live = &on };
     try on.put("os", "linux");
-    const out_on = (try mox.compose.composeFile(a, io, tree.files[0], &on, null, null)).?;
+    const out_on = (try mox.compose.composeFile(a, io, tree.files[0], &on_r, null, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out_on, "linux = true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_on, "mox:") == null);
 }
@@ -3831,7 +3960,8 @@ fn composeCompletionsAt(a: std.mem.Allocator, io: anytype, tmp: *std.testing.Tmp
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, suffix);
     var bindings = std.StringHashMap([]const u8).init(a);
-    return (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    return (try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null)).?;
 }
 
 test "completions: fish and zsh stubs from one registry, byte-exact" {
@@ -3930,9 +4060,10 @@ fn expectCompletionsError(expected: anyerror, registry: []const u8) !void {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".zcomp/completions.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try std.testing.expectError(
         expected,
-        mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null),
+        mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null),
     );
 }
 
@@ -4060,8 +4191,9 @@ test "completions: content beside the directive falls through to the loud inline
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".zcomp/completions.gen");
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     // Not a pure generator: composeGenerator declines it...
-    try std.testing.expect(try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null) == null);
+    try std.testing.expect(try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null) == null);
 }
 
 test "loop body: a doubled comment marker emits a literal marker line" {
@@ -4088,7 +4220,8 @@ test "loop body: a doubled comment marker emits a literal marker line" {
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     const gen = fileEndingWith(tree, ".config/out.conf");
     var bindings = std.StringHashMap([]const u8).init(a);
-    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings, null, null, null)).?;
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    const outputs = (try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null)).?;
     try std.testing.expectEqualStrings("#header a\nvalue\n", outputs[0].content);
 }
 

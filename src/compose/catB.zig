@@ -272,7 +272,7 @@ pub fn compose(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
 ) !?[]u8 {
     return composeTracked(arena, io, file, bindings, machine_state_opt, null, null, null);
@@ -295,7 +295,7 @@ pub fn composeWithSecrets(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?SecretCtx,
 ) !?[]u8 {
@@ -309,7 +309,7 @@ pub fn composeTracked(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?SecretCtx,
     prov: ?*std.ArrayList(Segment),
@@ -328,7 +328,7 @@ pub fn composeTrackedContent(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?SecretCtx,
     prov: ?*std.ArrayList(Segment),
@@ -510,7 +510,7 @@ pub fn composeGenerator(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?SecretCtx,
     diag: ?*interp.Diag,
@@ -830,7 +830,7 @@ fn composeCompletions(
     file: ManagedFile,
     comp: @FieldType(dsl.ast.Directive.Kind, "completions"),
     dir_line: u32,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     diag: ?*interp.Diag,
 ) EmitError!?[]GeneratedFile {
     var outputs: std.ArrayList(GeneratedFile) = .empty;
@@ -927,7 +927,7 @@ fn composeGeneratorBody(
     io: Io,
     em: *Emitter,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     ctx: interp.Ctx,
     secrets: ?SecretCtx,
     marker: []const u8,
@@ -1004,7 +1004,7 @@ fn emitDirective(
     em: *Emitter,
     file: ManagedFile,
     d: dsl.ast.Directive,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     ctx: interp.Ctx,
     secrets: ?SecretCtx,
     nest: Nest,
@@ -1151,7 +1151,7 @@ fn evalRow(
     arena: std.mem.Allocator,
     expr: *const dsl.ast.RowExpr,
     scope: []const interp.Frame,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     diag: ?*interp.Diag,
 ) EmitError!bool {
     var unknown: []const u8 = "";
@@ -1221,7 +1221,7 @@ fn emitForLoop(
     em: *Emitter,
     file: ManagedFile,
     loop: ForLoop,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     ctx: interp.Ctx,
     secrets: ?SecretCtx,
     nest: Nest,
@@ -1344,7 +1344,7 @@ fn emitParsedBody(
     io: Io,
     em: *Emitter,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     ctx: interp.Ctx,
     secrets: ?SecretCtx,
     src: []const u8,
@@ -1462,7 +1462,7 @@ fn pickFragmentFromRegion(
     io: Io,
     file: ManagedFile,
     dir_name: []const u8,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
 ) !?PickedFragment {
     for (file.regions) |region| {
         if (!std.mem.eql(u8, region.name, dir_name)) continue;
@@ -1487,7 +1487,7 @@ fn pickFragmentFromRegion(
 fn pickFragmentIndex(
     arena: std.mem.Allocator,
     fragments: []const Fragment,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
 ) !?usize {
     for (fragments, 0..) |frag, i| {
         const t = frag.exact_tuple orelse continue;

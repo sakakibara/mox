@@ -16,6 +16,7 @@ const std = @import("std");
 const compose = @import("../compose/root.zig");
 const source = @import("../source/root.zig");
 const machine = @import("../machine/root.zig");
+const dsl = @import("../dsl/root.zig");
 const config_space = @import("config_space.zig");
 
 const Io = std.Io;
@@ -89,6 +90,8 @@ pub fn snapshot(
 
 /// Compose one file, mapping the axis-gating "no output for this machine"
 /// errors to null so a gated-off file is a clean absence rather than a failure.
+/// `bindings` is one simulated configuration's snapshot, never this
+/// machine's live one -- wrapped `.fixed` so it never probes.
 fn composeOrNull(
     arena: std.mem.Allocator,
     io: Io,
@@ -97,7 +100,8 @@ fn composeOrNull(
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
 ) !?[]const u8 {
-    return try compose.composeFileTracked(arena, io, file, bindings, m_state, secrets, null, null);
+    const resolver: dsl.resolver.Resolver = .{ .fixed = bindings };
+    return try compose.composeFileTracked(arena, io, file, &resolver, m_state, secrets, null, null);
 }
 
 /// Diff before/after snapshots taken around a source edit. A configuration is

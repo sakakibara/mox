@@ -599,7 +599,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     if (!a.force) {
         const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-        var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        var bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
         const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, live_path);
         const is_dir = if (Io.Dir.cwd().statFile(ctx.io, live_path, .{ .follow_symlinks = false })) |st|
@@ -637,7 +638,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // at right now will be skipped by the next apply -- usually a typo
         // or an unbound axis. Warn; the add itself still proceeds.
         const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-        var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        var bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
         if (!mox.dsl.axis.evaluate(parsed, &bindings)) {
             try ctx.err.print("mox add: warning: gate `{s}` does not hold on this machine; the file will not apply here until the axis is bound\n", .{expr});
         }

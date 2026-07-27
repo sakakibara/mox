@@ -41,7 +41,7 @@ pub fn compose(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
@@ -88,7 +88,7 @@ fn readBaseHead(
     file: ManagedFile,
     path: []const u8,
     marker: []const u8,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
 ) !Head {
     const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
     if (!file.has_base) return .{ .text = raw };
@@ -138,7 +138,7 @@ fn composeToml(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
@@ -181,7 +181,7 @@ fn composeJson(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
@@ -228,7 +228,7 @@ fn composeYaml(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
@@ -272,7 +272,7 @@ fn composeSectionMerge(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     dialect: ini_merge.Dialect,
@@ -466,7 +466,7 @@ fn recordPerLineSecret(
 fn collectMatchingLayers(
     arena: std.mem.Allocator,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
 ) ![]const []const u8 {
     var layers: std.ArrayList(LayerRef) = .empty;
     errdefer layers.deinit(arena);
@@ -494,7 +494,7 @@ fn collectMatchingLayers(
 pub fn matchingLayerPaths(
     arena: std.mem.Allocator,
     file: ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const dsl.resolver.Resolver,
 ) ![]const []const u8 {
     return collectMatchingLayers(arena, file, bindings);
 }

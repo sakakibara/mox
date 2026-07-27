@@ -121,10 +121,11 @@ test "integration: axis evaluator works through full re-export chain" {
     const expr = try mox.dsl.axis.parseString(fba.allocator(), "os=darwin and profile=work");
 
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
     try bindings.put("profile", "work");
 
-    try std.testing.expect(mox.dsl.axis.evaluate(expr, &bindings));
+    try std.testing.expect(mox.dsl.axis.evaluate(expr, &bindings_r));
 }
 
 test "integration: a directive's when-clause accepts a quoted UTF-8 axis value" {
@@ -141,8 +142,9 @@ test "integration: a directive's when-clause accepts a quoted UTF-8 axis value" 
     const when = parsed.directives[0].kind.when_gate.when.?;
 
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("profile", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e");
-    try std.testing.expect(mox.dsl.axis.evaluate(when, &bindings));
+    try std.testing.expect(mox.dsl.axis.evaluate(when, &bindings_r));
 }
 
 test "integration: line_count counts last line when file ends with mox: end" {

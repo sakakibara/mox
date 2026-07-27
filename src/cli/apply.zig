@@ -77,7 +77,8 @@ fn applyPass(
     const resolver_opt: ?*DriftResolver = if (interactive_drift) &resolver else null;
 
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-    var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    var bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
     for (m_state.skipped_fact_keys) |key| {
         try ctx.err.print("mox apply: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
     }
@@ -102,7 +103,7 @@ fn applyPass(
         if (outcome.answers.len > 0) {
             try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
             m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-            bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+            bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         }
         if (outcome.unanswered.len > 0) {
             try ctx.err.writeAll("mox apply: missing facts:");
@@ -155,7 +156,7 @@ fn applyPass(
     // first-apply staleness the design exists to eliminate.
     if (pre_result.ran > 0) {
         m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-        bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     }
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
@@ -1355,7 +1356,7 @@ fn writeOwnedRecord(
 fn applyGenerator(
     ctx: *app.Ctx,
     file: mox.source.tree.ManagedFile,
-    bindings: *const std.StringHashMap([]const u8),
+    bindings: *const mox.dsl.resolver.Resolver,
     m_state: *const mox.machine.state.MachineState,
     secrets: mox.compose.catB.SecretCtx,
     snap_id: []const u8,

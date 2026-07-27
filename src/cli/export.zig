@@ -52,14 +52,26 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const out_dir = a.out;
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-    var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    const live_resolver: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
+    var bindings: *const mox.dsl.resolver.Resolver = &live_resolver;
 
+    var as_map: std.StringHashMap([]const u8) = undefined;
+    var as_override: mox.dsl.resolver.Resolver.Override = undefined;
+    var as_resolver: mox.dsl.resolver.Resolver = undefined;
     if (a.as) |as| {
         const tuple = mox.source.tuple.parseFilename(ctx.alloc, as) catch {
             try ctx.err.print("mox export: invalid axis tuple '{s}'\n", .{as});
             return 2;
         };
-        try applyTupleOverride(ctx.alloc, &bindings, tuple);
+        as_map = std.StringHashMap([]const u8).init(ctx.alloc);
+        try applyTupleOverride(ctx.alloc, &as_map, tuple);
+        // The override layer carries the `--as` tuple; it wins over the live
+        // snapshot for every axis it names, and falls through to it for
+        // every other axis.
+        as_override = .{ .map = &as_map, .inner = &live_resolver };
+        as_resolver = .{ .override = &as_override };
+        bindings = &as_resolver;
     }
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
@@ -84,7 +96,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // deletes, so a row dropped since a prior apply simply is not written).
         {
             var gdiag: mox.compose.interp.Diag = .{};
-            const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
+            const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, &m_state, secrets, &gdiag) catch |e| {
                 try ctx.err.print("mox export: {s}: generator failed: {s}\n", .{ file.live_path, @errorName(e) });
                 if (gdiag.capture()) |cap|
                     try ctx.err.print("mox export:   failing item: {s}\n", .{cap});
@@ -113,7 +125,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
 
         var diag: mox.compose.interp.Diag = .{};
-        const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, null, &diag) catch |e| {
+        const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, bindings, &m_state, secrets, null, &diag) catch |e| {
             try ctx.err.print("mox export: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
             if (diag.capture()) |cap|
                 try ctx.err.print("mox export:   failing item: {s}\n", .{cap});

@@ -239,7 +239,8 @@ fn neverMaterializing(
         if (!allNamesCompared(ax)) continue;
         const configs = try mox.classify.config_space.enumerate(arena, &this_bindings, ax, &.{}, &.{});
         const materializes = for (configs) |cfg| {
-            const composed = mox.compose.composeFileTracked(arena, io, file, &cfg.bindings, &m_state, null, null, null) catch break true;
+            var cfg_resolver: mox.dsl.resolver.Resolver = .{ .fixed = &cfg.bindings };
+            const composed = mox.compose.composeFileTracked(arena, io, file, &cfg_resolver, &m_state, null, null, null) catch break true;
             if (composed != null) break true;
         } else false;
         if (!materializes) try out.append(arena, file.source_base_path);
@@ -258,7 +259,8 @@ fn generatorProblems(
     context: app.Context,
 ) !?[]const []const u8 {
     const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
-    const bindings = try mox.machine.bindings.fromMachineState(arena, m_state);
+    const bindings_map = try mox.machine.bindings.fromMachineState(arena, m_state);
+    const bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
 
@@ -490,7 +492,8 @@ fn provenanceInSync(recorded: [mox.apply.applied.hash_hex_len]u8, composed: []co
 fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
-    var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+    const bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 

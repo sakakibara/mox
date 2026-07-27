@@ -76,11 +76,12 @@ test "run_scripts: top-level runs, matching gated dir runs, non-matching skipped
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("gate", "on");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 2), result.ran);
     try std.testing.expectEqual(@as(usize, 0), result.failed);
@@ -109,11 +110,12 @@ test "run_scripts: a true `# mox: when` header runs, a false one is skipped" {
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 1), result.ran);
     try std.testing.expectEqual(@as(usize, 1), result.skipped);
@@ -141,11 +143,12 @@ test "run_scripts: a header `or` expression runs on the second alternative" {
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "linux");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 1), result.ran);
     try std.testing.expectEqual(@as(usize, 0), result.skipped);
@@ -172,11 +175,12 @@ test "run_scripts: a malformed `# mox: when` header fails that script, others st
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
 
     // Malformed -> failed; the stage continued and ran the well-formed script.
     try std.testing.expectEqual(@as(usize, 1), result.failed);
@@ -204,11 +208,12 @@ test "run_scripts: a header does not bypass a non-matching axis dir" {
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 0), result.ran);
     try std.testing.expectEqual(@as(usize, 0), result.skipped);
@@ -1426,12 +1431,13 @@ test "run_scripts: a hung script is killed within the configured timeout" {
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "200");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 0), result.ran);
     try std.testing.expectEqual(@as(usize, 1), result.failed);
@@ -1452,12 +1458,13 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "notanumber");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 2), result.ran);
     const err = err_aw.written();
@@ -1521,12 +1528,13 @@ test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const facts = [_]mox.apply.run_scripts.Fact{.{ .name = "profile", .value = "work" }};
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
     try std.testing.expectEqual(@as(usize, 1), result.ran);
 
     try expectLoggedLines("/home/tester|work\n", try read(io, a, out_file));
@@ -1553,13 +1561,14 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
     const facts = [_]mox.apply.run_scripts.Fact{};
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "500");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
 
     // The script was terminated at ~500ms, counted failed, and runStage
     // RETURNED rather than blocking for the full 30s sleep.

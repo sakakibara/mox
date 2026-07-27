@@ -45,8 +45,9 @@ test "axis module reachable (parser + evaluator)" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try dsl.axis.parseString(fba.allocator(), "os=darwin");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
     try bindings.put("os", "darwin");
-    try std.testing.expect(dsl.axis.evaluate(expr, &bindings));
+    try std.testing.expect(dsl.axis.evaluate(expr, &bindings_r));
 }
 
 test "scanner module reachable" {
@@ -148,18 +149,20 @@ test "junk filter: regular file is not junk" {
 
 test "match: empty tuple matches everything" {
     var bindings = std.StringHashMap([]const u8).init(std.testing.allocator);
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
     defer bindings.deinit();
     try bindings.put("os", "darwin");
 
     const tuples = [_]source.tree.AxisTuple{
         .{ .pairs = &.{} },
     };
-    const idx = compose.match.bestMatch(&tuples, &bindings);
+    const idx = compose.match.bestMatch(&tuples, &bindings_r);
     try std.testing.expectEqual(@as(?usize, 0), idx);
 }
 
 test "match: most specific tuple wins" {
     var bindings = std.StringHashMap([]const u8).init(std.testing.allocator);
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
     defer bindings.deinit();
     try bindings.put("os", "darwin");
     try bindings.put("profile", "work");
@@ -174,12 +177,13 @@ test "match: most specific tuple wins" {
     } };
 
     const tuples = [_]source.tree.AxisTuple{ universal, os_only, both };
-    const idx = compose.match.bestMatch(&tuples, &bindings);
+    const idx = compose.match.bestMatch(&tuples, &bindings_r);
     try std.testing.expectEqual(@as(?usize, 2), idx);
 }
 
 test "match: no match returns null" {
     var bindings = std.StringHashMap([]const u8).init(std.testing.allocator);
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
     defer bindings.deinit();
     try bindings.put("os", "linux");
 
@@ -187,7 +191,7 @@ test "match: no match returns null" {
         .{ .name = "os", .value = "darwin" },
     } };
     const tuples = [_]source.tree.AxisTuple{darwin_only};
-    const idx = compose.match.bestMatch(&tuples, &bindings);
+    const idx = compose.match.bestMatch(&tuples, &bindings_r);
     try std.testing.expectEqual(@as(?usize, null), idx);
 }
 

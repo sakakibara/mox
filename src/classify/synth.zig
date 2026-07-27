@@ -380,12 +380,14 @@ test "synthesized region recomposes to the fallback for one profile and the frag
 
     var personal = std.StringHashMap([]const u8).init(a);
     try personal.put("profile", "personal");
-    const personal_out = (try compose.composeFile(a, io, file, &personal, null, null)).?;
+    var personal_r: dsl.resolver.Resolver = .{ .live = &personal };
+    const personal_out = (try compose.composeFile(a, io, file, &personal_r, null, null)).?;
     try testing.expectEqualStrings("export A=1\nexport KEY=old\nexport B=2\n", personal_out);
 
     var work = std.StringHashMap([]const u8).init(a);
     try work.put("profile", "work");
-    const work_out = (try compose.composeFile(a, io, file, &work, null, null)).?;
+    var work_r: dsl.resolver.Resolver = .{ .live = &work };
+    const work_out = (try compose.composeFile(a, io, file, &work_r, null, null)).?;
     try testing.expectEqualStrings("export A=1\nexport KEY=new\nexport B=2\n", work_out);
 }
 
