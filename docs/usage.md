@@ -1,9 +1,10 @@
 # Using mox day to day
 
-Everything in mox is one loop: **change a config in its normal format, then run
-`mox apply`.** This walks through the tasks that loop shows up in. For the
-composition model behind it, see the [README](../README.md#how-it-works); for the
-full comment DSL, [dsl.md](dsl.md).
+Everything in mox is two motions: **edit a live config where it lives, then
+`mox commit`** -- and, for how a config *varies* across machines, **edit its
+source, then `mox apply`**. This walks through the tasks they show up in. For
+the composition model behind them, see the
+[README](../README.md#how-it-works); for the full comment DSL, [dsl.md](dsl.md).
 
 Throughout, `mox` is assumed on your `PATH` (the installer puts it in
 `~/.local/bin`). The repo mox reads from is `$MOX_REPO`, defaulting to
@@ -26,7 +27,7 @@ mox init          # creates the repo skeleton (src/, scripts/)
 ```
 
 Either way, `mox apply` interviews you once for any facts your files need (an
-email, a signing key) and writes them to `~/.config/mox/facts.toml` -- which
+email, a signing key) and writes them to `$XDG_CONFIG_HOME/mox/facts.toml` -- which
 stays on the machine, never in the repo.
 
 ## Managing a file
@@ -47,18 +48,22 @@ mox diff          # the actual composed-vs-live diff
 
 ## The edit loop
 
-To change a config, edit its **source** and apply:
+Day to day, change a config by editing the **live** file, where it lives --
+your shell or editor picks the change up immediately, like it would on an
+unmanaged machine -- then let mox route it back into the repo:
 
 ```sh
-mox edit ~/.zshrc     # opens src/.zshrc in $EDITOR
-mox apply             # composes and writes it live (mox apply --dry-run to preview)
+vim ~/.zshrc             # edit the real file, in place
+mox commit ~/.zshrc      # status, diff, apply, and commit all take paths
 ```
 
-If you instead hand-edited the **live** file (say `~/.zshrc` directly), pull that
-change back into the source:
+Structure -- an overlay, a `# mox: when` region, a loop, anything about how
+the file *varies* -- lives only in sources. For that, edit the **source**
+and apply:
 
 ```sh
-mox commit ~/.zshrc      # status, diff, apply, and commit all take paths
+mox edit ~/.zshrc     # opens src/.zshrc in $EDITOR; --axis <tuple> for an overlay
+mox apply             # composes and writes it live (mox apply --dry-run to preview)
 ```
 
 `commit` confirms each change and routes it to the right place. A text file
@@ -161,7 +166,7 @@ mox facts                       # list; interview for anything missing
 mox facts set email you@work.com
 ```
 
-Facts live in `~/.config/mox/facts.toml` on the machine only.
+Facts live in `$XDG_CONFIG_HOME/mox/facts.toml` on the machine only.
 
 ## A secret
 
