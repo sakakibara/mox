@@ -4,6 +4,73 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-27
+
+### Added
+- `tool=<name>` and `env=<name>` are now open axes: any name resolves as a
+  live probe (against `$PATH` plus detected tool-home bin directories for
+  `tool=`, against the captured environ for `env=`) instead of a lookup
+  against a pre-enumerated watch list, so a name never registered anywhere
+  still resolves. `<machine.tool_path.NAME>` and `<env.NAME>` interpolation
+  share the same resolution.
+- An explicit `$MOX_PATH` channel: a setup script can append a directory a
+  tool installed into that neither `$PATH` nor a detected tool home would
+  otherwise see, and it joins the search space for the rest of the run.
+- `mox status` prints a probe log naming every `tool=`/`env=` name a run
+  actually asked and whether it resolved, so a typo'd gate is visible
+  instead of a silent false forever; `mox facts probe tool=<name> |
+  env=<name>` is the scriptable single-name counterpart.
+- An axis value may now be a quoted string, admitting a non-ASCII value
+  (a Kanji profile name, a Kanji `COMPUTERNAME`) that the bare-token
+  grammar rejected outright.
+- The `machine` axis/fact now binds only the hostname's first label
+  (network-stable), with the full name available separately as a new
+  `hostname` axis/fact.
+- A data row's own captures (`dir = "<machine.brew_prefix>/bin"`) now
+  expand through `<entry.field>` splices, one level deep.
+- Many previously-silent failures across apply, rollback, commit, doctor,
+  and status now surface as a visible warning or a hard error instead of
+  passing unnoticed.
+
+### Changed
+- **Breaking** for anyone gating on a dotted `machine=<value>`: `machine`
+  no longer binds the raw hostname, only its first label: an overlay or
+  fragment named for a full dotted hostname must be renamed to the first
+  label, or switched to the new `hostname` axis.
+- A custom fact named `tool`, `env`, or `path` is now rejected at load
+  time: it would otherwise silently shadow that axis's whole binding.
+- `path=` is now a closed axis (`brew_prefix`, `cargo_home`, `gopath`,
+  `pnpm_home`): an unnamed value is refused at parse time instead of
+  composing to a silent false forever.
+
+### Removed
+- `<xdg_config_home>/mox/extras.toml` is no longer read (superseded by the
+  open `tool=`/`env=` probes above). A one-time notice names the file and
+  states it is no longer read when mox finds one still on disk, so an
+  unmigrated machine finds out instead of watching its gates go quietly
+  dark.
+
+### Fixed
+- A batch of previously-swallowed error paths now propagate or warn instead
+  of failing silently: an fsync failure, a rollback symlink read failure, a
+  partial-target walk error, a snapshot mode-capture stat failure, a
+  facts.toml value dropped for the wrong type, an unencodable fact name
+  left out of script env, an unparseable timeout or snapshot-retention
+  override, a coupling-graph persist failure, and a post-edit restore
+  failure that used to discard the original error.
+- `mox doctor` now flags an unknown `scripts/` stage directory, an
+  unparseable tuple, an out-of-vocabulary `os=`/`arch=` gate or overlay
+  value, an unknown or wrong-typed `attributes.toml` key, and a
+  completions registry row key outside its schema -- all previously
+  dropped or silently ignored.
+- `mox status` ERROR rows now name the error and the failing item.
+- Machine capture now consults `HOMEBREW_PREFIX` and a per-user linuxbrew
+  install, and errors when neither `HOME` nor `USERPROFILE` is set instead
+  of proceeding with an empty home.
+- `mox upgrade` falls back to `wget` when `curl` is absent.
+- `mox add`'s home-membership check now resolves both sides through
+  `realpath`.
+
 ## [0.4.0] - 2026-07-28
 
 ### Added
