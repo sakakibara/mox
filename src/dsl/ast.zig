@@ -40,6 +40,11 @@ pub const RowExpr = union(enum) {
     /// resulting `<axis>=<substituted>` is in the bindings map. Lets users
     /// write `tool=<entry.when>` to mirror chezmoi's `lookPath entry.when`.
     axis_with_field: struct { axis: []const u8, field_ref: []const u8 },
+    /// `bound <var>.<field>` - substitute the row's field value, then check
+    /// that name is bound as a single-value machine fact (presence, not
+    /// equality). The twin of `axis_with_field`: that substitutes into an
+    /// `eq` check, this substitutes into a `present` check.
+    bound: []const u8,
     not: *const RowExpr,
     and_: struct { left: *const RowExpr, right: *const RowExpr },
     or_: struct { left: *const RowExpr, right: *const RowExpr },

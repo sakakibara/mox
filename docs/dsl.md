@@ -80,9 +80,10 @@ irrelevant to an existence check) -- the same directories the shells
 themselves put on `$PATH`, so "gate says installed" and "shell can run it"
 never diverge -- then any directory a setup script named via `$MOX_PATH`
 (see Scripts, below): in that order, so a `$PATH` hit always wins. A
-`data/paths.toml` row's own `when` field (a tool name gating whether that
-row contributes) is checked against `$PATH`+`$MOX_PATH` only, never against
-another row's directory -- one pass, no fixpoint.
+`data/paths.toml` row's own `when` field gates whether that row
+contributes on EITHER a tool name (checked against `$PATH`+`$MOX_PATH`
+only, never against another row's directory -- one pass, no fixpoint) OR
+a bound single-value fact name -- whichever matches first.
 `<machine.tool_path.NAME>` interpolation resolves through the same search
 space. `env=<name>` resolves directly against this machine's captured
 environ, same as `<env.NAME>` interpolation; a set-but-empty variable reads
@@ -116,6 +117,11 @@ Row predicates (`<row>`, used by `where` and an in-loop `when`):
 - `<var>.field` - field is present and non-empty.
 - `<var>.field = "x"` / `<var>.field has "x"` - equality / membership.
 - `axis = <var>.field` - the field's value, checked as an axis binding.
+- `bound <var>.field` - the field's value, checked for PRESENCE as a
+  single-value machine fact -- the twin of `axis = <var>.field` above,
+  which checks by equality instead. A field value naming a multi-value
+  axis (`tool`, `env`) always reads false: presence never resolves via
+  a multi-value key, so `bound` is for single-value facts only.
 - a bare `axis` or `axis=value` - a machine-axis test.
 - `and`, `or`, `not`, `( ... )`. An unknown loop variable is an error.
 

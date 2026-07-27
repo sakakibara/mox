@@ -180,7 +180,9 @@ fn addRowExpr(ax: *Axes, expr: *const dsl.ast.RowExpr) !void {
         // `<axis>=<entry.X>` references the axis by name; the value is a row
         // field known only at compose time, so no literal presence is recorded.
         .axis_with_field => |a| try addName(ax, a.axis),
-        .present, .has, .eq => {},
+        // `bound <entry.X>` names no axis statically either -- the bound
+        // name is itself a row field known only at compose time.
+        .present, .has, .eq, .bound => {},
         .not => |inner| try addRowExpr(ax, inner),
         .and_ => |a| {
             try addRowExpr(ax, a.left);

@@ -37,6 +37,10 @@ All notable changes to mox are documented here. The format follows
 - Many previously-silent failures across apply, rollback, commit, doctor,
   and status now surface as a visible warning or a hard error instead of
   passing unnoticed.
+- A new row-predicate form, `bound <var>.<field>`: substitutes the row
+  field's value, then checks it names a bound single-value machine fact by
+  presence -- the twin of the existing `axis = <var>.field` form, which
+  checks the substituted value by equality instead.
 
 ### Changed
 - A capture written inside a data-row string value now expands (one
@@ -50,6 +54,7 @@ All notable changes to mox are documented here. The format follows
 - A custom fact or `data/facts.toml` row named `tool`, `env`, or `path` is
   now rejected at load time: it would otherwise silently shadow that axis's
   whole binding.
+- The DSL's reserved words now include `bound`.
 
 ### Removed
 - The `path=` axis and its built-in tool-home detection (Homebrew, cargo,

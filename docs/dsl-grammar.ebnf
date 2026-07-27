@@ -58,7 +58,16 @@ row_not       = "not" row_not | row_atom ;
    name an in-scope loop); a bare ident is a machine axis. An in-loop `when`
    uses row_expr, so it mixes row-field and machine-axis conditions. *)
 row_atom      = ident [ "has" string | "=" ( string | ident ) ]
+              | "bound" ident
               | "(" row_expr ")" ;
+
+(* `bound <var>.<field>` substitutes the field's value, then checks it as a
+   single-value machine binding by PRESENCE -- the twin of the `axis =
+   <var>.field` form above, which checks the substituted value by equality.
+   The `ident` after `bound` must carry a `.` (a loop-variable field
+   reference); a bare token or a quoted string is rejected at parse. A
+   substituted value that names a multi-value axis (`tool`, `env`) always
+   reads false: presence never resolves via a multi-value key. *)
 
 (* Captures appear in region bodies and loop templates, not in directive
    lines. A capture substitutes one value; a chain tries members left to

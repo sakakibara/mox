@@ -1893,6 +1893,68 @@ test "compose catB: for-loop where-clause `tool=entry.X` substitutes then axis-c
     try std.testing.expect(std.mem.indexOf(u8, out.?, "missing-zk") == null);
 }
 
+test "compose catB: for-loop where-clause `bound entry.X` substitutes then checks fact presence" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `bound <entry.when>` substitutes the `when` field from each row, then
+    // checks the resulting name is bound as a single-value fact -- the
+    // presence twin of `tool=<entry.when>`'s equality check.
+    try writeFile(io, tmp.dir, "src/.zabbr", "# mox: for entry in abbr.toml where not entry.when or bound entry.when\n" ++
+        "# abbr \"<entry.key>\"\n" ++
+        "# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.zabbr.d/abbr.toml", "[[abbr]]\nkey = \"always\"\n\n" ++
+        "[[abbr]]\nkey = \"have-brew\"\nwhen = \"brew_prefix\"\n\n" ++
+        "[[abbr]]\nkey = \"missing-cargo\"\nwhen = \"cargo_home\"\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("brew_prefix", "/opt/homebrew");
+    // cargo_home NOT in bindings -- simulates "fact not derived on this machine"
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "have-brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "missing-cargo") == null);
+}
+
+test "compose catB: a typo'd loop variable in a `bound` where-clause errors and names it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `idz` names no in-scope frame (the loop variable is `id`).
+    try writeFile(io, tmp.dir, "src/.gc", "# mox: for id in ids.toml where bound idz.when\n" ++
+        "key = <id.slug>\n" ++
+        "# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.gc.d/ids.toml", "[[ids]]\nslug = \"personal\"\nwhen = \"brew_prefix\"\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(
+        error.UnknownLoopVariable,
+        mox.compose.catB.composeTracked(a, io, tree.files[0], &bindings_r, null, null, null, &diag),
+    );
+    const cap = diag.capture() orelse return error.TestExpectedDiag;
+    try std.testing.expectEqualStrings("idz", cap);
+}
+
 /// Absolute path to `<tmp>/sub`, matching the canonical
 /// `<cwd>/.zig-cache/tmp/<id>` location the other helpers here use.
 fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []const u8) ![]u8 {

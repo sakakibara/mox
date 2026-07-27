@@ -8,6 +8,7 @@
 //!   not_expr  := "not" not_expr | atom
 //!   atom      := axis_field    -- e.g. `tool=entry.when`
 //!              | axis_eq       -- e.g. `os=macos` (machine axis, in-loop)
+//!              | bound_field   -- e.g. `bound entry.when` (single-value fact presence)
 //!              | field_present -- e.g. `entry.shells` / bare `os`
 //!              | field_has     -- e.g. `entry.shells has "zsh"`
 //!              | field_eq      -- e.g. `entry.shells = "zsh"`
@@ -138,6 +139,23 @@ pub const Parser = struct {
             self.advance();
             return inner;
         }
+        // `bound <var>.field` - substitutes the field's value, then checks
+        // it names a bound single-value fact. Always a dotted ref: a bare
+        // token here (no `.`) would name a machine axis directly, which
+        // `bound` has no use for -- `<axis>` presence already does that.
+        if (isKw(t, "bound")) {
+            self.advance();
+            const field_ref = switch (self.peek().kind) {
+                .ident => |s| s,
+                else => return error.ExpectedFieldRef,
+            };
+            if (std.mem.indexOfScalar(u8, field_ref, '.') == null) return error.ExpectedFieldRef;
+            self.advance();
+            const node = try self.arena.create(RowExpr);
+            node.* = .{ .bound = field_ref };
+            return node;
+        }
+
         const name = switch (t.kind) {
             .ident => |s| s,
             else => return error.ExpectedRowAtom,
@@ -254,6 +272,7 @@ pub fn evaluate(
         .has => |h| memberRef(h.ref, h.value, scope, bindings, unknown_var),
         .eq => |e| memberRef(e.ref, e.value, scope, bindings, unknown_var),
         .axis_with_field => |a| axisWithField(arena, a.axis, a.field_ref, scope, bindings, unknown_var),
+        .bound => |field_ref| boundField(arena, field_ref, scope, bindings, unknown_var),
         .not => |inner| !(try evaluate(arena, inner, scope, bindings, unknown_var)),
         .and_ => |a| (try evaluate(arena, a.left, scope, bindings, unknown_var)) and
             (try evaluate(arena, a.right, scope, bindings, unknown_var)),
@@ -342,6 +361,32 @@ fn axisWithField(
     return axis_mod.eqMatch(axis, formatted, bindings);
 }
 
+/// `bound <var>.<field>` - the twin of `axisWithField`: substitutes the row
+/// field's value, then checks it names a bound machine binding by PRESENCE
+/// rather than equality. `presentMatch` never resolves via a multi-value
+/// compound key (`tool=`, `env=` bind no direct key), so a field value that
+/// happens to spell one of those axis names reads as unbound -- `bound` is
+/// for single-value facts, not the open multi-value axes.
+fn boundField(
+    arena: std.mem.Allocator,
+    field_ref: []const u8,
+    scope: []const Frame,
+    bindings: *const Resolver,
+    unknown_var: ?*[]const u8,
+) EvalError!bool {
+    const r = splitRef(field_ref);
+    const frame = findFrame(scope, r.head) orelse return noteUnknown(unknown_var, r.head);
+    const field = r.field orelse return false;
+    const rec = switch (frame.value) {
+        .record => |rec| rec,
+        .scalar => return false, // a scalar has no field to substitute
+    };
+    const v = rec.get(field) orelse return false;
+    if (v.isEmpty()) return false;
+    const formatted = try v.format(arena);
+    return axis_mod.presentMatch(formatted, bindings);
+}
+
 test "parse: deeply nested parens returns error instead of crashing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -390,6 +435,30 @@ test "parse: axis_with_field" {
     try std.testing.expect(e.* == .axis_with_field);
     try std.testing.expectEqualStrings("tool", e.axis_with_field.axis);
     try std.testing.expectEqualStrings("entry.when", e.axis_with_field.field_ref);
+}
+
+test "parse: bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const e = try parseString(arena.allocator(), "bound entry.when");
+    try std.testing.expect(e.* == .bound);
+    try std.testing.expectEqualStrings("entry.when", e.bound);
+}
+
+test "reject: bound with no field ref" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // A bare (undotted) token after `bound` names a machine axis directly,
+    // which `bound` has no use for -- it always substitutes a row field.
+    try std.testing.expectError(error.ExpectedFieldRef, parseString(arena.allocator(), "bound os"));
+    // Nothing at all after `bound`.
+    try std.testing.expectError(error.ExpectedFieldRef, parseString(arena.allocator(), "bound"));
+}
+
+test "reject: bound with a literal string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ExpectedFieldRef, parseString(arena.allocator(), "bound \"entry.when\""));
 }
 
 test "parse: bare axis presence and literal axis eq (machine forms)" {
@@ -586,4 +655,63 @@ test "evaluate: axis_with_field matches an over-256-byte field value" {
     const scope = entryScope(&record);
     const e = try parseString(a, "tool=entry.when");
     try std.testing.expect(try evaluate(a, e, &scope, &bindings_r, null));
+}
+
+test "evaluate: bound looks up the substituted single-value fact" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data_value.Value).init(a);
+    try record.put("when", .{ .string = "brew_prefix" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("brew_prefix", "/opt/homebrew");
+    const scope = entryScope(&record);
+    const e = try parseString(a, "bound entry.when");
+    try std.testing.expect(try evaluate(a, e, &scope, &bindings_r, null));
+}
+
+test "evaluate: bound returns false when the substituted fact is unbound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data_value.Value).init(a);
+    try record.put("when", .{ .string = "cargo_home" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+    const scope = entryScope(&record);
+    const e = try parseString(a, "bound entry.when");
+    try std.testing.expect(!try evaluate(a, e, &scope, &bindings_r, null));
+}
+
+test "evaluate: bound reads false for a multi-value axis name, even when its compound key is bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record = std.StringHashMap(data_value.Value).init(a);
+    try record.put("when", .{ .string = "tool" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+    // `tool` never binds directly -- only compound `tool=fd` keys exist --
+    // so substituting the literal axis name "tool" never presents as bound.
+    try bindings.put("tool=fd", "1");
+    const scope = entryScope(&record);
+    const e = try parseString(a, "bound entry.when");
+    try std.testing.expect(!try evaluate(a, e, &scope, &bindings_r, null));
+}
+
+test "evaluate: bound on an unknown loop variable errors and records the name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var record = std.StringHashMap(data_value.Value).init(arena.allocator());
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+    const scope = entryScope(&record);
+    const e = try parseString(arena.allocator(), "bound id.when");
+    var unknown: []const u8 = "";
+    try std.testing.expectError(
+        error.UnknownLoopVariable,
+        evaluate(arena.allocator(), e, &scope, &bindings_r, &unknown),
+    );
+    try std.testing.expectEqualStrings("id", unknown);
 }
