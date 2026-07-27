@@ -52,6 +52,14 @@ pub const MachineState = struct {
     /// ENV_WATCH_LIST that were defined and non-empty. Used by
     /// `<env.NAME>` interpolation.
     env_values: []const Fact = &.{},
+    /// Lazy fallback for an `env=NAME` axis query or `<env.NAME>`
+    /// interpolation member that `env_values` does not already answer (a
+    /// name outside the eager `ENV_WATCH_LIST`): reads this same captured
+    /// environ directly. Null only for a MachineState built by hand (every
+    /// test fixture); `capture` always supplies one. Also the probe layer a
+    /// `Resolver.Live` built from this snapshot's bindings falls through to
+    /// for `env=`.
+    env_probe: ?*EnvProbe = null,
     brew_prefix: []const u8,
     cargo_home: []const u8,
     gopath: []const u8,
@@ -75,6 +83,48 @@ pub const MachineState = struct {
     pub fn probe(self: MachineState) ?dsl.resolver.Resolver.Probe {
         const tp = self.tool_probe orelse return null;
         return tp.probe();
+    }
+
+    /// This snapshot's lazy env-probe layer, ready to hand to
+    /// `dsl.resolver.Resolver.Live.env`. Null only when `env_probe` itself is
+    /// null (a hand-built MachineState in a test, never one `capture`
+    /// returned).
+    pub fn envProbe(self: MachineState) ?dsl.resolver.Resolver.EnvProbe {
+        const ep = self.env_probe orelse return null;
+        return ep.probe();
+    }
+};
+
+/// Lazy, on-demand `env=NAME` / `<env.NAME>` answer for a name outside the
+/// eager `ENV_WATCH_LIST` snapshot: reads this machine's captured environ
+/// directly rather than a process-global lookup. No memoization -- `Env.get`
+/// is already an O(1) map/syscall-free read, unlike the PATH scan `ToolProbe`
+/// exists to batch. Empty-is-unset by construction (`Env.get`'s own
+/// contract), matching `env_values`' watched-name semantics exactly.
+pub const EnvProbe = struct {
+    arena: std.mem.Allocator,
+    environ: Environ,
+
+    pub fn init(arena: std.mem.Allocator, environ: Environ) EnvProbe {
+        return .{ .arena = arena, .environ = environ };
+    }
+
+    /// The value of `name`, or null when unset or set-but-empty.
+    pub fn get(self: *EnvProbe, name: []const u8) ?[]const u8 {
+        return self.environ.get(self.arena, name);
+    }
+
+    /// Adapt this reader to `dsl.resolver.Resolver.EnvProbe`, so a `Resolver`
+    /// built over this machine's bindings can fall through to it for an
+    /// `env=` name (or `<env.NAME>` interpolation member) the bindings/
+    /// `env_values` snapshot does not already answer.
+    pub fn probe(self: *EnvProbe) dsl.resolver.Resolver.EnvProbe {
+        return .{ .ctx = self, .getFn = getTrampoline };
+    }
+
+    fn getTrampoline(ctx: *anyopaque, name: []const u8) ?[]const u8 {
+        const self: *EnvProbe = @ptrCast(@alignCast(ctx));
+        return self.get(name);
     }
 };
 
@@ -210,6 +260,12 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const defined_envs = try envs.toOwnedSlice(arena);
     const env_values = try env_vals.toOwnedSlice(arena);
 
+    // A fresh env probe every capture, mirroring the tool probe: no state to
+    // reset here (no memo), but a stable arena-owned pointer is still needed
+    // since `EnvProbe.probe()` hands out a `ctx` pointer into it.
+    const env_probe = try arena.create(EnvProbe);
+    env_probe.* = EnvProbe.init(arena, environ);
+
     const brew_prefix = try detectBrewPrefix(arena, io, environ, builtin.os.tag, home);
 
     const xdg_config_home = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
@@ -237,6 +293,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
         .tool_probe = tool_probe,
         .defined_envs = defined_envs,
         .env_values = env_values,
+        .env_probe = env_probe,
         .brew_prefix = brew_prefix,
         .cargo_home = cargo_home,
         .gopath = gopath,
@@ -528,4 +585,51 @@ test "capture returns nonempty hostname" {
     defer arena.deinit();
     const m = try capture(arena.allocator(), std.testing.io, Environ{ .process = std.testing.environ });
     try std.testing.expect(m.hostname.len > 0);
+}
+
+test "EnvProbe.get: an unwatched name reads from the captured environ" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("MOX_UNWATCHED_SET_VAR", "hello");
+    var probe = EnvProbe.init(a, Environ{ .map = &map });
+
+    try std.testing.expectEqualStrings("hello", probe.get("MOX_UNWATCHED_SET_VAR").?);
+    try std.testing.expect(probe.get("MOX_UNWATCHED_UNSET_VAR") == null);
+}
+
+test "EnvProbe.get: a set-but-empty value reads as unset, same as env_values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("MOX_UNWATCHED_EMPTY_VAR", "");
+    var probe = EnvProbe.init(a, Environ{ .map = &map });
+
+    try std.testing.expect(probe.get("MOX_UNWATCHED_EMPTY_VAR") == null);
+}
+
+test "Resolver via EnvProbe.probe(): fixed variant never consults the environ, even for a name confirmed set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("MOX_REALLY_SET_VAR", "1");
+    var probe = EnvProbe.init(a, Environ{ .map = &map });
+    // Confirm the name really is set by probing directly -- the point being
+    // disproven is that `fixed` would ever do this itself.
+    try std.testing.expectEqualStrings("1", probe.get("MOX_REALLY_SET_VAR").?);
+
+    var empty = std.StringHashMap([]const u8).init(a);
+    const fixed: dsl.resolver.Resolver = .{ .fixed = &empty };
+    try std.testing.expect(!fixed.has("env", "MOX_REALLY_SET_VAR"));
+
+    // Contrast: the live variant, wired to the very same probe, DOES resolve
+    // it -- proving the difference is `fixed` never touching the environ at
+    // all, not some incidental miss.
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .env = probe.probe() };
+    const live_r: dsl.resolver.Resolver = .{ .live = &live };
+    try std.testing.expect(live_r.has("env", "MOX_REALLY_SET_VAR"));
 }

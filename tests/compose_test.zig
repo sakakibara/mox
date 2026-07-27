@@ -2039,6 +2039,84 @@ test "compose catB: for-loop where-clause `tool=entry.X` resolves an unseeded na
     try std.testing.expect(std.mem.indexOf(u8, out.?, "missing-zk") == null);
 }
 
+test "compose catB: when env=<unwatched-but-set> composes true, without the name ever being seeded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/herdr-env.sh", "# mox: when env=MOX_UNWATCHED_SET_VAR\n" ++
+        "alias h='herdr'\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_UNWATCHED_SET_VAR", "1");
+    var probe = mox.machine.state.EnvProbe.init(a, Env{ .map = &map });
+    var live: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .env = probe.probe() };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &live };
+
+    const out = try mox.compose.catB.compose(a, io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "alias h=") != null);
+}
+
+test "compose catB: when env=<unwatched-and-unset> stays false" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/herdr-env.sh", "# mox: when env=MOX_UNWATCHED_UNSET_VAR\n" ++
+        "alias h='herdr'\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var map = std.process.Environ.Map.init(a);
+    var probe = mox.machine.state.EnvProbe.init(a, Env{ .map = &map });
+    var live: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .env = probe.probe() };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &live };
+
+    const out = try mox.compose.catB.compose(a, io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out == null);
+}
+
+test "compose catB: when env=<unwatched-but-set-empty> stays false, empty is unset" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/herdr-env.sh", "# mox: when env=MOX_UNWATCHED_EMPTY_VAR\n" ++
+        "alias h='herdr'\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_UNWATCHED_EMPTY_VAR", "");
+    var probe = mox.machine.state.EnvProbe.init(a, Env{ .map = &map });
+    var live: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .env = probe.probe() };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &live };
+
+    const out = try mox.compose.catB.compose(a, io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out == null);
+}
+
 test "compose catA toml: <machine.X> in base content interpolates" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

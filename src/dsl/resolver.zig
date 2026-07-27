@@ -23,16 +23,19 @@ pub const Resolver = union(enum) {
     fixed: *const std.StringHashMap([]const u8),
     override: *const Override,
 
-    /// A live snapshot plus its lazy tool-probe layer. `bindings` answers
-    /// exactly like `fixed`'s map; `probe`, when present, is asked for
-    /// `tool=name` only when `bindings` does not already carry that name --
-    /// so a name the eager watch-list scan seeded never probes, and only a
-    /// name it never asked about does. `probe` is null for a resolver built
-    /// without one (every hand-built test fixture); a real captured machine
-    /// always supplies one.
+    /// A live snapshot plus its lazy tool-probe and env-probe layers.
+    /// `bindings` answers exactly like `fixed`'s map; `probe`, when present,
+    /// is asked for `tool=name` only when `bindings` does not already carry
+    /// that name -- so a name the eager watch-list scan seeded never probes,
+    /// and only a name it never asked about does. `env` is the same fallback
+    /// for `env=name`, reading the captured environ directly for a name
+    /// outside the eager `ENV_WATCH_LIST` snapshot. Both are null for a
+    /// resolver built without one (every hand-built test fixture); a real
+    /// captured machine always supplies both.
     pub const Live = struct {
         bindings: *const std.StringHashMap([]const u8),
         probe: ?Probe = null,
+        env: ?EnvProbe = null,
     };
 
     /// A minimal duck-typed presence probe: `ctx` is the concrete prober
@@ -45,6 +48,21 @@ pub const Resolver = union(enum) {
 
         pub fn present(self: Probe, name: []const u8) bool {
             return self.presentFn(self.ctx, name);
+        }
+    };
+
+    /// A minimal duck-typed environ reader: `ctx` is the concrete prober
+    /// (`machine.state.EnvProbe`), reached through a function pointer for the
+    /// same reason as `Probe`. Returns null for a name that is unset or
+    /// set-but-empty, mirroring `env.Env.get`'s own contract -- so a name
+    /// outside the eager watch list stays unbound exactly like a watched
+    /// one, never falling back to a process-global lookup.
+    pub const EnvProbe = struct {
+        ctx: *anyopaque,
+        getFn: *const fn (ctx: *anyopaque, name: []const u8) ?[]const u8,
+
+        pub fn get(self: EnvProbe, name: []const u8) ?[]const u8 {
+            return self.getFn(self.ctx, name);
         }
     };
 
@@ -82,16 +100,18 @@ pub const Resolver = union(enum) {
     /// True when `axis=value` holds: a single-value axis (os, arch, profile,
     /// machine, hostname, custom facts) compares its direct binding; a
     /// multi-value axis (tool, env, path) is membership in the compound
-    /// `axis=value` key set. On the live variant, a `tool=` query the
-    /// bindings map does not already answer falls through to the probe
-    /// layer -- so a name the eager scan never watched still resolves,
-    /// lazily, instead of answering false forever.
+    /// `axis=value` key set. On the live variant, a `tool=` or `env=` query
+    /// the bindings map does not already answer falls through to the
+    /// matching probe layer -- so a name the eager scan never watched still
+    /// resolves, lazily, instead of answering false forever.
     pub fn has(self: Resolver, axis: []const u8, value: []const u8) bool {
         return switch (self) {
             .live => |l| if (hasInMap(l.bindings, axis, value))
                 true
             else if (l.probe != null and std.mem.eql(u8, axis, "tool"))
                 l.probe.?.present(value)
+            else if (l.env != null and std.mem.eql(u8, axis, "env"))
+                l.env.?.get(value) != null
             else
                 false,
             .fixed => |m| hasInMap(m, axis, value),
@@ -305,4 +325,88 @@ test "live: a null probe leaves an unseeded tool name false, same as before prob
     const r: Resolver = .{ .live = &live };
 
     try std.testing.expect(!r.has("tool", "fd"));
+}
+
+/// An `EnvProbe` stub that answers from a fixed name-value list and records
+/// whether it was ever asked, mirroring `TestProbe` for the env fallback.
+const TestEnvProbe = struct {
+    values: []const struct { name: []const u8, value: []const u8 },
+    called: bool = false,
+
+    fn getFn(ctx: *anyopaque, name: []const u8) ?[]const u8 {
+        const self: *TestEnvProbe = @ptrCast(@alignCast(ctx));
+        self.called = true;
+        for (self.values) |kv| {
+            if (std.mem.eql(u8, kv.name, name)) return kv.value;
+        }
+        return null;
+    }
+
+    fn probe(self: *TestEnvProbe) Resolver.EnvProbe {
+        return .{ .ctx = self, .getFn = getFn };
+    }
+};
+
+test "live: an env name already seeded in bindings answers without consulting the env probe" {
+    var m = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer m.deinit();
+    try m.put("env=TMUX", "1");
+    var stub = TestEnvProbe{ .values = &.{.{ .name = "TMUX", .value = "x" }} };
+    const live: Resolver.Live = .{ .bindings = &m, .env = stub.probe() };
+    const r: Resolver = .{ .live = &live };
+
+    try std.testing.expect(r.has("env", "TMUX"));
+    try std.testing.expect(!stub.called);
+}
+
+test "live: an unwatched-but-set env name falls through to the env probe, true" {
+    var m = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer m.deinit();
+    var stub = TestEnvProbe{ .values = &.{.{ .name = "MY_UNWATCHED_VAR", .value = "x" }} };
+    const live: Resolver.Live = .{ .bindings = &m, .env = stub.probe() };
+    const r: Resolver = .{ .live = &live };
+
+    try std.testing.expect(r.has("env", "MY_UNWATCHED_VAR"));
+    try std.testing.expect(stub.called);
+}
+
+test "live: a set-but-empty env name stays unbound through the env probe" {
+    var m = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer m.deinit();
+    // The probe stub mirrors `Env.get`'s own empty-is-unset contract: an
+    // empty value is never returned, only null.
+    var stub = TestEnvProbe{ .values = &.{} };
+    const live: Resolver.Live = .{ .bindings = &m, .env = stub.probe() };
+    const r: Resolver = .{ .live = &live };
+
+    try std.testing.expect(!r.has("env", "SET_BUT_EMPTY"));
+    try std.testing.expect(stub.called);
+}
+
+test "live: a non-env axis never consults the env probe" {
+    var m = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer m.deinit();
+    var stub = TestEnvProbe{ .values = &.{.{ .name = "fd", .value = "1" }} };
+    const live: Resolver.Live = .{ .bindings = &m, .env = stub.probe() };
+    const r: Resolver = .{ .live = &live };
+
+    try std.testing.expect(!r.has("tool", "fd"));
+    try std.testing.expect(!stub.called);
+}
+
+test "live: a null env probe leaves an unseeded env name false, same as before probing existed" {
+    var m = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer m.deinit();
+    const live: Resolver.Live = .{ .bindings = &m };
+    const r: Resolver = .{ .live = &live };
+
+    try std.testing.expect(!r.has("env", "ANYTHING"));
+}
+
+test "fixed: never consults an env probe (there is none to consult -- the fixed variant has no probe field at all)" {
+    var m = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer m.deinit();
+    const r: Resolver = .{ .fixed = &m };
+
+    try std.testing.expect(!r.has("env", "ANYTHING"));
 }

@@ -260,7 +260,7 @@ fn generatorProblems(
 ) !?[]const []const u8 {
     const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
     const bindings_map = try mox.machine.bindings.fromMachineState(arena, m_state);
-    const live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe() };
+    const live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
     const bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
@@ -494,7 +494,7 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    const live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe() };
+    const live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
     const bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };

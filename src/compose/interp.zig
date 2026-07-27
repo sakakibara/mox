@@ -458,10 +458,13 @@ pub fn expandTracked(
             }
 
             if (std.mem.startsWith(u8, inner, "env.")) {
-                // `<env.NAME>` substitutes the captured value of an env var
-                // (from `MachineState.env_values`). Empty string when the
-                // name isn't in the watch list or isn't set, OR the default
-                // when one is supplied via `| default "..."`.
+                // `<env.NAME>` substitutes the captured value of an env var.
+                // `MachineState.env_values` answers a name in the eager
+                // watch list; a name outside it falls through to the same
+                // lazy environ read `env=` axis matching uses, so any name
+                // resolves, not only a watched one. Empty string when unset
+                // or set-but-empty, OR the default when supplied via
+                // `| default "..."`.
                 const m = ctx.machine orelse return error.MachineRefWithoutState;
                 const name = inner[4..];
                 var resolved: []const u8 = "";
@@ -471,6 +474,14 @@ pub fn expandTracked(
                         resolved = ev.value;
                         found = true;
                         break;
+                    }
+                }
+                if (!found) {
+                    if (m.env_probe) |ep| {
+                        if (ep.get(name)) |v| {
+                            resolved = v;
+                            found = true;
+                        }
                     }
                 }
                 if (!found and default_opt != null) resolved = default_opt.?;
@@ -568,10 +579,20 @@ fn resolveChain(
             };
         } else if (std.mem.startsWith(u8, member, "env.")) {
             const m = ctx.machine orelse return error.MachineRefWithoutState;
+            const name = member[4..];
+            var found = false;
             for (m.env_values) |ev| {
-                if (std.mem.eql(u8, ev.name, member[4..])) {
+                if (std.mem.eql(u8, ev.name, name)) {
                     value = ev.value;
+                    found = true;
                     break;
+                }
+            }
+            // A name outside the eager watch list falls through to the same
+            // lazy environ read the direct `<env.NAME>` capture uses.
+            if (!found) {
+                if (m.env_probe) |ep| {
+                    if (ep.get(name)) |v| value = v;
                 }
             }
         } else if (std.mem.startsWith(u8, member, "data.")) {
@@ -929,6 +950,48 @@ test "expand: a '>' inside a default does not truncate the capture" {
     // PAGER is not in env_values, so the default (which contains '>') is used.
     const out = try expand(arena.allocator(), "x=<env.PAGER | default \"less >log\">", null, .{ .machine = &m });
     try std.testing.expectEqualStrings("x=less >log", out);
+}
+
+test "expand: <env.NAME> for a name outside env_values falls through to the live env probe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_UNWATCHED_SET_VAR", "hello");
+    var probe = machine.state.EnvProbe.init(a, .{ .map = &map });
+    var m = chainTestState();
+    m.env_probe = &probe;
+
+    const out = try expand(a, "<env.MOX_UNWATCHED_SET_VAR>", null, .{ .machine = &m });
+    try std.testing.expectEqualStrings("hello", out);
+}
+
+test "expand: <env.NAME> set-but-empty through the probe stays unbound, default rescues it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_UNWATCHED_EMPTY_VAR", "");
+    var probe = machine.state.EnvProbe.init(a, .{ .map = &map });
+    var m = chainTestState();
+    m.env_probe = &probe;
+
+    const out = try expand(a, "<env.MOX_UNWATCHED_EMPTY_VAR | default \"fallback\">", null, .{ .machine = &m });
+    try std.testing.expectEqualStrings("fallback", out);
+}
+
+test "chain: an unwatched-but-set env member resolves through the live probe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_UNWATCHED_SET_VAR", "world");
+    var probe = machine.state.EnvProbe.init(a, .{ .map = &map });
+    var m = chainTestState();
+    m.env_probe = &probe;
+
+    const out = try expand(a, "<env.MOX_UNWATCHED_SET_VAR | default \"none\">", null, .{ .machine = &m });
+    try std.testing.expectEqualStrings("world", out);
 }
 
 test "chain: bare names outside template mode pass through literally" {
