@@ -364,16 +364,38 @@ const Discoverer = struct {
 
     // -- scripts tree -------------------------------------------------------
 
+    /// Mirrors `apply.run_scripts.runStage`'s shape exactly: every top-level
+    /// regular file, plus the files exactly ONE level inside a subdirectory
+    /// whose name parses as an axis tuple (`os=linux`, `os=linux+profile=work`).
+    /// A subdirectory that is not an axis tuple, or a file two or more levels
+    /// deep, is never reached -- apply would never run it either, so scanning
+    /// it here would surface directives (and their errors) apply itself never
+    /// acts on.
     fn scanScriptsTree(self: *Discoverer, abs_dir: []const u8, rel_prefix: []const u8) !void {
         const entries = try source.dirent.sortedPath(self.arena, self.io, abs_dir, .{ .iterate = true });
         for (entries) |e| {
             const abs = try std.fs.path.join(self.arena, &.{ abs_dir, e.name });
             const rel = try source.path.joinKey(self.arena, &.{ rel_prefix, e.name });
             switch (e.kind) {
-                .directory => try self.scanScriptsTree(abs, rel),
+                .directory => {
+                    if (isAxisTupleDirName(self.arena, e.name)) try self.scanGatedScriptsDir(abs, rel);
+                },
                 .file => try self.scanScriptFile(abs, rel),
                 else => {},
             }
+        }
+    }
+
+    /// The non-recursive second level `scanScriptsTree` descends into: every
+    /// regular file directly inside a matching axis-tuple directory, no
+    /// further subdirectories.
+    fn scanGatedScriptsDir(self: *Discoverer, abs_dir: []const u8, rel_prefix: []const u8) !void {
+        const entries = try source.dirent.sortedPath(self.arena, self.io, abs_dir, .{ .iterate = true });
+        for (entries) |e| {
+            if (e.kind != .file) continue;
+            const abs = try std.fs.path.join(self.arena, &.{ abs_dir, e.name });
+            const rel = try source.path.joinKey(self.arena, &.{ rel_prefix, e.name });
+            try self.scanScriptFile(abs, rel);
         }
     }
 
@@ -459,6 +481,15 @@ const Discoverer = struct {
         return slice;
     }
 };
+
+/// True when `name` parses as an axis tuple (`os=linux`, `os=linux+profile=work`),
+/// mirroring `apply.run_scripts.axisDirMatches`'s tuple-name validation --
+/// discovery has no machine bindings to match against, so it validates shape
+/// only, the same test a script-tuple dir must pass to be gated at all.
+fn isAxisTupleDirName(arena: std.mem.Allocator, name: []const u8) bool {
+    _ = source.tuple.parseFilename(arena, name) catch return false;
+    return true;
+}
 
 fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
@@ -1189,6 +1220,103 @@ test "discover: integration -- gdrive_account gated, 1Password pair gated on pro
     try std.testing.expectEqualStrings("personal", profile.capture_defaults[0]);
     // Gate-derived occurrence makes this unconditioned.
     try std.testing.expect(profile.asking_condition == null);
+}
+
+test "discover: a script two levels deep under a non-tuple directory is not scanned at all" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "lib" is not an axis-tuple name (no `=`), so a script inside it must never
+    // be scanned -- not even to notice its malformed `# mox: needs`, which
+    // would otherwise fail the whole discovery loudly.
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/lib/helper.sh",
+        "#!/bin/sh\n# mox: needs Bad-Name\necho \"$MOX_FACT_X\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
+}
+
+test "discover: the same malformed script still registers (fails loud) at top level" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/00-bad.sh",
+        "#!/bin/sh\n# mox: needs Bad-Name\necho \"$MOX_FACT_X\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    try std.testing.expectError(error.InvalidNeedsName, discover(a, io, repo));
+}
+
+test "discover: the same malformed script still registers (fails loud) one level inside a matching axis dir" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/os=linux/util.sh",
+        "#!/bin/sh\n# mox: needs Bad-Name\necho \"$MOX_FACT_X\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    try std.testing.expectError(error.InvalidNeedsName, discover(a, io, repo));
+}
+
+test "discover: a well-formed script one level inside an axis dir is scanned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/os=linux/util.sh",
+        "#!/bin/sh\necho \"$MOX_FACT_UTIL_DIM\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/os=linux/util.sh", d.scripts[0].path);
+}
+
+test "discover: a directory whose name is not an axis tuple is never descended into" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "scripts/pre/helpers/util.sh", "#!/bin/sh\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
 }
 
 test "discover: an empty repo (no src, no scripts) yields no dimensions and no scripts" {
