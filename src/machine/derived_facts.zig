@@ -131,9 +131,11 @@ fn resolveRow(
     return null;
 }
 
+/// True when `path` exists AND resolves to a directory (symlinks followed --
+/// the default): a regular file candidate must never bind a directory fact.
 fn dirExists(io: Io, path: []const u8) bool {
-    Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory;
 }
 
 /// `~` expands to `home`; `~/rest` expands to `<home>/rest` (native join);
@@ -232,6 +234,90 @@ test "load: no candidate exists leaves the row unbound, no error" {
     var map = std.process.Environ.Map.init(a);
     const r = try load(a, io, .{ .map = &map }, repo, "", "/home/x", null);
     try std.testing.expectEqual(@as(usize, 0), r.facts.len);
+}
+
+test "load: a candidate naming a regular file does not bind (directory required)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "not_a_dir", .data = "" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"brew_prefix\"\ncandidates = [\"__CAND__\"]\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const file_cand = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "not_a_dir" });
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\ncandidates = [\"{s}\"]\n", .{file_cand}),
+    });
+
+    var map = std.process.Environ.Map.init(a);
+    const r = try load(a, io, .{ .map = &map }, repo, "", "/home/x", null);
+    try std.testing.expectEqual(@as(usize, 0), r.facts.len);
+}
+
+test "load: a symlink to a directory candidate binds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.createDirPath(io, "real_dir");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const real_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "real_dir" });
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "dir_link" });
+
+    try Io.Dir.cwd().symLink(io, real_dir, link, .{ .is_directory = true });
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\ncandidates = [\"{s}\"]\n", .{link}),
+    });
+
+    var map = std.process.Environ.Map.init(a);
+    const r = try load(a, io, .{ .map = &map }, repo, "", "/home/x", null);
+    try std.testing.expectEqual(@as(usize, 1), r.facts.len);
+    try std.testing.expectEqualStrings(link, r.facts[0].value);
+}
+
+test "load: an env override naming a regular file does not win, falls through to candidates" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.createDirPath(io, "cand");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const cand = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "cand" });
+    const file_override = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "override_file" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file_override, .data = "" });
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\nenv = \"HOMEBREW_PREFIX\"\ncandidates = [\"{s}\"]\n", .{cand}),
+    });
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOMEBREW_PREFIX", file_override);
+    const r = try load(a, io, .{ .map = &map }, repo, "", "/home/x", null);
+    try std.testing.expectEqual(@as(usize, 1), r.facts.len);
+    try std.testing.expectEqualStrings(cand, r.facts[0].value);
 }
 
 test "load: ~ expands to home in a candidate" {
