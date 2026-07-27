@@ -110,7 +110,7 @@ A loop body is a template, so it may nest a `when` or another `for`.
 `<var.field>` captures resolve against the innermost enclosing loop that names
 `<var>`, then against `machine`/`env`/`data`. A `when` inside a loop tests the
 row (row predicates below), and a bare name or `name=value` still tests a
-machine axis -- so `when os=macos and id.signing_key` mixes both.
+machine axis -- so `when os=darwin and id.signing_key` mixes both.
 
 Row predicates (`<row>`, used by `where` and an in-loop `when`):
 
