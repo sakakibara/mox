@@ -87,6 +87,43 @@ pub fn load(
     return .{ .facts = try facts.toOwnedSlice(arena) };
 }
 
+/// Every dimension name `data/facts.toml` declares, regardless of whether it
+/// currently resolves to a value on this machine (`load` drops an unresolved
+/// row entirely, which is right for capture but wrong for discovery -- D1
+/// must exclude a declared name from the custom-dimension space even on a
+/// machine where its candidate directory doesn't exist yet). Validation
+/// mirrors `load`: a malformed row is `error.MalformedFactsRow`; a name
+/// colliding with a reserved axis, a built-in field, or declared twice is
+/// `error.ReservedFactsRowName`. A missing file (in both layers, or an empty
+/// `repo_dir`) is not an error: returns no names.
+pub fn declaredNames(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    private_dir: []const u8,
+) ![]const []const u8 {
+    const content = (try data_source.readShadowed(arena, io, repo_dir, private_dir, "facts.toml")) orelse
+        return &.{};
+
+    const array_map = toml.parse(arena, content) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedFactsRow,
+    };
+    const rows = array_map.get("facts") orelse return &.{};
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var seen = std.StringHashMap(void).init(arena);
+    for (rows) |row| {
+        const name = nameOf(row) orelse return error.MalformedFactsRow;
+        if (!isValidFactCharset(name)) return error.MalformedFactsRow;
+        if (source_axes.isReservedAxisName(name) or state_mod.isBuiltinField(name)) return error.ReservedFactsRowName;
+        if (seen.contains(name)) return error.ReservedFactsRowName;
+        try seen.put(name, {});
+        try names.append(arena, try arena.dupe(u8, name));
+    }
+    return names.toOwnedSlice(arena);
+}
+
 fn nameOf(row: toml.Record) ?[]const u8 {
     const v = row.get("name") orelse return null;
     return switch (v) {

@@ -7,6 +7,7 @@ pub const derived_facts = @import("derived_facts.zig");
 pub const path_registry = @import("path_registry.zig");
 pub const diag = @import("diag.zig");
 pub const interview = @import("interview.zig");
+pub const dimensions = @import("dimensions.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -19,4 +20,5 @@ test {
     _ = path_registry;
     _ = diag;
     _ = interview;
+    _ = dimensions;
 }
