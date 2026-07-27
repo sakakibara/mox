@@ -318,8 +318,6 @@ test "MachineState type is constructible" {
         .hostname = "test-host",
         .username = "tester",
         .home = "/home/tester",
-        .tools_on_path = &.{},
-        .defined_envs = &.{},
         .brew_prefix = "",
         .cargo_home = "",
         .gopath = "",
@@ -376,7 +374,7 @@ test "MachineState capture: sets home directory" {
     try std.testing.expect(m.home.len > 0);
 }
 
-test "machine bindings: produces os and tool entries" {
+test "machine bindings: produces os, arch, and path= entries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const m = machine.state.MachineState{
@@ -385,8 +383,6 @@ test "machine bindings: produces os and tool entries" {
         .hostname = "test",
         .username = "tester",
         .home = "/home/tester",
-        .tools_on_path = &.{ "fd", "rg" },
-        .defined_envs = &.{"WSL_DISTRO_NAME"},
         .brew_prefix = "/opt/homebrew",
         .cargo_home = "/home/tester/.cargo",
         .gopath = "",
@@ -399,10 +395,11 @@ test "machine bindings: produces os and tool entries" {
     var b = try machine.bindings.fromMachineState(arena.allocator(), m);
     try std.testing.expectEqualStrings("linux", b.get("os").?);
     try std.testing.expectEqualStrings("aarch64", b.get("arch").?);
-    try std.testing.expect(b.contains("tool=fd"));
-    try std.testing.expect(b.contains("tool=rg"));
-    try std.testing.expect(b.contains("env=WSL_DISTRO_NAME"));
     try std.testing.expect(b.contains("path=brew_prefix"));
+    try std.testing.expect(b.contains("path=cargo_home"));
+    // tool=/env= are open axes with no fixed vocabulary: a Resolver.Live
+    // answers them by probing, never from this map.
+    try std.testing.expect(!b.contains("tool=fd"));
 }
 
 test "tokens: extract from simple text" {

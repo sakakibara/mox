@@ -448,6 +448,13 @@ pub fn commitImpl(
     };
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 
+    // `bindings` is what every hypothetical configuration below clones
+    // (cross-configuration verification, impact analysis); seed its static
+    // tool=/env= literals now so those fixed clones see the same answer this
+    // machine's live resolver does, instead of reading every one as unbound.
+    const repo_ax = try mox.source.axes.ofManagedTree(ctx.alloc, ctx.io, tree);
+    try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
+
     // A scoped commit routes only the named files: everything else is left
     // for a later `mox commit`, so `scoped_live` gates the main routing loop
     // rather than shrinking `tree.files` (which every fidx-indexed array
@@ -950,6 +957,8 @@ pub fn commitImpl(
         m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
         bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = .{ .bindings = &bindings, .probe = m_state.probe(), .env = m_state.envProbe() };
+        // The fresh `bindings` map above starts unseeded again.
+        try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
     }
 
     // Rewalk so region synthesis (new fragments/regions) is reflected when the
@@ -4412,8 +4421,6 @@ test "routeHunk: a private-only base file's edit is flagged private by location"
         .hostname = "h",
         .username = "u",
         .home = "/home/u",
-        .tools_on_path = &.{},
-        .defined_envs = &.{},
         .brew_prefix = "",
         .cargo_home = "",
         .gopath = "",
@@ -4517,8 +4524,6 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
         .hostname = "test",
         .username = "tester",
         .home = "/home/me",
-        .tools_on_path = &.{},
-        .defined_envs = &.{},
         .brew_prefix = "",
         .cargo_home = "",
         .gopath = "",

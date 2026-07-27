@@ -458,30 +458,17 @@ pub fn expandTracked(
             }
 
             if (std.mem.startsWith(u8, inner, "env.")) {
-                // `<env.NAME>` substitutes the captured value of an env var.
-                // `MachineState.env_values` answers a name in the eager
-                // watch list; a name outside it falls through to the same
-                // lazy environ read `env=` axis matching uses, so any name
-                // resolves, not only a watched one. Empty string when unset
-                // or set-but-empty, OR the default when supplied via
-                // `| default "..."`.
+                // `<env.NAME>` substitutes the live environ's value of an env
+                // var, for any name: empty string when unset or set-but-
+                // empty, OR the default when supplied via `| default "..."`.
                 const m = ctx.machine orelse return error.MachineRefWithoutState;
                 const name = inner[4..];
                 var resolved: []const u8 = "";
                 var found = false;
-                for (m.env_values) |ev| {
-                    if (std.mem.eql(u8, ev.name, name)) {
-                        resolved = ev.value;
+                if (m.env_probe) |ep| {
+                    if (ep.get(name)) |v| {
+                        resolved = v;
                         found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    if (m.env_probe) |ep| {
-                        if (ep.get(name)) |v| {
-                            resolved = v;
-                            found = true;
-                        }
                     }
                 }
                 if (!found and default_opt != null) resolved = default_opt.?;
@@ -580,20 +567,8 @@ fn resolveChain(
         } else if (std.mem.startsWith(u8, member, "env.")) {
             const m = ctx.machine orelse return error.MachineRefWithoutState;
             const name = member[4..];
-            var found = false;
-            for (m.env_values) |ev| {
-                if (std.mem.eql(u8, ev.name, name)) {
-                    value = ev.value;
-                    found = true;
-                    break;
-                }
-            }
-            // A name outside the eager watch list falls through to the same
-            // lazy environ read the direct `<env.NAME>` capture uses.
-            if (!found) {
-                if (m.env_probe) |ep| {
-                    if (ep.get(name)) |v| value = v;
-                }
+            if (m.env_probe) |ep| {
+                if (ep.get(name)) |v| value = v;
             }
         } else if (std.mem.startsWith(u8, member, "data.")) {
             // A `data.` chain member falls through on a missing file/key, but
@@ -720,15 +695,10 @@ fn formatMachineField(
     if (std.mem.eql(u8, field, "xdg_data_home")) return arena.dupe(u8, m.xdg_data_home);
     if (std.mem.eql(u8, field, "xdg_state_home")) return arena.dupe(u8, m.xdg_state_home);
     // `tool_path.<name>` substitutes the first-hit absolute path of a
-    // tool found on PATH (chezmoi's `lookPath`). Empty string when not found.
+    // tool found on PATH (chezmoi's `lookPath`), for any name, via the same
+    // lazy probe `tool=` axis matching uses. Empty string when not found.
     if (std.mem.startsWith(u8, field, "tool_path.")) {
         const tool_name = field[10..];
-        for (m.tool_paths) |tp| {
-            if (std.mem.eql(u8, tp.name, tool_name)) return arena.dupe(u8, tp.path);
-        }
-        // Not in the eager watch-list scan: fall through to the same lazy
-        // probe `tool=` axis matching uses, so an unwatched name resolves
-        // too instead of interpolating empty forever.
         if (m.tool_probe) |probe| {
             if (probe.path(tool_name)) |p| return arena.dupe(u8, p);
         }
@@ -892,8 +862,6 @@ fn chainTestState() machine.state.MachineState {
         .hostname = "h",
         .username = "u",
         .home = "/home/u",
-        .tools_on_path = &.{},
-        .defined_envs = &.{},
         .brew_prefix = "/opt/homebrew",
         .cargo_home = "",
         .gopath = "",
@@ -902,18 +870,19 @@ fn chainTestState() machine.state.MachineState {
         .xdg_cache_home = "",
         .xdg_data_home = "",
         .xdg_state_home = "",
-        .env_values = &.{
-            .{ .name = "HTTPS_PROXY", .value = "http://proxy:3128" },
-            .{ .name = "EMPTYVAR", .value = "" },
-        },
     };
 }
 
 test "chain: first non-empty env member wins" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const m = chainTestState();
-    const out = try expand(arena.allocator(), "proxy = <env.http_proxy | env.HTTPS_PROXY | default \"\">", null, .{ .machine = &m });
+    const a = arena.allocator();
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HTTPS_PROXY", "http://proxy:3128");
+    var probe = machine.state.EnvProbe.init(a, .{ .map = &map });
+    var m = chainTestState();
+    m.env_probe = &probe;
+    const out = try expand(a, "proxy = <env.http_proxy | env.HTTPS_PROXY | default \"\">", null, .{ .machine = &m });
     try std.testing.expectEqualStrings("proxy = http://proxy:3128", out);
 }
 
@@ -947,12 +916,13 @@ test "expand: a '>' inside a default does not truncate the capture" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const m = chainTestState();
-    // PAGER is not in env_values, so the default (which contains '>') is used.
+    // PAGER is unset (no env_probe at all), so the default (which contains
+    // '>') is used.
     const out = try expand(arena.allocator(), "x=<env.PAGER | default \"less >log\">", null, .{ .machine = &m });
     try std.testing.expectEqualStrings("x=less >log", out);
 }
 
-test "expand: <env.NAME> for a name outside env_values falls through to the live env probe" {
+test "expand: <env.NAME> resolves any name through the live env probe" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1002,7 +972,7 @@ test "chain: bare names outside template mode pass through literally" {
     try std.testing.expectEqualStrings("cat <a | grep b>", out);
 }
 
-test "machine.tool_path: a name outside the eager watch list still resolves, lazily" {
+test "machine.tool_path: any name on PATH resolves, lazily" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1025,7 +995,7 @@ test "machine.tool_path: a name outside the eager watch list still resolves, laz
     try std.testing.expectEqualStrings(want, out);
 }
 
-test "machine.tool_path: a name outside the eager watch list, existing only in a tool home (D2b), still resolves" {
+test "machine.tool_path: a name existing only in a tool home (D2b) still resolves" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

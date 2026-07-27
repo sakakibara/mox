@@ -24,14 +24,14 @@ pub const Resolver = union(enum) {
     override: *const Override,
 
     /// A live snapshot plus its lazy tool-probe and env-probe layers.
-    /// `bindings` answers exactly like `fixed`'s map; `probe`, when present,
-    /// is asked for `tool=name` only when `bindings` does not already carry
-    /// that name -- so a name the eager watch-list scan seeded never probes,
-    /// and only a name it never asked about does. `env` is the same fallback
-    /// for `env=name`, reading the captured environ directly for a name
-    /// outside the eager `ENV_WATCH_LIST` snapshot. Both are null for a
-    /// resolver built without one (every hand-built test fixture); a real
-    /// captured machine always supplies both.
+    /// `bindings` answers exactly like `fixed`'s map; `probe` is asked for
+    /// `tool=name` only when `bindings` does not already carry that name --
+    /// in practice `bindings` never does (`tool=`/`env=` are open axes with
+    /// no fixed vocabulary, so `machine.bindings.fromMachineState` never
+    /// seeds a compound key for either), so `probe`/`env` are the sole
+    /// resolution path for any name. Both are null for a resolver built
+    /// without one (every hand-built test fixture); a real captured machine
+    /// always supplies both.
     pub const Live = struct {
         bindings: *const std.StringHashMap([]const u8),
         probe: ?Probe = null,
@@ -54,9 +54,8 @@ pub const Resolver = union(enum) {
     /// A minimal duck-typed environ reader: `ctx` is the concrete prober
     /// (`machine.state.EnvProbe`), reached through a function pointer for the
     /// same reason as `Probe`. Returns null for a name that is unset or
-    /// set-but-empty, mirroring `env.Env.get`'s own contract -- so a name
-    /// outside the eager watch list stays unbound exactly like a watched
-    /// one, never falling back to a process-global lookup.
+    /// set-but-empty, mirroring `env.Env.get`'s own contract, never falling
+    /// back to a process-global lookup.
     pub const EnvProbe = struct {
         ctx: *anyopaque,
         getFn: *const fn (ctx: *anyopaque, name: []const u8) ?[]const u8,
@@ -102,8 +101,8 @@ pub const Resolver = union(enum) {
     /// multi-value axis (tool, env, path) is membership in the compound
     /// `axis=value` key set. On the live variant, a `tool=` or `env=` query
     /// the bindings map does not already answer falls through to the
-    /// matching probe layer -- so a name the eager scan never watched still
-    /// resolves, lazily, instead of answering false forever.
+    /// matching probe layer -- the sole resolution path for either, so any
+    /// name resolves lazily instead of answering false forever.
     pub fn has(self: Resolver, axis: []const u8, value: []const u8) bool {
         return switch (self) {
             .live => |l| if (hasInMap(l.bindings, axis, value))

@@ -270,3 +270,136 @@ test "impact: an edit outside any gated region affects every configuration" {
     // A base-line edit reaches every configuration, including siblings.
     try testing.expect(containsLabel(got.affected, "os=linux"));
 }
+
+const static_tool_fixture = "common\n" ++
+    "# mox: when os=darwin\n" ++
+    "mac line\n" ++
+    "# mox: end\n" ++
+    "# mox: when os=linux\n" ++
+    "linux line\n" ++
+    "# mox: end\n" ++
+    "# mox: when tool=fd\n" ++
+    "fd line\n" ++
+    "# mox: end\n";
+
+/// Builds the `os=linux` sibling `this` bindings and probe/env plumbing a
+/// `commit`/`doctor` cross-configuration check would: a real capture (fd
+/// really present on `$PATH`) plus the same `bindings.seedStaticMultiValue`
+/// pre-probe `commitImpl`/`neverMaterializing` run before `config_space.
+/// enumerate`, over `ax`'s statically recorded `tool=`/`env=` literals.
+fn seededThisAndState(
+    a: std.mem.Allocator,
+    io: Io,
+    tmp: *std.testing.TmpDir,
+    ax: source.axes.Axes,
+) !struct { this: std.StringHashMap([]const u8), m_state: MachineState } {
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/fd", .data = "" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const bin_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "bin" });
+
+    var env_map = std.process.Environ.Map.init(a);
+    try env_map.put("HOME", "/home/me");
+    try env_map.put("PATH", bin_dir);
+    const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
+
+    var this = try machine.bindings.fromMachineState(a, m_state);
+    var live_ctx: dsl.resolver.Resolver.Live = .{ .bindings = &this, .probe = m_state.probe(), .env = m_state.envProbe() };
+    const live: dsl.resolver.Resolver = .{ .live = &live_ctx };
+    try machine.bindings.seedStaticMultiValue(&this, ax, live);
+
+    return .{ .this = this, .m_state = m_state };
+}
+
+test "impact: a static tool= literal, seeded, reaches an affected sibling configuration" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", static_tool_fixture);
+    const src_dir = try srcPathAlloc(a, &tmp);
+    const tree = try source.tree.walk(a, io, src_dir, "/home/me");
+    const file = tree.files[0];
+    const ax = try source.axes.ofFile(a, io, file);
+
+    const built = try seededThisAndState(a, io, &tmp, ax);
+    var this = built.this;
+    const configs = try config_space.enumerate(a, &this, ax, &.{}, &.{});
+    try testing.expect(hasLabel(configs, "os=linux"));
+
+    const before = try snapshot(a, io, file, configs, &built.m_state, null);
+    try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
+        "# mox: when os=darwin\n" ++
+        "mac line\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "linux line\n" ++
+        "# mox: end\n" ++
+        "# mox: when tool=fd\n" ++
+        "fd line EDITED\n" ++
+        "# mox: end\n");
+    const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
+    const after = try snapshot(a, io, tree2.files[0], configs, &built.m_state, null);
+
+    const got = try impact(a, configs, before, after);
+    // fd is really on PATH, so the seeded compound key materializes the
+    // tool=fd region on the os=linux sibling too (it is not nested under
+    // os=, so its truth is uniform across every configuration): the edit
+    // reaches it, matching what the eager `TOOL_WATCH_LIST` scan gave
+    // before it existed (fd was always a watched name).
+    try testing.expect(containsLabel(got.affected, "os=linux"));
+}
+
+test "impact: an absent tool= literal stays false -- the sibling is not affected" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "common\n" ++
+        "# mox: when os=darwin\n" ++
+        "mac line\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "linux line\n" ++
+        "# mox: end\n" ++
+        "# mox: when tool=definitely-not-installed-xyz\n" ++
+        "missing-tool line\n" ++
+        "# mox: end\n";
+    try writeFile(io, tmp.dir, "src/.zshrc", src);
+    const src_dir = try srcPathAlloc(a, &tmp);
+    const tree = try source.tree.walk(a, io, src_dir, "/home/me");
+    const file = tree.files[0];
+    const ax = try source.axes.ofFile(a, io, file);
+
+    const built = try seededThisAndState(a, io, &tmp, ax);
+    var this = built.this;
+    const configs = try config_space.enumerate(a, &this, ax, &.{}, &.{});
+    try testing.expect(hasLabel(configs, "os=linux"));
+    // The literal was probed and refuted: no compound key was seeded.
+    try testing.expect(!this.contains("tool=definitely-not-installed-xyz"));
+
+    const before = try snapshot(a, io, file, configs, &built.m_state, null);
+    try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
+        "# mox: when os=darwin\n" ++
+        "mac line\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "linux line\n" ++
+        "# mox: end\n" ++
+        "# mox: when tool=definitely-not-installed-xyz\n" ++
+        "missing-tool line EDITED\n" ++
+        "# mox: end\n");
+    const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
+    const after = try snapshot(a, io, tree2.files[0], configs, &built.m_state, null);
+
+    const got = try impact(a, configs, before, after);
+    // The gate never materializes on any configuration, so editing its body
+    // changes nothing observable.
+    try testing.expect(!containsLabel(got.affected, "os=linux"));
+}

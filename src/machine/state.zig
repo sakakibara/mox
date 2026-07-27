@@ -6,7 +6,6 @@ const EnvironMap = std.process.Environ.Map;
 const path_lookup = @import("path_lookup.zig");
 const source_path = @import("../source/path.zig");
 const facts_mod = @import("facts.zig");
-const extras_mod = @import("extras.zig");
 const dsl = @import("../dsl/root.zig");
 
 /// A user-supplied machine fact loaded from `$XDG_CONFIG_HOME/mox/facts.toml`.
@@ -35,30 +34,18 @@ pub const MachineState = struct {
     /// `hostname_fallback`.
     username_fallback: bool = false,
     home: []const u8,
-    tools_on_path: []const []const u8,
-    /// Same set as `tools_on_path` but with the first-hit absolute path
-    /// alongside each name. Used for `<machine.tool_path.X>` interpolation
-    /// (chezmoi's `lookPath` equivalent).
-    tool_paths: []const path_lookup.Found = &.{},
-    /// Lazy fallback for a `tool_path.<name>` interpolation `tool_paths`
-    /// does not already answer (a name outside the eager watch list):
-    /// probes and memoizes against this same machine's `$PATH`. Null only
-    /// for a MachineState built by hand (every test fixture); `capture`
-    /// always supplies one. Also the probe layer a `Resolver.Live` built
-    /// from this snapshot's bindings falls through to for `tool=`.
+    /// The `tool=`/`<machine.tool_path.X>` resolution layer: probes and
+    /// memoizes against this machine's `$PATH` (plus tool-home bin
+    /// directories, D2b) for any name, on first ask. Null only for a
+    /// MachineState built by hand (every test fixture); `capture` always
+    /// supplies one. Also the probe layer a `Resolver.Live` built from this
+    /// snapshot's bindings falls through to for `tool=`.
     tool_probe: ?*path_lookup.ToolProbe = null,
-    defined_envs: []const []const u8,
-    /// Map from env-var name to value, for the subset of vars in
-    /// ENV_WATCH_LIST that were defined and non-empty. Used by
-    /// `<env.NAME>` interpolation.
-    env_values: []const Fact = &.{},
-    /// Lazy fallback for an `env=NAME` axis query or `<env.NAME>`
-    /// interpolation member that `env_values` does not already answer (a
-    /// name outside the eager `ENV_WATCH_LIST`): reads this same captured
-    /// environ directly. Null only for a MachineState built by hand (every
-    /// test fixture); `capture` always supplies one. Also the probe layer a
-    /// `Resolver.Live` built from this snapshot's bindings falls through to
-    /// for `env=`.
+    /// The `env=`/`<env.NAME>` resolution layer: reads this machine's
+    /// captured environ directly for any name, on first ask. Null only for a
+    /// MachineState built by hand (every test fixture); `capture` always
+    /// supplies one. Also the probe layer a `Resolver.Live` built from this
+    /// snapshot's bindings falls through to for `env=`.
     env_probe: ?*EnvProbe = null,
     brew_prefix: []const u8,
     cargo_home: []const u8,
@@ -95,12 +82,11 @@ pub const MachineState = struct {
     }
 };
 
-/// Lazy, on-demand `env=NAME` / `<env.NAME>` answer for a name outside the
-/// eager `ENV_WATCH_LIST` snapshot: reads this machine's captured environ
-/// directly rather than a process-global lookup. No memoization -- `Env.get`
-/// is already an O(1) map/syscall-free read, unlike the PATH scan `ToolProbe`
-/// exists to batch. Empty-is-unset by construction (`Env.get`'s own
-/// contract), matching `env_values`' watched-name semantics exactly.
+/// Lazy, on-demand `env=NAME` / `<env.NAME>` answer for any name: reads this
+/// machine's captured environ directly rather than a process-global lookup.
+/// No memoization -- `Env.get` is already an O(1) map/syscall-free read,
+/// unlike the PATH scan `ToolProbe` exists to batch. Empty-is-unset by
+/// construction (`Env.get`'s own contract).
 pub const EnvProbe = struct {
     arena: std.mem.Allocator,
     environ: Environ,
@@ -115,9 +101,8 @@ pub const EnvProbe = struct {
     }
 
     /// Adapt this reader to `dsl.resolver.Resolver.EnvProbe`, so a `Resolver`
-    /// built over this machine's bindings can fall through to it for an
-    /// `env=` name (or `<env.NAME>` interpolation member) the bindings/
-    /// `env_values` snapshot does not already answer.
+    /// built over this machine's bindings can fall through to it for any
+    /// `env=` name (or `<env.NAME>` interpolation member).
     pub fn probe(self: *EnvProbe) dsl.resolver.Resolver.EnvProbe {
         return .{ .ctx = self, .getFn = getTrampoline };
     }
@@ -128,52 +113,20 @@ pub const EnvProbe = struct {
     }
 };
 
-/// Tools to probe via `$PATH` lookup. The presence of a name in
-/// `MachineState.tools_on_path` lets policies condition on tooling without
-/// running each binary.
-const TOOL_WATCH_LIST = [_][]const u8{
-    "fd",           "fdfind",  "rg",        "bat",        "batcat",
-    "eza",          "exa",     "lazygit",   "lazydocker", "starship",
-    "zoxide",       "atuin",   "fzf",       "skim",       "delta",
-    "git-delta",    "yazi",    "broot",     "navi",       "tldr",
-    "duf",          "dust",    "btm",       "btop",       "htop",
-    "hyperfine",    "sd",      "watchexec", "tokei",      "topiary",
-    "ast-grep",     "grex",    "gum",       "glow",       "frum",
-    "mise",         "asdf",    "pnpm",      "yarn",       "deno",
-    "bun",          "uv",      "ruff",      "pyright",    "nvim",
-    "vim",          "tmux",    "zellij",    "fish",       "zsh",
-    "bash",         "git",     "gh",        "gpg",        "ssh",
-    "op",           "doppler", "brew",      "apt",        "dnf",
-    "yum",          "pacman",  "go",        "rustc",      "cargo",
-    "node",         "python",  "python3",   "ruby",       "erl",
-    "elixir",       "lua",     "k9s",       "kubectl",    "helm",
-    "docker",       "podman",  "task",      "make",       "just",
-    // Windows binaries that may appear on a WSL `$PATH`. The `.exe`
-    // suffix matters: `lookPath "starship.exe"` is the chezmoi-side
-    // signal for "running under WSL with a Windows starship binary."
-    "starship.exe",
-};
-
-/// Environment variables to record (by name) when defined and non-empty.
-/// Captures session/runtime context like WSL, container indicators, secret
-/// managers, and orchestrator selectors.
-///
-/// Both presence (for `env=NAME` axis matching) and value (for `<env.NAME>`
-/// interpolation) are captured.
-const ENV_WATCH_LIST = [_][]const u8{
-    "WSL_DISTRO_NAME",   "WSLENV",            "CODESPACES",
-    "REMOTE_CONTAINERS", "DEVCONTAINER",      "TERM_PROGRAM",
-    "SSH_CONNECTION",    "SSH_CLIENT",        "TMUX",
-    "ZELLIJ",            "STY",               "DISPLAY",
-    "WAYLAND_DISPLAY",   "DOCKER_HOST",       "KUBECONFIG",
-    "AWS_PROFILE",       "GCP_PROJECT",       "AZURE_SUBSCRIPTION_ID",
-    "VIRTUAL_ENV",       "CONDA_DEFAULT_ENV",
-    // Proxy envs — captured for `<env.http_proxy>`-style interp in
-    // user templates that conditionally include proxy settings.
-    "http_proxy",
-    "https_proxy",       "HTTP_PROXY",        "HTTPS_PROXY",
-    "no_proxy",          "NO_PROXY",
-};
+/// One-line notice for a legacy `<xdg_config_home>/mox/extras.toml` still on
+/// disk: 0.5.0 no longer reads it (tools/envs now resolve on demand for any
+/// name, so the extension list it existed to hand-patch has no reason to
+/// exist), so a caller that captures prints this once rather than leaving an
+/// unread file's silence unexplained. Null when no file is there.
+pub fn extrasNotice(arena: std.mem.Allocator, io: Io, xdg_config_home: []const u8) !?[]const u8 {
+    const path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "extras.toml" });
+    Io.Dir.cwd().access(io, path, .{}) catch return null;
+    return try std.fmt.allocPrint(
+        arena,
+        "{s} exists but is no longer read (tools and envs now resolve on demand for any name); delete it to silence this notice",
+        .{path},
+    );
+}
 
 /// Capture a snapshot of the current machine state.
 ///
@@ -213,17 +166,6 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
         envOr(arena, environ, "USERPROFILE") orelse
         return error.HomeNotSet;
 
-    // Load user-supplied extras early so we can extend the watch lists
-    // before scanning. Extras file lives at the same XDG path as facts.
-    const xdg_config_home_pre = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
-    const extras_path = try std.fs.path.join(arena, &.{ xdg_config_home_pre, "mox", "extras.toml" });
-    const extras = try extras_mod.load(arena, io, extras_path);
-
-    // Built-in TOOL_WATCH_LIST + user extras.
-    var tool_watch: std.ArrayList([]const u8) = .empty;
-    for (TOOL_WATCH_LIST) |t| try tool_watch.append(arena, t);
-    for (extras.tools) |t| try tool_watch.append(arena, t);
-
     // Tool-home detection runs ahead of the `$PATH` scan (D2b) so their bin
     // directories can join the very same `Listing` build: a fresh Homebrew
     // (or cargo/go/pnpm) install is visible to `tool=` the moment its home
@@ -235,13 +177,10 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const pnpm_home = envOr(arena, environ, "PNPM_HOME") orelse try arena.dupe(u8, "");
     const tool_home_bin_dirs = try toolHomeBinDirs(arena, brew_prefix, cargo_home, gopath, pnpm_home);
 
-    // One `$PATH` (+ tool-home) enumeration for the whole capture: the eager
-    // watch scan and the lazy probe share this same listing, instead of the
-    // probe building its own on first use.
+    // One `$PATH` (+ tool-home) enumeration for the whole capture, seeding the
+    // lazy tool probe's listing cache so its first per-name lookup never
+    // rebuilds it.
     const path_listing = try path_lookup.buildListing(arena, io, environ, tool_home_bin_dirs);
-    const tool_paths = try path_lookup.findOnPathFullFromListing(arena, path_listing, tool_watch.items);
-    var tool_names_buf = try arena.alloc([]const u8, tool_paths.len);
-    for (tool_paths, 0..) |tp, i| tool_names_buf[i] = tp.name;
 
     // A fresh probe every capture, so a re-capture (facts interview, the
     // post-pre-script re-capture) starts with an empty memo instead of
@@ -249,27 +188,6 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const tool_probe = try arena.create(path_lookup.ToolProbe);
     tool_probe.* = path_lookup.ToolProbe.init(arena, io, environ);
     tool_probe.seedListing(path_listing);
-    const tools: []const []const u8 = tool_names_buf;
-
-    // Built-in ENV_WATCH_LIST + user extras.
-    var env_watch: std.ArrayList([]const u8) = .empty;
-    for (ENV_WATCH_LIST) |e| try env_watch.append(arena, e);
-    for (extras.envs) |e| try env_watch.append(arena, e);
-
-    var envs: std.ArrayList([]const u8) = .empty;
-    var env_vals: std.ArrayList(Fact) = .empty;
-    for (env_watch.items) |name| {
-        const val = environ.getAlloc(arena, name) catch continue;
-        if (val.len > 0) {
-            try envs.append(arena, try arena.dupe(u8, name));
-            try env_vals.append(arena, .{
-                .name = try arena.dupe(u8, name),
-                .value = val,
-            });
-        }
-    }
-    const defined_envs = try envs.toOwnedSlice(arena);
-    const env_values = try env_vals.toOwnedSlice(arena);
 
     // A fresh env probe every capture, mirroring the tool probe: no state to
     // reset here (no memo), but a stable arena-owned pointer is still needed
@@ -293,11 +211,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
         .username = username,
         .username_fallback = username_fallback,
         .home = home,
-        .tools_on_path = tools,
-        .tool_paths = tool_paths,
         .tool_probe = tool_probe,
-        .defined_envs = defined_envs,
-        .env_values = env_values,
         .env_probe = env_probe,
         .brew_prefix = brew_prefix,
         .cargo_home = cargo_home,
@@ -591,8 +505,6 @@ test "MachineState type is constructible" {
         .hostname = "test",
         .username = "tester",
         .home = "/home/tester",
-        .tools_on_path = &.{},
-        .defined_envs = &.{},
         .brew_prefix = "",
         .cargo_home = "",
         .gopath = "",
@@ -632,9 +544,9 @@ test "capture: a tool that exists only in cargo_home/bin, never on PATH, still r
 
     const m = try capture(a, io, Environ{ .map = &map });
     try std.testing.expectEqualStrings(cargo_home, m.cargo_home);
-    // Not in TOOL_WATCH_LIST, so the eager scan never seeds it -- only the
-    // widened `Listing` (D2b) resolves it.
-    for (m.tools_on_path) |t| try std.testing.expect(!std.mem.eql(u8, t, "only-in-cargo-home"));
+    // Resolves only through the widened `Listing` (D2b): the tool probe is
+    // the sole resolution path for `tool=`, so a name never on `$PATH`
+    // proper still resolves via the tool-home bin directory.
     try std.testing.expect(m.tool_probe.?.present("only-in-cargo-home"));
 }
 
@@ -656,6 +568,64 @@ test "capture: a facts.toml key named for a multi-value axis errors loudly" {
     try map.put("XDG_CONFIG_HOME", xdg_config_home);
 
     try std.testing.expectError(error.ReservedFactName, capture(a, io, Environ{ .map = &map }));
+}
+
+test "extrasNotice: names the path and that it is no longer read, when the file exists" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config/mox/extras.toml", .data = "tools = [\"zk\"]\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xdg_config_home = try tmpAbsPath(a, &tmp, "config");
+
+    const notice = (try extrasNotice(a, io, xdg_config_home)).?;
+    try std.testing.expect(std.mem.indexOf(u8, notice, "extras.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "no longer read") != null);
+}
+
+test "extrasNotice: null when no file is there" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xdg_config_home = try tmpAbsPath(a, &tmp, "config");
+
+    try std.testing.expect(try extrasNotice(a, io, xdg_config_home) == null);
+}
+
+test "capture: an extras.toml present does not fail capture, and its tools still resolve lazily" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config/mox/extras.toml", .data = "tools = [\"zk\"]\n" });
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/zk", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = try tmpAbsPath(a, &tmp, "");
+    const xdg_config_home = try tmpAbsPath(a, &tmp, "config");
+    const bin_dir = try tmpAbsPath(a, &tmp, "bin");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", home);
+    try map.put("XDG_CONFIG_HOME", xdg_config_home);
+    try map.put("PATH", bin_dir);
+
+    const m = try capture(a, io, Environ{ .map = &map });
+    // "zk" was never a watched name; it resolves purely because it is on
+    // PATH, the same as any other unlisted name -- extras.toml being present
+    // (and unread) changes nothing.
+    try std.testing.expect(m.tool_probe.?.present("zk"));
 }
 
 test "EnvProbe.get: an unwatched name reads from the captured environ" {

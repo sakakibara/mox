@@ -203,8 +203,22 @@ fn scanFile(ax: *Axes, arena: std.mem.Allocator, io: Io, file: source.tree.Manag
         for (rg.fragments) |fr| try addTuple(ax, fr.tuple, fr.exact_tuple);
     }
     if (file.has_base and file.source_base_abs.len > 0) {
-        const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_bytes)) catch return;
+        const raw = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_bytes)) catch return;
         const marker = dsl.comment.markerForExtension(identForMarker(file.source_base_path)) orelse return;
+        // A head declaration (`own`/`disown`/`check`) is not DSL syntax --
+        // the walk and real compose both strip it before parsing (`compose.
+        // catA.readBaseHead`) -- so it must be stripped here too, or a file
+        // that leads with one fails to parse at the very first line and this
+        // scan silently sees none of its directives, including its own
+        // whole-file gate.
+        const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
+        const head_parsed = source.head.parse(arena, head_text, marker) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            // A malformed head is the walk's problem to report; scan the
+            // unstripped text rather than giving up on this file entirely.
+            else => source.head.Parsed{},
+        };
+        const content = if (head_parsed.spans.len == 0) raw else try source.head.stripSpans(arena, raw, head_parsed.spans);
         const parsed = dsl.driver.parseFile(arena, content, marker, null) catch return;
         for (parsed.directives) |d| try addDirective(ax, d);
     }
@@ -213,14 +227,20 @@ fn scanFile(ax: *Axes, arena: std.mem.Allocator, io: Io, file: source.tree.Manag
 /// Scan `<repo>/src` for every axis referenced anywhere: `.d/` tuple filenames
 /// and every directive `when`/`where` axis expression.
 pub fn ofTree(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Axes {
-    var ax = initAxes(arena);
-
     const src_dir = try std.fs.path.join(arena, &.{ repo_dir, "src" });
     const tree = source.tree.walk(arena, io, src_dir, "") catch |e| switch (e) {
-        error.FileNotFound => return ax,
+        error.FileNotFound => return initAxes(arena),
         else => return e,
     };
+    return ofManagedTree(arena, io, tree);
+}
 
+/// Same scan as `ofTree`, over a tree the caller already walked -- so a
+/// caller that walked once (and handled a walk error with its own
+/// diagnostics) scans that same result instead of re-walking and re-raising
+/// a raw, undiagnosed error on the same problem.
+pub fn ofManagedTree(arena: std.mem.Allocator, io: Io, tree: source.tree.ManagedTree) !Axes {
+    var ax = initAxes(arena);
     for (tree.files) |file| try scanFile(&ax, arena, io, file);
     return ax;
 }
@@ -327,6 +347,32 @@ test "ofFile: a .psm1 gated on os=windows is a value comparison" {
 
     try std.testing.expect(ax.comparesValueOf("os"));
     try std.testing.expectEqualStrings("windows", ax.valuesFor("os")[0].value);
+}
+
+test "ofFile: a whole-file gate behind head ownership declarations is still recorded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A leading `own`/`check` block is not DSL syntax; real compose strips
+    // it before parsing (`compose.catA.readBaseHead`), and this scan must
+    // do the same or it fails on the very first line and never reaches the
+    // `when tool=codex` gate that follows.
+    try writeFile(io, tmp.dir, "src/.codex/config.toml", "# mox: own tui.keymap.global\n" ++
+        "# mox: check \"scripts/check/codex-config\"\n" ++
+        "# mox: when tool=codex\n" ++
+        "[tui.keymap.global]\n" ++
+        "x = 1\n");
+
+    const src_dir = try srcPathAlloc(a, &tmp);
+    const tree = try source.tree.walk(a, io, src_dir, "/home/me");
+    const ax = try ofFile(a, io, tree.files[0]);
+
+    try std.testing.expect(ax.referencesName("tool"));
+    try std.testing.expect(ax.referencesValue("tool=codex"));
 }
 
 test "ofTree: tuple names and directive axes; interpolation-only fact absent" {

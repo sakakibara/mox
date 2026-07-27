@@ -169,8 +169,6 @@ fn stateForOs(os: []const u8) mox.machine.state.MachineState {
         .hostname = "test",
         .username = "u",
         .home = "/h",
-        .tools_on_path = &.{},
-        .defined_envs = &.{},
         .brew_prefix = "",
         .cargo_home = "",
         .gopath = "",

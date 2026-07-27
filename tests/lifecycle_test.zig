@@ -1317,6 +1317,64 @@ test "apply and facts: a facts.toml key named for a multi-value axis errors loud
     try std.testing.expect(std.mem.indexOf(u8, facts_out.err, "tool, env, path") != null);
 }
 
+test "apply and doctor: a legacy extras.toml prints one notice; its tools still resolve lazily" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const bin_dir = try std.fs.path.join(a, &.{ root, "bin" });
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/zk", .data = "" });
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "PATH", .value = bin_dir }},
+    });
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
+        "# mox: when tool=zk\n" ++
+        "export HAS_ZK=1\n" ++
+        "# mox: end\n");
+
+    const extras_path = try h.homePath(".config/mox/extras.toml");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(extras_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = extras_path, .data = "tools = [\"zk\"]\n" });
+
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, applied.err, "extras.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "no longer read") != null);
+
+    // "zk" resolves purely because it is on PATH: extras.toml being present
+    // (and unread) neither seeds it nor is required for it to resolve.
+    const live = try read(io, a, try h.liveOf(".testrc"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "export HAS_ZK=1") != null);
+
+    const doctored = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, doctored.err, "extras.toml"));
+}
+
+test "apply: no extras.toml present prints no notice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "extras.toml") == null);
+
+    const doctored = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, doctored.err, "extras.toml") == null);
+}
+
 test "apply: a pre-script's axis-relevant change is visible to compose in the same apply" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1363,8 +1421,8 @@ test "apply: a pre-script that installs an unwatched tool is gated on in the sam
     defer arena.deinit();
     const a = arena.allocator();
 
-    // "herdr" is not in TOOL_WATCH_LIST: this file only materializes if the
-    // lazy probe sees it, and only after the pre-script installs it.
+    // This file only materializes once the lazy probe sees "herdr" on PATH,
+    // and only after the pre-script installs it.
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
         "# mox: when tool=herdr\n" ++
         "export HAS_HERDR=1\n" ++
@@ -1419,9 +1477,9 @@ test "apply: a pre-script that installs into cargo_home/bin (never on PATH) is g
     defer arena.deinit();
     const a = arena.allocator();
 
-    // "cargotool" is not in TOOL_WATCH_LIST and never touches $PATH: the
-    // only way this row materializes is the tool-home search-space layer
-    // (D2b) finding it under `$CARGO_HOME/bin`.
+    // "cargotool" never touches $PATH: the only way this row materializes
+    // is the tool-home search-space layer (D2b) finding it under
+    // `$CARGO_HOME/bin`.
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
         "# mox: when tool=cargotool\n" ++
         "export HAS_CARGOTOOL=1\n" ++

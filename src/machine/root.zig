@@ -3,7 +3,6 @@ pub const state = @import("state.zig");
 pub const path_lookup = @import("path_lookup.zig");
 pub const bindings = @import("bindings.zig");
 pub const facts = @import("facts.zig");
-pub const extras = @import("extras.zig");
 pub const interview = @import("interview.zig");
 
 test {
@@ -13,6 +12,5 @@ test {
     _ = path_lookup;
     _ = bindings;
     _ = facts;
-    _ = extras;
     _ = interview;
 }

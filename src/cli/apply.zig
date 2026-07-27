@@ -89,6 +89,9 @@ fn applyPass(
     if (m_state.username_fallback) {
         try ctx.err.writeAll("mox apply: username could not be determined; using \"unknown\"\n");
     }
+    if (try mox.machine.state.extrasNotice(ctx.alloc, ctx.io, m_state.xdg_config_home)) |notice| {
+        try ctx.err.print("mox apply: {s}\n", .{notice});
+    }
 
     // Facts interview: prompt for schema-declared facts that are not yet
     // bound, persist the answers, and re-capture so this apply already

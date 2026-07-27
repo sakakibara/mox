@@ -67,6 +67,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
 
+    // A dedicated capture solely for the legacy-extras notice: every other
+    // capture in this command tolerates its own failure independently (a
+    // fact.toml problem must skip only the checks that need machine state,
+    // not the whole report), so this one is kept separate rather than shared.
+    if (mox.machine.state.capture(ctx.alloc, ctx.io, context.env)) |notice_state| {
+        if (try mox.machine.state.extrasNotice(ctx.alloc, ctx.io, notice_state.xdg_config_home)) |notice| {
+            try ctx.err.print("mox doctor: {s}\n", .{notice});
+        }
+    } else |_| {}
+
     // `problems` are the rebuildable breakage the rc gates on and `--fix`
     // remediates (malformed provenance). `advisories` are findings mox reports
     // but deliberately does not auto-remediate (untracked sources); they never
@@ -225,9 +235,18 @@ fn neverMaterializing(
     context: app.Context,
 ) !?[]const []const u8 {
     const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
-    const this_bindings = try mox.machine.bindings.fromMachineState(arena, m_state);
+    var this_bindings = try mox.machine.bindings.fromMachineState(arena, m_state);
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
+
+    // `this_bindings` is what `config_space.enumerate` clones into every
+    // simulated configuration below (a `fixed` resolver, never probing);
+    // seed its static tool=/env= literals so those clones agree with what
+    // this machine's live resolver would answer.
+    const repo_ax = try mox.source.axes.ofManagedTree(arena, io, tree);
+    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &this_bindings, .probe = m_state.probe(), .env = m_state.envProbe() };
+    const live_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
+    try mox.machine.bindings.seedStaticMultiValue(&this_bindings, repo_ax, live_resolver);
 
     var out: std.ArrayList([]const u8) = .empty;
     for (tree.files) |file| {

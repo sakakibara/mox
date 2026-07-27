@@ -88,11 +88,12 @@ pub const Listing = struct {
 
 /// Scan every `$PATH` directory once, then `extra_dirs` in order, and index
 /// every entry found, keyed for `Listing.lookup`. Kept as a single full
-/// enumeration rather than probing per name: the watch list is ~75 names and
-/// a Windows PATH carries a PATHEXT of ~8, so per-name probing would be tens
-/// of thousands of stats per capture -- fast enough on POSIX to hide, slow
-/// enough on Windows to look like a hang. An empty or absent `$PATH` scans no
-/// PATH directories but still scans `extra_dirs`.
+/// enumeration, built once per capture and shared by every later per-name
+/// probe: naive per-name scanning against a Windows PATH (carrying a PATHEXT
+/// of ~8) would be a full directory listing per name, tens of thousands of
+/// stats across a source tree's worth of `tool=` gates -- fast enough on
+/// POSIX to hide, slow enough on Windows to look like a hang. An empty or
+/// absent `$PATH` scans no PATH directories but still scans `extra_dirs`.
 ///
 /// `extra_dirs` -- this machine's tool-home bin directories (D2b) -- are
 /// scanned strictly after every `$PATH` directory: `scanDirInto` only ever
@@ -181,9 +182,8 @@ pub const ToolProbe = struct {
     }
 
     /// Seed this probe with a `Listing` the caller already built (`capture`'s
-    /// eager tool-watch scan), so the first `path`/`present` call reuses it
-    /// instead of triggering its own `$PATH` enumeration -- one enumeration
-    /// per run, not two.
+    /// own `$PATH` enumeration), so the first `path`/`present` call reuses it
+    /// instead of triggering its own -- one enumeration per run, not two.
     pub fn seedListing(self: *ToolProbe, listing: Listing) void {
         self.listing = listing;
     }
@@ -263,8 +263,8 @@ fn executableExts(arena: std.mem.Allocator, environ: Environ) ![]const []const u
 }
 
 /// A name in the form both sides of a comparison agree on. Windows filenames
-/// are case-insensitive, so `Git.EXE` must match a `git` the watch list asked
-/// for; POSIX names are compared as written.
+/// are case-insensitive, so `Git.EXE` must match a `tool=git` probe; POSIX
+/// names are compared as written.
 fn foldName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (builtin.os.tag != .windows) return name;
     const out = try arena.dupe(u8, name);
