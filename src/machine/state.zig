@@ -359,12 +359,17 @@ test "capture: USER and USERNAME unset falls back to \"unknown\" and flags usern
     const a = arena.allocator();
     var map = EnvironMap.init(a);
     try map.put("HOME", "/home/whoever");
+    // Windows reads hostname from this same synthetic `environ` (no
+    // gethostname() there), unlike POSIX's real syscall: seed it so the
+    // fallback this test targets stays USER/USERNAME-only on every platform.
+    try map.put("COMPUTERNAME", "testhost");
 
     const m = try capture(a, std.testing.io, Environ{ .map = &map }, "", "");
     try std.testing.expectEqualStrings("unknown", m.username);
     try std.testing.expect(m.username_fallback);
-    // The real hostname resolves on every CI/dev machine; only the flag is
-    // asserted false here, since forcing a real gethostname failure needs no
+    // The real hostname resolves on every CI/dev machine (POSIX gethostname(),
+    // or COMPUTERNAME seeded above on Windows); only the flag is asserted
+    // false here, since forcing a real hostname-lookup failure needs no
     // portable seam.
     try std.testing.expect(!m.hostname_fallback);
 }

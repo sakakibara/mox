@@ -123,6 +123,10 @@ pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: Setup
     var map = std.process.Environ.Map.init(a);
     try map.put("HOME", home);
     try map.put("USER", "tester");
+    // Windows has no gethostname(); `machine.state.capture` reads COMPUTERNAME
+    // from this same isolated environ instead, so it must be seeded here too,
+    // or every test's hostname_fallback would spuriously flip true there.
+    try map.put("COMPUTERNAME", "TESTHOST");
     try map.put("MOX_REPO", repo);
     try map.put("MOX_STATE_DIR", state);
     if (opts.editor) |e| try map.put("EDITOR", e);
