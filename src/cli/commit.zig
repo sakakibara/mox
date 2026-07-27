@@ -409,7 +409,7 @@ pub fn commitImpl(
     // recompose (later in this same run) sees the new value.
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .probe = m_state.probe(), .env = m_state.envProbe() };
+    var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings);
     var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);

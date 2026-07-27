@@ -304,7 +304,7 @@ fn seededThisAndState(
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
 
     var this = try machine.bindings.fromMachineState(a, m_state);
-    var live_ctx: dsl.resolver.Resolver.Live = .{ .bindings = &this, .probe = m_state.probe(), .env = m_state.envProbe() };
+    var live_ctx: dsl.resolver.Resolver.Live = m_state.liveResolver(&this);
     const live: dsl.resolver.Resolver = .{ .live = &live_ctx };
     try machine.bindings.seedStaticMultiValue(&this, ax, live);
 

@@ -80,6 +80,16 @@ pub const MachineState = struct {
         const ep = self.env_probe orelse return null;
         return ep.probe();
     }
+
+    /// This snapshot's live resolver over `bindings`: `probe`/`env` wired in
+    /// from this same snapshot, so a call site cannot build a `Resolver.Live`
+    /// by hand and forget one. Every production call site goes through this;
+    /// a hand-built `Resolver.Live` (the null-default `probe`/`env` fields)
+    /// stays available for tests that construct a fixture with no snapshot
+    /// to draw probes from.
+    pub fn liveResolver(self: MachineState, bindings: *const std.StringHashMap([]const u8)) dsl.resolver.Resolver.Live {
+        return .{ .bindings = bindings, .probe = self.probe(), .env = self.envProbe() };
+    }
 };
 
 /// Lazy, on-demand `env=NAME` / `<env.NAME>` answer for any name: reads this
@@ -635,6 +645,35 @@ test "capture: an extras.toml present does not fail capture, and its tools still
     // PATH, the same as any other unlisted name -- extras.toml being present
     // (and unread) changes nothing.
     try std.testing.expect(m.tool_probe.?.present("zk"));
+}
+
+test "MachineState.liveResolver: wires bindings, tool probe, and env probe from the same snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/herdr", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = try tmpAbsPath(a, &tmp, "");
+    const bin_dir = try tmpAbsPath(a, &tmp, "bin");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", home);
+    try map.put("PATH", bin_dir);
+    try map.put("MOX_LIVE_RESOLVER_VAR", "set");
+
+    const m = try capture(a, io, Environ{ .map = &map });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const live_ctx = m.liveResolver(&bindings);
+    const resolver: dsl.resolver.Resolver = .{ .live = &live_ctx };
+
+    try std.testing.expect(resolver.has("tool", "herdr"));
+    try std.testing.expect(!resolver.has("tool", "definitely-not-installed-xyz"));
+    try std.testing.expect(resolver.has("env", "MOX_LIVE_RESOLVER_VAR"));
+    try std.testing.expect(!resolver.has("env", "MOX_LIVE_RESOLVER_UNSET"));
 }
 
 test "EnvProbe.get: an unwatched name reads from the captured environ" {

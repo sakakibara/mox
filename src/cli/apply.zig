@@ -96,7 +96,7 @@ fn applyPass(
 
     var m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
+    var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     for (m_state.skipped_fact_keys) |key| {
         try ctx.err.print("mox apply: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
