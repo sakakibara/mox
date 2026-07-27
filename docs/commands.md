@@ -16,6 +16,21 @@ for you to review -- a cloned repo's files and scripts are untrusted
 until you look at them -- and `--apply` applies right away for a
 one-command bootstrap. Refuses a non-empty repo dir.
 
+`--clone` accepts shorthand alongside full URLs:
+
+| Argument | Clones |
+| --- | --- |
+| `owner` | `https://github.com/owner/dotfiles` |
+| `owner/repo` | `https://github.com/owner/repo` |
+| `host/owner/repo` | `https://host/owner/repo` |
+| anything else | used as given |
+
+The shorthand is sugar only: an argument with a scheme, a colon
+(scp-style `git@host:path` remotes, drive letters), a leading `/`, `.`,
+or `~` (local paths), an empty segment, or a character outside
+`[A-Za-z0-9._-]` is passed to `git clone` verbatim, so any host and any
+protocol git speaks keep working spelled out.
+
 ## add
 
 Start managing a live file as a base file in `src/`. A path matching a

@@ -11,16 +11,17 @@ const Io = std.Io;
 const CloneFn = *const fn (std.mem.Allocator, Io, []const u8, []const u8) anyerror!void;
 
 const Spec = struct {
-    clone: cli.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply')" }),
+    clone: cli.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply'); <owner>, <owner>/<repo>, and <host>/<owner>/<repo> are shorthand for https URLs (owner alone assumes a repo named dotfiles)" }),
     apply: cli.Flag(.{ .help = "after cloning, apply immediately (write files, run scripts) instead of stopping to review" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    if (a.clone) |url| {
-        if (url.len == 0) {
+    if (a.clone) |raw| {
+        if (raw.len == 0) {
             try ctx.err.writeAll("mox init: --clone requires a repository URL\n");
             return 2;
         }
+        const url = try resolveCloneUrl(ctx.alloc, raw);
         const rc = try runClone(ctx, url, gitClone, a.apply);
         if (rc != 0) return rc;
         // Opt-in one-command bootstrap: clone, then apply a repo the user trusts.
@@ -31,6 +32,44 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (rc != 0) return rc;
     if (a.apply) return apply.applyImpl(ctx, false, false, false, &.{});
     return rc;
+}
+
+/// Expand a `--clone` shorthand into a git URL. Sugar only: anything that
+/// could already be a URL, an scp-style remote, or a local path passes
+/// through verbatim, so no clonable spelling is lost.
+///
+///   owner            -> https://github.com/owner/dotfiles
+///   owner/repo       -> https://github.com/owner/repo
+///   host/owner/repo  -> https://host/owner/repo
+///
+/// Verbatim: a scheme (`://`), any colon (scp-style `git@host:path`, drive
+/// letters), a leading `/`, `.`, or `~` (local paths), an empty segment, or
+/// a character outside [A-Za-z0-9._-].
+fn resolveCloneUrl(arena: std.mem.Allocator, arg: []const u8) ![]const u8 {
+    if (arg.len == 0) return arg;
+    if (std.mem.indexOfScalar(u8, arg, ':') != null) return arg;
+    if (arg[0] == '/' or arg[0] == '.' or arg[0] == '~') return arg;
+
+    var slashes: usize = 0;
+    var seg_len: usize = 0;
+    for (arg) |c| {
+        if (c == '/') {
+            if (seg_len == 0) return arg;
+            slashes += 1;
+            seg_len = 0;
+            continue;
+        }
+        const ok = std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-';
+        if (!ok) return arg;
+        seg_len += 1;
+    }
+    if (seg_len == 0) return arg;
+
+    return switch (slashes) {
+        0 => std.fmt.allocPrint(arena, "https://github.com/{s}/dotfiles", .{arg}),
+        1 => std.fmt.allocPrint(arena, "https://github.com/{s}", .{arg}),
+        else => std.fmt.allocPrint(arena, "https://{s}", .{arg}),
+    };
 }
 
 /// Clone `url` into the repo dir. Does not apply by default: a freshly cloned
@@ -126,12 +165,45 @@ pub const command = app.command(Spec, .{
     .name = "init",
     .summary = "Initialize a fresh mox repo",
     .usage = "mox init [--clone <url>] [--apply]",
-    .details = "Creates src/ and scripts/. --clone <url>: git clone <url> into the repo dir; without --apply it stops for you to review (then run 'mox apply'), with --apply it applies right away (writes files, runs scripts) for a one-command bootstrap. Refuses a non-empty repo dir.",
+    .details = "Creates src/ and scripts/. --clone <url>: git clone <url> into the repo dir; without --apply it stops for you to review (then run 'mox apply'), with --apply it applies right away (writes files, runs scripts) for a one-command bootstrap. Refuses a non-empty repo dir. <owner> expands to https://github.com/<owner>/dotfiles, <owner>/<repo> to https://github.com/<owner>/<repo>, <host>/<owner>/<repo> to https://<host>/<owner>/<repo>; full URLs, ssh remotes, and local paths are used as given.",
     .group = .general,
     .needs_context = true,
 }, run);
 
 const testing = std.testing;
+
+test "resolveCloneUrl: shorthand tiers expand to https URLs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("https://github.com/sakakibara/dotfiles", try resolveCloneUrl(a, "sakakibara"));
+    try testing.expectEqualStrings("https://github.com/sakakibara/dotfiles", try resolveCloneUrl(a, "sakakibara/dotfiles"));
+    try testing.expectEqualStrings("https://gitlab.com/me/dots", try resolveCloneUrl(a, "gitlab.com/me/dots"));
+}
+
+test "resolveCloneUrl: URLs, remotes, and paths pass through verbatim" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const verbatim = [_][]const u8{
+        "https://github.com/x/y",
+        "ssh://git@host/x/y",
+        "git@github.com:x/y.git",
+        "C:\\repos\\dots",
+        "/abs/path/repo",
+        "./relative/repo",
+        "~/repo",
+        "owner//repo",
+        "owner/repo/",
+        "owner/re po",
+        "owner/répo",
+    };
+    for (verbatim) |v| {
+        try testing.expectEqualStrings(v, try resolveCloneUrl(a, v));
+    }
+}
 
 test "dirNonEmpty: missing is empty, populated is non-empty, junk-only is empty" {
     const io = testing.io;

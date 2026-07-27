@@ -4,6 +4,15 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `mox init --clone` accepts shorthand: `owner` expands to
+  `https://github.com/owner/dotfiles`, `owner/repo` to
+  `https://github.com/owner/repo`, and `host/owner/repo` to
+  `https://host/owner/repo`. Full URLs, ssh remotes, and local paths are
+  passed to `git clone` verbatim as before.
+
 ## [0.5.0] - 2026-07-27
 
 ### Added
