@@ -83,7 +83,7 @@ never diverge -- then any directory a setup script named via `$MOX_PATH`
 `data/paths.toml` row's own `when` field gates whether that row
 contributes on EITHER a tool name (checked against `$PATH`+`$MOX_PATH`
 only, never against another row's directory -- one pass, no fixpoint) OR
-a bound single-value fact name -- whichever matches first.
+a bound single-value fact name -- either presence enables the row.
 `<machine.tool_path.NAME>` interpolation resolves through the same search
 space. `env=<name>` resolves directly against this machine's captured
 environ, same as `<env.NAME>` interpolation; a set-but-empty variable reads
