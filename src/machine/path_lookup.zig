@@ -7,65 +7,6 @@ const dsl = @import("../dsl/root.zig");
 const Io = std.Io;
 const Environ = Env;
 
-pub const Found = struct {
-    name: []const u8,
-    path: []const u8,
-};
-
-/// Find which of `candidates` exist on `$PATH`. Returns sorted list of names
-/// that exist. All returned strings are arena-owned (duplicated).
-///
-/// Uses the supplied `environ` to read `$PATH`; an empty or absent `$PATH`
-/// produces an empty result.
-pub fn findOnPath(
-    arena: std.mem.Allocator,
-    io: Io,
-    environ: Environ,
-    candidates: []const []const u8,
-) ![]const []const u8 {
-    const full = try findOnPathFull(arena, io, environ, candidates);
-    var names = try arena.alloc([]const u8, full.len);
-    for (full, 0..) |f, i| names[i] = f.name;
-    return names;
-}
-
-/// Same as `findOnPath` but also returns the absolute path of the first hit.
-/// Used to populate `MachineState.tool_paths` for `<machine.tool_path.X>`
-/// interpolation (mirrors chezmoi's `lookPath` template function).
-pub fn findOnPathFull(
-    arena: std.mem.Allocator,
-    io: Io,
-    environ: Environ,
-    candidates: []const []const u8,
-) ![]const Found {
-    const listing = try buildListing(arena, io, environ, &.{});
-    return findOnPathFullFromListing(arena, listing, candidates);
-}
-
-/// Same as `findOnPathFull` but against a `Listing` the caller already built,
-/// so a caller that also needs the listing for something else (a `ToolProbe`
-/// to hand it to) does not trigger a second `$PATH` enumeration.
-pub fn findOnPathFullFromListing(
-    arena: std.mem.Allocator,
-    listing: Listing,
-    candidates: []const []const u8,
-) ![]const Found {
-    var found: std.ArrayList(Found) = .empty;
-    for (candidates) |name| {
-        if (try listing.lookup(arena, name)) |path| {
-            try found.append(arena, .{ .name = try arena.dupe(u8, name), .path = path });
-        }
-    }
-
-    const slice = try found.toOwnedSlice(arena);
-    std.mem.sort(Found, slice, {}, struct {
-        fn lessThan(_: void, a: Found, b: Found) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lessThan);
-    return slice;
-}
-
 /// A one-time scan of every `$PATH` directory, indexed so any later lookup
 /// -- not just a name known ahead of the scan -- is a single hashmap `get`.
 /// Built by `buildListing`; queried by `lookup`.
@@ -285,29 +226,15 @@ fn stemForExecutable(arena: std.mem.Allocator, folded: []const u8, exts: []const
     return null;
 }
 
-test "findOnPath: empty candidate list returns empty" {
+test "ToolProbe.present: detects the platform's shell on the real PATH" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const found = try findOnPath(
-        arena.allocator(),
-        std.testing.io,
-        Env{ .process = std.testing.environ },
-        &.{},
-    );
-    try std.testing.expectEqual(@as(usize, 0), found.len);
-}
 
-test "findOnPath: nonexistent name not in result" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const candidates = [_][]const u8{"definitely-not-a-real-binary-xyz"};
-    const found = try findOnPath(
-        arena.allocator(),
-        std.testing.io,
-        Env{ .process = std.testing.environ },
-        &candidates,
-    );
-    try std.testing.expectEqual(@as(usize, 0), found.len);
+    // `cmd` resolves via PATHEXT to cmd.exe, which is the lookup being tested.
+    const shell = if (builtin.os.tag == .windows) "cmd" else "sh";
+    var probe = ToolProbe.init(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ });
+    try std.testing.expect(probe.present(shell));
+    try std.testing.expect(!probe.present("definitely-does-not-exist-9876"));
 }
 
 /// Absolute path to `<tmp>/sub` via the canonical `<cwd>/.zig-cache/tmp/<id>`

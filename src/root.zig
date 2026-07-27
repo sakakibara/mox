@@ -330,30 +330,6 @@ test "MachineState type is constructible" {
     try std.testing.expectEqualStrings("linux", m.os);
 }
 
-test "path_lookup: detects the platform's shell on PATH" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    // `cmd` resolves via PATHEXT to cmd.exe, which is the lookup being tested.
-    const shell = if (@import("builtin").os.tag == .windows) "cmd" else "sh";
-    const candidates = [_][]const u8{ shell, "definitely-does-not-exist-9876" };
-    const found = try machine.path_lookup.findOnPath(
-        arena.allocator(),
-        std.testing.io,
-        Env{ .process = std.testing.environ },
-        &candidates,
-    );
-
-    var has_shell = false;
-    for (found) |n| {
-        if (std.mem.eql(u8, n, shell)) has_shell = true;
-    }
-    try std.testing.expect(has_shell);
-    for (found) |n| {
-        try std.testing.expect(!std.mem.eql(u8, n, "definitely-does-not-exist-9876"));
-    }
-}
-
 test "MachineState capture: returns plausible OS" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

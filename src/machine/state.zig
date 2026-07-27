@@ -640,7 +640,7 @@ test "EnvProbe.get: an unwatched name reads from the captured environ" {
     try std.testing.expect(probe.get("MOX_UNWATCHED_UNSET_VAR") == null);
 }
 
-test "EnvProbe.get: a set-but-empty value reads as unset, same as env_values" {
+test "EnvProbe.get: a set-but-empty value reads as unset, same as env= axis evaluation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
