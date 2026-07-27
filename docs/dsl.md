@@ -282,7 +282,9 @@ say). Each row:
   counts as unset; a set value must itself name an existing directory to
   win, or resolution falls through to `candidates`.
 - `candidates` (optional): paths tried in order; `~` expands to home. The
-  first that exists on disk binds the fact.
+  first that exists on disk binds the fact. A Windows path's backslashes
+  need TOML's `'single-quoted'` literal string (or plain `/` forward
+  slashes) -- a `"double-quoted"` string treats `\` as an escape.
 
 Nothing existing (env unset/rejected and no candidate exists) leaves the row
 unbound -- no fact, no error. A bound row behaves exactly like any other

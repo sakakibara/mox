@@ -1611,7 +1611,7 @@ test "apply: a data/facts.toml-derived fact binds a gate, a quoted comparison, a
     const candidate = try std.fs.path.join(a, &.{ root, "home", ".customtool" });
     try writeRepo(io, &tmp, "repo/data/facts.toml", try std.fmt.allocPrint(
         a,
-        "[[facts]]\nname = \"customtool_home\"\ncandidates = [\"{s}\"]\n",
+        "[[facts]]\nname = \"customtool_home\"\ncandidates = ['{s}']\n",
         .{candidate},
     ));
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++

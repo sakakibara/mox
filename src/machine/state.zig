@@ -576,7 +576,7 @@ test "capture: private layer shadows the repo for both data/facts.toml and data/
     const priv_cand = try tmpAbsPath(a, &tmp, "priv-cand");
     try tmp.dir.writeFile(io, .{
         .sub_path = "private/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"cargo_home\"\ncandidates = [\"{s}\"]\n", .{priv_cand}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"cargo_home\"\ncandidates = ['{s}']\n", .{priv_cand}),
     });
 
     var map = EnvironMap.init(a);

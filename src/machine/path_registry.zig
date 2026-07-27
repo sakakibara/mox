@@ -271,7 +271,7 @@ test "resolve: a when tool-gate evaluates against the base layer only, never a r
         .sub_path = "repo/data/paths.toml",
         .data = try std.fmt.allocPrint(
             a,
-            "[[paths]]\ndir = \"{s}\"\n\n[[paths]]\ndir = \"/usr/local/other\"\nwhen = \"herdr\"\n",
+            "[[paths]]\ndir = '{s}'\n\n[[paths]]\ndir = \"/usr/local/other\"\nwhen = \"herdr\"\n",
             .{only_dir},
         ),
     });

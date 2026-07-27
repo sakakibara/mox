@@ -202,10 +202,12 @@ test "load: empty env falls through to candidates" {
     const cand = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "cand" });
 
     // Rewrite the candidate to the real absolute path (TOML has no
-    // interpolation of its own; substitute after writing).
+    // interpolation of its own; substitute after writing). A TOML literal
+    // (single-quoted) string, not a basic one: a native Windows path embeds
+    // backslashes, which a basic string's escape grammar would reject.
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\nenv = \"HOMEBREW_PREFIX\"\ncandidates = [\"{s}\"]\n", .{cand}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\nenv = \"HOMEBREW_PREFIX\"\ncandidates = ['{s}']\n", .{cand}),
     });
 
     var map = std.process.Environ.Map.init(a);
@@ -256,7 +258,7 @@ test "load: a candidate naming a regular file does not bind (directory required)
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\ncandidates = [\"{s}\"]\n", .{file_cand}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\ncandidates = ['{s}']\n", .{file_cand}),
     });
 
     var map = std.process.Environ.Map.init(a);
@@ -283,7 +285,7 @@ test "load: a symlink to a directory candidate binds" {
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\ncandidates = [\"{s}\"]\n", .{link}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\ncandidates = ['{s}']\n", .{link}),
     });
 
     var map = std.process.Environ.Map.init(a);
@@ -310,7 +312,7 @@ test "load: an env override naming a regular file does not win, falls through to
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\nenv = \"HOMEBREW_PREFIX\"\ncandidates = [\"{s}\"]\n", .{cand}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"brew_prefix\"\nenv = \"HOMEBREW_PREFIX\"\ncandidates = ['{s}']\n", .{cand}),
     });
 
     var map = std.process.Environ.Map.init(a);
@@ -468,11 +470,11 @@ test "load: private layer shadows repo" {
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"x\"\ncandidates = [\"{s}\"]\n", .{repo_cand}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"x\"\ncandidates = ['{s}']\n", .{repo_cand}),
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "private/data/facts.toml",
-        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"x\"\ncandidates = [\"{s}\"]\n", .{priv_cand}),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"x\"\ncandidates = ['{s}']\n", .{priv_cand}),
     });
 
     var map = std.process.Environ.Map.init(a);
