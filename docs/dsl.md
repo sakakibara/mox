@@ -47,11 +47,13 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 
 ## Axis expressions
 
-Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`, and
-the multi-value `tool`, `env`, `path`. `machine` is the first label of the
-hostname (e.g. `Foo` out of `Foo.attlocal.net`), stable across networks;
-`hostname` is the full name, for the rarer case that wants it. An axis
-expression is boolean over them:
+Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`; the
+open `tool`, `env` (any name is a live query, below); and the closed `path`
+(exactly the four derived tool-home members: `brew_prefix`, `cargo_home`,
+`gopath`, `pnpm_home`). `machine` is the first label of the hostname (e.g.
+`Foo` out of `Foo.attlocal.net`), stable across networks; `hostname` is the
+full name, for the rarer case that wants it. An axis expression is boolean
+over them:
 
 ```
 os=darwin
@@ -67,12 +69,19 @@ tool=fd and not env=WSL
 - `name` (no `=`) - presence: true when the axis is bound to a non-empty value.
 - `and`, `or`, `not`, and `( ... )` grouping. `not` may repeat.
 
-`tool=<name>` resolves against `$PATH`, then this machine's detected tool-home
-bin directories when present (`<brew_prefix>/bin`, `<cargo_home>/bin`,
-`<gopath>/bin`, `<pnpm_home>`), then any directory a setup script named via
-`$MOX_PATH` (see Scripts, below) -- in that order, so a `$PATH` hit always
-wins. `<machine.tool_path.NAME>` interpolation resolves through the same
-search space.
+`tool=<name>` and `env=<name>` are open axes: neither has a fixed
+vocabulary, so any name is a live query rather than a lookup against a
+pre-enumerated fact set. `tool=<name>` resolves against `$PATH`, then this
+machine's detected tool-home bin directories when present
+(`<brew_prefix>/bin`, `<cargo_home>/bin`, `<gopath>/bin`, `<pnpm_home>`),
+then any directory a setup script named via `$MOX_PATH` (see Scripts,
+below) -- in that order, so a `$PATH` hit always wins.
+`<machine.tool_path.NAME>` interpolation resolves through the same search
+space. `env=<name>` resolves directly against this machine's captured
+environ, same as `<env.NAME>` interpolation; a set-but-empty variable reads
+as unset, matching every other axis's presence test. Both are probed once
+per name per run and memoized; `mox status` and `mox facts probe` surface
+what was actually asked and its outcome.
 
 ## Loops
 
@@ -265,7 +274,14 @@ shell and `.ps1`. When a script sits in a gated subdir and also carries a header
 both must hold for it to run. A header that fails to parse is a hard error for
 that script, not a silent skip.
 
-Every setup script (both stages) gets `MOX_PATH`, naming a
+Every setup script (both stages) runs with mox's own environment plus
+`MOX_REPO` (the dotfiles repo root), `MOX_STATE_DIR`, `MOX_HOME` (the live
+root), and every fact as `MOX_FACT_<UPPERCASE_NAME>` (a character outside
+`[A-Z0-9_]` in the fact name becomes `_`; a name that cannot be encoded
+distinctly -- non-ASCII, or a collision with another fact's sanitized form --
+is left out and warned about instead of silently colliding).
+
+Every setup script (both stages) also gets `MOX_PATH`, naming a
 writable file private to this run (deleted when the run ends). A script that
 installs a tool somewhere `tool=` would not otherwise see -- neither `$PATH`
 nor a detected tool home -- appends that directory there, one absolute path
