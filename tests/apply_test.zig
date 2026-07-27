@@ -4727,6 +4727,25 @@ test "apply: an unknown path= value names the closed set; a real member keeps wo
     try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted path values: brew_prefix, cargo_home, gopath, pnpm_home") != null);
 }
 
+test "apply: a .d/ overlay filename naming an unknown path= member names the closed set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig", .data = "[user]\n" });
+    try tmp.dir.createDirPath(io, "repo/src/.gitconfig.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig.d/path=brew", .data = "[gpg]\n" });
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "path=brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted path values: brew_prefix, cargo_home, gopath, pnpm_home") != null);
+}
+
 test "apply: a real path= member composes without error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

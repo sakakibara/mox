@@ -385,7 +385,7 @@ fn walkDir(
             });
             defer dot_d_dir.close(io);
             const dot_d_abs = try std.fs.path.join(arena, &.{ abs_prefix, dot_d_name });
-            try enumerateDotD(arena, io, dot_d_dir, dot_d_abs, &overlays, &regions);
+            try enumerateDotD(arena, io, dot_d_dir, dot_d_abs, &overlays, &regions, diag);
         }
 
         // The applied file takes the source filename verbatim; no prefix is
@@ -445,7 +445,7 @@ fn walkDir(
             .follow_symlinks = false,
         });
         const dot_d_abs = try std.fs.path.join(arena, &.{ abs_prefix, name });
-        try enumerateDotD(arena, io, dot_d_dir, dot_d_abs, &overlays, &regions);
+        try enumerateDotD(arena, io, dot_d_dir, dot_d_abs, &overlays, &regions, diag);
 
         // Gap 6: an orphan `.d/` is treated as the overlay-dir of a phantom
         // managed file ONLY if it actually contains axis-named overlays.
@@ -732,6 +732,7 @@ fn enumerateDotD(
     dot_d_abs: []const u8,
     overlays_out: *[]const Overlay,
     regions_out: *[]const Region,
+    diag: ?*Diag,
 ) !void {
     var overlays: std.ArrayList(Overlay) = .empty;
     errdefer overlays.deinit(arena);
@@ -751,6 +752,13 @@ fn enumerateDotD(
             if (std.mem.indexOfScalar(u8, fragmentStem(entry.name), '=') == null) continue;
             const t = tuple_mod.parseFilename(arena, entry.name) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
+                // Kept distinct from the generic `InvalidEntry` below (D5):
+                // a caller reports the closed `path=` vocabulary the same
+                // way the directive grammar does, instead of a bare verdict.
+                error.UnknownPathAxisValue => {
+                    if (diag) |d| d.set(abs);
+                    return error.UnknownPathAxisValue;
+                },
                 else => return error.InvalidEntry,
             };
             // A value may itself contain a dot the extension heuristic strips

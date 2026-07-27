@@ -21,6 +21,24 @@ pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts, a.paths);
 }
 
+/// `machine.state.captureDiag`, reporting a `ReservedFactName` collision the
+/// same way `mox facts` does instead of letting the bare error name reach
+/// main's generic handler -- apply is where users actually hit this, not
+/// just `mox facts`. Null return means the caller already reported and
+/// should fail the run; any other error still propagates.
+fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env) !?mox.machine.state.MachineState {
+    var facts_diag: mox.machine.facts.Diag = .{};
+    return mox.machine.state.captureDiag(ctx.alloc, ctx.io, env, &facts_diag) catch |e| switch (e) {
+        error.ReservedFactName => {
+            try ctx.err.print("mox apply: {s}\n", .{
+                facts_diag.capture() orelse "a fact name collides with a reserved axis name",
+            });
+            return null;
+        },
+        else => return e,
+    };
+}
+
 /// The apply pipeline, callable with explicit flags so `mox init --apply` can
 /// run it right after a clone. `run` is the thin CLI wrapper over it. `paths`
 /// limits the run to those managed files (empty: every file); when non-empty
@@ -76,7 +94,7 @@ fn applyPass(
     };
     const resolver_opt: ?*DriftResolver = if (interactive_drift) &resolver else null;
 
-    var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    var m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
     var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
@@ -106,7 +124,7 @@ fn applyPass(
         const outcome = try mox.machine.interview.walk(ctx.alloc, schema, &bindings, input, if (interactive) ctx.out else null);
         if (outcome.answers.len > 0) {
             try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
-            m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+            m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
             bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
             live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
         }
@@ -176,7 +194,7 @@ fn applyPass(
     // against the machine as the bootstrap left it, not as it began -- the
     // first-apply staleness the design exists to eliminate.
     if (pre_result.ran > 0) {
-        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+        m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
     }
@@ -213,6 +231,18 @@ fn applyPass(
             try ctx.err.print("mox apply: attributes.toml: {s}: {s}\n", .{
                 walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
             });
+            return 1;
+        },
+        error.UnknownPathAxisValue => {
+            try ctx.err.print("mox apply: overlay filename: {s}: unknown path= member\n", .{
+                walk_diag.capture() orelse "?",
+            });
+            try ctx.err.writeAll("mox apply:   accepted path values: ");
+            for (mox.dsl.axis.path_axis_members, 0..) |m, i| {
+                if (i > 0) try ctx.err.writeAll(", ");
+                try ctx.err.writeAll(m);
+            }
+            try ctx.err.writeAll("\n");
             return 1;
         },
         else => return e,

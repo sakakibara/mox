@@ -1309,7 +1309,11 @@ test "apply and facts: a facts.toml key named for a multi-value axis errors loud
 
     const applied = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(applied.rc != 0);
-    try std.testing.expect(std.mem.indexOf(u8, applied.err, "ReservedFactName") != null);
+    // The remediation message -- which key collided and the reserved set --
+    // reaches apply's own diagnostic, not just the bare error name main
+    // would otherwise print with no remediation at all.
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "reserved axis names (tool, env, path)") != null);
 
     const facts_out = try h.run(&.{ "mox", "facts" });
     try std.testing.expectEqual(@as(u8, 1), facts_out.rc);

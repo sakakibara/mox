@@ -9,6 +9,11 @@ pub const ParseError = error{
     InvalidAxisName,
     InvalidAxisValue,
     MalformedTuple,
+    /// `path=` names a member outside the closed vocabulary
+    /// (`axis_mod.path_axis_members`) -- distinct from the generic
+    /// `InvalidAxisValue` so a caller can report the accepted set instead of
+    /// a bare "invalid" verdict.
+    UnknownPathAxisValue,
     OutOfMemory,
 };
 
@@ -49,7 +54,7 @@ fn parseStem(arena: std.mem.Allocator, stem: []const u8) ParseError!AxisTuple {
         // `path=` is a closed axis (D5): a tuple naming any member outside
         // the four derived tool-home facts is refused, same as an unknown
         // value in a `when`/`where` expression.
-        if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(value)) return error.InvalidAxisValue;
+        if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(value)) return error.UnknownPathAxisValue;
         try pairs.append(arena, .{
             .name = try arena.dupe(u8, name),
             .value = try arena.dupe(u8, value),
@@ -169,7 +174,7 @@ test "parseFilename: an unknown path= member is rejected" {
     var allocator_buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const result = parseFilename(fba.allocator(), "path=brew");
-    try std.testing.expectError(error.InvalidAxisValue, result);
+    try std.testing.expectError(error.UnknownPathAxisValue, result);
 }
 
 test "parseFilename: every real path= member is accepted" {

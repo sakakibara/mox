@@ -114,6 +114,26 @@ test "walk: finds managed file with category-A overlays" {
     try std.testing.expectEqual(@as(usize, 0), result.files[0].regions.len);
 }
 
+test "walk: an overlay filename naming an unknown path= member is refused, diag names the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/path=brew", "[gpg]\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectError(error.UnknownPathAxisValue, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, "path=brew") != null);
+}
+
 test "walk: finds managed file with category-B regions" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

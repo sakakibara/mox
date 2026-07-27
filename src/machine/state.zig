@@ -135,6 +135,15 @@ pub fn extrasNotice(arena: std.mem.Allocator, io: Io, xdg_config_home: []const u
 /// paths from `environ`, and probes tool availability against `$PATH`.
 /// All returned strings are owned by `arena`.
 pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState {
+    return captureDiag(arena, io, environ, null);
+}
+
+/// Same as `capture`, but a non-null `diag` is filled with the offending key
+/// and the reserved set when a custom fact collides with a multi-value axis
+/// name (`error.ReservedFactName`) -- the same message `mox facts` prints --
+/// so a caller can report it instead of leaving the bare error name to speak
+/// for itself.
+pub fn captureDiag(arena: std.mem.Allocator, io: Io, environ: Environ, diag: ?*facts_mod.Diag) !MachineState {
     const builtin = @import("builtin");
 
     const os_str = envOr(arena, environ, "MOX_OS") orelse osAxisValue(builtin.os.tag);
@@ -201,7 +210,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const xdg_state_home = try resolveXdg(arena, environ, "XDG_STATE_HOME", home, ".local/state");
 
     const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
-    const facts_result = try facts_mod.load(arena, io, facts_path, null);
+    const facts_result = try facts_mod.load(arena, io, facts_path, diag);
 
     return .{
         .os = os_str,
