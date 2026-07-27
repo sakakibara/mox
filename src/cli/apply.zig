@@ -132,30 +132,12 @@ fn applyPass(
 
     // Config-space discovery: every custom fact ("dimension") the repo's own
     // sources consume, replacing the deleted hand-maintained schema file.
-    // Its own per-file anomalies are reported loudly here rather than left
-    // for a caller that never asks to see them. A structurally invalid
-    // source tree (bad attributes.toml, an illegal own/check declaration, a
-    // reserved axis name, ...) is the source-tree walk further below's
-    // problem to diagnose with the offending file; discovery degrades to
-    // "nothing found" here rather than pre-empting that richer report with
-    // a bare error name.
-    const discovery = mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        else => mox.machine.dimensions.Discovery{ .dimensions = &.{}, .scripts = &.{} },
-    };
-    for (discovery.diagnostics) |d| {
-        try ctx.err.print("mox apply: {s}: <machine.{s}> is not a valid fact name; ignored\n", .{ d.path, d.name });
-    }
-    for (discovery.default_diagnostics) |dd| switch (dd) {
-        .conflict => |c| try ctx.err.print(
-            "mox apply: conflicting `# mox: default` for \"{s}\": {s}=\"{s}\" vs {s}=\"{s}\"\n",
-            .{ c.name, c.first_source, c.first_value, c.second_source, c.second_value },
-        ),
-        .unclaimed => |u| try ctx.err.print(
-            "mox apply: `# mox: default {s}=...` in {s} names a fact nothing else in the repo consumes; ignored\n",
-            .{ u.name, u.source },
-        ),
-    };
+    // Structural anomalies (a malformed capture/needs name, a reserved
+    // `# mox: default`) are loud per-site diagnostics, never a swallowed
+    // failure; `discover` itself has no blanket catch, so an actual
+    // OOM/IO-class error here propagates like any other.
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
+    try mox.machine.dimensions.writeDiagnostics(ctx.err, "mox apply: ", discovery.diagnostics, discovery.default_diagnostics);
 
     // Facts interview: resolve every eligible unbound dimension, persist the
     // answers, and re-capture so this apply already composes with them.

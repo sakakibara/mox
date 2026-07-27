@@ -27,6 +27,7 @@ fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
     }
 
     const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
+    try mox.machine.dimensions.writeDiagnostics(ctx.err, "", discovery.diagnostics, discovery.default_diagnostics);
     if (discovery.dimensions.len == 0) return 0;
 
     // The interview may persist answers into facts.toml; guard that

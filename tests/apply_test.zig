@@ -1114,6 +1114,82 @@ test "apply: conflicting `# mox: default` declarations for one name are surfaced
     try std.testing.expect(lineHasBoth(r.err, "b.conf", "gdrive"));
 }
 
+test "apply: a malformed `# mox: needs` name in a script is a loud diagnostic, not a swallowed discovery failure -- the interview still runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    // A genuine, presence-only dimension the interview must still surface.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when signing_key\nx = 1\n# mox: end\n",
+    });
+    const bad_rel = try std.fmt.allocPrint(a, "repo/scripts/pre/bad{s}", .{script_ext});
+    const bad_content = if (builtin.os.tag == .windows)
+        "# mox: needs BadName\nWrite-Output hi\n"
+    else
+        "#!/bin/sh\n# mox: needs BadName\necho hi\n";
+    try writeExecScript(io, tmp.dir, bad_rel, bad_content, try std.fs.path.join(a, &.{ root, bad_rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "needs BadName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not a valid fact name") != null);
+    // The discovery diagnostic never swallowed the rest of the run: the
+    // interview still names the unrelated, well-formed dimension.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unbound facts: signing_key") != null);
+}
+
+test "apply: a reserved `# mox: default` name in a source is a loud diagnostic, not a swallowed discovery failure -- the interview still runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/a.conf",
+        .data = "# mox: default os=\"linux\"\n# mox: when signing_key\nx = 1\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "default os=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "reserved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unbound facts: signing_key") != null);
+}
+
+test "mox facts: discovery diagnostics print the same way apply's do" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/a.conf",
+        .data = "# mox: default os=\"linux\"\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "facts" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "default os=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "reserved") != null);
+}
+
 test "apply/doctor: a leftover data/facts-schema.toml gets one loud never-read notice, from both commands" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

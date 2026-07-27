@@ -1,8 +1,8 @@
 //! Config-space discovery: a dedicated pre-interview pass that scans a repo's
 //! `src/` tree and `scripts/pre|post` trees for every custom fact ("dimension")
 //! the repo's sources actually consume, instead of a hand-maintained schema
-//! file. Pure function of (repo_dir, io, alloc): no state is written, and the
-//! result is not yet wired into `apply` or any command.
+//! file. Pure function of (repo_dir, io, alloc): no state is written. Wired
+//! into `apply` (before the interview) and `mox facts`.
 //!
 //! A dimension is discovered through three channels, at any nesting depth a
 //! directive's body reaches (a `# mox: when` nested inside a `when`/`for`/
@@ -37,9 +37,18 @@
 //! is a repo-level statement) declares an interview default for `NAME`; it
 //! is not itself a discovery channel (a default alone consumes nothing) and
 //! only attaches to a dimension one of the three channels above already
-//! made real, surfacing as `Dimension.declared_defaults`. A name declared
-//! with disagreeing values, or declared for a name no channel above made a
-//! dimension, is loud but non-fatal: `Discovery.default_diagnostics`.
+//! made real, surfacing as `Dimension.declared_defaults`.
+//!
+//! Structural anomalies are loud per-site diagnostics, never fatal: a
+//! `# mox: default` naming disagreeing values, naming an excluded name, or
+//! naming a fact no channel above made a dimension (`Discovery.
+//! default_diagnostics`); a `<machine.NAME>` capture or `# mox: needs NAME`
+//! outside the fact-name charset (`Discovery.diagnostics`, the latter also
+//! marking its `ScriptRecord.needs_unparseable`). The offending site is
+//! skipped and scanning continues -- `discover` itself only fails on an
+//! actual OOM/IO-class error, or a structurally invalid source tree it
+//! degrades to "nothing found" over rather than pre-empting the richer
+//! report `apply`'s own source-tree walk produces for the same file.
 
 const std = @import("std");
 const dsl = @import("../dsl/root.zig");
@@ -109,21 +118,39 @@ pub const ScriptRecord = struct {
     /// text, sorted and deduped.
     scanned_tokens: []const []const u8,
     /// Parsed `# mox: needs <name>...` head line: null when the script has no
-    /// such directive; an empty (non-null) slice when it declares no facts
-    /// needed. When non-null, REPLACES `scanned_tokens` as this script's
-    /// effective consumption set.
+    /// such directive (or its directive failed to parse, see
+    /// `needs_unparseable`); an empty (non-null) slice when it declares no
+    /// facts needed. When non-null, REPLACES `scanned_tokens` as this
+    /// script's effective consumption set.
     needs: ?[]const []const u8,
+    /// True when the script has a `# mox: needs` line whose name failed the
+    /// fact-name charset (`Diagnostic.needs_name`, printed for it). `needs`
+    /// is left null in that case rather than a guessed partial list -- the
+    /// script's contract is unknowable, and a future D3 fold blocks it
+    /// outright on this marker rather than falling back to a token scan.
+    needs_unparseable: bool = false,
 };
 
-/// A per-file scan anomaly worth surfacing even though it doesn't fail the
-/// whole discovery run.
-pub const Diagnostic = struct {
-    /// Repo-relative path of the file the capture was seen in.
-    path: []const u8,
-    /// The `<machine.NAME>` field text that failed the fact-name charset
-    /// (`[a-z][a-z0-9_]*`): recorded nowhere as a dimension, but reported
-    /// here loudly rather than silently dropped.
-    name: []const u8,
+/// A per-site scan anomaly worth surfacing loudly even though it doesn't
+/// fail the whole discovery run: a malformed name is ignored at its own
+/// site, and scanning continues everywhere else.
+pub const Diagnostic = union(enum) {
+    /// A `<machine.NAME>` capture whose NAME failed the fact-name charset
+    /// (`[a-z][a-z0-9_]*`): recorded nowhere as a dimension.
+    capture_name: struct {
+        path: []const u8,
+        name: []const u8,
+    },
+    /// A `# mox: needs NAME...` head directive whose NAME failed the
+    /// fact-name charset. The offending script's own `ScriptRecord` carries
+    /// `needs_unparseable = true` (its contract is unknowable, D3's
+    /// eventual block target); `needs` is left null on it, same as a script
+    /// with no `needs` line at all.
+    needs_name: struct {
+        path: []const u8,
+        name: []const u8,
+        line: u32,
+    },
 };
 
 /// A `# mox: default NAME="VALUE"` anomaly worth surfacing without failing
@@ -147,7 +174,53 @@ pub const DefaultDiagnostic = union(enum) {
         name: []const u8,
         source: []const u8,
     },
+    /// A `# mox: default` directive names a built-in, open-probe-axis,
+    /// reserved-axis, or `data/facts.toml`-derived name -- excluded by
+    /// category the same way a discovery occurrence would be, but loud
+    /// rather than silently dropped since a default declaration is a
+    /// deliberate repo-level statement.
+    reserved: struct {
+        name: []const u8,
+        source: []const u8,
+    },
 };
+
+/// Print every discovery anomaly to `out`, each line prefixed with
+/// `prefix` (`"mox apply: "` for apply, `""` for bare `mox facts`, matching
+/// `interview.writeUnboundNotice`'s own prefix contract). Shared between
+/// apply and `mox facts` so a repo's structural anomalies read identically
+/// wherever discovery runs.
+pub fn writeDiagnostics(
+    out: *std.Io.Writer,
+    prefix: []const u8,
+    diagnostics: []const Diagnostic,
+    default_diagnostics: []const DefaultDiagnostic,
+) !void {
+    for (diagnostics) |d| switch (d) {
+        .capture_name => |c| try out.print(
+            "{s}{s}: <machine.{s}> is not a valid fact name; ignored\n",
+            .{ prefix, c.path, c.name },
+        ),
+        .needs_name => |n| try out.print(
+            "{s}{s}:{d}: `# mox: needs {s}` is not a valid fact name; ignored\n",
+            .{ prefix, n.path, n.line, n.name },
+        ),
+    };
+    for (default_diagnostics) |dd| switch (dd) {
+        .conflict => |c| try out.print(
+            "{s}conflicting `# mox: default` for \"{s}\": {s}=\"{s}\" vs {s}=\"{s}\"\n",
+            .{ prefix, c.name, c.first_source, c.first_value, c.second_source, c.second_value },
+        ),
+        .unclaimed => |u| try out.print(
+            "{s}`# mox: default {s}=...` in {s} names a fact nothing else in the repo consumes; ignored\n",
+            .{ prefix, u.name, u.source },
+        ),
+        .reserved => |r| try out.print(
+            "{s}`# mox: default {s}=...` in {s} names a reserved/built-in fact name; ignored\n",
+            .{ prefix, r.name, r.source },
+        ),
+    };
+}
 
 pub const Discovery = struct {
     /// Every discovered dimension, sorted by name.
@@ -161,10 +234,6 @@ pub const Discovery = struct {
     /// order by name.
     default_diagnostics: []const DefaultDiagnostic = &.{},
 };
-
-/// A `# mox: needs <name>...` name fails the fact-name charset
-/// (`[a-z][a-z0-9_]*`, matching `data/facts.toml` and `facts.toml`).
-pub const DiscoverError = error{InvalidNeedsName};
 
 /// Discover the full config space a repo's sources consume. `repo_dir` is the
 /// mox repo root (the parent of `src/`); a missing `src/`, `scripts/pre/`, or
@@ -180,16 +249,24 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
         .scripts = .empty,
         .diagnostics = .empty,
         .declared_defaults = .empty,
+        .default_diagnostics = .empty,
     };
 
     for (try derived_facts.declaredNames(arena, io, repo_dir, "")) |n| {
         try self.derived_names.put(n, {});
     }
 
+    // A structurally invalid source tree (bad attributes.toml, an illegal
+    // own/check declaration, a reserved axis name on a path= overlay, ...)
+    // is the richer `source.tree.walkDiag` call further into `apply`'s own
+    // pipeline's problem to diagnose with the offending file and site;
+    // discovery degrades to "nothing found" on any such error here rather
+    // than pre-empting that later, better report with a bare error name.
+    // Only OOM is worth failing discovery itself over.
     const src_dir = try std.fs.path.join(arena, &.{ repo_dir, "src" });
     const tree = source.tree.walk(arena, io, src_dir, "") catch |e| switch (e) {
-        error.FileNotFound => source.tree.ManagedTree{ .files = &.{} },
-        else => return e,
+        error.OutOfMemory => return e,
+        else => source.tree.ManagedTree{ .files = &.{} },
     };
     for (tree.files) |file| try self.scanManagedFile(file);
 
@@ -231,6 +308,12 @@ const Discoverer = struct {
     /// whatever position the traversal reached it -- unconditioned by
     /// construction, since the collection call never consults a gate stack.
     declared_defaults: std.ArrayList(RawDefault),
+    /// `# mox: default` anomalies: a reserved-name occurrence is appended
+    /// here directly at scan time (`recordDeclaredDefault`); conflict/
+    /// unclaimed occurrences are appended once declared_defaults is grouped
+    /// at `finalize` time (`resolveDeclaredDefaults`). Both land in the same
+    /// list so `Discovery.default_diagnostics` needs no later merge.
+    default_diagnostics: std.ArrayList(DefaultDiagnostic),
 
     /// The dimension work-slot for `name`, creating it on first reference, or
     /// null when `name` is excluded by category (built-in, open axis,
@@ -401,14 +484,22 @@ const Discoverer = struct {
     /// never consults a gate stack (D2: "a declared default is a repo-level
     /// statement, its location's gates are irrelevant"). A default naming an
     /// excluded (built-in, open-axis, reserved-axis, or
-    /// `data/facts.toml`-derived) name is a source-load error, the same
-    /// class `ReservedAxisName` already is elsewhere in the DSL.
+    /// `data/facts.toml`-derived) name is a loud, non-fatal diagnostic --
+    /// `DefaultDiagnostic.reserved`, appended directly rather than deferred
+    /// to `finalize` since exclusion is already known here -- and the
+    /// declaration is dropped; scanning continues.
     fn recordDeclaredDefault(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8) !void {
         const def = switch (d.kind) {
             .default => |k| k,
             else => return,
         };
-        if (self.isExcluded(def.name)) return error.ReservedAxisName;
+        if (self.isExcluded(def.name)) {
+            try self.default_diagnostics.append(self.arena, .{ .reserved = .{
+                .name = try self.arena.dupe(u8, def.name),
+                .source = source_key,
+            } });
+            return;
+        }
         try self.declared_defaults.append(self.arena, .{
             .name = try self.arena.dupe(u8, def.name),
             .value = try self.arena.dupe(u8, def.value),
@@ -458,10 +549,11 @@ const Discoverer = struct {
     /// `recurseDirective` pair: an inferred set cannot resolve across the
     /// recursion cycle. Every read/parse failure on the path between them is
     /// already caught locally (a malformed nested body or missing fragment is
-    /// skipped, not propagated), so `OutOfMemory` and a reserved `# mox:
-    /// default` name (`recordDeclaredDefault`, which fails loudly rather than
-    /// skip) are the only errors either can actually return.
-    const ScanError = std.mem.Allocator.Error || error{ReservedAxisName};
+    /// skipped, not propagated) and every structural anomaly
+    /// (`recordDeclaredDefault`'s reserved name included) is now a
+    /// diagnostic rather than an error, so `OutOfMemory` is the only error
+    /// either can actually return.
+    const ScanError = std.mem.Allocator.Error;
 
     /// Parse `content` as one directive-tree scope (a whole file, or a nested
     /// region body) and scan its own content lines for `<machine.NAME>`
@@ -623,10 +715,10 @@ const Discoverer = struct {
             if (std.mem.startsWith(u8, field, "tool_path.")) continue;
 
             if (!source.tuple.isValidAxisName(field)) {
-                try self.diagnostics.append(self.arena, .{
+                try self.diagnostics.append(self.arena, .{ .capture_name = .{
                     .path = source_key,
                     .name = try self.arena.dupe(u8, field),
-                });
+                } });
                 continue;
             }
 
@@ -736,13 +828,27 @@ const Discoverer = struct {
         }
 
         var needs: ?[]const []const u8 = null;
-        if (head.needs) |raw| needs = try parseNeeds(self.arena, raw);
+        var needs_unparseable = false;
+        if (head.needs) |raw| {
+            const parsed = try parseNeeds(self.arena, raw);
+            if (parsed.invalid) |bad| {
+                try self.diagnostics.append(self.arena, .{ .needs_name = .{
+                    .path = rel_path,
+                    .name = bad,
+                    .line = head.needs_line,
+                } });
+                needs_unparseable = true;
+            } else {
+                needs = parsed.names;
+            }
+        }
 
         try self.scripts.append(self.arena, .{
             .path = rel_path,
             .when_head = head.when,
             .scanned_tokens = try scanMoxFactTokens(self.arena, content),
             .needs = needs,
+            .needs_unparseable = needs_unparseable,
         });
     }
 
@@ -759,8 +865,7 @@ const Discoverer = struct {
         while (name_it.next()) |k| try all_names.append(self.arena, k.*);
         const projected = try source.fact_env.project(self.arena, try all_names.toOwnedSlice(self.arena));
 
-        var default_diags: std.ArrayList(DefaultDiagnostic) = .empty;
-        const resolved_defaults = try self.resolveDeclaredDefaults(&default_diags);
+        const resolved_defaults = try self.resolveDeclaredDefaults();
 
         var it = self.dims.iterator();
         while (it.next()) |entry| {
@@ -795,7 +900,7 @@ const Discoverer = struct {
             .dimensions = dims_slice,
             .scripts = try self.scripts.toOwnedSlice(self.arena),
             .diagnostics = try self.diagnostics.toOwnedSlice(self.arena),
-            .default_diagnostics = try default_diags.toOwnedSlice(self.arena),
+            .default_diagnostics = try self.default_diagnostics.toOwnedSlice(self.arena),
         };
     }
 
@@ -807,8 +912,10 @@ const Discoverer = struct {
     /// `.unclaimed` diagnostic for a name that resolves cleanly but names no
     /// dimension any other source in the repo consumes (a default alone
     /// consumes nothing, per D2/D5). Same-value duplicates across files
-    /// collapse silently: they are not an anomaly.
-    fn resolveDeclaredDefaults(self: *Discoverer, diags: *std.ArrayList(DefaultDiagnostic)) !std.StringHashMap([]const u8) {
+    /// collapse silently: they are not an anomaly. A reserved name never
+    /// reaches this grouping at all -- `recordDeclaredDefault` already
+    /// diverted it straight to `self.default_diagnostics` at scan time.
+    fn resolveDeclaredDefaults(self: *Discoverer) !std.StringHashMap([]const u8) {
         var groups = std.StringHashMap(std.ArrayList(RawDefault)).init(self.arena);
         for (self.declared_defaults.items) |raw| {
             const gop = try groups.getOrPut(raw.name);
@@ -832,7 +939,7 @@ const Discoverer = struct {
             }
 
             if (distinct.items.len > 1) {
-                try diags.append(self.arena, .{ .conflict = .{
+                try self.default_diagnostics.append(self.arena, .{ .conflict = .{
                     .name = name,
                     .first_source = distinct.items[0].source,
                     .first_value = distinct.items[0].value,
@@ -846,7 +953,7 @@ const Discoverer = struct {
             if (self.dims.contains(name)) {
                 try resolved.put(name, value);
             } else {
-                try diags.append(self.arena, .{ .unclaimed = .{
+                try self.default_diagnostics.append(self.arena, .{ .unclaimed = .{
                     .name = name,
                     .source = occurrences[0].source,
                 } });
@@ -1021,6 +1128,9 @@ const header_scan_lines: usize = 16;
 const ScriptHead = struct {
     when: ?[]const u8 = null,
     needs: ?[]const u8 = null,
+    /// 1-indexed line `needs` was found on, for `Diagnostic.needs_name`.
+    /// Meaningless when `needs` is null.
+    needs_line: u32 = 0,
 };
 
 /// Scan a script's leading comment block (shebang/blank/`#`-comment lines, up
@@ -1060,6 +1170,7 @@ fn scanScriptHead(content: []const u8) ScriptHead {
             const after = rest[5..];
             if (!wordContinues(after)) {
                 result.needs = std.mem.trim(u8, after, " \t");
+                result.needs_line = @intCast(scanned);
                 continue;
             }
         }
@@ -1074,16 +1185,26 @@ fn wordContinues(after: []const u8) bool {
     return after.len != 0 and (std.ascii.isAlphanumeric(after[0]) or after[0] == '_');
 }
 
+const NeedsParse = struct {
+    names: []const []const u8,
+    /// The first token that failed the fact-name charset, or null when every
+    /// token parsed cleanly. `names` holds whatever parsed before it, but the
+    /// caller drops that partial list rather than trust a guessed contract.
+    invalid: ?[]const u8 = null,
+};
+
 /// Parse a `# mox: needs` line's argument into whitespace-separated names.
 /// An empty (or all-whitespace) argument is a valid explicit-empty list.
-fn parseNeeds(arena: std.mem.Allocator, raw: []const u8) (DiscoverError || std.mem.Allocator.Error)![]const []const u8 {
+fn parseNeeds(arena: std.mem.Allocator, raw: []const u8) std.mem.Allocator.Error!NeedsParse {
     var names: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeAny(u8, raw, " \t");
     while (it.next()) |tok| {
-        if (!source.tuple.isValidAxisName(tok)) return error.InvalidNeedsName;
+        if (!source.tuple.isValidAxisName(tok)) {
+            return .{ .names = try names.toOwnedSlice(arena), .invalid = try arena.dupe(u8, tok) };
+        }
         try names.append(arena, try arena.dupe(u8, tok));
     }
-    return names.toOwnedSlice(arena);
+    return .{ .names = try names.toOwnedSlice(arena) };
 }
 
 fn isFactTokenChar(c: u8) bool {
@@ -1558,7 +1679,7 @@ test "discover: an empty `# mox: needs` line declares an explicit empty list" {
     try std.testing.expectEqual(@as(usize, 0), s.needs.?.len);
 }
 
-test "discover: a malformed `# mox: needs` name is an error" {
+test "discover: a malformed `# mox: needs` name is a loud diagnostic, not a fatal error -- scanning continues" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1569,7 +1690,17 @@ test "discover: a malformed `# mox: needs` name is an error" {
     try writeFile(io, tmp.dir, "scripts/pre/bad.sh", "#!/bin/sh\n# mox: needs Not-Valid\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    try std.testing.expectError(error.InvalidNeedsName, discover(a, io, repo));
+    const d = try discover(a, io, repo);
+
+    try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
+    const diag = d.diagnostics[0].needs_name;
+    try std.testing.expectEqualStrings("scripts/pre/bad.sh", diag.path);
+    try std.testing.expectEqualStrings("Not-Valid", diag.name);
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+
+    try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
+    try std.testing.expect(d.scripts[0].needs == null);
+    try std.testing.expect(d.scripts[0].needs_unparseable);
 }
 
 test "discover: integration -- gdrive_account gated, 1Password pair gated on profile=work, profile compared+captured" {
@@ -1683,7 +1814,9 @@ test "discover: the same malformed script still registers (fails loud) at top le
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    try std.testing.expectError(error.InvalidNeedsName, discover(a, io, repo));
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/00-bad.sh", d.diagnostics[0].needs_name.path);
 }
 
 test "discover: the same malformed script still registers (fails loud) one level inside a matching axis dir" {
@@ -1702,7 +1835,9 @@ test "discover: the same malformed script still registers (fails loud) one level
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    try std.testing.expectError(error.InvalidNeedsName, discover(a, io, repo));
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/os=linux/util.sh", d.diagnostics[0].needs_name.path);
 }
 
 test "discover: a well-formed script one level inside an axis dir is scanned" {
@@ -1819,8 +1954,9 @@ test "discover: a capture field outside the fact-name charset is not a dimension
     const d = try discover(a, io, repo);
     try std.testing.expect(findDim(d, "Bad-Name") == null);
     try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
-    try std.testing.expectEqualStrings("src/.zshrc", d.diagnostics[0].path);
-    try std.testing.expectEqualStrings("Bad-Name", d.diagnostics[0].name);
+    const diag = d.diagnostics[0].capture_name;
+    try std.testing.expectEqualStrings("src/.zshrc", diag.path);
+    try std.testing.expectEqualStrings("Bad-Name", diag.name);
 }
 
 // -- capture positions beyond a `when_gate` body -----------------------------
@@ -2448,7 +2584,7 @@ test "discover: a declared default accepts a quoted UTF-8 value" {
     try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", dim.declared_defaults[0]);
 }
 
-test "discover: a declared default naming a built-in is a source-load error" {
+test "discover: a declared default naming a built-in is a loud diagnostic, not a fatal error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2459,10 +2595,15 @@ test "discover: a declared default naming a built-in is a source-load error" {
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default os=\"linux\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    try std.testing.expectError(error.ReservedAxisName, discover(a, io, repo));
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "os") == null);
+    try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
+    const diag = d.default_diagnostics[0].reserved;
+    try std.testing.expectEqualStrings("os", diag.name);
+    try std.testing.expectEqualStrings("src/a.zshrc", diag.source);
 }
 
-test "discover: a declared default naming an open probe axis is a source-load error" {
+test "discover: a declared default naming an open probe axis is a loud diagnostic, not a fatal error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2473,10 +2614,12 @@ test "discover: a declared default naming an open probe axis is a source-load er
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default tool=\"fd\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    try std.testing.expectError(error.ReservedAxisName, discover(a, io, repo));
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
+    try std.testing.expectEqualStrings("tool", d.default_diagnostics[0].reserved.name);
 }
 
-test "discover: a declared default naming a data/facts.toml-derived name is a source-load error" {
+test "discover: a declared default naming a data/facts.toml-derived name is a loud diagnostic, not a fatal error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2488,7 +2631,9 @@ test "discover: a declared default naming a data/facts.toml-derived name is a so
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default brew_prefix=\"/opt/homebrew\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    try std.testing.expectError(error.ReservedAxisName, discover(a, io, repo));
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
+    try std.testing.expectEqualStrings("brew_prefix", d.default_diagnostics[0].reserved.name);
 }
 
 test "discover: corpus-shaped fixture with a declared default added -- every other dimension is unchanged" {
