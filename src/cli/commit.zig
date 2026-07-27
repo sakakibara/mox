@@ -956,7 +956,7 @@ pub fn commitImpl(
     if (fact_edits.items.len > 0) {
         m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
         bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-        live_ctx = .{ .bindings = &bindings, .probe = m_state.probe(), .env = m_state.envProbe() };
+        live_ctx = m_state.liveResolver(&bindings);
         // The fresh `bindings` map above starts unseeded again.
         try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
     }

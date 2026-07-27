@@ -126,7 +126,7 @@ fn applyPass(
             try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
             m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
             bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-            live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
+            live_ctx = m_state.liveResolver(&bindings_map);
         }
         if (outcome.unanswered.len > 0) {
             try ctx.err.writeAll("mox apply: missing facts:");
@@ -196,7 +196,7 @@ fn applyPass(
     if (pre_result.ran > 0) {
         m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-        live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe(), .env = m_state.envProbe() };
+        live_ctx = m_state.liveResolver(&bindings_map);
     }
     // $MOX_PATH additions the pre stage named: fold into this run's probe
     // search space (on the FRESH state above, if it just recaptured) and
