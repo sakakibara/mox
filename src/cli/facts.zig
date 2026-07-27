@@ -7,8 +7,8 @@ const mox = @import("../root.zig");
 
 const BareSpec = struct {};
 
-/// `mox facts`: list current facts, then interview for any schema-declared
-/// facts that are still unanswered.
+/// `mox facts`: list current facts, then interview for any discovered
+/// dimension that is still unanswered.
 fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
     const context = ctx.context.?;
     var facts_diag: mox.machine.facts.Diag = .{};
@@ -54,6 +54,9 @@ fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
             try ctx.out.print("{s} = \"{s}\"\n", .{ a.name, a.value });
         }
     }
+    // Unlike apply, facts never composes a file: refusing here costs nothing
+    // and surfaces an unresolved fact immediately instead of leaving it
+    // silently unbound.
     if (outcome.unbound.len > 0) {
         try ctx.err.writeAll("missing facts:");
         for (outcome.unbound) |n| try ctx.err.print(" {s}", .{n});
