@@ -1453,8 +1453,13 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
 
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    try writeExecScript(io, tmp.dir, "scripts/00-a.sh", "#!/bin/sh\ntrue\n", try std.fs.path.join(a, &.{ root, "scripts/00-a.sh" }));
-    try writeExecScript(io, tmp.dir, "scripts/01-b.sh", "#!/bin/sh\ntrue\n", try std.fs.path.join(a, &.{ root, "scripts/01-b.sh" }));
+    // A trivial no-op script, spelled for the platform's dialect (PowerShell
+    // has neither a shebang nor `true`; an empty script exits 0 there).
+    const noop = if (builtin.os.tag == .windows) "" else "#!/bin/sh\ntrue\n";
+    const rel_a = try std.fmt.allocPrint(a, "scripts/00-a{s}", .{script_ext});
+    const rel_b = try std.fmt.allocPrint(a, "scripts/01-b{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, rel_a, noop, try std.fs.path.join(a, &.{ root, rel_a }));
+    try writeExecScript(io, tmp.dir, rel_b, noop, try std.fs.path.join(a, &.{ root, rel_b }));
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
