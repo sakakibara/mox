@@ -740,7 +740,7 @@ fn composeZshrcUnder(a: std.mem.Allocator, io: Io, h: Harness, axis: []const u8,
     const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
     const tree = try mox.source.tree.walk(a, io, src_dir, h.home);
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put(axis, value);
     for (tree.files) |f| {
         if (!std.mem.endsWith(u8, f.live_path, ".zshrc")) continue;

@@ -57,7 +57,7 @@ pub fn bestMatch(tuples: []const AxisTuple, resolver: *const Resolver) ?usize {
 
 test "matches: empty tuple matches everything" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     try b.put("os", "darwin");
     const t = AxisTuple{ .pairs = &.{} };
@@ -66,7 +66,7 @@ test "matches: empty tuple matches everything" {
 
 test "matches: pair must match" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     try b.put("os", "darwin");
     const t = AxisTuple{ .pairs = &.{.{ .name = "os", .value = "darwin" }} };
@@ -75,7 +75,7 @@ test "matches: pair must match" {
 
 test "matches: missing axis fails" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     const t = AxisTuple{ .pairs = &.{.{ .name = "os", .value = "darwin" }} };
     try std.testing.expect(!matches(t, &b_r));
@@ -83,7 +83,7 @@ test "matches: missing axis fails" {
 
 test "bestMatch: longest wins" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     try b.put("os", "darwin");
     try b.put("profile", "work");
@@ -98,7 +98,7 @@ test "bestMatch: longest wins" {
 
 test "bestMatch: no match returns null" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     try b.put("os", "linux");
     const tuples = [_]AxisTuple{
@@ -109,7 +109,7 @@ test "bestMatch: no match returns null" {
 
 test "matches: multi-value axis overlay matches via the compound key" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     try b.put("tool=fd", "1"); // this machine has fd (multi-value axis binding)
     const has = AxisTuple{ .pairs = &.{.{ .name = "tool", .value = "fd" }} };
@@ -120,7 +120,7 @@ test "matches: multi-value axis overlay matches via the compound key" {
 
 test "matches: a multi-value axis with an over-256-byte value still matches" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     const long = "/" ** 300; // e.g. a deep `path=` axis value
     const key = "path=" ++ long;
@@ -131,7 +131,7 @@ test "matches: a multi-value axis with an over-256-byte value still matches" {
 
 test "bestMatch: equal-specificity tie is filesystem-order independent" {
     var b = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var b_r: Resolver = .{ .live = &b };
+    var b_r: Resolver = .{ .live = &.{ .bindings = &b } };
     defer b.deinit();
     try b.put("os", "darwin");
     try b.put("profile", "work");

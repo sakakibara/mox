@@ -409,7 +409,8 @@ pub fn commitImpl(
     // recompose (later in this same run) sees the new value.
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .probe = m_state.probe() };
+    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
@@ -948,6 +949,7 @@ pub fn commitImpl(
     if (fact_edits.items.len > 0) {
         m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
         bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        live_ctx = .{ .bindings = &bindings, .probe = m_state.probe() };
     }
 
     // Rewalk so region synthesis (new fragments/regions) is reflected when the
@@ -4543,7 +4545,7 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
     var err_aw: Io.Writer.Allocating = .init(a);
     var reader = Io.Reader.fixed("");
     var claims: Claims = .empty;
-    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const cc: ClassCtx = .{
         .arena = a,
         .io = faulty,

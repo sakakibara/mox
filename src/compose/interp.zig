@@ -705,6 +705,12 @@ fn formatMachineField(
         for (m.tool_paths) |tp| {
             if (std.mem.eql(u8, tp.name, tool_name)) return arena.dupe(u8, tp.path);
         }
+        // Not in the eager watch-list scan: fall through to the same lazy
+        // probe `tool=` axis matching uses, so an unwatched name resolves
+        // too instead of interpolating empty forever.
+        if (m.tool_probe) |probe| {
+            if (probe.path(tool_name)) |p| return arena.dupe(u8, p);
+        }
         return arena.dupe(u8, "");
     }
     for (m.custom_facts) |f| {
@@ -931,6 +937,43 @@ test "chain: bare names outside template mode pass through literally" {
     const m = chainTestState();
     const out = try expand(arena.allocator(), "cat <a | grep b>", null, .{ .machine = &m });
     try std.testing.expectEqualStrings("cat <a | grep b>", out);
+}
+
+test "machine.tool_path: a name outside the eager watch list still resolves, lazily" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/herdr", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const bin_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "bin" });
+    const want = try std.fs.path.join(a, &.{ bin_dir, "herdr" });
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", "/home/tester");
+    try map.put("PATH", bin_dir);
+    const m = try machine.state.capture(a, io, Env{ .map = &map });
+
+    const out = try expand(a, "<machine.tool_path.herdr>", null, .{ .machine = &m });
+    try std.testing.expectEqualStrings(want, out);
+}
+
+test "machine.tool_path: an absent unwatched name interpolates empty, not an error" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", "/home/tester");
+    const m = try machine.state.capture(a, io, Env{ .map = &map });
+
+    const out = try expand(a, "<machine.tool_path.definitely-not-installed-xyz>", null, .{ .machine = &m });
+    try std.testing.expectEqualStrings("", out);
 }
 
 fn secretTestCtx(m: *const machine.state.MachineState, map: *std.process.Environ.Map, cache: *secret.cache.Cache) Ctx {

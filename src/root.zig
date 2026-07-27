@@ -45,7 +45,7 @@ test "axis module reachable (parser + evaluator)" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const expr = try dsl.axis.parseString(fba.allocator(), "os=darwin");
     var bindings = std.StringHashMap([]const u8).init(fba.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "darwin");
     try std.testing.expect(dsl.axis.evaluate(expr, &bindings_r));
 }
@@ -149,7 +149,7 @@ test "junk filter: regular file is not junk" {
 
 test "match: empty tuple matches everything" {
     var bindings = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     defer bindings.deinit();
     try bindings.put("os", "darwin");
 
@@ -162,7 +162,7 @@ test "match: empty tuple matches everything" {
 
 test "match: most specific tuple wins" {
     var bindings = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     defer bindings.deinit();
     try bindings.put("os", "darwin");
     try bindings.put("profile", "work");
@@ -183,7 +183,7 @@ test "match: most specific tuple wins" {
 
 test "match: no match returns null" {
     var bindings = std.StringHashMap([]const u8).init(std.testing.allocator);
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     defer bindings.deinit();
     try bindings.put("os", "linux");
 

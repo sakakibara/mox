@@ -7,6 +7,7 @@ const path_lookup = @import("path_lookup.zig");
 const source_path = @import("../source/path.zig");
 const facts_mod = @import("facts.zig");
 const extras_mod = @import("extras.zig");
+const dsl = @import("../dsl/root.zig");
 
 /// A user-supplied machine fact loaded from `$XDG_CONFIG_HOME/mox/facts.toml`.
 /// Facts extend the built-in MachineState fields with values mox can't auto-
@@ -39,6 +40,13 @@ pub const MachineState = struct {
     /// alongside each name. Used for `<machine.tool_path.X>` interpolation
     /// (chezmoi's `lookPath` equivalent).
     tool_paths: []const path_lookup.Found = &.{},
+    /// Lazy fallback for a `tool_path.<name>` interpolation `tool_paths`
+    /// does not already answer (a name outside the eager watch list):
+    /// probes and memoizes against this same machine's `$PATH`. Null only
+    /// for a MachineState built by hand (every test fixture); `capture`
+    /// always supplies one. Also the probe layer a `Resolver.Live` built
+    /// from this snapshot's bindings falls through to for `tool=`.
+    tool_probe: ?*path_lookup.ToolProbe = null,
     defined_envs: []const []const u8,
     /// Map from env-var name to value, for the subset of vars in
     /// ENV_WATCH_LIST that were defined and non-empty. Used by
@@ -59,6 +67,15 @@ pub const MachineState = struct {
     /// capture use (a gate naming the key just never matches); named here so
     /// a caller can warn instead of leaving the drop silent too.
     skipped_fact_keys: []const []const u8 = &.{},
+
+    /// This snapshot's lazy tool-probe layer, ready to hand to
+    /// `dsl.resolver.Resolver.Live.probe`. Null only when `tool_probe` itself
+    /// is null (a hand-built MachineState in a test, never one `capture`
+    /// returned).
+    pub fn probe(self: MachineState) ?dsl.resolver.Resolver.Probe {
+        const tp = self.tool_probe orelse return null;
+        return tp.probe();
+    }
 };
 
 /// Tools to probe via `$PATH` lookup. The presence of a name in
@@ -159,6 +176,12 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const tool_paths = try path_lookup.findOnPathFull(arena, io, environ, tool_watch.items);
     var tool_names_buf = try arena.alloc([]const u8, tool_paths.len);
     for (tool_paths, 0..) |tp, i| tool_names_buf[i] = tp.name;
+
+    // A fresh probe every capture, so a re-capture (facts interview, the
+    // post-pre-script re-capture) starts with an empty memo and listing
+    // cache instead of carrying one over from before whatever just changed.
+    const tool_probe = try arena.create(path_lookup.ToolProbe);
+    tool_probe.* = path_lookup.ToolProbe.init(arena, io, environ);
     const tools: []const []const u8 = tool_names_buf;
 
     // Built-in ENV_WATCH_LIST + user extras.
@@ -205,6 +228,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
         .home = home,
         .tools_on_path = tools,
         .tool_paths = tool_paths,
+        .tool_probe = tool_probe,
         .defined_envs = defined_envs,
         .env_values = env_values,
         .brew_prefix = brew_prefix,

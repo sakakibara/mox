@@ -67,7 +67,7 @@ fn fuzzAxis(_: void, smith: *Smith) anyerror!void {
     // Bindings from the same bytes: whitespace-split tokens become `k=v`
     // (compound axis) or bare-`k` presence entries.
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     var it = std.mem.tokenizeAny(u8, input, " \t\r\n");
     while (it.next()) |tok| {
         if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {

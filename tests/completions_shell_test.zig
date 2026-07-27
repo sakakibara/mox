@@ -50,7 +50,7 @@ fn composeStub(
     const src_dir = try absPath(a, io, tmp, "src");
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const outputs = (try mox.compose.catB.composeGenerator(a, io, tree.files[0], &bindings_r, null, null, null)).?;
     for (outputs) |o| {
         if (std.mem.endsWith(u8, o.live_path, stub_suffix)) return o.content;

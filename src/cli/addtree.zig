@@ -32,7 +32,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    var bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
+    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe() };
+    var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
 
     // sortedPath maps a missing directory to an empty listing (a contract its

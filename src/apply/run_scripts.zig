@@ -770,7 +770,7 @@ test "axisDirMatches: gated by binding; non-axis dirs ignored" {
     var bindings = std.StringHashMap([]const u8).init(a);
     try bindings.put("os", "windows");
     try bindings.put("profile", "work");
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     try testing.expect(try axisDirMatches(a, "os=windows", &bindings_r));
     try testing.expect(try axisDirMatches(a, "os=windows+profile=work", &bindings_r));

@@ -196,7 +196,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    var bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
+    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe() };
+    var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 

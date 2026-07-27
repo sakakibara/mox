@@ -156,7 +156,7 @@ test "load: merges .mox/ignore and .moxignore, root wins ties" {
 
     const st = stateForOs("darwin");
     var bindings = try mox.machine.bindings.fromMachineState(a, st);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const set = try load(a, io, repo, &bindings_r, &st);
     try testing.expect(set.isIgnored("a/b.jsonl", false)); // from .mox/ignore
     try testing.expect(!set.isIgnored(".secret", false)); // root negation wins (last)
@@ -204,14 +204,14 @@ test "load: axis-gated rules resolve for the current machine" {
 
     const darwin_state = stateForOs("darwin");
     var darwin_bindings = try mox.machine.bindings.fromMachineState(a, darwin_state);
-    var darwin_bindings_r: mox.dsl.resolver.Resolver = .{ .live = &darwin_bindings };
+    var darwin_bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &darwin_bindings } };
     const darwin = try load(a, io, repo, &darwin_bindings_r, &darwin_state);
     try testing.expect(darwin.isIgnored("always.txt", false));
     try testing.expect(!darwin.isIgnored("linux-only", true));
 
     const linux_state = stateForOs("linux");
     var linux_bindings = try mox.machine.bindings.fromMachineState(a, linux_state);
-    var linux_bindings_r: mox.dsl.resolver.Resolver = .{ .live = &linux_bindings };
+    var linux_bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &linux_bindings } };
     const linux = try load(a, io, repo, &linux_bindings_r, &linux_state);
     try testing.expect(linux.isIgnored("always.txt", false));
     try testing.expect(linux.isIgnored("linux-only", true));
@@ -254,7 +254,7 @@ test "load: missing files yield an empty (never-ignoring) set" {
     const a = arena_state.allocator();
     const st = stateForOs("darwin");
     var bindings = try mox.machine.bindings.fromMachineState(a, st);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const set = try load(a, io, repo, &bindings_r, &st);
     try testing.expect(!set.isIgnored("anything", false));
 }

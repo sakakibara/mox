@@ -53,7 +53,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    const live_resolver: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
+    const live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe() };
+    const live_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     var bindings: *const mox.dsl.resolver.Resolver = &live_resolver;
 
     var as_map: std.StringHashMap([]const u8) = undefined;

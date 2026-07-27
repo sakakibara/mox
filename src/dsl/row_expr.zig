@@ -409,7 +409,7 @@ test "parse: a quoted literal axis eq accepts a UTF-8 value" {
     try std.testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", e.eq.value);
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("profile", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e");
     const scope: []const Frame = &.{};
     try std.testing.expect(try evaluate(a, e, scope, &bindings_r, null));
@@ -435,7 +435,7 @@ test "evaluate: present false when field unset" {
     defer arena.deinit();
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells");
     try std.testing.expect(!try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
@@ -447,7 +447,7 @@ test "evaluate: present true when field set" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("shells", .{ .string = "zsh" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells");
     try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
@@ -458,7 +458,7 @@ test "evaluate: unknown loop variable errors and records the name" {
     defer arena.deinit();
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "id.shells");
     var unknown: []const u8 = "";
@@ -475,7 +475,7 @@ test "evaluate: a bare axis resolves against bindings, not the row" {
     const a = arena.allocator();
     var record = std.StringHashMap(data_value.Value).init(a);
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "macos");
     const scope = entryScope(&record);
     const present_e = try parseString(a, "os");
@@ -493,7 +493,7 @@ test "evaluate: an outer frame resolves from an inner scope" {
     var outer = std.StringHashMap(data_value.Value).init(a);
     try outer.put("tag", .{ .string = "t" });
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     // Innermost first: `url` scalar shadows nothing; `outer` still reaches the record.
     const scope = [_]Frame{
         .{ .name = "url", .value = .{ .scalar = "x" } },
@@ -509,7 +509,7 @@ test "evaluate: has on string field equality" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("shells", .{ .string = "zsh" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells has \"zsh\"");
     try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
@@ -526,7 +526,7 @@ test "evaluate: has on array field membership" {
     items[1] = "fish";
     try record.put("shells", .{ .array_of_strings = items });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "entry.shells has \"zsh\"");
     try std.testing.expect(try evaluate(arena.allocator(), e, &scope, &bindings_r, null));
@@ -540,7 +540,7 @@ test "evaluate: axis_with_field looks up substituted axis" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("when", .{ .string = "fd" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("tool=fd", "1");
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "tool=entry.when");
@@ -553,7 +553,7 @@ test "evaluate: axis_with_field returns false when binding absent" {
     var record = std.StringHashMap(data_value.Value).init(arena.allocator());
     try record.put("when", .{ .string = "zk" });
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("tool=fd", "1");
     const scope = entryScope(&record);
     const e = try parseString(arena.allocator(), "tool=entry.when");
@@ -568,7 +568,7 @@ test "evaluate: axis_with_field matches an over-256-byte field value" {
     var record = std.StringHashMap(data_value.Value).init(a);
     try record.put("when", .{ .string = long });
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: Resolver = .{ .live = &bindings };
+    var bindings_r: Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("tool=" ++ long, "1");
     const scope = entryScope(&record);
     const e = try parseString(a, "tool=entry.when");

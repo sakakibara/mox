@@ -76,7 +76,7 @@ test "run_scripts: top-level runs, matching gated dir runs, non-matching skipped
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("gate", "on");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -110,7 +110,7 @@ test "run_scripts: a true `# mox: when` header runs, a false one is skipped" {
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "darwin");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -143,7 +143,7 @@ test "run_scripts: a header `or` expression runs on the second alternative" {
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "linux");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -175,7 +175,7 @@ test "run_scripts: a malformed `# mox: when` header fails that script, others st
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "darwin");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -208,7 +208,7 @@ test "run_scripts: a header does not bypass a non-matching axis dir" {
 
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "darwin");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -1431,7 +1431,7 @@ test "run_scripts: a hung script is killed within the configured timeout" {
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "200");
 
@@ -1458,7 +1458,7 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "notanumber");
 
@@ -1528,7 +1528,7 @@ test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const facts = [_]mox.apply.run_scripts.Fact{.{ .name = "profile", .value = "work" }};
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
 
@@ -1561,7 +1561,7 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
-    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const facts = [_]mox.apply.run_scripts.Fact{};
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "500");

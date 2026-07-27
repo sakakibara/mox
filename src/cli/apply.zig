@@ -78,7 +78,8 @@ fn applyPass(
 
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-    var bindings: mox.dsl.resolver.Resolver = .{ .live = &bindings_map };
+    var live_ctx: mox.dsl.resolver.Resolver.Live = .{ .bindings = &bindings_map, .probe = m_state.probe() };
+    var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     for (m_state.skipped_fact_keys) |key| {
         try ctx.err.print("mox apply: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
     }
@@ -104,6 +105,7 @@ fn applyPass(
             try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
             m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
             bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+            live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe() };
         }
         if (outcome.unanswered.len > 0) {
             try ctx.err.writeAll("mox apply: missing facts:");
@@ -157,6 +159,7 @@ fn applyPass(
     if (pre_result.ran > 0) {
         m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        live_ctx = .{ .bindings = &bindings_map, .probe = m_state.probe() };
     }
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });

@@ -1332,6 +1332,62 @@ test "apply: a pre-script's axis-relevant change is visible to compose in the sa
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.home, ".cargo" })));
 }
 
+test "apply: a pre-script that installs an unwatched tool is gated on in the same apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "herdr" is not in TOOL_WATCH_LIST: this file only materializes if the
+    // lazy probe sees it, and only after the pre-script installs it.
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
+        "# mox: when tool=herdr\n" ++
+        "export HAS_HERDR=1\n" ++
+        "# mox: end\n");
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const bin_dir = try std.fs.path.join(a, &.{ root, "toolbin" });
+
+    // A pre-script that drops a plain file named "herdr" into a directory
+    // already on $PATH -- the real system PATH is preserved alongside it so
+    // the script's own `mkdir`/`New-Item` still resolve.
+    const real_path = (mox.env.Env{ .process = std.testing.environ }).getAlloc(a, "PATH") catch "";
+    const test_path = if (real_path.len > 0)
+        try std.fmt.allocPrint(a, "{s}{c}{s}", .{ bin_dir, std.fs.path.delimiter, real_path })
+    else
+        bin_dir;
+
+    const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
+    const body = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(
+            a,
+            "New-Item -ItemType Directory -Force -Path \"{s}\" | Out-Null\nSet-Content -LiteralPath \"{s}\\herdr\" -NoNewline -Value ''\n",
+            .{ bin_dir, bin_dir },
+        )
+    else
+        try std.fmt.allocPrint(a, "#!/bin/sh\nmkdir -p \"{s}\"\ntouch \"{s}/herdr\"\n", .{ bin_dir, bin_dir });
+    const sub = try std.fmt.allocPrint(a, "repo/scripts/pre/00-herdr{s}", .{ext});
+    const abs = try std.fs.path.join(a, &.{ root, sub });
+    try writeExecScript(io, &tmp, sub, body, abs);
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "PATH", .value = test_path }},
+    });
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ bin_dir, "herdr" })));
+
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+
+    // The gate flipped within the same apply, and the file really was created.
+    const live = try read(io, a, try h.liveOf(".testrc"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "export HAS_HERDR=1") != null);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ bin_dir, "herdr" })));
+}
+
 // Partial-ownership lifecycle: onboarding via `add --own` and the partial
 // semantics of add-tree, remove, mv, export, and doctor.
 

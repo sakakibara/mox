@@ -271,7 +271,7 @@ test "walk: bound facts skipped, dependent when follows earlier answer" {
         .{ .name = "email", .prompt = "email" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("os", "darwin");
 
     var input = Io.Reader.fixed("gdrive\nme@example.com\nada@example.com\n");
@@ -294,7 +294,7 @@ test "walk: empty answer takes the default; false when skips dependent" {
         .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     var input = Io.Reader.fixed("\n");
     const outcome = try walk(arena.allocator(), &schema, &bindings_r, &input, null);
@@ -312,7 +312,7 @@ test "walk: non-interactive reports unanswered, hides dependents of unanswered g
         .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     const outcome = try walk(arena.allocator(), &schema, &bindings_r, null, null);
     try std.testing.expectEqual(@as(usize, 0), outcome.answers.len);
@@ -436,7 +436,7 @@ test "ask: EOF on a no-default fact errors instead of hanging" {
         .{ .name = "email", .prompt = "email" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     var input = Io.Reader.fixed("");
     try std.testing.expectError(
@@ -453,7 +453,7 @@ test "ask: blank-line answers on a no-default fact are bounded, not infinite" {
         .{ .name = "email", .prompt = "email" },
     };
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &bindings };
+    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     const blanks = "\n" ** (max_ask_attempts + 5);
     var input = Io.Reader.fixed(blanks);
