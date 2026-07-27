@@ -36,7 +36,7 @@ pub const Listing = struct {
 /// POSIX to hide, slow enough on Windows to look like a hang. An empty or
 /// absent `$PATH` scans no PATH directories but still scans `extra_dirs`.
 ///
-/// `extra_dirs` -- this machine's tool-home bin directories (D2b) -- are
+/// `extra_dirs` -- this machine's tool-home bin directories -- are
 /// scanned strictly after every `$PATH` directory: `scanDirInto` only ever
 /// inserts a name it has not already seen, so a `$PATH` hit always wins over
 /// a tool-home hit for the same name, unchanged from PATH-only behavior.
@@ -93,7 +93,7 @@ fn scanDirInto(
 /// Scan `dirs` into an already-built `listing` in place, same precedence
 /// rule as `buildListing` (a name already present -- from `$PATH`, a tool
 /// home, or an earlier `extendListing` call -- is never overwritten). Used
-/// for the `$MOX_PATH` channel (D2b): directories a setup script names after
+/// for the `$MOX_PATH` channel: directories a setup script names after
 /// this run's `Listing` already exists join the search space without
 /// rebuilding it.
 pub fn extendListing(arena: std.mem.Allocator, io: Io, environ: Environ, listing: *Listing, dirs: []const []const u8) !void {
@@ -105,7 +105,7 @@ pub fn extendListing(arena: std.mem.Allocator, io: Io, environ: Environ, listing
 }
 
 /// One name a probe was asked to resolve this run, and whether it resolved.
-/// `mox status`'s probe-log section and `mox facts probe` (D6) share this
+/// `mox status`'s probe-log section and `mox facts probe` share this
 /// shape across `ToolProbe` (tool=) and `machine.state.EnvProbe` (env=).
 pub const ProbedName = struct {
     name: []const u8,
@@ -174,7 +174,7 @@ pub const ToolProbe = struct {
     /// Every name asked of `path`/`present` so far this run, sorted by name
     /// so the result is independent of ask order and of `memo`'s hash-map
     /// iteration order (both unspecified). Powers `mox status`'s probe-log
-    /// section and `mox facts probe` (D6): the typo-visibility surface for
+    /// section and `mox facts probe`: the typo-visibility surface for
     /// `tool=` -- a name asked and not found stays in the log as `present =
     /// false`, distinct from a name never asked at all (absent from the log
     /// entirely).
@@ -182,7 +182,7 @@ pub const ToolProbe = struct {
         return sortedProbedNames(arena, &self.memo);
     }
 
-    /// Widen the search space with `dirs` (the `$MOX_PATH` channel, D2b):
+    /// Widen the search space with `dirs` (the `$MOX_PATH` channel):
     /// scanned into the existing `Listing` in place -- a name already found
     /// via `$PATH` or a tool home is never overwritten, so this can only add
     /// names, never change an existing answer. Building the listing first

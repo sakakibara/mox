@@ -3426,7 +3426,7 @@ test "commit partial: the guard rolls back a routed key when another edit change
     try std.testing.expectEqualStrings("[tui]\nkeys = \"b\"\n", try read(io, a, try h.srcOf("app.toml.d/os=darwin.toml")));
 }
 
-test "commit partial: a sibling configuration's D2 violation rolls the file back naming the configuration and leaf" {
+test "commit partial: a sibling configuration's own-declaration violation rolls the file back naming the configuration and leaf" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3436,8 +3436,8 @@ test "commit partial: a sibling configuration's D2 violation rolls the file back
 
     try writePartialRepo(io, &tmp, "# mox: own tui\n[tui]\nk = \"a\"\n");
     // The linux overlay defines a leaf outside the declaration: broken for
-    // os=linux, invisible to a darwin apply -- commit's per-configuration D2
-    // pass is what catches it.
+    // os=linux, invisible to a darwin apply -- commit's per-configuration
+    // own-declaration pass is what catches it.
     try writeRepo(io, &tmp, "repo/src/app.toml.d/os=linux.toml", "[stray]\ns = 1\n");
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
 

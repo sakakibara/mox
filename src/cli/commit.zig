@@ -875,8 +875,8 @@ pub fn commitImpl(
         baseline[fidx] = (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets)).per_config;
         // A partial file's per-configuration snapshot is the CANONICAL OWNED
         // serialization of that configuration's compose, so the guard compares
-        // owned content, never text layout. Pre-existing D2 violations are
-        // ignored here; only the post-write pass acts on them.
+        // owned content, never text layout. Pre-existing own-declaration
+        // violations are ignored here; only the post-write pass acts on them.
         if (file.own_paths.len > 0) {
             baseline[fidx] = (try partialPerConfig(ctx.alloc, space.configs, baseline[fidx], file)).per;
         }
@@ -1273,7 +1273,7 @@ pub fn commitImpl(
 /// parsed and replaced by its canonical owned serialization, so the guard's
 /// comparisons are canonical-byte. `violation` carries the first
 /// configuration whose composed document defines a leaf outside the declared
-/// own paths (D2), with the offending leaf spelled.
+/// own paths, with the offending leaf spelled.
 const PartialPerConfig = struct {
     per: []const impact.ConfigOutput,
     violation: ?struct { label: []const u8, leaf: []const u8 },
@@ -2135,7 +2135,7 @@ fn routeStructChanges(
     return .cont;
 }
 
-/// A partially owned file's commit gate (D9): decide committability from the
+/// A partially owned file's commit gate: decide committability from the
 /// owned record and the extracted live owned document, then hand the changed
 /// keys to the structured per-key routing. `last` is the record's canonical
 /// serialization and `live` the live document's, both restricted to the

@@ -101,7 +101,7 @@ const ProbeSpec = struct {
 const probe_usage = "mox facts probe: usage: mox facts probe tool=<name> | env=<name>\n";
 
 /// `mox facts probe <axis>=<name>`: probes live (the same `tool=`/`env=`
-/// resolution `apply`/`status` use, D6), the scriptable single-name
+/// resolution `apply`/`status` use), the scriptable single-name
 /// diagnostic counterpart to status's probe-log section. Exits 0 when bound,
 /// 1 when not -- distinct from a usage error (2), so a caller can tell
 /// "asked and unbound" from "asked wrong".

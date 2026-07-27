@@ -410,10 +410,10 @@ fn verifyParseFail(e: anyerror) VerifyError {
     return if (e == error.OutOfMemory) error.OutOfMemory else error.CandidateUnparseable;
 }
 
-/// D2 leaf rule: every leaf the composed document defines must sit under a
-/// declared path. Returns the spelled path of the first undeclared leaf, or
-/// null when the document lies within the declaration. A leaf is a
-/// non-container value, or an empty container that is not a pure
+/// The own-declaration leaf rule: every leaf the composed document defines
+/// must sit under a declared path. Returns the spelled path of the first
+/// undeclared leaf, or null when the document lies within the declaration.
+/// A leaf is a non-container value, or an empty container that is not a pure
 /// intermediate on a declared route; intermediate containers implied by the
 /// syntax are traversal, not violations.
 pub fn undeclaredLeaf(
@@ -2505,11 +2505,12 @@ fn valueHasMask(v: AnyValue) bool {
 // live to candidate, and (c) the candidate minus the disowned spans equals
 // the composed text byte-for-byte.
 
-/// D2 inverted: the first declared path the composed document contradicts
-/// (spelled), or null. Composed content under a disowned path can never be
-/// asserted, and a NON-container value at a strict ancestor pins the path
-/// shut -- its live content could never be spliced back. Both refuse here,
-/// at classification, never after a clean adoption at splice time.
+/// The disown-declaration leaf rule, inverted: the first declared path the
+/// composed document contradicts (spelled), or null. Composed content under
+/// a disowned path can never be asserted, and a NON-container value at a
+/// strict ancestor pins the path shut -- its live content could never be
+/// spliced back. Both refuse here, at classification, never after a clean
+/// adoption at splice time.
 pub fn populatedDisownPath(
     arena: std.mem.Allocator,
     owned: *const OwnedDoc,
@@ -4026,7 +4027,7 @@ test "disown verify: a smuggled owned byte and a mutated protected span both fai
     ));
 }
 
-test "disown D2: a composed document populating a disowned path is named" {
+test "disown: a composed document populating a disowned path is named" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4037,13 +4038,14 @@ test "disown D2: a composed document populating a disowned path is named" {
     try testing.expect(try populatedDisownPath(arena, &clean, paths) == null);
 }
 
-test "disown D2: a non-container ancestor of a disowned path refuses at classification" {
+test "disown: a non-container ancestor of a disowned path refuses at classification" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const nested = try testOwn(arena, &.{"survey.state"});
     // survey pinned to a scalar: the disowned leaf could never be spliced
-    // back, so the contradiction surfaces at D2, never at splice time.
+    // back, so the contradiction surfaces at classification, never at splice
+    // time.
     const pinned = try OwnedDoc.parse(arena, .json, "{\"theme\": \"dark\", \"survey\": 5}");
     try testing.expectEqualStrings("survey.state", (try populatedDisownPath(arena, &pinned, nested)).?);
     // A container ancestor holding OWNED siblings is the normal shape.

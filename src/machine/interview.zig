@@ -84,7 +84,7 @@ fn stringField(v: toml.Value, key: []const u8) ?[]const u8 {
 /// are skipped; a false `when` skips; the rest are prompted through
 /// `input`/`prompt_out` when present, or reported as unanswered when not.
 /// Answers accumulate in an override layer over `base_bindings` (the facts
-/// interview's working set, D4) rather than a full copy: a later `when` sees
+/// interview's working set) rather than a full copy: a later `when` sees
 /// both this run's earlier answers and every base binding, in one lookup.
 pub fn walk(
     arena: std.mem.Allocator,

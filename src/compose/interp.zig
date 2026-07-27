@@ -1083,7 +1083,7 @@ test "machine.tool_path: any name on PATH resolves, lazily" {
     try std.testing.expectEqualStrings(want, out);
 }
 
-test "machine.tool_path: a name existing only in a tool home (D2b) still resolves" {
+test "machine.tool_path: a name existing only in a tool home still resolves" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

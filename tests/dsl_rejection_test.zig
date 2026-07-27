@@ -99,7 +99,7 @@ test "reject: an unquoted non-ASCII axis value does not lex" {
 test "reject: a when gate naming an unknown path= member" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // `path=` is a closed axis (D5): only the four derived tool-home facts
+    // `path=` is a closed axis: only the four derived tool-home facts
     // are members, so a typo'd or invented one is refused rather than
     // composing to a silent false forever.
     const src = "# mox: when path=brew\nbody\n# mox: end\n";

@@ -145,7 +145,7 @@ pub const Parser = struct {
             else => return error.ExpectedAxisValue,
         };
         self.advance();
-        // `path=` is a closed axis (D5): an unnamed member can never resolve
+        // `path=` is a closed axis: an unnamed member can never resolve
         // on any machine, so it is refused here rather than composing to a
         // silent false forever.
         if (std.mem.eql(u8, axis_name, "path") and !isValidPathAxisValue(value)) {

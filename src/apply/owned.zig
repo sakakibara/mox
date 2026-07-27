@@ -1,7 +1,7 @@
 //! Drift classification for partially owned files, shared by apply, status,
 //! and diff.
 //!
-//! The one rule (D5/D6): the extracted live owned subtree versus the
+//! The one rule: the extracted live owned subtree versus the
 //! last-applied owned record decides drift, per path over the union of the
 //! record-time and current `own` lists. A path in both lists compares against
 //! its recorded section; a path only in the current list is first contact
@@ -537,7 +537,7 @@ test "classifyDisown: a grown disown list stops comparing; a shrunk one is first
     const rec = try disownRecordOf(arena, "[user]\nname = \"me\"\n\n[survey]\nseen = 1\n", &old_raws);
 
     // Disown GROWS to cover survey: the program rewrote it live, and the
-    // composed source dropped it (D2). Not drift -- it stopped being compared.
+    // composed source dropped it. Not drift -- it stopped being compared.
     const grown = [_][]const u8{ "state", "survey" };
     const live_grown = "[user]\nname = \"me\"\n\n[survey]\nseen = 99\n\n[state]\ncount = 1\n";
     try testing.expect(try classifyDisownToml(arena, "[user]\nname = \"me\"\n", live_grown, &grown, rec) == .clean);

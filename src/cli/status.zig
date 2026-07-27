@@ -198,7 +198,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             continue;
         }
 
-        // A partial file is classified on its owned subtree only (D6);
+        // A partial file is classified on its owned subtree only;
         // program activity outside the declared paths can never surface.
         if (file.own_paths.len > 0) {
             const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?);
@@ -235,7 +235,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return if (problems > 0) 1 else 0;
 }
 
-/// This run's open-axis probe log (D6): after every file has composed, name
+/// This run's open-axis probe log: after every file has composed, name
 /// the `tool=`/`env=` names this run actually asked and their outcome, so a
 /// typo'd gate (`when tool=hedrr`) is one status call from visible instead
 /// of a silent false forever. Printed only when at least one probe
@@ -275,11 +275,11 @@ fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![
     return std.fmt.allocPrint(arena, "  ({s} {d})", .{ word, file.own_paths.len });
 }
 
-/// The status cell for one partial file, per D6: MISSING only when the live
+/// The status cell for one partial file: MISSING only when the live
 /// file is absent; otherwise the extracted live owned subtree is compared
 /// canonically against the owned record (DRIFT) and the composed owned
 /// document (OUTDATED), clean when all equal. A composed document violating
-/// its declaration (D2), or an unparseable composed/live file, is ERROR --
+/// its declaration, or an unparseable composed/live file, is ERROR --
 /// the same shapes apply refuses.
 fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8) !Cell {
     const partial_mod = mox.apply.partial;

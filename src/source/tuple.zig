@@ -51,7 +51,7 @@ fn parseStem(arena: std.mem.Allocator, stem: []const u8) ParseError!AxisTuple {
         const value = part[eq_idx + 1 ..];
         if (!isValidAxisName(name)) return error.InvalidAxisName;
         if (!isValidAxisValue(value)) return error.InvalidAxisValue;
-        // `path=` is a closed axis (D5): a tuple naming any member outside
+        // `path=` is a closed axis: a tuple naming any member outside
         // the four derived tool-home facts is refused, same as an unknown
         // value in a `when`/`where` expression.
         if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(value)) return error.UnknownPathAxisValue;

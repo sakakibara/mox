@@ -627,7 +627,7 @@ fn applyPass(
     return if (total_fail > 0) 1 else 0;
 }
 
-/// Fold whatever a just-finished stage appended to `$MOX_PATH` (D2b) into
+/// Fold whatever a just-finished stage appended to `$MOX_PATH` into
 /// this run: widen `m_state`'s tool probe so a `tool=` gate sees it for the
 /// rest of the run, and prepend it to `script_env`'s `PATH` so a later
 /// script or check hook's own PATH lookups do too. `dirs_so_far` accumulates
@@ -1017,13 +1017,13 @@ const PartialInput = struct {
     resolver: ?*DriftResolver = null,
     /// The check hook's wall-clock bound, resolved once per apply run.
     check_timeout_ms: i64,
-    /// Directories named via `$MOX_PATH` (D2b) by a stage that already ran
+    /// Directories named via `$MOX_PATH` by a stage that already ran
     /// this apply, prepended onto the check hook's PATH. Empty outside
     /// `mox apply` (rollback names no scripts, so it passes none).
     extra_path_dirs: []const []const u8 = &.{},
 };
 
-/// Run a partial file's `check` hook (D7) against `candidate`, materialized
+/// Run a partial file's `check` hook against `candidate`, materialized
 /// in a private temp dir under the live basename. The child gets
 /// MOX_CHECK_FILE and MOX_CHECK_DIR, runs with cwd at the repo root, and is
 /// bounded by `timeout_ms` (the caller resolves MOX_CHECK_TIMEOUT_MS once per
@@ -1031,7 +1031,7 @@ const PartialInput = struct {
 /// true on acceptance; any other outcome reports the refusal (with the
 /// child's tail output), bumps `fail_count`, and returns false. Public
 /// because rollback runs the same hook before re-patching a partial target.
-/// `extra_path_dirs` (D2b) is prepended onto the child's PATH -- empty for
+/// `extra_path_dirs` is prepended onto the child's PATH -- empty for
 /// rollback, which names no scripts of its own.
 pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize, extra_path_dirs: []const []const u8) !bool {
     const context = ctx.context.?;
@@ -1115,9 +1115,9 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
 
-    // D2, in the file's mode: every composed leaf must lie under a declared
-    // path (own), or no declared path may be populated (disown), checked
-    // before live is read or touched.
+    // The own-declaration leaf rule, in the file's mode: every composed leaf
+    // must lie under a declared path (own), or no declared path may be
+    // populated (disown), checked before live is read or touched.
     switch (mode) {
         .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
             try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });

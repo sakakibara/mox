@@ -752,8 +752,8 @@ fn enumerateDotD(
             if (std.mem.indexOfScalar(u8, fragmentStem(entry.name), '=') == null) continue;
             const t = tuple_mod.parseFilename(arena, entry.name) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                // Kept distinct from the generic `InvalidEntry` below (D5):
-                // a caller reports the closed `path=` vocabulary the same
+                // Kept distinct from the generic `InvalidEntry` below: a
+                // caller reports the closed `path=` vocabulary the same
                 // way the directive grammar does, instead of a bare verdict.
                 error.UnknownPathAxisValue => {
                     if (diag) |d| d.set(abs);

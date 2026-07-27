@@ -1666,7 +1666,7 @@ test "apply: a pre-script that installs into cargo_home/bin (never on PATH) is g
     const a = arena.allocator();
 
     // "cargotool" never touches $PATH: the only way this row materializes
-    // is the tool-home search-space layer (D2b) finding it under
+    // is the tool-home search-space layer finding it under
     // `$CARGO_HOME/bin`.
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
         "# mox: when tool=cargotool\n" ++
@@ -1729,7 +1729,7 @@ test "apply: a pre-script names an arbitrary dir via $MOX_PATH; gates true same 
     const a = arena.allocator();
 
     // "mypathtool" lives in a directory that is neither on $PATH nor any
-    // detected tool home: only the explicit $MOX_PATH channel (D2b) can
+    // detected tool home: only the explicit $MOX_PATH channel can
     // make it visible.
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
         "# mox: when tool=mypathtool\n" ++
@@ -1762,7 +1762,7 @@ test "apply: a pre-script names an arbitrary dir via $MOX_PATH; gates true same 
 
     // A post script writes "yes"/"no" to a marker depending on whether the
     // pre stage's $MOX_PATH addition shows up on ITS OWN PATH -- the
-    // "subsequent scripts" half of D2b's contract.
+    // "subsequent scripts" half of the $MOX_PATH channel's contract.
     const post_body = if (builtin.os.tag == .windows)
         try std.fmt.allocPrint(
             a,

@@ -36,7 +36,7 @@ pub const MachineState = struct {
     home: []const u8,
     /// The `tool=`/`<machine.tool_path.X>` resolution layer: probes and
     /// memoizes against this machine's `$PATH` (plus tool-home bin
-    /// directories, D2b) for any name, on first ask. Null only for a
+    /// directories) for any name, on first ask. Null only for a
     /// MachineState built by hand (every test fixture); `capture` always
     /// supplies one. Also the probe layer a `Resolver.Live` built from this
     /// snapshot's bindings falls through to for `tool=`.
@@ -97,7 +97,7 @@ pub const MachineState = struct {
 /// No answer memoization -- `Env.get` is already an O(1) map/syscall-free
 /// read, unlike the PATH scan `ToolProbe` exists to batch. Empty-is-unset by
 /// construction (`Env.get`'s own contract). `log` records every name asked,
-/// for the probe-log diagnostics (D6); it is never consulted for an answer.
+/// for the probe-log diagnostics; it is never consulted for an answer.
 pub const EnvProbe = struct {
     arena: std.mem.Allocator,
     environ: Environ,
@@ -195,7 +195,7 @@ pub fn captureDiag(arena: std.mem.Allocator, io: Io, environ: Environ, diag: ?*f
         envOr(arena, environ, "USERPROFILE") orelse
         return error.HomeNotSet;
 
-    // Tool-home detection runs ahead of the `$PATH` scan (D2b) so their bin
+    // Tool-home detection runs ahead of the `$PATH` scan so their bin
     // directories can join the very same `Listing` build: a fresh Homebrew
     // (or cargo/go/pnpm) install is visible to `tool=` the moment its home
     // exists, not just once its shellenv line is itself applied and PATH
@@ -507,8 +507,8 @@ fn resolveToolHome(
     return path;
 }
 
-/// This machine's tool-home bin directories, in the fixed order D2b
-/// specifies: `<brew_prefix>/bin`, `<cargo_home>/bin`, `<gopath>/bin`,
+/// This machine's tool-home bin directories, in this fixed order:
+/// `<brew_prefix>/bin`, `<cargo_home>/bin`, `<gopath>/bin`,
 /// `<pnpm_home>` (already a bin dir, unlike the other three). A fact that
 /// resolved empty (unset, or its detection rule found nothing) contributes
 /// no directory rather than joining "" into a bogus root-relative path.
@@ -573,7 +573,7 @@ test "capture: a tool that exists only in cargo_home/bin, never on PATH, still r
 
     const m = try capture(a, io, Environ{ .map = &map });
     try std.testing.expectEqualStrings(cargo_home, m.cargo_home);
-    // Resolves only through the widened `Listing` (D2b): the tool probe is
+    // Resolves only through the widened `Listing`: the tool probe is
     // the sole resolution path for `tool=`, so a name never on `$PATH`
     // proper still resolves via the tool-home bin directory.
     try std.testing.expect(m.tool_probe.?.present("only-in-cargo-home"));

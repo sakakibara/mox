@@ -376,11 +376,11 @@ fn diffOne(
 }
 
 /// Diff one partial file's owned subtree: canonical composed-owned vs
-/// canonical live-owned, as text, labeled with the live path (D6). Keys in
+/// canonical live-owned, as text, labeled with the live path. Keys in
 /// the secret set -- the record's, plus any path the current compose resolved
 /// a secret into -- are masked on BOTH sides before diffing, so a resolved
 /// value never reaches stdout. A composed document violating its declaration
-/// (D2) reports apply's ERROR line on stderr; diff stays read-only and keeps
+/// reports apply's ERROR line on stderr; diff stays read-only and keeps
 /// its exit contract.
 fn diffPartial(
     ctx: *app.Ctx,
