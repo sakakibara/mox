@@ -1294,6 +1294,29 @@ test "apply and facts: a non-string facts.toml value is dropped loudly, not sile
     try std.testing.expect(std.mem.indexOf(u8, facts_out.err, "profile") != null);
 }
 
+test "apply and facts: a facts.toml key named for a multi-value axis errors loudly, naming the reserved set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const facts_path = try h.homePath(".config/mox/facts.toml");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "tool = \"x\"\n" });
+
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(applied.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "ReservedFactName") != null);
+
+    const facts_out = try h.run(&.{ "mox", "facts" });
+    try std.testing.expectEqual(@as(u8, 1), facts_out.rc);
+    try std.testing.expect(std.mem.indexOf(u8, facts_out.err, "tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts_out.err, "tool, env, path") != null);
+}
+
 test "apply: a pre-script's axis-relevant change is visible to compose in the same apply" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -11,7 +11,14 @@ const BareSpec = struct {};
 /// facts that are still unanswered.
 fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
     const context = ctx.context.?;
-    const current = try mox.machine.facts.load(ctx.alloc, ctx.io, context.paths.facts_path);
+    var facts_diag: mox.machine.facts.Diag = .{};
+    const current = mox.machine.facts.load(ctx.alloc, ctx.io, context.paths.facts_path, &facts_diag) catch |e| switch (e) {
+        error.ReservedFactName => {
+            try ctx.err.print("mox facts: {s}\n", .{facts_diag.capture() orelse "a fact name collides with a reserved axis name"});
+            return 1;
+        },
+        else => return e,
+    };
     for (current.facts) |f| {
         try ctx.out.print("{s} = \"{s}\"\n", .{ f.name, f.value });
     }

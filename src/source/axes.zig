@@ -15,12 +15,19 @@ const Io = std.Io;
 
 const max_bytes: usize = 4 * 1024 * 1024;
 
+/// The multi-value axis names: each binds via a compound `name=value` key
+/// rather than a direct one. Reserved against a custom fact of the same name
+/// (`machine.facts.load`), since a fact there would otherwise shadow the
+/// whole axis through the single-value lookup path.
+pub const multi_value_axis_names = [_][]const u8{ "tool", "env", "path" };
+
 /// Multi-value axes use a compound `name=value` binding key; everything else
 /// is a single-value axis addressed by bare name.
-fn isMultiValueAxis(name: []const u8) bool {
-    return std.mem.eql(u8, name, "tool") or
-        std.mem.eql(u8, name, "env") or
-        std.mem.eql(u8, name, "path");
+pub fn isMultiValueAxis(name: []const u8) bool {
+    for (multi_value_axis_names) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
 }
 
 /// One value a source compares an axis against.

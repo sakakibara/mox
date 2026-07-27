@@ -283,7 +283,7 @@ pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState
     const xdg_state_home = try resolveXdg(arena, environ, "XDG_STATE_HOME", home, ".local/state");
 
     const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
-    const facts_result = try facts_mod.load(arena, io, facts_path);
+    const facts_result = try facts_mod.load(arena, io, facts_path, null);
 
     return .{
         .os = os_str,
@@ -636,6 +636,26 @@ test "capture: a tool that exists only in cargo_home/bin, never on PATH, still r
     // widened `Listing` (D2b) resolves it.
     for (m.tools_on_path) |t| try std.testing.expect(!std.mem.eql(u8, t, "only-in-cargo-home"));
     try std.testing.expect(m.tool_probe.?.present("only-in-cargo-home"));
+}
+
+test "capture: a facts.toml key named for a multi-value axis errors loudly" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config/mox/facts.toml", .data = "tool = \"x\"\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = try tmpAbsPath(a, &tmp, "");
+    const xdg_config_home = try tmpAbsPath(a, &tmp, "config");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", home);
+    try map.put("XDG_CONFIG_HOME", xdg_config_home);
+
+    try std.testing.expectError(error.ReservedFactName, capture(a, io, Environ{ .map = &map }));
 }
 
 test "EnvProbe.get: an unwatched name reads from the captured environ" {
