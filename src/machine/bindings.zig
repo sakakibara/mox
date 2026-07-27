@@ -5,8 +5,6 @@ const dsl = @import("../dsl/root.zig");
 
 /// Convert a MachineState into a flat Bindings hashmap suitable for axis evaluation.
 /// Single-value axes use direct key=value (e.g. "os" -> "linux").
-/// `path=` (the only closed multi-value axis eagerly known here) uses a
-/// compound key with sentinel value "1" (e.g. "path=brew_prefix" -> "1").
 /// `tool=`/`env=` are open axes with no fixed vocabulary to enumerate: a
 /// `Resolver.Live` answers them by probing, not from this map.
 pub fn fromMachineState(arena: std.mem.Allocator, m: state_mod.MachineState) !std.StringHashMap([]const u8) {
@@ -22,18 +20,6 @@ pub fn fromMachineState(arena: std.mem.Allocator, m: state_mod.MachineState) !st
     try b.put("machine", firstLabel(m.hostname));
     try b.put("hostname", m.hostname);
 
-    if (m.brew_prefix.len > 0) {
-        try b.put("path=brew_prefix", "1");
-    }
-    if (m.cargo_home.len > 0) {
-        try b.put("path=cargo_home", "1");
-    }
-    if (m.gopath.len > 0) {
-        try b.put("path=gopath", "1");
-    }
-    if (m.pnpm_home.len > 0) {
-        try b.put("path=pnpm_home", "1");
-    }
     // Custom facts contribute to axis matching too: `# mox: when profile=work`
     // resolves against `bindings.get("profile")`. Built-in fields above take
     // priority on name conflict.
@@ -56,12 +42,10 @@ pub fn fromMachineState(arena: std.mem.Allocator, m: state_mod.MachineState) !st
 /// every hypothetical configuration, including this machine's own. Seeding
 /// closes that for every literal the source tree actually names.
 ///
-/// `path=` needs no seeding here: `fromMachineState` already binds every
-/// member it detects, eagerly and unconditionally, since it is closed and
-/// derived rather than probed. A data-driven name (`tool=<entry.when>`) is
-/// never recorded by `source.axes` in the first place -- only the axis name
-/// is -- so it cannot be seeded and stays unbound in a hypothetical
-/// configuration: an owned fidelity divergence, not a bug.
+/// A data-driven name (`tool=<entry.when>`) is never recorded by
+/// `source.axes` in the first place -- only the axis name is -- so it cannot
+/// be seeded and stays unbound in a hypothetical configuration: an owned
+/// fidelity divergence, not a bug.
 pub fn seedStaticMultiValue(
     bindings: *std.StringHashMap([]const u8),
     ax: source_axes.Axes,
@@ -98,10 +82,6 @@ test "fromMachineState: machine binds the first hostname label, hostname keeps t
         .hostname = "Foo.attlocal.net",
         .username = "u",
         .home = "/h",
-        .brew_prefix = "",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
@@ -121,10 +101,6 @@ test "fromMachineState: an undotted hostname binds identically to machine and ho
         .hostname = "plainhost",
         .username = "u",
         .home = "/h",
-        .brew_prefix = "",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
@@ -192,22 +168,6 @@ test "seedStaticMultiValue: a static tool= literal the live probe refutes is lef
     try std.testing.expect(!bindings.contains("tool=nope"));
 }
 
-test "seedStaticMultiValue: path= is never seeded here -- fromMachineState already binds it" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var bindings = std.StringHashMap([]const u8).init(a);
-    const ax = try axesWithValue(a, "path=brew_prefix");
-    // The stub answers true for anything, so a wrong seed would be caught.
-    var stub = TestProbe{ .present_names = &.{"brew_prefix"} };
-    const live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings, .probe = stub.probe() };
-    const resolver: dsl.resolver.Resolver = .{ .live = &live };
-
-    try seedStaticMultiValue(&bindings, ax, resolver);
-    try std.testing.expect(!bindings.contains("path=brew_prefix"));
-}
-
 test "seedStaticMultiValue: an already-bound key is left alone, never re-probed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -227,26 +187,24 @@ test "seedStaticMultiValue: an already-bound key is left alone, never re-probed"
     try std.testing.expectEqualStrings("1", bindings.get("tool=fd").?);
 }
 
-test "fromMachineState: path= binds only the tool homes actually detected" {
+test "fromMachineState: a derived custom fact binds as an ordinary key, not a compound path= key" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    const facts = [_]state_mod.Fact{.{ .name = "brew_prefix", .value = "/opt/homebrew" }};
     const m = state_mod.MachineState{
         .os = "linux",
         .arch = "aarch64",
         .hostname = "test",
         .username = "u",
         .home = "/h",
-        .brew_prefix = "/opt/homebrew",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
         .xdg_state_home = "",
+        .custom_facts = &facts,
     };
     var b = try fromMachineState(arena.allocator(), m);
     try std.testing.expectEqualStrings("linux", b.get("os").?);
-    try std.testing.expect(b.contains("path=brew_prefix"));
-    try std.testing.expect(!b.contains("path=cargo_home"));
+    try std.testing.expectEqualStrings("/opt/homebrew", b.get("brew_prefix").?);
+    try std.testing.expect(!b.contains("path=brew_prefix"));
 }

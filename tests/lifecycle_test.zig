@@ -1598,6 +1598,47 @@ test "apply: no extras.toml present prints no notice" {
     try std.testing.expect(std.mem.indexOf(u8, doctored.err, "extras.toml") == null);
 }
 
+test "apply: a data/facts.toml-derived fact binds a gate, a quoted comparison, and a <machine.X> capture" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const candidate = try std.fs.path.join(a, &.{ root, "home", ".customtool" });
+    try writeRepo(io, &tmp, "repo/data/facts.toml", try std.fmt.allocPrint(
+        a,
+        "[[facts]]\nname = \"customtool_home\"\ncandidates = [\"{s}\"]\n",
+        .{candidate},
+    ));
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
+        "# mox: when customtool_home\n" ++
+        "export HAS_HOME=1\n" ++
+        "# mox: end\n" ++
+        "# mox: when customtool_home=\"nope\"\n" ++
+        "export WRONG_VALUE=1\n" ++
+        "# mox: end\n" ++
+        "path=<machine.customtool_home>\n");
+
+    const h = try setup(a, io, &tmp, null);
+    // The candidate does not exist yet: every gate reads false, the bare
+    // capture errors (an unbound fact has no `| default` here to rescue it).
+    const before = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), before.rc);
+
+    try tmp.dir.createDirPath(io, "home/.customtool");
+    const after = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), after.rc);
+
+    const live = try read(io, a, try h.liveOf(".testrc"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "export HAS_HOME=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "export WRONG_VALUE=1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, live, candidate) != null);
+}
+
 test "apply: a pre-script's axis-relevant change is visible to compose in the same apply" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1606,9 +1647,11 @@ test "apply: a pre-script's axis-relevant change is visible to compose in the sa
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Gated on path=cargo_home, which binds only once ~/.cargo exists.
+    // Gated on the derived `cargo_home` fact's bare presence, which binds
+    // only once ~/.cargo exists.
+    try writeRepo(io, &tmp, "repo/data/facts.toml", "[[facts]]\nname = \"cargo_home\"\ncandidates = [\"~/.cargo\"]\n");
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
-        "# mox: when path=cargo_home\n" ++
+        "# mox: when cargo_home\n" ++
         "export HAS_CARGO=1\n" ++
         "# mox: end\n");
 
@@ -1701,8 +1744,10 @@ test "apply: a pre-script that installs into cargo_home/bin (never on PATH) is g
     const a = arena.allocator();
 
     // "cargotool" never touches $PATH: the only way this row materializes
-    // is the tool-home search-space layer finding it under
-    // `$CARGO_HOME/bin`.
+    // is the `data/paths.toml`-registered `<machine.cargo_home>/bin`
+    // directory joining the probe search space.
+    try writeRepo(io, &tmp, "repo/data/facts.toml", "[[facts]]\nname = \"cargo_home\"\nenv = \"CARGO_HOME\"\n");
+    try writeRepo(io, &tmp, "repo/data/paths.toml", "[[paths]]\ndir = \"<machine.cargo_home>/bin\"\n");
     try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n" ++
         "# mox: when tool=cargotool\n" ++
         "export HAS_CARGOTOOL=1\n" ++
@@ -1713,9 +1758,10 @@ test "apply: a pre-script that installs into cargo_home/bin (never on PATH) is g
     const cargo_home = try std.fs.path.join(a, &.{ root, "fakecargo" });
     const cargo_bin = try std.fs.path.join(a, &.{ cargo_home, "bin" });
 
-    // CARGO_HOME must already exist for `resolveToolHome` to accept it (it
-    // access-checks the root); the pre-script is what creates `bin/` and
-    // drops the "installed" binary into it, mid-apply.
+    // CARGO_HOME must already exist for the `data/facts.toml` row to accept
+    // it (an `env` override must name an existing dir to win); the
+    // pre-script is what creates `bin/` and drops the "installed" binary
+    // into it, mid-apply.
     try tmp.dir.createDirPath(io, "fakecargo");
 
     const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";

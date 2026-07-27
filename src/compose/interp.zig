@@ -737,10 +737,6 @@ fn formatMachineField(
     if (std.mem.eql(u8, field, "hostname")) return arena.dupe(u8, m.hostname);
     if (std.mem.eql(u8, field, "username")) return arena.dupe(u8, m.username);
     if (std.mem.eql(u8, field, "home")) return arena.dupe(u8, m.home);
-    if (std.mem.eql(u8, field, "brew_prefix")) return arena.dupe(u8, m.brew_prefix);
-    if (std.mem.eql(u8, field, "cargo_home")) return arena.dupe(u8, m.cargo_home);
-    if (std.mem.eql(u8, field, "gopath")) return arena.dupe(u8, m.gopath);
-    if (std.mem.eql(u8, field, "pnpm_home")) return arena.dupe(u8, m.pnpm_home);
     if (std.mem.eql(u8, field, "xdg_config_home")) return arena.dupe(u8, m.xdg_config_home);
     if (std.mem.eql(u8, field, "xdg_cache_home")) return arena.dupe(u8, m.xdg_cache_home);
     if (std.mem.eql(u8, field, "xdg_data_home")) return arena.dupe(u8, m.xdg_data_home);
@@ -906,6 +902,12 @@ test "expand: a data capture's default rescues a missing data context" {
     try std.testing.expectError(error.DataRefWithoutContext, expand(a, "<data.f.k>", null, .{}));
 }
 
+const chain_test_facts = [_]machine.state.Fact{.{ .name = "brew_prefix", .value = "/opt/homebrew" }};
+
+/// `cargo_home` is deliberately NOT among `chain_test_facts`: a chain member
+/// naming an unbound derived fact must fall through exactly like an empty
+/// one, and `resolveChain` proves that by catching `error.UnknownMachineField`
+/// -- not by the fact resolving to a known-empty string, the old shape.
 fn chainTestState() machine.state.MachineState {
     return .{
         .os = "linux",
@@ -913,14 +915,11 @@ fn chainTestState() machine.state.MachineState {
         .hostname = "h",
         .username = "u",
         .home = "/home/u",
-        .brew_prefix = "/opt/homebrew",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
         .xdg_state_home = "",
+        .custom_facts = &chain_test_facts,
     };
 }
 
@@ -1151,18 +1150,27 @@ test "machine.tool_path: any name on PATH resolves, lazily" {
     var map = std.process.Environ.Map.init(a);
     try map.put("HOME", "/home/tester");
     try map.put("PATH", bin_dir);
-    const m = try machine.state.capture(a, io, Env{ .map = &map });
+    const m = try machine.state.capture(a, io, Env{ .map = &map }, "", "");
 
     const out = try expand(a, "<machine.tool_path.herdr>", null, .{ .machine = &m });
     try std.testing.expectEqualStrings(want, out);
 }
 
-test "machine.tool_path: a name existing only in a tool home still resolves" {
+test "machine.tool_path: a name existing only in a data/paths.toml-registered dir still resolves" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "cargo/bin");
     try tmp.dir.writeFile(io, .{ .sub_path = "cargo/bin/only-in-cargo-home", .data = "" });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"cargo_home\"\nenv = \"CARGO_HOME\"\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/paths.toml",
+        .data = "[[paths]]\ndir = \"<machine.cargo_home>/bin\"\n",
+    });
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1170,13 +1178,14 @@ test "machine.tool_path: a name existing only in a tool home still resolves" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const home = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
     const cargo_home = try std.fs.path.join(a, &.{ home, "cargo" });
+    const repo = try std.fs.path.join(a, &.{ home, "repo" });
     const want = try std.fs.path.join(a, &.{ cargo_home, "bin", "only-in-cargo-home" });
 
     var map = std.process.Environ.Map.init(a);
     try map.put("HOME", home);
     try map.put("CARGO_HOME", cargo_home);
-    // No $PATH at all: only the tool-home layer can resolve this name.
-    const m = try machine.state.capture(a, io, Env{ .map = &map });
+    // No $PATH at all: only the registry-declared directory can resolve this.
+    const m = try machine.state.capture(a, io, Env{ .map = &map }, repo, "");
 
     const out = try expand(a, "<machine.tool_path.only-in-cargo-home>", null, .{ .machine = &m });
     try std.testing.expectEqualStrings(want, out);
@@ -1190,7 +1199,7 @@ test "machine.tool_path: an absent unwatched name interpolates empty, not an err
 
     var map = std.process.Environ.Map.init(a);
     try map.put("HOME", "/home/tester");
-    const m = try machine.state.capture(a, io, Env{ .map = &map });
+    const m = try machine.state.capture(a, io, Env{ .map = &map }, "", "");
 
     const out = try expand(a, "<machine.tool_path.definitely-not-installed-xyz>", null, .{ .machine = &m });
     try std.testing.expectEqualStrings("", out);

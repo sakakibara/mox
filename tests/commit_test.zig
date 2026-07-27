@@ -1012,7 +1012,7 @@ test "commit: narrowing a shared base line to an axis materializes the region an
     try std.testing.expect(std.mem.indexOf(u8, src, "export EDITOR=vim\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "export EDITOR=nvim") == null);
 
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expectEqualStrings("export EDITOR=nvim\n", try read(io, a, frag));
 
@@ -1055,7 +1055,7 @@ test "commit: a narrowing that would change an unchosen configuration is rejecte
 
     // "Not committed" left nothing behind: the base is byte-identical and the
     // synthesized fragment is gone, so the whole source tree hashes as before.
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expect(!exists(io, frag));
     const after = try treeDigest(io, a, src_dir);
@@ -1116,7 +1116,7 @@ test "commit: narrowing to an axis the file already has a region for is refused,
     // The existing region's fragments are untouched -- above all the one named
     // for THIS machine's os, which is exactly the path the synthesized fragment
     // would have overwritten.
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const mine = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, mine), "PAGER=") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, mine), "EDITOR") == null);
@@ -1160,7 +1160,7 @@ test "commit: narrowing to an axis the file has no region for still synthesizes 
 
     // The pre-existing os region is untouched, and this machine's compose now
     // matches its source: nothing is left drifting.
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const mine = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, mine), "PAGER=") != null);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
@@ -1180,7 +1180,7 @@ test "commit: a leftover fragment at the exact synthesis path is refused, its co
     // A leftover fragment already sits at the exact path this machine's os
     // narrowing would write -- no directive claims the "os" region yet, so
     // nothing composes it and nothing warns it is there.
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const leftover_sub = try std.fmt.allocPrint(a, "repo/src/.zshrc.d/os/{s}", .{m_state.os});
     try writeRepo(io, &tmp, leftover_sub, "leftover, unclaimed by any directive\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -1221,7 +1221,7 @@ test "commit: narrowing succeeds end-to-end when no fragment sits at the write p
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expect(!exists(io, frag));
 
@@ -1325,7 +1325,7 @@ test "commit: a universal hunk and a narrowed hunk in the same file both land" {
     try std.testing.expect(std.mem.indexOf(u8, src, "export PAGER=less") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "export PAGER=more") == null);
 
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expectEqualStrings("export PAGER=more\n", try read(io, a, frag));
 
@@ -1417,7 +1417,7 @@ test "commit: a routed file whose recompose still differs from live is restored,
 
     // "Not committed" left nothing behind: the base is byte-identical, and the
     // fragment and the region directory the synthesis created are gone.
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expect(!exists(io, frag));
     try std.testing.expect(!exists(io, try h.srcOf(".zshrc.d/os")));
@@ -1489,7 +1489,7 @@ test "commit: narrowing to this machine uses the machine axis's first-label valu
     // a fragment named for this machine's first-label value.
     const src = try read(io, a, try h.srcOf(".zshrc"));
     try std.testing.expect(std.mem.indexOf(u8, src, "# mox: replace from \"machine\"") != null);
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const machine_value = mox.machine.bindings.firstLabel(m_state.hostname);
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/machine/{s}", .{machine_value}));
     try std.testing.expectEqualStrings("export EDITOR=nvim\n", try read(io, a, frag));
@@ -1567,7 +1567,7 @@ test "commit: an extension-bearing fragment still resolves by its stem" {
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const live = try h.liveOf(".zshrc");
     const want = try std.fmt.allocPrint(a, "export SHARED=1\nexport PLATFORM={s}\n", .{m_state.os});
     try std.testing.expectEqualStrings(want, try read(io, a, live));
@@ -1924,7 +1924,7 @@ test "commit: firstViolation still aborts an unintended configuration change in 
     const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
     try std.testing.expect(std.mem.indexOf(u8, facts, "email = \"team@work.com\"") != null);
     // ...and .zshrc's rejected narrowing left its source untouched.
-    const m_state = try mox.machine.state.capture(a, io, h.env);
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
     const frag = try h.srcOf(try std.fmt.allocPrint(a, ".zshrc.d/os/{s}", .{m_state.os}));
     try std.testing.expect(!exists(io, frag));
     try std.testing.expectEqualStrings(zshrc_before, try read(io, a, try h.srcOf(".zshrc")));

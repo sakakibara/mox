@@ -1,7 +1,8 @@
 //! The `$MOX_PATH` channel: every setup script gets an
 //! env var naming a writable file in this run's private temp area. A script
 //! that installs a tool into an arbitrary location -- one that is neither
-//! `$PATH` nor a detected tool home -- appends that directory to the file
+//! `$PATH` nor this repo's `data/paths.toml` registry -- appends that
+//! directory to the file
 //! (one absolute path per line, modeled on GitHub Actions' `GITHUB_PATH`).
 //! After each stage, mox reads back whatever is new, widens the tool probe's
 //! search space with it, and prepends it to `$PATH` for every later script

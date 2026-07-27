@@ -21,17 +21,25 @@ pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts, a.paths);
 }
 
-/// `machine.state.captureDiag`, reporting a `ReservedFactName` collision the
-/// same way `mox facts` does instead of letting the bare error name reach
-/// main's generic handler -- apply is where users actually hit this, not
-/// just `mox facts`. Null return means the caller already reported and
-/// should fail the run; any other error still propagates.
-fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env) !?mox.machine.state.MachineState {
-    var facts_diag: mox.machine.facts.Diag = .{};
-    return mox.machine.state.captureDiag(ctx.alloc, ctx.io, env, &facts_diag) catch |e| switch (e) {
-        error.ReservedFactName => {
+/// `machine.state.captureDiag`, reporting a `ReservedFactName` (a custom fact
+/// or `data/facts.toml` row colliding with a reserved axis or built-in
+/// field) or a malformed `data/facts.toml` row the same way `mox facts` does,
+/// instead of letting the bare error name reach main's generic handler --
+/// apply is where users actually hit this, not just `mox facts`. Null return
+/// means the caller already reported and should fail the run; any other
+/// error still propagates.
+fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, private_dir: []const u8) !?mox.machine.state.MachineState {
+    var diag: mox.machine.diag.Diag = .{};
+    return mox.machine.state.captureDiag(ctx.alloc, ctx.io, env, repo_dir, private_dir, &diag) catch |e| switch (e) {
+        error.ReservedFactName, error.ReservedFactsRowName => {
             try ctx.err.print("mox apply: {s}\n", .{
-                facts_diag.capture() orelse "a fact name collides with a reserved axis name",
+                diag.capture() orelse "a fact name collides with a reserved axis name",
+            });
+            return null;
+        },
+        error.MalformedFactsRow => {
+            try ctx.err.print("mox apply: {s}\n", .{
+                diag.capture() orelse "a data/facts.toml row is malformed",
             });
             return null;
         },
@@ -94,7 +102,7 @@ fn applyPass(
     };
     const resolver_opt: ?*DriftResolver = if (interactive_drift) &resolver else null;
 
-    var m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
+    var m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
@@ -124,7 +132,7 @@ fn applyPass(
         const outcome = try mox.machine.interview.walk(ctx.alloc, schema, &bindings, input, if (interactive) ctx.out else null);
         if (outcome.answers.len > 0) {
             try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
-            m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
+            m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
             bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
             live_ctx = m_state.liveResolver(&bindings_map);
         }
@@ -165,7 +173,7 @@ fn applyPass(
 
     // $MOX_PATH: a private per-run file every setup script
     // gets, for naming an install directory mox would otherwise never see
-    // (neither $PATH nor a detected tool home). Created empty up front --
+    // (neither $PATH nor this repo's data/paths.toml registry). Created empty up front --
     // dies with the run, same private-temp-area treatment as the
     // MOX_CHECK_FILE/MOX_CHECK_DIR staging below.
     const mox_path_file = try mox.apply.mox_path.filePath(ctx.alloc, context.paths.state_dir);
@@ -189,12 +197,12 @@ fn applyPass(
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, &bindings, &script_env, ctx.out, ctx.err);
 
-    // A pre-script may install a tool or create a named path that the
-    // `tool=`/`path=` axes gate on. Re-capture so this same apply composes
-    // against the machine as the bootstrap left it, not as it began -- the
+    // A pre-script may install a tool or create a directory a `data/facts.toml`
+    // row derives a fact from. Re-capture so this same apply composes against
+    // the machine as the bootstrap left it, not as it began -- the
     // first-apply staleness the design exists to eliminate.
     if (pre_result.ran > 0) {
-        m_state = (try captureOrReport(ctx, context.env)) orelse return 1;
+        m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
     }
@@ -233,16 +241,10 @@ fn applyPass(
             });
             return 1;
         },
-        error.UnknownPathAxisValue => {
-            try ctx.err.print("mox apply: overlay filename: {s}: unknown path= member\n", .{
+        error.ReservedAxisName => {
+            try ctx.err.print("mox apply: overlay filename: {s}: \"path\" is a reserved axis name; the path= axis no longer exists\n", .{
                 walk_diag.capture() orelse "?",
             });
-            try ctx.err.writeAll("mox apply:   accepted path values: ");
-            for (mox.dsl.axis.path_axis_members, 0..) |m, i| {
-                if (i > 0) try ctx.err.writeAll(", ");
-                try ctx.err.writeAll(m);
-            }
-            try ctx.err.writeAll("\n");
             return 1;
         },
         else => return e,
@@ -337,14 +339,8 @@ fn applyPass(
             try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
             if (e == error.UnknownShell)
                 try ctx.err.print("mox apply:   accepted shells: fish, zsh, bash, powershell\n", .{});
-            if (e == error.UnknownPathAxisValue) {
-                try ctx.err.writeAll("mox apply:   accepted path values: ");
-                for (mox.dsl.axis.path_axis_members, 0..) |m, i| {
-                    if (i > 0) try ctx.err.writeAll(", ");
-                    try ctx.err.writeAll(m);
-                }
-                try ctx.err.writeAll("\n");
-            }
+            if (e == error.ReservedAxisName)
+                try ctx.err.writeAll("mox apply:   \"path\" is a reserved axis name; the path= axis no longer exists\n");
             if (diag.capture()) |cap|
                 try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
             counts.fail += 1;

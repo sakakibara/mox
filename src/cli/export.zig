@@ -51,7 +51,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
     const out_dir = a.out;
 
-    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     const live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     const live_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };

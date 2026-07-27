@@ -30,7 +30,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "add-tree")) orelse return 1;
     defer lk.release();
 
-    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };

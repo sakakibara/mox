@@ -49,7 +49,7 @@ pub const ParseError = error{
     ExpectedFieldRef,
     UnclosedParen,
     ExpressionTooDeep,
-    UnknownPathAxisValue,
+    ReservedAxisName,
     OutOfMemory,
 };
 
@@ -153,14 +153,15 @@ pub const Parser = struct {
                     self.advance();
                     // A dotted RHS substitutes a row field into a machine-axis
                     // check; a bare RHS is a literal axis-value comparison.
+                    // `path=` is reserved either way -- its axis name is
+                    // known statically here even when the value is not.
                     if (std.mem.indexOfScalar(u8, val_ident, '.') != null) {
+                        if (std.mem.eql(u8, name, "path")) return error.ReservedAxisName;
                         const node = try self.arena.create(RowExpr);
                         node.* = .{ .axis_with_field = .{ .axis = name, .field_ref = val_ident } };
                         return node;
                     }
-                    if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(val_ident)) {
-                        return error.UnknownPathAxisValue;
-                    }
+                    if (std.mem.eql(u8, name, "path")) return error.ReservedAxisName;
                     const node = try self.arena.create(RowExpr);
                     node.* = .{ .eq = .{ .ref = name, .value = val_ident } };
                     return node;
@@ -169,18 +170,14 @@ pub const Parser = struct {
                 // the axis grammar): `kind=from`, `os=end`, ...
                 .keyword => |val_kw| {
                     self.advance();
-                    if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(val_kw)) {
-                        return error.UnknownPathAxisValue;
-                    }
+                    if (std.mem.eql(u8, name, "path")) return error.ReservedAxisName;
                     const node = try self.arena.create(RowExpr);
                     node.* = .{ .eq = .{ .ref = name, .value = val_kw } };
                     return node;
                 },
                 .string => |val_str| {
                     self.advance();
-                    if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(val_str)) {
-                        return error.UnknownPathAxisValue;
-                    }
+                    if (std.mem.eql(u8, name, "path")) return error.ReservedAxisName;
                     const node = try self.arena.create(RowExpr);
                     node.* = .{ .eq = .{ .ref = name, .value = val_str } };
                     return node;
@@ -428,7 +425,7 @@ test "parse: a quoted literal axis eq accepts a UTF-8 value" {
 test "parse: an unknown path= literal is rejected in a row expression too" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(error.UnknownPathAxisValue, parseString(arena.allocator(), "path=brew"));
+    try std.testing.expectError(error.ReservedAxisName, parseString(arena.allocator(), "path=brew"));
 }
 
 test "parse: complex `not entry.X or entry.X has Y`" {

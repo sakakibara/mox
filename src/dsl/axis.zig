@@ -14,24 +14,9 @@ pub const ParseError = error{
     ExpectedAxisValue,
     UnclosedParen,
     ExpressionTooDeep,
-    UnknownPathAxisValue,
+    ReservedAxisName,
     OutOfMemory,
 };
-
-/// The closed vocabulary of the `path=` axis: each member is a derived fact
-/// with its own detection rule in `machine.state.capture` (Homebrew/cargo/go/
-/// pnpm home directories). Unlike `tool=`/`env=` (open, resolved by probing
-/// for any name), no other name can ever resolve here on any machine, so an
-/// unknown one is refused at parse time instead of silently answering false
-/// forever.
-pub const path_axis_members = [_][]const u8{ "brew_prefix", "cargo_home", "gopath", "pnpm_home" };
-
-pub fn isValidPathAxisValue(value: []const u8) bool {
-    for (path_axis_members) |m| {
-        if (std.mem.eql(u8, m, value)) return true;
-    }
-    return false;
-}
 
 /// Recursion-depth cap for `parseExpr`/`parseNot`. Bounds `not not ...` and
 /// `((( ... )))` nesting so a hostile directive line cannot overflow the
@@ -125,6 +110,14 @@ pub const Parser = struct {
             else => return error.ExpectedAxisName,
         };
         self.advance();
+        // `path=` is a reserved name: the closed axis it once named was
+        // deleted (D8), and it never became a fact or any other axis, so a
+        // leftover `path=` source must error loudly here rather than compose
+        // to a silent false forever (equality only -- bare `when path` is
+        // unaffected, matching how the axis has always answered presence).
+        if (std.mem.eql(u8, axis_name, "path") and self.peek().kind == .eq) {
+            return error.ReservedAxisName;
+        }
         // Bare `name` (no `=`) is a presence check: `name` is bound to any
         // non-empty value. Lets users gate sections on "email is set",
         // "signing_key is set", etc., without having to invent a sentinel.
@@ -145,12 +138,6 @@ pub const Parser = struct {
             else => return error.ExpectedAxisValue,
         };
         self.advance();
-        // `path=` is a closed axis: an unnamed member can never resolve
-        // on any machine, so it is refused here rather than composing to a
-        // silent false forever.
-        if (std.mem.eql(u8, axis_name, "path") and !isValidPathAxisValue(value)) {
-            return error.UnknownPathAxisValue;
-        }
         const node = try self.arena.create(AxisExpr);
         node.* = .{ .eq = .{ .axis = axis_name, .value = value } };
         return node;
@@ -398,21 +385,20 @@ test "parse: an unquoted non-ASCII axis value still fails to lex" {
     );
 }
 
-test "parse: an unknown path= value is rejected, naming the closed set" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectError(error.UnknownPathAxisValue, parseString(arena.allocator(), "path=brew"));
-}
-
-test "parse: every real path= member still parses" {
+test "parse: path= is rejected as a reserved axis name, any value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for (path_axis_members) |m| {
-        const expr = try parseString(a, try std.fmt.allocPrint(a, "path={s}", .{m}));
-        try std.testing.expect(expr.* == .eq);
-        try std.testing.expectEqualStrings(m, expr.eq.value);
+    for ([_][]const u8{ "brew_prefix", "brew", "anything" }) |v| {
+        try std.testing.expectError(error.ReservedAxisName, parseString(a, try std.fmt.allocPrint(a, "path={s}", .{v})));
     }
+}
+
+test "parse: bare presence path (no =) is unaffected -- only path= errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expr = try parseString(arena.allocator(), "path");
+    try std.testing.expect(expr.* == .present);
 }
 
 test "parseString: trailing tokens after a valid prefix are rejected" {

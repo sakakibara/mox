@@ -16,15 +16,28 @@ const Io = std.Io;
 const max_bytes: usize = 4 * 1024 * 1024;
 
 /// The multi-value axis names: each binds via a compound `name=value` key
-/// rather than a direct one. Reserved against a custom fact of the same name
-/// (`machine.facts.load`), since a fact there would otherwise shadow the
-/// whole axis through the single-value lookup path.
-pub const multi_value_axis_names = [_][]const u8{ "tool", "env", "path" };
+/// rather than a direct one.
+pub const multi_value_axis_names = [_][]const u8{ "tool", "env" };
 
 /// Multi-value axes use a compound `name=value` binding key; everything else
 /// is a single-value axis addressed by bare name.
 pub fn isMultiValueAxis(name: []const u8) bool {
     for (multi_value_axis_names) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// Every reserved axis name: the open multi-value axes (`tool`, `env`) plus
+/// `path`, whose closed multi-value axis was deleted (D8) but which stays
+/// reserved so a leftover `path=` source errors loudly instead of silently
+/// never matching. Reserved against a custom fact or `data/facts.toml` row of
+/// the same name, since either would otherwise shadow the axis through the
+/// single-value lookup path.
+pub const reserved_axis_names = [_][]const u8{ "tool", "env", "path" };
+
+pub fn isReservedAxisName(name: []const u8) bool {
+    for (reserved_axis_names) |n| {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;

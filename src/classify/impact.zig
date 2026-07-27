@@ -206,7 +206,7 @@ test "impact: an edit inside a gated region affects only that configuration" {
 
     var env_map = std.process.Environ.Map.init(a);
     try env_map.put("HOME", "/home/me");
-    const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
+    const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
     const before = try snapshot(a, io, file, configs, &m_state, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
@@ -251,7 +251,7 @@ test "impact: an edit outside any gated region affects every configuration" {
 
     var env_map = std.process.Environ.Map.init(a);
     try env_map.put("HOME", "/home/me");
-    const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
+    const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
     const before = try snapshot(a, io, file, configs, &m_state, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common EDITED\n" ++
@@ -301,7 +301,7 @@ fn seededThisAndState(
     var env_map = std.process.Environ.Map.init(a);
     try env_map.put("HOME", "/home/me");
     try env_map.put("PATH", bin_dir);
-    const m_state = try machine.state.capture(a, io, .{ .map = &env_map });
+    const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
     var this = try machine.bindings.fromMachineState(a, m_state);
     var live_ctx: dsl.resolver.Resolver.Live = m_state.liveResolver(&this);

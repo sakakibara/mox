@@ -114,7 +114,7 @@ test "walk: finds managed file with category-A overlays" {
     try std.testing.expectEqual(@as(usize, 0), result.files[0].regions.len);
 }
 
-test "walk: an overlay filename naming an unknown path= member is refused, diag names the file" {
+test "walk: an overlay filename naming path= is refused as a reserved axis name, diag names the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -130,7 +130,7 @@ test "walk: an overlay filename naming an unknown path= member is refused, diag 
 
     var diag: mox.source.tree.Diag = .{};
     const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
-    try std.testing.expectError(error.UnknownPathAxisValue, result);
+    try std.testing.expectError(error.ReservedAxisName, result);
     try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, "path=brew") != null);
 }
 

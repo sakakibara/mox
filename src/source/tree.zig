@@ -753,11 +753,11 @@ fn enumerateDotD(
             const t = tuple_mod.parseFilename(arena, entry.name) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // Kept distinct from the generic `InvalidEntry` below: a
-                // caller reports the closed `path=` vocabulary the same
-                // way the directive grammar does, instead of a bare verdict.
-                error.UnknownPathAxisValue => {
+                // caller reports the reserved axis name the same way the
+                // directive grammar does, instead of a bare verdict.
+                error.ReservedAxisName => {
                     if (diag) |d| d.set(abs);
-                    return error.UnknownPathAxisValue;
+                    return error.ReservedAxisName;
                 },
                 else => return error.InvalidEntry,
             };

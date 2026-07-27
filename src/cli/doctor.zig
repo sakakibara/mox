@@ -71,7 +71,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // capture in this command tolerates its own failure independently (a
     // fact.toml problem must skip only the checks that need machine state,
     // not the whole report), so this one is kept separate rather than shared.
-    if (mox.machine.state.capture(ctx.alloc, ctx.io, context.env)) |notice_state| {
+    if (mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir)) |notice_state| {
         if (try mox.machine.state.extrasNotice(ctx.alloc, ctx.io, notice_state.xdg_config_home)) |notice| {
             try ctx.err.print("mox doctor: {s}\n", .{notice});
         }
@@ -234,7 +234,7 @@ fn neverMaterializing(
     src_dir: []const u8,
     context: app.Context,
 ) !?[]const []const u8 {
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
+    const m_state = mox.machine.state.capture(arena, io, context.env, context.paths.repo_dir, context.paths.private_dir) catch return null;
     var this_bindings = try mox.machine.bindings.fromMachineState(arena, m_state);
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
@@ -277,7 +277,7 @@ fn generatorProblems(
     src_dir: []const u8,
     context: app.Context,
 ) !?[]const []const u8 {
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
+    const m_state = mox.machine.state.capture(arena, io, context.env, context.paths.repo_dir, context.paths.private_dir) catch return null;
     const bindings_map = try mox.machine.bindings.fromMachineState(arena, m_state);
     const live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     const bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
@@ -322,7 +322,7 @@ fn trackedAndIgnored(
     src_dir: []const u8,
     context: app.Context,
 ) !?[]const []const u8 {
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
+    const m_state = mox.machine.state.capture(arena, io, context.env, context.paths.repo_dir, context.paths.private_dir) catch return null;
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
     const ruleset = mox.source.ignore.load.loadUnconditional(arena, io, context.paths.repo_dir) catch return null;
@@ -350,7 +350,7 @@ fn orphanedAttributes(
 ) !?[]const []const u8 {
     const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir, null) catch return null;
     if (attrs.map.count() == 0) return &.{};
-    const m_state = mox.machine.state.capture(arena, io, context.env) catch return null;
+    const m_state = mox.machine.state.capture(arena, io, context.env, context.paths.repo_dir, context.paths.private_dir) catch return null;
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
     const tree = mox.private.layer.merge(arena, io, base_tree, context.paths.private_dir, m_state.home) catch base_tree;
 
@@ -518,7 +518,7 @@ fn provenanceInSync(recorded: [mox.apply.applied.hash_hex_len]u8, composed: []co
 /// its provenance (and applied records). Returns the number rebuilt.
 fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const context = ctx.context.?;
-    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     const live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     const bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
@@ -562,7 +562,7 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
 /// coupled (co-occurring) tokens.
 fn rescanCoupling(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const context = ctx.context.?;
-    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     const tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch return 0;
 
     var inputs: std.ArrayList(mox.coupling.index.FileInput) = .empty;

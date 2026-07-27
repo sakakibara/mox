@@ -1,6 +1,7 @@
 const std = @import("std");
 const toml = @import("toml");
 const source_axes = @import("../source/axes.zig");
+const diag_mod = @import("diag.zig");
 
 const Io = std.Io;
 const state_mod = @import("state.zig");
@@ -19,19 +20,7 @@ pub const LoadResult = struct {
 /// Names a reserved-axis-name collision (`error.ReservedFactName`): which key
 /// in `facts.toml` collided, so a caller can report it instead of leaving the
 /// bare error name to speak for itself.
-pub const Diag = struct {
-    buf: [160]u8 = undefined,
-    len: usize = 0,
-
-    fn set(self: *Diag, comptime fmt: []const u8, args: anytype) void {
-        const written = std.fmt.bufPrint(&self.buf, fmt, args) catch &self.buf;
-        self.len = written.len;
-    }
-
-    pub fn capture(self: *const Diag) ?[]const u8 {
-        return if (self.len > 0) self.buf[0..self.len] else null;
-    }
-};
+pub const Diag = diag_mod.Diag;
 
 /// Load custom machine facts from a TOML file.
 ///
@@ -63,7 +52,7 @@ pub fn load(arena: std.mem.Allocator, io: Io, path: []const u8, diag: ?*Diag) !L
     var it = v.table.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
-        if (source_axes.isMultiValueAxis(name)) {
+        if (source_axes.isReservedAxisName(name)) {
             if (diag) |d| d.set(
                 "facts.toml: \"{s}\" collides with the reserved axis names (tool, env, path); rename it",
                 .{name},
@@ -185,7 +174,7 @@ test "load: every reserved axis name errors as a fact name" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    for (source_axes.multi_value_axis_names) |name| {
+    for (source_axes.reserved_axis_names) |name| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const data = try std.fmt.allocPrint(a, "{s} = \"x\"\n", .{name});

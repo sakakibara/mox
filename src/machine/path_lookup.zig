@@ -36,10 +36,10 @@ pub const Listing = struct {
 /// POSIX to hide, slow enough on Windows to look like a hang. An empty or
 /// absent `$PATH` scans no PATH directories but still scans `extra_dirs`.
 ///
-/// `extra_dirs` -- this machine's tool-home bin directories -- are
+/// `extra_dirs` -- this repo's resolved `data/paths.toml` registry -- are
 /// scanned strictly after every `$PATH` directory: `scanDirInto` only ever
 /// inserts a name it has not already seen, so a `$PATH` hit always wins over
-/// a tool-home hit for the same name, unchanged from PATH-only behavior.
+/// a registry hit for the same name, unchanged from PATH-only behavior.
 pub fn buildListing(arena: std.mem.Allocator, io: Io, environ: Environ, extra_dirs: []const []const u8) !Listing {
     var entries = std.StringHashMap([]const u8).init(arena);
     const exts = try executableExts(arena, environ);
@@ -62,7 +62,7 @@ pub fn buildListing(arena: std.mem.Allocator, io: Io, environ: Environ, extra_di
 /// Index every regular file directly inside `dir_path` into `entries`,
 /// keyed for `Listing.lookup`. Best-effort: a directory that does not exist
 /// or will not enumerate is silently skipped, not fatal -- shared by every
-/// PATH/tool-home/`$MOX_PATH` directory a `Listing` ever scans. Sorted so a
+/// PATH/registry/`$MOX_PATH` directory a `Listing` ever scans. Sorted so a
 /// tie between two names folding to the same key (`git` and `git.exe`)
 /// resolves the same way on every machine, rather than by filesystem order.
 fn scanDirInto(
@@ -184,7 +184,7 @@ pub const ToolProbe = struct {
 
     /// Widen the search space with `dirs` (the `$MOX_PATH` channel):
     /// scanned into the existing `Listing` in place -- a name already found
-    /// via `$PATH` or a tool home is never overwritten, so this can only add
+    /// via `$PATH` or the registry is never overwritten, so this can only add
     /// names, never change an existing answer. Building the listing first
     /// (if this is the first call) rather than deferring to the next
     /// `path`/`present` keeps the memo and the listing consistent: any

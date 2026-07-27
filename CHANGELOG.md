@@ -8,13 +8,19 @@ All notable changes to mox are documented here. The format follows
 
 ### Added
 - `tool=<name>` and `env=<name>` are now open axes: any name resolves as a
-  live probe (against `$PATH` plus detected tool-home bin directories for
-  `tool=`, against the captured environ for `env=`) instead of a lookup
-  against a pre-enumerated watch list, so a name never registered anywhere
-  still resolves. `<machine.tool_path.NAME>` and `<env.NAME>` interpolation
-  share the same resolution.
+  live probe (against `$PATH` plus this repo's resolved `data/paths.toml`
+  registry for `tool=`, against the captured environ for `env=`) instead of
+  a lookup against a pre-enumerated watch list, so a name never registered
+  anywhere still resolves. `<machine.tool_path.NAME>` and `<env.NAME>`
+  interpolation share the same resolution.
+- `data/facts.toml`: a repo-provided, private-shadowed registry of
+  `[[facts]]` rows deriving a single-value fact (name/env/candidates) mox
+  has no built-in knowledge of, re-derived on the post-pre-script
+  re-capture. A bound row behaves like any other fact; a name colliding
+  with a built-in field or a reserved axis name, or a malformed row, is a
+  capture error naming it.
 - An explicit `$MOX_PATH` channel: a setup script can append a directory a
-  tool installed into that neither `$PATH` nor a detected tool home would
+  tool installed into that neither `$PATH` nor `data/paths.toml` would
   otherwise see, and it joins the search space for the rest of the run.
 - `mox status` prints a probe log naming every `tool=`/`env=` name a run
   actually asked and whether it resolved, so a typo'd gate is visible
@@ -41,13 +47,17 @@ All notable changes to mox are documented here. The format follows
   no longer binds the raw hostname, only its first label: an overlay or
   fragment named for a full dotted hostname must be renamed to the first
   label, or switched to the new `hostname` axis.
-- A custom fact named `tool`, `env`, or `path` is now rejected at load
-  time: it would otherwise silently shadow that axis's whole binding.
-- `path=` is now a closed axis (`brew_prefix`, `cargo_home`, `gopath`,
-  `pnpm_home`): an unnamed value is refused at parse time instead of
-  composing to a silent false forever.
+- A custom fact or `data/facts.toml` row named `tool`, `env`, or `path` is
+  now rejected at load time: it would otherwise silently shadow that axis's
+  whole binding.
 
 ### Removed
+- The `path=` axis and its built-in tool-home detection (Homebrew, cargo,
+  go, pnpm) are gone: mox ships with zero built-in directory knowledge.
+  `path` stays a reserved name so a leftover `path=` source errors loudly
+  instead of composing to a silent false forever; a repo that wants the old
+  facts declares them in `data/facts.toml` instead, and their PATH
+  directories are ordinary `data/paths.toml` rows.
 - `<xdg_config_home>/mox/extras.toml` is no longer read (superseded by the
   open `tool=`/`env=` probes above). A one-time notice names the file and
   states it is no longer read when mox finds one still on disk, so an

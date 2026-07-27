@@ -318,10 +318,6 @@ test "MachineState type is constructible" {
         .hostname = "test-host",
         .username = "tester",
         .home = "/home/tester",
-        .brew_prefix = "",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
@@ -333,7 +329,7 @@ test "MachineState type is constructible" {
 test "MachineState capture: returns plausible OS" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const m = try machine.state.capture(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ });
+    const m = try machine.state.capture(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ }, "", "");
     // macOS reports as "darwin" (uname/chezmoi convention), not Zig's "macos".
     const known_os = [_][]const u8{ "linux", "darwin", "windows", "freebsd", "openbsd" };
     var ok = false;
@@ -346,33 +342,30 @@ test "MachineState capture: returns plausible OS" {
 test "MachineState capture: sets home directory" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const m = try machine.state.capture(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ });
+    const m = try machine.state.capture(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ }, "", "");
     try std.testing.expect(m.home.len > 0);
 }
 
-test "machine bindings: produces os, arch, and path= entries" {
+test "machine bindings: produces os, arch, and custom-fact entries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    const facts = [_]machine.state.Fact{.{ .name = "brew_prefix", .value = "/opt/homebrew" }};
     const m = machine.state.MachineState{
         .os = "linux",
         .arch = "aarch64",
         .hostname = "test",
         .username = "tester",
         .home = "/home/tester",
-        .brew_prefix = "/opt/homebrew",
-        .cargo_home = "/home/tester/.cargo",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "/home/tester/.config",
         .xdg_cache_home = "",
         .xdg_data_home = "",
         .xdg_state_home = "",
+        .custom_facts = &facts,
     };
     var b = try machine.bindings.fromMachineState(arena.allocator(), m);
     try std.testing.expectEqualStrings("linux", b.get("os").?);
     try std.testing.expectEqualStrings("aarch64", b.get("arch").?);
-    try std.testing.expect(b.contains("path=brew_prefix"));
-    try std.testing.expect(b.contains("path=cargo_home"));
+    try std.testing.expectEqualStrings("/opt/homebrew", b.get("brew_prefix").?);
     // tool=/env= are open axes with no fixed vocabulary: a Resolver.Live
     // answers them by probing, never from this map.
     try std.testing.expect(!b.contains("tool=fd"));

@@ -407,7 +407,7 @@ pub fn commitImpl(
 
     // A fact write in the write phase re-captures this, so a routed file's
     // recompose (later in this same run) sees the new value.
-    var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+    var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings);
     var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
@@ -954,7 +954,7 @@ pub fn commitImpl(
     // the recompose-verify step sees the new value instead of the one this
     // run started with.
     if (fact_edits.items.len > 0) {
-        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env);
+        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
         bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings);
         // The fresh `bindings` map above starts unseeded again.
@@ -3767,16 +3767,7 @@ fn asMachineCapture(name: []const u8) ?[]const u8 {
 /// (`src/compose/interp.zig`) resolves itself before ever falling through to
 /// `custom_facts`.
 fn isBuiltinMachineField(field: []const u8) bool {
-    const builtins = [_][]const u8{
-        "os",             "arch",            "hostname",       "username",
-        "home",           "brew_prefix",     "cargo_home",     "gopath",
-        "pnpm_home",      "xdg_config_home", "xdg_cache_home", "xdg_data_home",
-        "xdg_state_home",
-    };
-    for (builtins) |b| {
-        if (std.mem.eql(u8, field, b)) return true;
-    }
-    return std.mem.startsWith(u8, field, "tool_path.");
+    return mox.machine.state.isBuiltinField(field);
 }
 
 /// Rebuild `template` with the capture spanning `[open, close]` (whose raw
@@ -4421,10 +4412,6 @@ test "routeHunk: a private-only base file's edit is flagged private by location"
         .hostname = "h",
         .username = "u",
         .home = "/home/u",
-        .brew_prefix = "",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
@@ -4524,10 +4511,6 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
         .hostname = "test",
         .username = "tester",
         .home = "/home/me",
-        .brew_prefix = "",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",

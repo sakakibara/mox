@@ -47,10 +47,12 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 
 ## Axis expressions
 
-Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`; the
-open `tool`, `env` (any name is a live query, below); and the closed `path`
-(exactly the four derived tool-home members: `brew_prefix`, `cargo_home`,
-`gopath`, `pnpm_home`). `machine` is the first label of the hostname (e.g.
+Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`, any
+custom or `data/facts.toml`-derived fact (below); and the open `tool`, `env`
+(any name is a live query, below). `path` is a reserved name -- it named a
+closed axis mox has since deleted, so a leftover `path=` source errors
+loudly instead of silently never matching. `machine` is the first label of
+the hostname (e.g.
 `Foo` out of `Foo.attlocal.net`), stable across networks; `hostname` is the
 full name, for the rarer case that wants it. An axis expression is boolean
 over them:
@@ -72,10 +74,15 @@ tool=fd and not env=WSL
 `tool=<name>` and `env=<name>` are open axes: neither has a fixed
 vocabulary, so any name is a live query rather than a lookup against a
 pre-enumerated fact set. `tool=<name>` resolves against `$PATH`, then this
-machine's detected tool-home bin directories when present
-(`<brew_prefix>/bin`, `<cargo_home>/bin`, `<gopath>/bin`, `<pnpm_home>`),
-then any directory a setup script named via `$MOX_PATH` (see Scripts,
-below) -- in that order, so a `$PATH` hit always wins.
+repo's own `data/paths.toml` PATH registry resolved against this machine
+(captures expanded, nonexistent directories skipped, `shells`/`prepend`
+irrelevant to an existence check) -- the same directories the shells
+themselves put on `$PATH`, so "gate says installed" and "shell can run it"
+never diverge -- then any directory a setup script named via `$MOX_PATH`
+(see Scripts, below): in that order, so a `$PATH` hit always wins. A
+`data/paths.toml` row's own `when` field (a tool name gating whether that
+row contributes) is checked against `$PATH`+`$MOX_PATH` only, never against
+another row's directory -- one pass, no fixpoint.
 `<machine.tool_path.NAME>` interpolation resolves through the same search
 space. `env=<name>` resolves directly against this machine's captured
 environ, same as `<env.NAME>` interpolation; a set-but-empty variable reads
@@ -191,14 +198,15 @@ A capture `<...>` substitutes one value inside a region body or loop template.
 It is a plain lookup - no arithmetic, no transforms, no regex:
 
 - `<entry.field>` - a loop row field. When the field's string itself carries
-  captures (a data row authored as `dir = "<machine.brew_prefix>/bin"`), they
-  expand through this same mechanism -- but only one level deep: the result
-  of that nested expansion is spliced verbatim and never scanned again, so a
-  row value cannot chain into a second round of expansion. An unknown capture
+  captures (a `data/paths.toml` row authored as `dir = "<machine.brew_prefix>/bin"`,
+  where `brew_prefix` is a `data/facts.toml`-derived fact), they expand
+  through this same mechanism -- but only one level deep: the result of that
+  nested expansion is spliced verbatim and never scanned again, so a row
+  value cannot chain into a second round of expansion. An unknown capture
   inside a row value is a compose error with the same diagnostics as an
   inline one; `| default` chains inside a row value resolve the same way too.
-- `<machine.field>` - a machine fact (`os`, `arch`, `home`, `brew_prefix`,
-  `xdg_config_home`, `tool_path.<name>`, custom facts, ...).
+- `<machine.field>` - a machine fact: `os`, `arch`, `home`, `xdg_config_home`,
+  `tool_path.<name>`, a custom fact, or a `data/facts.toml`-derived one.
 - `<env.NAME>` - a captured environment variable value.
 - `<data.FILE.KEY>` - a committed shared scalar from `data/FILE.toml` (the
   private layer shadows the repo, exactly as `mox data get` resolves it).
@@ -247,14 +255,39 @@ one unnoticed.
 
 ## Fact and data model
 
-- **Facts** come from the machine interview (`data/facts-schema.toml`) plus
-  auto-detected machine state (os, arch, tools on PATH, env vars). They drive
-  axis expressions and `<machine.*>` / `<env.*>` captures.
+- **Facts** come from the machine interview (`data/facts-schema.toml`), the
+  machine-local `$XDG_CONFIG_HOME/mox/facts.toml`, `data/facts.toml`
+  (below), and auto-detected machine state (os, arch, tools on PATH, env
+  vars). They drive axis expressions and `<machine.*>` / `<env.*>` captures.
 - **Data files** are `data/*.toml` (shared, repo-relative) or `<base>.d/*.toml`
   (per-file). Their arrays feed `for` loops; their top-level scalars feed
   `<data.FILE.KEY>` captures.
 - **Fragments** live under `<base>.d/`; overlay regions select the
   best-matching one by axis tuple.
+
+### Derived facts (`data/facts.toml`)
+
+Repo-provided, private-shadowed, `[[facts]]` rows deriving a single-value
+fact mox has no built-in knowledge of (a package manager's home directory,
+say). Each row:
+
+- `name` (required, the same charset as an axis name).
+- `env` (optional): an override variable consulted first. Set-but-empty
+  counts as unset; a set value must itself name an existing directory to
+  win, or resolution falls through to `candidates`.
+- `candidates` (optional): paths tried in order; `~` expands to home. The
+  first that exists on disk binds the fact.
+
+Nothing existing (env unset/rejected and no candidate exists) leaves the row
+unbound -- no fact, no error. A bound row behaves exactly like any other
+fact: `<machine.NAME>` captures it, `when NAME` tests its presence,
+`when NAME="..."` compares its value. A row's `name` colliding with a
+built-in field or a reserved axis name (`tool`, `env`, `path`) is a capture
+error naming the conflict; a malformed row (bad name charset, wrong field
+type) is a capture error naming the row. A missing `data/facts.toml`
+derives nothing and is not an error. Re-derived on the post-pre-script
+re-capture, so a bootstrap script that installs the thing a row detects is
+seen by the very same apply.
 
 ## Scripts
 
@@ -284,8 +317,8 @@ is left out and warned about instead of silently colliding).
 Every setup script (both stages) also gets `MOX_PATH`, naming a
 writable file private to this run (deleted when the run ends). A script that
 installs a tool somewhere `tool=` would not otherwise see -- neither `$PATH`
-nor a detected tool home -- appends that directory there, one absolute path
-per line (modeled on GitHub Actions' `GITHUB_PATH`). After each stage, mox
+nor this repo's `data/paths.toml` registry -- appends that directory there,
+one absolute path per line (modeled on GitHub Actions' `GITHUB_PATH`). After each stage, mox
 reads back whatever is new: it joins the `tool=` search space for the rest of
 the run and is prepended to `PATH` for every later script and check hook. A
 relative or otherwise malformed line is a stderr warning naming the file and

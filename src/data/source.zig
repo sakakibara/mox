@@ -62,7 +62,7 @@ pub fn lookupScalar(
 
 /// Read `data/<filename>` from the private layer if present there, else the
 /// repo. Null when it exists in neither.
-fn readShadowed(
+pub fn readShadowed(
     arena: std.mem.Allocator,
     io: Io,
     repo_dir: []const u8,

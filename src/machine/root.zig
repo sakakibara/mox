@@ -3,6 +3,9 @@ pub const state = @import("state.zig");
 pub const path_lookup = @import("path_lookup.zig");
 pub const bindings = @import("bindings.zig");
 pub const facts = @import("facts.zig");
+pub const derived_facts = @import("derived_facts.zig");
+pub const path_registry = @import("path_registry.zig");
+pub const diag = @import("diag.zig");
 pub const interview = @import("interview.zig");
 
 test {
@@ -12,5 +15,8 @@ test {
     _ = path_lookup;
     _ = bindings;
     _ = facts;
+    _ = derived_facts;
+    _ = path_registry;
+    _ = diag;
     _ = interview;
 }

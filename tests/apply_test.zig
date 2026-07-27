@@ -4707,7 +4707,7 @@ test "apply completions: an unknown shell names the accepted set" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted shells: fish, zsh, bash, powershell") != null);
 }
 
-test "apply: an unknown path= value names the closed set; a real member keeps working" {
+test "apply: a path= gate is refused as a reserved axis name, any value" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4723,11 +4723,11 @@ test "apply: an unknown path= value names the closed set; a real member keeps wo
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expect(r.rc != 0);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownPathAxisValue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted path values: brew_prefix, cargo_home, gopath, pnpm_home") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ReservedAxisName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "reserved axis name") != null);
 }
 
-test "apply: a .d/ overlay filename naming an unknown path= member names the closed set" {
+test "apply: a .d/ overlay filename naming path= is refused as a reserved axis name" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4743,10 +4743,10 @@ test "apply: a .d/ overlay filename naming an unknown path= member names the clo
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "path=brew") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted path values: brew_prefix, cargo_home, gopath, pnpm_home") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "reserved axis name") != null);
 }
 
-test "apply: a real path= member composes without error" {
+test "apply: a bare fact-presence gate on a name that used to be a path= member composes without error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4754,12 +4754,16 @@ test "apply: a real path= member composes without error" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    // `path=` no longer exists; `brew_prefix` is now an ordinary (unbound,
+    // absent any registry) fact name, gated with a plain bare-presence
+    // check -- composes cleanly, the gate simply false.
     try tmp.dir.createDirPath(io, "repo/src");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.zshrc",
-        .data = "# mox: when path=brew_prefix\nok\n# mox: end\n",
+        .data = "# mox: when brew_prefix\nok\n# mox: end\n",
     });
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownPathAxisValue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ReservedAxisName") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }

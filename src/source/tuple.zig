@@ -1,6 +1,5 @@
 const std = @import("std");
 const tree = @import("tree.zig");
-const axis_mod = @import("../dsl/axis.zig");
 
 const AxisTuple = tree.AxisTuple;
 const Pair = tree.AxisTuple.Pair;
@@ -9,11 +8,10 @@ pub const ParseError = error{
     InvalidAxisName,
     InvalidAxisValue,
     MalformedTuple,
-    /// `path=` names a member outside the closed vocabulary
-    /// (`axis_mod.path_axis_members`) -- distinct from the generic
-    /// `InvalidAxisValue` so a caller can report the accepted set instead of
-    /// a bare "invalid" verdict.
-    UnknownPathAxisValue,
+    /// `path` is a reserved axis name (D8): its closed axis was deleted, and
+    /// it never became a fact or any other axis, so a tuple naming it must
+    /// error loudly rather than compose to a silent false forever.
+    ReservedAxisName,
     OutOfMemory,
 };
 
@@ -50,11 +48,8 @@ fn parseStem(arena: std.mem.Allocator, stem: []const u8) ParseError!AxisTuple {
         const name = part[0..eq_idx];
         const value = part[eq_idx + 1 ..];
         if (!isValidAxisName(name)) return error.InvalidAxisName;
+        if (std.mem.eql(u8, name, "path")) return error.ReservedAxisName;
         if (!isValidAxisValue(value)) return error.InvalidAxisValue;
-        // `path=` is a closed axis: a tuple naming any member outside
-        // the four derived tool-home facts is refused, same as an unknown
-        // value in a `when`/`where` expression.
-        if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(value)) return error.UnknownPathAxisValue;
         try pairs.append(arena, .{
             .name = try arena.dupe(u8, name),
             .value = try arena.dupe(u8, value),
@@ -86,7 +81,7 @@ pub fn stripExtension(filename: []const u8) []const u8 {
     return filename;
 }
 
-fn isValidAxisName(name: []const u8) bool {
+pub fn isValidAxisName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (!std.ascii.isLower(name[0])) return false;
     for (name) |c| {
@@ -170,22 +165,11 @@ test "parseFilename: a UTF-8 value is accepted verbatim" {
     try std.testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", t.pairs[0].value);
 }
 
-test "parseFilename: an unknown path= member is rejected" {
+test "parseFilename: path= is rejected as a reserved axis name, any value" {
     var allocator_buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const result = parseFilename(fba.allocator(), "path=brew");
-    try std.testing.expectError(error.UnknownPathAxisValue, result);
-}
-
-test "parseFilename: every real path= member is accepted" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for (axis_mod.path_axis_members) |m| {
-        const filename = try std.fmt.allocPrint(a, "path={s}", .{m});
-        const t = try parseFilename(a, filename);
-        try std.testing.expectEqualStrings(m, t.pairs[0].value);
-    }
+    try std.testing.expectError(error.ReservedAxisName, result);
 }
 
 test "parseFilenameVerbatim: keeps a dotted value parseFilename would strip" {

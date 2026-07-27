@@ -6,6 +6,9 @@ const EnvironMap = std.process.Environ.Map;
 const path_lookup = @import("path_lookup.zig");
 const source_path = @import("../source/path.zig");
 const facts_mod = @import("facts.zig");
+const derived_facts_mod = @import("derived_facts.zig");
+const path_registry = @import("path_registry.zig");
+const diag_mod = @import("diag.zig");
 const dsl = @import("../dsl/root.zig");
 
 /// A user-supplied machine fact loaded from `$XDG_CONFIG_HOME/mox/facts.toml`.
@@ -16,6 +19,25 @@ pub const Fact = struct {
     name: []const u8,
     value: []const u8,
 };
+
+/// `MachineState` fields `interp.formatMachineField` resolves itself before
+/// ever consulting `custom_facts`, plus `machine` -- the hostname-label axis
+/// `bindings.fromMachineState` binds directly, never through `custom_facts`.
+/// Reserved against a `data/facts.toml` row (a hard capture error there) and
+/// consulted by `mox commit`'s fact-authoring heuristic (a capture already
+/// answered here would be written to a fact nothing ever reads).
+pub const builtin_field_names = [_][]const u8{
+    "os",            "arch",           "machine",         "hostname",
+    "username",      "home",           "xdg_config_home", "xdg_cache_home",
+    "xdg_data_home", "xdg_state_home",
+};
+
+pub fn isBuiltinField(field: []const u8) bool {
+    for (builtin_field_names) |b| {
+        if (std.mem.eql(u8, field, b)) return true;
+    }
+    return std.mem.startsWith(u8, field, "tool_path.");
+}
 
 /// Snapshot of machine state captured at the start of `mox apply`.
 /// All strings are arena-owned. The arena must outlive the MachineState.
@@ -35,8 +57,8 @@ pub const MachineState = struct {
     username_fallback: bool = false,
     home: []const u8,
     /// The `tool=`/`<machine.tool_path.X>` resolution layer: probes and
-    /// memoizes against this machine's `$PATH` (plus tool-home bin
-    /// directories) for any name, on first ask. Null only for a
+    /// memoizes against this machine's `$PATH` (plus this repo's resolved
+    /// `data/paths.toml` registry) for any name, on first ask. Null only for a
     /// MachineState built by hand (every test fixture); `capture` always
     /// supplies one. Also the probe layer a `Resolver.Live` built from this
     /// snapshot's bindings falls through to for `tool=`.
@@ -47,10 +69,6 @@ pub const MachineState = struct {
     /// supplies one. Also the probe layer a `Resolver.Live` built from this
     /// snapshot's bindings falls through to for `env=`.
     env_probe: ?*EnvProbe = null,
-    brew_prefix: []const u8,
-    cargo_home: []const u8,
-    gopath: []const u8,
-    pnpm_home: []const u8,
     xdg_config_home: []const u8,
     xdg_cache_home: []const u8,
     xdg_data_home: []const u8,
@@ -152,18 +170,30 @@ pub fn extrasNotice(arena: std.mem.Allocator, io: Io, xdg_config_home: []const u
 ///
 /// Reads OS/arch from the build (overridable via `MOX_OS`/`MOX_ARCH`, so the
 /// os/arch axes are injectable), hostname from the OS, identity and named
-/// paths from `environ`, and probes tool availability against `$PATH`.
-/// All returned strings are owned by `arena`.
-pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ) !MachineState {
-    return captureDiag(arena, io, environ, null);
+/// paths from `environ`, and probes tool availability against `$PATH` plus
+/// this repo's `data/paths.toml` registry. `repo_dir`/`private_dir` locate
+/// the repo's `data/facts.toml` (derived facts) and `data/paths.toml`
+/// (probe-widening registry); pass `""` for either when no repo is in scope
+/// (registry-absent behavior: no derived facts, no extra probe directories).
+pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ, repo_dir: []const u8, private_dir: []const u8) !MachineState {
+    return captureDiag(arena, io, environ, repo_dir, private_dir, null);
 }
 
-/// Same as `capture`, but a non-null `diag` is filled with the offending key
-/// and the reserved set when a custom fact collides with a multi-value axis
-/// name (`error.ReservedFactName`) -- the same message `mox facts` prints --
-/// so a caller can report it instead of leaving the bare error name to speak
-/// for itself.
-pub fn captureDiag(arena: std.mem.Allocator, io: Io, environ: Environ, diag: ?*facts_mod.Diag) !MachineState {
+/// Same as `capture`, but a non-null `diag` is filled with the offending name
+/// when a custom fact or a `data/facts.toml` row collides with a reserved
+/// axis name or a built-in fact (`error.ReservedFactName`,
+/// `error.ReservedFactsRowName`), or names a malformed `data/facts.toml` row
+/// (`error.MalformedFactsRow`) -- the same message `mox facts`/`mox apply`
+/// print -- so a caller can report it instead of leaving the bare error name
+/// to speak for itself.
+pub fn captureDiag(
+    arena: std.mem.Allocator,
+    io: Io,
+    environ: Environ,
+    repo_dir: []const u8,
+    private_dir: []const u8,
+    diag: ?*diag_mod.Diag,
+) !MachineState {
     const builtin = @import("builtin");
 
     const os_str = envOr(arena, environ, "MOX_OS") orelse osAxisValue(builtin.os.tag);
@@ -195,21 +225,40 @@ pub fn captureDiag(arena: std.mem.Allocator, io: Io, environ: Environ, diag: ?*f
         envOr(arena, environ, "USERPROFILE") orelse
         return error.HomeNotSet;
 
-    // Tool-home detection runs ahead of the `$PATH` scan so their bin
-    // directories can join the very same `Listing` build: a fresh Homebrew
-    // (or cargo/go/pnpm) install is visible to `tool=` the moment its home
-    // exists, not just once its shellenv line is itself applied and PATH
-    // grows on some LATER process's re-exec.
-    const brew_prefix = try detectBrewPrefix(arena, io, environ, builtin.os.tag, home);
-    const cargo_home = try resolveToolHome(arena, io, environ, "CARGO_HOME", home, ".cargo");
-    const gopath = try resolveToolHome(arena, io, environ, "GOPATH", home, "go");
-    const pnpm_home = envOr(arena, environ, "PNPM_HOME") orelse try arena.dupe(u8, "");
-    const tool_home_bin_dirs = try toolHomeBinDirs(arena, brew_prefix, cargo_home, gopath, pnpm_home);
+    const xdg_config_home = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
+    const xdg_cache_home = try resolveXdg(arena, environ, "XDG_CACHE_HOME", home, ".cache");
+    const xdg_data_home = try resolveXdg(arena, environ, "XDG_DATA_HOME", home, ".local/share");
+    const xdg_state_home = try resolveXdg(arena, environ, "XDG_STATE_HOME", home, ".local/state");
 
-    // One `$PATH` (+ tool-home) enumeration for the whole capture, seeding the
+    // mox ships with zero built-in directory knowledge: `data/facts.toml`
+    // (repo-derived) runs ahead of the `$PATH` scan, same reason the deleted
+    // hardcoded tool-home detection did -- a freshly-installed Homebrew (or
+    // whatever a repo's own registry declares) is visible to `tool=` the
+    // moment its directory exists, via `data/paths.toml` below, not just
+    // once a shellenv line is itself applied and PATH grows on some LATER
+    // process's re-exec.
+    const derived = try derived_facts_mod.load(arena, io, environ, repo_dir, private_dir, home, diag);
+
+    const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
+    const facts_result = try facts_mod.load(arena, io, facts_path, diag);
+
+    // Machine-local facts.toml wins over the repo's derived registry on a
+    // name collision (checked here, not enforced -- distinct row spaces).
+    var combined_facts: std.ArrayList(Fact) = .empty;
+    try combined_facts.appendSlice(arena, facts_result.facts);
+    try combined_facts.appendSlice(arena, derived.facts);
+    const custom_facts = try combined_facts.toOwnedSlice(arena);
+
+    // Base-layer probe ($PATH only, no `data/paths.toml` dirs): the
+    // registry's own `when` gates are evaluated against this, never against
+    // each other's contributed dirs -- one pass, no fixpoint.
+    var base_probe = path_lookup.ToolProbe.init(arena, io, environ);
+    const registry_dirs = try path_registry.resolve(arena, io, environ, repo_dir, private_dir, custom_facts, &base_probe);
+
+    // One `$PATH` (+ registry) enumeration for the whole capture, seeding the
     // lazy tool probe's listing cache so its first per-name lookup never
     // rebuilds it.
-    const path_listing = try path_lookup.buildListing(arena, io, environ, tool_home_bin_dirs);
+    const path_listing = try path_lookup.buildListing(arena, io, environ, registry_dirs);
 
     // A fresh probe every capture, so a re-capture (facts interview, the
     // post-pre-script re-capture) starts with an empty memo instead of
@@ -224,14 +273,6 @@ pub fn captureDiag(arena: std.mem.Allocator, io: Io, environ: Environ, diag: ?*f
     const env_probe = try arena.create(EnvProbe);
     env_probe.* = EnvProbe.init(arena, environ);
 
-    const xdg_config_home = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
-    const xdg_cache_home = try resolveXdg(arena, environ, "XDG_CACHE_HOME", home, ".cache");
-    const xdg_data_home = try resolveXdg(arena, environ, "XDG_DATA_HOME", home, ".local/share");
-    const xdg_state_home = try resolveXdg(arena, environ, "XDG_STATE_HOME", home, ".local/state");
-
-    const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
-    const facts_result = try facts_mod.load(arena, io, facts_path, diag);
-
     return .{
         .os = os_str,
         .arch = arch_str,
@@ -242,15 +283,11 @@ pub fn captureDiag(arena: std.mem.Allocator, io: Io, environ: Environ, diag: ?*f
         .home = home,
         .tool_probe = tool_probe,
         .env_probe = env_probe,
-        .brew_prefix = brew_prefix,
-        .cargo_home = cargo_home,
-        .gopath = gopath,
-        .pnpm_home = pnpm_home,
         .xdg_config_home = xdg_config_home,
         .xdg_cache_home = xdg_cache_home,
         .xdg_data_home = xdg_data_home,
         .xdg_state_home = xdg_state_home,
-        .custom_facts = facts_result.facts,
+        .custom_facts = custom_facts,
         .skipped_fact_keys = facts_result.skipped,
     };
 }
@@ -309,11 +346,11 @@ test "capture: both HOME and USERPROFILE unset or empty errors instead of defaul
     defer arena.deinit();
     const a = arena.allocator();
     var map = EnvironMap.init(a);
-    try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }));
+    try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }, "", ""));
 
     // An empty value is unset too, same as absent.
     try map.put("HOME", "");
-    try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }));
+    try std.testing.expectError(error.HomeNotSet, capture(a, std.testing.io, Environ{ .map = &map }, "", ""));
 }
 
 test "capture: USER and USERNAME unset falls back to \"unknown\" and flags username_fallback" {
@@ -323,7 +360,7 @@ test "capture: USER and USERNAME unset falls back to \"unknown\" and flags usern
     var map = EnvironMap.init(a);
     try map.put("HOME", "/home/whoever");
 
-    const m = try capture(a, std.testing.io, Environ{ .map = &map });
+    const m = try capture(a, std.testing.io, Environ{ .map = &map }, "", "");
     try std.testing.expectEqualStrings("unknown", m.username);
     try std.testing.expect(m.username_fallback);
     // The real hostname resolves on every CI/dev machine; only the flag is
@@ -340,7 +377,7 @@ test "capture: a defined USER is used verbatim, username_fallback stays false" {
     try map.put("HOME", "/home/whoever");
     try map.put("USER", "tester");
 
-    const m = try capture(a, std.testing.io, Environ{ .map = &map });
+    const m = try capture(a, std.testing.io, Environ{ .map = &map }, "", "");
     try std.testing.expectEqualStrings("tester", m.username);
     try std.testing.expect(!m.username_fallback);
 }
@@ -374,105 +411,6 @@ fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []con
     return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path, sub });
 }
 
-test "detectBrewPrefix: HOMEBREW_PREFIX is consulted ahead of the hardcoded candidates" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "custom/bin");
-    try tmp.dir.writeFile(io, .{ .sub_path = "custom/bin/brew", .data = "" });
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const prefix = try tmpAbsPath(a, &tmp, "custom");
-
-    var map = EnvironMap.init(a);
-    try map.put("HOMEBREW_PREFIX", prefix);
-    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .macos, "/home/x");
-    try std.testing.expectEqualStrings(prefix, got);
-}
-
-test "detectBrewPrefix: HOMEBREW_PREFIX pointing nowhere falls back to hardcoded candidates" {
-    const io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var map = EnvironMap.init(a);
-    try map.put("HOMEBREW_PREFIX", "/definitely/does/not/exist");
-    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .linux, "/home/x");
-    try std.testing.expectEqualStrings("", got);
-}
-
-test "detectBrewPrefix: a non-root <home>/.linuxbrew install is found on Linux" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, ".linuxbrew/bin");
-    try tmp.dir.writeFile(io, .{ .sub_path = ".linuxbrew/bin/brew", .data = "" });
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const home = try tmpAbsPath(a, &tmp, "");
-    const want = try std.fs.path.join(a, &.{ home, ".linuxbrew" });
-
-    var map = EnvironMap.init(a);
-    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .linux, home);
-    try std.testing.expectEqualStrings(want, got);
-}
-
-test "detectBrewPrefix: empty home skips the <home>/.linuxbrew candidate without erroring" {
-    const io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var map = EnvironMap.init(a);
-    const got = try detectBrewPrefix(a, io, Environ{ .map = &map }, .linux, "");
-    try std.testing.expectEqualStrings("", got);
-}
-
-/// Detect the active Homebrew/Linuxbrew prefix. A caller-set `HOMEBREW_PREFIX`
-/// (brew's own `shellenv` export) names the install brew itself picked, so it
-/// is tried before any hardcoded guess -- an override of the default install
-/// location would otherwise never be found. Falls back to the conventional
-/// per-OS locations, including the non-root `<home>/.linuxbrew` install
-/// alongside the system-wide `/home/linuxbrew/.linuxbrew` one.
-fn detectBrewPrefix(
-    arena: std.mem.Allocator,
-    io: Io,
-    environ: Environ,
-    os_tag: std.Target.Os.Tag,
-    home: []const u8,
-) ![]const u8 {
-    if (envOr(arena, environ, "HOMEBREW_PREFIX")) |prefix| {
-        if (hasBrewBin(arena, io, prefix)) return try arena.dupe(u8, prefix);
-    }
-
-    var candidates: std.ArrayList([]const u8) = .empty;
-    if (os_tag == .macos) {
-        try candidates.appendSlice(arena, &.{ "/opt/homebrew", "/usr/local" });
-    } else {
-        try candidates.append(arena, "/home/linuxbrew/.linuxbrew");
-        if (home.len > 0) {
-            try candidates.append(arena, try std.fs.path.join(arena, &.{ home, ".linuxbrew" }));
-        }
-        try candidates.append(arena, "/usr/local");
-    }
-
-    for (candidates.items) |dir| {
-        if (hasBrewBin(arena, io, dir)) return try arena.dupe(u8, dir);
-    }
-    return try arena.dupe(u8, "");
-}
-
-fn hasBrewBin(arena: std.mem.Allocator, io: Io, dir: []const u8) bool {
-    const brew_bin = std.fs.path.join(arena, &.{ dir, "bin", "brew" }) catch return false;
-    Io.Dir.cwd().access(io, brew_bin, .{}) catch return false;
-    return true;
-}
-
 fn resolveXdg(
     arena: std.mem.Allocator,
     environ: Environ,
@@ -487,46 +425,6 @@ fn resolveXdg(
     return try source_path.joinKeyOnto(arena, home, fallback_subdir);
 }
 
-fn resolveToolHome(
-    arena: std.mem.Allocator,
-    io: Io,
-    environ: Environ,
-    env_name: []const u8,
-    home: []const u8,
-    fallback_subdir: []const u8,
-) ![]const u8 {
-    const path = if (envOr(arena, environ, env_name)) |v|
-        v
-    else if (home.len == 0)
-        try arena.dupe(u8, "")
-    else
-        try std.fs.path.join(arena, &.{ home, fallback_subdir });
-
-    if (path.len == 0) return path;
-    Io.Dir.cwd().access(io, path, .{}) catch return arena.dupe(u8, "");
-    return path;
-}
-
-/// This machine's tool-home bin directories, in this fixed order:
-/// `<brew_prefix>/bin`, `<cargo_home>/bin`, `<gopath>/bin`,
-/// `<pnpm_home>` (already a bin dir, unlike the other three). A fact that
-/// resolved empty (unset, or its detection rule found nothing) contributes
-/// no directory rather than joining "" into a bogus root-relative path.
-fn toolHomeBinDirs(
-    arena: std.mem.Allocator,
-    brew_prefix: []const u8,
-    cargo_home: []const u8,
-    gopath: []const u8,
-    pnpm_home: []const u8,
-) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    if (brew_prefix.len > 0) try out.append(arena, try std.fs.path.join(arena, &.{ brew_prefix, "bin" }));
-    if (cargo_home.len > 0) try out.append(arena, try std.fs.path.join(arena, &.{ cargo_home, "bin" }));
-    if (gopath.len > 0) try out.append(arena, try std.fs.path.join(arena, &.{ gopath, "bin" }));
-    if (pnpm_home.len > 0) try out.append(arena, pnpm_home);
-    return out.toOwnedSlice(arena);
-}
-
 test "MachineState type is constructible" {
     const m = MachineState{
         .os = "linux",
@@ -534,10 +432,6 @@ test "MachineState type is constructible" {
         .hostname = "test",
         .username = "tester",
         .home = "/home/tester",
-        .brew_prefix = "",
-        .cargo_home = "",
-        .gopath = "",
-        .pnpm_home = "",
         .xdg_config_home = "",
         .xdg_cache_home = "",
         .xdg_data_home = "",
@@ -549,33 +443,57 @@ test "MachineState type is constructible" {
 test "capture returns nonempty hostname" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const m = try capture(arena.allocator(), std.testing.io, Environ{ .process = std.testing.environ });
+    const m = try capture(arena.allocator(), std.testing.io, Environ{ .process = std.testing.environ }, "", "");
     try std.testing.expect(m.hostname.len > 0);
 }
 
-test "capture: a tool that exists only in cargo_home/bin, never on PATH, still resolves via tool_probe" {
+test "capture: registry absent leaves custom_facts empty and errors none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+    const m = try capture(a, std.testing.io, Environ{ .map = &map }, "", "");
+    try std.testing.expectEqual(@as(usize, 0), m.custom_facts.len);
+}
+
+test "capture: a data/facts.toml-derived fact's data/paths.toml bin dir reaches the tool probe" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "cargo/bin");
     try tmp.dir.writeFile(io, .{ .sub_path = "cargo/bin/only-in-cargo-home", .data = "" });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"cargo_home\"\nenv = \"CARGO_HOME\"\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/paths.toml",
+        .data = "[[paths]]\ndir = \"<machine.cargo_home>/bin\"\n",
+    });
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const home = try tmpAbsPath(a, &tmp, "");
     const cargo_home = try tmpAbsPath(a, &tmp, "cargo");
+    const repo = try tmpAbsPath(a, &tmp, "repo");
 
     var map = EnvironMap.init(a);
     try map.put("HOME", home);
     try map.put("CARGO_HOME", cargo_home);
-    // No PATH at all: the only way to reach the binary is the tool-home layer.
+    // No PATH at all: the only way to reach the binary is the registry.
 
-    const m = try capture(a, io, Environ{ .map = &map });
-    try std.testing.expectEqualStrings(cargo_home, m.cargo_home);
+    const m = try capture(a, io, Environ{ .map = &map }, repo, "");
+    var got_cargo_home: ?[]const u8 = null;
+    for (m.custom_facts) |f| {
+        if (std.mem.eql(u8, f.name, "cargo_home")) got_cargo_home = f.value;
+    }
+    try std.testing.expectEqualStrings(cargo_home, got_cargo_home.?);
     // Resolves only through the widened `Listing`: the tool probe is
     // the sole resolution path for `tool=`, so a name never on `$PATH`
-    // proper still resolves via the tool-home bin directory.
+    // proper still resolves via the registry-declared directory.
     try std.testing.expect(m.tool_probe.?.present("only-in-cargo-home"));
 }
 
@@ -596,7 +514,113 @@ test "capture: a facts.toml key named for a multi-value axis errors loudly" {
     try map.put("HOME", home);
     try map.put("XDG_CONFIG_HOME", xdg_config_home);
 
-    try std.testing.expectError(error.ReservedFactName, capture(a, io, Environ{ .map = &map }));
+    try std.testing.expectError(error.ReservedFactName, capture(a, io, Environ{ .map = &map }, "", ""));
+}
+
+test "capture: a data/facts.toml row colliding with a built-in fact errors loudly, naming it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"home\"\ncandidates = [\"/tmp\"]\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbsPath(a, &tmp, "repo");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+    var d: diag_mod.Diag = .{};
+    try std.testing.expectError(error.ReservedFactsRowName, captureDiag(a, io, Environ{ .map = &map }, repo, "", &d));
+    try std.testing.expect(std.mem.indexOf(u8, d.capture().?, "home") != null);
+}
+
+test "capture: a malformed data/facts.toml row is a capture error naming the row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/facts.toml", .data = "[[facts]]\ncandidates = [\"/tmp\"]\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbsPath(a, &tmp, "repo");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+    try std.testing.expectError(error.MalformedFactsRow, capture(a, io, Environ{ .map = &map }, repo, ""));
+}
+
+test "capture: private layer shadows the repo for both data/facts.toml and data/paths.toml" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.createDirPath(io, "private/data");
+    try tmp.dir.createDirPath(io, "priv-cand");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"cargo_home\"\ncandidates = [\"/definitely/does/not/exist\"]\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbsPath(a, &tmp, "repo");
+    const priv = try tmpAbsPath(a, &tmp, "private");
+    const priv_cand = try tmpAbsPath(a, &tmp, "priv-cand");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "private/data/facts.toml",
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"cargo_home\"\ncandidates = [\"{s}\"]\n", .{priv_cand}),
+    });
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+    const m = try capture(a, io, Environ{ .map = &map }, repo, priv);
+    var got: ?[]const u8 = null;
+    for (m.custom_facts) |f| {
+        if (std.mem.eql(u8, f.name, "cargo_home")) got = f.value;
+    }
+    try std.testing.expectEqualStrings(priv_cand, got.?);
+}
+
+test "capture: a pre-script re-capture picks up a dir the script just created" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.createDirPath(io, "home");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"cargo_home\"\ncandidates = [\"~/.cargo\"]\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = try tmpAbsPath(a, &tmp, "home");
+    const repo = try tmpAbsPath(a, &tmp, "repo");
+
+    var map = EnvironMap.init(a);
+    try map.put("HOME", home);
+
+    const before = try capture(a, io, Environ{ .map = &map }, repo, "");
+    try std.testing.expectEqual(@as(usize, 0), before.custom_facts.len);
+
+    // The "script" creates ~/.cargo between the two captures.
+    try tmp.dir.createDirPath(io, "home/.cargo");
+
+    const after = try capture(a, io, Environ{ .map = &map }, repo, "");
+    var got: ?[]const u8 = null;
+    for (after.custom_facts) |f| {
+        if (std.mem.eql(u8, f.name, "cargo_home")) got = f.value;
+    }
+    try std.testing.expect(got != null);
 }
 
 test "extrasNotice: names the path and that it is no longer read, when the file exists" {
@@ -650,7 +674,7 @@ test "capture: an extras.toml present does not fail capture, and its tools still
     try map.put("XDG_CONFIG_HOME", xdg_config_home);
     try map.put("PATH", bin_dir);
 
-    const m = try capture(a, io, Environ{ .map = &map });
+    const m = try capture(a, io, Environ{ .map = &map }, "", "");
     // "zk" was never a watched name; it resolves purely because it is on
     // PATH, the same as any other unlisted name -- extras.toml being present
     // (and unread) changes nothing.
@@ -675,7 +699,7 @@ test "MachineState.liveResolver: wires bindings, tool probe, and env probe from 
     try map.put("PATH", bin_dir);
     try map.put("MOX_LIVE_RESOLVER_VAR", "set");
 
-    const m = try capture(a, io, Environ{ .map = &map });
+    const m = try capture(a, io, Environ{ .map = &map }, "", "");
     var bindings = std.StringHashMap([]const u8).init(a);
     const live_ctx = m.liveResolver(&bindings);
     const resolver: dsl.resolver.Resolver = .{ .live = &live_ctx };

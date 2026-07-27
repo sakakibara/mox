@@ -96,15 +96,15 @@ test "reject: an unquoted non-ASCII axis value does not lex" {
     );
 }
 
-test "reject: a when gate naming an unknown path= member" {
+test "reject: a when gate naming path= is refused as a reserved axis name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // `path=` is a closed axis: only the four derived tool-home facts
-    // are members, so a typo'd or invented one is refused rather than
-    // composing to a silent false forever.
+    // `path` is a reserved axis name: its closed axis was deleted (D8), so
+    // any `path=` source now errors loudly rather than composing to a
+    // silent false forever.
     const src = "# mox: when path=brew\nbody\n# mox: end\n";
     try std.testing.expectError(
-        error.UnknownPathAxisValue,
+        error.ReservedAxisName,
         mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
     );
 }
