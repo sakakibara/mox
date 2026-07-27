@@ -440,12 +440,14 @@ fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u
 }
 
 /// Entries under `<repo>/scripts/` that never run, silently: a top-level
-/// entry named neither `pre` nor `post` (`run_scripts` reads only those two),
-/// and -- inside either stage -- a subdirectory name containing '=' whose
-/// tuple fails to parse (a plain-named subdirectory with no '=' is an
-/// exempt helper dir: `run_scripts` never runs it either, by design, so it is
-/// not flagged). Null means `scripts/` could not be read (the check could not
-/// run); a missing `scripts/` is not an error. Sorted, arena-owned messages.
+/// entry named neither `pre`, `post`, nor `check` (`run_scripts` iterates only
+/// the first two as stages; `check` is the documented home for check-hook
+/// executables invoked by explicit path instead), and -- inside either stage
+/// -- a subdirectory name containing '=' whose tuple fails to parse (a
+/// plain-named subdirectory with no '=' is an exempt helper dir: `run_scripts`
+/// never runs it either, by design, so it is not flagged). Null means
+/// `scripts/` could not be read (the check could not run); a missing
+/// `scripts/` is not an error. Sorted, arena-owned messages.
 fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const []const u8 {
     const scripts_dir = try std.fs.path.join(arena, &.{ repo_dir, "scripts" });
     var dir = Io.Dir.cwd().openDir(io, scripts_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
@@ -458,6 +460,11 @@ fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !
     for (try mox.source.dirent.sorted(arena, io, dir)) |entry| {
         if (mox.source.junk.isJunk(entry.name)) continue;
         if (std.mem.eql(u8, entry.name, "pre") or std.mem.eql(u8, entry.name, "post")) continue;
+        // `check` is not a stage `run_scripts` iterates -- its executables are
+        // invoked by explicit path from a `# mox: check "scripts/check/..."`
+        // head directive -- but it is docs/dsl.md's documented conventional
+        // home for them, so it is a recognized name, not an unknown one.
+        if (std.mem.eql(u8, entry.name, "check")) continue;
         try out.append(arena, try std.fmt.allocPrint(
             arena,
             "unknown-stage scripts/{s} (only pre/ and post/ run; rename or remove it)",
@@ -823,4 +830,37 @@ test "scriptStageProblems: a well-formed pre/post tree has nothing to report" {
     const repo = try tmpAbs(a, io, &tmp, "repo");
     const bad = (try scriptStageProblems(a, io, repo)).?;
     try testing.expectEqual(@as(usize, 0), bad.len);
+}
+
+test "scriptStageProblems: scripts/check is exempt, unlike a genuinely unknown stage" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/scripts/check");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/check/codex-config", .data = "true\n" });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try scriptStageProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 0), bad.len);
+}
+
+test "scriptStageProblems: scripts/pre-install still reports as an unknown stage" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/scripts/pre-install");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre-install/x.sh", .data = "true\n" });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try scriptStageProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 1), bad.len);
+    try testing.expect(std.mem.indexOf(u8, bad[0], "unknown-stage scripts/pre-install") != null);
 }
