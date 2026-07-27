@@ -1025,6 +1025,31 @@ test "machine.tool_path: a name outside the eager watch list still resolves, laz
     try std.testing.expectEqualStrings(want, out);
 }
 
+test "machine.tool_path: a name outside the eager watch list, existing only in a tool home (D2b), still resolves" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "cargo/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "cargo/bin/only-in-cargo-home", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const home = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const cargo_home = try std.fs.path.join(a, &.{ home, "cargo" });
+    const want = try std.fs.path.join(a, &.{ cargo_home, "bin", "only-in-cargo-home" });
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", home);
+    try map.put("CARGO_HOME", cargo_home);
+    // No $PATH at all: only the tool-home layer can resolve this name.
+    const m = try machine.state.capture(a, io, Env{ .map = &map });
+
+    const out = try expand(a, "<machine.tool_path.only-in-cargo-home>", null, .{ .machine = &m });
+    try std.testing.expectEqualStrings(want, out);
+}
+
 test "machine.tool_path: an absent unwatched name interpolates empty, not an error" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
