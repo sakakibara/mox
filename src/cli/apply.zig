@@ -14,11 +14,12 @@ pub const Spec = struct {
     dry_run: cli.Flag(.{ .help = "report only, write nothing" }),
     force: cli.Flag(.{ .help = "overwrite drifted files" }),
     skip_scripts: cli.Flag(.{ .help = "compose and write files, run no scripts" }),
+    defaults: cli.Flag(.{ .help = "never prompt: bind each unbound fact's default, decline the rest" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts, a.paths);
+    return applyImpl(ctx, a.force, a.dry_run, a.skip_scripts, a.defaults, a.paths);
 }
 
 /// `machine.state.captureDiag`, reporting a `ReservedFactName` (a custom fact
@@ -52,9 +53,9 @@ fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, privat
 /// limits the run to those managed files (empty: every file); when non-empty
 /// the `.mox-exact` prune sweep is skipped entirely, since it reasons about
 /// the whole tree and a scoped apply must touch only the named files.
-pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, paths: []const []const u8) anyerror!u8 {
+pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, paths: []const []const u8) anyerror!u8 {
     var queued: std.ArrayList([]const u8) = .empty;
-    const rc = try applyPass(ctx, force, dry_run, skip_scripts_arg, paths, &queued);
+    const rc = try applyPass(ctx, force, dry_run, skip_scripts_arg, defaults, paths, &queued);
     if (queued.items.len == 0) return rc;
     // Deferred on purpose: the apply pass holds the state lock and the lock is
     // not re-entrant, so the commit the drift prompt queued can only run once
@@ -70,6 +71,7 @@ fn applyPass(
     force: bool,
     dry_run: bool,
     skip_scripts_arg: bool,
+    defaults_only: bool,
     paths: []const []const u8,
     queued_out: *std.ArrayList([]const u8),
 ) anyerror!u8 {
@@ -86,17 +88,23 @@ fn applyPass(
     // never survives past this run.
     mox.apply.run_scripts.sweepCheckDirs(ctx.alloc, ctx.io, context.paths.state_dir);
 
+    // Drift resolution and the facts interview below share ONE buffered
+    // stdin reader: two independent `File.Reader`s over the same real fd
+    // would each buffer-consume bytes the other needed, breaking piped
+    // input meant to script both in a single apply run.
+    const scripted_input = app.stdin_override;
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader: std.Io.File.Reader = .initStreaming(.stdin(), ctx.io, &stdin_buf);
+    const shared_stdin: *std.Io.Reader = scripted_input orelse &stdin_reader.interface;
+
     // Drift is resolved by asking only on a real terminal with nothing already
     // deciding the outcome. `--force` resolves it before the prompt is reached;
     // `--dry-run` writes nothing; a non-TTY keeps the skip-and-report contract
     // every script and CI run depends on.
-    const scripted_input = app.stdin_override;
     const interactive_drift = (scripted_input != null or tty.isInteractive(0)) and !force and !dry_run;
-    var drift_stdin_buf: [4096]u8 = undefined;
-    var drift_reader: std.Io.File.Reader = .initStreaming(.stdin(), ctx.io, &drift_stdin_buf);
     var resolver: DriftResolver = .{
         .arena = ctx.alloc,
-        .input = scripted_input orelse &drift_reader.interface,
+        .input = shared_stdin,
         .sty = .{ .on = style.enabled(tty.isInteractive(1), context.env.get(ctx.alloc, "NO_COLOR") != null, .auto) },
         .state_dir = context.paths.state_dir,
     };
@@ -118,31 +126,60 @@ fn applyPass(
     if (try mox.machine.state.extrasNotice(ctx.alloc, ctx.io, m_state.xdg_config_home)) |notice| {
         try ctx.err.print("mox apply: {s}\n", .{notice});
     }
-
-    // Facts interview: prompt for schema-declared facts that are not yet
-    // bound, persist the answers, and re-capture so this apply already
-    // composes with them. Non-interactive runs with missing facts refuse
-    // (composing without them would bake wrong values into live files).
-    const schema = try mox.machine.interview.loadSchema(ctx.alloc, ctx.io, context.paths.repo_dir);
-    if (schema.len > 0) {
-        const interactive = tty.isInteractive(0);
-        var stdin_buf: [4096]u8 = undefined;
-        var stdin_reader: std.Io.File.Reader = .initStreaming(.stdin(), ctx.io, &stdin_buf);
-        const input: ?*std.Io.Reader = if (interactive) &stdin_reader.interface else null;
-        const outcome = try mox.machine.interview.walk(ctx.alloc, schema, &bindings, input, if (interactive) ctx.out else null);
-        if (outcome.answers.len > 0) {
-            try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
-            m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
-            bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-            live_ctx = m_state.liveResolver(&bindings_map);
-        }
-        if (outcome.unanswered.len > 0) {
-            try ctx.err.writeAll("mox apply: missing facts:");
-            for (outcome.unanswered) |f| try ctx.err.print(" {s}", .{f.name});
-            try ctx.err.writeAll("\nAnswer interactively (mox apply / mox facts) or set directly (mox facts set <name> <value>).\n");
-            return 1;
-        }
+    if (try mox.machine.state.schemaLeftoverNotice(ctx.alloc, ctx.io, context.paths.repo_dir)) |notice| {
+        try ctx.err.print("mox apply: {s}\n", .{notice});
     }
+
+    // Config-space discovery: every custom fact ("dimension") the repo's own
+    // sources consume, replacing the deleted hand-maintained schema file.
+    // Its own per-file anomalies are reported loudly here rather than left
+    // for a caller that never asks to see them. A structurally invalid
+    // source tree (bad attributes.toml, an illegal own/check declaration, a
+    // reserved axis name, ...) is the source-tree walk further below's
+    // problem to diagnose with the offending file; discovery degrades to
+    // "nothing found" here rather than pre-empting that richer report with
+    // a bare error name.
+    const discovery = mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => mox.machine.dimensions.Discovery{ .dimensions = &.{}, .scripts = &.{} },
+    };
+    for (discovery.diagnostics) |d| {
+        try ctx.err.print("mox apply: {s}: <machine.{s}> is not a valid fact name; ignored\n", .{ d.path, d.name });
+    }
+    for (discovery.default_diagnostics) |dd| switch (dd) {
+        .conflict => |c| try ctx.err.print(
+            "mox apply: conflicting `# mox: default` for \"{s}\": {s}=\"{s}\" vs {s}=\"{s}\"\n",
+            .{ c.name, c.first_source, c.first_value, c.second_source, c.second_value },
+        ),
+        .unclaimed => |u| try ctx.err.print(
+            "mox apply: `# mox: default {s}=...` in {s} names a fact nothing else in the repo consumes; ignored\n",
+            .{ u.name, u.source },
+        ),
+    };
+
+    // Facts interview: resolve every eligible unbound dimension, persist the
+    // answers, and re-capture so this apply already composes with them.
+    // Interactive on a real terminal (or scripted stdin in a test); `mox
+    // apply --defaults` never prompts and binds each dimension's agreed
+    // default (or declines it); `--dry-run` and a plain non-interactive run
+    // never persist -- there is no global refusal here, only a report: a
+    // script that actually needs an unresolved fact is D3's problem to
+    // block, not this pass's to refuse wholesale.
+    const interactive_interview = (scripted_input != null or tty.isInteractive(0)) and !dry_run;
+    const interview_mode: mox.machine.interview.Mode = blk: {
+        if (dry_run) break :blk .report_only;
+        if (defaults_only) break :blk .defaults;
+        if (interactive_interview) break :blk .{ .interactive = .{ .input = shared_stdin, .out = ctx.out } };
+        break :blk .report_only;
+    };
+    const interview = try mox.machine.interview.walkDimensions(ctx.alloc, discovery.dimensions, &bindings, interview_mode);
+    if (interview.answers.len > 0) {
+        try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, interview.answers);
+        m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
+        bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        live_ctx = m_state.liveResolver(&bindings_map);
+    }
+    try mox.machine.interview.writeUnboundNotice(ctx.err, "mox apply: ", interview.unbound);
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };

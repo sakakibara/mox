@@ -1,152 +1,255 @@
-//! First-run facts interview.
+//! Config-space interview: walk over `dimensions.discover`'s output instead
+//! of a hand-maintained schema file.
 //!
-//! A repo may declare the user facts it needs in `data/facts-schema.toml`:
+//! A dimension is asked when it is unbound (an existing binding, even the
+//! empty string, is a persisted decline and is never re-asked) and its
+//! `asking_condition` -- the OR of its capture occurrences' enclosing gates,
+//! null for a value-compared or presence-only dimension, whose comparison
+//! IS the demand -- evaluates true against the bindings accumulated so far
+//! this run (axes, existing facts, and earlier answers in the same walk).
+//! Dimensions are asked in FIXPOINT waves: everything eligible right now is
+//! asked, then the walk re-evaluates every remaining dimension's condition
+//! against the freshly widened bindings and asks whatever that newly
+//! exposed, repeating until nothing more becomes eligible. This is how a
+//! personal/icloud machine's answers never expose `gdrive_account` or a
+//! work-profile-gated fact, while a work answer exposes them in the same
+//! run. Within one wave, dimensions are asked in name order.
 //!
-//!   [[fact]]
-//!   name = "profile"
-//!   prompt = "Profile (personal/work)"
-//!   default = "personal"
-//!
-//!   [[fact]]
-//!   name = "gdrive_account"
-//!   prompt = "Google Drive account"
-//!   when = "cloud_backend=gdrive"
-//!
-//! On apply, facts that are declared but not yet bound are prompted for on
-//! a TTY and persisted to the machine-local facts file, so a fresh machine
-//! is interviewed exactly once. `when` uses the v1 axis-expression grammar
-//! and is evaluated against the bindings accumulated so far (axes, existing
-//! facts, and answers given earlier in the same interview) — facts are
-//! walked in schema order, so a `when` may only reference earlier facts.
+//! Each prompt shows an advisory choice list (`observed_values`, `
+//! capture_defaults`, and `declared_defaults`, unioned and sorted -- free
+//! text is always still accepted), a default when every declared/capture
+//! default for the name agrees on one value, and one provenance line (the
+//! source count, plus any scripts that consume it). A non-empty answer to a
+//! value-compared dimension that matches none of its observed values is
+//! confirmed once before it binds; declining the confirmation re-asks.
+//! Pressing enter takes the default when there is one, and binds the empty
+//! string (a decline) when there is not -- declined and legitimately-empty
+//! are the same state, never re-asked.
 
 const std = @import("std");
-const toml = @import("toml");
 const dsl = @import("../dsl/root.zig");
 const state_mod = @import("state.zig");
+const dimensions = @import("dimensions.zig");
 
 const Io = std.Io;
 
-const max_schema_bytes: usize = 256 * 1024;
+const max_facts_bytes: usize = 256 * 1024;
 
-pub const SchemaFact = struct {
-    name: []const u8,
-    prompt: []const u8,
-    default: ?[]const u8 = null,
-    when: ?[]const u8 = null,
+/// One interview run's mode: which of the three answer sources (interactive
+/// prompting, silent reporting, or declared-default auto-binding) resolves
+/// each eligible dimension.
+pub const Mode = union(enum) {
+    /// TTY (or scripted-stdin test) run: `askDimension` prompts through
+    /// `input`/`out` for every eligible dimension.
+    interactive: Interactive,
+    /// Non-interactive, or `--dry-run`: nothing is asked or persisted; every
+    /// eligible dimension's name is reported in `Outcome.unbound` instead.
+    report_only,
+    /// `mox apply --defaults`: never prompts; every eligible dimension binds
+    /// its agreed default, or the empty string (a decline) when it has none.
+    defaults,
+
+    pub const Interactive = struct {
+        input: *Io.Reader,
+        out: *Io.Writer,
+    };
 };
 
 pub const Outcome = struct {
-    /// Facts answered during this walk (interactive input present).
+    /// Facts resolved this run (interactive answers, or `--defaults`
+    /// bindings), in ask order. Includes empty-string declines.
     answers: []const state_mod.Fact = &.{},
-    /// Facts that need answers but had no input to draw from
-    /// (non-interactive mode). Dependents of an unanswered gate are not
-    /// listed; they surface once the gate is answered.
-    unanswered: []const SchemaFact = &.{},
+    /// Names of dimensions eligible to be asked but left unresolved
+    /// (`report_only` mode only), sorted.
+    unbound: []const []const u8 = &.{},
 };
 
-/// Load `<repo>/data/facts-schema.toml`. Missing file: empty schema.
-pub fn loadSchema(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]const SchemaFact {
-    const path = try std.fs.path.join(arena, &.{ repo_dir, "data", "facts-schema.toml" });
-    const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_schema_bytes)) catch |e| switch (e) {
-        error.FileNotFound => return &.{},
-        else => return e,
-    };
-    const v = try toml.parse(arena, content, .{});
-    if (v != .table) return error.InvalidFactsSchema;
-    const facts_v = v.table.get("fact") orelse return &.{};
-    if (facts_v != .array) return error.InvalidFactsSchema;
-
-    var out: std.ArrayList(SchemaFact) = .empty;
-    errdefer out.deinit(arena);
-    for (facts_v.array.items) |item| {
-        if (item != .table) return error.InvalidFactsSchema;
-        const name = stringField(item, "name") orelse return error.InvalidFactsSchema;
-        const prompt = stringField(item, "prompt") orelse return error.InvalidFactsSchema;
-        try out.append(arena, .{
-            .name = name,
-            .prompt = prompt,
-            .default = stringField(item, "default"),
-            .when = stringField(item, "when"),
-        });
-    }
-    return out.toOwnedSlice(arena);
-}
-
-fn stringField(v: toml.Value, key: []const u8) ?[]const u8 {
-    const field = v.table.get(key) orelse return null;
-    return switch (field) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-/// Walk the schema in order against `base_bindings`. Already-bound facts
-/// are skipped; a false `when` skips; the rest are prompted through
-/// `input`/`prompt_out` when present, or reported as unanswered when not.
-/// Answers accumulate in an override layer over `base_bindings` (the facts
-/// interview's working set) rather than a full copy: a later `when` sees
-/// both this run's earlier answers and every base binding, in one lookup.
-pub fn walk(
+/// Walk `dims` (typically `dimensions.discover(...).dimensions`) against
+/// `base_bindings`, resolving each eligible dimension through `mode`. See
+/// the module doc comment for the fixpoint-wave and prompt-content contract.
+pub fn walkDimensions(
     arena: std.mem.Allocator,
-    schema: []const SchemaFact,
+    dims: []const dimensions.Dimension,
     base_bindings: *const dsl.resolver.Resolver,
-    input: ?*Io.Reader,
-    prompt_out: ?*Io.Writer,
+    mode: Mode,
 ) !Outcome {
+    if (mode == .report_only) return walkReportOnly(arena, dims, base_bindings);
+
     var working = std.StringHashMap([]const u8).init(arena);
     var override: dsl.resolver.Resolver.Override = .{ .map = &working, .inner = base_bindings };
     var resolver: dsl.resolver.Resolver = .{ .override = &override };
 
     var answers: std.ArrayList(state_mod.Fact) = .empty;
-    var unanswered: std.ArrayList(SchemaFact) = .empty;
 
-    for (schema) |fact| {
-        if (resolver.lookup(fact.name) != null) continue;
-        if (fact.when) |expr_src| {
-            const expr = try dsl.axis.parseString(arena, expr_src);
-            if (!dsl.axis.evaluate(expr, &resolver)) continue;
-        }
-        const in = input orelse {
-            try unanswered.append(arena, fact);
-            continue;
-        };
-        const value = try ask(arena, fact, in, prompt_out);
-        try answers.append(arena, .{ .name = fact.name, .value = value });
-        try working.put(fact.name, value);
-    }
-
-    return .{
-        .answers = try answers.toOwnedSlice(arena),
-        .unanswered = try unanswered.toOwnedSlice(arena),
-    };
-}
-
-fn ask(arena: std.mem.Allocator, fact: SchemaFact, input: *Io.Reader, prompt_out: ?*Io.Writer) ![]const u8 {
-    // Hard bound on re-asks: a no-default fact re-prompts on blank answers,
-    // and the bound turns no-progress input into an error instead of a spin.
-    // takeDelimiter consumes the delimiter; the -Exclusive variant does not
-    // and would yield "" here forever.
-    var attempts: usize = 0;
-    while (attempts < max_ask_attempts) : (attempts += 1) {
-        if (prompt_out) |w| {
-            if (fact.default) |d| {
-                try w.print("{s} ({s}) [{s}]: ", .{ fact.name, fact.prompt, d });
-            } else {
-                try w.print("{s} ({s}): ", .{ fact.name, fact.prompt });
+    while (true) {
+        var wave: std.ArrayList(dimensions.Dimension) = .empty;
+        for (dims) |d| {
+            if (resolver.lookup(d.name) != null) continue;
+            if (d.asking_condition) |cond| {
+                if (!dsl.axis.evaluate(cond, &resolver)) continue;
             }
-            try w.flush();
+            try wave.append(arena, d);
         }
-        const line = (try input.takeDelimiter('\n')) orelse
-            return fact.default orelse error.InterviewInputClosed;
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len > 0) return arena.dupe(u8, trimmed);
-        if (fact.default) |d| return d;
-        // No default and empty answer: ask again.
+        if (wave.items.len == 0) break;
+        std.mem.sort(dimensions.Dimension, wave.items, {}, dimNameLess);
+
+        for (wave.items) |d| {
+            const value = switch (mode) {
+                .interactive => |io_pair| try askDimension(arena, d, io_pair.input, io_pair.out),
+                .defaults => agreedDefault(d) orelse "",
+                .report_only => unreachable,
+            };
+            try answers.append(arena, .{ .name = d.name, .value = value });
+            try working.put(d.name, value);
+        }
     }
-    return error.InterviewInputStalled;
+
+    return .{ .answers = try answers.toOwnedSlice(arena) };
 }
 
-const max_ask_attempts = 100;
+/// The non-interactive/`--dry-run` path: a single pass (nothing is bound, so
+/// there is nothing to fixpoint over) naming every dimension eligible to be
+/// asked right now against `base_bindings` as-is.
+fn walkReportOnly(arena: std.mem.Allocator, dims: []const dimensions.Dimension, base_bindings: *const dsl.resolver.Resolver) !Outcome {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (dims) |d| {
+        if (base_bindings.lookup(d.name) != null) continue;
+        if (d.asking_condition) |cond| {
+            if (!dsl.axis.evaluate(cond, base_bindings)) continue;
+        }
+        try names.append(arena, d.name);
+    }
+    std.mem.sort([]const u8, names.items, {}, lessThanStr);
+    return .{ .unbound = try names.toOwnedSlice(arena) };
+}
+
+/// Prompt for one dimension: provenance line, then the question line
+/// (choices, default), then read and validate an answer. Loops only on a
+/// declined keep-anyway confirmation; a blank line (including one produced
+/// by a closed/EOF input) always resolves immediately (to the default, or
+/// the empty-string decline), so this never hangs or spins on dead input.
+fn askDimension(arena: std.mem.Allocator, dim: dimensions.Dimension, input: *Io.Reader, out: *Io.Writer) ![]const u8 {
+    const choices = try choiceList(arena, dim);
+    const default = agreedDefault(dim);
+
+    try printProvenance(out, dim);
+    try printPrompt(arena, out, dim.name, choices, default);
+    try out.flush();
+
+    while (true) {
+        const line = try input.takeDelimiter('\n');
+        const trimmed = std.mem.trim(u8, line orelse "", " \t\r");
+        if (trimmed.len == 0) return default orelse "";
+
+        if (dim.roles.value_compared and dim.observed_values.len > 0 and !containsStr(dim.observed_values, trimmed)) {
+            const answer = try arena.dupe(u8, trimmed);
+            if (try confirmKeepAnyway(arena, dim.name, answer, dim.observed_values, input, out)) return answer;
+            try printPrompt(arena, out, dim.name, choices, default);
+            try out.flush();
+            continue;
+        }
+        return try arena.dupe(u8, trimmed);
+    }
+}
+
+/// One keep-anyway confirmation for a value-compared answer outside its
+/// observed set. Any answer not starting with `y`/`Y` (including a blank or
+/// closed-input line) declines.
+fn confirmKeepAnyway(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    value: []const u8,
+    observed: []const []const u8,
+    input: *Io.Reader,
+    out: *Io.Writer,
+) !bool {
+    const joined = try std.mem.join(arena, ", ", observed);
+    try out.print("\"{s}\" is not among {s}'s observed values ({s}) -- keep anyway? [y/N]: ", .{ value, name, joined });
+    try out.flush();
+    const line = try input.takeDelimiter('\n');
+    const trimmed = std.mem.trim(u8, line orelse "", " \t\r");
+    return trimmed.len > 0 and (trimmed[0] == 'y' or trimmed[0] == 'Y');
+}
+
+fn printProvenance(out: *Io.Writer, dim: dimensions.Dimension) !void {
+    try out.print("  ({d} source{s}", .{
+        dim.provenance.source_count,
+        if (dim.provenance.source_count == 1) "" else "s",
+    });
+    if (dim.provenance.needing_scripts.len > 0) {
+        try out.writeAll(", needs:");
+        for (dim.provenance.needing_scripts) |s| try out.print(" {s}", .{s});
+    }
+    try out.writeAll(")\n");
+}
+
+fn printPrompt(arena: std.mem.Allocator, out: *Io.Writer, name: []const u8, choices: []const []const u8, default: ?[]const u8) !void {
+    try out.print("{s}", .{name});
+    if (choices.len > 0) {
+        const joined = try std.mem.join(arena, ", ", choices);
+        try out.print(" ({s})", .{joined});
+    }
+    if (default) |d| try out.print(" [{s}]", .{d});
+    try out.writeAll(": ");
+}
+
+/// `observed_values` UNION `capture_defaults` UNION `declared_defaults`,
+/// sorted and deduped: the advisory choice list a prompt shows.
+fn choiceList(arena: std.mem.Allocator, dim: dimensions.Dimension) ![]const []const u8 {
+    var set = std.StringHashMap(void).init(arena);
+    for (dim.observed_values) |v| try set.put(v, {});
+    for (dim.capture_defaults) |v| try set.put(v, {});
+    for (dim.declared_defaults) |v| try set.put(v, {});
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = set.keyIterator();
+    while (it.next()) |k| try out.append(arena, k.*);
+    const slice = try out.toOwnedSlice(arena);
+    std.mem.sort([]const u8, slice, {}, lessThanStr);
+    return slice;
+}
+
+/// The interview default: the single value every `capture_defaults` and
+/// `declared_defaults` entry agrees on, or null when there is none (no
+/// defaults at all, or more than one distinct value among them).
+fn agreedDefault(dim: dimensions.Dimension) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    for (dim.capture_defaults) |v| {
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, v)) return null;
+        } else first = v;
+    }
+    for (dim.declared_defaults) |v| {
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, v)) return null;
+        } else first = v;
+    }
+    return first;
+}
+
+/// One stderr notice for `Outcome.unbound`: shared text between `mox apply`
+/// (`prefix = "mox apply: "`) and bare `mox facts` (`prefix = ""`, matching
+/// its own unprefixed messages) so the two callers stay worded identically.
+pub fn writeUnboundNotice(out: *Io.Writer, prefix: []const u8, names: []const []const u8) !void {
+    if (names.len == 0) return;
+    try out.print("{s}unbound facts:", .{prefix});
+    for (names) |n| try out.print(" {s}", .{n});
+    try out.print("\n{s}Answer interactively (mox apply / mox facts) or set directly (mox facts set <name> <value>).\n", .{prefix});
+}
+
+fn dimNameLess(_: void, a: dimensions.Dimension, b: dimensions.Dimension) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn containsStr(list: []const []const u8, s: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, s)) return true;
+    }
+    return false;
+}
 
 /// True when `s` holds a C0 control byte (newline, CR, tab, ...) or DEL. Such
 /// a byte in a fact value would inject a line into / break the parse of
@@ -191,7 +294,7 @@ pub fn persist(arena: std.mem.Allocator, io: Io, facts_path: []const u8, answers
         if (hasControlChar(ans.value)) return error.InvalidFactValue;
     }
 
-    const existing = Io.Dir.cwd().readFileAlloc(io, facts_path, arena, .limited(max_schema_bytes)) catch |e| switch (e) {
+    const existing = Io.Dir.cwd().readFileAlloc(io, facts_path, arena, .limited(max_facts_bytes)) catch |e| switch (e) {
         error.FileNotFound => "",
         else => return e,
     };
@@ -228,7 +331,7 @@ pub fn persist(arena: std.mem.Allocator, io: Io, facts_path: []const u8, answers
 /// with no assignment, is a no-op. Used to roll a fact write back to "never
 /// set" when the name did not exist before it was written.
 pub fn remove(arena: std.mem.Allocator, io: Io, facts_path: []const u8, name: []const u8) !void {
-    const existing = Io.Dir.cwd().readFileAlloc(io, facts_path, arena, .limited(max_schema_bytes)) catch |e| switch (e) {
+    const existing = Io.Dir.cwd().readFileAlloc(io, facts_path, arena, .limited(max_facts_bytes)) catch |e| switch (e) {
         error.FileNotFound => return,
         else => return e,
     };
@@ -260,64 +363,254 @@ fn findAnswer(answers: []const state_mod.Fact, name: []const u8) ?[]const u8 {
     return null;
 }
 
-test "walk: bound facts skipped, dependent when follows earlier answer" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
-    const schema = [_]SchemaFact{
-        .{ .name = "os", .prompt = "never asked" },
-        .{ .name = "cloud_backend", .prompt = "backend", .default = "icloud" },
-        .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
-        .{ .name = "email", .prompt = "email" },
+fn testDim(name: []const u8, opts: struct {
+    value_compared: bool = false,
+    presence: bool = false,
+    captured: bool = false,
+    observed_values: []const []const u8 = &.{},
+    capture_defaults: []const []const u8 = &.{},
+    declared_defaults: []const []const u8 = &.{},
+    asking_condition: ?*const dsl.ast.AxisExpr = null,
+    source_count: usize = 1,
+    needing_scripts: []const []const u8 = &.{},
+}) dimensions.Dimension {
+    return .{
+        .name = name,
+        .roles = .{ .value_compared = opts.value_compared, .presence = opts.presence, .captured = opts.captured },
+        .observed_values = opts.observed_values,
+        .capture_defaults = opts.capture_defaults,
+        .declared_defaults = opts.declared_defaults,
+        .asking_condition = opts.asking_condition,
+        .provenance = .{ .source_count = opts.source_count, .needing_scripts = opts.needing_scripts },
     };
-    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-    try bindings.put("os", "darwin");
-
-    var input = Io.Reader.fixed("gdrive\nme@example.com\nada@example.com\n");
-    const outcome = try walk(arena.allocator(), &schema, &bindings_r, &input, null);
-
-    try std.testing.expectEqual(@as(usize, 3), outcome.answers.len);
-    try std.testing.expectEqualStrings("cloud_backend", outcome.answers[0].name);
-    try std.testing.expectEqualStrings("gdrive", outcome.answers[0].value);
-    try std.testing.expectEqualStrings("gdrive_account", outcome.answers[1].name);
-    try std.testing.expectEqualStrings("me@example.com", outcome.answers[1].value);
-    try std.testing.expectEqualStrings("email", outcome.answers[2].name);
 }
 
-test "walk: empty answer takes the default; false when skips dependent" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const schema = [_]SchemaFact{
-        .{ .name = "cloud_backend", .prompt = "backend", .default = "icloud" },
-        .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
-    };
-    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-
-    var input = Io.Reader.fixed("\n");
-    const outcome = try walk(arena.allocator(), &schema, &bindings_r, &input, null);
-
-    try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
-    try std.testing.expectEqualStrings("icloud", outcome.answers[0].value);
+fn eqExpr(arena: std.mem.Allocator, axis: []const u8, value: []const u8) !*const dsl.ast.AxisExpr {
+    const e = try arena.create(dsl.ast.AxisExpr);
+    e.* = .{ .eq = .{ .axis = axis, .value = value } };
+    return e;
 }
 
-test "walk: non-interactive reports unanswered, hides dependents of unanswered gates" {
+test "walkDimensions: fixpoint exposure -- a work answer asks the gated dimension in the same run, personal never does" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    const a = arena.allocator();
 
-    const schema = [_]SchemaFact{
-        .{ .name = "cloud_backend", .prompt = "backend", .default = "icloud" },
-        .{ .name = "gdrive_account", .prompt = "account", .when = "cloud_backend=gdrive" },
+    const gate = try eqExpr(a, "profile", "work");
+    const dims = [_]dimensions.Dimension{
+        testDim("onepassword_account", .{ .captured = true, .capture_defaults = &.{}, .asking_condition = gate }),
+        testDim("profile", .{ .value_compared = true, .observed_values = &.{"work"}, .capture_defaults = &.{"personal"} }),
     };
-    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
-    const outcome = try walk(arena.allocator(), &schema, &bindings_r, null, null);
+    {
+        var bindings = std.StringHashMap([]const u8).init(a);
+        var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+        var r: dsl.resolver.Resolver = .{ .live = &live };
+        var input = Io.Reader.fixed("\n"); // Enter -> takes the "personal" default
+        var discard: [4096]u8 = undefined;
+        var out: Io.Writer = .fixed(&discard);
+        const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+        try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
+        try std.testing.expectEqualStrings("profile", outcome.answers[0].name);
+        try std.testing.expectEqualStrings("personal", outcome.answers[0].value);
+    }
+    {
+        var bindings = std.StringHashMap([]const u8).init(a);
+        var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+        var r: dsl.resolver.Resolver = .{ .live = &live };
+        var input = Io.Reader.fixed("work\nteam@example.com\n");
+        var out_buf: [4096]u8 = undefined;
+        var out: Io.Writer = .fixed(&out_buf);
+        const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+        try std.testing.expectEqual(@as(usize, 2), outcome.answers.len);
+        try std.testing.expectEqualStrings("profile", outcome.answers[0].name);
+        try std.testing.expectEqualStrings("work", outcome.answers[0].value);
+        try std.testing.expectEqualStrings("onepassword_account", outcome.answers[1].name);
+        try std.testing.expectEqualStrings("team@example.com", outcome.answers[1].value);
+    }
+}
+
+test "walkDimensions: a bound dimension (including bound-empty) is skipped, never asked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dims = [_]dimensions.Dimension{
+        testDim("profile", .{ .value_compared = true }),
+        testDim("signing_key", .{ .presence = true }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("profile", "work");
+    try bindings.put("signing_key", ""); // declined
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    const outcome = try walkDimensions(a, &dims, &r, .report_only);
+    try std.testing.expectEqual(@as(usize, 0), outcome.unbound.len);
+}
+
+test "walkDimensions: report-only lists eligible unbound dimensions, sorted, persists nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gate = try eqExpr(a, "profile", "work");
+    const dims = [_]dimensions.Dimension{
+        testDim("zzz_fact", .{ .presence = true }),
+        testDim("gated_fact", .{ .captured = true, .asking_condition = gate }),
+        testDim("aaa_fact", .{ .presence = true }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    const outcome = try walkDimensions(a, &dims, &r, .report_only);
+    try std.testing.expectEqual(@as(usize, 2), outcome.unbound.len);
+    try std.testing.expectEqualStrings("aaa_fact", outcome.unbound[0]);
+    try std.testing.expectEqualStrings("zzz_fact", outcome.unbound[1]);
     try std.testing.expectEqual(@as(usize, 0), outcome.answers.len);
-    try std.testing.expectEqual(@as(usize, 1), outcome.unanswered.len);
-    try std.testing.expectEqualStrings("cloud_backend", outcome.unanswered[0].name);
+}
+
+test "walkDimensions: --defaults binds the agreed default and declines the rest, never prompts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dims = [_]dimensions.Dimension{
+        testDim("holt_backend", .{ .value_compared = true, .observed_values = &.{"gdrive"}, .declared_defaults = &.{"icloud"} }),
+        testDim("signing_key", .{ .presence = true }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    const outcome = try walkDimensions(a, &dims, &r, .defaults);
+    try std.testing.expectEqual(@as(usize, 2), outcome.answers.len);
+    try std.testing.expectEqualStrings("holt_backend", outcome.answers[0].name);
+    try std.testing.expectEqualStrings("icloud", outcome.answers[0].value);
+    try std.testing.expectEqualStrings("signing_key", outcome.answers[1].name);
+    try std.testing.expectEqualStrings("", outcome.answers[1].value);
+}
+
+test "askDimension (via walkDimensions): an answer outside the observed set is confirmed once, accepted on 'y'" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dims = [_]dimensions.Dimension{
+        testDim("profile", .{ .value_compared = true, .observed_values = &.{ "personal", "work" } }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    var input = Io.Reader.fixed("side-project\ny\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+    try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
+    try std.testing.expectEqualStrings("side-project", outcome.answers[0].value);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "not among") != null);
+}
+
+test "askDimension (via walkDimensions): declining the keep-anyway confirmation re-asks the same dimension" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dims = [_]dimensions.Dimension{
+        testDim("profile", .{ .value_compared = true, .observed_values = &.{ "personal", "work" } }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    // "typo" is declined at the confirmation, so it re-asks; "work" is then
+    // accepted outright (an observed value needs no confirmation).
+    var input = Io.Reader.fixed("typo\nn\nwork\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+    try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
+    try std.testing.expectEqualStrings("work", outcome.answers[0].value);
+}
+
+test "askDimension (via walkDimensions): a UTF-8 answer is bound byte-for-byte" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dims = [_]dimensions.Dimension{
+        testDim("display_name", .{ .presence = true }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    var input = Io.Reader.fixed("\u{69d1}\u{6749}\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+    try std.testing.expectEqual(@as(usize, 1), outcome.answers.len);
+    try std.testing.expectEqualStrings("\u{69d1}\u{6749}", outcome.answers[0].value);
+}
+
+test "askDimension (via walkDimensions): enter with a default takes it, enter without one declines (binds empty)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dims = [_]dimensions.Dimension{
+        testDim("holt_backend", .{ .captured = true, .capture_defaults = &.{"icloud"} }),
+        testDim("email", .{ .presence = true }),
+    };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var live: dsl.resolver.Resolver.Live = .{ .bindings = &bindings };
+    var r: dsl.resolver.Resolver = .{ .live = &live };
+
+    var input = Io.Reader.fixed("\n\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    const outcome = try walkDimensions(a, &dims, &r, .{ .interactive = .{ .input = &input, .out = &out } });
+    try std.testing.expectEqual(@as(usize, 2), outcome.answers.len);
+    // Name order within the wave: "email" sorts before "holt_backend".
+    try std.testing.expectEqualStrings("email", outcome.answers[0].name);
+    try std.testing.expectEqualStrings("", outcome.answers[0].value);
+    try std.testing.expectEqualStrings("holt_backend", outcome.answers[1].name);
+    try std.testing.expectEqualStrings("icloud", outcome.answers[1].value);
+}
+
+test "printPrompt: choices and default rendered, provenance line names source count and needing scripts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const d = testDim("profile", .{
+        .value_compared = true,
+        .observed_values = &.{"work"},
+        .capture_defaults = &.{"personal"},
+        .source_count = 2,
+        .needing_scripts = &.{"scripts/pre/10-op.sh"},
+    });
+    var out_buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    try printProvenance(&out, d);
+    try printPrompt(a, &out, d.name, try choiceList(a, d), agreedDefault(d));
+
+    const got = out.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, got, "2 sources") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "scripts/pre/10-op.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "personal, work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[personal]") != null);
+}
+
+test "agreedDefault: disagreeing capture and declared defaults yield no default" {
+    const d = testDim("holt_backend", .{ .capture_defaults = &.{"personal"}, .declared_defaults = &.{"icloud"} });
+    try std.testing.expect(agreedDefault(d) == null);
 }
 
 test "persist: replaces existing assignment, keeps comments, escapes quotes" {
@@ -421,44 +714,14 @@ test "canPersist: rejects exactly what persist itself would refuse" {
     try std.testing.expect(!canPersist("", "ok"));
 }
 
-test "loadSchema: missing file yields empty schema" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const schema = try loadSchema(arena.allocator(), std.testing.io, "/nonexistent-repo-xyz");
-    try std.testing.expectEqual(@as(usize, 0), schema.len);
-}
+test "writeUnboundNotice: empty list writes nothing; a non-empty list names every dimension with the prefix" {
+    var buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try writeUnboundNotice(&out, "mox apply: ", &.{});
+    try std.testing.expectEqualStrings("", out.buffered());
 
-test "ask: EOF on a no-default fact errors instead of hanging" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const schema = [_]SchemaFact{
-        .{ .name = "email", .prompt = "email" },
-    };
-    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-
-    var input = Io.Reader.fixed("");
-    try std.testing.expectError(
-        error.InterviewInputClosed,
-        walk(arena.allocator(), &schema, &bindings_r, &input, null),
-    );
-}
-
-test "ask: blank-line answers on a no-default fact are bounded, not infinite" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const schema = [_]SchemaFact{
-        .{ .name = "email", .prompt = "email" },
-    };
-    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
-    var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-
-    const blanks = "\n" ** (max_ask_attempts + 5);
-    var input = Io.Reader.fixed(blanks);
-    try std.testing.expectError(
-        error.InterviewInputStalled,
-        walk(arena.allocator(), &schema, &bindings_r, &input, null),
-    );
+    try writeUnboundNotice(&out, "mox apply: ", &.{ "gdrive_account", "profile" });
+    const got = out.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, got, "mox apply: unbound facts: gdrive_account profile\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "mox facts set") != null);
 }

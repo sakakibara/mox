@@ -26,8 +26,8 @@ fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
         try ctx.err.print("mox facts: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
     }
 
-    const schema = try mox.machine.interview.loadSchema(ctx.alloc, ctx.io, context.paths.repo_dir);
-    if (schema.len == 0) return 0;
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
+    if (discovery.dimensions.len == 0) return 0;
 
     // The interview may persist answers into facts.toml; guard that
     // read-modify-write with the command lock, as `facts set` and `apply` do.
@@ -41,18 +41,21 @@ fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
     const interactive = tty.isInteractive(0);
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader: std.Io.File.Reader = .initStreaming(.stdin(), ctx.io, &stdin_buf);
-    const input: ?*std.Io.Reader = if (interactive) &stdin_reader.interface else null;
+    const mode: mox.machine.interview.Mode = if (interactive)
+        .{ .interactive = .{ .input = &stdin_reader.interface, .out = ctx.out } }
+    else
+        .report_only;
 
-    const outcome = try mox.machine.interview.walk(ctx.alloc, schema, &bindings, input, if (interactive) ctx.out else null);
+    const outcome = try mox.machine.interview.walkDimensions(ctx.alloc, discovery.dimensions, &bindings, mode);
     if (outcome.answers.len > 0) {
         try mox.machine.interview.persist(ctx.alloc, ctx.io, context.paths.facts_path, outcome.answers);
         for (outcome.answers) |a| {
             try ctx.out.print("{s} = \"{s}\"\n", .{ a.name, a.value });
         }
     }
-    if (outcome.unanswered.len > 0) {
+    if (outcome.unbound.len > 0) {
         try ctx.err.writeAll("missing facts:");
-        for (outcome.unanswered) |f| try ctx.err.print(" {s}", .{f.name});
+        for (outcome.unbound) |n| try ctx.err.print(" {s}", .{n});
         try ctx.err.writeAll("\nSet directly with 'mox facts set <name> <value>'.\n");
         return 1;
     }

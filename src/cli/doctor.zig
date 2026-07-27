@@ -76,6 +76,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox doctor: {s}\n", .{notice});
         }
     } else |_| {}
+    if (try mox.machine.state.schemaLeftoverNotice(ctx.alloc, ctx.io, context.paths.repo_dir)) |notice| {
+        try ctx.err.print("mox doctor: {s}\n", .{notice});
+    }
 
     // `problems` are the rebuildable breakage the rc gates on and `--fix`
     // remediates (malformed provenance). `advisories` are findings mox reports

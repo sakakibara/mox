@@ -908,10 +908,11 @@ test "facts interview: persist is guarded by the command lock" {
     const a = arena.allocator();
 
     try tmp.dir.createDirPath(io, "repo/src");
-    try tmp.dir.createDirPath(io, "repo/data");
+    // A bare presence gate makes "profile" a discovered dimension, so the
+    // interview has something to (attempt to) persist.
     try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/data/facts-schema.toml",
-        .data = "[[fact]]\nname = \"profile\"\nprompt = \"Profile\"\n",
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile\nx = 1\n# mox: end\n",
     });
 
     const c = try cliSetup(a, io, &tmp);
@@ -929,6 +930,276 @@ test "facts interview: persist is guarded by the command lock" {
     const r = try c.run(&.{ "mox", "facts" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "lock held") != null);
+}
+
+/// A corpus-shaped fixture: `holt_backend`/`profile` are value-compared
+/// (asked unconditioned, wave 0); `gdrive_account` is captured only under
+/// `holt_backend=gdrive`, and the two `onepassword_*` facts only under
+/// `profile=work` -- both wave-1-or-never, per the fixpoint asking law.
+fn writeConditionalCorpus(io: Io, tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/mox-corpus.conf",
+        .data =
+        \\profile = <machine.profile | default "personal">
+        \\# mox: when holt_backend=gdrive
+        \\gdrive_account = <machine.gdrive_account>
+        \\# mox: end
+        \\# mox: when profile=work
+        \\onepassword_account = <machine.onepassword_account>
+        \\onepassword_vault = <machine.onepassword_vault>
+        \\# mox: end
+        \\
+        ,
+    });
+}
+
+test "apply interview: a personal/icloud answer path never asks gdrive_account or the onepassword pair" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeConditionalCorpus(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+
+    // Wave 0 asks holt_backend then profile (name order); Enter on
+    // holt_backend declines (no default), Enter on profile takes its
+    // "personal" capture default -- neither unlocks a wave-1 question.
+    const r = try c.runWithInput(&.{ "mox", "apply" }, "\n\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "gdrive_account") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_account") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_vault") == null);
+
+    const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "profile = \"personal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "holt_backend") == null or std.mem.indexOf(u8, facts, "holt_backend = \"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "gdrive_account") == null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "onepassword_account") == null);
+}
+
+test "apply interview: a work answer path asks gdrive_account/onepassword facts newly exposed in the same run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeConditionalCorpus(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+
+    // Wave 0: holt_backend=gdrive, profile=work. Wave 1 (fixpoint-exposed in
+    // the same run): gdrive_account, onepassword_account, onepassword_vault,
+    // asked in name order.
+    const r = try c.runWithInput(
+        &.{ "mox", "apply" },
+        "gdrive\nwork\ndrive@example.com\nteam@example.com\nvault-x\n",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "gdrive_account") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_account") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "onepassword_vault") != null);
+
+    const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "holt_backend = \"gdrive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "profile = \"work\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "gdrive_account = \"drive@example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "onepassword_account = \"team@example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "onepassword_vault = \"vault-x\"") != null);
+    _ = r.rc;
+}
+
+test "apply --defaults: binds each agreed default and declines the rest, non-TTY; a second run asks nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/mox-defaults.conf",
+        .data =
+        \\# mox: default holt_backend="icloud"
+        \\# mox: when holt_backend=gdrive
+        \\x = 1
+        \\# mox: end
+        \\# mox: when signing_key
+        \\y = 1
+        \\# mox: end
+        \\
+        ,
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r1 = try c.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "holt_backend = \"icloud\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "signing_key = \"\"") != null);
+
+    // Both dimensions are now bound (holt_backend non-empty, signing_key a
+    // persisted decline): nothing left to ask, no unbound-facts notice.
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r2.err, "unbound facts") == null);
+}
+
+test "apply: a dry run never persists interview answers and reports like a non-interactive run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.config/x.conf", .data = "# mox: when signing_key\ny = 1\n# mox: end\n" });
+    const c = try cliSetup(a, io, &tmp);
+
+    // Scripted stdin present, but --dry-run must still behave like a
+    // non-interactive report: nothing is asked or persisted.
+    const r = try c.runWithInput(&.{ "mox", "apply", "--dry-run" }, "some-value\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unbound facts: signing_key") != null);
+    const facts_path = try c.homePath(".config/mox/facts.toml");
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, facts_path, .{}));
+}
+
+test "apply: a non-interactive run with unbound facts prints one stderr notice and does not refuse" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/x.conf",
+        .data = "# mox: when signing_key\na = 1\n# mox: end\n# mox: when aaa_fact\nb = 1\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: unbound facts: aaa_fact signing_key\n") != null);
+    // Exactly one notice line, not one per dimension.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.err, "unbound facts:"));
+}
+
+test "apply: conflicting `# mox: default` declarations for one name are surfaced loudly on stderr, naming both sites" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/a.conf",
+        .data = "# mox: default holt_backend=\"icloud\"\n# mox: when holt_backend\nx = 1\n# mox: end\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/b.conf",
+        .data = "# mox: default holt_backend=\"gdrive\"\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "conflicting") != null);
+    try std.testing.expect(lineHasBoth(r.err, "a.conf", "icloud"));
+    try std.testing.expect(lineHasBoth(r.err, "b.conf", "gdrive"));
+}
+
+test "apply/doctor: a leftover data/facts-schema.toml gets one loud never-read notice, from both commands" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts-schema.toml",
+        .data = "[[fact]]\nname = \"never_read\"\nprompt = \"x\"\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r_apply = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "facts-schema.toml exists but is no longer read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "delete it") != null);
+    // Nothing consumes "never_read" anywhere else, so it names no dimension
+    // and is never asked about.
+    try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "never_read") == null);
+
+    const r_doctor = try c.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, r_doctor.err, "mox doctor: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r_doctor.err, "facts-schema.toml exists but is no longer read") != null);
+}
+
+test "apply: interview and drift resolution share one stdin reader -- piped input answers both in one run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    // A fact-free file to drift, plus a fact-bearing file whose capture falls
+    // back to its own default so it composes fine before the fact is ever
+    // answered.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "line one\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "[user]\n\teditor = <machine.editor_name | default \"vim\">\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    // First apply: non-interactive, materializes both live files.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // Hand-edit the drift-only file so this run's per-file loop hits a drift
+    // prompt after the interview has already run.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("notes.txt"), .data = "line one\nedited\n" });
+
+    // One piped stream: first line answers the editor_name interview
+    // (still unbound after the first, non-interactive apply), the rest
+    // answers the drift prompt for notes.txt ('s' = skip).
+    const r = try c.runWithInput(&.{ "mox", "apply" }, "emacs\ns\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.txt") != null);
+
+    const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "editor_name = \"emacs\"") != null);
+    // The drift answer ('s', skip) was correctly read AFTER the interview
+    // consumed its own line, not lost to a second, independently buffered
+    // stdin reader: the live edit survives untouched.
+    try std.testing.expectEqualStrings("line one\nedited\n", try read(io, a, try c.homePath("notes.txt")));
+}
+
+test "mox facts: bare output stays 'name = \"value\"' lines, byte-identical, with no dimension left to ask" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    const c = try cliSetup(a, io, &tmp);
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "alpha", "1" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "beta", "2" })).rc);
+
+    const r = try c.run(&.{ "mox", "facts" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("alpha = \"1\"\nbeta = \"2\"\n", r.out);
 }
 
 test "apply: a resolved secret value is never persisted anywhere in the state dir" {

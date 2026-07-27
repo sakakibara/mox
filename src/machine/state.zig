@@ -166,6 +166,21 @@ pub fn extrasNotice(arena: std.mem.Allocator, io: Io, xdg_config_home: []const u
     );
 }
 
+/// One-line notice for a legacy `<repo_dir>/data/facts-schema.toml` still on
+/// disk: 0.7.0 no longer reads it (the interview now derives its questions
+/// from a repo's own sources instead of a hand-maintained schema -- D2/D4),
+/// so a caller that applies or diagnoses prints this once rather than
+/// leaving an unread file's silence unexplained. Null when no file is there.
+pub fn schemaLeftoverNotice(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const u8 {
+    const path = try std.fs.path.join(arena, &.{ repo_dir, "data", "facts-schema.toml" });
+    Io.Dir.cwd().access(io, path, .{}) catch return null;
+    return try std.fmt.allocPrint(
+        arena,
+        "{s} exists but is no longer read; the interview derives from your sources -- delete it",
+        .{path},
+    );
+}
+
 /// Capture a snapshot of the current machine state.
 ///
 /// Reads OS/arch from the build (overridable via `MOX_OS`/`MOX_ARCH`, so the
@@ -656,6 +671,37 @@ test "extrasNotice: null when no file is there" {
     const xdg_config_home = try tmpAbsPath(a, &tmp, "config");
 
     try std.testing.expect(try extrasNotice(a, io, xdg_config_home) == null);
+}
+
+test "schemaLeftoverNotice: names the path and that it is no longer read, when the file exists" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/facts-schema.toml", .data = "[[fact]]\nname = \"profile\"\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo_dir = try tmpAbsPath(a, &tmp, "repo");
+
+    const notice = (try schemaLeftoverNotice(a, io, repo_dir)).?;
+    try std.testing.expect(std.mem.indexOf(u8, notice, "facts-schema.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "no longer read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "delete it") != null);
+}
+
+test "schemaLeftoverNotice: null when no file is there" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo_dir = try tmpAbsPath(a, &tmp, "repo");
+
+    try std.testing.expect(try schemaLeftoverNotice(a, io, repo_dir) == null);
 }
 
 test "capture: an extras.toml present does not fail capture, and its tools still resolve lazily" {

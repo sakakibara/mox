@@ -1309,8 +1309,6 @@ test "apply: nothing about this machine is written outside it" {
 
     // A file that gates on one fact and interpolates another: the two shapes
     // that published a value before.
-    try writeRepo(io, &tmp, "repo/data/facts-schema.toml", "[[fact]]\nname = \"signing_key\"\nprompt = \"k\"\n" ++
-        "[[fact]]\nname = \"email\"\nprompt = \"e\"\n");
     try writeRepo(io, &tmp, "repo/src/.gitconfig", "[user]\n" ++
         "# mox: when signing_key\n" ++
         "\tsigningkey = <machine.signing_key>\n" ++
