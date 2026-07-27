@@ -14,23 +14,32 @@ and tar). It downloads the release binary for your platform, verifies it against
 the release's `SHA256SUMS`, and installs to `~/.local/bin` (override with
 `BINDIR`):
 
+### sh & curl
+
 ```sh
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)"
 ```
 
+### sh & wget
+
+```sh
+sh -c "$(wget -qO- https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)"
+```
+
+### powershell
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sakakibara/mox/main/install.ps1)))
+```
+
 mox is meant to be the *first* thing on a new machine -- it installs your
-runtimes and packages from there. Pass any mox arguments after `--` to install
-and bootstrap in one step:
+runtimes and packages from there. Any arguments after the script (after `--`
+in the sh forms) are passed to the installed mox, so one line installs and
+bootstraps:
 
 ```sh
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)" -- \
     init --clone https://github.com/<you>/dotfiles --apply
-```
-
-On Windows (PowerShell):
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sakakibara/mox/main/install.ps1)))
 ```
 
 `MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror. Update in
