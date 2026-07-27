@@ -49,6 +49,7 @@ pub const ParseError = error{
     ExpectedFieldRef,
     UnclosedParen,
     ExpressionTooDeep,
+    UnknownPathAxisValue,
     OutOfMemory,
 };
 
@@ -157,6 +158,9 @@ pub const Parser = struct {
                         node.* = .{ .axis_with_field = .{ .axis = name, .field_ref = val_ident } };
                         return node;
                     }
+                    if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(val_ident)) {
+                        return error.UnknownPathAxisValue;
+                    }
                     const node = try self.arena.create(RowExpr);
                     node.* = .{ .eq = .{ .ref = name, .value = val_ident } };
                     return node;
@@ -165,12 +169,18 @@ pub const Parser = struct {
                 // the axis grammar): `kind=from`, `os=end`, ...
                 .keyword => |val_kw| {
                     self.advance();
+                    if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(val_kw)) {
+                        return error.UnknownPathAxisValue;
+                    }
                     const node = try self.arena.create(RowExpr);
                     node.* = .{ .eq = .{ .ref = name, .value = val_kw } };
                     return node;
                 },
                 .string => |val_str| {
                     self.advance();
+                    if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(val_str)) {
+                        return error.UnknownPathAxisValue;
+                    }
                     const node = try self.arena.create(RowExpr);
                     node.* = .{ .eq = .{ .ref = name, .value = val_str } };
                     return node;
@@ -413,6 +423,12 @@ test "parse: a quoted literal axis eq accepts a UTF-8 value" {
     try bindings.put("profile", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e");
     const scope: []const Frame = &.{};
     try std.testing.expect(try evaluate(a, e, scope, &bindings_r, null));
+}
+
+test "parse: an unknown path= literal is rejected in a row expression too" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.UnknownPathAxisValue, parseString(arena.allocator(), "path=brew"));
 }
 
 test "parse: complex `not entry.X or entry.X has Y`" {

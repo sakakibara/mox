@@ -304,6 +304,14 @@ fn applyPass(
             try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
             if (e == error.UnknownShell)
                 try ctx.err.print("mox apply:   accepted shells: fish, zsh, bash, powershell\n", .{});
+            if (e == error.UnknownPathAxisValue) {
+                try ctx.err.writeAll("mox apply:   accepted path values: ");
+                for (mox.dsl.axis.path_axis_members, 0..) |m, i| {
+                    if (i > 0) try ctx.err.writeAll(", ");
+                    try ctx.err.writeAll(m);
+                }
+                try ctx.err.writeAll("\n");
+            }
             if (diag.capture()) |cap|
                 try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
             counts.fail += 1;

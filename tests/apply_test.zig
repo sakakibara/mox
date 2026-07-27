@@ -4706,3 +4706,41 @@ test "apply completions: an unknown shell names the accepted set" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownShell") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted shells: fish, zsh, bash, powershell") != null);
 }
+
+test "apply: an unknown path= value names the closed set; a real member keeps working" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zshrc",
+        .data = "# mox: when path=brew\nbad\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownPathAxisValue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted path values: brew_prefix, cargo_home, gopath, pnpm_home") != null);
+}
+
+test "apply: a real path= member composes without error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zshrc",
+        .data = "# mox: when path=brew_prefix\nok\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownPathAxisValue") == null);
+}

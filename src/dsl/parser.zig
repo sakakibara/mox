@@ -31,6 +31,7 @@ pub const ParseError = error{
     IntoOnNestedFor,
     ExpectedShell,
     UnknownShell,
+    UnknownPathAxisValue,
 };
 
 /// Loop-variable names that shadow a fixed interpolation namespace: a frame so

@@ -1,5 +1,6 @@
 const std = @import("std");
 const tree = @import("tree.zig");
+const axis_mod = @import("../dsl/axis.zig");
 
 const AxisTuple = tree.AxisTuple;
 const Pair = tree.AxisTuple.Pair;
@@ -45,6 +46,10 @@ fn parseStem(arena: std.mem.Allocator, stem: []const u8) ParseError!AxisTuple {
         const value = part[eq_idx + 1 ..];
         if (!isValidAxisName(name)) return error.InvalidAxisName;
         if (!isValidAxisValue(value)) return error.InvalidAxisValue;
+        // `path=` is a closed axis (D5): a tuple naming any member outside
+        // the four derived tool-home facts is refused, same as an unknown
+        // value in a `when`/`where` expression.
+        if (std.mem.eql(u8, name, "path") and !axis_mod.isValidPathAxisValue(value)) return error.InvalidAxisValue;
         try pairs.append(arena, .{
             .name = try arena.dupe(u8, name),
             .value = try arena.dupe(u8, value),
@@ -158,6 +163,24 @@ test "parseFilename: a UTF-8 value is accepted verbatim" {
     const t = try parseFilename(fba.allocator(), "profile=\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.toml");
     try std.testing.expectEqualStrings("profile", t.pairs[0].name);
     try std.testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", t.pairs[0].value);
+}
+
+test "parseFilename: an unknown path= member is rejected" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const result = parseFilename(fba.allocator(), "path=brew");
+    try std.testing.expectError(error.InvalidAxisValue, result);
+}
+
+test "parseFilename: every real path= member is accepted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (axis_mod.path_axis_members) |m| {
+        const filename = try std.fmt.allocPrint(a, "path={s}", .{m});
+        const t = try parseFilename(a, filename);
+        try std.testing.expectEqualStrings(m, t.pairs[0].value);
+    }
 }
 
 test "parseFilenameVerbatim: keeps a dotted value parseFilename would strip" {
