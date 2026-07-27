@@ -14,7 +14,17 @@ directive     = marker "mox:" ( line_dir | region_open | "end" ) EOL ;
 
 line_dir      = "include" string [ "when" axis_expr ]
               | "secret" string
+              | "default" fact_name "=" string
               | "completions" shell string [ "when" axis_expr ] ;
+
+(* `default` declares the interview default for fact `<name>`: stripped from
+   output, never gates or emits anything, and is not a region -- no `end`.
+   Compose semantics are otherwise untouched; an unbound fact still never
+   silently reads as this value, only the interview consults it. `fact_name`
+   is `[a-z][a-z0-9_]*`, the same stricter charset `# mox: needs` and an
+   axis-tuple filename's `<axis>` enforce (narrower than the general
+   `ident` a `when` axis name lexes as). *)
+fact_name     = lower { lower | digit | "_" } ;
 
 (* The `completions` shell is a positional typed token, validated by the
    parser against the supported set (`fish` | `zsh` | `bash` |

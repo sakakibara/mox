@@ -32,7 +32,22 @@ pub const ParseError = error{
     ExpectedShell,
     UnknownShell,
     ReservedAxisName,
+    InvalidFactName,
 };
+
+/// The fact-name charset a `# mox: default <name>=...` name must satisfy:
+/// `[a-z][a-z0-9_]*`, the same charset `source.tuple.isValidAxisName`
+/// enforces on axis names and `# mox: needs` enforces on script fact names.
+/// Duplicated here (rather than imported) because `dsl` sits below `source`
+/// in the module layering and must not depend back up into it.
+fn isValidFactName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!std.ascii.isLower(name[0])) return false;
+    for (name) |c| {
+        if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_')) return false;
+    }
+    return true;
+}
 
 /// Loop-variable names that shadow a fixed interpolation namespace: a frame so
 /// named would intercept `<machine.X>` / `<env.X>` / `<data.X>` before the
@@ -136,6 +151,23 @@ pub fn parseLineDirective(arena: std.mem.Allocator, args: []const u8, line_no: u
             .end_line = line_no,
         };
     }
+    if (std.mem.eql(u8, verb, "default")) {
+        const name = switch (ps.peek().kind) {
+            .ident => |s| s,
+            else => return error.ExpectedAxisName,
+        };
+        ps.advance();
+        if (!isValidFactName(name)) return error.InvalidFactName;
+        if (ps.peek().kind != .eq) return error.ExpectedEquals;
+        ps.advance();
+        const value = try ps.expectString();
+        try ps.expectEof();
+        return .{
+            .kind = .{ .default = .{ .name = name, .value = value } },
+            .start_line = line_no,
+            .end_line = line_no,
+        };
+    }
     if (std.mem.eql(u8, verb, "completions")) {
         const shell_word = switch (ps.peek().kind) {
             .ident => |s| s,
@@ -184,6 +216,60 @@ test "parseLineDirective: secret" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const dir = try parseLineDirective(fba.allocator(), "secret \"op://foo\"", 1);
     try std.testing.expectEqualStrings("op://foo", dir.kind.secret.uri);
+}
+
+test "parseLineDirective: default" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const dir = try parseLineDirective(fba.allocator(), "default holt_backend=\"icloud\"", 1);
+    try std.testing.expect(dir.kind == .default);
+    try std.testing.expectEqualStrings("holt_backend", dir.kind.default.name);
+    try std.testing.expectEqualStrings("icloud", dir.kind.default.value);
+}
+
+test "parseLineDirective: default rejects a missing equals" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const result = parseLineDirective(fba.allocator(), "default holt_backend \"icloud\"", 1);
+    try std.testing.expectError(error.ExpectedEquals, result);
+}
+
+test "parseLineDirective: default rejects an unquoted value" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const result = parseLineDirective(fba.allocator(), "default holt_backend=icloud", 1);
+    try std.testing.expectError(error.ExpectedString, result);
+}
+
+test "parseLineDirective: default rejects a malformed name charset" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    // Uppercase lexes as a valid ident (the DSL's general axis-name charset
+    // is broader) but fails the stricter fact-name charset `default` shares
+    // with `# mox: needs` and axis-tuple filenames.
+    const result = parseLineDirective(fba.allocator(), "default Holt-Backend=\"icloud\"", 1);
+    try std.testing.expectError(error.InvalidFactName, result);
+}
+
+test "parseLineDirective: default rejects an empty name" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const result = parseLineDirective(fba.allocator(), "default =\"icloud\"", 1);
+    try std.testing.expectError(error.ExpectedAxisName, result);
+}
+
+test "parseLineDirective: default rejects trailing junk" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const result = parseLineDirective(fba.allocator(), "default holt_backend=\"icloud\" extra", 1);
+    try std.testing.expectError(error.UnexpectedTrailingTokens, result);
+}
+
+test "parseLineDirective: default accepts a quoted UTF-8 value" {
+    var allocator_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const dir = try parseLineDirective(fba.allocator(), "default locale=\"\xe6\x9d\xb1\xe4\xba\xac\"", 1);
+    try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", dir.kind.default.value);
 }
 
 test "parseLineDirective: completions with shell, registry, and when" {

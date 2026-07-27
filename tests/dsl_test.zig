@@ -109,6 +109,21 @@ test "integration: secret directive on its own line" {
     try std.testing.expectEqualStrings("op://Personal/GitHub/token", parsed.directives[0].kind.secret.uri);
 }
 
+test "integration: default directive on its own line" {
+    var allocator_buf: [32768]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const src =
+        \\[holt]
+        \\# mox: default holt_backend="icloud"
+        \\backend = "<machine.holt_backend>"
+    ;
+    const parsed = try mox.dsl.driver.parseFile(fba.allocator(), src, "#", null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.directives.len);
+    try std.testing.expect(parsed.directives[0].kind == .default);
+    try std.testing.expectEqualStrings("holt_backend", parsed.directives[0].kind.default.name);
+    try std.testing.expectEqualStrings("icloud", parsed.directives[0].kind.default.value);
+}
+
 test "integration: comment marker lookup" {
     try std.testing.expectEqualStrings("#", mox.dsl.comment.markerForExtension(".sh").?);
     try std.testing.expectEqualStrings("--", mox.dsl.comment.markerForExtension(".lua").?);

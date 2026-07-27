@@ -9,7 +9,7 @@ const KEYWORDS = [_][]const u8{
     "remove",  "from",        "when",   "for",
     "secret",  "in",          "and",    "or",
     "not",     "end",         "where",  "has",
-    "into",    "completions", "bound",
+    "into",    "completions", "bound",  "default",
 };
 
 fn isKeyword(s: []const u8) bool {

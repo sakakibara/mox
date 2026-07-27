@@ -1093,6 +1093,10 @@ fn emitDirective(
         },
         .for_loop => |loop| try emitForLoop(arena, io, em, file, loop, bindings, ctx, secrets, nest),
         .completions => return error.CompletionsOnNonGenerator,
+        // An interview default declares nothing compose acts on: the line is
+        // consumed and emits nothing, never gates anything, and is not a
+        // region.
+        .default => {},
         .secret => |s| {
             // A dedicated-manager secret marks the file for auto-0600 (set on
             // the resolve path before resolution; a failure aborts the compose).

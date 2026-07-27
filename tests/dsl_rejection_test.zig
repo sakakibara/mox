@@ -149,6 +149,22 @@ test "reject: completions with trailing tokens after the when clause" {
     );
 }
 
+test "reject: a default directive followed by a body and end marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // `default` is line-level, like `secret`: it never opens a region, so a
+    // trailing `# mox: end` has no opener to match.
+    const src =
+        \\# mox: default holt_backend="icloud"
+        \\body
+        \\# mox: end
+    ;
+    try std.testing.expectError(
+        error.UnmatchedEndMarker,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}
+
 test "reject: completions shell given as a key=value argument" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

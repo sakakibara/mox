@@ -143,6 +143,15 @@ pub const Directive = struct {
         secret: struct {
             uri: []const u8,
         },
+        /// `# mox: default <name>="<value>"` - line-level. Declares the
+        /// interview default for fact `<name>`; stripped from output, never
+        /// gates or emits anything, and compose semantics are otherwise
+        /// untouched (an unbound fact still never silently reads as this
+        /// value -- only the interview consults it).
+        default: struct {
+            name: []const u8,
+            value: []const u8,
+        },
         /// `# mox: completions <shell> "<registry>" [when <expr>]` - generator
         /// directive: the file emits one completion stub per registry row into
         /// its target directory and is not materialized itself. The shell is a

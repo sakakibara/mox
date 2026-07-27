@@ -701,6 +701,122 @@ test "compose catB: secret directive emits placeholder with trailing newline" {
     try std.testing.expect(std.mem.indexOf(u8, out.?, "<SECRET:op://Personal/email>\nname") != null);
 }
 
+test "compose catB: a top-level default directive is stripped, surrounding content intact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.config/holt/config.toml", "[holt]\n" ++
+        "# mox: default holt_backend=\"icloud\"\n" ++
+        "backend = \"x\"\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.?, "mox: default") == null);
+    try std.testing.expectEqualStrings("[holt]\nbackend = \"x\"\n", out.?);
+}
+
+test "compose catB: a default directive nested in a when-gate body is stripped; the gate still governs its siblings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when profile=work\n" ++
+        "# mox: default holt_backend=\"icloud\"\n" ++
+        "export WORK=1\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+
+    var work = std.StringHashMap([]const u8).init(a);
+    var work_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &work } };
+    try work.put("profile", "work");
+    const work_out = (try mox.compose.catB.compose(a, io, tree.files[0], &work_r, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, work_out, "mox: default") == null);
+    try std.testing.expectEqualStrings("export WORK=1\n", work_out);
+
+    // The default directive never gates: the enclosing `when` alone decides
+    // whether its sibling content emits. The gate is scoped (`# mox: end`),
+    // not a whole-file gate, so a false condition composes to empty content
+    // rather than omitting the file.
+    var personal = std.StringHashMap([]const u8).init(a);
+    var personal_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &personal } };
+    try personal.put("profile", "personal");
+    const personal_out = (try mox.compose.catB.compose(a, io, tree.files[0], &personal_r, null)).?;
+    try std.testing.expectEqualStrings("", personal_out);
+}
+
+test "compose catB: a default directive nested in a for-loop body is stripped from every row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\nname = \"fd\"\n[[tools]]\nname = \"rg\"\n");
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for entry in \"data/tools.toml\"\n" ++
+        "# mox: default holt_backend=\"icloud\"\n" ++
+        "# alias <entry.name>\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "mox: default") == null);
+    try std.testing.expectEqualStrings("alias fd\nalias rg\n", out);
+}
+
+test "compose catB: a default directive alongside an append fragment doesn't disturb it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "export A=1\n" ++
+        "# mox: default holt_backend=\"icloud\"\n" ++
+        "# mox: append \"extras/darwin.sh\" when os=darwin\n" ++
+        "# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.zshrc.d/extras/darwin.sh", "export DARWIN=1\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("os", "darwin");
+
+    const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "mox: default") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export DARWIN=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export A=1") != null);
+}
+
 test "compose catB: inline <secret:URI> resolves mid-line and marks the line .secret" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -31,6 +31,15 @@
 //!
 //! Built-ins, the open probe axes, reserved axis names, and `data/facts.toml`-
 //! derived names are excluded by category, never by a hand-written name list.
+//!
+//! A `# mox: default NAME="VALUE"` line directive (found at the same
+//! nesting depths, unconditioned -- its enclosing gates are irrelevant, it
+//! is a repo-level statement) declares an interview default for `NAME`; it
+//! is not itself a discovery channel (a default alone consumes nothing) and
+//! only attaches to a dimension one of the three channels above already
+//! made real, surfacing as `Dimension.declared_defaults`. A name declared
+//! with disagreeing values, or declared for a name no channel above made a
+//! dimension, is loud but non-fatal: `Discovery.default_diagnostics`.
 
 const std = @import("std");
 const dsl = @import("../dsl/root.zig");
@@ -75,6 +84,13 @@ pub const Dimension = struct {
     /// Every distinct `| default "..."` value observed on a capture of this
     /// name, sorted and deduped.
     capture_defaults: []const []const u8,
+    /// The declared interview default from `# mox: default NAME="VALUE"`
+    /// (D2), when the repo's `default` directives for this name agree: a
+    /// single-element slice holding that value, or empty when no `default`
+    /// directive names this dimension. Never more than one element --
+    /// conflicting declarations for the same name resolve to no value here
+    /// (see `Discovery.default_diagnostics`) rather than an arbitrary pick.
+    declared_defaults: []const []const u8,
     /// The OR of the enclosing-gate expressions of this dimension's CAPTURE
     /// occurrences. Null when the dimension has any value-compared or
     /// presence occurrence (the comparison itself is the demand -- D2), or
@@ -110,6 +126,29 @@ pub const Diagnostic = struct {
     name: []const u8,
 };
 
+/// A `# mox: default NAME="VALUE"` anomaly worth surfacing without failing
+/// the whole discovery run -- neither aborts discovery, matching
+/// `Diagnostic`'s own "loud, never silently dropped" contract.
+pub const DefaultDiagnostic = union(enum) {
+    /// Two `# mox: default` directives named the same fact with different
+    /// values.
+    conflict: struct {
+        name: []const u8,
+        first_source: []const u8,
+        first_value: []const u8,
+        second_source: []const u8,
+        second_value: []const u8,
+    },
+    /// A `# mox: default` directive names a fact no source in the repo
+    /// otherwise compares, captures, or tests for presence -- a default
+    /// alone consumes nothing, so no dimension is created for it either
+    /// (keeps `doctor`'s stale-fact logic coherent: D5).
+    unclaimed: struct {
+        name: []const u8,
+        source: []const u8,
+    },
+};
+
 pub const Discovery = struct {
     /// Every discovered dimension, sorted by name.
     dimensions: []const Dimension,
@@ -118,6 +157,9 @@ pub const Discovery = struct {
     scripts: []const ScriptRecord,
     /// Capture-charset anomalies, in scan order.
     diagnostics: []const Diagnostic = &.{},
+    /// `# mox: default` conflict/unclaimed anomalies, in first-encounter
+    /// order by name.
+    default_diagnostics: []const DefaultDiagnostic = &.{},
 };
 
 /// A `# mox: needs <name>...` name fails the fact-name charset
@@ -137,6 +179,7 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
         .derived_names = std.StringHashMap(void).init(arena),
         .scripts = .empty,
         .diagnostics = .empty,
+        .declared_defaults = .empty,
     };
 
     for (try derived_facts.declaredNames(arena, io, repo_dir, "")) |n| {
@@ -169,6 +212,14 @@ const DimWork = struct {
     sources: std.StringHashMap(void),
 };
 
+/// One collected `# mox: default NAME="VALUE"` occurrence, before conflict
+/// resolution groups them by name.
+const RawDefault = struct {
+    name: []const u8,
+    value: []const u8,
+    source: []const u8,
+};
+
 const Discoverer = struct {
     arena: std.mem.Allocator,
     io: Io,
@@ -176,6 +227,10 @@ const Discoverer = struct {
     derived_names: std.StringHashMap(void),
     scripts: std.ArrayList(ScriptRecord),
     diagnostics: std.ArrayList(Diagnostic),
+    /// Every `# mox: default` occurrence collected during the tree scan, at
+    /// whatever position the traversal reached it -- unconditioned by
+    /// construction, since the collection call never consults a gate stack.
+    declared_defaults: std.ArrayList(RawDefault),
 
     /// The dimension work-slot for `name`, creating it on first reference, or
     /// null when `name` is excluded by category (built-in, open axis,
@@ -323,8 +378,28 @@ const Discoverer = struct {
                 if (k.where) |r| try self.recordRowExpr(r, source_key, loop_vars);
             },
             .completions => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
-            .from, .secret => {},
+            .from, .secret, .default => {},
         }
+    }
+
+    /// Collect a `# mox: default NAME="VALUE"` directive, whatever position
+    /// `scanBody` visited it at -- unconditioned by construction, since this
+    /// never consults a gate stack (D2: "a declared default is a repo-level
+    /// statement, its location's gates are irrelevant"). A default naming an
+    /// excluded (built-in, open-axis, reserved-axis, or
+    /// `data/facts.toml`-derived) name is a source-load error, the same
+    /// class `ReservedAxisName` already is elsewhere in the DSL.
+    fn recordDeclaredDefault(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8) !void {
+        const def = switch (d.kind) {
+            .default => |k| k,
+            else => return,
+        };
+        if (self.isExcluded(def.name)) return error.ReservedAxisName;
+        try self.declared_defaults.append(self.arena, .{
+            .name = try self.arena.dupe(u8, def.name),
+            .value = try self.arena.dupe(u8, def.value),
+            .source = source_key,
+        });
     }
 
     fn recordTuple(self: *Discoverer, tuple: source.tree.AxisTuple, source_key: []const u8) !void {
@@ -369,9 +444,10 @@ const Discoverer = struct {
     /// `recurseDirective` pair: an inferred set cannot resolve across the
     /// recursion cycle. Every read/parse failure on the path between them is
     /// already caught locally (a malformed nested body or missing fragment is
-    /// skipped, not propagated), so `OutOfMemory` is the only error either
-    /// can actually return.
-    const ScanError = std.mem.Allocator.Error;
+    /// skipped, not propagated), so `OutOfMemory` and a reserved `# mox:
+    /// default` name (`recordDeclaredDefault`, which fails loudly rather than
+    /// skip) are the only errors either can actually return.
+    const ScanError = std.mem.Allocator.Error || error{ReservedAxisName};
 
     /// Parse `content` as one directive-tree scope (a whole file, or a nested
     /// region body) and scan its own content lines for `<machine.NAME>`
@@ -387,6 +463,7 @@ const Discoverer = struct {
             dsl.driver.parseFile(self.arena, content, nest.marker, null) catch return;
 
         for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key, nest.loop_vars);
+        for (parsed.directives) |d| try self.recordDeclaredDefault(d, source_key);
 
         const condition = try combineAnd(self.arena, nest.gate_stack);
         var line_no: u32 = 0;
@@ -482,7 +559,7 @@ const Discoverer = struct {
                 };
                 try self.scanBody(loop.body_template, source_key, inner);
             },
-            .completions, .secret => {},
+            .completions, .secret, .default => {},
         }
     }
 
@@ -668,15 +745,24 @@ const Discoverer = struct {
         while (name_it.next()) |k| try all_names.append(self.arena, k.*);
         const projected = try source.fact_env.project(self.arena, try all_names.toOwnedSlice(self.arena));
 
+        var default_diags: std.ArrayList(DefaultDiagnostic) = .empty;
+        const resolved_defaults = try self.resolveDeclaredDefaults(&default_diags);
+
         var it = self.dims.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             const dw = entry.value_ptr;
+            const declared: []const []const u8 = if (resolved_defaults.get(name)) |v| blk: {
+                const one = try self.arena.alloc([]const u8, 1);
+                one[0] = v;
+                break :blk one;
+            } else &.{};
             try dims_out.append(self.arena, .{
                 .name = name,
                 .roles = dw.roles,
                 .observed_values = try sortedKeys(self.arena, &dw.observed_values),
                 .capture_defaults = try sortedKeys(self.arena, &dw.capture_defaults),
+                .declared_defaults = declared,
                 .asking_condition = try computeAskingCondition(self.arena, dw),
                 .provenance = .{
                     .source_count = dw.sources.count(),
@@ -695,7 +781,64 @@ const Discoverer = struct {
             .dimensions = dims_slice,
             .scripts = try self.scripts.toOwnedSlice(self.arena),
             .diagnostics = try self.diagnostics.toOwnedSlice(self.arena),
+            .default_diagnostics = try default_diags.toOwnedSlice(self.arena),
         };
+    }
+
+    /// Group every collected `# mox: default` occurrence by name and resolve
+    /// each group to the single value every occurrence in it agrees on.
+    /// Appends a `.conflict` diagnostic (naming the first two disagreeing
+    /// sites) for a name with more than one distinct declared value -- no
+    /// value is resolved for it, rather than an arbitrary pick -- and a
+    /// `.unclaimed` diagnostic for a name that resolves cleanly but names no
+    /// dimension any other source in the repo consumes (a default alone
+    /// consumes nothing, per D2/D5). Same-value duplicates across files
+    /// collapse silently: they are not an anomaly.
+    fn resolveDeclaredDefaults(self: *Discoverer, diags: *std.ArrayList(DefaultDiagnostic)) !std.StringHashMap([]const u8) {
+        var groups = std.StringHashMap(std.ArrayList(RawDefault)).init(self.arena);
+        for (self.declared_defaults.items) |raw| {
+            const gop = try groups.getOrPut(raw.name);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.arena, raw);
+        }
+
+        var resolved = std.StringHashMap([]const u8).init(self.arena);
+        var it = groups.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const occurrences = entry.value_ptr.items;
+
+            // Distinct values, in first-occurrence order.
+            var distinct: std.ArrayList(RawDefault) = .empty;
+            outer: for (occurrences) |occ| {
+                for (distinct.items) |d| {
+                    if (std.mem.eql(u8, d.value, occ.value)) continue :outer;
+                }
+                try distinct.append(self.arena, occ);
+            }
+
+            if (distinct.items.len > 1) {
+                try diags.append(self.arena, .{ .conflict = .{
+                    .name = name,
+                    .first_source = distinct.items[0].source,
+                    .first_value = distinct.items[0].value,
+                    .second_source = distinct.items[1].source,
+                    .second_value = distinct.items[1].value,
+                } });
+                continue;
+            }
+
+            const value = distinct.items[0].value;
+            if (self.dims.contains(name)) {
+                try resolved.put(name, value);
+            } else {
+                try diags.append(self.arena, .{ .unclaimed = .{
+                    .name = name,
+                    .source = occurrences[0].source,
+                } });
+            }
+        }
+        return resolved;
     }
 
     /// Every script that effectively consumes `dim_name`: via `# mox: needs`
@@ -2097,6 +2240,281 @@ test "discover: a `for` loop's own `when` clause nested inside a when-gate is st
     const dim = findDim(d, "nested_for_axis").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqualStrings("val", dim.observed_values[0]);
+}
+
+// -- declared defaults (`# mox: default`) ------------------------------------
+
+test "discover: a `default` directive records a declared default on an already-real dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.config/holt/config.toml",
+        "# mox: default holt_backend=\"icloud\"\n" ++
+            "# mox: when holt_backend=gdrive\naccount = 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "holt_backend").?;
+    try std.testing.expect(dim.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
+    try std.testing.expectEqualStrings("icloud", dim.declared_defaults[0]);
+    try std.testing.expectEqual(@as(usize, 0), d.default_diagnostics.len);
+}
+
+test "discover: a `default` directive nested inside an unrelated when-gate is still recorded, unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The default line sits inside a `profile=work` gate that has nothing to
+    // do with `holt_backend`; a declared default is a repo-level statement,
+    // so its own location's gates are irrelevant -- it must be recorded the
+    // same as if it sat at the top level.
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.config/holt/config.toml",
+        "# mox: when profile=work\n" ++
+            "# mox: default holt_backend=\"icloud\"\n" ++
+            "# mox: end\n" ++
+            "# mox: when holt_backend=gdrive\naccount = 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "holt_backend").?;
+    try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
+    try std.testing.expectEqualStrings("icloud", dim.declared_defaults[0]);
+}
+
+test "discover: conflicting declared defaults for one name is a diagnostic naming both sites, no value resolved" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default conflict_dim=\"first\"\n");
+    try writeFile(io, tmp.dir, "src/b.zshrc", "# mox: default conflict_dim=\"second\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
+    const diag = d.default_diagnostics[0];
+    try std.testing.expect(diag == .conflict);
+    try std.testing.expectEqualStrings("conflict_dim", diag.conflict.name);
+    try std.testing.expectEqualStrings("src/a.zshrc", diag.conflict.first_source);
+    try std.testing.expectEqualStrings("first", diag.conflict.first_value);
+    try std.testing.expectEqualStrings("src/b.zshrc", diag.conflict.second_source);
+    try std.testing.expectEqualStrings("second", diag.conflict.second_value);
+}
+
+test "discover: the same declared default value from two files dedupes silently" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/a.zshrc",
+        "# mox: default dedupe_dim=\"same\"\n# mox: when dedupe_dim=x\ny = 1\n# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "src/b.zshrc", "# mox: default dedupe_dim=\"same\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 0), d.default_diagnostics.len);
+    const dim = findDim(d, "dedupe_dim").?;
+    try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
+    try std.testing.expectEqualStrings("same", dim.declared_defaults[0]);
+}
+
+test "discover: a declared default for a fact no source consumes is an unclaimed diagnostic, no dimension created" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default unclaimed_dim=\"x\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "unclaimed_dim") == null);
+    try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
+    const diag = d.default_diagnostics[0];
+    try std.testing.expect(diag == .unclaimed);
+    try std.testing.expectEqualStrings("unclaimed_dim", diag.unclaimed.name);
+    try std.testing.expectEqualStrings("src/a.zshrc", diag.unclaimed.source);
+}
+
+test "discover: a declared default accepts a quoted UTF-8 value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig",
+        // "Tokyo" in kanji, as raw UTF-8 bytes.
+        "# mox: default locale=\"\xe6\x9d\xb1\xe4\xba\xac\"\n" ++
+            "# mox: when locale=tokyo\nx = 1\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "locale").?;
+    try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
+    try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", dim.declared_defaults[0]);
+}
+
+test "discover: a declared default naming a built-in is a source-load error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default os=\"linux\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    try std.testing.expectError(error.ReservedAxisName, discover(a, io, repo));
+}
+
+test "discover: a declared default naming an open probe axis is a source-load error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default tool=\"fd\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    try std.testing.expectError(error.ReservedAxisName, discover(a, io, repo));
+}
+
+test "discover: a declared default naming a data/facts.toml-derived name is a source-load error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "data/facts.toml", "[[facts]]\nname = \"brew_prefix\"\ncandidates = [\"/opt/homebrew\"]\n");
+    try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default brew_prefix=\"/opt/homebrew\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    try std.testing.expectError(error.ReservedAxisName, discover(a, io, repo));
+}
+
+test "discover: corpus-shaped fixture with a declared default added -- every other dimension is unchanged" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Same fixture as "discover: integration -- gdrive_account gated, ..."
+    // (the corpus's own shape: a gated capture, a profile=work-gated pair,
+    // and a captured+compared `profile`), with one addition: the holt config
+    // declares its lost gated-only default back in-source, exactly the edit
+    // the real dotfiles fold makes after this ships.
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.config/holt/config.toml",
+        "# mox: default holt_backend=\"icloud\"\n" ++
+            "backend = \"<machine.holt_backend | default \\\"personal\\\">\"\n" ++
+            "# mox: when holt_backend=gdrive\naccount = <machine.gdrive_account>\n# mox: end\n",
+    );
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.config/op/plugins.sh",
+        "# mox: when profile=work\n" ++
+            "export OP_ACCOUNT=<machine.op_account>\n" ++
+            "export OP_VAULT=<machine.op_vault | default \"Personal\">\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: when profile=work\n" ++
+            "x = 1\n" ++
+            "# mox: end\n" ++
+            "kind = <machine.profile | default \"personal\">\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    // Every assertion from the corpus-shaped integration test, unchanged.
+    const gdrive = findDim(d, "gdrive_account").?;
+    try std.testing.expect(gdrive.roles.captured);
+    try std.testing.expect(!gdrive.roles.value_compared);
+    var b1 = std.StringHashMap([]const u8).init(a);
+    var r1: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b1 } };
+    try b1.put("holt_backend", "icloud");
+    try std.testing.expect(!dsl.axis.evaluate(gdrive.asking_condition.?, &r1));
+    try b1.put("holt_backend", "gdrive");
+    try std.testing.expect(dsl.axis.evaluate(gdrive.asking_condition.?, &r1));
+
+    const op_account = findDim(d, "op_account").?;
+    try std.testing.expect(op_account.roles.captured);
+    try std.testing.expectEqual(@as(usize, 0), op_account.capture_defaults.len);
+    var b2 = std.StringHashMap([]const u8).init(a);
+    var r2: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b2 } };
+    try b2.put("profile", "personal");
+    try std.testing.expect(!dsl.axis.evaluate(op_account.asking_condition.?, &r2));
+    try b2.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(op_account.asking_condition.?, &r2));
+
+    const op_vault = findDim(d, "op_vault").?;
+    try std.testing.expectEqualStrings("Personal", op_vault.capture_defaults[0]);
+
+    const profile = findDim(d, "profile").?;
+    try std.testing.expect(profile.roles.value_compared);
+    try std.testing.expect(profile.roles.captured);
+    try std.testing.expectEqual(@as(usize, 1), profile.observed_values.len);
+    try std.testing.expectEqualStrings("work", profile.observed_values[0]);
+    try std.testing.expectEqual(@as(usize, 1), profile.capture_defaults.len);
+    try std.testing.expectEqualStrings("personal", profile.capture_defaults[0]);
+    try std.testing.expect(profile.asking_condition == null);
+    try std.testing.expectEqual(@as(usize, 0), profile.declared_defaults.len);
+
+    // The addition: holt_backend also carries the declared default, cleanly
+    // (one source, one value, no diagnostic).
+    const holt_backend = findDim(d, "holt_backend").?;
+    try std.testing.expectEqual(@as(usize, 1), holt_backend.declared_defaults.len);
+    try std.testing.expectEqualStrings("icloud", holt_backend.declared_defaults[0]);
+    try std.testing.expectEqual(@as(usize, 0), d.default_diagnostics.len);
 }
 
 // -- recursion is bounded (defensive; no fixture requires this depth) -------
