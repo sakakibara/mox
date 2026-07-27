@@ -4,12 +4,18 @@
 //! file. Pure function of (repo_dir, io, alloc): no state is written, and the
 //! result is not yet wired into `apply` or any command.
 //!
-//! A dimension is discovered through three channels:
+//! A dimension is discovered through three channels, at any nesting depth a
+//! directive's body reaches (a `# mox: when` nested inside a `when`/`for`/
+//! `append`/... body is honored by compose's own recursive emit, so this scan
+//! follows it there too):
 //!   - value-compared: `name=value` in a gate, region, whole-file gate, overlay
 //!     filename tuple, generator gate, or script `# mox: when` head, with the
 //!     observed literal value set (a `name = <var>.field` row predicate is
 //!     value-compared with an EMPTY observed set; `bound <var>.field` names no
-//!     axis and contributes nothing).
+//!     axis and contributes nothing; a bare, undotted `present`/`has`/`eq`
+//!     inside a for-loop row predicate is a machine-axis reference exactly
+//!     when the row-expr grammar itself treats it as one -- its head names no
+//!     enclosing loop frame -- and is recorded the same way).
 //!   - captured: `<machine.NAME>` occurrences anywhere compose would actually
 //!     emit them -- a managed file's base content (recursing into every
 //!     nested `# mox: when`/`for` region), a directive's literal body, and
@@ -225,7 +231,22 @@ const Discoverer = struct {
         }
     }
 
-    fn recordRowExpr(self: *Discoverer, expr: *const dsl.ast.RowExpr, source_key: []const u8) !void {
+    /// `ref`'s a machine-axis reference, not a row reference, exactly when
+    /// `row_expr.evaluate` would treat it as one: it carries no `.` (so it
+    /// cannot be a `<var>.<field>` row lookup) AND its head does not name an
+    /// enclosing loop frame (`loop_vars`) -- a bare `entry` inside a `for
+    /// entry in ...` is that row's own presence check, not an axis, exactly
+    /// as `row_expr.presentRef`/`memberRef` resolve it against the scope
+    /// before ever falling back to a machine-axis lookup.
+    fn bareAxisRef(ref: []const u8, loop_vars: []const []const u8) bool {
+        if (std.mem.indexOfScalar(u8, ref, '.') != null) return false;
+        for (loop_vars) |v| {
+            if (std.mem.eql(u8, v, ref)) return false;
+        }
+        return true;
+    }
+
+    fn recordRowExpr(self: *Discoverer, expr: *const dsl.ast.RowExpr, source_key: []const u8, loop_vars: []const []const u8) !void {
         switch (expr.*) {
             // `<axis>=<var>.field`: the axis name is static even though the
             // compared value is a row field known only at compose time, so it
@@ -237,35 +258,69 @@ const Discoverer = struct {
                 }
             },
             // `bound <var>.field` names no axis statically (the bound name is
-            // itself a row field); `present`/`has`/`eq` reference row fields,
-            // not machine axes. None of these are a discovery source.
-            .present, .has, .eq, .bound => {},
-            .not => |inner| try self.recordRowExpr(inner, source_key),
+            // itself a row field). A DOTTED `present`/`has`/`eq` ref is a row
+            // field too. An UNDOTTED one, though, is exactly what
+            // `row_expr.evaluate` falls back to a machine-axis lookup for
+            // (`axis_mod.presentMatch`/`eqMatch`) once no enclosing loop frame
+            // matches its head -- so it is recorded the same way the axis
+            // grammar's own `present`/`eq` are.
+            .bound => {},
+            .present => |ref| {
+                if (!bareAxisRef(ref, loop_vars)) return;
+                if (try self.dimFor(ref)) |dw| {
+                    dw.roles.presence = true;
+                    try dw.sources.put(source_key, {});
+                }
+            },
+            .has => |h| {
+                if (!bareAxisRef(h.ref, loop_vars)) return;
+                if (try self.dimFor(h.ref)) |dw| {
+                    dw.roles.value_compared = true;
+                    try dw.observed_values.put(try self.arena.dupe(u8, h.value), {});
+                    try dw.sources.put(source_key, {});
+                }
+            },
+            .eq => |e| {
+                if (!bareAxisRef(e.ref, loop_vars)) return;
+                if (try self.dimFor(e.ref)) |dw| {
+                    dw.roles.value_compared = true;
+                    try dw.observed_values.put(try self.arena.dupe(u8, e.value), {});
+                    try dw.sources.put(source_key, {});
+                }
+            },
+            .not => |inner| try self.recordRowExpr(inner, source_key, loop_vars),
             .and_ => |a| {
-                try self.recordRowExpr(a.left, source_key);
-                try self.recordRowExpr(a.right, source_key);
+                try self.recordRowExpr(a.left, source_key, loop_vars);
+                try self.recordRowExpr(a.right, source_key, loop_vars);
             },
             .or_ => |o| {
-                try self.recordRowExpr(o.left, source_key);
-                try self.recordRowExpr(o.right, source_key);
+                try self.recordRowExpr(o.left, source_key, loop_vars);
+                try self.recordRowExpr(o.right, source_key, loop_vars);
             },
         }
     }
 
-    /// A top-level directive's own axis/row expressions, mirroring
-    /// `source.axes`'s directive scan exactly (same depth: a nested directive
-    /// inside a region's body is not visited here for axis purposes).
-    fn recordDirectiveAxes(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8) !void {
+    /// A directive's own axis/row expressions. Called by `scanBody` at every
+    /// nesting depth it visits -- a nested `# mox: when` inside a
+    /// `when`/`for`/`append`/... body is honored by compose's own recursive
+    /// emit, so a fact compared only there is as real a dimension as one
+    /// compared at the top level.
+    fn recordDirectiveAxes(self: *Discoverer, d: dsl.ast.Directive, source_key: []const u8, loop_vars: []const []const u8) !void {
         switch (d.kind) {
             .include => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
             .replace => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
             .append => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
             .prepend => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
             .remove => |k| try self.recordAxisExpr(k.when, source_key),
-            .when_gate => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
+            .when_gate => |k| {
+                if (k.when) |w|
+                    try self.recordAxisExpr(w, source_key)
+                else if (k.row_when) |r|
+                    try self.recordRowExpr(r, source_key, loop_vars);
+            },
             .for_loop => |k| {
                 if (k.when) |w| try self.recordAxisExpr(w, source_key);
-                if (k.where) |r| try self.recordRowExpr(r, source_key);
+                if (k.where) |r| try self.recordRowExpr(r, source_key, loop_vars);
             },
             .completions => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key),
             .from, .secret => {},
@@ -331,9 +386,7 @@ const Discoverer = struct {
         else
             dsl.driver.parseFile(self.arena, content, nest.marker, null) catch return;
 
-        if (nest.depth == 0) {
-            for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key);
-        }
+        for (parsed.directives) |d| try self.recordDirectiveAxes(d, source_key, nest.loop_vars);
 
         const condition = try combineAnd(self.arena, nest.gate_stack);
         var line_no: u32 = 0;
@@ -1940,6 +1993,110 @@ test "discover: a gate-true replace fragment target's capture gets the replace's
     try std.testing.expect(cond.* == .eq);
     try std.testing.expectEqualStrings("profile", cond.eq.axis);
     try std.testing.expectEqualStrings("work", cond.eq.value);
+}
+
+// -- axis roles at full depth (Finding 4) ------------------------------------
+
+test "discover: an axis compared only in a `when` nested inside a for body is still value-compared" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\"\n" ++
+            "# mox: when nested_axis=val\n" ++
+            "# x 1\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "nested_axis").?;
+    try std.testing.expect(dim.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
+    try std.testing.expectEqualStrings("val", dim.observed_values[0]);
+}
+
+test "discover: a dotted row-field reference in a nested for-body `when` is not an axis" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\"\n" ++
+            "# mox: when entry.shells has \"zsh\"\n" ++
+            "# x 1\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "entry") == null);
+    try std.testing.expect(findDim(d, "shells") == null);
+}
+
+test "discover: a bare ref matching the enclosing loop variable's own name is not a phantom axis" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\"\n" ++
+            "# mox: when entry\n" ++
+            "# x 1\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "entry") == null);
+}
+
+test "discover: a `for` loop's own `when` clause nested inside a when-gate is still value-compared" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: when profile=work\n" ++
+            "# mox: for entry in \"data/tools.toml\" when nested_for_axis=val\n" ++
+            "# x 1\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "nested_for_axis").?;
+    try std.testing.expect(dim.roles.value_compared);
+    try std.testing.expectEqualStrings("val", dim.observed_values[0]);
 }
 
 // -- recursion is bounded (defensive; no fixture requires this depth) -------
