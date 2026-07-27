@@ -231,7 +231,39 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         if (cell.problem) problems += 1;
         try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
     }
+    try printProbeLog(ctx, m_state);
     return if (problems > 0) 1 else 0;
+}
+
+/// This run's open-axis probe log (D6): after every file has composed, name
+/// the `tool=`/`env=` names this run actually asked and their outcome, so a
+/// typo'd gate (`when tool=hedrr`) is one status call from visible instead
+/// of a silent false forever. Printed only when at least one probe
+/// happened; an axis with zero probes gets no line at all.
+fn printProbeLog(ctx: *app.Ctx, m_state: mox.machine.state.MachineState) !void {
+    var printed_any = false;
+    if (m_state.tool_probe) |tp| {
+        printed_any = try printProbedAxis(ctx, "tool", try tp.probedNames(ctx.alloc), printed_any);
+    }
+    if (m_state.env_probe) |ep| {
+        _ = try printProbedAxis(ctx, "env", try ep.probedNames(ctx.alloc), printed_any);
+    }
+}
+
+/// One probe-log line (`"tool probed: fd present, hedrr ABSENT"`), or
+/// nothing when `names` is empty. Returns true once any line -- this call's
+/// or an earlier one's -- has printed, so the section's blank-line lead-in
+/// prints exactly once regardless of which axis triggers it first.
+fn printProbedAxis(ctx: *app.Ctx, axis: []const u8, names: []const mox.machine.path_lookup.ProbedName, already_printed: bool) !bool {
+    if (names.len == 0) return already_printed;
+    if (!already_printed) try ctx.out.writeAll("\n");
+    try ctx.out.print("{s} probed:", .{axis});
+    for (names, 0..) |n, i| {
+        try ctx.out.writeAll(if (i == 0) " " else ", ");
+        try ctx.out.print("{s} {s}", .{ n.name, if (n.present) "present" else "ABSENT" });
+    }
+    try ctx.out.writeAll("\n");
+    return true;
 }
 
 /// The ownership annotation appended to a partial file's status line:

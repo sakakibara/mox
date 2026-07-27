@@ -104,6 +104,32 @@ pub fn extendListing(arena: std.mem.Allocator, io: Io, environ: Environ, listing
     }
 }
 
+/// One name a probe was asked to resolve this run, and whether it resolved.
+/// `mox status`'s probe-log section and `mox facts probe` (D6) share this
+/// shape across `ToolProbe` (tool=) and `machine.state.EnvProbe` (env=).
+pub const ProbedName = struct {
+    name: []const u8,
+    present: bool,
+};
+
+/// Every key in `memo` (`ToolProbe`'s or `EnvProbe`'s -- both are `name ->
+/// ?value`), sorted by name. Shared so the two probers' `probedNames`
+/// methods agree on ordering and shape.
+pub fn sortedProbedNames(arena: std.mem.Allocator, memo: *const std.StringHashMap(?[]const u8)) ![]const ProbedName {
+    var out: std.ArrayList(ProbedName) = .empty;
+    var it = memo.iterator();
+    while (it.next()) |entry| {
+        try out.append(arena, .{ .name = entry.key_ptr.*, .present = entry.value_ptr.* != null });
+    }
+    const slice = try out.toOwnedSlice(arena);
+    std.mem.sort(ProbedName, slice, {}, struct {
+        fn lessThan(_: void, a: ProbedName, b: ProbedName) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    return slice;
+}
+
 /// Lazy, memoized `tool=` answers layered over `Listing`: the first probe of
 /// ANY name builds one `Listing` (one full `$PATH` enumeration); every probe
 /// after that, of any name, is a memo lookup or a `Listing.lookup`. Memo and
@@ -143,6 +169,17 @@ pub const ToolProbe = struct {
     /// True when `name` resolves on `$PATH`.
     pub fn present(self: *ToolProbe, name: []const u8) bool {
         return self.path(name) != null;
+    }
+
+    /// Every name asked of `path`/`present` so far this run, sorted by name
+    /// so the result is independent of ask order and of `memo`'s hash-map
+    /// iteration order (both unspecified). Powers `mox status`'s probe-log
+    /// section and `mox facts probe` (D6): the typo-visibility surface for
+    /// `tool=` -- a name asked and not found stays in the log as `present =
+    /// false`, distinct from a name never asked at all (absent from the log
+    /// entirely).
+    pub fn probedNames(self: *ToolProbe, arena: std.mem.Allocator) ![]const ProbedName {
+        return sortedProbedNames(arena, &self.memo);
     }
 
     /// Widen the search space with `dirs` (the `$MOX_PATH` channel, D2b):
@@ -245,6 +282,36 @@ fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []con
     defer allocator.free(cwd_path);
     if (sub.len == 0) return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path });
     return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path, sub });
+}
+
+test "ToolProbe.probedNames: every name asked so far, sorted, with its outcome" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/fd", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bin_dir = try tmpAbsPath(a, &tmp, "bin");
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put("PATH", bin_dir);
+    var probe = ToolProbe.init(a, io, Env{ .map = &map });
+
+    // Nothing asked yet: the log is empty, not "everything absent".
+    try std.testing.expectEqual(@as(usize, 0), (try probe.probedNames(a)).len);
+
+    try std.testing.expect(probe.present("fd"));
+    try std.testing.expect(!probe.present("hedrr"));
+
+    const names = try probe.probedNames(a);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("fd", names[0].name);
+    try std.testing.expect(names[0].present);
+    try std.testing.expectEqualStrings("hedrr", names[1].name);
+    try std.testing.expect(!names[1].present);
 }
 
 test "ToolProbe.present: an unwatched name is found on PATH and memoized" {

@@ -94,20 +94,30 @@ pub const MachineState = struct {
 
 /// Lazy, on-demand `env=NAME` / `<env.NAME>` answer for any name: reads this
 /// machine's captured environ directly rather than a process-global lookup.
-/// No memoization -- `Env.get` is already an O(1) map/syscall-free read,
-/// unlike the PATH scan `ToolProbe` exists to batch. Empty-is-unset by
-/// construction (`Env.get`'s own contract).
+/// No answer memoization -- `Env.get` is already an O(1) map/syscall-free
+/// read, unlike the PATH scan `ToolProbe` exists to batch. Empty-is-unset by
+/// construction (`Env.get`'s own contract). `log` records every name asked,
+/// for the probe-log diagnostics (D6); it is never consulted for an answer.
 pub const EnvProbe = struct {
     arena: std.mem.Allocator,
     environ: Environ,
+    log: std.StringHashMap(?[]const u8),
 
     pub fn init(arena: std.mem.Allocator, environ: Environ) EnvProbe {
-        return .{ .arena = arena, .environ = environ };
+        return .{ .arena = arena, .environ = environ, .log = std.StringHashMap(?[]const u8).init(arena) };
     }
 
     /// The value of `name`, or null when unset or set-but-empty.
     pub fn get(self: *EnvProbe, name: []const u8) ?[]const u8 {
-        return self.environ.get(self.arena, name);
+        const v = self.environ.get(self.arena, name);
+        self.log.put(name, v) catch {};
+        return v;
+    }
+
+    /// Every name asked of `get` so far this run, sorted -- same contract as
+    /// `path_lookup.ToolProbe.probedNames`.
+    pub fn probedNames(self: *EnvProbe, arena: std.mem.Allocator) ![]const path_lookup.ProbedName {
+        return path_lookup.sortedProbedNames(arena, &self.log);
     }
 
     /// Adapt this reader to `dsl.resolver.Resolver.EnvProbe`, so a `Resolver`
@@ -674,6 +684,28 @@ test "MachineState.liveResolver: wires bindings, tool probe, and env probe from 
     try std.testing.expect(!resolver.has("tool", "definitely-not-installed-xyz"));
     try std.testing.expect(resolver.has("env", "MOX_LIVE_RESOLVER_VAR"));
     try std.testing.expect(!resolver.has("env", "MOX_LIVE_RESOLVER_UNSET"));
+}
+
+test "EnvProbe.probedNames: every name asked so far, sorted, with its outcome" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("MOX_PROBED_SET", "1");
+    var probe = EnvProbe.init(a, Environ{ .map = &map });
+
+    // Nothing asked yet: the log is empty, not "everything absent".
+    try std.testing.expectEqual(@as(usize, 0), (try probe.probedNames(a)).len);
+
+    _ = probe.get("MOX_PROBED_SET");
+    _ = probe.get("MOX_PROBED_UNSET");
+
+    const names = try probe.probedNames(a);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("MOX_PROBED_SET", names[0].name);
+    try std.testing.expect(names[0].present);
+    try std.testing.expectEqualStrings("MOX_PROBED_UNSET", names[1].name);
+    try std.testing.expect(!names[1].present);
 }
 
 test "EnvProbe.get: an unwatched name reads from the captured environ" {

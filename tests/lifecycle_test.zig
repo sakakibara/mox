@@ -196,6 +196,71 @@ test "status: an unmanaged path argument exits non-zero reporting not managed" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not managed") != null);
 }
 
+test "status: no probe-log section when the run probed no tool= or env= name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "probed:") == null);
+}
+
+test "status: the tool probe log names every tool= name this run asked, misses highlighted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const bin_dir = try std.fs.path.join(a, &.{ root, "bin" });
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/fd", .data = "" });
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "PATH", .value = bin_dir }},
+    });
+    try writeRepo(io, &tmp, "repo/src/.has-fd", "# mox: when tool=fd\nyes\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.has-hedrr", "# mox: when tool=hedrr\nyes\n# mox: end\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "tool probed: fd present, hedrr ABSENT\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "env probed:") == null);
+}
+
+test "status: the env probe log names every env= name this run asked, misses highlighted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "MOX_STATUS_PROBE_VAR", .value = "1" }},
+    });
+    try writeRepo(io, &tmp, "repo/src/.has-var", "# mox: when env=MOX_STATUS_PROBE_VAR\nyes\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.no-var", "# mox: when env=MOX_STATUS_PROBE_TYPO\nyes\n# mox: end\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "env probed: MOX_STATUS_PROBE_TYPO ABSENT, MOX_STATUS_PROBE_VAR present\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "tool probed:") == null);
+}
+
 test "diff: a path argument limits the stat summary to that file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
