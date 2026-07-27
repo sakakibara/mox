@@ -142,7 +142,7 @@ fn applyPass(
     // unparseable override would otherwise warn once per file checked.
     const check_timeout_ms = mox.apply.run_scripts.checkTimeoutMs(&script_env, ctx.err);
 
-    // $MOX_PATH (D2b): a private per-run file every script and check hook
+    // $MOX_PATH: a private per-run file every setup script
     // gets, for naming an install directory mox would otherwise never see
     // (neither $PATH nor a detected tool home). Created empty up front --
     // dies with the run, same private-temp-area treatment as the

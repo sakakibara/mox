@@ -1,4 +1,4 @@
-//! The `$MOX_PATH` channel (D2b): every setup script and check hook gets an
+//! The `$MOX_PATH` channel: every setup script gets an
 //! env var naming a writable file in this run's private temp area. A script
 //! that installs a tool into an arbitrary location -- one that is neither
 //! `$PATH` nor a detected tool home -- appends that directory to the file

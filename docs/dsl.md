@@ -259,7 +259,7 @@ shell and `.ps1`. When a script sits in a gated subdir and also carries a header
 both must hold for it to run. A header that fails to parse is a hard error for
 that script, not a silent skip.
 
-Every script (both stages) and check hook also gets `MOX_PATH`, naming a
+Every setup script (both stages) gets `MOX_PATH`, naming a
 writable file private to this run (deleted when the run ends). A script that
 installs a tool somewhere `tool=` would not otherwise see -- neither `$PATH`
 nor a detected tool home -- appends that directory there, one absolute path
