@@ -368,6 +368,24 @@ const Discoverer = struct {
         return gop.value_ptr;
     }
 
+    /// D3: a `# mox: needs NAME` reference that names no dimension any other
+    /// channel already made real registers `NAME` as a scripts-only
+    /// dimension -- free-form (no role) and unconditioned (an unconditioned
+    /// occurrence, same treatment as a top-level unguarded capture), so the
+    /// interview asks it like any other. An excluded name (built-in, open
+    /// axis, reserved, `data/facts.toml`-derived) registers nothing, same as
+    /// `dimFor` everywhere else -- it already has its own resolution path,
+    /// not an interview question. A name that is ALREADY a real dimension via
+    /// some other channel is left untouched: `needingScripts` links this
+    /// script to it by name alone at `finalize` time, and pushing another
+    /// occurrence here would wrongly widen an existing conditioned
+    /// dimension's asking condition to unconditioned.
+    fn registerNeedsName(self: *Discoverer, name: []const u8) !void {
+        if (self.dims.contains(name)) return;
+        const dw = (try self.dimFor(name)) orelse return;
+        try dw.occurrence_conditions.append(self.arena, null);
+    }
+
     fn isExcluded(self: *Discoverer, name: []const u8) bool {
         return state.isBuiltinField(name) or
             source.axes.isReservedAxisName(name) or
@@ -915,6 +933,7 @@ const Discoverer = struct {
                 needs_unparseable = true;
             } else {
                 needs = parsed.names;
+                for (parsed.names) |n| try self.registerNeedsName(n);
             }
         }
 
@@ -1929,6 +1948,68 @@ test "discover: a malformed `# mox: needs` name is a loud diagnostic, not a fata
     try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
     try std.testing.expect(d.scripts[0].needs == null);
     try std.testing.expect(d.scripts[0].needs_unparseable);
+}
+
+test "discover: a `# mox: needs` name with no other occurrence anywhere registers a scripts-only dimension, unconditioned and free-form" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "scripts/pre/00-steam.sh", "#!/bin/sh\n# mox: needs steam_library\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "steam_library").?;
+    try std.testing.expect(dim.asking_condition == null);
+    try std.testing.expectEqual(@as(usize, 0), dim.observed_values.len);
+    try std.testing.expect(!dim.roles.value_compared);
+    try std.testing.expect(!dim.roles.captured);
+    try std.testing.expect(!dim.roles.presence);
+    try std.testing.expectEqual(@as(usize, 1), dim.provenance.needing_scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/00-steam.sh", dim.provenance.needing_scripts[0]);
+}
+
+test "discover: a `# mox: needs` name that is already a gated dimension elsewhere keeps its original condition, not flipped unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `onepassword_account` is captured only nested inside `when
+    // profile=work`, so its own occurrence is genuinely conditioned (unlike
+    // a bare top-level `when profile=work` gate, whose own comparison is
+    // always unconditioned by design).
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when profile=work\nop = <machine.onepassword_account>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\n# mox: needs onepassword_account\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "onepassword_account").?;
+    // Still conditioned by the src/ gate: a needs reference alone must not
+    // silently widen an existing dimension's asking condition to null.
+    try std.testing.expect(dim.asking_condition != null);
+    try std.testing.expectEqual(@as(usize, 1), dim.provenance.needing_scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/00-op.sh", dim.provenance.needing_scripts[0]);
+}
+
+test "discover: a `# mox: needs` name excluded by category (built-in) registers no dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "scripts/pre/00-os.sh", "#!/bin/sh\n# mox: needs os\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "os") == null);
 }
 
 test "discover: integration -- gdrive_account gated, 1Password pair gated on profile=work, profile compared+captured" {

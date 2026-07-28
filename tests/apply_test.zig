@@ -81,7 +81,7 @@ test "run_scripts: top-level runs, matching gated dir runs, non-matching skipped
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 2), result.ran);
     try std.testing.expectEqual(@as(usize, 0), result.failed);
@@ -115,7 +115,7 @@ test "run_scripts: a true `# mox: when` header runs, a false one is skipped" {
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 1), result.ran);
     try std.testing.expectEqual(@as(usize, 1), result.skipped);
@@ -148,7 +148,7 @@ test "run_scripts: a header `or` expression runs on the second alternative" {
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 1), result.ran);
     try std.testing.expectEqual(@as(usize, 0), result.skipped);
@@ -180,7 +180,7 @@ test "run_scripts: a malformed `# mox: when` header fails that script, others st
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
 
     // Malformed -> failed; the stage continued and ran the well-formed script.
     try std.testing.expectEqual(@as(usize, 1), result.failed);
@@ -213,7 +213,7 @@ test "run_scripts: a header does not bypass a non-matching axis dir" {
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, null, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 0), result.ran);
     try std.testing.expectEqual(@as(usize, 0), result.skipped);
@@ -1131,6 +1131,144 @@ test "apply: conflicting `# mox: default` declarations for one name are surfaced
     try std.testing.expect(lineHasBoth(r.err, "b.conf", "gdrive"));
 }
 
+test "apply: script_env rebuilds after a pre-script re-capture, so a post-script's needed fact runs with the fresh value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+
+    // Pre-script persists a fact directly into facts.toml -- standing in for
+    // `mox facts set` from inside a script, without depending on a real mox
+    // binary being on PATH in the test harness.
+    const pre_rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-persist{s}", .{script_ext});
+    const pre_content = if (builtin.os.tag == .windows)
+        "New-Item -ItemType Directory -Force -Path \"$env:MOX_HOME/.config/mox\" | Out-Null\n" ++
+            "Add-Content -LiteralPath \"$env:MOX_HOME/.config/mox/facts.toml\" -Value 'postneeds = \"fresh-value\"'\n"
+    else
+        "#!/bin/sh\nmkdir -p \"$MOX_HOME/.config/mox\"\nprintf 'postneeds = \"fresh-value\"\\n' >> \"$MOX_HOME/.config/mox/facts.toml\"\n";
+    try writeExecScript(io, tmp.dir, pre_rel, pre_content, try std.fs.path.join(a, &.{ root, pre_rel }));
+
+    const log = try std.fs.path.join(a, &.{ root, "seen" });
+    const post_rel = try std.fmt.allocPrint(a, "repo/scripts/post/00-consume{s}", .{script_ext});
+    const post_content = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(a, "# mox: needs postneeds\nSet-Content -LiteralPath '{s}' -Value \"$env:MOX_FACT_POSTNEEDS\"\n", .{log})
+    else
+        try std.fmt.allocPrint(a, "#!/bin/sh\n# mox: needs postneeds\nprintf '%s\\n' \"$MOX_FACT_POSTNEEDS\" > \"{s}\"\n", .{log});
+    try writeExecScript(io, tmp.dir, post_rel, post_content, try std.fs.path.join(a, &.{ root, post_rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") == null);
+
+    try expectLoggedLines("fresh-value\n", try read(io, a, log));
+}
+
+test "apply: a gate-mismatched script's needs are never evaluated -- no block for an os=windows script on a non-windows machine" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    const rel = "repo/scripts/pre/os=windows/00-only-windows.sh";
+    // Needs a fact that could never resolve on this machine -- would be
+    // blocked RED if it were ever evaluated, but the directory tuple never
+    // matches a non-windows host, so it must never even be reached.
+    try writeExecScript(io, tmp.dir, rel, "#!/bin/sh\n# mox: needs windows_only_thing\necho hi\n", try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "linux" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Discovery is machine-independent (over-asking is safe by design), so
+    // the interview may still legitimately ask about "windows_only_thing" --
+    // what must NOT happen is the script's own contract ever being evaluated
+    // for it, since the directory tuple never matches this machine.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") == null);
+}
+
+test "apply: fresh-machine incident replica -- a literal $MOX_FACT_PROFILE token with profile unbound blocks RED, non-interactive" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    // Makes `profile` a real, unconditioned dimension (the original Steam
+    // incident's shape: a script reads $MOX_FACT_PROFILE with no `# mox:
+    // needs` line at all, relying on the token scan).
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile=work\nx = 1\n# mox: end\n",
+    });
+    const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-steam{s}", .{script_ext});
+    const content = if (builtin.os.tag == .windows)
+        "Write-Output $env:MOX_FACT_PROFILE\n"
+    else
+        "#!/bin/sh\necho \"$MOX_FACT_PROFILE\"\n";
+    try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    // Non-interactive (no scripted stdin): profile is reported unbound by
+    // the interview, never bound -- the script must not silently run.
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "profile") != null);
+}
+
+test "apply: fresh-machine incident replica, profile declined -- skipped (declined), green" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile=work\nx = 1\n# mox: end\n",
+    });
+    const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-steam{s}", .{script_ext});
+    const content = if (builtin.os.tag == .windows)
+        "Write-Output $env:MOX_FACT_PROFILE\n"
+    else
+        "#!/bin/sh\necho \"$MOX_FACT_PROFILE\"\n";
+    try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    // A prior interview already declined `profile` (bound empty): the
+    // script must be a green declined-skip, never a guess.
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"\"\n" });
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped (declined)") != null);
+}
+
 test "apply: a malformed `# mox: needs` name in a script is a loud diagnostic, not a swallowed discovery failure -- the interview still runs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1828,7 +1966,7 @@ test "run_scripts: a hung script is killed within the configured timeout" {
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 0), result.ran);
     try std.testing.expectEqual(@as(usize, 1), result.failed);
@@ -1860,7 +1998,7 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 2), result.ran);
     const err = err_aw.written();
@@ -1961,7 +2099,7 @@ test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
     try std.testing.expectEqual(@as(usize, 1), result.ran);
 
     try expectLoggedLines("/home/tester|work\n", try read(io, a, out_file));
@@ -1995,7 +2133,7 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
-    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, &bindings_r, &script_env, &out_aw.writer, &err_aw.writer);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
 
     // The script was terminated at ~500ms, counted failed, and runStage
     // RETURNED rather than blocking for the full 30s sleep.

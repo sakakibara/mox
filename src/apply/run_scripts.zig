@@ -45,6 +45,9 @@ const match_mod = @import("../compose/match.zig");
 const dsl = @import("../dsl/root.zig");
 const dirent = @import("../source/dirent.zig");
 const fact_env = @import("../source/fact_env.zig");
+const path_mod = @import("../source/path.zig");
+const dimensions = @import("../machine/dimensions.zig");
+const derived_facts = @import("../machine/derived_facts.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
@@ -67,6 +70,14 @@ pub const Result = struct {
     ran: usize = 0,
     skipped: usize = 0,
     failed: usize = 0,
+    /// A script whose fact contract could not be resolved this stage (D3):
+    /// counts into the failing exit exactly like `failed`, but under its own
+    /// summary label -- a broken contract is a distinct defect class from a
+    /// nonzero exit code.
+    blocked: usize = 0,
+    /// A script that did not run because a fact it needs was bound but
+    /// explicitly declined (D3): green, does not fail the run.
+    declined: usize = 0,
 };
 
 /// A machine fact exposed to scripts as `MOX_FACT_<UPPERCASE_NAME>`.
@@ -83,6 +94,248 @@ pub const ScriptEnv = struct {
     /// here so a caller can warn instead of leaving either failure silent.
     skipped: []const []const u8 = &.{},
 };
+
+// Script fact contracts (D3)
+
+/// Everything a stage needs to judge a script's fact contract against this
+/// stage's ACTUAL projected environment, never an abstract name set: the
+/// discovered config space (which names are interviewable dimensions),
+/// `data/facts.toml`'s declared rows (for a derived fact's remediation), the
+/// facts this stage's environment was built from, which of those a
+/// projection collision dropped, and the environment itself. Rebuild this
+/// (via `buildContracts`) after every re-capture, same as `buildScriptEnv` --
+/// a fact a pre-script just persisted must be visible to a post-script's
+/// availability check, not just its environment.
+pub const Contracts = struct {
+    dims: []const dimensions.Dimension,
+    scripts: []const dimensions.ScriptRecord,
+    derived: []const derived_facts.DeclaredRow,
+    custom: []const Fact,
+    skipped: []const []const u8,
+    env: *const EnvironMap,
+    /// Reverse of `fact_env.project` over every name discovery, `data/
+    /// facts.toml`, and the currently bound facts know about (deduped): a
+    /// scanned `MOX_FACT_*` token maps back to the one name that would
+    /// produce it, when the mapping is unambiguous.
+    token_to_name: std.StringHashMap([]const u8),
+};
+
+/// Build `Contracts` for one stage: `dims`/`scripts` come from `dimensions.
+/// discover` (stable for the whole apply run, a pure function of the repo
+/// tree); `derived` from `data/facts.toml`'s declared rows (also stable);
+/// `custom`/`skipped`/`env` are THIS stage's actual bound facts and the
+/// environment `buildScriptEnv` projected them into -- the caller rebuilds
+/// this after every re-capture.
+pub fn buildContracts(
+    arena: std.mem.Allocator,
+    dims: []const dimensions.Dimension,
+    scripts: []const dimensions.ScriptRecord,
+    derived: []const derived_facts.DeclaredRow,
+    custom: []const Fact,
+    skipped: []const []const u8,
+    env: *const EnvironMap,
+) !Contracts {
+    var names_set = std.StringHashMap(void).init(arena);
+    for (dims) |d| try names_set.put(d.name, {});
+    for (derived) |r| try names_set.put(r.name, {});
+    for (custom) |f| try names_set.put(f.name, {});
+    var names: std.ArrayList([]const u8) = .empty;
+    var name_it = names_set.keyIterator();
+    while (name_it.next()) |k| try names.append(arena, k.*);
+
+    const projected = try fact_env.project(arena, try names.toOwnedSlice(arena));
+    var token_to_name = std.StringHashMap([]const u8).init(arena);
+    var proj_it = projected.iterator();
+    while (proj_it.next()) |e| try token_to_name.put(e.value_ptr.*, e.key_ptr.*);
+
+    return .{
+        .dims = dims,
+        .scripts = scripts,
+        .derived = derived,
+        .custom = custom,
+        .skipped = skipped,
+        .env = env,
+        .token_to_name = token_to_name,
+    };
+}
+
+/// One needed fact's classification against `c`'s actual environment.
+const NeedVerdict = union(enum) {
+    runs,
+    /// The fact name, bound but explicitly empty (a persisted decline).
+    declined: []const u8,
+    /// A fully worded, ready-to-print reason this fact cannot be resolved.
+    blocked: []const u8,
+};
+
+/// A whole script's contract outcome: the worst lane across every needed
+/// fact (`blocked` if any is blocked, else `declined` if any is declined,
+/// else `runs`), with the message(s) to print for it.
+pub const ScriptVerdict = struct {
+    lane: enum { runs, declined, blocked } = .runs,
+    /// One aggregated line when `lane == .declined` (D3: "one notice line
+    /// per script"); one line per blocking needed fact when `lane ==
+    /// .blocked`, each its own loud diagnostic. Empty when `lane == .runs`.
+    messages: []const []const u8 = &.{},
+};
+
+fn findFactValue(facts: []const Fact, name: []const u8) ?[]const u8 {
+    for (facts) |f| if (std.mem.eql(u8, f.name, name)) return f.value;
+    return null;
+}
+
+fn findDerivedRow(rows: []const derived_facts.DeclaredRow, name: []const u8) ?derived_facts.DeclaredRow {
+    for (rows) |r| if (std.mem.eql(u8, r.name, name)) return r;
+    return null;
+}
+
+fn isDimensionName(dims: []const dimensions.Dimension, name: []const u8) bool {
+    for (dims) |d| if (std.mem.eql(u8, d.name, name)) return true;
+    return false;
+}
+
+fn findScriptRecord(scripts: []const dimensions.ScriptRecord, rel_path: []const u8) ?dimensions.ScriptRecord {
+    for (scripts) |s| if (std.mem.eql(u8, s.path, rel_path)) return s;
+    return null;
+}
+
+fn containsStr(list: []const []const u8, s: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, s)) return true;
+    return false;
+}
+
+fn singleton(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, 1);
+    out[0] = s;
+    return out;
+}
+
+/// A derived fact's remediation text: its env override, its candidate
+/// directories, both, or (a row declaring neither, a degenerate repo
+/// mistake) a fallback that still names the row.
+fn derivedRemediation(arena: std.mem.Allocator, row: derived_facts.DeclaredRow) ![]const u8 {
+    if (row.env != null and row.candidates.len > 0) {
+        return std.fmt.allocPrint(arena, "set ${s}, or create one of: {s}", .{
+            row.env.?, try std.mem.join(arena, ", ", row.candidates),
+        });
+    }
+    if (row.env) |e| return std.fmt.allocPrint(arena, "set ${s}", .{e});
+    if (row.candidates.len > 0) {
+        return std.fmt.allocPrint(arena, "create one of: {s}", .{try std.mem.join(arena, ", ", row.candidates)});
+    }
+    return std.fmt.allocPrint(arena, "its data/facts.toml row declares no env override or candidates", .{});
+}
+
+/// Classify one needed FACT NAME (from an explicit `# mox: needs` list, or a
+/// scanned token `classifyToken` already resolved to a name) against `c`'s
+/// actual environment -- the availability predicate is the projected env
+/// itself, not an abstract name set, so this always checks `c.env` first.
+fn classifyName(arena: std.mem.Allocator, name: []const u8, c: *const Contracts) !NeedVerdict {
+    const token = try fact_env.envName(arena, name);
+    if (c.env.get(token)) |v| {
+        if (v.len > 0) return .runs;
+        return .{ .declined = name };
+    }
+
+    // Not in the environment: bound but dropped by a projection collision
+    // (the existing skip-both behavior) is unavailable, not "never bound".
+    if (containsStr(c.skipped, name)) {
+        return .{ .blocked = try std.fmt.allocPrint(
+            arena,
+            "needs \"{s}\", which never reaches this script's environment (its MOX_FACT_* name collides with another fact's -- see the notice above)",
+            .{name},
+        ) };
+    }
+    // Defensive: `buildScriptEnv` puts every bound, non-skipped fact into
+    // `env` (declines included), so a bound name absent from both `env` and
+    // `skipped` should not occur -- if it somehow does, treat its own
+    // recorded value as authoritative rather than misreporting "never
+    // bound".
+    if (findFactValue(c.custom, name)) |v| {
+        return if (v.len == 0) .{ .declined = name } else .runs;
+    }
+
+    if (findDerivedRow(c.derived, name)) |row| {
+        return .{ .blocked = try std.fmt.allocPrint(
+            arena,
+            "needs \"{s}\" (a derived fact), unresolved on this machine ({s})",
+            .{ name, try derivedRemediation(arena, row) },
+        ) };
+    }
+    if (isDimensionName(c.dims, name)) {
+        return .{ .blocked = try std.fmt.allocPrint(
+            arena,
+            "needs \"{s}\", never bound (mox facts set {s} <value>, or answer the interview)",
+            .{ name, name },
+        ) };
+    }
+    // Names an existing built-in or nothing mox knows how to bind at all --
+    // a `# mox: needs` line naming this cannot be honored.
+    return .{ .blocked = try std.fmt.allocPrint(
+        arena,
+        "needs \"{s}\", which names no fact mox can bind or derive",
+        .{name},
+    ) };
+}
+
+/// Classify one scanned `MOX_FACT_*` token (used only when a script has no
+/// explicit `# mox: needs` line) against `c`'s actual environment. A token
+/// mapping to no known fact at all fails closed -- this is D3's incident
+/// class: a stale or typo'd token must never silently run unguarded.
+fn classifyToken(arena: std.mem.Allocator, token: []const u8, c: *const Contracts) !NeedVerdict {
+    if (c.env.get(token)) |v| {
+        if (v.len > 0) return .runs;
+        return .{ .declined = c.token_to_name.get(token) orelse token };
+    }
+    if (c.token_to_name.get(token)) |name| return classifyName(arena, name, c);
+    return .{ .blocked = try std.fmt.allocPrint(
+        arena,
+        "{s} matches no known fact; bind it with 'mox facts set <name> <value>' so it projects onto this token, or declare this script's real contract with '# mox: needs <name>'",
+        .{token},
+    ) };
+}
+
+/// A whole script's verdict: `record` is its `dimensions.ScriptRecord` (null
+/// when discovery has no matching entry -- a defensive fallback, since
+/// `dimensions.discover`'s script scan mirrors this module's own runnable
+/// shape exactly, so this should not happen in practice; treated as "no
+/// contract declared", same as an ordinary script with no needs and no
+/// MOX_FACT_* tokens). `needs_unparseable` is checked first: an unparseable
+/// `# mox: needs` line makes the whole contract unknowable, regardless of
+/// what the token scan would otherwise have found.
+pub fn verdictForScript(arena: std.mem.Allocator, record: ?dimensions.ScriptRecord, c: *const Contracts) !ScriptVerdict {
+    const rec = record orelse return .{};
+    if (rec.needs_unparseable) {
+        return .{ .lane = .blocked, .messages = try singleton(
+            arena,
+            "`# mox: needs` could not be parsed; this script's fact contract is unknowable",
+        ) };
+    }
+
+    var blocked: std.ArrayList([]const u8) = .empty;
+    var declined: std.ArrayList([]const u8) = .empty;
+
+    if (rec.needs) |names| {
+        for (names) |n| switch (try classifyName(arena, n, c)) {
+            .runs => {},
+            .declined => |name| try declined.append(arena, name),
+            .blocked => |msg| try blocked.append(arena, msg),
+        };
+    } else {
+        for (rec.scanned_tokens) |t| switch (try classifyToken(arena, t, c)) {
+            .runs => {},
+            .declined => |name| try declined.append(arena, name),
+            .blocked => |msg| try blocked.append(arena, msg),
+        };
+    }
+
+    if (blocked.items.len > 0) return .{ .lane = .blocked, .messages = try blocked.toOwnedSlice(arena) };
+    if (declined.items.len > 0) {
+        const joined = try std.mem.join(arena, ", ", declined.items);
+        return .{ .lane = .declined, .messages = try singleton(arena, joined) };
+    }
+    return .{};
+}
 
 /// Build the child environment for setup scripts: the parent environment
 /// augmented with MOX_REPO, MOX_STATE_DIR, MOX_HOME (the live root), and every
@@ -120,12 +373,19 @@ pub fn buildScriptEnv(
 /// the scripts inside each matching `<axis>=<value>` subdirectory. A missing
 /// scripts dir is not an error (no scripts to run). When `environ_map` is
 /// non-null, scripts inherit it instead of mox's own environment.
+/// `rel_prefix` (`"scripts/pre"` or `"scripts/post"`) locates each script's
+/// `dimensions.ScriptRecord` in `contracts` by its repo-relative path;
+/// `contracts` is null only when the caller has none to check against
+/// (`--skip-scripts` never reaches here at all, so in practice this is
+/// always non-null in `apply`).
 pub fn runStage(
     arena: std.mem.Allocator,
     io: Io,
     scripts_dir: []const u8,
+    rel_prefix: []const u8,
     bindings: *const dsl.resolver.Resolver,
     environ_map: ?*const EnvironMap,
+    contracts: ?*const Contracts,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !Result {
@@ -157,11 +417,13 @@ pub fn runStage(
     var result: Result = .{};
     for (file_names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ scripts_dir, name });
-        runOne(arena, io, path, bindings, environ_map, timeout_ms, stdout, stderr, &result);
+        const rel = try path_mod.joinKey(arena, &.{ rel_prefix, name });
+        try runOne(arena, io, path, rel, bindings, environ_map, contracts, timeout_ms, stdout, stderr, &result);
     }
     for (gated_dirs.items) |dname| {
         const sub_path = try std.fs.path.join(arena, &.{ scripts_dir, dname });
-        try runGatedDir(arena, io, sub_path, bindings, environ_map, timeout_ms, stdout, stderr, &result);
+        const sub_rel = try path_mod.joinKey(arena, &.{ rel_prefix, dname });
+        try runGatedDir(arena, io, sub_path, sub_rel, bindings, environ_map, contracts, timeout_ms, stdout, stderr, &result);
     }
     return result;
 }
@@ -184,8 +446,10 @@ fn runGatedDir(
     arena: std.mem.Allocator,
     io: Io,
     dir_path: []const u8,
+    rel_prefix: []const u8,
     bindings: *const dsl.resolver.Resolver,
     environ_map: ?*const EnvironMap,
+    contracts: ?*const Contracts,
     timeout_ms: i64,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -207,7 +471,8 @@ fn runGatedDir(
     }
     for (names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ dir_path, name });
-        runOne(arena, io, path, bindings, environ_map, timeout_ms, stdout, stderr, result);
+        const rel = try path_mod.joinKey(arena, &.{ rel_prefix, name });
+        try runOne(arena, io, path, rel, bindings, environ_map, contracts, timeout_ms, stdout, stderr, result);
     }
 }
 
@@ -415,13 +680,15 @@ fn runOne(
     arena: std.mem.Allocator,
     io: Io,
     path: []const u8,
+    rel_path: []const u8,
     bindings: *const dsl.resolver.Resolver,
     environ_map: ?*const EnvironMap,
+    contracts: ?*const Contracts,
     timeout_ms: i64,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     result: *Result,
-) void {
+) !void {
     // Optional `# mox: when <axis-expr>` header gates the script on the machine
     // bindings. A read failure here is left for the spawn below to surface; a
     // malformed expression is a hard failure, never a silent run.
@@ -435,6 +702,28 @@ fn runOne(
             result.skipped += 1;
             stdout.print("  skipped {s}\n", .{path}) catch {};
             return;
+        }
+    }
+
+    // D3: only a script whose when-gate and directory tuple already matched
+    // this machine (both checked above/by the caller) is ever evaluated for
+    // its fact contract -- a gate-mismatched script is never blocked for a
+    // fact it will never actually need.
+    if (contracts) |c| {
+        const record = findScriptRecord(c.scripts, rel_path);
+        const verdict = try verdictForScript(arena, record, c);
+        switch (verdict.lane) {
+            .runs => {},
+            .declined => {
+                result.declined += 1;
+                stdout.print("  skipped (declined) {s}: {s}\n", .{ path, verdict.messages[0] }) catch {};
+                return;
+            },
+            .blocked => {
+                result.blocked += 1;
+                for (verdict.messages) |m| stderr.print("mox apply: {s}: blocked: {s}\n", .{ path, m }) catch {};
+                return;
+            },
         }
     }
 
@@ -738,4 +1027,188 @@ test "axisDirMatches: gated by binding; non-axis dirs ignored" {
     // A plain directory name is not an axis tuple: ignored, not an error.
     try testing.expect(!try axisDirMatches(a, "windows", &bindings_r));
     try testing.expect(!try axisDirMatches(a, "helpers", &bindings_r));
+}
+
+// D3: script fact contract lane tests
+
+fn testDim(name: []const u8) dimensions.Dimension {
+    return .{
+        .name = name,
+        .roles = .{},
+        .observed_values = &.{},
+        .capture_defaults = &.{},
+        .declared_defaults = &.{},
+        .asking_condition = null,
+        .provenance = .{ .source_count = 0, .needing_scripts = &.{} },
+    };
+}
+
+fn testRecord(path: []const u8, needs: ?[]const []const u8, scanned_tokens: []const []const u8) dimensions.ScriptRecord {
+    return .{
+        .path = path,
+        .when_head = null,
+        .scanned_tokens = scanned_tokens,
+        .needs = needs,
+        .needs_unparseable = false,
+    };
+}
+
+test "verdictForScript: needed fact present non-empty -> runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    try env.put("MOX_FACT_PROFILE", "work");
+    const dims = [_]dimensions.Dimension{testDim("profile")};
+    const custom = [_]Fact{.{ .name = "profile", .value = "work" }};
+    const c = try buildContracts(a, &dims, &.{}, &.{}, &custom, &.{}, &env);
+
+    const rec = testRecord("scripts/pre/x.sh", &.{"profile"}, &.{});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.runs, v.lane);
+    try testing.expectEqual(@as(usize, 0), v.messages.len);
+}
+
+test "verdictForScript: needed fact bound empty -> skipped (declined), green, one aggregated line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    try env.put("MOX_FACT_PROFILE", "");
+    const dims = [_]dimensions.Dimension{testDim("profile")};
+    const custom = [_]Fact{.{ .name = "profile", .value = "" }};
+    const c = try buildContracts(a, &dims, &.{}, &.{}, &custom, &.{}, &env);
+
+    const rec = testRecord("scripts/pre/x.sh", &.{"profile"}, &.{});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.declined, v.lane);
+    try testing.expectEqual(@as(usize, 1), v.messages.len);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "profile") != null);
+}
+
+test "verdictForScript: needed fact never bound, interviewable dimension -> blocked naming `mox facts set`" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    const dims = [_]dimensions.Dimension{testDim("profile")};
+    const c = try buildContracts(a, &dims, &.{}, &.{}, &.{}, &.{}, &env);
+
+    const rec = testRecord("scripts/pre/x.sh", &.{"profile"}, &.{});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.blocked, v.lane);
+    try testing.expectEqual(@as(usize, 1), v.messages.len);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "profile") != null);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "mox facts set profile") != null);
+}
+
+test "verdictForScript: needed fact is an unresolved derived fact -> blocked naming its env/candidates remediation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    const derived = [_]derived_facts.DeclaredRow{.{
+        .name = "brew_prefix",
+        .env = "HOMEBREW_PREFIX",
+        .candidates = &.{ "/opt/homebrew", "/usr/local" },
+    }};
+    const c = try buildContracts(a, &.{}, &.{}, &derived, &.{}, &.{}, &env);
+
+    const rec = testRecord("scripts/pre/x.sh", &.{"brew_prefix"}, &.{});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.blocked, v.lane);
+    try testing.expectEqual(@as(usize, 1), v.messages.len);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "brew_prefix") != null);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "HOMEBREW_PREFIX") != null);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "/opt/homebrew") != null);
+}
+
+test "verdictForScript: a scanned token mapping to no known fact -> blocked, fail-closed, names the token and both remedies" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    const c = try buildContracts(a, &.{}, &.{}, &.{}, &.{}, &.{}, &env);
+
+    // No `needs` line: falls to the scanned-token path.
+    const rec = testRecord("scripts/pre/x.sh", null, &.{"MOX_FACT_NONSENSE"});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.blocked, v.lane);
+    try testing.expectEqual(@as(usize, 1), v.messages.len);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "MOX_FACT_NONSENSE") != null);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "mox facts set") != null);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "# mox: needs") != null);
+}
+
+test "verdictForScript: needs_unparseable is blocked regardless of tokens, contract unknowable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    const c = try buildContracts(a, &.{}, &.{}, &.{}, &.{}, &.{}, &env);
+
+    const rec: dimensions.ScriptRecord = .{
+        .path = "scripts/pre/x.sh",
+        .when_head = null,
+        .scanned_tokens = &.{},
+        .needs = null,
+        .needs_unparseable = true,
+    };
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.blocked, v.lane);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "unknowable") != null);
+}
+
+test "verdictForScript: a projection-collision-dropped bound fact is unavailable -> blocked naming the collision" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `cloud.backend` and `cloud-backend` both sanitize to
+    // MOX_FACT_CLOUD_BACKEND: buildScriptEnv drops both (existing skip-both
+    // behavior), so a script needing either is blocked, not silently run
+    // unguarded.
+    var parent = EnvironMap.init(a);
+    const facts = [_]Fact{
+        .{ .name = "cloud.backend", .value = "gdrive" },
+        .{ .name = "cloud-backend", .value = "dropbox" },
+    };
+    var env_result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    const dims = [_]dimensions.Dimension{testDim("cloud.backend")};
+    const c = try buildContracts(a, &dims, &.{}, &.{}, &facts, env_result.skipped, &env_result.map);
+
+    const rec = testRecord("scripts/pre/x.sh", &.{"cloud.backend"}, &.{});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.blocked, v.lane);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "cloud.backend") != null);
+    try testing.expect(std.mem.indexOf(u8, v.messages[0], "collide") != null);
+}
+
+test "verdictForScript: empty needs (explicit none) always runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    const c = try buildContracts(a, &.{}, &.{}, &.{}, &.{}, &.{}, &env);
+    const rec = testRecord("scripts/pre/x.sh", &.{}, &.{"MOX_FACT_ANYTHING"});
+    const v = try verdictForScript(a, rec, &c);
+    try testing.expectEqual(.runs, v.lane);
+}
+
+test "verdictForScript: no matching discovery record is treated as no contract, runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env = EnvironMap.init(a);
+    const c = try buildContracts(a, &.{}, &.{}, &.{}, &.{}, &.{}, &env);
+    const v = try verdictForScript(a, null, &c);
+    try testing.expectEqual(.runs, v.lane);
 }

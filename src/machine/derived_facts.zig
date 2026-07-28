@@ -87,7 +87,17 @@ pub fn load(
     return .{ .facts = try facts.toOwnedSlice(arena) };
 }
 
-/// Every dimension name `data/facts.toml` declares, regardless of whether it
+/// One `data/facts.toml` row's declared shape, regardless of whether it
+/// currently resolves on this machine: its name plus the `env`/`candidates`
+/// remediation a caller can name when the row is unresolved (D3's blocked-
+/// on-a-derived-fact lane).
+pub const DeclaredRow = struct {
+    name: []const u8,
+    env: ?[]const u8 = null,
+    candidates: []const []const u8 = &.{},
+};
+
+/// Every `data/facts.toml` row's declared shape, regardless of whether it
 /// currently resolves to a value on this machine (`load` drops an unresolved
 /// row entirely, which is right for capture but wrong for discovery -- D1
 /// must exclude a declared name from the custom-dimension space even on a
@@ -95,13 +105,13 @@ pub fn load(
 /// mirrors `load`: a malformed row is `error.MalformedFactsRow`; a name
 /// colliding with a reserved axis, a built-in field, or declared twice is
 /// `error.ReservedFactsRowName`. A missing file (in both layers, or an empty
-/// `repo_dir`) is not an error: returns no names.
-pub fn declaredNames(
+/// `repo_dir`) is not an error: returns no rows.
+pub fn declaredRows(
     arena: std.mem.Allocator,
     io: Io,
     repo_dir: []const u8,
     private_dir: []const u8,
-) ![]const []const u8 {
+) ![]const DeclaredRow {
     const content = (try data_source.readShadowed(arena, io, repo_dir, private_dir, "facts.toml")) orelse
         return &.{};
 
@@ -111,7 +121,7 @@ pub fn declaredNames(
     };
     const rows = array_map.get("facts") orelse return &.{};
 
-    var names: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList(DeclaredRow) = .empty;
     var seen = std.StringHashMap(void).init(arena);
     for (rows) |row| {
         const name = nameOf(row) orelse return error.MalformedFactsRow;
@@ -119,9 +129,40 @@ pub fn declaredNames(
         if (source_axes.isReservedAxisName(name) or state_mod.isBuiltinField(name)) return error.ReservedFactsRowName;
         if (seen.contains(name)) return error.ReservedFactsRowName;
         try seen.put(name, {});
-        try names.append(arena, try arena.dupe(u8, name));
+
+        const env_field = row.get("env");
+        const env: ?[]const u8 = if (env_field) |v| switch (v) {
+            .string => |s| if (s.len > 0) s else null,
+            else => null,
+        } else null;
+        const candidates_field = row.get("candidates");
+        const candidates: []const []const u8 = if (candidates_field) |v| switch (v) {
+            .array_of_strings => |arr| arr,
+            else => &.{},
+        } else &.{};
+
+        try out.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .env = env,
+            .candidates = candidates,
+        });
     }
-    return names.toOwnedSlice(arena);
+    return out.toOwnedSlice(arena);
+}
+
+/// Every dimension name `data/facts.toml` declares. See `declaredRows` for
+/// the full contract; this is the name-only projection discovery's exclusion
+/// check uses.
+pub fn declaredNames(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    private_dir: []const u8,
+) ![]const []const u8 {
+    const rows = try declaredRows(arena, io, repo_dir, private_dir);
+    const names = try arena.alloc([]const u8, rows.len);
+    for (rows, 0..) |r, i| names[i] = r.name;
+    return names;
 }
 
 fn nameOf(row: toml.Record) ?[]const u8 {
@@ -518,4 +559,51 @@ test "load: private layer shadows repo" {
     const r = try load(a, io, .{ .map = &map }, repo, priv, "/home/x", null);
     try std.testing.expectEqual(@as(usize, 1), r.facts.len);
     try std.testing.expectEqualStrings(priv_cand, r.facts[0].value);
+}
+
+test "declaredRows: carries env/candidates remediation for an unresolved row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"brew_prefix\"\nenv = \"HOMEBREW_PREFIX\"\ncandidates = [\"/opt/homebrew\", \"/usr/local\"]\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+
+    const rows = try declaredRows(a, io, repo, "");
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("brew_prefix", rows[0].name);
+    try std.testing.expectEqualStrings("HOMEBREW_PREFIX", rows[0].env.?);
+    try std.testing.expectEqual(@as(usize, 2), rows[0].candidates.len);
+    try std.testing.expectEqualStrings("/opt/homebrew", rows[0].candidates[0]);
+    try std.testing.expectEqualStrings("/usr/local", rows[0].candidates[1]);
+}
+
+test "declaredRows: a row with neither env nor candidates has both empty/null" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = "[[facts]]\nname = \"gopath\"\n",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+
+    const rows = try declaredRows(a, io, repo, "");
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(rows[0].env == null);
+    try std.testing.expectEqual(@as(usize, 0), rows[0].candidates.len);
 }

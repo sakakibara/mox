@@ -172,22 +172,16 @@ fn applyPass(
     // Setup scripts inherit mox's environment plus MOX_REPO/MOX_STATE_DIR/
     // MOX_HOME and every fact as MOX_FACT_<UPPERCASE_NAME>, so a bootstrap
     // script can branch on the same facts that gate the file layer.
-    const script_facts = try ctx.alloc.alloc(mox.apply.run_scripts.Fact, m_state.custom_facts.len);
-    for (m_state.custom_facts, 0..) |f, i| script_facts[i] = .{ .name = f.name, .value = f.value };
-    const script_env_result = try mox.apply.run_scripts.buildScriptEnv(
-        ctx.alloc,
-        context.env,
-        context.paths.repo_dir,
-        context.paths.state_dir,
-        context.paths.home,
-        script_facts,
-    );
-    var script_env = script_env_result.map;
-    if (script_env_result.skipped.len > 0) {
-        try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
-        for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
-        try ctx.err.writeAll("\n");
-    }
+    //
+    // `data/facts.toml`'s declared rows (for a derived fact's remediation
+    // text) are stable for the whole run -- a repo file, not machine state --
+    // so this loads once; `script_env`/`contracts` below are rebuilt after
+    // every re-capture (D3: a post-script must see a pre-script's fresh
+    // facts, both as env and for its own availability check).
+    const derived_rows = try mox.machine.derived_facts.declaredRows(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir);
+    var script_env: std.process.Environ.Map = undefined;
+    var contracts: mox.apply.run_scripts.Contracts = undefined;
+    try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts);
 
     // Resolved once per apply run (not per checked partial file): an
     // unparseable override would otherwise warn once per file checked.
@@ -217,16 +211,21 @@ fn applyPass(
     const pre_result = if (skip_scripts)
         mox.apply.run_scripts.Result{}
     else
-        try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, &bindings, &script_env, ctx.out, ctx.err);
+        try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, "scripts/pre", &bindings, &script_env, &contracts, ctx.out, ctx.err);
 
     // A pre-script may install a tool or create a directory a `data/facts.toml`
     // row derives a fact from. Re-capture so this same apply composes against
     // the machine as the bootstrap left it, not as it began -- the
-    // first-apply staleness the design exists to eliminate.
+    // first-apply staleness the design exists to eliminate. `script_env`/
+    // `contracts` are rebuilt in lockstep (D3): a post-script must see and be
+    // judged against exactly the facts this re-capture just bound, not the
+    // pre-stage's stale projection.
     if (pre_result.ran > 0) {
         m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
+        try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts);
+        try script_env.put("MOX_PATH", mox_path_file);
     }
     // $MOX_PATH additions the pre stage named: fold into this run's probe
     // search space (on the FRESH state above, if it just recaptured) and
@@ -606,7 +605,7 @@ fn applyPass(
     const post_result = if (skip_scripts or resolver.aborted)
         mox.apply.run_scripts.Result{}
     else
-        try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, post_dir, &bindings, &script_env, ctx.out, ctx.err);
+        try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, post_dir, "scripts/post", &bindings, &script_env, &contracts, ctx.out, ctx.err);
     // $MOX_PATH additions the post stage named: no script or check hook runs
     // after this in the same apply, but folding them in keeps the run's
     // bookkeeping (probe search space, PATH) consistent regardless of stage.
@@ -626,11 +625,12 @@ fn applyPass(
         );
     } else {
         try ctx.out.print(
-            "\nApplied: {d} written, {d} unchanged, {d} skipped, {s}{d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed\n",
+            "\nApplied: {d} written, {d} unchanged, {d} skipped, {s}{d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed, {d} blocked, {d} declined\n",
             .{
-                counts.ok,                        counts.unchanged,                         counts.skip,
-                resolved,                         counts.drift,                             counts.fail,
-                pre_result.ran + post_result.ran, pre_result.skipped + post_result.skipped, pre_result.failed + post_result.failed,
+                counts.ok,                                counts.unchanged,                           counts.skip,
+                resolved,                                 counts.drift,                               counts.fail,
+                pre_result.ran + post_result.ran,         pre_result.skipped + post_result.skipped,   pre_result.failed + post_result.failed,
+                pre_result.blocked + post_result.blocked, pre_result.declined + post_result.declined,
             },
         );
     }
@@ -641,8 +641,50 @@ fn applyPass(
     } else {
         queued_out.* = resolver.queued;
     }
-    const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed;
+    // A blocked script (D3: its fact contract could not be resolved) fails
+    // the run exactly like a failed one, under its own summary label.
+    const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed + pre_result.blocked + post_result.blocked;
     return if (total_fail > 0) 1 else 0;
+}
+
+/// Rebuild `script_env`/`contracts` in lockstep from `m_state`'s current
+/// `custom_facts` (D3: every re-capture must rebuild both, never just the
+/// environment -- an availability check against a stale projection would
+/// silently disagree with what the script itself just received).
+fn refreshScriptStage(
+    ctx: *app.Ctx,
+    context: app.Context,
+    m_state: mox.machine.state.MachineState,
+    discovery: mox.machine.dimensions.Discovery,
+    derived_rows: []const mox.machine.derived_facts.DeclaredRow,
+    script_env: *std.process.Environ.Map,
+    contracts: *mox.apply.run_scripts.Contracts,
+) !void {
+    const script_facts = try ctx.alloc.alloc(mox.apply.run_scripts.Fact, m_state.custom_facts.len);
+    for (m_state.custom_facts, 0..) |f, i| script_facts[i] = .{ .name = f.name, .value = f.value };
+    const script_env_result = try mox.apply.run_scripts.buildScriptEnv(
+        ctx.alloc,
+        context.env,
+        context.paths.repo_dir,
+        context.paths.state_dir,
+        context.paths.home,
+        script_facts,
+    );
+    if (script_env_result.skipped.len > 0) {
+        try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
+        for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
+        try ctx.err.writeAll("\n");
+    }
+    script_env.* = script_env_result.map;
+    contracts.* = try mox.apply.run_scripts.buildContracts(
+        ctx.alloc,
+        discovery.dimensions,
+        discovery.scripts,
+        derived_rows,
+        script_facts,
+        script_env_result.skipped,
+        script_env,
+    );
 }
 
 /// Fold whatever a just-finished stage appended to `$MOX_PATH` into
