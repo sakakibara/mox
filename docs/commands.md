@@ -15,9 +15,9 @@ clones an existing dotfiles repo into the repo dir; by default it stops
 for you to review -- a cloned repo's files and scripts are untrusted
 until you look at them -- and `--apply` applies right away for a
 one-command bootstrap. Refuses a non-empty repo dir. `--apply`'s facts
-interview is the ordinary interactive one; for a non-interactive
-bootstrap, follow it with `mox apply --defaults` (see [apply](#apply)) to
-bind declared defaults and decline the rest instead of prompting.
+interview is the ordinary interactive one; add `--defaults` (see
+[apply](#apply)) for the zero-touch form that binds declared defaults
+and declines the rest instead of prompting.
 
 `--clone` accepts shorthand alongside full URLs:
 

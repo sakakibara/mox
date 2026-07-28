@@ -13,6 +13,7 @@ const CloneFn = *const fn (std.mem.Allocator, Io, []const u8, []const u8) anyerr
 const Spec = struct {
     clone: cli.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply'); <owner>, <owner>/<repo>, and <host>/<owner>/<repo> are shorthand for https URLs (owner alone assumes a repo named dotfiles)" }),
     apply: cli.Flag(.{ .help = "after cloning, apply immediately (write files, run scripts) instead of stopping to review" }),
+    defaults: cli.Flag(.{ .help = "with --apply: never prompt in the facts interview; bind declared defaults and decline the rest" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
@@ -25,12 +26,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const rc = try runClone(ctx, url, gitClone, a.apply);
         if (rc != 0) return rc;
         // Opt-in one-command bootstrap: clone, then apply a repo the user trusts.
-        if (a.apply) return apply.applyImpl(ctx, false, false, false, false, &.{});
+        if (a.apply) return apply.applyImpl(ctx, false, false, false, a.defaults, &.{});
         return rc;
     }
     const rc = try initFresh(ctx);
     if (rc != 0) return rc;
-    if (a.apply) return apply.applyImpl(ctx, false, false, false, false, &.{});
+    if (a.apply) return apply.applyImpl(ctx, false, false, false, a.defaults, &.{});
     return rc;
 }
 
@@ -164,7 +165,7 @@ fn initFresh(ctx: *app.Ctx) !u8 {
 pub const command = app.command(Spec, .{
     .name = "init",
     .summary = "Initialize a fresh mox repo",
-    .usage = "mox init [--clone <url>] [--apply]",
+    .usage = "mox init [--clone <url>] [--apply [--defaults]]",
     .details = "Creates src/ and scripts/. --clone <url>: git clone <url> into the repo dir; without --apply it stops for you to review (then run 'mox apply'), with --apply it applies right away (writes files, runs scripts) for a one-command bootstrap. Refuses a non-empty repo dir. <owner> expands to https://github.com/<owner>/dotfiles, <owner>/<repo> to https://github.com/<owner>/<repo>, <host>/<owner>/<repo> to https://<host>/<owner>/<repo>; full URLs, ssh remotes, and local paths are used as given.",
     .group = .general,
     .needs_context = true,

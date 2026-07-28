@@ -46,9 +46,9 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/instal
 `owner/repo`, `host/owner/repo`, full URLs, ssh remotes, and local paths
 all work too. The powershell form takes the same arguments directly, no
 `--`: `& ([scriptblock]::Create((irm .../install.ps1))) init --clone <you> --apply`.
-For a non-interactive machine, follow with `mox apply --defaults`: it binds
-every unanswered fact to its declared default and declines the rest,
-instead of prompting.
+For a non-interactive machine, add `--defaults`: the facts interview
+then binds every unanswered fact to its declared default and declines
+the rest, instead of prompting -- a zero-touch bootstrap.
 
 `MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror. Update in
 place with `mox upgrade` (it verifies the download against `SHA256SUMS`).
