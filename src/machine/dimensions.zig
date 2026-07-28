@@ -1578,6 +1578,32 @@ test "simplifyOr: an or_ nested inside a single occurrence's condition is flatte
     });
 }
 
+test "simplifyOr: exact-duplicate disjuncts are deduped (absorption keeps equal sets, dedup drops them)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two occurrences under an identical gate produce the same condition.
+    // Absorption's strict-superset check deliberately keeps equal atom sets
+    // (neither is a strict superset), so only dedup collapses the pair --
+    // this pins dedup specifically, which absorption alone would not.
+    const os_darwin: AxisExpr = .{ .eq = .{ .axis = "os", .value = "darwin" } };
+    const profile_work: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const conj: AxisExpr = .{ .and_ = .{ .left = &os_darwin, .right = &profile_work } };
+
+    const disjuncts = [_]*const AxisExpr{ &conj, &conj };
+    const simplified = try simplifyOr(a, &disjuncts);
+
+    // Collapses to the single conjunction -- no residual top-level or_.
+    try std.testing.expect(simplified.* == .and_);
+    try std.testing.expectEqualStrings("os=darwin and profile=work", try writeExprToStringForTest(a, simplified));
+
+    try truthTableEquivalent(a, &disjuncts, simplified, &.{
+        .{ .axis = "os", .value = "darwin" },
+        .{ .axis = "profile", .value = "work" },
+    });
+}
+
 test "discover: signing_work_key's redundant multi-occurrence OR simplifies to profile=work" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
