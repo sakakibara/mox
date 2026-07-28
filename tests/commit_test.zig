@@ -183,6 +183,40 @@ test "commit: a first-contact file's real edit routes into source preserving an 
         "export C=3 \n", try read(io, a, live));
 }
 
+test "commit --yes on a first-contact file never silently routes a spurious hunk; it stays unresolved" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export C=3\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    // No `mox apply`: the repo has a source, but mox never wrote this live
+    // path -- first contact. The only difference from the source is a
+    // trailing space, the kind of rendering quirk another tool's writer
+    // (e.g. a chezmoi-rendered live file during a migration) might leave.
+    const live = try h.liveOf(".bashrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export C=3 \n" });
+
+    // `--yes` reads no input at all -- if this silently auto-accepted, the
+    // process would need none, and the spurious hunk would land in source.
+    // Nothing here was routed at all (the only hunk is manual), so this
+    // matches every other wholly-manual fallback test: only the report and
+    // the untouched sources are asserted, not the exit code -- see the
+    // sibling data-interpolated manual tests for the same rule.
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+
+    // The hunk is a first-contact one, never a silent keep-all: nothing is
+    // written to source, and the live file is untouched too.
+    try std.testing.expectEqualStrings("export C=3\n", try read(io, a, try h.srcOf(".bashrc")));
+    try std.testing.expectEqualStrings("export C=3 \n", try read(io, a, live));
+}
+
 test "commit: a first-contact structured file with no matching layer creates one, scoped to this machine, and routes the key into it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
