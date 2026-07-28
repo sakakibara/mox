@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !u8 {
         try stderr.print("mox: internal error: {s}\n", .{@errorName(e)});
         try stdout.flush();
         try stderr.flush();
-        return 1;
+        return 2;
     };
 
     try stdout.flush();

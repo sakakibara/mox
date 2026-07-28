@@ -1447,7 +1447,8 @@ test "apply: a structurally invalid source tree fails before scripts/pre ever ru
     const sentinel = try c.homePath("sentinel");
 
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    // A structural tree error is a genuine failure (rc 2), not drift.
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, sentinel, .{}));
 }
 
@@ -1468,7 +1469,7 @@ test "apply: a malformed overlay tuple names the offending file on stderr" {
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "os=.toml") != null);
 }
 
@@ -1533,7 +1534,7 @@ test "apply/doctor: a leftover data/facts-schema.toml gets one loud never-read n
     try std.testing.expect(std.mem.indexOf(u8, r_doctor.err, "facts-schema.toml exists but is no longer read") != null);
 }
 
-test "apply: interview and drift resolution share one stdin reader -- piped input answers both in one run" {
+test "apply: a drifted file never consumes the interview's scripted stdin" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1555,22 +1556,20 @@ test "apply: interview and drift resolution share one stdin reader -- piped inpu
     // First apply: non-interactive, materializes both live files.
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    // Hand-edit the drift-only file so this run's per-file loop hits a drift
-    // prompt after the interview has already run.
+    // Hand-edit the drift-only file so this run's per-file loop hits drift
+    // after the interview has already run.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("notes.txt"), .data = "line one\nedited\n" });
 
-    // One piped stream: first line answers the editor_name interview
-    // (still unbound after the first, non-interactive apply), the rest
-    // answers the drift prompt for notes.txt ('s' = skip).
-    const r = try c.runWithInput(&.{ "mox", "apply" }, "emacs\ns\n");
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.txt") != null);
+    // One piped stream: the interview reads its one line; apply never prompts
+    // for drift, so nothing else is ever read from it.
+    const r = try c.runWithInput(&.{ "mox", "apply" }, "emacs\n");
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "notes.txt") != null);
 
     const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
     try std.testing.expect(std.mem.indexOf(u8, facts, "editor_name = \"emacs\"") != null);
-    // The drift answer ('s', skip) was correctly read AFTER the interview
-    // consumed its own line, not lost to a second, independently buffered
-    // stdin reader: the live edit survives untouched.
+    // Drift is skipped, not prompted: the live edit survives untouched.
     try std.testing.expectEqualStrings("line one\nedited\n", try read(io, a, try c.homePath("notes.txt")));
 }
 
@@ -1983,8 +1982,8 @@ test "apply: a symlink-flagged source refuses a live regular file as drift, repl
     // First apply: this is unrecorded live content mox never wrote. It must be
     // refused as drift, NOT silently unlinked.
     const r1 = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(r1.rc != 0);
-    try std.testing.expect(std.mem.indexOf(u8, r1.err, "mylink") != null);
+    try std.testing.expectEqual(@as(u8, 1), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "mylink") != null);
     try std.testing.expect(!isSymlink(io, live));
     try std.testing.expectEqualStrings("hand written user data\n", try read(io, a, live));
 
@@ -3302,18 +3301,16 @@ test "apply generator: mox mv re-keys the manifest so the old leaves are pruned,
     try std.testing.expect(try snapshotHas(io, a, c.state, ".config/id-a.inc", "key=a\n"));
 }
 
-// -- interactive drift resolution --
+// -- non-interactive drift: skip, collect, and report --
 
 /// Two managed files, applied, then both edited live so both are drifted.
-/// `a.conf` is the one whose live edit should win; `b.conf` the one whose
-/// live copy is damaged and should be discarded.
 fn writeDriftPair(io: Io, tmp: *std.testing.TmpDir) !void {
     try tmp.dir.createDirPath(io, "repo/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "keep = source\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "full = source\n" });
 }
 
-test "apply drift: [o] discards the live edit and writes the composed output" {
+test "apply drift: --overwrite discards the live edit and writes the composed output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3326,12 +3323,13 @@ test "apply drift: [o] discards the live edit and writes the composed output" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "damaged\n" });
 
-    const res = try c.runWithInput(&.{ "mox", "apply" }, "o\n");
+    const res = try c.run(&.{ "mox", "apply", "--overwrite", try c.homePath("b.conf") });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
     // The source is never touched by an overwrite.
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.srcOf("b.conf")));
+    // A second apply is clean: overwrite converges.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 }
 
 test "apply: an unparseable MOX_SNAPSHOT_RETENTION warns and falls back to the default" {
@@ -3357,7 +3355,7 @@ test "apply: an unparseable MOX_SNAPSHOT_RETENTION warns and falls back to the d
     try std.testing.expect(std.mem.indexOf(u8, res.err, "using default") != null);
 }
 
-test "apply drift: [s] leaves the live edit alone, exactly as before" {
+test "apply drift: left untouched by default, exit 1, no prompt" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3370,37 +3368,14 @@ test "apply drift: [s] leaves the live edit alone, exactly as before" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "mine\n" });
 
-    const res = try c.runWithInput(&.{ "mox", "apply" }, "s\n");
+    // Input is available but never read: apply never prompts.
+    const res = try c.runWithInput(&.{ "mox", "apply" }, "o\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 drifted") != null);
 }
 
-test "apply drift: [c] routes the live edit into source instead of discarding it" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    try writeDriftPair(io, &tmp);
-    const c = try cliSetup(a, io, &tmp);
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("a.conf"), .data = "keep = mine\n" });
-
-    // [c] at the drift prompt, then [y] at commit's own per-hunk prompt.
-    const res = try c.runWithInput(&.{ "mox", "apply" }, "c\ny\n");
-    // The live edit survives AND reaches the source -- the outcome no
-    // combination of today's flags can produce.
-    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.srcOf("a.conf")));
-    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.homePath("a.conf")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "queued") != null);
-    // Nothing is left drifted afterwards.
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
-}
-
-test "apply drift: one run resolves two files in opposite directions" {
+test "apply drift: --overwrite is scoped -- an unnamed drifted file stays untouched and still reports" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3414,17 +3389,20 @@ test "apply drift: one run resolves two files in opposite directions" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("a.conf"), .data = "keep = mine\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "damaged\n" });
 
-    // Files are walked in tree order: a.conf keeps its live edit, b.conf is
-    // discarded. This is the case --force resolves wrongly and today's apply
-    // cannot resolve at all.
-    const res = try c.runWithInput(&.{ "mox", "apply" }, "c\no\ny\n");
-    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.srcOf("a.conf")));
+    // --overwrite named only b.conf: a scoped apply walks only the named
+    // path, so it resolves cleanly without ever touching a.conf.
+    const res = try c.run(&.{ "mox", "apply", "--overwrite", try c.homePath("b.conf") });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.homePath("a.conf")));
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
+
+    // An unscoped apply still finds a.conf's drift untouched by the scoped run.
+    const full = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), full.rc);
+    try std.testing.expect(std.mem.indexOf(u8, full.out, "a.conf") != null);
 }
 
-test "apply drift: [q] stops the run, reports the rest, and writes nothing" {
+test "apply drift: an unscoped --overwrite resolves every drifted file, exit 0" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3436,24 +3414,16 @@ test "apply drift: [q] stops the run, reports the rest, and writes nothing" {
     const c = try cliSetup(a, io, &tmp);
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("a.conf"), .data = "keep = mine\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "mine\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "damaged\n" });
 
-    // `?` first, so the drift prompt's own quit wording is exercised; then q.
-    const res = try c.runWithInput(&.{ "mox", "apply" }, "?\nq\n");
-    try std.testing.expectEqual(@as(u8, 1), res.rc);
-    // a.conf hit the prompt; b.conf was never reached. Both are reported and
-    // counted drifted, and neither live file was touched.
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "DRIFT   ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "a.conf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "unresolved") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "b.conf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 drifted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "stop the apply") != null);
-    try std.testing.expectEqualStrings("keep = mine\n", try read(io, a, try c.homePath("a.conf")));
-    try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
+    const res = try c.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("keep = source\n", try read(io, a, try c.homePath("a.conf")));
+    try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
 }
 
-test "apply drift: non-interactive and --force keep their exact contracts" {
+test "apply drift: non-interactive skip-and-report, --dry-run, and --force (--overwrite's retained alias)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3470,8 +3440,8 @@ test "apply drift: non-interactive and --force keep their exact contracts" {
     // script and CI run depends on.
     const plain = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), plain.rc);
-    try std.testing.expect(std.mem.indexOf(u8, plain.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plain.err, "re-run with --force") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.out, "re-run with --force") != null);
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
 
     // --dry-run writes nothing and never prompts, even with input available.
@@ -3479,7 +3449,8 @@ test "apply drift: non-interactive and --force keep their exact contracts" {
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "Dry run:") != null);
 
-    // --force still overwrites everything with no prompt.
+    // --force (the retained alias of --overwrite) still overwrites everything
+    // with no prompt.
     const forced = try c.run(&.{ "mox", "apply", "--force" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
@@ -3661,7 +3632,7 @@ test "apply partial: a dangling symlinked live path refuses with the live untouc
     try Io.Dir.cwd().symLink(io, "no-such-target.toml", live, .{});
 
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "dangling symlink") != null);
     // The link is untouched and its target was never created.
     const st = try Io.Dir.cwd().statFile(io, live, .{ .follow_symlinks = false });
@@ -3703,9 +3674,9 @@ test "apply partial: first-contact drift is skipped, --force reasserts the sourc
 
     const r1 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r1.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r1.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1.err, "tui.keymap.global") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1.err, "'mox commit' it or re-run with --force") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "tui.keymap.global") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "'mox commit' it or re-run with --force") != null);
     try std.testing.expectEqualStrings(drifted, try read(io, a, live));
 
     const r2 = try c.run(&.{ "mox", "apply", "--force" });
@@ -3754,7 +3725,7 @@ test "apply partial: enforced absence removes through the record and drifts past
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own keep\n# mox: own gone\n[keep]\nk = 1\n" });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "DRIFT") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "g = 99") != null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
@@ -3787,8 +3758,8 @@ test "apply partial: a path added to own is first contact, never a silent overwr
     });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "beta") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "theirs = true") != null);
 
     const forced = try c.run(&.{ "mox", "apply", "--force" });
@@ -3827,7 +3798,7 @@ test "apply partial: a composed leaf outside the declaration refuses the file" {
     const c = try cliSetup(a, io, &tmp);
 
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "stray") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "outside the declared own paths") != null);
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
@@ -3847,7 +3818,7 @@ test "apply partial: an unparseable live file refuses the patch" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "not [ = toml = [\n" });
 
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "does not parse") != null);
     try std.testing.expectEqualStrings("not [ = toml = [\n", try read(io, a, live));
 }
@@ -3873,7 +3844,7 @@ test "apply partial: --dry-run reports would-create and drift without writing" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\nk = 9\n" });
     const dry2 = try c.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry2.rc);
-    try std.testing.expect(std.mem.indexOf(u8, dry2.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry2.out, "DRIFT") != null);
     try std.testing.expectEqualStrings("[tui]\nk = 9\n", try read(io, a, live));
 }
 
@@ -4051,11 +4022,11 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
     // The whole-scope hash comparison names the owned content, never a
     // sentinel interpolated as a path name.
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "(owned content changed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "owned path owned content") == null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "(owned content changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "owned path owned content") == null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
@@ -4121,7 +4092,9 @@ test "apply: an own declaration the walk rejects reports the target by name" {
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    // A structural walk error is a genuine failure for apply (rc 2); status/
+    // diff/commit/rollback below are untouched by the exit-code split.
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "dotted key path") != null);
 
@@ -4131,7 +4104,8 @@ test "apply: an own declaration the walk rejects reports the target by name" {
     const mixed_want = "ownership declaration: app.toml: own and disown cannot combine in one head";
     inline for (.{ "apply", "status", "diff", "commit" }) |cmd| {
         const m = try c.run(&.{ "mox", cmd });
-        try std.testing.expectEqual(@as(u8, 1), m.rc);
+        const want_rc: u8 = if (std.mem.eql(u8, cmd, "apply")) 2 else 1;
+        try std.testing.expectEqual(want_rc, m.rc);
         try std.testing.expect(std.mem.indexOf(u8, m.err, mixed_want) != null);
     }
     // rollback warns (whole-file restores must still work) and then fails
@@ -4142,7 +4116,7 @@ test "apply: an own declaration the walk rejects reports the target by name" {
     // Overlapping declared paths are refused at the walk, naming both.
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n# mox: own tui.keymap\n[tui]\n" });
     const ov = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), ov.rc);
+    try std.testing.expectEqual(@as(u8, 2), ov.rc);
     try std.testing.expect(std.mem.indexOf(u8, ov.err, "ownership declaration: app.toml: tui: overlaps declared path tui.keymap") != null);
     try std.testing.expect(std.mem.indexOf(u8, ov.err, "disjoint subtrees") != null);
 }
@@ -4156,14 +4130,14 @@ test "apply: a directive-looking line in an unstructured head fails only that fi
     const a = arena.allocator();
 
     // Prose that happens to spell a directive: the .md file itself errors,
-    // everything else still applies, and the run exits 1.
+    // everything else still applies, and the run exits 2 (a genuine failure).
     try tmp.dir.createDirPath(io, "repo/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.md", .data = "# mox: own x\nprose body\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v1\n" });
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "structured") != null);
     try std.testing.expectEqualStrings("v1\n", try read(io, a, try c.homePath("b.conf")));
@@ -4535,9 +4509,10 @@ test "apply partial check: a rejecting hook refuses the file and reports its out
 
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("app.toml");
-    // Creation path: the candidate is refused, so nothing lands live.
+    // Creation path: the candidate is refused, so nothing lands live. A check
+    // refusal is a genuine failure (rc 2), not drift.
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "check") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "exit 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "custom-rejection-detail") != null);
@@ -4547,7 +4522,7 @@ test "apply partial check: a rejecting hook refuses the file and reports its out
     const program_live = "[tui]\nk = 9\n\n[program]\nstate = 1\n";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
     const r2 = try c.run(&.{ "mox", "apply", "--force" });
-    try std.testing.expectEqual(@as(u8, 1), r2.rc);
+    try std.testing.expectEqual(@as(u8, 2), r2.rc);
     try std.testing.expectEqualStrings(program_live, try read(io, a, live));
 }
 
@@ -4659,7 +4634,7 @@ test "apply partial check: a hanging hook is killed within the timeout bound" {
     const started = Io.Clock.real.now(io).toSeconds();
     const r = try c.run(&.{ "mox", "apply" });
     const elapsed = Io.Clock.real.now(io).toSeconds() - started;
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "timed out") != null);
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
     // Killed by the 1500ms bound, not by the checker's 30s sleep ending.
@@ -4743,7 +4718,7 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     // restored owned content as drift, mirroring whole-file rollback.
     const drift = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), drift.rc);
-    try std.testing.expect(std.mem.indexOf(u8, drift.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drift.out, "DRIFT") != null);
 }
 
 var repatch_stat_fail_target: []const u8 = "";
@@ -5034,8 +5009,8 @@ test "apply disown: a user-key live edit drifts and --force reasserts around the
     });
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "theme") != null);
 
     const forced = try c.run(&.{ "mox", "apply", "--force" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
@@ -5092,8 +5067,8 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
     });
     const shrunk = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), shrunk.rc);
-    try std.testing.expect(std.mem.indexOf(u8, shrunk.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, shrunk.err, "model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "model") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "model") != null);
 
     const forced = try c.run(&.{ "mox", "apply", "--force" });
@@ -5246,8 +5221,8 @@ test "apply disown: a shrunk disown list on a secret record is first contact, ne
     try writeDisownFixture(io, &tmp, "// mox: disown model\n{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S2>\"\n}\n");
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, skip.err, "survey") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "survey") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "survey") != null);
 
     // --force removes it, keeps the still-disowned model, rotates the secret.
@@ -5313,7 +5288,7 @@ test "apply disown: a composed source defining content under a disowned path ref
     const c = try cliSetup(a, io, &tmp);
 
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "defines content under disowned path model") != null);
     try std.testing.expect(!exists(io, try c.homePath("settings.json")));
     try std.testing.expectEqualStrings("v1\n", try read(io, a, try c.homePath("b.conf")));

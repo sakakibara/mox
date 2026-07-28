@@ -32,13 +32,23 @@ pub const Options = struct {
     home: []const u8,
     force: bool,
     dry_run: bool,
+    /// True when the caller folds a drift-class refusal into its own
+    /// generator-scoped report row (the unified classifier's `generated_set`
+    /// unit) and so does not want a per-leaf DRIFT line duplicating it.
+    /// `false` keeps the per-leaf message (an orphaned generator has no
+    /// scopeable row to fold into, so the per-leaf line is the only report).
+    mute_drift_message: bool = false,
 };
 
 pub const Result = struct {
     /// Leaves removed (or, under dry-run, that would be removed).
     removed: usize = 0,
-    /// Leaves refused (unsnapshottable, or drifted without `--force`).
-    refused: usize = 0,
+    /// Leaves refused because they drifted and `--force`/`--overwrite` was
+    /// not given: resolvable by the caller re-running forced.
+    drift_refused: usize = 0,
+    /// Leaves refused for a reason `--force`/`--overwrite` cannot resolve
+    /// (unsnapshottable, undeletable, or now a directory/special file).
+    error_refused: usize = 0,
 };
 
 fn manifestPath(arena: std.mem.Allocator, state_dir: []const u8, gen_live: []const u8) ![]u8 {
@@ -123,9 +133,9 @@ pub fn sweepOrphans(
             const leaf = std.mem.trim(u8, line, " \t\r");
             if (leaf.len == 0) continue;
             if (keep.contains(leaf)) continue;
-            const before = result.refused;
+            const before = result.drift_refused + result.error_refused;
             try removeLeaf(arena, io, opts, leaf, stdout, stderr, &result);
-            if (result.refused > before) all_removed = false;
+            if (result.drift_refused + result.error_refused > before) all_removed = false;
         }
         // Keep the manifest while any leaf was refused (drifted or
         // unsnapshottable), so the next apply retries instead of orphaning
@@ -180,9 +190,11 @@ fn removeLeaf(
             try forgetRecords(arena, io, opts.state_dir, live_path);
             return;
         },
-        // Never delete a directory that appeared where a leaf was.
+        // Never delete a directory that appeared where a leaf was. `--force`
+        // does not resolve this (there is no directory-replace primitive
+        // here), so it is an error, not drift needing a decision.
         .directory => {
-            result.refused += 1;
+            result.error_refused += 1;
             try stderr.print("  {s}: generated leaf is now a directory, not removing\n", .{live_path});
             return;
         },
@@ -191,8 +203,9 @@ fn removeLeaf(
         // target string, not the dereferenced content) and remove it.
         .symlink => |target| {
             if (!opts.force) {
-                result.refused += 1;
-                try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --force to prune)\n", .{live_path});
+                result.drift_refused += 1;
+                if (!opts.mute_drift_message)
+                    try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --force to prune)\n", .{live_path});
                 return;
             }
             if (opts.dry_run) {
@@ -201,12 +214,12 @@ fn removeLeaf(
                 return;
             }
             snapshot.saveSymlink(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, target) catch |e| {
-                result.refused += 1;
+                result.error_refused += 1;
                 try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ live_path, @errorName(e) });
                 return;
             };
             Io.Dir.cwd().deleteFile(io, live_path) catch |e| {
-                result.refused += 1;
+                result.error_refused += 1;
                 try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ live_path, @errorName(e) });
                 return;
             };
@@ -225,7 +238,7 @@ fn removeLeaf(
     switch (write.guardLiveRead(io, live_path)) {
         .readable, .absent => {},
         .special => {
-            result.refused += 1;
+            result.error_refused += 1;
             try stderr.print("  {s}: generated leaf is not a regular file, not removing\n", .{live_path});
             return;
         },
@@ -238,7 +251,7 @@ fn removeLeaf(
         },
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            result.refused += 1;
+            result.error_refused += 1;
             try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; not removing, cannot read to back up)\n", .{live_path});
             return;
         },
@@ -249,8 +262,9 @@ fn removeLeaf(
     const rec = try applied.read(arena, io, opts.state_dir, live_path);
     const clean = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
     if (!clean and !opts.force) {
-        result.refused += 1;
-        try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --force to prune)\n", .{live_path});
+        result.drift_refused += 1;
+        if (!opts.mute_drift_message)
+            try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --force to prune)\n", .{live_path});
         return;
     }
     if (opts.dry_run) {
@@ -263,12 +277,12 @@ fn removeLeaf(
     // before deleting, and refuse the delete if the snapshot cannot be taken.
     const snap_content = try redactedContent(arena, io, opts.state_dir, live_path, content);
     snapshot.save(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, snap_content) catch |e| {
-        result.refused += 1;
+        result.error_refused += 1;
         try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ live_path, @errorName(e) });
         return;
     };
     Io.Dir.cwd().deleteFile(io, live_path) catch |e| {
-        result.refused += 1;
+        result.error_refused += 1;
         try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ live_path, @errorName(e) });
         return;
     };

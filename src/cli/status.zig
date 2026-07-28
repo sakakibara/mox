@@ -164,17 +164,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             const target = std.mem.trim(u8, composed.?, " \t\r\n");
             const site = mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, file.live_path);
             const recorded_target = try mox.apply.applied.readSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
-            const disp: mox.apply.applied.Disposition = switch (site) {
-                .absent => .fresh_write,
-                .symlink => |cur| blk: {
-                    if (mox.apply.applied.sameSymlinkTarget(cur, target)) break :blk .unchanged;
-                    if (recorded_target) |rt| if (mox.apply.applied.sameSymlinkTarget(rt, cur)) break :blk .safe_overwrite;
-                    break :blk .drift;
-                },
-                // A regular file, directory, or special entry where a symlink
-                // is expected: mox never records a non-symlink here, so drift.
-                .directory, .other => .drift,
-            };
+            const disp = mox.apply.drift.symlinkDisposition(site, recorded_target, target);
             const cell = cellFor(disp);
             if (cell.problem) problems += 1;
             try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });

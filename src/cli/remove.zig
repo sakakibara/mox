@@ -161,11 +161,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             // leaf (undeletable, a directory, an unsnapshottable drift) would
             // otherwise become a permanent un-prunable orphan once the source is
             // trashed; retain the manifest so it stays tracked and retryable.
-            if (res.refused == 0) {
+            const refused = res.drift_refused + res.error_refused;
+            if (refused == 0) {
                 try mox.apply.generated.deleteManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
             }
             try ctx.out.print("  removed {d} generated file(s)\n", .{res.removed});
-            return if (res.refused > 0) 1 else 0;
+            return if (refused > 0) 1 else 0;
         }
     }
 

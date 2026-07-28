@@ -3600,7 +3600,7 @@ test "commit partial: a first-contact-only file exits nonzero outside report mod
     try std.testing.expectEqualStrings("# mox: own tui\n[tui]\nk = 1\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
-test "apply drift partial: [o] reasserts the owned span and keeps the remainder" {
+test "apply drift partial: --overwrite reasserts the owned span and keeps the remainder" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3615,16 +3615,20 @@ test "apply drift partial: [o] reasserts the owned span and keeps the remainder"
     const live = try h.liveOf("app.toml");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "# program header\nmodel = \"gpt\"\n\n[tui.keymap.global]\nsubmit = \"escape\"\n\n[state]\ncount = 42\n" });
 
-    const res = try h.runWithInput(&.{ "mox", "apply" }, "o\n");
+    // apply no longer prompts: drift is skipped and reported first.
+    const skip = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), skip.rc);
+    try std.testing.expectEqualStrings("# program header\nmodel = \"gpt\"\n\n[tui.keymap.global]\nsubmit = \"escape\"\n\n[state]\ncount = 42\n", try read(io, a, live));
+
+    const res = try h.run(&.{ "mox", "apply", "--overwrite", live });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
     const after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, after, "submit = \"enter\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "# program header") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "count = 42") != null);
 }
 
-test "apply drift partial: [d] shows the owned diff, [c] commits the owned edit through the deferred pass" {
+test "apply drift partial: reported by apply, then routed to source by a separate mox commit" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3639,13 +3643,14 @@ test "apply drift partial: [d] shows the owned diff, [c] commits the owned edit 
     const live = try h.liveOf("app.toml");
     try editLive(io, a, live, "submit = \"enter\"", "submit = \"ctrl-enter\"");
 
-    // [d] shows the owned canonical diff, [c] queues, then commit's own
-    // per-key prompt takes [y].
-    const res = try h.runWithInput(&.{ "mox", "apply" }, "d\nc\ny\n");
+    // apply reports the drift and touches nothing; resolving it is a
+    // separate, explicit `mox commit` run (its own per-key prompt: [y]).
+    const skip = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), skip.rc);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "submit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "queued") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "Committing 1 live edit(s)") != null);
 
     // The live edit reached the base source and the record advanced.
     try std.testing.expectEqualStrings("# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"ctrl-enter\"\n", try read(io, a, try h.srcOf("app.toml")));
@@ -3655,7 +3660,7 @@ test "apply drift partial: [d] shows the owned diff, [c] commits the owned edit 
     try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
 }
 
-test "apply drift partial: [c] on a secret-bearing record is refused inline, then [o] is accepted" {
+test "apply drift partial: a secret-bearing record refuses commit, --overwrite still resolves it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3673,10 +3678,17 @@ test "apply drift partial: [c] on a secret-bearing record is refused inline, the
     const live = try h.liveOf("app.toml");
     try editLive(io, a, live, secret_value, "edited-by-hand");
 
-    const res = try h.runWithInput(&.{ "mox", "apply" }, "c\no\n");
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // mox commit's own standalone secret guard refuses it (unrelated to
+    // apply's now-removed drift prompt).
+    const committed = try h.run(&.{ "mox", "commit" });
+    try std.testing.expectEqual(@as(u8, 1), committed.rc);
+    try std.testing.expect(std.mem.indexOf(u8, committed.out, "contains a secret; edit its source directly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "edited-by-hand") != null);
+
+    const res = try h.run(&.{ "mox", "apply", "--overwrite", live });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "contains a secret; edit its source directly") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 overwritten") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
 }
 

@@ -33,8 +33,13 @@ pub const Options = struct {
 pub const Result = struct {
     /// Entries removed (or, under dry-run, that would be removed).
     removed: usize = 0,
-    /// Entries refused for lacking `--force`.
-    refused: usize = 0,
+    /// Entries refused only for lacking `--force`/`--overwrite`: resolvable
+    /// by the caller re-running forced.
+    drift_refused: usize = 0,
+    /// Entries refused for a reason `--force`/`--overwrite` cannot resolve
+    /// (unreadable/unsnapshottable, or a foreign subtree harboring an
+    /// ignored entry mox will never delete).
+    error_refused: usize = 0,
 };
 
 /// The direct child of `dir_live` that `file_live` lives under, or null when
@@ -133,7 +138,7 @@ fn sweepFile(
     const content = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            result.refused += 1;
+            result.error_refused += 1;
             try stderr.print("  UNSNAPSHOTTABLE {s} (exact dir; not removing, cannot read to back up)\n", .{live_path});
             return;
         },
@@ -142,7 +147,7 @@ fn sweepFile(
     const clean_leftover = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
 
     if (!clean_leftover and !opts.force) {
-        result.refused += 1;
+        result.drift_refused += 1;
         try stderr.print("  UNMANAGED {s} (exact dir; --force to remove)\n", .{live_path});
         return;
     }
@@ -170,7 +175,7 @@ fn sweepDir(
 ) !void {
     // A foreign directory is always "unknown"; removing it needs --force.
     if (!opts.force) {
-        result.refused += 1;
+        result.drift_refused += 1;
         try stderr.print("  UNMANAGED {s}/ (exact dir; --force to remove)\n", .{live_path});
         return;
     }
@@ -178,9 +183,11 @@ fn sweepDir(
     // path is ignored. A non-ignored foreign dir may still harbor an ignored
     // descendant several levels down; the guarantee that mox never deletes an
     // ignored file is absolute, so the entire subtree is refused rather than
-    // deleted around it.
+    // deleted around it. `--force` cannot resolve this (mox will never
+    // delete an ignored entry), so it is an error, not drift needing a
+    // decision.
     if (try subtreeHasIgnored(arena, io, live_path, home, ruleset, 0)) {
-        result.refused += 1;
+        result.error_refused += 1;
         try stderr.print("  UNMANAGED {s}/ contains ignored entries; not removed\n", .{live_path});
         return;
     }
@@ -194,7 +201,7 @@ fn sweepDir(
     // past the depth cap), refuse the delete: removing it would destroy data
     // with no recoverable copy.
     if (!try snapshotTree(arena, io, live_path, opts, 0)) {
-        result.refused += 1;
+        result.error_refused += 1;
         try stderr.print("  UNSNAPSHOTTABLE {s}/ (exact dir; not removing, would lose unsaved data)\n", .{live_path});
         return;
     }
@@ -212,7 +219,7 @@ fn sweepOther(
     result: *Result,
 ) !void {
     if (!opts.force) {
-        result.refused += 1;
+        result.drift_refused += 1;
         try stderr.print("  UNMANAGED {s} (exact dir; --force to remove)\n", .{live_path});
         return;
     }
@@ -313,7 +320,8 @@ test "enforce: an unreadable file is refused, never deleted with an empty snapsh
     const res = try enforce(a, io, &.{dir_live}, &.{}, opts, &out_aw.writer, &err_aw.writer, &empty_ruleset, base);
 
     try std.testing.expectEqual(@as(usize, 0), res.removed);
-    try std.testing.expectEqual(@as(usize, 1), res.refused);
+    try std.testing.expectEqual(@as(usize, 1), res.error_refused);
+    try std.testing.expectEqual(@as(usize, 0), res.drift_refused);
     // The file survives.
     try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "UNSNAPSHOTTABLE") != null);
     _ = Io.Dir.cwd().statFile(io, victim, .{}) catch return std.testing.expect(false);

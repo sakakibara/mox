@@ -139,6 +139,17 @@ pub fn build(b: *std.Build) void {
     const apply_tests = b.addTest(.{ .root_module = apply_tests_mod });
     test_step.dependOn(&b.addRunArtifact(apply_tests).step);
 
+    // Unified drift classifier + non-interactive apply integration tests at
+    // tests/drift_test.zig.
+    const drift_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/drift_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    drift_tests_mod.addImport("mox", lib_mod);
+    const drift_tests = b.addTest(.{ .root_module = drift_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(drift_tests).step);
+
     // Shell-level completions-stub tests at tests/completions_shell_test.zig.
     const completions_shell_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/completions_shell_test.zig"),

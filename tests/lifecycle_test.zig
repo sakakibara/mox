@@ -1188,7 +1188,7 @@ test "apply: an unknown attributes.toml key refuses loudly instead of silently d
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".config/app.local\"]\nseed_one = true\n");
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "attributes.toml") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "seed_one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "schema") != null);
@@ -1736,7 +1736,7 @@ test "apply: a data/facts.toml-derived fact binds a gate, a quoted comparison, a
     // The candidate does not exist yet: every gate reads false, the bare
     // capture errors (an unbound fact has no `| default` here to rescue it).
     const before = try h.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), before.rc);
+    try std.testing.expectEqual(@as(u8, 2), before.rc);
 
     try tmp.dir.createDirPath(io, "home/.customtool");
     const after = try h.run(&.{ "mox", "apply" });
@@ -2165,7 +2165,7 @@ test "add --own-absent: the declared path flows to enforced absence" {
     // enforced absence, so removal is drift until forced.
     const drift = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), drift.rc);
-    try std.testing.expect(std.mem.indexOf(u8, drift.err, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drift.out, "DRIFT") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "[gone]") != null);
 
     const forced = try h.run(&.{ "mox", "apply", "--force" });
@@ -2726,7 +2726,7 @@ test "apply: a FIFO at a live path is reported, never opened, and the run contin
     defer g2.stop(io);
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not a regular file") != null);
     // Both FIFO targets are reported individually, and neither was replaced.
     try std.testing.expect(std.mem.indexOf(u8, r.err, ".zshrc") != null);

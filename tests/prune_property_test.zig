@@ -190,8 +190,9 @@ fn runSequence(gpa: std.mem.Allocator, io: Io, steps: []const Step) !void {
         const exp1: u8 = if (g1_ok) maskOf(s.g1) else model1;
         const exp2: u8 = if (g2_ok) maskOf(s.g2) else model2;
 
-        // A failing generator returns rc 1 but does not abort the other's work.
-        const want_rc: u8 = if (g1_ok and g2_ok) 0 else 1;
+        // A failing generator (corrupt data, or a colliding duplicate row) is a
+        // compose-class failure -- rc 2 -- but does not abort the other's work.
+        const want_rc: u8 = if (g1_ok and g2_ok) 0 else 2;
         try std.testing.expectEqual(want_rc, r.rc);
 
         // EXACTNESS: each generator's on-disk set is exactly what its data implies
