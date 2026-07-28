@@ -426,6 +426,9 @@ pub fn applyToLayer(
         .yaml => try applyYamlLayer(arena, existing, change),
         .ini, .gitconfig => try applyIniLayer(arena, existing, change, format),
     };
+    // A layer routed to for the first time (a fresh overlay a placement
+    // creates) has no parent directory yet.
+    if (std.fs.path.dirname(layer_abs)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_abs, .data = out });
 }
 

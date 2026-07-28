@@ -47,6 +47,7 @@ const scope = @import("scope.zig");
 const style = @import("style.zig");
 const mox = @import("../root.zig");
 const commit_struct = @import("commit_struct.zig");
+const edit_mod = @import("edit.zig");
 
 const Io = std.Io;
 const Segment = mox.provenance.map.Segment;
@@ -615,7 +616,6 @@ pub fn commitImpl(
         }
 
         const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
-        if (recorded == null) continue;
         // Kind guard BEFORE the open: a FIFO here would block the read and
         // brick the whole commit.
         if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
@@ -626,14 +626,40 @@ pub fn commitImpl(
             error.FileNotFound => continue,
             else => return e,
         };
+
+        if (recorded == null) {
+            // No stored baseline at all: the repo has a source for this file,
+            // but mox never wrote it here (first contact -- e.g. inherited
+            // from another tool during a migration). `keep` is universal, so
+            // this recomposes a fresh baseline instead of skipping outright.
+            switch (try processFallbackFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, live, .first_contact)) {
+                .cont => {},
+                .abort => {
+                    aborted = true;
+                    break :files;
+                },
+                .abort_strict => {
+                    strict_abort = true;
+                    break :files;
+                },
+            }
+            continue;
+        }
+
         const last_content = (try mox.apply.applied.readContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
-            // A secret-bearing file's cleartext is deliberately never cached, so
-            // an edit to it cannot be routed. Say so when the live file has
-            // actually drifted, rather than dropping the edit without a word.
-            if (!std.mem.eql(u8, &recorded.?, &mox.apply.applied.contentHashHex(live))) {
-                try ctx.out.print("  skipped {s} (contains a secret; edit its source directly)\n", .{file.live_path});
-                skipped_secret += 1;
-                pending = true;
+            // A record (content hash) exists, but a secret-bearing
+            // composition's cleartext is deliberately never cached: recompose
+            // to rebuild a verifiable baseline instead of skipping outright.
+            switch (try processFallbackFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, live, .{ .secret = recorded.? })) {
+                .cont => {},
+                .abort => {
+                    aborted = true;
+                    break :files;
+                },
+                .abort_strict => {
+                    strict_abort = true;
+                    break :files;
+                },
             }
             continue;
         };
@@ -704,7 +730,11 @@ pub fn commitImpl(
         const space = spaces[fidx].?;
 
         for (hunks, 0..) |hunk, hi| {
-            switch (try processHunk(&cc, &ra, file, fidx, space, prov.segments, a_lines, b_lines, hunk, hi + 1, hunks.len)) {
+            // The stored-baseline path never carries a `.secret` segment (its
+            // cleartext is never cached in the first place, so a secret-
+            // bearing file never reaches here with a `last_content` to diff
+            // against); `null` is inert.
+            switch (try processHunk(&cc, &ra, file, fidx, space, prov.segments, a_lines, b_lines, hunk, hi + 1, hunks.len, null)) {
                 .cont => {},
                 .abort => {
                     aborted = true;
@@ -2133,6 +2163,284 @@ fn routeStructChanges(
     return .cont;
 }
 
+/// Why `processFallbackFile` has no stored `last_content` to diff against:
+/// mox never wrote this live path at all, or it did but the composition
+/// resolved a secret whose cleartext is never cached. Either way a baseline
+/// has to be recomposed fresh instead of read back.
+const FallbackKind = union(enum) {
+    first_contact,
+    /// The applied record's content hash, checked against a fresh recompose
+    /// before it is trusted as a baseline.
+    secret: [mox.apply.applied.hash_hex_len]u8,
+};
+
+/// Route a live file that has NO stored baseline at all: recompose the
+/// source fresh (resolving secrets, matching overlays) to build one, instead
+/// of reading the applied-content cache the stored-baseline path uses. This
+/// is a FALLBACK, used only here -- the stored `last_content` path above
+/// (and its `sourceLinesMatch` guard, which refuses a hunk whose source moved
+/// on since the last apply) is untouched and still the one every edited
+/// managed file with a stored baseline goes through.
+///
+/// `.first_contact`: the repo has a source for this file, but mox never
+/// wrote it to this live path (no applied record at all) -- e.g. a file
+/// inherited from another tool during a migration.
+/// `.secret`: an applied record (content hash) exists, but a secret-bearing
+/// composition's cleartext is never cached; the hash lets a mismatch (the
+/// source changed since the apply, or the record is stale) be told apart
+/// from a genuine live edit before the recompose is trusted as a baseline --
+/// the same protection `sourceLinesMatch` gives the stored path, applied here
+/// because there is no stored baseline to check the recompose against
+/// directly.
+fn processFallbackFile(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    spaces: []?FileSpace,
+    repo_dir: []const u8,
+    live: []const u8,
+    kind: FallbackKind,
+) !HunkOutcome {
+    if (kind == .secret and std.mem.eql(u8, &kind.secret, &mox.apply.applied.contentHashHex(live))) {
+        // Unedited: live still holds exactly what mox last wrote. No need to
+        // recompose (let alone resolve the secret) just to learn that.
+        return .cont;
+    }
+
+    var prov: std.ArrayList(Segment) = .empty;
+    const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
+        if (kind == .secret) {
+            try cc.stdout.print(
+                "  cannot verify {s}: the secret-derived content could not be recomposed ({s}); overwrite or skip\n",
+                .{ file.live_path, @errorName(e) },
+            );
+        } else {
+            try cc.stdout.print("  manual: {s} (compose failed: {s})\n", .{ file.live_path, @errorName(e) });
+        }
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        return .cont;
+    };
+    // Null covers two distinct cases compose does not tell apart: a real
+    // whole-file `when` gate evaluating false (nothing to route -- same as
+    // the stored-baseline path's own gate-off treatment), and, for a
+    // structured file, no layer at all -- not even a base -- matching this
+    // machine (there is no existing target to route a key change to). A
+    // first-contact structured file with zero matching layers is exactly the
+    // second case: create one instead of silently doing nothing.
+    const baseline = composed orelse {
+        if (kind == .first_contact) {
+            if (commit_struct.formatOfPath(file.source_base_path)) |format| {
+                const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch &.{};
+                if (layers.len == 0) return createFirstContactOverlay(cc, ra, file, fidx, spaces, format, live, repo_dir);
+            }
+        }
+        return .cont;
+    };
+
+    if (kind == .secret and !std.mem.eql(u8, &kind.secret, &mox.apply.applied.contentHashHex(baseline))) {
+        // The source moved on since the apply that recorded this hash (or the
+        // record is stale): the fresh recompose is not provably what mox last
+        // wrote, so it is not a safe baseline to diff a live edit against.
+        try cc.stdout.print(
+            "  cannot verify {s}: the secret-derived content no longer matches what mox last applied; overwrite or skip\n",
+            .{file.live_path},
+        );
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        return .cont;
+    }
+    if (std.mem.eql(u8, live, baseline)) return .cont;
+
+    const has_secret = mox.provenance.map.hasSecret(prov.items);
+    // A `.secret`-origin segment must never reach the structured key-diff
+    // path: `printKeyChange` prints a changed key's OLD value with no
+    // equivalent guard to the line-hunk path's `hunkTouchesSecret`, so a
+    // changed secret key would leak its old resolved value there. The plain
+    // line-hunk path below is the one path proven safe for a `.secret`
+    // origin, so any secret-bearing file is routed through it regardless of
+    // format -- a non-secret key elsewhere in the same overlaid file reports
+    // manual ("came from a structural merge") rather than routing by key,
+    // which is conservative, not unsafe.
+    if (!has_secret) {
+        if (commit_struct.formatOfPath(file.source_base_path)) |sf| {
+            if (containsOverlayOrigin(prov.items)) {
+                spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
+                return processStructFile(cc, ra, file, fidx, spaces[fidx].?, sf, baseline, live);
+            }
+        }
+    }
+
+    // A placeholder recompose (no secrets context, so `<secret:URI>` stays
+    // literal `<SECRET:uri>` text) index-aligned with `baseline`'s lines, so
+    // a `.secret`-touching hunk can recover the store URI without ever
+    // resolving or displaying the old cleartext.
+    var secret_lines: ?[]const []const u8 = null;
+    if (has_secret) {
+        var placeholder_prov: std.ArrayList(Segment) = .empty;
+        if (mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, null, &placeholder_prov, null) catch null) |placeholder| {
+            secret_lines = mox.diff.lines.splitLines(cc.arena, placeholder) catch null;
+        }
+    }
+
+    const a_lines = try mox.diff.lines.splitLines(cc.arena, baseline);
+    const b_lines = try mox.diff.lines.splitLines(cc.arena, live);
+    const hunks = mox.diff.lines.diff(cc.arena, a_lines, b_lines) catch |e| switch (e) {
+        error.TooManyLines => {
+            try cc.stdout.print("  manual: {s} (too large to diff)\n", .{file.live_path});
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            return .cont;
+        },
+        else => return e,
+    };
+
+    if (spaces[fidx] == null) spaces[fidx] = try fileSpace(cc.arena, cc.io, cc.this_bindings, file);
+    const space = spaces[fidx].?;
+
+    // First-contact keep is never a silent keep-all: every hunk goes through
+    // the SAME per-hunk `processHunk` the stored-baseline path uses, which
+    // already confirms `[y/s]` on a terminal -- a rendering difference from
+    // another tool (whitespace, trailing newline, key order) shows up as a
+    // spurious hunk the user skips there, exactly like any other hunk.
+    for (hunks, 0..) |hunk, hi| {
+        switch (try processHunk(cc, ra, file, fidx, space, prov.items, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines)) {
+            .cont => {},
+            .abort => return .abort,
+            .abort_strict => return .abort_strict,
+        }
+    }
+    return .cont;
+}
+
+/// A first-contact structured file for which NO layer -- not even a base --
+/// matches this machine's bindings: there is no existing target to route a
+/// key change to at all. Creates one, scoped to this machine's own values for
+/// the axes the file's OTHER layers already vary on, at the same `.d/`+tuple
+/// path `mox edit --axis` names, seeded with the live file's content -- every
+/// key in it is new by definition, since nothing composes here yet.
+fn createFirstContactOverlay(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    spaces: []?FileSpace,
+    format: commit_struct.Format,
+    live: []const u8,
+    repo_dir: []const u8,
+) !HunkOutcome {
+    ra.affected[fidx] = true;
+
+    const ax = try mox.source.axes.ofFile(cc.arena, cc.io, file);
+    var pairs: std.ArrayList(mox.source.tree.AxisTuple.Pair) = .empty;
+    var it = ax.compared.keyIterator();
+    while (it.next()) |name| {
+        const value = cc.this_bindings.get(name.*) orelse {
+            try cc.stdout.print(
+                "  manual: {s} (no source matches this machine; axis '{s}' is unbound here)\n",
+                .{ file.live_path, name.* },
+            );
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            return .cont;
+        };
+        try pairs.append(cc.arena, .{ .name = name.*, .value = value });
+    }
+    if (pairs.items.len == 0) {
+        try cc.stdout.print("  manual: {s} (no source matches this machine)\n", .{file.live_path});
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        return .cont;
+    }
+    std.mem.sort(mox.source.tree.AxisTuple.Pair, pairs.items, {}, lessPairName);
+    const tuple: mox.source.tree.AxisTuple = .{ .pairs = pairs.items };
+    const tuple_name = try edit_mod.tupleFilename(cc.arena, tuple);
+    const base_abs = try std.fs.path.join(cc.arena, &.{ repo_dir, file.source_base_path });
+    const overlay_dir = try std.fmt.allocPrint(cc.arena, "{s}.d", .{base_abs});
+    const target_path = try mox.source.path.joinKeyOnto(cc.arena, overlay_dir, tuple_name);
+
+    const changes = commit_struct.changedKeyPaths(cc.arena, format, emptyDocText(format), live) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            try cc.stdout.print("  manual: {s} could not be parsed as {s}; edit its source directly\n", .{ file.live_path, @tagName(format) });
+            return .cont;
+        },
+    };
+    if (changes.len == 0) return .cont;
+
+    if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
+    const space = spaces[fidx].?;
+    const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
+    const overlay_name = std.fs.path.basename(target_path);
+
+    for (changes, 0..) |change, ki| {
+        var accept = !cc.report_mode and !cc.interactive;
+        if (cc.report_mode) {
+            ra.pending.* = true;
+            ra.routed_count.* += 1;
+            try cc.stdout.print("  would create {s} for {s} {s}\n", .{ overlay_name, rel, try keyPathLabel(cc.arena, change.path) });
+            continue;
+        }
+        if (cc.interactive) {
+            const label = try std.fmt.allocPrint(cc.arena, "new overlay {s}", .{overlay_name});
+            try printHunkHeader(cc.stdout, cc.sty, rel, "key", ki + 1, changes.len, label);
+            try printKeyChange(cc.arena, cc.sty, cc.stdout, change, label);
+            const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
+            switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
+                .chosen => |i| accept = (i == 0),
+                .abort => return .abort,
+                .abort_strict => return .abort_strict,
+                .report_only => unreachable,
+            }
+        }
+        if (accept) {
+            const edits = [_]StructEdit{.{ .format = format, .layer_abs = target_path, .change = change }};
+            if (space.configs.len > 1) {
+                switch (try simulateStructImpact(cc, file, &edits, space.configs)) {
+                    .ok => |imp| for (imp.affected) |l| try ra.allowed[fidx].put(l, {}),
+                    .rejected => {
+                        ra.manual_count.* += 1;
+                        ra.manual_hunks[fidx] += 1;
+                        ra.pending.* = true;
+                        try cc.stdout.print("  manual: {s} {s}: the new overlay cannot hold this key\n", .{ file.live_path, try keyPathLabel(cc.arena, change.path) });
+                        continue;
+                    },
+                }
+            }
+            try ra.struct_edits.append(cc.arena, edits[0]);
+            try ra.struct_owners.append(cc.arena, fidx);
+            ra.routed_count.* += 1;
+            if (!cc.interactive) try cc.stdout.print("  write {s} {s} -> new overlay {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), overlay_name });
+        } else {
+            ra.declined_hunks[fidx] += 1;
+        }
+    }
+    return .cont;
+}
+
+fn lessPairName(_: void, a: mox.source.tree.AxisTuple.Pair, b: mox.source.tree.AxisTuple.Pair) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+/// The empty-document text `changedKeyPaths` parses to mean "nothing composes
+/// yet" for `format`, so every key in a live file diffed against it reads as
+/// newly added.
+fn emptyDocText(format: commit_struct.Format) []const u8 {
+    return switch (format) {
+        .toml, .ini, .gitconfig => "",
+        .json, .yaml => "{}",
+    };
+}
+
 /// A partially owned file's commit gate: decide committability from the
 /// owned record and the extracted live owned document, then hand the changed
 /// keys to the structured per-key routing. `last` is the record's canonical
@@ -2833,10 +3141,18 @@ fn processHunk(
     hunk: Hunk,
     hunk_no: usize,
     hunk_total: usize,
+    secret_lines: ?[]const []const u8,
 ) !HunkOutcome {
     const route = try routeHunk(cc.arena, cc.io, segments, hunk, file, a_lines, b_lines, cc.m_state);
     switch (route) {
         .manual => |reason| {
+            // A hunk covering (or straddling into) a `.secret` segment's
+            // resolved output must never show its a-side: that is the old
+            // resolved secret value. `printMiniDiff` is unconditionally unsafe
+            // here, so it is never called for this reason -- a dedicated
+            // display shows only the new live value and, when it can be
+            // recovered from a placeholder recompose, the store URI.
+            const touches_secret = hunkTouchesSecret(segments, hunk);
             if (!cc.interactive) {
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
@@ -2845,7 +3161,11 @@ fn processHunk(
                 return .cont;
             }
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
-            try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+            if (touches_secret) {
+                try printSecretNotice(cc, secret_lines, hunk, b_lines);
+            } else {
+                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+            }
             const legend_line = try legend(cc.arena, &sx_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &sx_choices, 0, legend_line, cc.input, cc.stdout)) {
                 .chosen => |i| switch (i) {
@@ -2869,7 +3189,7 @@ fn processHunk(
                             try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
                         } else {
                             for (subs) |sub| {
-                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total);
+                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total, secret_lines);
                                 if (outcome != .cont) return outcome;
                             }
                         }
@@ -3962,6 +4282,59 @@ fn filenameStem(path: []const u8) []const u8 {
     const basename = std.fs.path.basename(path);
     const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
     return basename[0..dot];
+}
+
+/// True when any `.secret`-origin segment overlaps the hunk's a-range. This
+/// is deliberately broader than `covering()`: a hunk straddling a secret
+/// segment and a non-secret one is uncovered (routes to plain `.manual`), but
+/// its a-side text still holds the resolved secret and must not be shown --
+/// so every overlap counts, not just a hunk fully contained in one segment.
+fn hunkTouchesSecret(segments: []const Segment, hunk: Hunk) bool {
+    const a_end = hunk.a_start + hunk.a_len;
+    for (segments) |s| {
+        if (s.origin != .secret) continue;
+        const s_end = s.out_start + s.out_len;
+        if (s.out_start < a_end and hunk.a_start < s_end) return true;
+    }
+    return false;
+}
+
+/// Safe replacement for `printMiniDiff` on a `.secret`-touching hunk: the new
+/// live value only (never the old resolved value), plus the store URI when it
+/// can be recovered from a placeholder recompose (`secret_lines`, composed
+/// with no secrets context so `<secret:URI>` captures stay as literal
+/// `<SECRET:uri>` text instead of resolving) -- or a generic pointer to the
+/// source when it cannot.
+fn printSecretNotice(cc: *const ClassCtx, secret_lines: ?[]const []const u8, hunk: Hunk, b_lines: []const []const u8) !void {
+    var i: u32 = 0;
+    while (i < hunk.b_len) : (i += 1) {
+        try cc.sty.green(cc.stdout);
+        try cc.stdout.print("    + {s}\n", .{b_lines[hunk.b_start + i]});
+        try cc.sty.close(cc.stdout);
+    }
+    if (secretUriAt(secret_lines, hunk.a_start)) |uri| {
+        try cc.stdout.print("    old value withheld; set it at the store yourself: {s}\n", .{uri});
+    } else {
+        try cc.stdout.writeAll("    old value withheld; edit the value at its secret directive directly\n");
+    }
+}
+
+/// The `<SECRET:URI>` placeholder text at output line `a_start` of a
+/// placeholder recompose, or null when there is none to recover (no
+/// placeholder available, the line is out of range, or it holds no
+/// placeholder marker). `secret_lines` is that recompose's split lines, index-
+/// aligned with the real (secrets-resolved) recompose's `a_lines` -- both come
+/// from the same base text, differing only in whether `<secret:URI>` resolved,
+/// so a secret line's position matches across the two.
+fn secretUriAt(secret_lines: ?[]const []const u8, a_start: u32) ?[]const u8 {
+    const lines = secret_lines orelse return null;
+    if (a_start >= lines.len) return null;
+    const line = lines[a_start];
+    const marker = "<SECRET:";
+    const open = std.mem.indexOf(u8, line, marker) orelse return null;
+    const rest = line[open + marker.len ..];
+    const close = std.mem.indexOfScalar(u8, rest, '>') orelse return null;
+    return rest[0..close];
 }
 
 fn printMiniDiff(sty: style.Style, out: *Io.Writer, hunk: Hunk, a_lines: []const []const u8, b_lines: []const []const u8) !void {

@@ -110,6 +110,158 @@ test "commit: base-origin edit routes to src base and recompose is byte-identica
     try std.testing.expectEqual(@as(u8, 0), st.rc);
 }
 
+test "commit: a stored-baseline edit still refuses when the source changed since apply, not just when it is unmodified" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport B=2\nexport C=3\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The source moves on independently of any live edit -- e.g. another
+    // machine's `mox commit` landed first. The stored baseline (what mox last
+    // applied here) still says "export B=2", so a naive recompose-as-baseline
+    // would trivially match the CURRENT source against itself and mis-route
+    // the live edit below into a source that has already changed underneath
+    // it. `sourceLinesMatch` must still see the mismatch and refuse.
+    const src_path = try h.srcOf(".zshrc");
+    try editLive(io, a, src_path, "export B=2", "export B=99");
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export B=2", "export B=22");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "source no longer matches recorded provenance") != null);
+
+    // Nothing was routed: the independently-changed source and the live edit
+    // both stand exactly as they were before this commit ran.
+    try std.testing.expectEqualStrings("export A=1\nexport B=99\nexport C=3\n", try read(io, a, src_path));
+    try std.testing.expectEqualStrings("export A=1\nexport B=22\nexport C=3\n", try read(io, a, live));
+}
+
+test "commit: a first-contact file's real edit routes into source preserving an adjacent capture, and a spurious hunk is skippable" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export A=1\n" ++
+        "export PROFILE=<machine.profile | default \"work\">\n" ++
+        "export C=3\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    // No `mox apply` here: the repo has a source, but mox never wrote this
+    // live path -- as if another tool (or a prior manual placement) put it
+    // there. This is first contact: no applied record exists for it at all.
+    const live = try h.liveOf(".bashrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export A=11\n" ++
+        "export PROFILE=work\n" ++
+        "export C=3 \n" });
+
+    // Two hunks: a real edit (A) and a spurious rendering difference (a
+    // trailing space on C, the kind another tool's writer might leave). The
+    // capture line is untouched, so it produces no hunk at all -- proving the
+    // recompose preserved it rather than baking the resolved default in.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ns\n");
+    _ = res;
+
+    const src = try read(io, a, try h.srcOf(".bashrc"));
+    try std.testing.expectEqualStrings("export A=11\n" ++
+        "export PROFILE=<machine.profile | default \"work\">\n" ++
+        "export C=3\n", src);
+
+    // The declined (spurious) hunk stays as drift in the live file; the
+    // routed edit did not touch it.
+    try std.testing.expectEqualStrings("export A=11\n" ++
+        "export PROFILE=work\n" ++
+        "export C=3 \n", try read(io, a, live));
+}
+
+test "commit: a first-contact structured file with no matching layer creates one, scoped to this machine, and routes the key into it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Only a linux overlay exists; this machine is darwin (pinned by
+    // `setup`), so NO layer -- not even a base -- matches it: there is no
+    // existing target to route a key change to at all.
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=linux.toml", "theme = \"light\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    const live = try h.liveOf("settings.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "theme = \"dark\"\n" });
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") != null);
+
+    const overlay = try h.srcOf("settings.toml.d/os=darwin");
+    const overlay_src = try read(io, a, overlay);
+    try std.testing.expect(std.mem.indexOf(u8, overlay_src, "theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlay_src, "dark") != null);
+
+    // The linux overlay is untouched by a darwin-scoped key placement.
+    const linux_overlay = try h.srcOf("settings.toml.d/os=linux.toml");
+    try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, linux_overlay));
+
+    // Converges: the newly-created overlay now composes on this machine,
+    // matching live.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a changed secret value is shown without its old resolved value, and never routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/config.toml", "token = \"<secret:env:MOX_TEST_TOKEN>\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    var h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", h.home);
+    try map.put("USER", "tester");
+    try map.put("MOX_REPO", h.repo);
+    try map.put("MOX_STATE_DIR", h.state);
+    try map.put("MOX_OS", "darwin");
+    try map.put("MOX_TEST_TOKEN", "s3cr3t");
+    const map_ptr = try a.create(std.process.Environ.Map);
+    map_ptr.* = map;
+    h.env = .{ .map = map_ptr };
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("config.toml");
+    try editLive(io, a, live, "s3cr3t", "changed");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+
+    // The new (live) value and the secret's store URI are shown -- but the
+    // OLD resolved secret value never appears anywhere in the output, on
+    // either stream.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "env:MOX_TEST_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "s3cr3t") == null);
+
+    // Nothing secret is written anywhere: the source keeps its directive
+    // verbatim, never the resolved value in any form.
+    const src = try read(io, a, try h.srcOf("config.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "changed") == null);
+    try std.testing.expectEqualStrings("token = \"<secret:env:MOX_TEST_TOKEN>\"\n", src);
+}
+
 fn chmodPath(path: []const u8, mode: u32) void {
     var zbuf: [4096]u8 = undefined;
     @memcpy(zbuf[0..path.len], path);
@@ -2860,7 +3012,7 @@ test "commit: structured [p] to base over a real os sibling never confirms a spu
     try std.testing.expectEqualStrings("theme = \"blue\"\n", try read(io, a, try h.srcOf("config.toml.d/os=linux.toml")));
 }
 
-test "commit: structured secret-derived key is skipped, never routed" {
+test "commit: structured secret-derived key is never routed, non-interactively too" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2885,21 +3037,21 @@ test "commit: structured secret-derived key is skipped, never routed" {
     h.env = .{ .map = map_ptr };
 
     _ = try h.run(&.{ "mox", "apply" });
-    // A file whose composition resolved a secret has no cached cleartext, so a
-    // live edit to it is reported skipped (edit the source directly). This
-    // asserts the secret invariant holds end-to-end: no source bakes the token.
+    // A file whose composition resolved a secret has no cached cleartext:
+    // `--yes` (non-interactive) never shows a diff for any hunk, so a
+    // changed secret hunk is reported manual with no display at all here --
+    // still safe, just via the ordinary non-interactive manual path rather
+    // than the dedicated notice a terminal gets. Assert the observable
+    // outcome (nothing routed, nothing leaked) rather than the exact wording.
     const live = try h.liveOf("config.toml");
     try editLive(io, a, live, "s3cr3t", "changed");
     const res = try h.run(&.{ "mox", "commit", "--yes" });
-    // The skip happens at the FILE level, before the key-path flow: a
-    // secret-bearing composition is never content-cached, so there is nothing
-    // to diff against. Assert that observable outcome rather than just the
-    // source bytes, which no route was ever in a position to change.
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "contains a secret; edit its source directly") != null);
-    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "s3cr3t") == null);
     const src = try read(io, a, try h.srcOf("config.toml"));
     try std.testing.expect(std.mem.indexOf(u8, src, "s3cr3t") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "changed") == null);
+    try std.testing.expectEqualStrings("token = \"<secret:env:MOX_TEST_TOKEN>\"\n", src);
 }
 
 test "commit: skipping at the fact prompt is a decline, not an un-routable hunk" {
