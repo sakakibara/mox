@@ -168,9 +168,9 @@ pub fn extrasNotice(arena: std.mem.Allocator, io: Io, xdg_config_home: []const u
 
 /// One-line notice for a legacy `<repo_dir>/data/facts-schema.toml` still on
 /// disk: 0.7.0 no longer reads it (the interview now derives its questions
-/// from a repo's own sources instead of a hand-maintained schema -- D2/D4),
-/// so a caller that applies or diagnoses prints this once rather than
-/// leaving an unread file's silence unexplained. Null when no file is there.
+/// from a repo's own sources instead of a hand-maintained schema), so a
+/// caller that applies or diagnoses prints this once rather than leaving an
+/// unread file's silence unexplained. Null when no file is there.
 pub fn schemaLeftoverNotice(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const u8 {
     const path = try std.fs.path.join(arena, &.{ repo_dir, "data", "facts-schema.toml" });
     Io.Dir.cwd().access(io, path, .{}) catch return null;

@@ -103,8 +103,8 @@ pub const Dimension = struct {
     /// Every distinct `| default "..."` value observed on a capture of this
     /// name, sorted and deduped.
     capture_defaults: []const []const u8,
-    /// The declared interview default from `# mox: default NAME="VALUE"`
-    /// (D2), when the repo's `default` directives for this name agree: a
+    /// The declared interview default from `# mox: default NAME="VALUE"`,
+    /// when the repo's `default` directives for this name agree: a
     /// single-element slice holding that value, or empty when no `default`
     /// directive names this dimension. Never more than one element --
     /// conflicting declarations for the same name resolve to no value here
@@ -138,8 +138,8 @@ pub const ScriptRecord = struct {
     /// True when the script has a `# mox: needs` line whose name failed the
     /// fact-name charset (`Diagnostic.needs_name`, printed for it). `needs`
     /// is left null in that case rather than a guessed partial list -- the
-    /// script's contract is unknowable, and a future D3 fold blocks it
-    /// outright on this marker rather than falling back to a token scan.
+    /// script's contract is unknowable, so the script-contract check blocks
+    /// it outright on this marker rather than falling back to a token scan.
     needs_unparseable: bool = false,
 };
 
@@ -155,9 +155,10 @@ pub const Diagnostic = union(enum) {
     },
     /// A `# mox: needs NAME...` head directive whose NAME failed the
     /// fact-name charset. The offending script's own `ScriptRecord` carries
-    /// `needs_unparseable = true` (its contract is unknowable, D3's
-    /// eventual block target); `needs` is left null on it, same as a script
-    /// with no `needs` line at all.
+    /// `needs_unparseable = true` (its contract is unknowable, so the
+    /// script-contract check blocks it outright on this marker rather than
+    /// falling back to a token scan); `needs` is left null on it, same as a
+    /// script with no `needs` line at all.
     needs_name: struct {
         path: []const u8,
         name: []const u8,
@@ -180,8 +181,10 @@ pub const DefaultDiagnostic = union(enum) {
     },
     /// A `# mox: default` directive names a fact no source in the repo
     /// otherwise compares, captures, or tests for presence -- a default
-    /// alone consumes nothing, so no dimension is created for it either
-    /// (keeps `doctor`'s stale-fact logic coherent: D5).
+    /// alone consumes nothing, so no dimension is created for it either.
+    /// Creating one anyway would make `doctor`'s stale-fact check wrongly
+    /// treat an otherwise-unconsumed bound fact as used, purely because
+    /// someone once declared a default for it.
     unclaimed: struct {
         name: []const u8,
         source: []const u8,
@@ -368,7 +371,7 @@ const Discoverer = struct {
         return gop.value_ptr;
     }
 
-    /// D3: a `# mox: needs NAME` reference that names no dimension any other
+    /// A `# mox: needs NAME` reference that names no dimension any other
     /// channel already made real registers `NAME` as a scripts-only
     /// dimension -- free-form (no role) and unconditioned (an unconditioned
     /// occurrence, same treatment as a top-level unguarded capture), so the
@@ -568,8 +571,8 @@ const Discoverer = struct {
 
     /// Collect a `# mox: default NAME="VALUE"` directive, whatever position
     /// `scanBody` visited it at -- unconditioned by construction, since this
-    /// never consults a gate stack (D2: "a declared default is a repo-level
-    /// statement, its location's gates are irrelevant"). A default naming an
+    /// never consults a gate stack: a declared default is a repo-level
+    /// statement, its location's gates are irrelevant. A default naming an
     /// excluded (built-in, open-axis, reserved-axis, or
     /// `data/facts.toml`-derived) name is a loud, non-fatal diagnostic --
     /// `DefaultDiagnostic.reserved`, appended directly rather than deferred
@@ -1005,7 +1008,8 @@ const Discoverer = struct {
     /// value is resolved for it, rather than an arbitrary pick -- and a
     /// `.unclaimed` diagnostic for a name that resolves cleanly but names no
     /// dimension any other source in the repo consumes (a default alone
-    /// consumes nothing, per D2/D5). Same-value duplicates across files
+    /// consumes nothing -- see the `.unclaimed` doc comment above). Same-
+    /// value duplicates across files
     /// collapse silently: they are not an anomaly. A reserved name never
     /// reaches this grouping at all -- `recordDeclaredDefault` already
     /// diverted it straight to `self.default_diagnostics` at scan time.

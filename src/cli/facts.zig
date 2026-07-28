@@ -28,10 +28,10 @@ fn run(ctx: *app.Ctx, _: cli.Args(BareSpec)) anyerror!u8 {
 
     const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "", discovery.diagnostics, discovery.default_diagnostics);
-    // Unlike apply, `facts` has no later, richer source-tree walk to report
-    // this failure for it -- so a tree discovery could only degrade to
-    // "nothing found" over is a loud refusal here, not a silent empty
-    // dimension list.
+    // Unlike apply, `facts` has no later, richer source-tree walk that could
+    // still surface this failure downstream -- so a tree-discovery error
+    // here is a loud refusal, not a silent degrade to an empty dimension
+    // list.
     if (discovery.tree_error) |e| {
         try ctx.err.print(
             "mox facts: source tree could not be scanned ({s}); fact listing and interview are unavailable until it parses\n",
