@@ -5,6 +5,7 @@ pub const applied = @import("applied.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const exact = @import("exact.zig");
 pub const generated = @import("generated.zig");
+pub const drift = @import("drift.zig");
 pub const partial = @import("partial.zig");
 pub const canonical = @import("canonical.zig");
 pub const owned = @import("owned.zig");
@@ -19,6 +20,7 @@ test {
     _ = snapshot;
     _ = exact;
     _ = generated;
+    _ = drift;
     _ = partial;
     _ = canonical;
     _ = owned;
