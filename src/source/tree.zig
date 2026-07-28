@@ -278,11 +278,11 @@ pub fn walk(
     return walkDiag(arena, io, src_dir, home_dir, null);
 }
 
-/// `walk` with a diagnostic: when a base head's ownership declaration fails
-/// validation (directives on an unstructured, symlink, seed-once, or
-/// generator target, a path the key grammar rejects, or a malformed
-/// directive line), `diag` names the target -- and, for a path error, the
-/// offending path.
+/// `walk` with a diagnostic: when the tree fails validation -- a base
+/// head's ownership declaration (directives on an unstructured, symlink,
+/// seed-once, or generator target, a path the key grammar rejects, or a
+/// malformed directive line), a reserved axis name, or a malformed overlay
+/// tuple -- `diag` names the offending target or path.
 pub fn walkDiag(
     arena: std.mem.Allocator,
     io: Io,
