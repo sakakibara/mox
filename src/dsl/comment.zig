@@ -178,3 +178,125 @@ test "marker for .bat is rem" {
 test "marker for .psm1 is case-insensitive" {
     try std.testing.expectEqualStrings("#", markerForExtension(".PSM1").?);
 }
+
+/// Identifier for `markerForExtension`: a dotfile with no further dot
+/// (`.zshrc`) or an un-dotted basename (`Dockerfile`) is itself; otherwise the
+/// trailing extension (`.lua`).
+fn identForMarker(path: []const u8) []const u8 {
+    const basename = std.fs.path.basename(path);
+    if (basename.len == 0) return basename;
+    if (basename[0] == '.') {
+        const rest = basename[1..];
+        if (std.mem.indexOfScalar(u8, rest, '.') == null) return basename;
+    }
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
+    return basename[dot..];
+}
+
+fn eqAny(s: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |c| if (std.mem.eql(u8, s, c)) return true;
+    return false;
+}
+
+/// Infer the comment marker from a shebang on line 1, if any. The
+/// interpreter name (last path segment) is mapped to its known marker.
+/// Returns null when there is no shebang or the interpreter is unrecognized.
+fn markerForShebang(content: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, content, "#!")) return null;
+    const eol = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+    const line = content[2..eol];
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    // Take the last path component of the interpreter (skip `env <name>`).
+    const first_word_end = std.mem.indexOfAnyPos(u8, trimmed, 0, " \t") orelse trimmed.len;
+    const interp_path = trimmed[0..first_word_end];
+    const last_slash = std.mem.lastIndexOfScalar(u8, interp_path, '/');
+    var interp_name: []const u8 = if (last_slash) |s| interp_path[s + 1 ..] else interp_path;
+    // `#!/usr/bin/env <name>` or `#!/usr/bin/env -S <name>` — pick the next word.
+    if (std.mem.eql(u8, interp_name, "env")) {
+        const rest = std.mem.trimStart(u8, trimmed[first_word_end..], " \t");
+        var skip: usize = 0;
+        if (std.mem.startsWith(u8, rest, "-S")) {
+            const after = std.mem.trimStart(u8, rest[2..], " \t");
+            skip = @intFromPtr(after.ptr) - @intFromPtr(rest.ptr);
+        }
+        const after_skip = rest[skip..];
+        const word_end = std.mem.indexOfAnyPos(u8, after_skip, 0, " \t") orelse after_skip.len;
+        interp_name = after_skip[0..word_end];
+    }
+    if (interp_name.len == 0) return null;
+    if (eqAny(interp_name, &.{
+        // POSIX shells + common alternatives
+        "bash",   "sh",      "zsh",     "fish",   "ksh",     "ash",
+        "dash",   "mksh",    "yash",    "elvish", "xonsh",   "nushell",
+        "nu",     "pwsh",    "rc",
+        // Scripting languages with `#` line comments
+             "python", "python3", "ruby",
+        "perl",   "perl5",   "perl6",   "raku",   "tcl",     "tclsh",
+        "node",   "deno",    "bun",     "lua",    "luajit",  "guile",
+        "scheme", "racket",  "chicken", "csi",    "gosh",    "expect",
+        "wish",
+        // Text/data processors
+          "awk",     "gawk",    "mawk",   "sed",     "jq",
+        "yq",
+        // Statistical / scientific
+            "Rscript", "julia",   "octave",
+    })) return "#";
+    return null;
+}
+
+/// If `content` has any line of the form `<ws><1-3 non-alnum chars><ws>mox:`,
+/// return the marker chars (the comment-prefix preceding `mox:`). Otherwise
+/// null. Used to infer the comment marker for files whose extension isn't in
+/// the marker table — `# mox: ...` is itself proof that `#` is the marker.
+fn markerFromApparentDirective(content: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var rest = std.mem.trimStart(u8, line, " \t");
+        if (rest.len == 0 or std.ascii.isAlphanumeric(rest[0])) continue;
+        var i: usize = 0;
+        while (i < @min(@as(usize, 3), rest.len) and
+            !std.ascii.isAlphanumeric(rest[i]) and
+            rest[i] != ' ' and rest[i] != '\t') : (i += 1)
+        {}
+        if (i == 0) continue;
+        const candidate_marker = rest[0..i];
+        const after = std.mem.trimStart(u8, rest[i..], " \t");
+        if (std.mem.startsWith(u8, after, "mox:")) return candidate_marker;
+    }
+    return null;
+}
+
+/// The comment marker for a source file, or null when no signal is available.
+/// Tries the extension, then a shebang (extensionless scripts), then an
+/// apparent `# mox:` directive (plain config files with no extension/shebang).
+/// The single marker-resolution authority both compose and discovery share --
+/// whichever marker compose would resolve for a file is exactly the marker
+/// discovery resolves for it too, so a file compose composes is never one
+/// discovery silently skips.
+pub fn markerForFile(source_base_path: []const u8, base_content: []const u8) ?[]const u8 {
+    const ident = identForMarker(source_base_path);
+    if (markerForExtension(ident)) |m| return m;
+    if (markerForShebang(base_content)) |m| return m;
+    if (markerFromApparentDirective(base_content)) |m| return m;
+    return null;
+}
+
+test "markerForFile: extension wins over shebang" {
+    try std.testing.expectEqualStrings("#", markerForFile("script.py", "#!/usr/bin/env bash\n").?);
+}
+
+test "markerForFile: recognized shebang resolves a marker for an unrecognized extension" {
+    try std.testing.expectEqualStrings("#", markerForFile("script", "#!/bin/sh\necho hi\n").?);
+}
+
+test "markerForFile: unrecognized shebang interpreter falls through to apparent-directive" {
+    try std.testing.expect(markerForFile("script", "#!/opt/custom/interp\necho hi\n") == null);
+}
+
+test "markerForFile: apparent `# mox:` directive resolves a marker with no extension or shebang" {
+    try std.testing.expectEqualStrings("#", markerForFile("allowed_signers", "user namespaces=\"git\"\n# mox: when profile=work\n").?);
+}
+
+test "markerForFile: no extension, shebang, or apparent directive resolves nothing" {
+    try std.testing.expect(markerForFile("README.md", "# Title\n\nSome prose.\n") == null);
+}

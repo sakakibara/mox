@@ -866,7 +866,14 @@ const Discoverer = struct {
         if (!file.has_base or file.source_base_abs.len == 0) return;
 
         const raw = Io.Dir.cwd().readFileAlloc(self.io, file.source_base_abs, self.arena, .limited(max_file_bytes)) catch return;
-        const marker = dsl.comment.markerForExtension(identForMarker(file.source_base_path)) orelse return;
+        const marker = dsl.comment.markerForFile(file.source_base_path, raw) orelse {
+            // Mirrors compose's own null-marker passthrough (`compose.catB.
+            // composeTrackedContent`): with no marker at all, no directive
+            // can exist in this file either, but compose still interpolates
+            // `<machine.X>` line by line -- scan the same, unconditioned.
+            try self.scanFlatText(raw, &.{}, source_key);
+            return;
+        };
         const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
         const head_parsed = source.head.parse(self.arena, head_text, marker) catch |e| switch (e) {
             error.OutOfMemory => return e,
@@ -1225,21 +1232,6 @@ fn splitDefault(inner: []const u8) struct { field: []const u8, default: ?[]const
     const close = std.mem.lastIndexOfScalar(u8, after, '"') orelse return .{ .field = inner, .default = null };
     const field = std.mem.trimEnd(u8, inner[0..idx], " \t");
     return .{ .field = field, .default = after[0..close] };
-}
-
-/// Identifier for `comment.markerForExtension`: a dotfile with no further dot
-/// (`.zshrc`) or an un-dotted basename (`Dockerfile`) is itself; otherwise the
-/// trailing extension (`.lua`). Mirrors `source.axes`'s private helper of the
-/// same name and contract.
-fn identForMarker(path: []const u8) []const u8 {
-    const basename = std.fs.path.basename(path);
-    if (basename.len == 0) return basename;
-    if (basename[0] == '.') {
-        const rest = basename[1..];
-        if (std.mem.indexOfScalar(u8, rest, '.') == null) return basename;
-    }
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
-    return basename[dot..];
 }
 
 const header_scan_lines: usize = 16;
@@ -3044,6 +3036,163 @@ test "discover: corpus-shaped fixture with a declared default added -- every oth
     try std.testing.expectEqual(@as(usize, 1), holt_backend.declared_defaults.len);
     try std.testing.expectEqualStrings("icloud", holt_backend.declared_defaults[0]);
     try std.testing.expectEqual(@as(usize, 0), d.default_diagnostics.len);
+}
+
+// -- marker resolution mirrors compose's, not just the extension table ------
+
+test "discover: a markerless-extension file's capture is still a dimension with its default recorded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No extension in the marker table, no shebang, no apparent `# mox:`
+    // directive: compose still interpolates this capture on its null-marker
+    // passthrough, so discovery must see it too.
+    try writeFile(io, tmp.dir, "src/.config/tool/settings", "value = <machine.newfact | default \"x\">\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const dim = findDim(d, "newfact").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+    try std.testing.expectEqual(@as(usize, 1), dim.capture_defaults.len);
+    try std.testing.expectEqualStrings("x", dim.capture_defaults[0]);
+}
+
+test "discover: an unrecognized-extension file with a shebang has its gate and capture discovered" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/scripts/helper.myext",
+        "#!/bin/sh\n" ++
+            "# mox: when workonly=yes\n" ++
+            "x = <machine.gatedfact>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const gate = findDim(d, "workonly").?;
+    try std.testing.expect(gate.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 1), gate.observed_values.len);
+    try std.testing.expectEqualStrings("yes", gate.observed_values[0]);
+
+    const dim = findDim(d, "gatedfact").?;
+    try std.testing.expect(dim.roles.captured);
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("workonly", "no");
+    try std.testing.expect(!dsl.axis.evaluate(dim.asking_condition.?, &r));
+    try bindings.put("workonly", "yes");
+    try std.testing.expect(dsl.axis.evaluate(dim.asking_condition.?, &r));
+}
+
+test "discover: an unrecognized-extension file resolves its marker from an apparent `# mox:` directive" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No shebang: the FIRST content line is the `# mox:` directive itself,
+    // which is the only signal that `#` is this file's marker.
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/config/myapp.weird",
+        "# mox: when apparentfact=on\n" ++
+            "y = <machine.apparentcapture>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const gate = findDim(d, "apparentfact").?;
+    try std.testing.expect(gate.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 1), gate.observed_values.len);
+    try std.testing.expectEqualStrings("on", gate.observed_values[0]);
+
+    const dim = findDim(d, "apparentcapture").?;
+    try std.testing.expect(dim.roles.captured);
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("apparentfact", "off");
+    try std.testing.expect(!dsl.axis.evaluate(dim.asking_condition.?, &r));
+    try bindings.put("apparentfact", "on");
+    try std.testing.expect(dsl.axis.evaluate(dim.asking_condition.?, &r));
+}
+
+test "discover: a fully markerless file consuming an already-real fact increments its provenance source_count" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `profile` is already real via the shell rc file's capture; a second,
+    // fully markerless file -- shaped like the real corpus's
+    // src/.config/git/allowed_signers -- also captures it. Before the fix
+    // this second source was invisible to discovery entirely (extension-only
+    // marker resolution `orelse return`s on a file with no marker at all),
+    // silently undercounting `profile`'s provenance.
+    try writeFile(io, tmp.dir, "src/.zshrc", "kind = <machine.profile | default \"personal\">\n");
+    try writeFile(io, tmp.dir, "src/.config/git/allowed_signers", "sho@example.com namespaces=\"git\" <machine.profile>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const profile = findDim(d, "profile").?;
+    try std.testing.expectEqual(@as(usize, 2), profile.provenance.source_count);
+}
+
+test "discover: a recognized-extension file's discovery is unchanged (mutation guard)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig",
+        "# mox: when profile=work\n" ++
+            "name = <machine.git_name>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+
+    const profile = findDim(d, "profile").?;
+    try std.testing.expect(profile.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 1), profile.observed_values.len);
+    try std.testing.expectEqualStrings("work", profile.observed_values[0]);
+
+    const git_name = findDim(d, "git_name").?;
+    try std.testing.expect(git_name.roles.captured);
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("profile", "personal");
+    try std.testing.expect(!dsl.axis.evaluate(git_name.asking_condition.?, &r));
+    try bindings.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(git_name.asking_condition.?, &r));
 }
 
 // -- recursion is bounded (defensive; no fixture requires this depth) -------

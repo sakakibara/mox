@@ -339,7 +339,7 @@ pub fn composeTrackedContent(
 
     const ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
 
-    const marker = markerForFile(file.source_base_path, base_content) orelse {
+    const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse {
         // No signal at all. Pass through verbatim — directiveless config
         // files shouldn't need a marker — but still run `<machine.X>` interp
         // so user-baked facts substitute consistently with the directive
@@ -464,7 +464,7 @@ pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const marker = markerForFile(file.source_base_path, base_content) orelse return null;
+    const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse return null;
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;
     return wholeFileGateExpr(base_content, parsed);
 }
@@ -518,7 +518,7 @@ pub fn composeGenerator(
     if (!file.has_base or file.source_base_abs.len == 0) return null;
 
     const base_content = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
-    const marker = markerForFile(file.source_base_path, base_content) orelse return null;
+    const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse return null;
     // A parse error here is not a generator decision: let the normal compose
     // path re-parse and report it with a source location.
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;
@@ -1524,96 +1524,12 @@ fn identForMarker(path: []const u8) []const u8 {
     return basename[dot..];
 }
 
-/// The comment marker for a source file, or null when no signal is available.
-/// Tries the extension, then a shebang (extensionless scripts), then an
-/// apparent `# mox:` directive (plain config files with no extension/shebang).
-fn markerForFile(source_base_path: []const u8, base_content: []const u8) ?[]const u8 {
-    const ident = identForMarker(source_base_path);
-    if (dsl.comment.markerForExtension(ident)) |m| return m;
-    if (markerForShebang(base_content)) |m| return m;
-    if (markerFromApparentDirective(base_content)) |m| return m;
-    return null;
-}
-
 /// Stem of a filename: the basename without its trailing extension.
 /// Handles paths (returns the last segment's stem, ignoring directories).
 fn filenameStem(filename: []const u8) []const u8 {
     const basename = std.fs.path.basename(filename);
     const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
     return basename[0..dot];
-}
-
-/// Infer the comment marker from a shebang on line 1, if any. The
-/// interpreter name (last path segment) is mapped to its known marker.
-/// Returns null when there is no shebang or the interpreter is unrecognized.
-fn markerForShebang(content: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, content, "#!")) return null;
-    const eol = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
-    const line = content[2..eol];
-    const trimmed = std.mem.trimStart(u8, line, " \t");
-    // Take the last path component of the interpreter (skip `env <name>`).
-    const first_word_end = std.mem.indexOfAnyPos(u8, trimmed, 0, " \t") orelse trimmed.len;
-    const interp_path = trimmed[0..first_word_end];
-    const last_slash = std.mem.lastIndexOfScalar(u8, interp_path, '/');
-    var interp_name: []const u8 = if (last_slash) |s| interp_path[s + 1 ..] else interp_path;
-    // `#!/usr/bin/env <name>` or `#!/usr/bin/env -S <name>` — pick the next word.
-    if (std.mem.eql(u8, interp_name, "env")) {
-        const rest = std.mem.trimStart(u8, trimmed[first_word_end..], " \t");
-        var skip: usize = 0;
-        if (std.mem.startsWith(u8, rest, "-S")) {
-            const after = std.mem.trimStart(u8, rest[2..], " \t");
-            skip = @intFromPtr(after.ptr) - @intFromPtr(rest.ptr);
-        }
-        const after_skip = rest[skip..];
-        const word_end = std.mem.indexOfAnyPos(u8, after_skip, 0, " \t") orelse after_skip.len;
-        interp_name = after_skip[0..word_end];
-    }
-    if (interp_name.len == 0) return null;
-    if (eqAny(interp_name, &.{
-        // POSIX shells + common alternatives
-        "bash",   "sh",      "zsh",     "fish",   "ksh",     "ash",
-        "dash",   "mksh",    "yash",    "elvish", "xonsh",   "nushell",
-        "nu",     "pwsh",    "rc",
-        // Scripting languages with `#` line comments
-             "python", "python3", "ruby",
-        "perl",   "perl5",   "perl6",   "raku",   "tcl",     "tclsh",
-        "node",   "deno",    "bun",     "lua",    "luajit",  "guile",
-        "scheme", "racket",  "chicken", "csi",    "gosh",    "expect",
-        "wish",
-        // Text/data processors
-          "awk",     "gawk",    "mawk",   "sed",     "jq",
-        "yq",
-        // Statistical / scientific
-            "Rscript", "julia",   "octave",
-    })) return "#";
-    return null;
-}
-
-fn eqAny(s: []const u8, candidates: []const []const u8) bool {
-    for (candidates) |c| if (std.mem.eql(u8, s, c)) return true;
-    return false;
-}
-
-/// If `content` has any line of the form `<ws><1-3 non-alnum chars><ws>mox:`,
-/// return the marker chars (the comment-prefix preceding `mox:`). Otherwise
-/// null. Used to infer the comment marker for files whose extension isn't in
-/// the marker table — `# mox: ...` is itself proof that `#` is the marker.
-fn markerFromApparentDirective(content: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        var rest = std.mem.trimStart(u8, line, " \t");
-        if (rest.len == 0 or std.ascii.isAlphanumeric(rest[0])) continue;
-        var i: usize = 0;
-        while (i < @min(@as(usize, 3), rest.len) and
-            !std.ascii.isAlphanumeric(rest[i]) and
-            rest[i] != ' ' and rest[i] != '\t') : (i += 1)
-        {}
-        if (i == 0) continue;
-        const candidate_marker = rest[0..i];
-        const after = std.mem.trimStart(u8, rest[i..], " \t");
-        if (std.mem.startsWith(u8, after, "mox:")) return candidate_marker;
-    }
-    return null;
 }
 
 fn langFromPath(path: []const u8) []const u8 {
