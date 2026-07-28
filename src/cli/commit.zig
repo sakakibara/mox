@@ -81,6 +81,26 @@ const RowEdit = struct {
     fields: []const Field,
 };
 
+/// A pending literal sync of a symlink source's recorded target to the live
+/// target. Only ever built for a plain-literal source (no capture, no
+/// secret): a capture-bearing target is reported manual instead, never
+/// collected here, so this route can never clobber one.
+const SymSync = struct {
+    live_path: []const u8,
+    source_abs: []const u8,
+    new_target: []const u8,
+};
+
+/// A generator leaf whose keep wrote at least one field into its data-source
+/// row this run: enough to re-expand the generator afterward, find this leaf
+/// in the fresh output, and verify it reproduces live before advancing its
+/// applied record.
+const GenLeafCommit = struct {
+    fidx: usize,
+    gen_file: mox.source.tree.ManagedFile,
+    leaf_live_path: []const u8,
+};
+
 /// A pending structured key-path edit to one source layer of a Cat-A file.
 /// Applied via `commit_struct.applyToLayer` in the write phase (deferred like
 /// every other route, so abort writes nothing); its `layer_abs` is backed up in
@@ -457,11 +477,28 @@ pub fn commitImpl(
     // A scoped commit routes only the named files: everything else is left
     // for a later `mox commit`, so `scoped_live` gates the main routing loop
     // rather than shrinking `tree.files` (which every fidx-indexed array
-    // below is still sized against).
+    // below is still sized against). A generator's OWN live path (the report's
+    // scoped-drift row, D4) resolves here like any other managed file; a
+    // produced LEAF path does not (it is not in `tree.files` at all), so it is
+    // tried separately below, against every generator's re-expanded output --
+    // `scoped_leaves` then restricts that generator's keep to just the named
+    // leaves instead of its whole set.
     var scoped_live: ?std.StringHashMap(void) = null;
+    var scoped_leaves: ?std.StringHashMap(std.StringHashMap(void)) = null;
     if (paths.len > 0) {
+        var direct: std.ArrayList([]const u8) = .empty;
+        var leaf_targets: std.ArrayList([]const u8) = .empty;
+        for (paths) |p| {
+            const live = try edit_mod.liveTarget(ctx.alloc, p, m_state.home);
+            if (findByLive(tree, live) != null) {
+                try direct.append(ctx.alloc, p);
+            } else {
+                try leaf_targets.append(ctx.alloc, live);
+            }
+        }
+
         var diag: scope.Diag = .{};
-        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, paths, &diag) catch |e| switch (e) {
+        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, direct.items, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox commit: {s}: not managed\n", .{diag.capture().?});
                 return 1;
@@ -470,6 +507,21 @@ pub fn commitImpl(
         };
         var set: std.StringHashMap(void) = .init(ctx.alloc);
         for (scoped_files) |f| try set.put(f.live_path, {});
+
+        if (leaf_targets.items.len > 0) {
+            var leaves: std.StringHashMap(std.StringHashMap(void)) = .init(ctx.alloc);
+            for (leaf_targets.items) |lp| {
+                const gen = (try findGeneratorLeaf(ctx.alloc, ctx.io, tree.files, &axis_resolver, &m_state, secrets, lp)) orelse {
+                    try ctx.err.print("mox commit: {s}: not managed\n", .{lp});
+                    return 1;
+                };
+                try set.put(gen.live_path, {});
+                const gop = try leaves.getOrPut(gen.live_path);
+                if (!gop.found_existing) gop.value_ptr.* = .init(ctx.alloc);
+                try gop.value_ptr.put(lp, {});
+            }
+            scoped_leaves = leaves;
+        }
         scoped_live = set;
     }
 
@@ -519,6 +571,15 @@ pub fn commitImpl(
     var fact_edits: std.ArrayList(FactEdit) = .empty;
     var synth_plans: std.ArrayList(SynthDecision) = .empty;
     var struct_edits: std.ArrayList(StructEdit) = .empty;
+    // Symlink-target and generator-leaf keep bypass the whole-file
+    // affected[]/spaces[] machinery below entirely: a symlink's source and a
+    // generator's data source do not compose the way an ordinary managed file
+    // does (composing a generator's own directive file the normal way is an
+    // error, and a symlink's live path is not readable as a regular file's
+    // content), so both get their own small, self-contained write+verify pass.
+    var sym_syncs: std.ArrayList(SymSync) = .empty;
+    var gen_row_edits: std.ArrayList(RowEdit) = .empty;
+    var gen_leaf_commits: std.ArrayList(GenLeafCommit) = .empty;
     // Index of the managed file each pending edit was routed from, so a file
     // whose routing verification fails can restore exactly the sources it wrote.
     var line_owners: std.ArrayList(usize) = .empty;
@@ -592,7 +653,49 @@ pub fn commitImpl(
             try ctx.err.print("mox commit: {s}: skipped ({s})\n", .{ file.live_path, file.head_error });
             continue;
         }
-        if (file.is_symlink) continue;
+
+        // A generator (`for ... into`, or `completions`) fans out to a
+        // produced LEAF SET instead of writing its own live path -- recognized
+        // the same way apply recognizes it (composeGenerator's directive-shape
+        // check), tried before any of the ordinary single-file gates below,
+        // none of which apply to it.
+        {
+            var gdiag: mox.compose.interp.Diag = .{};
+            const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &gdiag) catch |e| {
+                try ctx.err.print("mox commit: {s}: generator failed to re-expand: {s}\n", .{ file.live_path, @errorName(e) });
+                continue;
+            };
+            if (gen) |outputs| {
+                const only_leaves = if (scoped_leaves) |*m| m.getPtr(file.live_path) else null;
+                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, &gen_row_edits, &gen_leaf_commits)) {
+                    .cont => {},
+                    .abort => {
+                        aborted = true;
+                        break :files;
+                    },
+                    .abort_strict => {
+                        strict_abort = true;
+                        break :files;
+                    },
+                }
+                continue;
+            }
+        }
+
+        if (file.is_symlink) {
+            switch (try processSymlinkFile(&cc, &ra, file, fidx, context.paths.state_dir, &sym_syncs)) {
+                .cont => {},
+                .abort => {
+                    aborted = true;
+                    break :files;
+                },
+                .abort_strict => {
+                    strict_abort = true;
+                    break :files;
+                },
+            }
+            continue;
+        }
         // Seed-once files carry no applied record and are user-owned after
         // creation; there is nothing to route back to their source.
         if (file.create_once) continue;
@@ -921,6 +1024,18 @@ pub fn commitImpl(
         }
     }
 
+    // Symlink-target and generator-leaf keep are OUTSIDE the affected[]/
+    // spaces[] machinery above (see their write+verify pass below), so their
+    // pre-write backups are collected separately here, at the same point
+    // `routed_orig` is: one entry per distinct source a sync will rewrite, one
+    // per distinct data source a generator row edit will rewrite. `addBackup`
+    // dedupes by path, so multiple leaves of one generator sharing a data
+    // source back it up exactly once.
+    var sym_backup: std.ArrayList(Backup) = .empty;
+    for (sym_syncs.items) |s| try addBackup(ctx.alloc, ctx.io, &sym_backup, s.source_abs);
+    var gen_data_backup: std.ArrayList(Backup) = .empty;
+    for (gen_row_edits.items) |e| try addBackup(ctx.alloc, ctx.io, &gen_data_backup, e.data_source);
+
     // Write phase: every prompt is done, so applying now honors the
     // abort-writes-nothing contract.
     //
@@ -932,6 +1047,8 @@ pub fn commitImpl(
     const synth_bases = try synthBases(ctx.alloc, synth_plans.items);
     try applyLineEdits(ctx.alloc, ctx.io, try lineEditsExcluding(ctx.alloc, line_edits.items, synth_bases));
     try applyRowEdits(ctx.alloc, ctx.io, row_edits.items);
+    try applySymlinkSyncs(ctx.alloc, ctx.io, sym_syncs.items);
+    try applyRowEdits(ctx.alloc, ctx.io, gen_row_edits.items);
     for (synth_bases) |base_abs| {
         var splices: std.ArrayList(LineEdit) = .empty;
         for (line_edits.items) |e| {
@@ -996,6 +1113,88 @@ pub fn commitImpl(
 
     var mismatch = false;
     var committed_count: usize = 0;
+
+    // Symlink-target syncs verify by recomposing the (unchanged) source and
+    // confirming it reproduces exactly the live target it was set to -- no
+    // rewalk needed, since a literal sync never creates or removes a source.
+    for (sym_syncs.items) |s| {
+        const file = findByLive(tree, s.live_path) orelse continue;
+        var vprov: std.ArrayList(Segment) = .empty;
+        const recomposed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &vprov, null) catch null;
+        const ok = if (recomposed) |bytes|
+            mox.apply.applied.sameSymlinkTarget(std.mem.trim(u8, bytes, " \t\r\n"), s.new_target)
+        else
+            false;
+        if (!ok) {
+            mismatch = true;
+            try restoreRouted(ctx.io, sym_backup.items);
+            try ctx.err.print("mox commit: {s}: recomposed symlink target does not match; not committed\n", .{s.live_path});
+            continue;
+        }
+        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target);
+        try ctx.out.print("  committed {s}\n", .{s.live_path});
+        committed_count += 1;
+    }
+
+    // Generator leaf row edits verify by re-expanding each touched generator
+    // and confirming every touched leaf reproduces live exactly. Verified as
+    // one all-or-nothing batch (not per generator): a data source shared by
+    // two leaves in the same run must not advance one leaf's applied record
+    // while restoring the file underneath it because a sibling leaf failed.
+    if (gen_leaf_commits.items.len > 0) {
+        const ok = try ctx.alloc.alloc(bool, gen_leaf_commits.items.len);
+        const live_now = try ctx.alloc.alloc(?[]const u8, gen_leaf_commits.items.len);
+        const leaf_prov = try ctx.alloc.alloc(?[]const Segment, gen_leaf_commits.items.len);
+        const leaf_secret = try ctx.alloc.alloc(bool, gen_leaf_commits.items.len);
+        var any_failed = false;
+        // One re-expansion per distinct generator this run touched, reused
+        // across every leaf it produced that was routed.
+        var gen_cache: std.AutoHashMap(usize, ?[]const mox.compose.catB.GeneratedFile) = .init(ctx.alloc);
+        for (gen_leaf_commits.items, 0..) |gc, i| {
+            const outputs = blk: {
+                if (gen_cache.get(gc.fidx)) |cached| break :blk cached;
+                var vdiag: mox.compose.interp.Diag = .{};
+                const out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, gc.gen_file, &axis_resolver, &m_state, secrets, &vdiag) catch null;
+                try gen_cache.put(gc.fidx, out);
+                break :blk out;
+            };
+            const leaf = findGeneratedByLive(outputs, gc.leaf_live_path);
+            const now = Io.Dir.cwd().readFileAlloc(ctx.io, gc.leaf_live_path, ctx.alloc, .limited(max_file_bytes)) catch null;
+            if (leaf != null and now != null and std.mem.eql(u8, leaf.?.content, now.?)) {
+                ok[i] = true;
+                live_now[i] = now;
+                leaf_prov[i] = leaf.?.prov;
+                leaf_secret[i] = leaf.?.contains_secret;
+            } else {
+                ok[i] = false;
+                any_failed = true;
+            }
+        }
+
+        if (any_failed) {
+            mismatch = true;
+            try restoreRouted(ctx.io, gen_data_backup.items);
+            for (gen_leaf_commits.items, 0..) |gc, i| {
+                if (ok[i]) {
+                    try ctx.err.print(
+                        "mox commit: {s}: not committed (a sibling leaf from the same generator failed to verify; its data source was restored)\n",
+                        .{gc.leaf_live_path},
+                    );
+                } else {
+                    try ctx.err.print("mox commit: {s}: recomposed generator output does not match; not committed\n", .{gc.leaf_live_path});
+                }
+            }
+        } else {
+            for (gen_leaf_commits.items, 0..) |gc, i| {
+                try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, live_now[i].?);
+                if (!leaf_secret[i]) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, live_now[i].?);
+                try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, leaf_prov[i].?);
+                try ctx.out.print("  committed {s}\n", .{gc.leaf_live_path});
+                committed_count += 1;
+            }
+        }
+    }
+
     // A file whose sources were put back: what it wrote is gone, so neither it
     // nor any coupled update to it counts as committed.
     const rolled_back = try ctx.alloc.alloc(bool, tree.files.len);
@@ -2441,6 +2640,396 @@ fn emptyDocText(format: commit_struct.Format) []const u8 {
     };
 }
 
+/// Route a managed symlink whose live target no longer matches what mox last
+/// recorded there. A symlink's source is a regular file whose composed,
+/// trimmed content IS the target -- keep syncs the source to the live target,
+/// but only when the recorded target is a plain literal. When the source
+/// target holds a capture (`<machine.X>`) or a `<secret:...>`, the composed
+/// and live targets differing is expected (they differ in the resolved
+/// value), and literal-syncing would bake that resolved value into the
+/// source, permanently discarding the capture -- so this always refuses, and
+/// a secret-derived target is never even considered for a literal write.
+fn processSymlinkFile(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    state_dir: []const u8,
+    sym_syncs: *std.ArrayList(SymSync),
+) !HunkOutcome {
+    const site = mox.apply.applied.inspectSymSite(cc.io, cc.arena, file.live_path);
+    // A directory, a plain file, or an absent path where a symlink belongs is
+    // not something `keep` can route (no target string to compare against) --
+    // `mox apply --overwrite` is the resolution for those, not commit.
+    if (site != .symlink) return .cont;
+    const live_target = site.symlink;
+
+    const recorded_target = try mox.apply.applied.readSymlink(cc.arena, cc.io, state_dir, file.live_path);
+
+    var prov: std.ArrayList(Segment) = .empty;
+    const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
+        try cc.stdout.print("  manual: {s} (compose failed: {s})\n", .{ file.live_path, @errorName(e) });
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        return .cont;
+    };
+    // A whole-file `when` gate false for this machine: nothing composes here,
+    // so there is no current target to compare the live one against.
+    const bytes = composed orelse return .cont;
+    const composed_target = std.mem.trim(u8, bytes, " \t\r\n");
+
+    // The SAME disposition rule `mox apply`/`mox status` classify by: not
+    // drift covers both an already-matching link and a "safe reassert" (the
+    // live link is exactly what mox last wrote, and only a binding changed
+    // since) -- neither needs `keep`.
+    if (mox.apply.drift.symlinkDisposition(site, recorded_target, composed_target) != .drift) return .cont;
+
+    const has_secret = mox.provenance.map.hasSecret(prov.items);
+    const has_capture = has_secret or hasInterpolated(prov.items);
+    if (has_capture) {
+        const why = if (has_secret)
+            "its target is derived from a secret"
+        else
+            "its target is derived from a capture (e.g. <machine.X>)";
+        try cc.stdout.print(
+            "  manual: {s} (symlink target changed, but {s}; keeping would discard it -- edit the source directly)\n",
+            .{ file.live_path, why },
+        );
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        return .cont;
+    }
+
+    var accept = !cc.report_mode and !cc.interactive;
+    if (cc.report_mode) {
+        ra.pending.* = true;
+        ra.routed_count.* += 1;
+        try cc.stdout.print("  would keep {s}: symlink target -> {s}\n", .{ file.live_path, live_target });
+        return .cont;
+    }
+    if (cc.interactive) {
+        try printHunkHeader(cc.stdout, cc.sty, file.live_path, "symlink", 1, 1, "symlink target");
+        try cc.sty.green(cc.stdout);
+        try cc.stdout.print("    + {s}\n", .{live_target});
+        try cc.sty.close(cc.stdout);
+        const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
+        switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
+            .chosen => |i| switch (i) {
+                0 => accept = true,
+                else => ra.declined_hunks[fidx] += 1,
+            },
+            .abort => return .abort,
+            .abort_strict => return .abort_strict,
+            .report_only => unreachable,
+        }
+    }
+    if (accept) {
+        ra.routed_count.* += 1;
+        try sym_syncs.append(cc.arena, .{
+            .live_path = file.live_path,
+            .source_abs = file.source_base_abs,
+            .new_target = try cc.arena.dupe(u8, live_target),
+        });
+        if (!cc.interactive) try cc.stdout.print("  write {s} -> new symlink target {s}\n", .{ file.source_base_path, live_target });
+    }
+    return .cont;
+}
+
+/// True when any segment in `segments` is `.interpolated`: the source held a
+/// `<machine.X>` capture that machine interpolation rewrote to a resolved
+/// value. Used the same way `hasSecret` is -- to decide a target is
+/// capture-derived and must never be literal-synced.
+fn hasInterpolated(segments: []const Segment) bool {
+    for (segments) |s| {
+        if (s.origin == .interpolated) return true;
+    }
+    return false;
+}
+
+/// Write every accepted symlink-target sync, one whole-file replace per
+/// source. Deferred to the write phase like every other route, so aborting
+/// mid-prompt still writes nothing.
+fn applySymlinkSyncs(arena: std.mem.Allocator, io: Io, syncs: []const SymSync) !void {
+    for (syncs) |s| {
+        const data = try std.fmt.allocPrint(arena, "{s}\n", .{s.new_target});
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = s.source_abs, .data = data });
+    }
+}
+
+/// A generator (`for ... into`, or `completions`) has no single live path of
+/// its own -- `outputs` is its already-re-expanded produced set (the SAME
+/// `composeGenerator` call apply uses). Diff each produced leaf against its
+/// live file and route hunks by origin; `only_leaves`, when set, restricts
+/// this to the named leaves (a scoped `mox commit <leaf-path>`) instead of
+/// the whole set (`mox commit` unscoped, or `mox commit <generator-path>`).
+fn processGeneratorFile(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    gen_file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    outputs: []const mox.compose.catB.GeneratedFile,
+    only_leaves: ?*const std.StringHashMap(void),
+    gen_row_edits: *std.ArrayList(RowEdit),
+    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+) !HunkOutcome {
+    for (outputs) |leaf| {
+        if (only_leaves) |set| {
+            if (!set.contains(leaf.live_path)) continue;
+        }
+        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, gen_row_edits, gen_leaf_commits)) {
+            .cont => {},
+            .abort => return .abort,
+            .abort_strict => return .abort_strict,
+        }
+    }
+    return .cont;
+}
+
+/// Diff one produced leaf's composed baseline against its live file, routing
+/// each hunk. A leaf whose live path is absent was pruned (or never written);
+/// nothing to keep.
+fn processGeneratorLeaf(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    gen_file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    leaf: mox.compose.catB.GeneratedFile,
+    gen_row_edits: *std.ArrayList(RowEdit),
+    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+) !HunkOutcome {
+    const live = Io.Dir.cwd().readFileAlloc(cc.io, leaf.live_path, cc.arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return .cont,
+        else => return e,
+    };
+    if (std.mem.eql(u8, live, leaf.content)) return .cont;
+
+    // A placeholder recompose of this SAME leaf (secrets unresolved, so a
+    // `<secret:URI>` capture stays literal `<SECRET:uri>` text) lets a
+    // secret-touching hunk recover the store URI without ever resolving or
+    // displaying the old cleartext -- mirrors `processFallbackFile`.
+    var secret_lines: ?[]const []const u8 = null;
+    if (leaf.contains_secret) {
+        var pdiag: mox.compose.interp.Diag = .{};
+        if (mox.compose.catB.composeGenerator(cc.arena, cc.io, gen_file, cc.resolver, cc.m_state, null, &pdiag) catch null) |placeholder_outputs| {
+            for (placeholder_outputs) |po| {
+                if (!std.mem.eql(u8, po.live_path, leaf.live_path)) continue;
+                secret_lines = mox.diff.lines.splitLines(cc.arena, po.content) catch null;
+                break;
+            }
+        }
+    }
+
+    const a_lines = try mox.diff.lines.splitLines(cc.arena, leaf.content);
+    const b_lines = try mox.diff.lines.splitLines(cc.arena, live);
+    const hunks = mox.diff.lines.diff(cc.arena, a_lines, b_lines) catch |e| switch (e) {
+        error.TooManyLines => {
+            try cc.stdout.print("  manual: {s} (too large to diff)\n", .{leaf.live_path});
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            return .cont;
+        },
+        else => return e,
+    };
+
+    for (hunks, 0..) |hunk, hi| {
+        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, gen_row_edits, gen_leaf_commits)) {
+            .cont => {},
+            .abort => return .abort,
+            .abort_strict => return .abort_strict,
+        }
+    }
+    return .cont;
+}
+
+/// Route one hunk of a generator leaf: a secret line is never routed (shown
+/// safely, never written); a single-line change that a reverse-parse of the
+/// row's own template fully explains routes to that DATA-SOURCE ROW; anything
+/// else -- a multi-line change, a nested (directive-bearing) leaf body with no
+/// tracked template, or a live edit the template cannot explain as a field
+/// substitution -- comes from the generator's SHARED TEMPLATE, which every
+/// leaf this generator produces shares, so it is surfaced and never silently
+/// routed as though it were this leaf's own.
+fn processGeneratedHunk(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    gen_file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    leaf: mox.compose.catB.GeneratedFile,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    hunk: Hunk,
+    hunk_no: usize,
+    hunk_total: usize,
+    secret_lines: ?[]const []const u8,
+    gen_row_edits: *std.ArrayList(RowEdit),
+    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+) !HunkOutcome {
+    if (hunkTouchesSecret(leaf.prov, hunk)) {
+        return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, secret_lines, a_lines, b_lines, "came from a secret", true);
+    }
+
+    if (hunk.a_len == 1 and hunk.b_len == 1 and leaf.template.len > 0 and
+        std.mem.indexOfScalar(u8, leaf.template, '\n') == null)
+    {
+        if (try reverseTemplate(cc.arena, leaf.template, b_lines[hunk.b_start])) |fields| {
+            return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, fields, gen_row_edits, gen_leaf_commits);
+        }
+    }
+
+    return reportGeneratedManual(
+        cc,
+        ra,
+        fidx,
+        leaf,
+        hunk,
+        hunk_no,
+        hunk_total,
+        null,
+        a_lines,
+        b_lines,
+        try std.fmt.allocPrint(
+            cc.arena,
+            "comes from the generator's shared template -- this generator produces one file per row, and every one of them shares this text; edit the generator's source directly ({s})",
+            .{gen_file.source_base_path},
+        ),
+        false,
+    );
+}
+
+/// Accept (or prompt for) a leaf hunk that reverse-parsed cleanly to a
+/// data-source row edit, and collect it. `[y/s]` on a terminal, `--yes`
+/// (and any other non-interactive, non-report mode) auto-accepts -- this
+/// leaf's baseline IS something mox composed and wrote, unlike a
+/// first-contact file, so there is no rendering-ambiguity reason to demand a
+/// human confirm here.
+fn acceptGeneratedRow(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    gen_file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    leaf: mox.compose.catB.GeneratedFile,
+    hunk: Hunk,
+    hunk_no: usize,
+    hunk_total: usize,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    fields: []const Field,
+    gen_row_edits: *std.ArrayList(RowEdit),
+    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+) !HunkOutcome {
+    ra.routed_count.* += 1;
+    const desc = try std.fmt.allocPrint(cc.arena, "{s} row {d}", .{ leaf.data_source, leaf.row });
+    var accept = !cc.report_mode and !cc.interactive;
+    if (cc.report_mode) {
+        ra.pending.* = true;
+        try cc.stdout.print("  would update {s}\n", .{desc});
+        try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+        return .cont;
+    }
+    if (cc.interactive) {
+        try printHunkHeader(cc.stdout, cc.sty, leaf.live_path, "hunk", hunk_no, hunk_total, desc);
+        try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+        const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
+        switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
+            .chosen => |i| switch (i) {
+                0 => accept = true,
+                else => ra.declined_hunks[fidx] += 1,
+            },
+            .abort => return .abort,
+            .abort_strict => return .abort_strict,
+            .report_only => unreachable,
+        }
+    }
+    if (accept) {
+        try gen_row_edits.append(cc.arena, .{
+            .data_source = leaf.data_source,
+            .stem = filenameStem(leaf.data_source),
+            .row = @intCast(leaf.row),
+            .fields = fields,
+        });
+        var already = false;
+        for (gen_leaf_commits.items) |gc| {
+            if (std.mem.eql(u8, gc.leaf_live_path, leaf.live_path)) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) try gen_leaf_commits.append(cc.arena, .{ .fidx = fidx, .gen_file = gen_file, .leaf_live_path = leaf.live_path });
+        if (!cc.interactive) try cc.stdout.print("  update {s}\n", .{desc});
+    }
+    return .cont;
+}
+
+/// Report one generator-leaf hunk as manual: same `[s/x]` shape as
+/// `processHunk`'s own manual branch (secret-safe display when
+/// `touches_secret`, plain mini-diff otherwise), because a generator leaf has
+/// no sub-origin boundaries to split on -- `split` always falls through to
+/// "nothing to split", exactly like an uncovered hunk in a regular file.
+fn reportGeneratedManual(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    fidx: usize,
+    leaf: mox.compose.catB.GeneratedFile,
+    hunk: Hunk,
+    hunk_no: usize,
+    hunk_total: usize,
+    secret_lines: ?[]const []const u8,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    reason: []const u8,
+    touches_secret: bool,
+) !HunkOutcome {
+    if (!cc.interactive) {
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ leaf.live_path, hunk.a_start + 1, reason });
+        return .cont;
+    }
+    try printHunkHeader(cc.stdout, cc.sty, leaf.live_path, "hunk", hunk_no, hunk_total, try std.fmt.allocPrint(cc.arena, "manual -- {s}", .{reason}));
+    if (touches_secret) {
+        try printSecretNotice(cc, secret_lines, hunk, b_lines);
+    } else {
+        try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+    }
+    const legend_line = try legend(cc.arena, &sx_choices, 0, cc.sty);
+    switch (try prompt.ask(cc.ask_mode, &sx_choices, 0, legend_line, cc.input, cc.stdout)) {
+        .chosen => |i| switch (i) {
+            0 => {
+                ra.manual_count.* += 1;
+                ra.manual_hunks[fidx] += 1;
+                ra.pending.* = true;
+                try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ leaf.live_path, hunk.a_start + 1, reason });
+            },
+            else => {
+                ra.manual_count.* += 1;
+                ra.manual_hunks[fidx] += 1;
+                ra.pending.* = true;
+                try cc.stdout.print("  nothing to split: {s}:{d} lies in no single source\n", .{ leaf.live_path, hunk.a_start + 1 });
+                try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ leaf.live_path, hunk.a_start + 1, reason });
+            },
+        },
+        .abort => return .abort,
+        .abort_strict => return .abort_strict,
+        .report_only => unreachable,
+    }
+    return .cont;
+}
+
+/// The output in `outputs` (a fresh `composeGenerator` re-expansion) whose
+/// live path is `live_path`, or null when it is absent (the row was removed,
+/// `where` no longer matches it, or the re-expansion itself failed).
+fn findGeneratedByLive(outputs: ?[]const mox.compose.catB.GeneratedFile, live_path: []const u8) ?mox.compose.catB.GeneratedFile {
+    const outs = outputs orelse return null;
+    for (outs) |o| {
+        if (std.mem.eql(u8, o.live_path, live_path)) return o;
+    }
+    return null;
+}
+
 /// A partially owned file's commit gate: decide committability from the
 /// owned record and the extracted live owned document, then hand the changed
 /// keys to the structured per-key routing. `last` is the record's canonical
@@ -3663,6 +4252,33 @@ fn isRegionFragment(file: mox.source.tree.ManagedFile, path: []const u8) bool {
 fn findByLive(tree: mox.source.tree.ManagedTree, live_path: []const u8) ?mox.source.tree.ManagedFile {
     for (tree.files) |f| {
         if (std.mem.eql(u8, f.live_path, live_path)) return f;
+    }
+    return null;
+}
+
+/// The generator (or `completions` set) whose current re-expansion produces
+/// `live_path` as one of its leaves, or null when no managed file's expansion
+/// does. Tried for a scoped `mox commit <path>` argument that named a leaf
+/// directly rather than the generator's own path -- a leaf is not itself in
+/// `tree_files`, so `scope.filterTree` cannot resolve it. Re-expands every
+/// candidate (there is no cheaper index), which is fine at the scale a repo's
+/// generator count runs at.
+fn findGeneratorLeaf(
+    arena: std.mem.Allocator,
+    io: Io,
+    tree_files: []const mox.source.tree.ManagedFile,
+    resolver: *const mox.dsl.resolver.Resolver,
+    m_state: *const mox.machine.state.MachineState,
+    secrets: mox.compose.catB.SecretCtx,
+    live_path: []const u8,
+) !?mox.source.tree.ManagedFile {
+    for (tree_files) |f| {
+        var diag: mox.compose.interp.Diag = .{};
+        const gen = mox.compose.catB.composeGenerator(arena, io, f, resolver, m_state, secrets, &diag) catch continue;
+        const outputs = gen orelse continue;
+        for (outputs) |o| {
+            if (std.mem.eql(u8, o.live_path, live_path)) return f;
+        }
     }
     return null;
 }

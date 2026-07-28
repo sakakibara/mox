@@ -481,6 +481,20 @@ pub const GeneratedFile = struct {
     /// True when a dedicated-manager (op://|pass://) secret resolved into the
     /// body, so apply auto-restricts the file to 0600.
     manager_secret: bool,
+    /// 0-based index into the data source's row array (stable across `where`
+    /// filtering) that produced this file. Meaningful only for a `for ...
+    /// into` row (default 0 for a `completions` output, which has no row).
+    row: usize = 0,
+    /// Absolute path of the data source this row came from. Empty for a
+    /// `completions` output. Together with `row`, lets `mox commit` route a
+    /// field edit in a leaf back to the data source row that produced it.
+    data_source: []const u8 = "",
+    /// The loop body's raw (pacifier-stripped, uninterpolated) single-line
+    /// template, or empty when the body carries its own directives (nested)
+    /// or the output is not a `for ... into` row at all: either way there is
+    /// no field-level template to reverse-parse an edit against, so `mox
+    /// commit` treats every line of such a leaf as manual.
+    template: []const u8 = "",
 };
 
 /// Compose a GENERATOR: a managed file whose SOLE top-level directive is a
@@ -551,7 +565,8 @@ pub fn composeGenerator(
 
     try interp.lint(arena, template);
 
-    const records = try loadGeneratorRows(arena, io, file, loop.data_source, diag);
+    const rows = try loadGeneratorRows(arena, io, file, loop.data_source, diag);
+    const records = rows.records;
 
     const scope = try prependFrame(arena, ctx.scope, loop.variable);
     ctx.scope = scope;
@@ -567,7 +582,7 @@ pub fn composeGenerator(
     // otherwise silently drop one row's file (last write wins).
     var seen = std.StringHashMap(void).init(arena);
 
-    for (records) |*record_ptr| {
+    for (records, 0..) |*record_ptr, row_idx| {
         scope[0] = .{ .name = loop.variable, .value = .{ .record = record_ptr } };
         if (loop.where) |w| {
             if (!try evalRow(arena, w, scope, bindings, ctx.diag)) continue;
@@ -613,6 +628,9 @@ pub fn composeGenerator(
             .prov = try prov.toOwnedSlice(arena),
             .contains_secret = contains_secret,
             .manager_secret = row_diag.manager_secret,
+            .row = row_idx,
+            .data_source = rows.data_path,
+            .template = if (!nested) stripped else "",
         });
     }
 
@@ -842,7 +860,7 @@ fn composeCompletions(
         if (!dsl.axis.evaluate(expr_ptr, bindings)) return try outputs.toOwnedSlice(arena);
     }
 
-    const records = try loadGeneratorRows(arena, io, file, comp.registry, diag);
+    const records = (try loadGeneratorRows(arena, io, file, comp.registry, diag)).records;
     const base_dir = std.fs.path.dirname(file.live_path) orelse file.live_path;
     var seen = std.StringHashMap(void).init(arena);
 
@@ -945,6 +963,14 @@ fn composeGeneratorBody(
     }
 }
 
+/// A generator's loaded rows plus the resolved absolute path they came from
+/// (private-shadows-repo already applied), so a caller that needs to write
+/// a row back (`mox commit`'s leaf routing) does not re-derive it.
+const GeneratorRows = struct {
+    records: []RecordMap,
+    data_path: []const u8,
+};
+
 /// Load a generator's data rows from its file-based source (a `/`-bearing
 /// repo-relative path, private layer shadowing repo; or a bare per-file name).
 /// Mirrors `emitForLoop`'s file branch; a top-level generator has no enclosing
@@ -955,7 +981,7 @@ fn loadGeneratorRows(
     file: ManagedFile,
     data_source: []const u8,
     diag: ?*interp.Diag,
-) EmitError![]RecordMap {
+) EmitError!GeneratorRows {
     const data_path = blk: {
         if (std.mem.indexOfScalar(u8, data_source, '/') != null) {
             if (file.private_dir.len > 0) {
@@ -982,10 +1008,11 @@ fn loadGeneratorRows(
     // array -- a 0-byte or truncated file, or a mistyped array declaration -- is
     // an error, not zero rows, so a corruption cannot silently prune every
     // produced file. This mirrors the inline loop's protection.
-    return arr_map.get(stem) orelse {
+    const records = arr_map.get(stem) orelse {
         if (diag) |dg| dg.set(data_path);
         return error.DataSourceArrayNotFound;
     };
+    return .{ .records = records, .data_path = data_path };
 }
 
 /// Record a single whole-file `.base` segment for a verbatim directiveless

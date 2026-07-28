@@ -3964,3 +3964,250 @@ test "commit disown: routes a user-key edit to the base; the program's key never
     try std.testing.expectEqual(@as(u8, 0), re.rc);
     try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
 }
+
+// -- symlink-target keep --
+
+fn isSymlink(io: Io, path: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
+}
+
+fn linkTarget(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try Io.Dir.cwd().readLink(io, path, &buf);
+    return a.dupe(u8, buf[0..n]);
+}
+
+fn writeSymlinkFixture(io: Io, tmp: *std.testing.TmpDir, target: []const u8) !void {
+    try writeRepo(io, tmp, "repo/src/mylink", target);
+    try writeRepo(io, tmp, "repo/.mox/attributes.toml", "[\"mylink\"]\nsymlink = true\n");
+}
+
+test "commit: symlink-target keep syncs a plain-literal source to the new live target, converging" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSymlinkFixture(io, &tmp, "/tmp/mox-old-target\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("mylink");
+    try std.testing.expect(isSymlink(io, live));
+    try Io.Dir.cwd().deleteFile(io, live);
+    try Io.Dir.cwd().symLink(io, "/tmp/mox-new-target", live, .{});
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") != null);
+
+    // The source now holds the new target, literal.
+    try std.testing.expectEqualStrings("/tmp/mox-new-target\n", try read(io, a, try h.srcOf("mylink")));
+
+    // Converges: a fresh apply sees no drift and touches nothing.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+    const re = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), re.rc);
+    try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
+}
+
+test "commit: symlink-target keep does not clobber a capture-bearing source" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSymlinkFixture(io, &tmp, "<machine.home>/real-nvim\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("mylink");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try Io.Dir.cwd().symLink(io, "/somewhere/else", live, .{});
+
+    const src_path = try h.srcOf("mylink");
+    const before = try read(io, a, src_path);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    // The capture is never clobbered with the resolved literal: the source is
+    // byte-identical, and the live edit is reported, not silently discarded.
+    try std.testing.expectEqualStrings(before, try read(io, a, src_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mylink") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "capture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+}
+
+test "commit: symlink-target keep never writes a resolved secret into the source" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSymlinkFixture(io, &tmp, "<secret:env:MOX_TEST_LINK_SECRET>\n");
+    var h = try setup(a, io, &tmp, .{});
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", h.home);
+    try map.put("USER", "tester");
+    try map.put("MOX_REPO", h.repo);
+    try map.put("MOX_STATE_DIR", h.state);
+    try map.put("MOX_TEST_LINK_SECRET", "/secret/resolved/target");
+    const map_ptr = try a.create(std.process.Environ.Map);
+    map_ptr.* = map;
+    h.env = .{ .map = map_ptr };
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("mylink");
+    try std.testing.expect(isSymlink(io, live));
+    try expectSymlinkTargetContains(io, a, live, "/secret/resolved/target");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try Io.Dir.cwd().symLink(io, "/somewhere/else", live, .{});
+
+    const src_path = try h.srcOf("mylink");
+    const before = try read(io, a, src_path);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    // Never written into the source, and the old resolved value never
+    // reaches stdout -- only the manual notice.
+    try std.testing.expectEqualStrings(before, try read(io, a, src_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "/secret/resolved/target") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "secret") != null);
+}
+
+fn expectSymlinkTargetContains(io: Io, a: std.mem.Allocator, path: []const u8, needle: []const u8) !void {
+    const target = try linkTarget(io, a, path);
+    try std.testing.expect(std.mem.indexOf(u8, target, needle) != null);
+}
+
+// -- generated-leaf keep --
+
+/// A generator source at `src/.config/gen.inc` producing one file per row,
+/// `id-<entry.slug>.inc`, whose body is `key=<entry.value>` -- the row's
+/// `slug` names the leaf, `value` is what a leaf edit reverse-routes into,
+/// so editing a leaf's body never renames its own file.
+fn writeGenValueFixture(io: Io, tmp: *std.testing.TmpDir, rows: []const [2][]const u8) !void {
+    try tmp.dir.createDirPath(io, "repo/src/.config");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/gen.inc",
+        .data = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value>\n# mox: end\n",
+    });
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    for (rows) |r| {
+        try body.appendSlice(std.testing.allocator, "[[entries]]\nslug = \"");
+        try body.appendSlice(std.testing.allocator, r[0]);
+        try body.appendSlice(std.testing.allocator, "\"\nvalue = \"");
+        try body.appendSlice(std.testing.allocator, r[1]);
+        try body.appendSlice(std.testing.allocator, "\"\n\n");
+    }
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/entries.toml", .data = body.items });
+}
+
+test "commit: a generator leaf edit that reverse-parses cleanly routes to its data-source row, converging" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{ .{ "a", "1" }, .{ "b", "2" } });
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const leaf_a = try h.liveOf(".config/id-a.inc");
+    try editLive(io, a, leaf_a, "key=1", "key=99");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "id-a.inc") != null);
+
+    const data = try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }));
+    try std.testing.expectEqualStrings(
+        "[[entries]]\nslug = \"a\"\nvalue = \"99\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n\n",
+        data,
+    );
+    // The untouched sibling leaf is unaffected.
+    try std.testing.expectEqualStrings("key=2\n", try read(io, a, try h.liveOf(".config/id-b.inc")));
+
+    // Converges: a fresh apply regenerates the set identically to live.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+    const re = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), re.rc);
+}
+
+test "commit: a generator leaf edit that does not match the row template surfaces as the shared template, not a silent route" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{.{ "a", "1" }});
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // Replace the leaf's whole line with text the row template's literal
+    // prefix ("key=") cannot match at all -- indistinguishable, without the
+    // template, from a change to the shared template text itself.
+    const leaf_a = try h.liveOf(".config/id-a.inc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_a, .data = "totally different line\n" });
+
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
+    const data_before = try read(io, a, data_path);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    // Never silently routed as a row edit: the data source is untouched, and
+    // the report names the generator's own source, not a row.
+    try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "shared template") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "gen.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+}
+
+test "commit: a leaf path argument routes only that leaf, addressing its generator" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{ .{ "a", "1" }, .{ "b", "2" } });
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const leaf_a = try h.liveOf(".config/id-a.inc");
+    const leaf_b = try h.liveOf(".config/id-b.inc");
+    try editLive(io, a, leaf_a, "key=1", "key=91");
+    try editLive(io, a, leaf_b, "key=2", "key=92");
+
+    // Scoped to leaf a's own live path -- not the generator's.
+    const res = try h.run(&.{ "mox", "commit", "--yes", leaf_a });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "id-b.inc") == null);
+
+    const data = try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }));
+    try std.testing.expectEqualStrings(
+        "[[entries]]\nslug = \"a\"\nvalue = \"91\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n\n",
+        data,
+    );
+    // The out-of-scope leaf's edit is untouched and still shows as drift.
+    try std.testing.expectEqualStrings("key=92\n", try read(io, a, leaf_b));
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "DRIFT") != null or std.mem.indexOf(u8, st.err, "DRIFT") != null);
+}
