@@ -1410,12 +1410,74 @@ test "mox facts: a structurally invalid source tree is a loud non-zero refusal, 
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ReservedAxisName") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "unavailable") != null);
 
-    // apply is unaffected: it ignores discovery's tree_error and keeps its
-    // own richer walkDiag report for the same file.
+    // apply reports the same failure, via its own richer walkDiag report for
+    // the same file, now surfaced from the same tree_error check up front.
     const r_apply = try c.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(r_apply.rc != 0);
     try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "path=brew") != null);
     try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "reserved axis name") != null);
+}
+
+test "apply: a structurally invalid source tree fails before scripts/pre ever runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    // A malformed overlay tuple (an axis value the grammar rejects): the
+    // walk fails validating the source tree, before any script runs.
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig", .data = "[user]\n" });
+    try tmp.dir.createDirPath(io, "repo/src/.gitconfig.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig.d/os=.toml", .data = "[gpg]\n" });
+
+    const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-sentinel{s}", .{script_ext});
+    const content = if (builtin.os.tag == .windows)
+        "New-Item -ItemType File -Force -Path \"$env:MOX_HOME/sentinel\" | Out-Null\n"
+    else
+        "#!/bin/sh\ntouch \"$MOX_HOME/sentinel\"\n";
+    try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const sentinel = try c.homePath("sentinel");
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, sentinel, .{}));
+}
+
+test "apply: scripts/pre still runs before the compose walk on a healthy tree" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+
+    // A pre-script writes a NEW managed source file. If pre-stage scripts run
+    // before the compose walk, the walk (later in this same run) sees it and
+    // applies it; if the walk ran first, this file would not exist yet.
+    const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-generate{s}", .{script_ext});
+    const content = if (builtin.os.tag == .windows)
+        "Set-Content -Path \"$env:MOX_REPO/src/generated\" -Value 'seeded'\n"
+    else
+        "#!/bin/sh\nprintf 'seeded\\n' > \"$MOX_REPO/src/generated\"\n";
+    try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("seeded\n", try read(io, a, try c.homePath("generated")));
 }
 
 test "apply/doctor: a leftover data/facts-schema.toml gets one loud never-read notice, from both commands" {

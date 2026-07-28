@@ -48,6 +48,54 @@ fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, privat
     };
 }
 
+/// Walk the source tree, reporting a structural failure (a malformed
+/// ownership declaration, an invalid `.mox/attributes.toml` entry, a
+/// reserved axis name, ...) with the offending file rather than a bare error
+/// name. Shared by the up-front `discovery.tree_error` check (before the
+/// interview or any script has run) and the compose pass's own walk, so
+/// both report the same failure the same way. Null return means the caller
+/// already reported and should fail the run; any other error still
+/// propagates.
+fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.source.tree.ManagedTree {
+    var walk_diag: mox.source.tree.Diag = .{};
+    return mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, home, &walk_diag) catch |e| switch (e) {
+        error.FileNotFound => {
+            try ctx.err.print("mox apply: source tree not found at {s}\n", .{src_dir});
+            try ctx.err.writeAll("Run 'mox init' first.\n");
+            return null;
+        },
+        error.OwnOnSymlink,
+        error.OwnOnSeedOnce,
+        error.OwnOnGenerator,
+        error.OwnAndDisown,
+        error.OwnPathOverlap,
+        error.InvalidOwnPath,
+        error.InvalidCheckDirective,
+        error.CheckWithoutOwnership,
+        => {
+            try ctx.err.print("mox apply: ownership declaration: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
+            });
+            return null;
+        },
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox apply: attributes.toml: {s}: {s}\n", .{
+                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return null;
+        },
+        error.ReservedAxisName => {
+            try ctx.err.print("mox apply: overlay filename: {s}: \"path\" is a reserved axis name; the path= axis no longer exists\n", .{
+                walk_diag.capture() orelse "?",
+            });
+            return null;
+        },
+        else => return e,
+    };
+}
+
 /// The apply pipeline, callable with explicit flags so `mox init --apply` can
 /// run it right after a clone. `run` is the thin CLI wrapper over it. `paths`
 /// limits the run to those managed files (empty: every file); when non-empty
@@ -138,9 +186,15 @@ fn applyPass(
     // OOM/IO-class error here propagates like any other.
     const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "mox apply: ", discovery.diagnostics, discovery.default_diagnostics);
-    // discovery.tree_error is ignored here: apply's own source.tree.walkDiag
-    // call below reports the same failure with the offending file and a
-    // richer message, so discovery's bare error name would only be noise.
+    // A structurally invalid source tree must fail here, before the interview
+    // persists anything and before scripts/pre runs a single script: neither
+    // is safe to act on a repo the walk cannot even validate. Re-walking with
+    // a diagnostic is the same cost `discover` already paid to learn
+    // `tree_error` was non-null, so this is not new work on the healthy path.
+    if (discovery.tree_error != null) {
+        const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
+        _ = (try walkTreeOrReport(ctx, src_dir, m_state.home)) orelse return 1;
+    }
 
     // Facts interview: resolve every eligible unbound dimension, persist the
     // answers, and re-capture so this apply already composes with them.
@@ -237,43 +291,7 @@ fn applyPass(
     try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs);
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    var walk_diag: mox.source.tree.Diag = .{};
-    const base_tree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, m_state.home, &walk_diag) catch |e| switch (e) {
-        error.FileNotFound => {
-            try ctx.err.print("mox apply: source tree not found at {s}\n", .{src_dir});
-            try ctx.err.writeAll("Run 'mox init' first.\n");
-            return 1;
-        },
-        error.OwnOnSymlink,
-        error.OwnOnSeedOnce,
-        error.OwnOnGenerator,
-        error.OwnAndDisown,
-        error.OwnPathOverlap,
-        error.InvalidOwnPath,
-        error.InvalidCheckDirective,
-        error.CheckWithoutOwnership,
-        => {
-            try ctx.err.print("mox apply: ownership declaration: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
-            });
-            return 1;
-        },
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
-        => {
-            try ctx.err.print("mox apply: attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-            });
-            return 1;
-        },
-        error.ReservedAxisName => {
-            try ctx.err.print("mox apply: overlay filename: {s}: \"path\" is a reserved axis name; the path= axis no longer exists\n", .{
-                walk_diag.capture() orelse "?",
-            });
-            return 1;
-        },
-        else => return e,
-    };
+    const base_tree = (try walkTreeOrReport(ctx, src_dir, m_state.home)) orelse return 1;
 
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 
