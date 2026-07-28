@@ -148,8 +148,8 @@ fn applyPass(
     // apply --defaults` never prompts and binds each dimension's agreed
     // default (or declines it); `--dry-run` and a plain non-interactive run
     // never persist -- there is no global refusal here, only a report: a
-    // script that actually needs an unresolved fact is D3's problem to
-    // block, not this pass's to refuse wholesale.
+    // script that actually needs an unresolved fact is the script-contract
+    // check's problem to block, not this pass's to refuse wholesale.
     const interactive_interview = (scripted_input != null or tty.isInteractive(0)) and !dry_run;
     const interview_mode: mox.machine.interview.Mode = blk: {
         if (dry_run) break :blk .report_only;
@@ -176,12 +176,16 @@ fn applyPass(
     // `data/facts.toml`'s declared rows (for a derived fact's remediation
     // text) are stable for the whole run -- a repo file, not machine state --
     // so this loads once; `script_env`/`contracts` below are rebuilt after
-    // every re-capture (D3: a post-script must see a pre-script's fresh
-    // facts, both as env and for its own availability check).
+    // every re-capture: a post-script must see a pre-script's fresh facts,
+    // both as env and for its own availability check.
     const derived_rows = try mox.machine.derived_facts.declaredRows(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir);
     var script_env: std.process.Environ.Map = undefined;
     var contracts: mox.apply.run_scripts.Contracts = undefined;
-    try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts);
+    // Threaded through every `refreshScriptStage` call so its unrepresentable-
+    // fact notice prints once per run, not once per re-capture, when the
+    // skipped set does not change.
+    var notified_skipped: []const []const u8 = &.{};
+    try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped);
 
     // Resolved once per apply run (not per checked partial file): an
     // unparseable override would otherwise warn once per file checked.
@@ -217,14 +221,14 @@ fn applyPass(
     // row derives a fact from. Re-capture so this same apply composes against
     // the machine as the bootstrap left it, not as it began -- the
     // first-apply staleness the design exists to eliminate. `script_env`/
-    // `contracts` are rebuilt in lockstep (D3): a post-script must see and be
+    // `contracts` are rebuilt in lockstep: a post-script must see and be
     // judged against exactly the facts this re-capture just bound, not the
     // pre-stage's stale projection.
     if (pre_result.ran > 0) {
         m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 1;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
-        try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts);
+        try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped);
         try script_env.put("MOX_PATH", mox_path_file);
     }
     // $MOX_PATH additions the pre stage named: fold into this run's probe
@@ -641,16 +645,27 @@ fn applyPass(
     } else {
         queued_out.* = resolver.queued;
     }
-    // A blocked script (D3: its fact contract could not be resolved) fails
-    // the run exactly like a failed one, under its own summary label.
+    // A blocked script (its fact contract could not be resolved) fails the
+    // run exactly like a failed one, under its own summary label.
     const total_fail = counts.fail + counts.drift + pre_result.failed + post_result.failed + pre_result.blocked + post_result.blocked;
     return if (total_fail > 0) 1 else 0;
 }
 
+/// True when `a` and `b` name the same facts in the same order (the order
+/// `buildScriptEnv` produces `skipped` in, itself derived from
+/// `m_state.custom_facts`'s stable order) -- good enough to tell "the same
+/// notice as last time" from "a re-capture actually changed the skipped
+/// set", without needing to sort either side.
+fn sameSkippedNames(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
 /// Rebuild `script_env`/`contracts` in lockstep from `m_state`'s current
-/// `custom_facts` (D3: every re-capture must rebuild both, never just the
+/// `custom_facts`: every re-capture must rebuild both, never just the
 /// environment -- an availability check against a stale projection would
-/// silently disagree with what the script itself just received).
+/// silently disagree with what the script itself just received.
 fn refreshScriptStage(
     ctx: *app.Ctx,
     context: app.Context,
@@ -659,6 +674,7 @@ fn refreshScriptStage(
     derived_rows: []const mox.machine.derived_facts.DeclaredRow,
     script_env: *std.process.Environ.Map,
     contracts: *mox.apply.run_scripts.Contracts,
+    notified_skipped: *[]const []const u8,
 ) !void {
     const script_facts = try ctx.alloc.alloc(mox.apply.run_scripts.Fact, m_state.custom_facts.len);
     for (m_state.custom_facts, 0..) |f, i| script_facts[i] = .{ .name = f.name, .value = f.value };
@@ -670,10 +686,16 @@ fn refreshScriptStage(
         context.paths.home,
         script_facts,
     );
-    if (script_env_result.skipped.len > 0) {
+    // Printed once per run, not once per `refreshScriptStage` call: a
+    // re-capture between pre- and post-stage rebuilds this same notice from
+    // the same facts.toml far more often than the skipped set actually
+    // changes, and repeating an unchanged notice only trains the reader to
+    // skip past it.
+    if (script_env_result.skipped.len > 0 and !sameSkippedNames(script_env_result.skipped, notified_skipped.*)) {
         try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
         for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
         try ctx.err.writeAll("\n");
+        notified_skipped.* = script_env_result.skipped;
     }
     script_env.* = script_env_result.map;
     contracts.* = try mox.apply.run_scripts.buildContracts(

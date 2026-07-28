@@ -1171,6 +1171,47 @@ test "apply: script_env rebuilds after a pre-script re-capture, so a post-script
     try expectLoggedLines("fresh-value\n", try read(io, a, log));
 }
 
+test "apply: the not-representable-as-MOX_FACT_* notice prints once per run, not once per re-capture" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    // `cloud.backend` and `cloud-backend` both sanitize to
+    // MOX_FACT_CLOUD_BACKEND -- a projection collision present in
+    // facts.toml from the very first capture, unaffected by the pre-script
+    // re-capture below, so its notice is the SAME notice both times.
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.config/mox/facts.toml",
+        .data = "\"cloud.backend\" = \"gdrive\"\n\"cloud-backend\" = \"dropbox\"\n",
+    });
+
+    // A pre-script that persists an unrelated fact, forcing apply's
+    // post-pre-stage re-capture (which rebuilds script_env/contracts and
+    // would otherwise reprint the same collision notice a second time).
+    const pre_rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-persist{s}", .{script_ext});
+    const pre_content = if (builtin.os.tag == .windows)
+        "Add-Content -LiteralPath \"$env:MOX_HOME/.config/mox/facts.toml\" -Value 'other = \"x\"'\n"
+    else
+        "#!/bin/sh\nprintf 'other = \"x\"\\n' >> \"$MOX_HOME/.config/mox/facts.toml\"\n";
+    try writeExecScript(io, tmp.dir, pre_rel, pre_content, try std.fs.path.join(a, &.{ root, pre_rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, r.err, "not representable as MOX_FACT_*"),
+    );
+}
+
 test "apply: a gate-mismatched script's needs are never evaluated -- no block for an os=windows script on a non-windows machine" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1219,10 +1260,15 @@ test "apply: fresh-machine incident replica -- a literal $MOX_FACT_PROFILE token
         .data = "# mox: when profile=work\nx = 1\n# mox: end\n",
     });
     const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-steam{s}", .{script_ext});
+    // apply-e2e fixture scripts must not write to inherited stdout -- under
+    // `zig build test --listen` that fd is the build-runner protocol
+    // channel, so a fixture that ever actually spawns and prints to it would
+    // deadlock the suite. Redirect to /dev/null; the token stays in the text
+    // for the token scan to find.
     const content = if (builtin.os.tag == .windows)
         "Write-Output $env:MOX_FACT_PROFILE\n"
     else
-        "#!/bin/sh\necho \"$MOX_FACT_PROFILE\"\n";
+        "#!/bin/sh\necho \"$MOX_FACT_PROFILE\" >/dev/null\n";
     try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
 
     const c = try cliSetup(a, io, &tmp);
@@ -1254,7 +1300,7 @@ test "apply: fresh-machine incident replica, profile declined -- skipped (declin
     const content = if (builtin.os.tag == .windows)
         "Write-Output $env:MOX_FACT_PROFILE\n"
     else
-        "#!/bin/sh\necho \"$MOX_FACT_PROFILE\"\n";
+        "#!/bin/sh\necho \"$MOX_FACT_PROFILE\" >/dev/null\n";
     try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
 
     const c = try cliSetup(a, io, &tmp);
