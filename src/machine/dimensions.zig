@@ -93,6 +93,18 @@ pub const Provenance = struct {
     needing_scripts: []const []const u8,
 };
 
+/// Write `p` as a compact provenance summary, no surrounding punctuation or
+/// trailing newline (`"3 sources, needs: scripts/pre/00-op.sh"`) -- the
+/// shared text between the interview's per-prompt provenance line, `mox
+/// status`'s unbound-facts section, and `mox facts --report`.
+pub fn writeProvenance(out: *std.Io.Writer, p: Provenance) !void {
+    try out.print("{d} source{s}", .{ p.source_count, if (p.source_count == 1) "" else "s" });
+    if (p.needing_scripts.len > 0) {
+        try out.writeAll(", needs:");
+        for (p.needing_scripts) |s| try out.print(" {s}", .{s});
+    }
+}
+
 pub const Dimension = struct {
     name: []const u8,
     roles: Roles,

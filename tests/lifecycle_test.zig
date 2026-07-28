@@ -296,6 +296,53 @@ test "status: a run probing both axes prints tool then env under one blank-line 
     ) != null);
 }
 
+test "status: no unbound-facts section when the repo has no dimensions" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "unbound facts:") == null);
+}
+
+test "status: an unbound, unconditioned dimension gets its own section with provenance, after the probe log" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\nunbound facts:\n  profile (1 source)\n") != null);
+}
+
+test "status: a bound fact is never listed as unbound" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"work\"\n" });
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "unbound facts:") == null);
+}
+
 test "diff: a path argument limits the stat summary to that file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1030,6 +1077,70 @@ test "doctor: a presence-fact gate is not a never-materializes false positive" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "never-materializes") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "healthy") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "doctor: a bound fact nothing in the repo consumes is an unused-fact advisory, not a failure" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
+    const facts_path = try h.homePath(".config/mox/facts.toml");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "leftover_fact = \"x\"\n" });
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "unused-fact leftover_fact (bound but unused by this repo)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "advisory item(s) need attention") != null);
+}
+
+test "doctor: a bound fact this repo's sources actually consume is never flagged unused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    const facts_path = try h.homePath(".config/mox/facts.toml");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "profile = \"work\"\n" });
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "unused-fact") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "healthy") != null);
+}
+
+test "doctor: an unused fact close to an unbound dimension's name bridges as a probable rename" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // "persona" (unbound dimension) vs "personb" (bound, unused): edit
+    // distance 1, both well past the length guard.
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when persona\nx = 1\n# mox: end\n");
+    const facts_path = try h.homePath(".config/mox/facts.toml");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "personb = \"x\"\n" });
+
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "unused-fact personb (bound but unused; unbound \"persona\" -- renamed? mox facts set persona <value>)",
+    ) != null);
 }
 
 /// `git init` in `repo`, so doctor's git-backed untracked-source check has a

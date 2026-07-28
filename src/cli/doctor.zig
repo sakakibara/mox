@@ -190,6 +190,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  note: scripts/ could not be read; the script-stage check was skipped\n", .{});
     }
 
+    // A bound machine fact nothing in the repo consumes: completes the
+    // unbound-vs-unused lifecycle (unbound-but-consumed asks or blocks,
+    // bound-but-unconsumed flags here).
+    if (try staleFacts(ctx.alloc, ctx.io, context)) |stale| {
+        for (stale) |msg| {
+            advisories += 1;
+            try ctx.out.print("  {s}\n", .{msg});
+        }
+    } else {
+        skipped += 1;
+        try ctx.out.print("  note: machine state or the source tree could not be read; the stale-fact check was skipped\n", .{});
+    }
+
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
     var problems = bad_prov.len;
@@ -495,6 +508,117 @@ fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !
         }
     }
     return try out.toOwnedSlice(arena);
+}
+
+/// A `facts.toml` fact bound on this machine whose name is not a discovered
+/// dimension (which already covers value-compared, presence, captured, and
+/// scripts-`needs`-registered alike -- every consuming channel produces a
+/// dimension), not a `data/facts.toml`-derived name, and not a built-in:
+/// nothing in the repo consumes it. Advisory, never a failure -- deleting or
+/// renaming a fact that used to matter is the user's call. When the unused
+/// name is a probable rename of some still-unbound dimension (edit distance
+/// <= 2, both names at least `min_bridge_len` bytes so a short name cannot
+/// spuriously match half the alphabet), the advisory names the migration
+/// command directly. Null means the check could not run (machine state or
+/// discovery failed); sorted by the unused fact's own name for a stable
+/// report.
+fn staleFacts(arena: std.mem.Allocator, io: Io, context: app.Context) !?[]const []const u8 {
+    var facts_diag: mox.machine.facts.Diag = .{};
+    const bound = mox.machine.facts.load(arena, io, context.paths.facts_path, &facts_diag) catch return null;
+    const discovery = mox.machine.dimensions.discover(arena, io, context.paths.repo_dir) catch return null;
+    if (discovery.tree_error != null) return null;
+    const derived_names = mox.machine.derived_facts.declaredNames(arena, io, context.paths.repo_dir, context.paths.private_dir) catch return null;
+
+    // Every dimension this machine has not answered at all -- a decline
+    // (bound empty) already consumed its question, so it is never offered as
+    // a rename target.
+    var unbound: std.ArrayList([]const u8) = .empty;
+    for (discovery.dimensions) |dim| {
+        if (findFactValue(bound.facts, dim.name) == null) try unbound.append(arena, dim.name);
+    }
+    std.mem.sort([]const u8, unbound.items, {}, lessString);
+
+    var stale: std.ArrayList([]const u8) = .empty;
+    for (bound.facts) |f| {
+        if (isDimensionName(discovery.dimensions, f.name)) continue;
+        if (containsStr(derived_names, f.name)) continue;
+        if (mox.machine.state.isBuiltinField(f.name)) continue;
+        if (try closestRename(arena, unbound.items, f.name)) |renamed| {
+            try stale.append(arena, try std.fmt.allocPrint(
+                arena,
+                "unused-fact {s} (bound but unused; unbound \"{s}\" -- renamed? mox facts set {s} <value>)",
+                .{ f.name, renamed, renamed },
+            ));
+        } else {
+            try stale.append(arena, try std.fmt.allocPrint(
+                arena,
+                "unused-fact {s} (bound but unused by this repo)",
+                .{f.name},
+            ));
+        }
+    }
+    std.mem.sort([]const u8, stale.items, {}, lessString);
+    return try stale.toOwnedSlice(arena);
+}
+
+fn findFactValue(facts: []const mox.machine.state.Fact, name: []const u8) ?[]const u8 {
+    for (facts) |f| if (std.mem.eql(u8, f.name, name)) return f.value;
+    return null;
+}
+
+fn isDimensionName(dims: []const mox.machine.dimensions.Dimension, name: []const u8) bool {
+    for (dims) |d| if (std.mem.eql(u8, d.name, name)) return true;
+    return false;
+}
+
+fn containsStr(list: []const []const u8, s: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, s)) return true;
+    return false;
+}
+
+/// Shortest edit distance (Levenshtein) below which two names are treated as
+/// a probable rename, rather than an accidental partial match: guards a
+/// three-or-fewer-byte name (already rare after the built-in/derived
+/// exclusions above) from bridging to nearly anything.
+const min_bridge_len = 4;
+const max_bridge_distance = 2;
+
+/// The closest still-unbound dimension name within `max_bridge_distance` of
+/// `name`, or null when none qualifies. `unbound` is assumed sorted, so a tie
+/// on distance resolves to the alphabetically first candidate.
+fn closestRename(arena: std.mem.Allocator, unbound: []const []const u8, name: []const u8) !?[]const u8 {
+    if (name.len < min_bridge_len) return null;
+    var best: ?[]const u8 = null;
+    var best_dist: usize = max_bridge_distance + 1;
+    for (unbound) |cand| {
+        if (cand.len < min_bridge_len) continue;
+        const d = try editDistance(arena, name, cand);
+        if (d <= max_bridge_distance and d < best_dist) {
+            best = cand;
+            best_dist = d;
+        }
+    }
+    return best;
+}
+
+/// Levenshtein distance between `a` and `b`: single-row DP, O(a.len * b.len)
+/// time, O(b.len) space.
+fn editDistance(arena: std.mem.Allocator, a: []const u8, b: []const u8) !usize {
+    var row = try arena.alloc(usize, b.len + 1);
+    for (row, 0..) |*cell, j| cell.* = j;
+    for (a, 0..) |ac, i| {
+        var prev_diag = row[0];
+        row[0] = i + 1;
+        for (b, 0..) |bc, j| {
+            const prev_above = row[j + 1];
+            row[j + 1] = if (ac == bc)
+                prev_diag
+            else
+                1 + @min(prev_diag, @min(prev_above, row[j]));
+            prev_diag = prev_above;
+        }
+    }
+    return row[b.len];
 }
 
 /// Whether every axis the file references is a compared axis (one `enumerate`

@@ -21,6 +21,49 @@ pub const AxisExpr = union(enum) {
     or_: struct { left: *const AxisExpr, right: *const AxisExpr },
 };
 
+/// Render `expr` back to its DSL surface syntax (`profile=work`, `not
+/// tool=fd`, `a=1 and b=2`, `(a=1 or b=2) and c=3`), parenthesizing only
+/// where precedence would otherwise change the reading -- `not` binds
+/// tighter than `and`, which binds tighter than `or`. For showing a
+/// condition to a human (a facts report, a diagnostic), never for parsing.
+pub fn writeExpr(out: *std.Io.Writer, expr: *const AxisExpr) !void {
+    try writeExprAt(out, expr, 0);
+}
+
+fn exprPrecedence(expr: *const AxisExpr) u8 {
+    return switch (expr.*) {
+        .eq, .present => 3,
+        .not => 2,
+        .and_ => 1,
+        .or_ => 0,
+    };
+}
+
+fn writeExprAt(out: *std.Io.Writer, expr: *const AxisExpr, min_prec: u8) !void {
+    const prec = exprPrecedence(expr);
+    const needs_parens = prec < min_prec;
+    if (needs_parens) try out.writeAll("(");
+    switch (expr.*) {
+        .eq => |e| try out.print("{s}={s}", .{ e.axis, e.value }),
+        .present => |n| try out.writeAll(n),
+        .not => |inner| {
+            try out.writeAll("not ");
+            try writeExprAt(out, inner, 2);
+        },
+        .and_ => |a| {
+            try writeExprAt(out, a.left, 1);
+            try out.writeAll(" and ");
+            try writeExprAt(out, a.right, 1);
+        },
+        .or_ => |o| {
+            try writeExprAt(out, o.left, 0);
+            try out.writeAll(" or ");
+            try writeExprAt(out, o.right, 0);
+        },
+    }
+    if (needs_parens) try out.writeAll(")");
+}
+
 /// Row predicate used by for-loop `where` clauses. Evaluated per record;
 /// rows for which the predicate evaluates false are skipped during emit.
 ///
@@ -182,4 +225,69 @@ test "AST Directive type can be constructed" {
         .end_line = 1,
     };
     try std.testing.expectEqual(@as(u32, 1), dir.start_line);
+}
+
+fn writeExprToString(a: std.mem.Allocator, expr: *const AxisExpr) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try writeExpr(&aw.writer, expr);
+    return a.dupe(u8, aw.written());
+}
+
+test "writeExpr: eq and present render as their literal syntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const eq: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    try std.testing.expectEqualStrings("profile=work", try writeExprToString(a, &eq));
+
+    const present: AxisExpr = .{ .present = "signing_key" };
+    try std.testing.expectEqualStrings("signing_key", try writeExprToString(a, &present));
+}
+
+test "writeExpr: not binds tighter than and/or, no parens needed around a leaf" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const eq: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const not_expr: AxisExpr = .{ .not = &eq };
+    try std.testing.expectEqualStrings("not profile=work", try writeExprToString(a, &not_expr));
+}
+
+test "writeExpr: and of two comparisons, no parens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const left: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const right: AxisExpr = .{ .present = "signing_work_key" };
+    const and_expr: AxisExpr = .{ .and_ = .{ .left = &left, .right = &right } };
+    try std.testing.expectEqualStrings("profile=work and signing_work_key", try writeExprToString(a, &and_expr));
+}
+
+test "writeExpr: an or nested inside an and is parenthesized, precedence preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const left1: AxisExpr = .{ .eq = .{ .axis = "os", .value = "darwin" } };
+    const left2: AxisExpr = .{ .eq = .{ .axis = "os", .value = "linux" } };
+    const or_expr: AxisExpr = .{ .or_ = .{ .left = &left1, .right = &left2 } };
+    const right: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const and_expr: AxisExpr = .{ .and_ = .{ .left = &or_expr, .right = &right } };
+    try std.testing.expectEqualStrings("(os=darwin or os=linux) and profile=work", try writeExprToString(a, &and_expr));
+}
+
+test "writeExpr: not wrapping an and is parenthesized" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const left: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const right: AxisExpr = .{ .present = "signing_work_key" };
+    const and_expr: AxisExpr = .{ .and_ = .{ .left = &left, .right = &right } };
+    const not_expr: AxisExpr = .{ .not = &and_expr };
+    try std.testing.expectEqualStrings("not (profile=work and signing_work_key)", try writeExprToString(a, &not_expr));
 }

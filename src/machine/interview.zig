@@ -197,14 +197,8 @@ fn confirmKeepAnyway(
 }
 
 fn printProvenance(out: *Io.Writer, dim: dimensions.Dimension) !void {
-    try out.print("  ({d} source{s}", .{
-        dim.provenance.source_count,
-        if (dim.provenance.source_count == 1) "" else "s",
-    });
-    if (dim.provenance.needing_scripts.len > 0) {
-        try out.writeAll(", needs:");
-        for (dim.provenance.needing_scripts) |s| try out.print(" {s}", .{s});
-    }
+    try out.writeAll("  (");
+    try dimensions.writeProvenance(out, dim.provenance);
     try out.writeAll(")\n");
 }
 

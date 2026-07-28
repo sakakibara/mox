@@ -232,7 +232,33 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
     }
     try printProbeLog(ctx, m_state);
+    try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
     return if (problems > 0) 1 else 0;
+}
+
+/// This run's `unbound facts:` section: every discovered dimension that is
+/// still unbound and currently askable, with a compact provenance, sorted --
+/// its own section (not folded into the probe log above), printed only when
+/// non-empty. A structural discovery error is not this command's to report:
+/// `walkDiag` above already caught and refused on one before this point, so
+/// by the time this runs the tree is known to parse.
+fn printUnboundFacts(ctx: *app.Ctx, repo_dir: []const u8, bindings: *const mox.dsl.resolver.Resolver) !void {
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, repo_dir);
+    const outcome = try mox.machine.interview.walkDimensions(ctx.alloc, discovery.dimensions, bindings, .report_only);
+    if (outcome.unbound.len == 0) return;
+
+    try ctx.out.writeAll("\nunbound facts:\n");
+    for (outcome.unbound) |name| {
+        const dim = findDimByName(discovery.dimensions, name) orelse continue;
+        try ctx.out.print("  {s} (", .{name});
+        try mox.machine.dimensions.writeProvenance(ctx.out, dim.provenance);
+        try ctx.out.writeAll(")\n");
+    }
+}
+
+fn findDimByName(dims: []const mox.machine.dimensions.Dimension, name: []const u8) ?mox.machine.dimensions.Dimension {
+    for (dims) |d| if (std.mem.eql(u8, d.name, name)) return d;
+    return null;
 }
 
 /// This run's open-axis probe log: after every file has composed, name

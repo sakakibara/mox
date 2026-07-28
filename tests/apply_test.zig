@@ -1506,6 +1506,144 @@ test "mox facts: bare output stays 'name = \"value\"' lines, byte-identical, wit
     try std.testing.expectEqualStrings("alpha = \"1\"\nbeta = \"2\"\n", r.out);
 }
 
+test "mox facts --report: bound/declined/UNBOUND states, provenance, and a conditioned dimension's asking-condition" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile=work\nx = 1\n# mox: end\n" ++
+            "# mox: when holt_backend=gdrive\naccount = <machine.gdrive_account>\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "profile", "work" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "gdrive_account", "" })).rc);
+
+    const r = try c.run(&.{ "mox", "facts", "--report" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Sorted by name (gdrive_account, holt_backend, profile), one line each:
+    // bound with its value, declined naming its bound-empty state, and an
+    // unbound dimension with no value at all.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "gdrive_account: declined (bound empty) (1 source) -- asked when holt_backend=gdrive\n" ++
+            "holt_backend: UNBOUND (1 source)\n" ++
+            "profile: bound \"work\" (1 source)\n",
+    ) != null);
+    // Never the bare mode's machine-readable lines.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "= \"") == null);
+}
+
+test "mox facts ask: refuses on a non-terminal, both bare and named" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when signing_key\nx = 1\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+
+    const bare = try c.run(&.{ "mox", "facts", "ask" });
+    try std.testing.expectEqual(@as(u8, 1), bare.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bare.err, "not a terminal") != null);
+
+    const named = try c.run(&.{ "mox", "facts", "ask", "signing_key" });
+    try std.testing.expectEqual(@as(u8, 1), named.rc);
+    try std.testing.expect(std.mem.indexOf(u8, named.err, "not a terminal") != null);
+}
+
+test "mox facts ask <name>: refuses when the name is not a fact this repo's sources consume" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    const c = try cliSetup(a, io, &tmp);
+
+    // Scripted stdin (even unconsumed) passes the interactive gate so the
+    // unknown-name refusal itself is reached and tested in isolation.
+    const r = try c.runWithInput(&.{ "mox", "facts", "ask", "not_a_thing" }, "\n");
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not_a_thing") != null);
+}
+
+test "mox facts ask <name>: re-interviews an already-bound fact, full provenance UX, persists the new answer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when signing_key\nx = 1\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "signing_key", "old-value" })).rc);
+
+    const r = try c.runWithInput(&.{ "mox", "facts", "ask", "signing_key" }, "new-value\n");
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "(1 source)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "signing_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "signing_key = \"new-value\"\n") != null);
+
+    const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "signing_key = \"new-value\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "old-value") == null);
+}
+
+test "mox facts ask: bare re-asks unbound and declined dimensions, never an already-bound non-empty one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when alpha_key\nx = 1\n# mox: end\n" ++
+            "# mox: when beta_key\ny = 1\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    // alpha_key was previously declined (bound empty); beta_key is bound to a
+    // real value and must stay untouched.
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.config/mox/facts.toml",
+        .data = "alpha_key = \"\"\nbeta_key = \"realval\"\n",
+    });
+
+    const r = try c.runWithInput(&.{ "mox", "facts", "ask" }, "newalpha\n");
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "alpha_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "beta_key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "alpha_key = \"newalpha\"\n") != null);
+
+    const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "alpha_key = \"newalpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts, "beta_key = \"realval\"") != null);
+}
+
 test "apply: a resolved secret value is never persisted anywhere in the state dir" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
