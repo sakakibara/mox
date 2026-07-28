@@ -134,6 +134,28 @@ test "walk: an overlay filename naming path= is refused as a reserved axis name,
     try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, "path=brew") != null);
 }
 
+test "walk: a malformed overlay tuple is InvalidEntry, diag names the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n");
+    // Empty axis value: `parseFilename` rejects it with `InvalidAxisValue`,
+    // which the walk folds into the generic `InvalidEntry`.
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/os=.toml", "[gpg]\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var diag: mox.source.tree.Diag = .{};
+    const result = mox.source.tree.walkDiag(arena.allocator(), io, src_dir, "/home/me", &diag);
+    try std.testing.expectError(error.InvalidEntry, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, "os=.toml") != null);
+}
+
 test "walk: finds managed file with category-B regions" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

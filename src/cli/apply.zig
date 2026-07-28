@@ -50,12 +50,12 @@ fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, privat
 
 /// Walk the source tree, reporting a structural failure (a malformed
 /// ownership declaration, an invalid `.mox/attributes.toml` entry, a
-/// reserved axis name, ...) with the offending file rather than a bare error
-/// name. Shared by the up-front `discovery.tree_error` check (before the
-/// interview or any script has run) and the compose pass's own walk, so
-/// both report the same failure the same way. Null return means the caller
-/// already reported and should fail the run; any other error still
-/// propagates.
+/// reserved or malformed overlay axis tuple, ...) with the offending file
+/// rather than a bare error name. Shared by the up-front
+/// `discovery.tree_error` check (before the interview or any script has run)
+/// and the compose pass's own walk, so both report the same failure the same
+/// way. Null return means the caller already reported and should fail the
+/// run; any other error still propagates.
 fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.source.tree.ManagedTree {
     var walk_diag: mox.source.tree.Diag = .{};
     return mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, home, &walk_diag) catch |e| switch (e) {
@@ -88,6 +88,12 @@ fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.
         },
         error.ReservedAxisName => {
             try ctx.err.print("mox apply: overlay filename: {s}: \"path\" is a reserved axis name; the path= axis no longer exists\n", .{
+                walk_diag.capture() orelse "?",
+            });
+            return null;
+        },
+        error.InvalidEntry => {
+            try ctx.err.print("mox apply: overlay filename: {s}: malformed axis tuple\n", .{
                 walk_diag.capture() orelse "?",
             });
             return null;

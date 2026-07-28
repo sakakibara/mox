@@ -754,12 +754,16 @@ fn enumerateDotD(
                 error.OutOfMemory => return error.OutOfMemory,
                 // Kept distinct from the generic `InvalidEntry` below: a
                 // caller reports the reserved axis name the same way the
-                // directive grammar does, instead of a bare verdict.
+                // directive grammar does, instead of a generic "malformed"
+                // verdict. Both name the offending file via `diag`.
                 error.ReservedAxisName => {
                     if (diag) |d| d.set(abs);
                     return error.ReservedAxisName;
                 },
-                else => return error.InvalidEntry,
+                else => {
+                    if (diag) |d| d.set(abs);
+                    return error.InvalidEntry;
+                },
             };
             // A value may itself contain a dot the extension heuristic strips
             // (a `hostname` value is the full dotted name, and every macOS

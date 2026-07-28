@@ -1451,6 +1451,27 @@ test "apply: a structurally invalid source tree fails before scripts/pre ever ru
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, sentinel, .{}));
 }
 
+test "apply: a malformed overlay tuple names the offending file on stderr" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The same malformed-tuple fixture as the ordering test above: an axis
+    // value the grammar rejects (empty).
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig", .data = "[user]\n" });
+    try tmp.dir.createDirPath(io, "repo/src/.gitconfig.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig.d/os=.toml", .data = "[gpg]\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "os=.toml") != null);
+}
+
 test "apply: scripts/pre still runs before the compose walk on a healthy tree" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
