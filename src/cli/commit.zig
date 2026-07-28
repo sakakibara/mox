@@ -3432,11 +3432,11 @@ fn classifyChoice(
         return .unroutable;
     }
 
-    const marker = markerFor(file.source_base_path) orelse {
+    const base_content = try Io.Dir.cwd().readFileAlloc(cc.io, edit.path, cc.arena, .limited(max_file_bytes));
+    const marker = mox.dsl.comment.markerForFile(file.source_base_path, base_content) orelse {
         try cc.stdout.print("  {s}: unknown comment marker; cannot synthesize a region; left uncommitted\n", .{desc});
         return .unroutable;
     };
-    const base_content = try Io.Dir.cwd().readFileAlloc(cc.io, edit.path, cc.arena, .limited(max_file_bytes));
     // A machine-local narrowing gates on this machine's own `machine`-axis
     // value (the hostname's first label), which Candidate no longer carries
     // (there is no machine axis to name).
@@ -3493,25 +3493,6 @@ fn configsMatchingAxis(arena: std.mem.Allocator, configs: []const Configuration,
         if (std.mem.eql(u8, v, value)) try labels.append(arena, cfg.label);
     }
     return labels.toOwnedSlice(arena);
-}
-
-/// Comment marker for a source path, or null when the dialect is unknown.
-fn markerFor(path: []const u8) ?[]const u8 {
-    return mox.dsl.comment.markerForExtension(identForMarker(path));
-}
-
-/// Identifier for `comment.markerForExtension`: a dotfile with no further dot
-/// (`.zshrc`) or an un-dotted basename (`Dockerfile`) is itself; otherwise the
-/// trailing extension (`.lua`).
-fn identForMarker(path: []const u8) []const u8 {
-    const basename = std.fs.path.basename(path);
-    if (basename.len == 0) return basename;
-    if (basename[0] == '.') {
-        const rest = basename[1..];
-        if (std.mem.indexOfScalar(u8, rest, '.') == null) return basename;
-    }
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
-    return basename[dot..];
 }
 
 /// Run impact analysis for one line edit: snapshot every configuration's

@@ -195,20 +195,6 @@ fn addRowExpr(ax: *Axes, expr: *const dsl.ast.RowExpr) !void {
     }
 }
 
-/// Identifier for `comment.markerForExtension`: a dotfile with no further dot
-/// (`.zshrc`) or an un-dotted basename (`Dockerfile`) is itself; otherwise the
-/// trailing extension (`.lua`).
-fn identForMarker(path: []const u8) []const u8 {
-    const basename = std.fs.path.basename(path);
-    if (basename.len == 0) return basename;
-    if (basename[0] == '.') {
-        const rest = basename[1..];
-        if (std.mem.indexOfScalar(u8, rest, '.') == null) return basename;
-    }
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
-    return basename[dot..];
-}
-
 /// Scan one managed file's overlays, regions, and (if it has a base) directive
 /// axis expressions.
 fn scanFile(ax: *Axes, arena: std.mem.Allocator, io: Io, file: source.tree.ManagedFile) !void {
@@ -219,7 +205,7 @@ fn scanFile(ax: *Axes, arena: std.mem.Allocator, io: Io, file: source.tree.Manag
     }
     if (file.has_base and file.source_base_abs.len > 0) {
         const raw = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_bytes)) catch return;
-        const marker = dsl.comment.markerForExtension(identForMarker(file.source_base_path)) orelse return;
+        const marker = dsl.comment.markerForFile(file.source_base_path, raw) orelse return;
         // A head declaration (`own`/`disown`/`check`) is not DSL syntax --
         // the walk and real compose both strip it before parsing (`compose.
         // catA.readBaseHead`) -- so it must be stripped here too, or a file
@@ -432,6 +418,27 @@ test "ofTree: multi-value axis records the literal value" {
     try std.testing.expect(ax.referencesName("tool"));
     try std.testing.expect(ax.referencesValue("tool=starship"));
     try std.testing.expect(!ax.referencesValue("tool=fd"));
+}
+
+test "ofFile: a markerless-extension base with an apparent `# mox:` directive resolves via the shebang/apparent-directive fallback" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No dot anywhere in the basename, so `markerForExtension` has no entry
+    // and there is no shebang either -- only the apparent `# mox:` line
+    // signals the marker.
+    try writeFile(io, tmp.dir, "src/allowed_signers", "user namespaces=\"git\"\n# mox: when profile=work\nx = 1\n# mox: end\n");
+
+    const src_dir = try srcPathAlloc(a, &tmp);
+    const tree = try source.tree.walk(a, io, src_dir, "/home/me");
+    const ax = try ofFile(a, io, tree.files[0]);
+
+    try std.testing.expect(ax.comparesValueOf("profile"));
+    try std.testing.expectEqualStrings("work", ax.valuesFor("profile")[0].value);
 }
 
 fn writeFile(io: Io, dir: Io.Dir, sub: []const u8, content: []const u8) !void {

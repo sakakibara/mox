@@ -1278,6 +1278,79 @@ test "commit: narrowing a shebang line is refused, leaving the script and its wh
     try std.testing.expectEqualSlices(u8, &before, &after);
 }
 
+test "commit: narrowing a shared base line synthesizes a region on a shebang-bearing, extensionless base" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No dot anywhere in the basename, so `markerForExtension` has no entry --
+    // only the shebang signals the comment marker. Mirrors
+    // `writeSharedBaseFixture` (a shared line above two `os`-gated branches),
+    // which proves the "os" axis and its values come from the directive scan
+    // itself, not a pre-existing `.d/` overlay.
+    try writeRepo(io, &tmp, "repo/src/myscript", "#!/bin/sh\n" ++
+        "echo SHELL_OK=1\n" ++
+        "echo EDITOR=vim\n" ++
+        "# mox: when os=darwin\n" ++
+        "echo BREW=1\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "echo APT=1\n" ++
+        "# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("myscript");
+    try editLive(io, a, live, "echo EDITOR=vim", "echo EDITOR=nvim");
+
+    // Choice 2 is the os axis candidate for this machine's own os (darwin).
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "2\n");
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[2] os=darwin") != null);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    const src = try read(io, a, try h.srcOf("myscript"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "# mox: replace from \"os\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "echo EDITOR=vim\n") != null);
+    try std.testing.expectEqualStrings("echo EDITOR=nvim\n", try read(io, a, try h.srcOf("myscript.d/os/darwin")));
+}
+
+test "commit: a narrowing on a base with no extension, shebang, or apparent directive is still refused for an unknown marker" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No extension, no shebang, and no apparent `# mox:` line anywhere in the
+    // base -- every resolution path `markerForFile` tries comes up empty, so
+    // the refusal must still fire. The "os" axis is established the same way
+    // as the success case above, via a sibling region fragment.
+    try writeRepo(io, &tmp, "repo/src/plainconfig", "greeting: hello\n" ++
+        "farewell: bye\n");
+    try writeRepo(io, &tmp, "repo/src/plainconfig.d/os/windows", "greeting: hi\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
+    const before = try treeDigest(io, a, src_dir);
+
+    const live = try h.liveOf("plainconfig");
+    try editLive(io, a, live, "greeting: hello", "greeting: hi there");
+
+    const res = try h.runWithInput(&.{ "mox", "commit" }, "2\n");
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[2] os=darwin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "unknown comment marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "left uncommitted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed") != null);
+
+    const after = try treeDigest(io, a, src_dir);
+    try std.testing.expectEqualSlices(u8, &before, &after);
+}
+
 /// Two non-adjacent shared base lines (`export EDITOR`, `export PAGER`) in a
 /// file whose own directives gate on `os`: editing both live lines yields TWO
 /// hunks routed to the SAME base file, each independently classifiable.
