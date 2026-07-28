@@ -14,7 +14,10 @@ Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>`
 clones an existing dotfiles repo into the repo dir; by default it stops
 for you to review -- a cloned repo's files and scripts are untrusted
 until you look at them -- and `--apply` applies right away for a
-one-command bootstrap. Refuses a non-empty repo dir.
+one-command bootstrap. Refuses a non-empty repo dir. `--apply`'s facts
+interview is the ordinary interactive one; for a non-interactive
+bootstrap, follow it with `mox apply --defaults` (see [apply](#apply)) to
+bind declared defaults and decline the rest instead of prompting.
 
 `--clone` accepts shorthand alongside full URLs:
 
@@ -83,8 +86,20 @@ live remainder is not mox's to delete).
 ## apply
 
 Compose all managed files and write them to their live paths
-(`--dry-run`, `--force`, `--skip-scripts`, or a list of paths to limit
-the run).
+(`--dry-run`, `--force`, `--skip-scripts`, `--defaults`, or a list of
+paths to limit the run).
+
+Before composing, apply discovers the repo's fact interview (below) and
+walks it: on a terminal (or scripted stdin) it prompts for every
+eligible unbound fact and persists the answers, then re-captures so the
+run composes against them. `--defaults` never prompts: every eligible
+fact binds its declared default when it has one, and is declined (bound
+to the empty string) otherwise -- the non-interactive, zero-touch form.
+Off a terminal without `--defaults` (scripts, CI), and under
+`--dry-run`, nothing is asked or persisted; a stderr notice lists the
+facts left unbound (`unbound facts: <names>`) and how to resolve them.
+There is no global refusal for an unresolved fact -- that is a
+per-script concern (below), not this pass's to fail wholesale.
 
 A live file edited since mox last wrote it is never overwritten
 silently. On a terminal each one asks `[o]verwrite` (discard the live
@@ -93,7 +108,9 @@ verified like any other commit), `[d]iff`, `[s]kip`, or `[O]`/`[S]` to
 answer the rest the same way -- so two drifted files wanting opposite
 outcomes are resolved in one run. Off a terminal, or with `--dry-run`,
 drifted files are skipped and reported and the run exits 1; `--force`
-overwrites them all without asking.
+overwrites them all without asking. Interactive drift resolution and the
+facts interview share one buffered stdin reader, so piped input can
+script both in a single run.
 
 A partially owned file (an `own` or `disown` head declaration) is
 patched around the other side's content: the owned content is written,
@@ -101,6 +118,17 @@ every protected byte is preserved exactly, drift is judged on the owned
 content only, and its `check` hook (if any) must accept the candidate
 first. Under `--skip-scripts` the hook does not run and a check-bearing
 file is not written.
+
+Every `scripts/pre/`/`scripts/post/` script lands in one of six outcomes,
+summarized on the closing line (`scripts: N ran, N skipped, N failed, N
+blocked, N declined`): `ran` (exit 0); `skipped` (its directory tuple or
+`# mox: when` gate did not match); `declined` (every fact it needs is
+bound but empty -- green, does not fail the run); `blocked` (a needed
+fact could not be resolved -- see Scripts in
+[dsl.md](dsl.md#scripts); counts into the failing exit like `failed`,
+under its own label); `failed` (nonzero exit or abnormal termination);
+timed out (also counted under `failed`). `--skip-scripts` skips scripts
+and their fact checks entirely.
 
 ## commit
 
@@ -162,10 +190,13 @@ candidate path when the source does not exist.
 
 Show each managed file's state: `clean`, `OUTDATED`, `DRIFT`,
 `MISSING`, `GATED`, `ERROR`, plus this run's probe log (every
-`tool=`/`env=` name asked and whether it resolved). A partially owned
-file is classified on its owned content only, so the program's writes
-on the other side never surface. Exits 1 if any file is `OUTDATED`,
-`DRIFT`, `MISSING`, or `ERROR`.
+`tool=`/`env=` name asked and whether it resolved) and, when non-empty,
+an `unbound facts:` section listing every discovered fact still
+eligible and unbound, each with its provenance -- its own section, not
+folded into the probe log. A partially owned file is classified on its
+owned content only, so the program's writes on the other side never
+surface. Exits 1 if any file is `OUTDATED`, `DRIFT`, `MISSING`, or
+`ERROR`.
 
 ## export
 
@@ -178,10 +209,28 @@ guarantee and CI parity input.
 
 ## facts
 
-List facts; interview for missing ones. `facts set <name> <value>`
-writes one; `facts probe tool=<name>` / `facts probe env=<name>`
-resolves a single live probe scriptably (exit 0 present, 1 absent,
-2 error).
+List facts (`name = "value"` lines, a machine-readable format kept
+byte-frozen for other tooling to parse); interview for any discovered
+fact still unanswered. Refuses loudly (rather than reporting an empty
+config space) when the source tree cannot be scanned. `--report` replaces
+the listing with every discovered fact's state -- `bound "<value>"`,
+`declined (bound empty)`, or `UNBOUND`, each with its provenance (source
+count, needing scripts) and, when conditioned, the expression it is
+asked under.
+
+`facts set <name> <value>` writes one directly; an empty value is the
+scriptable decline (`mox facts set <name> ""`), identical to pressing
+Enter at an unanswered prompt with no default.
+
+`facts ask [<name>]` re-runs the interview interactively (refuses off a
+terminal -- there is no non-interactive form of "ask again"). With
+`<name>`, that fact alone, even if already bound: the change-an-answer
+flow, with its full choice list, default, and provenance. Bare, every
+fact currently unbound or declined whose condition holds -- wider than
+the standard interview, which never revisits a decline.
+
+`facts probe tool=<name>` / `facts probe env=<name>` resolves a single
+live probe scriptably (exit 0 present, 1 absent, 2 error), unchanged.
 
 ## data get
 
@@ -193,13 +242,22 @@ private layer shadows the repo.
 Health report: source files not tracked by git, source modes git
 cannot carry that are not yet in `.mox/attributes.toml` (lost on
 clone), sources that compose to nothing under every configuration (a
-contradictory or mistyped whole-file gate), and malformed state
-(provenance). `--rebuild-provenance` recomposes and re-records every
-tracked file's provenance (partial targets keep no line provenance and
-are skipped); `--rebuild-coupling` rescans source tokens and rewrites
-the stored coupling graph under `<state>/coupling/`; `--fix` performs
-the safe rebuilds. Mutating runs take the lock; exits 1 while problems
-remain.
+contradictory or mistyped whole-file gate), malformed state
+(provenance), and a `facts.toml` fact bound on this machine that
+nothing in the repo consumes (`unused-fact <name> (bound but unused by
+this repo)`) -- advisory, since deleting or renaming a fact the repo no
+longer reads is the user's call. When the unused name is a probable
+rename of some still-unbound fact (a short edit distance), the advisory
+bridges the two and names the migration directly:
+`unused-fact persona (bound but unused; unbound "profile" -- renamed?
+mox facts set profile <value>)`. A leftover `data/facts-schema.toml`
+gets its own one-line notice: it is no longer read (the interview
+derives from the repo's own sources), delete it. `--rebuild-provenance`
+recomposes and re-records every tracked file's provenance (partial
+targets keep no line provenance and are skipped); `--rebuild-coupling`
+rescans source tokens and rewrites the stored coupling graph under
+`<state>/coupling/`; `--fix` performs the safe rebuilds. Mutating runs
+take the lock; exits 1 while problems remain.
 
 ## snapshot / rollback
 

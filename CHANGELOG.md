@@ -4,6 +4,64 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-28
+
+### Added
+- The config-space interview: `mox apply` (and `mox facts`) now discover
+  which facts to ask about directly from a repo's own sources instead of a
+  hand-maintained schema file -- every fact a gate compares by value, a
+  capture interpolates, a bare presence test names, or a script consumes,
+  each asked only when the configuration it gates is reachable given the
+  answers bound so far in the same run (a personal machine is never asked a
+  work-only or backend-only question). A `# mox: default <name>="<value>"`
+  line directive declares a fact's interview default in the source that
+  owns the concern; it is an interview default only, never a silent
+  fallback for an unbound fact. `mox apply --defaults` never prompts:
+  every eligible fact binds its declared default, or is declined (bound to
+  the empty string), for a non-interactive bootstrap. `mox facts --report`
+  lists every discovered fact's state (bound, declined, or unbound) with
+  its provenance; `mox facts ask [<name>]` re-interviews one fact (even if
+  already bound, the change-an-answer flow) or every unbound/declined one;
+  `mox status` gains an `unbound facts:` section; `mox doctor` flags a
+  bound fact nothing in the repo consumes, bridging it to a probable
+  rename when one is close.
+- Script fact contracts: a setup script's use of `MOX_FACT_*` is now a
+  checkable contract, resolved from a literal `MOX_FACT_[A-Z0-9_]+` token
+  scan of the script's text, or overridden with a `# mox: needs
+  <name>...` head line (an empty line declares "needs nothing"). Each
+  needed fact is checked against the stage's actual projected
+  environment and lands in one of six outcomes: runs, skips (gate
+  false), skips declined (green, the needed fact was bound but
+  explicitly empty), or blocks (red, counted like a failed script under
+  its own summary label) -- naming the fact and its remediation, and
+  failing closed on a token that maps to no known fact.
+
+### Changed
+- A non-interactive `mox apply` (no terminal, no `--defaults`) no longer
+  refuses the run when a fact is unbound: it lists the unbound facts on
+  stderr and proceeds, and a script that actually needs one of them is
+  blocked individually instead. **Breaking** for a script or CI job that
+  relied on the previous global refusal to catch a missing fact early --
+  it now needs its own `# mox: needs` contract (or a consuming gate) to
+  be blocked the same way.
+- The schema's gated-only interview defaults are replaced by the
+  `# mox: default` directive, declared in-source: a gate-only fact no
+  longer gets an implicit default from where it happens to be compared.
+- The DSL's reserved words now include `default`.
+- `mox facts` now refuses loudly, instead of reporting an empty config
+  space, when the source tree cannot be scanned for its interview.
+
+### Removed
+- `data/facts-schema.toml` support is gone: the hand-maintained schema
+  file is no longer read, superseded by the sources-derived interview
+  above. A repo that still has one gets a one-time notice from `mox
+  apply` and `mox doctor` naming the file and saying to delete it.
+
+### Fixed
+- A post-stage setup script now sees the current, post-recapture fact
+  environment: previously it could read the pre-stage env even after a
+  pre-stage script persisted a new fact.
+
 ## [0.6.0] - 2026-07-28
 
 ### Added

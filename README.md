@@ -46,6 +46,9 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/instal
 `owner/repo`, `host/owner/repo`, full URLs, ssh remotes, and local paths
 all work too. The powershell form takes the same arguments directly, no
 `--`: `& ([scriptblock]::Create((irm .../install.ps1))) init --clone <you> --apply`.
+For a non-interactive machine, follow with `mox apply --defaults`: it binds
+every unanswered fact to its declared default and declines the rest,
+instead of prompting.
 
 `MOX_VERSION` pins a release tag; `MOX_BASE_URL` points at a mirror. Update in
 place with `mox upgrade` (it verifies the download against `SHA256SUMS`).
@@ -114,11 +117,15 @@ the file's format:
 The rest of the model, briefly:
 
 - **Facts** -- interpolated per-machine values (`<machine.email>`), kept
-  in `$XDG_CONFIG_HOME/mox/facts.toml`, never in the repo. `mox apply`
-  interviews you once for any a reachable file needs. `data/facts.toml`
-  rows can *derive* facts (an env override, then candidate dirs), and
-  `tool=<name>` / `env=<name>` gates probe the machine live -- no
-  pre-registered vocabulary anywhere.
+  in `$XDG_CONFIG_HOME/mox/facts.toml`, never in the repo. There is no
+  schema file: `mox apply` discovers the questions to ask straight from
+  your sources -- every fact a gate compares by value, a capture
+  interpolates, or a script consumes -- and asks each only when the
+  configuration it applies to is actually reachable. `# mox: default
+  <name>="<value>"` declares a fact's interview default in the source
+  that owns the concern. `data/facts.toml` rows can *derive* facts (an
+  env override, then candidate dirs), and `tool=<name>` / `env=<name>`
+  gates probe the machine live -- no pre-registered vocabulary anywhere.
 - **Secrets** -- `# mox: secret "<uri>"` or a mid-line `<secret:URI>`
   resolves at apply time from `env:`, `file://`, `op://` (1Password),
   `pass://`, or `cmd:`. Cleartext reaches the live file only, never mox

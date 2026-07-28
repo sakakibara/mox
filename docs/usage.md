@@ -30,7 +30,16 @@ mox init          # creates the repo skeleton (src/, scripts/)
 
 Either way, `mox apply` interviews you once for any facts your files need (an
 email, a signing key) and writes them to `$XDG_CONFIG_HOME/mox/facts.toml` -- which
-stays on the machine, never in the repo.
+stays on the machine, never in the repo. There is no schema to maintain: apply
+scans the repo for what it actually asks -- a gate compared by value, a
+capture, a script's `MOX_FACT_*` use -- and asks only the questions a
+condition reachable on this machine's answers-so-far still leaves open, so a
+personal machine is never asked a work-only or backend-only question. On a
+machine with no one to answer -- CI, a scripted bootstrap -- `mox apply
+--defaults` never prompts: it binds each fact to its declared default (a
+capture's `| default`, or a source's own `# mox: default <name>="<value>"`)
+and declines everything else, a decline being a persisted empty value, not an
+error.
 
 ## Managing a file
 
@@ -167,6 +176,14 @@ Set it (or let `mox apply` prompt you):
 mox facts                       # list; interview for anything missing
 mox facts set email you@work.com
 ```
+
+Pressing Enter at a prompt with no default binds the empty string -- a
+decline, not a skip: mox never asks again, and every gate or capture on that
+fact reads it as unset. `mox facts set <name> ""` declines the same way from
+a script. To change an answer you already gave (or revisit a decline),
+`mox facts ask <name>` re-asks that one fact with its full choice list and
+default; `mox facts ask` with no name re-asks every fact still unbound or
+declined.
 
 Facts live in `$XDG_CONFIG_HOME/mox/facts.toml` on the machine only.
 

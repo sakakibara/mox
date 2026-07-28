@@ -262,10 +262,24 @@ one unnoticed.
 
 ## Fact and data model
 
-- **Facts** come from the machine interview (`data/facts-schema.toml`), the
-  machine-local `$XDG_CONFIG_HOME/mox/facts.toml`, `data/facts.toml`
-  (below), and auto-detected machine state (os, arch, tools on PATH, env
-  vars). They drive axis expressions and `<machine.*>` / `<env.*>` captures.
+- **Facts** are per-machine values kept in `$XDG_CONFIG_HOME/mox/facts.toml`,
+  plus auto-detected machine state (os, arch, tools on PATH, env vars) and
+  `data/facts.toml`-derived facts (below). They drive axis expressions and
+  `<machine.*>` / `<env.*>` captures. There is no schema file: `mox apply`
+  (and `mox facts`) discover which facts to ask about directly from the
+  repo's own sources -- every fact a gate compares by value, a capture
+  interpolates, a bare presence test names, or a script consumes (see
+  Scripts, below) -- and ask each only when the configuration it gates is
+  reachable given the answers bound so far in the same run, so a personal
+  machine is never asked a work-only or backend-only question. A
+  `# mox: default <name>="<value>"` line (above) declares a fact's interview
+  default in the source that owns the concern; it is an interview default
+  only -- an unbound fact never silently reads as it. Enter with no default
+  binds the empty string: a persisted decline, the same state as
+  legitimately empty, never re-asked. The full surface -- `mox facts`,
+  `facts ask`, `facts --report`, `status`'s `unbound facts:` section,
+  `doctor`'s stale-fact advisory, `apply --defaults` -- is in
+  [commands.md](commands.md).
 - **Data files** are `data/*.toml` (shared, repo-relative) or `<base>.d/*.toml`
   (per-file). Their arrays feed `for` loops; their top-level scalars feed
   `<data.FILE.KEY>` captures.
@@ -322,6 +336,55 @@ root), and every fact as `MOX_FACT_<UPPERCASE_NAME>` (a character outside
 `[A-Z0-9_]` in the fact name becomes `_`; a name that cannot be encoded
 distinctly -- non-ASCII, or a collision with another fact's sanitized form --
 is left out and warned about instead of silently colliding).
+
+### Fact contracts
+
+A script's consumption of `MOX_FACT_*` is a checkable contract, not just an
+environment variable it happens to read. mox resolves it one of two ways:
+
+- **Scanned**, by default: every literal `MOX_FACT_[A-Z0-9_]+` token found
+  anywhere in the script's text (CRLF-tolerant, same pattern for bash and
+  PowerShell -- `$MOX_FACT_X`, `${MOX_FACT_X}`, `%MOX_FACT_X%` all match).
+- **Declared**, with a `# mox: needs <name>...` head line (scanned the same
+  window as `# mox: when`, above -- both may appear, in either order). When
+  present it REPLACES the token scan entirely: an empty `# mox: needs` line
+  declares "needs nothing" and always runs, regardless of what tokens the
+  script's text contains. A name the line lists that names no fact yet known
+  anywhere else registers a new, free-form interview question (closing the
+  gap where a script's own fact had no other consumer to discover it from).
+  A `# mox: needs` line that fails to parse (a name outside the fact-name
+  charset) blocks the script outright -- its contract is unknowable, and the
+  token scan is not consulted as a fallback.
+
+Each needed fact (declared or scanned) is checked against THIS stage's
+actual projected environment, not an abstract name set -- so a projection
+collision (two names sanitizing to the same `MOX_FACT_*`, both dropped) or a
+name that maps to no fact at all is caught here, not assumed away. The
+script then lands in one of six outcomes, each its own printed line:
+
+| Outcome | Printed | When |
+| --- | --- | --- |
+| ran | `  ran <path>` (stdout) | exit 0; every needed fact bound non-empty |
+| skipped | `  skipped <path>` (stdout) | the directory tuple or `# mox: when` gate did not match |
+| declined | `  skipped (declined) <path>: <name>[, <name>...]` (stdout) | every needed fact is bound but empty -- green, does not fail the run |
+| blocked | `mox apply: <path>: blocked: <reason>` (stderr, one line per unresolved fact) | a needed fact could not be resolved -- fails the run under its own summary count, distinct from `failed` |
+| failed | `mox apply: <path>: exit <code>` (stderr) | nonzero exit |
+| failed | `mox apply: <path>: timed out after <ms>ms, killed` / `... terminated abnormally` (stderr) | killed after `MOX_SCRIPT_TIMEOUT_MS` (default 600000ms, `<= 0` disables), or exited abnormally |
+
+`<reason>` in the `blocked` line names the fact and the remediation: never
+bound but interviewable (`mox facts set <name> <value>`, or answer the
+interview); an unresolved derived fact (its `data/facts.toml` env override
+or candidate dirs); a built-in, which is never projected as `MOX_FACT_*`
+(gate the script instead); a name mox cannot bind or derive at all; a
+projection collision (names both colliding facts); or a scanned token
+matching no known fact (bind it, or declare the script's real contract with
+`# mox: needs`, which also silences a false-positive match inside comment
+text).
+
+`script_env` (and the contract it is checked against) is rebuilt after every
+re-capture -- including the one a pre-stage script triggers by persisting a
+fact -- so a post-stage script sees and is judged against exactly the
+fresh, current env, never the pre-stage's stale projection.
 
 Every setup script (both stages) also gets `MOX_PATH`, naming a
 writable file private to this run (deleted when the run ends). A script that
