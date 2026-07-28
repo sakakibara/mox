@@ -39,12 +39,27 @@ fn exprPrecedence(expr: *const AxisExpr) u8 {
     };
 }
 
+/// True when `value` needs no quoting to round-trip through the DSL's own
+/// value grammar (`lexer.isIdentStart`/`isIdentCont`): non-empty and every
+/// byte in `[A-Za-z0-9._+-]`.
+fn isBareTokenValue(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '+' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 fn writeExprAt(out: *std.Io.Writer, expr: *const AxisExpr, min_prec: u8) !void {
     const prec = exprPrecedence(expr);
     const needs_parens = prec < min_prec;
     if (needs_parens) try out.writeAll("(");
     switch (expr.*) {
-        .eq => |e| try out.print("{s}={s}", .{ e.axis, e.value }),
+        .eq => |e| if (isBareTokenValue(e.value))
+            try out.print("{s}={s}", .{ e.axis, e.value })
+        else
+            try out.print("{s}=\"{s}\"", .{ e.axis, e.value }),
         .present => |n| try out.writeAll(n),
         .not => |inner| {
             try out.writeAll("not ");
@@ -62,6 +77,34 @@ fn writeExprAt(out: *std.Io.Writer, expr: *const AxisExpr, min_prec: u8) !void {
         },
     }
     if (needs_parens) try out.writeAll(")");
+}
+
+/// Structural equality: same shape, same axis names/values, same operand
+/// order. `not`/`and_`/`or_` compare recursively; `and_`/`or_` are NOT
+/// commutative here -- `a and b` and `b and a` compare unequal.
+pub fn exprEqual(a: *const AxisExpr, b: *const AxisExpr) bool {
+    return switch (a.*) {
+        .eq => |ae| switch (b.*) {
+            .eq => |be| std.mem.eql(u8, ae.axis, be.axis) and std.mem.eql(u8, ae.value, be.value),
+            else => false,
+        },
+        .present => |an| switch (b.*) {
+            .present => |bn| std.mem.eql(u8, an, bn),
+            else => false,
+        },
+        .not => |ai| switch (b.*) {
+            .not => |bi| exprEqual(ai, bi),
+            else => false,
+        },
+        .and_ => |aa| switch (b.*) {
+            .and_ => |ba| exprEqual(aa.left, ba.left) and exprEqual(aa.right, ba.right),
+            else => false,
+        },
+        .or_ => |ao| switch (b.*) {
+            .or_ => |bo| exprEqual(ao.left, bo.left) and exprEqual(ao.right, bo.right),
+            else => false,
+        },
+    };
 }
 
 /// Row predicate used by for-loop `where` clauses. Evaluated per record;
@@ -290,4 +333,72 @@ test "writeExpr: not wrapping an and is parenthesized" {
     const and_expr: AxisExpr = .{ .and_ = .{ .left = &left, .right = &right } };
     const not_expr: AxisExpr = .{ .not = &and_expr };
     try std.testing.expectEqualStrings("not (profile=work and signing_work_key)", try writeExprToString(a, &not_expr));
+}
+
+test "writeExpr: a bare-token value stays unquoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const eq: AxisExpr = .{ .eq = .{ .axis = "tool", .value = "fdfind-2.0" } };
+    try std.testing.expectEqualStrings("tool=fdfind-2.0", try writeExprToString(a, &eq));
+}
+
+test "writeExpr: a value containing a space renders quoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const eq: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "new york" } };
+    try std.testing.expectEqualStrings("profile=\"new york\"", try writeExprToString(a, &eq));
+}
+
+test "writeExpr: a non-ASCII value renders quoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const eq: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e" } };
+    try std.testing.expectEqualStrings("profile=\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\"", try writeExprToString(a, &eq));
+}
+
+test "exprEqual: identical eq/present/not/and/or expressions compare equal" {
+    const eq1: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const eq2: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    try std.testing.expect(exprEqual(&eq1, &eq2));
+
+    const present1: AxisExpr = .{ .present = "email" };
+    const present2: AxisExpr = .{ .present = "email" };
+    try std.testing.expect(exprEqual(&present1, &present2));
+
+    const not1: AxisExpr = .{ .not = &eq1 };
+    const not2: AxisExpr = .{ .not = &eq2 };
+    try std.testing.expect(exprEqual(&not1, &not2));
+
+    const and1: AxisExpr = .{ .and_ = .{ .left = &eq1, .right = &present1 } };
+    const and2: AxisExpr = .{ .and_ = .{ .left = &eq2, .right = &present2 } };
+    try std.testing.expect(exprEqual(&and1, &and2));
+
+    const or1: AxisExpr = .{ .or_ = .{ .left = &eq1, .right = &present1 } };
+    const or2: AxisExpr = .{ .or_ = .{ .left = &eq2, .right = &present2 } };
+    try std.testing.expect(exprEqual(&or1, &or2));
+}
+
+test "exprEqual: differing axis, value, shape, or operand order compare unequal" {
+    const profile_work: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const profile_personal: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "personal" } };
+    try std.testing.expect(!exprEqual(&profile_work, &profile_personal));
+
+    const os_work: AxisExpr = .{ .eq = .{ .axis = "os", .value = "work" } };
+    try std.testing.expect(!exprEqual(&profile_work, &os_work));
+
+    const email: AxisExpr = .{ .present = "email" };
+    try std.testing.expect(!exprEqual(&profile_work, &email));
+
+    const and_pe: AxisExpr = .{ .and_ = .{ .left = &profile_work, .right = &email } };
+    const and_ep: AxisExpr = .{ .and_ = .{ .left = &email, .right = &profile_work } };
+    try std.testing.expect(!exprEqual(&and_pe, &and_ep));
+
+    const or_pe: AxisExpr = .{ .or_ = .{ .left = &profile_work, .right = &email } };
+    try std.testing.expect(!exprEqual(&and_pe, &or_pe));
 }

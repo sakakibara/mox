@@ -414,3 +414,20 @@ test "parseString: trailing tokens after a valid prefix are rejected" {
     try b.put("os", "linux");
     try std.testing.expect(evaluate(e, &b_r));
 }
+
+test "writeExpr round-trips a quoted space-containing value back through the parser" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const expr = try parseString(a, "profile=\"new york\"");
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try ast.writeExpr(&aw.writer, expr);
+    try std.testing.expectEqualStrings("profile=\"new york\"", aw.written());
+
+    const reparsed = try parseString(a, aw.written());
+    try std.testing.expect(reparsed.* == .eq);
+    try std.testing.expectEqualStrings("profile", reparsed.eq.axis);
+    try std.testing.expectEqualStrings("new york", reparsed.eq.value);
+}

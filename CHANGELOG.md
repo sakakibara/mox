@@ -4,6 +4,18 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- A dimension's asking condition -- the OR of every occurrence's condition,
+  shown on `mox facts --report`'s "asked when ..." line and re-evaluated
+  each interview wave -- is now simplified at construction: exact-duplicate
+  disjuncts are dropped, and a disjunct whose and-conjoined atoms are a
+  strict superset of another disjunct's atoms is absorbed (`A or (A and B)`
+  reduces to `A`). A gate value like `profile="new york"` that contains a
+  space or any character outside the bare-token set now renders quoted in
+  written-back conditions, matching the DSL's own value grammar.
+
 ## [0.7.0] - 2026-07-28
 
 ### Added

@@ -1146,11 +1146,111 @@ fn combineAnd(arena: std.mem.Allocator, exprs: []const *const AxisExpr) !?*const
     return acc;
 }
 
-fn combineOr(arena: std.mem.Allocator, a: ?*const AxisExpr, b: *const AxisExpr) !*const AxisExpr {
-    const left = a orelse return b;
-    const node = try arena.create(AxisExpr);
-    node.* = .{ .or_ = .{ .left = left, .right = b } };
-    return node;
+/// `expr` flattened into its and-conjoined atoms: `a and b and c` -> `{a, b,
+/// c}`; anything else (including a single `not`/`present`/`eq`/`or_`) is its
+/// own one-element atom set.
+fn atomsOf(arena: std.mem.Allocator, expr: *const AxisExpr) ![]const *const AxisExpr {
+    return switch (expr.*) {
+        .and_ => |a| blk: {
+            const left = try atomsOf(arena, a.left);
+            const right = try atomsOf(arena, a.right);
+            const out = try arena.alloc(*const AxisExpr, left.len + right.len);
+            @memcpy(out[0..left.len], left);
+            @memcpy(out[left.len..], right);
+            break :blk out;
+        },
+        else => blk: {
+            const out = try arena.alloc(*const AxisExpr, 1);
+            out[0] = expr;
+            break :blk out;
+        },
+    };
+}
+
+/// True when every atom in `sub` (by `exprEqual`) also appears in `super`.
+fn atomSetSubset(sub: []const *const AxisExpr, super: []const *const AxisExpr) bool {
+    for (sub) |sub_atom| {
+        var found = false;
+        for (super) |super_atom| {
+            if (dsl.ast.exprEqual(sub_atom, super_atom)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Flatten every top-level `or_` in `expr` (recursively) into `out`, so a
+/// disjunct that is itself `X or Y` contributes `X` and `Y` as separate
+/// leaves rather than one leaf that is itself an `or_`.
+fn flattenOrLeaves(arena: std.mem.Allocator, out: *std.ArrayList(*const AxisExpr), expr: *const AxisExpr) !void {
+    switch (expr.*) {
+        .or_ => |o| {
+            try flattenOrLeaves(arena, out, o.left);
+            try flattenOrLeaves(arena, out, o.right);
+        },
+        else => try out.append(arena, expr),
+    }
+}
+
+/// Sound (equivalence-preserving) simplification of an OR of conjunctions,
+/// applied at construction so the STORED asking condition is clean -- this
+/// is what eligibility re-evaluates on every interview wave, not just what a
+/// report prints. Two provably-safe reductions only, no general boolean
+/// minimization (no distribution, no negation reasoning -- `not X` is an
+/// opaque atom):
+///   - dedup: drop a later disjunct that is structurally identical
+///     (`ast.exprEqual`) to an earlier surviving one.
+///   - absorption: `A or (A and B) = A` -- treating each disjunct as the SET
+///     of its and-conjoined atoms (flattened; a non-`and_` disjunct is its
+///     own singleton set), drop any disjunct whose atom set is a STRICT
+///     superset of another surviving disjunct's atom set.
+/// `disjuncts` must be non-empty; a nested `or_` inside any one of them is
+/// flattened into the disjunct list before dedup/absorption run.
+fn simplifyOr(arena: std.mem.Allocator, disjuncts: []const *const AxisExpr) !*const AxisExpr {
+    var flat: std.ArrayList(*const AxisExpr) = .empty;
+    for (disjuncts) |d| try flattenOrLeaves(arena, &flat, d);
+
+    var deduped: std.ArrayList(*const AxisExpr) = .empty;
+    for (flat.items) |cand| {
+        var dup = false;
+        for (deduped.items) |kept| {
+            if (dsl.ast.exprEqual(cand, kept)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try deduped.append(arena, cand);
+    }
+
+    const atom_sets = try arena.alloc([]const *const AxisExpr, deduped.items.len);
+    for (deduped.items, 0..) |d, i| atom_sets[i] = try atomsOf(arena, d);
+
+    var survivors: std.ArrayList(*const AxisExpr) = .empty;
+    for (deduped.items, 0..) |d, i| {
+        var absorbed = false;
+        for (atom_sets, 0..) |other_atoms, j| {
+            if (i == j) continue;
+            if (atomSetSubset(other_atoms, atom_sets[i]) and !atomSetSubset(atom_sets[i], other_atoms)) {
+                absorbed = true;
+                break;
+            }
+        }
+        if (!absorbed) try survivors.append(arena, d);
+    }
+
+    // Rebuild a right-leaning or-tree: A or (B or (C or D)).
+    var idx = survivors.items.len - 1;
+    var acc = survivors.items[idx];
+    while (idx > 0) {
+        idx -= 1;
+        const node = try arena.create(AxisExpr);
+        node.* = .{ .or_ = .{ .left = survivors.items[idx], .right = acc } };
+        acc = node;
+    }
+    return acc;
 }
 
 /// `ctx` with `sibling` conjoined -- `recordAxisExpr`'s conjunction-sibling
@@ -1199,12 +1299,12 @@ fn appendStr(arena: std.mem.Allocator, list: []const []const u8, item: []const u
 /// condition.
 fn computeAskingCondition(arena: std.mem.Allocator, dw: *const DimWork) !?*const AxisExpr {
     if (dw.occurrence_conditions.items.len == 0) return null;
-    var combined: ?*const AxisExpr = null;
+    var conds: std.ArrayList(*const AxisExpr) = .empty;
     for (dw.occurrence_conditions.items) |maybe_cond| {
         const cond = maybe_cond orelse return null;
-        combined = try combineOr(arena, combined, cond);
+        try conds.append(arena, cond);
     }
-    return combined;
+    return try simplifyOr(arena, conds.items);
 }
 
 /// Index of the `>` that closes a `<machine....>` capture opened at `open`
@@ -1381,6 +1481,129 @@ fn findDim(d: Discovery, name: []const u8) ?Dimension {
         if (std.mem.eql(u8, dim.name, name)) return dim;
     }
     return null;
+}
+
+const TruthTableAtom = struct { axis: []const u8, value: []const u8 };
+
+/// For every combination of true/false across `atoms`, bind each true atom
+/// (`eq` atoms bind `axis=value`, `present` atoms bind any non-empty value)
+/// and assert `simplified` evaluates identically to the OR of
+/// `original_disjuncts` -- the exact pre-simplification meaning of a
+/// dimension's asking condition. Proves simplification never changes
+/// eligibility.
+fn truthTableEquivalent(
+    a: std.mem.Allocator,
+    original_disjuncts: []const *const AxisExpr,
+    simplified: *const AxisExpr,
+    atoms: []const TruthTableAtom,
+) !void {
+    const combos = @as(usize, 1) << @intCast(atoms.len);
+    var combo: usize = 0;
+    while (combo < combos) : (combo += 1) {
+        var bindings = std.StringHashMap([]const u8).init(a);
+        defer bindings.deinit();
+        for (atoms, 0..) |atom, i| {
+            if ((combo >> @intCast(i)) & 1 == 1) try bindings.put(atom.axis, atom.value);
+        }
+        var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+        var original_result = false;
+        for (original_disjuncts) |d| {
+            if (dsl.axis.evaluate(d, &r)) {
+                original_result = true;
+                break;
+            }
+        }
+        try std.testing.expectEqual(original_result, dsl.axis.evaluate(simplified, &r));
+    }
+}
+
+fn writeExprToStringForTest(a: std.mem.Allocator, expr: *const AxisExpr) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try dsl.ast.writeExpr(&aw.writer, expr);
+    return a.dupe(u8, aw.written());
+}
+
+test "simplifyOr: the real signing_work_key 4-term OR reduces to exactly profile=work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Mirrors the real corpus: git/config gates the capture on
+    // `profile=work and signing_work_key`, allowed_signers on `profile=work
+    // and email and signing_work_key`. Discovery's gate-self-reference and
+    // conjunction-sibling rules (see recordAxisExpr/combineAndSibling) turn
+    // that into these four occurrence conditions for signing_work_key.
+    const profile_work: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const email: AxisExpr = .{ .present = "email" };
+    const signing: AxisExpr = .{ .present = "signing_work_key" };
+    const d1: AxisExpr = .{ .and_ = .{ .left = &profile_work, .right = &email } };
+    const d2: AxisExpr = .{ .and_ = .{ .left = &d1, .right = &signing } };
+    const d4: AxisExpr = .{ .and_ = .{ .left = &profile_work, .right = &signing } };
+
+    const disjuncts = [_]*const AxisExpr{ &d1, &d2, &profile_work, &d4 };
+    const simplified = try simplifyOr(a, &disjuncts);
+
+    try std.testing.expect(simplified.* == .eq);
+    try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, simplified));
+
+    try truthTableEquivalent(a, &disjuncts, simplified, &.{
+        .{ .axis = "profile", .value = "work" },
+        .{ .axis = "email", .value = "x@y.com" },
+        .{ .axis = "signing_work_key", .value = "KEYID" },
+    });
+}
+
+test "simplifyOr: an or_ nested inside a single occurrence's condition is flattened, then absorbed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const os_darwin: AxisExpr = .{ .eq = .{ .axis = "os", .value = "darwin" } };
+    const profile_work: AxisExpr = .{ .eq = .{ .axis = "profile", .value = "work" } };
+    const and_both: AxisExpr = .{ .and_ = .{ .left = &os_darwin, .right = &profile_work } };
+    const inner_or: AxisExpr = .{ .or_ = .{ .left = &profile_work, .right = &and_both } };
+    // A single occurrence's own condition, itself an or_: os=darwin or
+    // (profile=work or (os=darwin and profile=work)).
+    const nested: AxisExpr = .{ .or_ = .{ .left = &os_darwin, .right = &inner_or } };
+
+    const disjuncts = [_]*const AxisExpr{&nested};
+    const simplified = try simplifyOr(a, &disjuncts);
+
+    try std.testing.expectEqualStrings("os=darwin or profile=work", try writeExprToStringForTest(a, simplified));
+
+    try truthTableEquivalent(a, &disjuncts, simplified, &.{
+        .{ .axis = "os", .value = "darwin" },
+        .{ .axis = "profile", .value = "work" },
+    });
+}
+
+test "discover: signing_work_key's redundant multi-occurrence OR simplifies to profile=work" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.config/git/config",
+        "# mox: when profile=work and signing_work_key\nsigningkey = <machine.signing_work_key>\n# mox: end\n",
+    );
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.config/git/allowed_signers",
+        "# mox: when profile=work and email and signing_work_key\n<machine.email> namespaces=\"git\" <machine.signing_work_key>\n# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "signing_work_key").?;
+    const cond = dim.asking_condition.?;
+    try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, cond));
 }
 
 fn containsStr(list: []const []const u8, s: []const u8) bool {
