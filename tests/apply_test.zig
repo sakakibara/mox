@@ -1498,7 +1498,11 @@ test "apply: scripts/pre still runs before the compose walk on a healthy tree" {
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expectEqualStrings("seeded\n", try read(io, a, try c.homePath("generated")));
+    // Trailing newline shape is the fixture shell's business (PowerShell's
+    // Set-Content writes CRLF); the point is that the pre-script's generated
+    // file was composed and applied.
+    const generated = try read(io, a, try c.homePath("generated"));
+    try std.testing.expectEqualStrings("seeded", std.mem.trim(u8, generated, "\r\n"));
 }
 
 test "apply/doctor: a leftover data/facts-schema.toml gets one loud never-read notice, from both commands" {
