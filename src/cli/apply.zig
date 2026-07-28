@@ -130,8 +130,8 @@ fn applyPass(
     // free file-only applies; scripts may install packages or hit the network.
     const skip_scripts = dry_run or skip_scripts_arg;
 
-    // Lock contention is a genuine failure (D7's error class), not drift
-    // needing a decision: another apply must finish or be cleared first.
+    // Lock contention exits with the error code, not the drift code: another
+    // apply must finish or be cleared first, not a decision the user resolves.
     const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 2;
     defer lk.release();
 
@@ -568,7 +568,7 @@ fn applyPass(
     // entries in `.mox-exact` directories that mox did not produce. The global
     // keep set is the managed set: a generated leaf (current, or a failed
     // generator's prior) is protected and never swept. An exact-dir entry has
-    // no kind in the classifier's taxonomy (D3) and no scopeable path in the
+    // no kind in the classifier's taxonomy and no scopeable path in the
     // managed-file tree, so a foreign file refused here counts toward the
     // exit code but, like an orphaned generator, does not add a report row.
     var exact_result = mox.apply.exact.Result{};
@@ -647,9 +647,9 @@ fn applyPass(
     try printDriftReport(ctx, units.items, counts.drift);
 
     // A blocked script (its fact contract could not be resolved), a compose
-    // failure, an unwritable target, or lock contention is a genuine failure
-    // (D7): rc 2. Drift left untouched (skipped, not forced) is a normal,
-    // actionable non-success: rc 1. Neither: rc 0.
+    // failure, an unwritable target, or lock contention is a genuine failure:
+    // rc 2. Drift left untouched (skipped, not forced) is a normal, actionable
+    // non-success: rc 1. Neither: rc 0.
     const error_class = counts.fail + pre_result.failed + post_result.failed + pre_result.blocked + post_result.blocked;
     if (error_class > 0) return 2;
     if (counts.drift > 0) return 1;
@@ -662,7 +662,7 @@ fn applyPass(
 /// orphaned generator's leaf has no scopeable path to report as a unit (see
 /// the callers above), but still counts toward "drift needs a decision".
 /// Guidance pre-fills the scoped `--overwrite` command only when exactly one
-/// thing drifted, full stop (D9): copy-pasting an unscoped form when more is
+/// thing drifted, full stop: copy-pasting an unscoped form when more is
 /// drifted, or when unreported drift exists alongside a reported unit, would
 /// risk overwriting something the reader meant to leave alone.
 fn printDriftReport(ctx: *app.Ctx, units: []mox.apply.drift.Unit, total_drift: usize) !void {

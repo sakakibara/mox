@@ -383,10 +383,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return commitImpl(ctx, a.dry_run, a.yes, a.abort_on_prompt, a.color orelse .auto, a.paths);
 }
 
-/// The whole of `mox commit`, callable without an argv. `apply` uses this to
-/// run the commit its drift prompt queued, once it has released the state lock
-/// (the lock is not re-entrant, so this cannot be called from inside apply's
-/// own pass). Acquires the lock itself, exactly as the command does.
+/// The whole of `mox commit`, callable without an argv. Acquires the state
+/// lock itself, exactly as the command does.
 pub fn commitImpl(
     ctx: *app.Ctx,
     dry_run: bool,
