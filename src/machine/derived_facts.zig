@@ -1,7 +1,7 @@
 //! `data/facts.toml` (repo layer, private-shadowed): rows that derive a
 //! single-value machine fact from an environment variable override or a
 //! filesystem candidate search -- the registry that replaced capture's
-//! hardcoded brew/cargo/go/pnpm detection (D8). It pairs with the
+//! hardcoded brew/cargo/go/pnpm detection. It pairs with the
 //! machine-local `$XDG_CONFIG_HOME/mox/facts.toml` (`facts.zig`): repo
 //! DERIVES, machine STATES, same noun because same concept.
 
@@ -89,8 +89,8 @@ pub fn load(
 
 /// One `data/facts.toml` row's declared shape, regardless of whether it
 /// currently resolves on this machine: its name plus the `env`/`candidates`
-/// remediation a caller can name when the row is unresolved (D3's blocked-
-/// on-a-derived-fact lane).
+/// remediation a caller can name when a script is blocked on the row while
+/// it is unresolved.
 pub const DeclaredRow = struct {
     name: []const u8,
     env: ?[]const u8 = null,
@@ -99,8 +99,8 @@ pub const DeclaredRow = struct {
 
 /// Every `data/facts.toml` row's declared shape, regardless of whether it
 /// currently resolves to a value on this machine (`load` drops an unresolved
-/// row entirely, which is right for capture but wrong for discovery -- D1
-/// must exclude a declared name from the custom-dimension space even on a
+/// row entirely, which is right for capture but wrong for discovery: a
+/// declared name must stay out of the custom-dimension space even on a
 /// machine where its candidate directory doesn't exist yet). Validation
 /// mirrors `load`: a malformed row is `error.MalformedFactsRow`; a name
 /// colliding with a reserved axis, a built-in field, or declared twice is

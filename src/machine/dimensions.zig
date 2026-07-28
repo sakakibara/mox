@@ -629,7 +629,7 @@ const Discoverer = struct {
     /// Recursion state threaded through a file's directive tree. `gate_stack`
     /// holds every enclosing condition that is both cleanly axis-expressible
     /// and required for emission, innermost last -- a capture's condition is
-    /// their conjunction (the paper's conservative-ask law: anything not
+    /// their conjunction (over-asking is safe, under-asking is not: anything not
     /// cleanly expressible, e.g. which fragment a tuple match picks or a
     /// for-loop's per-row emission, contributes NOTHING rather than narrowing
     /// the condition, so under-asking never happens at the cost of an

@@ -90,7 +90,7 @@ Compose all managed files and write them to their live paths
 paths to limit the run).
 
 Before composing, apply discovers the repo's fact interview (below) and
-walks it: on a terminal (or scripted stdin) it prompts for every
+walks it: on a terminal it prompts for every
 eligible unbound fact and persists the answers, then re-captures so the
 run composes against them. `--defaults` never prompts: every eligible
 fact binds its declared default when it has one, and is declined (bound
@@ -108,9 +108,11 @@ verified like any other commit), `[d]iff`, `[s]kip`, or `[O]`/`[S]` to
 answer the rest the same way -- so two drifted files wanting opposite
 outcomes are resolved in one run. Off a terminal, or with `--dry-run`,
 drifted files are skipped and reported and the run exits 1; `--force`
-overwrites them all without asking. Interactive drift resolution and the
-facts interview share one buffered stdin reader, so piped input can
-script both in a single run.
+overwrites them all without asking. Interactive drift resolution and
+the facts interview share one buffered stdin reader. Piping answers on
+stdin does not make a run interactive: off a terminal the interview
+takes the non-interactive path -- script a bootstrap with `--defaults`
+or pre-seed `mox facts set` instead.
 
 A partially owned file (an `own` or `disown` head declaration) is
 patched around the other side's content: the owned content is written,
