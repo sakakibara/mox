@@ -54,7 +54,11 @@
 //! skipped and scanning continues -- `discover` itself only fails on an
 //! actual OOM/IO-class error, or a structurally invalid source tree it
 //! degrades to "nothing found" over rather than pre-empting the richer
-//! report `apply`'s own source-tree walk produces for the same file.
+//! report `apply`'s own source-tree walk produces for the same file. That
+//! degrade is recorded on `Discovery.tree_error` rather than left silent:
+//! `apply` ignores it (its own later walk reports the same failure better),
+//! `mox facts` -- which has no such backstop -- refuses on it instead of
+//! reporting an empty config space as if the tree had parsed cleanly.
 
 const std = @import("std");
 const dsl = @import("../dsl/root.zig");
@@ -241,6 +245,17 @@ pub const Discovery = struct {
     /// `# mox: default` conflict/unclaimed anomalies, in first-encounter
     /// order by name.
     default_diagnostics: []const DefaultDiagnostic = &.{},
+    /// Set when the `src/` tree walk failed on something other than OOM (a
+    /// reserved axis name, a malformed ownership declaration, ...): the
+    /// error name `source.tree.walk` returned. Dimension content still
+    /// degrades to "nothing found" in this case (see `discover`'s doc
+    /// comment) rather than the caller getting a half-scanned tree with no
+    /// indication anything was wrong -- `apply` ignores this signal (its own
+    /// later `walkDiag` call reports the same failure with the offending
+    /// file and a richer message); `mox facts`, which has no such backstop,
+    /// checks it and refuses instead of silently reporting an empty config
+    /// space.
+    tree_error: ?anyerror = null,
 };
 
 /// Discover the full config space a repo's sources consume. `repo_dir` is the
@@ -272,9 +287,17 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
     // than pre-empting that later, better report with a bare error name.
     // Only OOM is worth failing discovery itself over.
     const src_dir = try std.fs.path.join(arena, &.{ repo_dir, "src" });
+    var tree_error: ?anyerror = null;
     const tree = source.tree.walk(arena, io, src_dir, "") catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => source.tree.ManagedTree{ .files = &.{} },
+        // No `src/` at all is a fresh/empty repo, not a structural problem
+        // (this function's own doc comment: "a missing src/ ... is not an
+        // error") -- degrades silently, same as before this fix.
+        error.FileNotFound => source.tree.ManagedTree{ .files = &.{} },
+        else => blk: {
+            tree_error = e;
+            break :blk source.tree.ManagedTree{ .files = &.{} };
+        },
     };
     for (tree.files) |file| try self.scanManagedFile(file);
 
@@ -283,7 +306,9 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
         try self.scanScriptsTree(abs, "scripts/" ++ stage);
     }
 
-    return self.finalize();
+    var result = try self.finalize();
+    result.tree_error = tree_error;
+    return result;
 }
 
 /// Per-dimension scan state, held in `Discoverer.dims` keyed by name.
@@ -2962,4 +2987,25 @@ test "discover: an empty repo (no src, no scripts) yields no dimensions and no s
     const d = try discover(a, io, repo);
     try std.testing.expectEqual(@as(usize, 0), d.dimensions.len);
     try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
+    try std.testing.expect(d.tree_error == null);
+}
+
+test "discover: a structurally invalid source tree sets tree_error and still degrades to empty dimension content" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/path=brew", "[gpg]\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(error.ReservedAxisName, d.tree_error.?);
+    // The invalid tree degrades to "nothing found" for dimension content --
+    // apply's own richer walkDiag call owns the per-site message for this
+    // file, not discovery.
+    try std.testing.expectEqual(@as(usize, 0), d.dimensions.len);
 }

@@ -138,6 +138,9 @@ fn applyPass(
     // OOM/IO-class error here propagates like any other.
     const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "mox apply: ", discovery.diagnostics, discovery.default_diagnostics);
+    // discovery.tree_error is ignored here: apply's own source.tree.walkDiag
+    // call below reports the same failure with the offending file and a
+    // richer message, so discovery's bare error name would only be noise.
 
     // Facts interview: resolve every eligible unbound dimension, persist the
     // answers, and re-capture so this apply already composes with them.

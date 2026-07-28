@@ -1207,6 +1207,33 @@ test "mox facts: discovery diagnostics print the same way apply's do" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "reserved") != null);
 }
 
+test "mox facts: a structurally invalid source tree is a loud non-zero refusal, not a silent success" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig", .data = "[user]\n" });
+    try tmp.dir.createDirPath(io, "repo/src/.gitconfig.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig.d/path=brew", .data = "[gpg]\n" });
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "facts" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ReservedAxisName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unavailable") != null);
+
+    // apply is unaffected: it ignores discovery's tree_error and keeps its
+    // own richer walkDiag report for the same file.
+    const r_apply = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(r_apply.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "path=brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r_apply.err, "reserved axis name") != null);
+}
+
 test "apply/doctor: a leftover data/facts-schema.toml gets one loud never-read notice, from both commands" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
