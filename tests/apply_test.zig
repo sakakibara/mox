@@ -1594,7 +1594,7 @@ test "apply: a drifted file never consumes the interview's scripted stdin" {
     // for drift, so nothing else is ever read from it.
     const r = try c.runWithInput(&.{ "mox", "apply" }, "emacs\n");
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "notes.txt") != null);
 
     const facts = try read(io, a, try c.homePath(".config/mox/facts.toml"));
@@ -3470,8 +3470,8 @@ test "apply drift: non-interactive skip-and-report, --dry-run, and --force (--ov
     // script and CI run depends on.
     const plain = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), plain.rc);
-    try std.testing.expect(std.mem.indexOf(u8, plain.out, "DRIFT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plain.out, "re-run with --force") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.out, "drifted, left untouched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.out, "overwrite: whole file") != null);
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
 
     // --dry-run writes nothing and never prompts, even with input available.
@@ -3704,9 +3704,9 @@ test "apply partial: first-contact drift is skipped, --force reasserts the sourc
 
     const r1 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r1.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r1.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1.out, "tui.keymap.global") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1.out, "'mox commit' it or re-run with --force") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "keep: mox commit") != null);
     try std.testing.expectEqualStrings(drifted, try read(io, a, live));
 
     const r2 = try c.run(&.{ "mox", "apply", "--force" });
@@ -3755,7 +3755,7 @@ test "apply partial: enforced absence removes through the record and drifts past
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own keep\n# mox: own gone\n[keep]\nk = 1\n" });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "g = 99") != null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
@@ -3788,7 +3788,7 @@ test "apply partial: a path added to own is first contact, never a silent overwr
     });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "beta") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "theirs = true") != null);
 
@@ -3874,7 +3874,7 @@ test "apply partial: --dry-run reports would-create and drift without writing" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\nk = 9\n" });
     const dry2 = try c.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry2.rc);
-    try std.testing.expect(std.mem.indexOf(u8, dry2.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry2.out, "drifted, left untouched") != null);
     try std.testing.expectEqualStrings("[tui]\nk = 9\n", try read(io, a, live));
 }
 
@@ -4052,10 +4052,10 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
     // The whole-scope hash comparison names the owned content, never a
     // sentinel interpolated as a path name.
-    try std.testing.expect(std.mem.indexOf(u8, skip.out, "(owned content changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "owned content changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "owned path owned content") == null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
@@ -4748,7 +4748,7 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     // restored owned content as drift, mirroring whole-file rollback.
     const drift = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), drift.rc);
-    try std.testing.expect(std.mem.indexOf(u8, drift.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drift.out, "drifted, left untouched") != null);
 }
 
 var repatch_stat_fail_target: []const u8 = "";
@@ -5039,7 +5039,7 @@ test "apply disown: a user-key live edit drifts and --force reasserts around the
     });
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "theme") != null);
 
     const forced = try c.run(&.{ "mox", "apply", "--force" });
@@ -5097,7 +5097,7 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
     });
     const shrunk = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), shrunk.rc);
-    try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "model") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "model") != null);
 
@@ -5251,7 +5251,7 @@ test "apply disown: a shrunk disown list on a secret record is first contact, ne
     try writeDisownFixture(io, &tmp, "// mox: disown model\n{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S2>\"\n}\n");
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "survey") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "survey") != null);
 

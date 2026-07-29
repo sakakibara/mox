@@ -3833,7 +3833,7 @@ test "apply drift partial: reported by apply, then routed to source by a separat
     // separate, explicit `mox commit` run (its own per-key prompt: [y]).
     const skip = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
 
     const res = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
     try std.testing.expectEqual(@as(u8, 0), res.rc);

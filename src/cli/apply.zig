@@ -3,6 +3,8 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
+const style = @import("style.zig");
+const drift_report = @import("drift_report.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
 
@@ -14,11 +16,12 @@ pub const Spec = struct {
     force: cli.Flag(.{ .help = "alias of --overwrite" }),
     skip_scripts: cli.Flag(.{ .help = "compose and write files, run no scripts" }),
     defaults: cli.Flag(.{ .help = "never prompt: bind each unbound fact's default, decline the rest" }),
+    color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    return applyImpl(ctx, a.overwrite or a.force, a.dry_run, a.skip_scripts, a.defaults, a.paths);
+    return applyImpl(ctx, a.overwrite or a.force, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
 }
 
 /// `machine.state.captureDiag`, reporting a `ReservedFactName` (a custom fact
@@ -113,8 +116,8 @@ fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.
 /// drift instead of skipping it, scoped to `paths` when given. Returns 0
 /// (clean), 1 (drift was skipped and needs a decision), or 2 (a genuine
 /// failure -- see the exit-code split in `applyPass`).
-pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, paths: []const []const u8) anyerror!u8 {
-    return applyPass(ctx, force, dry_run, skip_scripts_arg, defaults, paths);
+pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, color: style.ColorFlag, paths: []const []const u8) anyerror!u8 {
+    return applyPass(ctx, force, dry_run, skip_scripts_arg, defaults, color, paths);
 }
 
 fn applyPass(
@@ -123,6 +126,7 @@ fn applyPass(
     dry_run: bool,
     skip_scripts_arg: bool,
     defaults_only: bool,
+    color: style.ColorFlag,
     paths: []const []const u8,
 ) anyerror!u8 {
     const context = ctx.context.?;
@@ -312,6 +316,12 @@ fn applyPass(
     }
 
     var counts: Counts = .{};
+    // Drift the classifier could not scope to a `Unit` -- a foreign entry in
+    // a `.mox-exact` directory, an orphaned generator's leaf -- still counts
+    // toward `counts.drift` (the exit code) but names no path for a report
+    // row; threaded to the renderer separately so exit 1 always carries a
+    // stdout explanation even when nothing here got its own row.
+    var unrowed_drift: usize = 0;
 
     const snap_id = try mox.apply.snapshot.freshId(ctx.alloc, ctx.io, context.paths.snapshots_dir);
     var snapshotted = false;
@@ -562,6 +572,7 @@ fn applyPass(
         if (swept.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += swept.error_refused;
         counts.drift += swept.drift_refused;
+        unrowed_drift += swept.drift_refused;
     }
 
     // Exact-directory sweep: after every managed file is written, remove live
@@ -597,6 +608,7 @@ fn applyPass(
         if (exact_result.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += exact_result.error_refused;
         counts.drift += exact_result.drift_refused;
+        unrowed_drift += exact_result.drift_refused;
     }
 
     if (snapshotted) {
@@ -644,7 +656,18 @@ fn applyPass(
         );
     }
 
-    try printDriftReport(ctx, units.items, counts.drift);
+    const sty = style.Style{ .on = style.enabled(
+        tty.isInteractive(1),
+        context.env.get(ctx.alloc, "NO_COLOR") != null,
+        color,
+    ) };
+    try drift_report.render(ctx.alloc, ctx.out, units.items, .{
+        .written = counts.ok,
+        .unrowed = unrowed_drift,
+        .home = m_state.home,
+        .sty = sty,
+        .width = tty.terminalWidth(80),
+    });
 
     // A blocked script (its fact contract could not be resolved), a compose
     // failure, an unwritable target, or lock contention is a genuine failure:
@@ -654,32 +677,6 @@ fn applyPass(
     if (error_class > 0) return 2;
     if (counts.drift > 0) return 1;
     return 0;
-}
-
-/// The end-of-run drift report: sorted, one line per unit, all on stdout (a
-/// single stream, so its order never depends on flush timing). `total_drift`
-/// may exceed `units.len` -- a foreign file in a `.mox-exact` directory or an
-/// orphaned generator's leaf has no scopeable path to report as a unit (see
-/// the callers above), but still counts toward "drift needs a decision".
-/// Guidance pre-fills the scoped `--overwrite` command only when exactly one
-/// thing drifted, full stop: copy-pasting an unscoped form when more is
-/// drifted, or when unreported drift exists alongside a reported unit, would
-/// risk overwriting something the reader meant to leave alone.
-fn printDriftReport(ctx: *app.Ctx, units: []mox.apply.drift.Unit, total_drift: usize) !void {
-    if (units.len == 0) return;
-    mox.apply.drift.sortByPath(units);
-    try ctx.out.writeAll("\n");
-    for (units) |u| {
-        const kind_label = try mox.apply.drift.kindLabel(ctx.alloc, u.kind);
-        const desc = try mox.apply.drift.describe(ctx.alloc, u);
-        const contact: []const u8 = if (u.first_contact) " (first contact)" else "";
-        try ctx.out.print("  DRIFT   {s}  {s}{s} ({s})\n", .{ u.path, kind_label, contact, desc });
-    }
-    if (units.len == 1 and total_drift == units.len) {
-        try ctx.out.print("\n  overwrite it:  mox apply --overwrite {s}\n", .{units[0].path});
-    } else {
-        try ctx.out.writeAll("\n  see the full list:  mox status\n  overwrite one:      mox apply --overwrite <path>\n");
-    }
 }
 
 /// True when `a` and `b` name the same facts in the same order (the order

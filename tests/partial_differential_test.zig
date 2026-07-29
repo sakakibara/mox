@@ -191,7 +191,7 @@ test "codex differential: force reassertion matches the script's keymap and rema
     // the missing global/composer tables) is drift, never a silent write.
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
-    try std.testing.expect(std.mem.indexOf(u8, skip.out, "DRIFT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
     try std.testing.expectEqualStrings(live_fixture, try read(io, a, live));
 
     // The script's unconditional patch corresponds to consented reassertion.

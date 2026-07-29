@@ -122,10 +122,10 @@ test "kind matrix: whole_file first-contact -- skip, report as first contact (ne
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqualStrings("already here\n", try read(io, a, live));
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "first contact") != null);
-    // Never the "live file was edited" phrasing D2 flags as wrong for a
-    // never-written file.
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "live file was edited") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "not written by mox") != null);
+    // Never the "edited since mox wrote it" phrasing, wrong for a file mox
+    // never wrote in the first place.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "edited since mox wrote it") == null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", live })).rc);
     try std.testing.expectEqualStrings("source\n", try read(io, a, live));
@@ -265,7 +265,7 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
     var lines: usize = 0;
     var it = std.mem.splitScalar(u8, r.out, '\n');
     while (it.next()) |line| {
-        if (std.mem.indexOf(u8, line, "DRIFT") != null) lines += 1;
+        if (std.mem.indexOf(u8, line, "generated set drifted") != null) lines += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), lines);
 
