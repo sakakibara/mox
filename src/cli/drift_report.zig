@@ -71,7 +71,7 @@ pub fn render(arena: std.mem.Allocator, out: *std.Io.Writer, units: []Unit, opts
     }
 
     // A collapsed migration block already carries its own guidance (the
-    // unscoped overwrite IS the point of a first-apply migration, D10); a
+    // unscoped overwrite IS the point of a first-apply migration); a
     // second, more cautious guidance block right under it would contradict
     // it as much as it would repeat it.
     if (units.len > 0 and !collapse) try renderGuidance(out, units);

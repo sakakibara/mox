@@ -117,9 +117,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 problems += 1;
                 continue;
             }) |outputs| {
-                // The drift summary scopes a generator to its OWN row (D4):
-                // any one drifted leaf is enough to add it once, regardless
-                // of how many leaves under it drifted.
+                // The drift summary scopes a generator to its own row: any
+                // one drifted leaf is enough to add it once, regardless of
+                // how many leaves under it drifted.
                 var gen_drifted = false;
                 for (outputs) |o| {
                     // Kind guard BEFORE the open: a FIFO here would block the

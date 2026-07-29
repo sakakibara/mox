@@ -1,8 +1,8 @@
-//! Fold-1 gates for the unified drift classifier and `mox apply`'s
-//! non-interactive core: the clean-tree differential, one fixture per D3
-//! kind (plus first-contact) asserting skip-and-collect and `--overwrite`
-//! convergence, the 0/1/2 exit-code split, and `status`/`apply` agreement on
-//! the drift set for the same tree.
+//! Coverage for the unified drift classifier and `mox apply`'s non-interactive
+//! core: the clean-tree differential, one fixture per drift kind (plus
+//! first-contact) asserting skip-and-collect and `--overwrite` convergence,
+//! the 0/1/2 exit-code split, and `status`/`apply` agreement on the drift set
+//! for the same tree.
 
 const std = @import("std");
 const mox = @import("mox");
@@ -72,7 +72,7 @@ test "clean tree: apply writes, reports no drift, exit 0" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
 }
 
-// -- kind matrix: one fixture per D3 kind + first-contact --
+// -- kind matrix: one fixture per drift kind + first-contact --
 
 test "kind matrix: whole_file edited -- skip, report, --overwrite converges" {
     const io = std.testing.io;
@@ -195,7 +195,7 @@ test "kind matrix: symlink_target -- skip, report, --overwrite converges" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 }
 
-test "kind matrix: symlink over a directory reports drift and stays non-converging under --overwrite (fold-5 gap)" {
+test "kind matrix: symlink over a directory reports drift and stays non-converging under --overwrite" {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -220,8 +220,8 @@ test "kind matrix: symlink over a directory reports drift and stays non-convergi
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "symlink target") != null);
 
-    // Documented gap (D11, fold 5): --overwrite still refuses to replace a
-    // directory with a symlink; it does not converge this fold.
+    // Known, deliberate gap: --overwrite still refuses to replace a
+    // directory with a symlink, so this case never converges on its own.
     const forced = try c.run(&.{ "mox", "apply", "--overwrite", live });
     try std.testing.expect(forced.rc != 0);
     try std.testing.expect(std.mem.indexOf(u8, forced.err, "refusing to replace a directory with a symlink") != null);
@@ -269,8 +269,7 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
     }
     try std.testing.expectEqual(@as(usize, 1), lines);
     // One scopeable unit (the generator itself), even though it carries two
-    // drifted leaves: the safe scoped pre-fill still applies -- the fold-1
-    // gap this closes.
+    // drifted leaves: the safe scoped pre-fill still applies.
     try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{gen_live})) != null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", gen_live })).rc);
