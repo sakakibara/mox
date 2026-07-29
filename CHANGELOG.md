@@ -7,10 +7,28 @@ All notable changes to mox are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `mox status --drift`, `--json`, and `--porcelain`: emit the drift set (the
+  same set `mox apply` reports, from the same classifier) as a filtered view
+  or as machine-readable data for tooling.
 - `# mox: keep-empty` line directive: materialize a directive-bearing file
   even when it composes to nothing, for a conditionally-present but empty file.
 
 ### Changed
+- `mox apply` is now non-interactive: it writes the files that are clean or
+  absent and never prompts. A drifted file -- one edited since mox last wrote
+  it, or one mox never wrote (a first apply or migration) -- is left untouched
+  and listed in a report on stdout, with the exact command to resolve it:
+  `mox apply --overwrite <path>` takes the repo's version, `mox commit <path>`
+  keeps the live edit. `--overwrite` is the flag's name now, with `--force`
+  retained as an alias. Exit codes are 0 (clean), 1 (drift left unresolved),
+  2 (a genuine failure); the drift report moved from stderr to stdout.
+- `mox commit` keeps a hand-edit for every kind of drift, not only a file mox
+  last wrote. With no stored baseline (a first apply, or a secret-bearing
+  composition whose cleartext is not cached) it recomposes the source to
+  rebuild a verifiable baseline and routes the edit against it.
+- A managed symlink whose live path is a directory now converges under
+  `--overwrite`: the directory is snapshotted (recoverable via `mox rollback`)
+  and replaced with the link, instead of being refused.
 - A directive-bearing file that composes to nothing is no longer written as a
   0-byte file; it is omitted, matching the generator rule where zero data
   already produces zero files. A file mox previously wrote whose source now

@@ -53,7 +53,7 @@ mox add-tree ~/.config/nvim            # every file under a directory
 The file is now managed. Check state any time:
 
 ```sh
-mox status        # clean / OUTDATED / DRIFT / MISSING / GATED per file
+mox status        # clean / OUTDATED / DRIFT / MISSING / STALE / GATED per file
 mox diff          # the actual composed-vs-live diff
 ```
 
@@ -116,21 +116,26 @@ affect composing differently rolls the file back.
 ## When apply meets an edited live file
 
 `mox apply` never silently overwrites a live file you (or a program) edited
-since mox last wrote it. On a terminal it asks, per file:
+since mox last wrote it. It does not prompt either: it writes the files that
+are clean, leaves the drifted ones untouched, and prints a report of them:
 
 ```
-DRIFT  ~/.config/nvim/pack-lock.json
-  [o]verwrite  [c]ommit  [d]iff  [s]kip  [O] all  [S] skip all  [q]uit
+mox apply
+  3 written
+
+  1 drifted, left untouched
+    ~/.config/nvim/pack-lock.json   edited since mox wrote it
+      take the repo's version:  mox apply --overwrite ~/.config/nvim/pack-lock.json
+      keep your edit:           mox commit ~/.config/nvim/pack-lock.json
 ```
 
-`[o]` discards the live edit and writes the composed output (snapshotted
-first). `[c]` keeps the live edit -- it runs `commit` on that file after the
-apply, so the change lands in its source and the file ends in sync. `[d]`
-shows the diff and asks again. Two drifted files wanting opposite outcomes
-resolve in one run.
-
-Off a terminal (scripts, CI) nothing is asked: drifted files are skipped,
-reported, and the run exits 1. `--force` overwrites them all without asking.
+`mox apply --overwrite <path>` discards the live edit and writes the composed
+output (snapshotted first, recoverable via `mox rollback`). `mox commit <path>`
+keeps the live edit, routing it back into the source so the file ends in sync.
+`--overwrite` with no path takes the repo's version of every drifted file;
+`mox status --drift` lists them all (`--json`/`--porcelain` for tooling). The
+run exits 1 while any drift is unresolved, so a script notices. `--force` is a
+retained alias of `--overwrite`.
 
 ## A Mac-only (or per-profile) difference
 
@@ -342,13 +347,13 @@ contract is the deliverable, never a whole live file that belongs partly to
 the program.
 
 Drift protection follows the whole-file rule over the owned content: it is
-compared against what mox last applied, and a mismatch asks (or is skipped
-and reported, off a terminal) instead of overwriting. First contact -- no
+compared against what mox last applied, and a mismatch is reported as drift
+and left untouched instead of overwritten. First contact -- no
 applied record yet, a path newly added to `own`, or one removed from
 `disown` -- needs consent too: live content already matching the source is
 adopted without asking (`adopted` in the apply output); anything else is
-`DRIFT`, resolved through the usual `[o]verwrite / [c]ommit / [d]iff /
-[s]kip` prompt or `mox apply --force`. A path newly added to `disown` simply
+`DRIFT`, resolved the usual way -- `mox apply --overwrite <path>` or
+`mox commit <path>`. A path newly added to `disown` simply
 stops being compared -- the protected set grew. There is no way for mox to
 take over existing content without you seeing it.
 
@@ -378,7 +383,7 @@ usual rule -- cleartext is written live, never cached -- so the owned record
 keeps only a hash. The consequences: `mox diff` masks such keys on both sides
 (a change confined to secret keys shows no diff), `mox commit` skips the file
 (`contains a secret; edit its source directly` -- there is no cleartext to
-route) and the apply prompt refuses `[c]` the same way, snapshots store masked
+route), snapshots store masked
 values, and `mox rollback` refuses a snapshot whose owned values were masked:
 placeholders are never written live; re-apply the source instead.
 

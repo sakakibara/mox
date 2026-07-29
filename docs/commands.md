@@ -86,8 +86,8 @@ live remainder is not mox's to delete).
 ## apply
 
 Compose all managed files and write them to their live paths
-(`--dry-run`, `--force`, `--skip-scripts`, `--defaults`, or a list of
-paths to limit the run).
+(`--dry-run`, `--overwrite`, `--skip-scripts`, `--defaults`, or a list of
+paths to limit the run). `--force` is a retained alias of `--overwrite`.
 
 Before composing, apply discovers the repo's fact interview (below) and
 walks it: on a terminal it prompts for every
@@ -101,18 +101,19 @@ facts left unbound (`unbound facts: <names>`) and how to resolve them.
 There is no global refusal for an unresolved fact -- that is a
 per-script concern (below), not this pass's to fail wholesale.
 
-A live file edited since mox last wrote it is never overwritten
-silently. On a terminal each one asks `[o]verwrite` (discard the live
-edit), `[c]ommit` (route the live edit back into its source layer,
-verified like any other commit), `[d]iff`, `[s]kip`, or `[O]`/`[S]` to
-answer the rest the same way -- so two drifted files wanting opposite
-outcomes are resolved in one run. Off a terminal, or with `--dry-run`,
-drifted files are skipped and reported and the run exits 1; `--force`
-overwrites them all without asking. Interactive drift resolution and
-the facts interview share one buffered stdin reader. Piping answers on
-stdin does not make a run interactive: off a terminal the interview
-takes the non-interactive path -- script a bootstrap with `--defaults`
-or pre-seed `mox facts set` instead.
+apply is non-interactive. It writes every file that is clean or absent
+and never silently changes one that has drifted -- a live file edited
+since mox last wrote it, or one mox never wrote (a first apply or
+migration). Drifted files are left untouched, listed in a report on
+stdout, and the run exits 1. The report names each file, what changed,
+and the exact command to resolve it: `mox apply --overwrite <path>`
+takes the repo's version, `mox commit <path>` keeps the live edit by
+routing it back into its source. `--overwrite` (alias `--force`) with no
+paths overwrites every drifted file; a path list scopes it. `mox status
+--drift` lists the full set at any time, and `--json`/`--porcelain` emit
+it for tooling. A genuine failure -- an unresolvable fact contract, an
+unwritable target, an unsnapshottable removal -- exits 2, distinct from
+drift's 1.
 
 A partially owned file (an `own` or `disown` head declaration) is
 patched around the other side's content: the owned content is written,
@@ -158,6 +159,14 @@ Routing: base lines go to `src/`, fragment lines to their fragment,
 loop-row edits to the data source. Private-origin edits go only to the
 private layer, never repo `src/`. A value derived from a secret or an
 interpolation is reported, never routed.
+
+Keeping a live edit works for every kind of drift, not only a file mox
+last wrote. When there is no stored baseline -- a first apply, or a
+secret-bearing composition whose cleartext is deliberately not cached --
+commit recomposes the source to rebuild a verifiable baseline and routes
+the edit against it. A source that now composes to nothing is the one
+exception: there is no file to route into, so commit reports it and
+leaves the live copy for you to remove or re-fill.
 
 A file merged from several layers routes per KEY instead of per line,
 `[y/p/s]`: each changed key goes to the layer that defines it, and `p`
@@ -207,6 +216,14 @@ composes to nothing: apply will remove it (an edited such file is
 classified on its owned content only, so the program's writes on the
 other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 `MISSING`, `STALE`, or `ERROR`.
+
+`--drift` shows only the drift set (the report `mox apply` prints for the
+same tree, from the same classifier -- the two never disagree), dropping
+the clean/gated table and the probe/unbound context. `--json` and
+`--porcelain` serialize that set for tooling instead of the human report:
+`--json` as an array of `{path, kind, key?, first_contact}`, `--porcelain`
+as stable tab-separated lines (`kind`, `key`, `first_contact` 0/1,
+`path`). Both imply `--drift` and keep the same exit code.
 
 ## export
 
