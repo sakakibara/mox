@@ -73,6 +73,10 @@ const Head = struct {
     /// A leading whole-file gate held: `text` is the gate's body and composes
     /// by the file's native category, never through Cat B.
     gate_on: bool = false,
+    /// The file declares `own`/`disown`: mox owns only part of a file a program
+    /// also writes. Such a file is patched, never materialized or omitted
+    /// wholesale, so an empty render is "mox owns nothing here", not "no file".
+    partial: bool = false,
 };
 
 /// Read the base layer and run the ONE leading-block pass: parse the head
@@ -99,17 +103,18 @@ fn readBaseHead(
         // intact so the failure surfaces with a source location downstream.
         else => return .{ .text = raw },
     };
+    const partial = parsed.ownership != .none;
     const stripped = if (parsed.spans.len == 0) raw else try source.head.stripSpans(arena, raw, parsed.spans);
-    if (parsed.gate == null) return .{ .text = stripped };
+    if (parsed.gate == null) return .{ .text = stripped, .partial = partial };
     // The candidate is a whole-file existence gate only when the DSL agrees:
     // the file must parse, and the gate must run to EOF (a matching `end`
     // later makes it a region, composed through Cat B).
-    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return .{ .text = stripped };
-    if (!dsl.axis.evaluate(expr, bindings)) return .{ .text = stripped, .absent = true };
+    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return .{ .text = stripped, .partial = partial };
+    if (!dsl.axis.evaluate(expr, bindings)) return .{ .text = stripped, .absent = true, .partial = partial };
     // The gate line is line 1 of the stripped text by construction; consume
     // exactly it.
     const nl = std.mem.indexOfScalar(u8, stripped, '\n');
-    return .{ .text = if (nl) |n| stripped[n + 1 ..] else "", .gate_on = true };
+    return .{ .text = if (nl) |n| stripped[n + 1 ..] else "", .gate_on = true, .partial = partial };
 }
 
 fn formatOf(path: []const u8) ?Format {
@@ -154,7 +159,7 @@ fn composeToml(
     // include / from / when. A whole-file gate composes its body structurally.
     // The pass-through preserves comments, blank lines, and key ordering.
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
@@ -194,7 +199,7 @@ fn composeJson(
     if (hd.absent) return null;
 
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirectiveJson(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        if (!hd.gate_on and containsMoxDirectiveJson(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
@@ -241,7 +246,7 @@ fn composeYaml(
     if (hd.absent) return null;
 
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 
@@ -286,7 +291,7 @@ fn composeSectionMerge(
     if (hd.absent) return null;
 
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text);
+        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
     }
 

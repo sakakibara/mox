@@ -317,7 +317,7 @@ pub fn composeTracked(
 ) !?[]u8 {
     if (!file.has_base) return error.NoBase;
     const base_raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
-    return composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, base_raw);
+    return composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, base_raw, true);
 }
 
 /// `composeTracked` with the base layer's text already in hand. Cat A routes
@@ -334,6 +334,7 @@ pub fn composeTrackedContent(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
     base_content: []const u8,
+    omit_on_empty: bool,
 ) !?[]u8 {
     if (!file.has_base) return error.NoBase;
 
@@ -386,6 +387,11 @@ pub fn composeTrackedContent(
         if (!dsl.axis.evaluate(w, bindings)) return null;
     }
 
+    var keep_empty = false;
+    for (parsed.directives) |d| {
+        if (d.kind == .keep_empty) keep_empty = true;
+    }
+
     var empty_record = std.StringHashMap(data_mod.value.Value).init(arena);
     const top_nest: Nest = .{ .marker = marker, .record = &empty_record, .in_for = false, .depth = 0 };
 
@@ -433,7 +439,25 @@ pub fn composeTrackedContent(
     }
     if (prov) |p| prov_mod.map.truncateTo(p, prov_mod.map.lineCount(out.items));
 
+    // A directive-bearing template that composed to nothing (a zero-iteration
+    // loop, a gated-off region, all content stripped) has no reason to exist:
+    // omit it, the same as a whole-file gate. `keep-empty` opts back in to a
+    // materialized empty file. A directiveless empty file never reaches here --
+    // it passes through the no-marker branch above and materializes verbatim.
+    // A partial (owned-key) file opts out too: its empty render means mox owns
+    // nothing here, not that the whole file (which a program also writes)
+    // should vanish.
+    if (omit_on_empty and !keep_empty and isBlank(out.items)) return null;
+
     return try out.toOwnedSlice(arena);
+}
+
+/// True when `s` is empty or only ASCII whitespace. A template that leaves a
+/// stray blank line outside a zero-iteration loop still counts as an empty
+/// render (`keep-empty` overrides), so authoring a trailing newline does not
+/// defeat the omit.
+fn isBlank(s: []const u8) bool {
+    return std.mem.indexOfNone(u8, s, " \t\r\n") == null;
 }
 
 /// The leading `when` directive's axis expression when it is a genuine
@@ -1124,6 +1148,9 @@ fn emitDirective(
         // consumed and emits nothing, never gates anything, and is not a
         // region.
         .default => {},
+        // A file-level flag consulted at the empty-render check; the line
+        // itself is consumed and emits nothing.
+        .keep_empty => {},
         .secret => |s| {
             // A dedicated-manager secret marks the file for auto-0600 (set on
             // the resolve path before resolution; a failure aborts the compose).

@@ -146,7 +146,7 @@ fn addDirective(ax: *Axes, d: dsl.ast.Directive) !void {
             if (k.where) |r| try addRowExpr(ax, r);
         },
         .completions => |k| if (k.when) |w| try addAxisExpr(ax, w),
-        .from, .secret, .default => {},
+        .from, .secret, .default, .keep_empty => {},
     }
 }
 

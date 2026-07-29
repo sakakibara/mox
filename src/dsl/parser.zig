@@ -151,6 +151,14 @@ pub fn parseLineDirective(arena: std.mem.Allocator, args: []const u8, line_no: u
             .end_line = line_no,
         };
     }
+    if (std.mem.eql(u8, verb, "keep-empty")) {
+        try ps.expectEof();
+        return .{
+            .kind = .keep_empty,
+            .start_line = line_no,
+            .end_line = line_no,
+        };
+    }
     if (std.mem.eql(u8, verb, "default")) {
         const name = switch (ps.peek().kind) {
             .ident => |s| s,
@@ -216,6 +224,20 @@ test "parseLineDirective: secret" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const dir = try parseLineDirective(fba.allocator(), "secret \"op://foo\"", 1);
     try std.testing.expectEqualStrings("op://foo", dir.kind.secret.uri);
+}
+
+test "parseLineDirective: keep-empty" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const dir = try parseLineDirective(fba.allocator(), "keep-empty", 3);
+    try std.testing.expect(dir.kind == .keep_empty);
+    try std.testing.expectEqual(@as(u32, 3), dir.start_line);
+}
+
+test "parseLineDirective: keep-empty rejects trailing tokens" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    try std.testing.expectError(error.UnexpectedTrailingTokens, parseLineDirective(fba.allocator(), "keep-empty please", 1));
 }
 
 test "parseLineDirective: default" {

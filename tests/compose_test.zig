@@ -368,6 +368,114 @@ test "compose catB: scoped when...end on line 1 gates only its region, keeps tra
     try std.testing.expect(std.mem.indexOf(u8, out.?, "mac-only line") == null);
 }
 
+test "compose catB: a directive-bearing file that composes to empty is omitted, not written blank" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A scoped when...end (not a whole-file gate: it has an end) covering every
+    // content line. Gated off, nothing is emitted, so the file has no reason to
+    // exist -- it must be omitted, not materialized as a 0-byte file.
+    try writeFile(io, tmp.dir, "src/.config/git/only-mac.inc", "# mox: when os=darwin\n" ++
+        "[core]\n" ++
+        "\teditor = mac\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("os", "linux");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out == null);
+}
+
+test "compose catB: a directiveless empty file still materializes as an empty file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // No directives at all -> a genuine empty file (.hushlogin / .keep), which
+    // must be materialized verbatim, never omitted.
+    try writeFile(io, tmp.dir, "src/.hushlogin", "");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out != null);
+    try std.testing.expectEqualStrings("", out.?);
+}
+
+test "compose catB: keep-empty materializes an empty file instead of omitting it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Same empty render as the omit case, but keep-empty opts the file back in:
+    // a conditionally-present but empty file (materialized 0 bytes, not dropped).
+    try writeFile(io, tmp.dir, "src/.config/git/only-mac.inc", "# mox: keep-empty\n" ++
+        "# mox: when os=darwin\n" ++
+        "[core]\n" ++
+        "\teditor = mac\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("os", "linux");
+
+    const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
+    try std.testing.expect(out != null);
+    try std.testing.expectEqualStrings("", out.?);
+}
+
+test "compose catB: keep-empty on a generator is rejected, not silently ignored" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // keep-empty governs a single-file template's empty render; a generator
+    // (for ... into) already produces zero files for zero data, so the two do
+    // not combine. The extra directive drops it out of generator detection and
+    // the normal path then rejects the `into` loudly.
+    try writeFile(io, tmp.dir, "src/.config/gen.gen", "# mox: keep-empty\n" ++
+        "# mox: for x in \"data/xs.toml\" into \"out-<x.k>\"\n" ++
+        "content <x.k>\n" ++
+        "# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.config/xs.toml", "[[xs]]\nk = \"one\"\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    try std.testing.expectError(
+        error.IntoOnNonGenerator,
+        mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null),
+    );
+}
+
 test "compose catB: .psm1 gated on os=windows composes to nothing under darwin" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -753,14 +861,15 @@ test "compose catB: a default directive nested in a when-gate body is stripped; 
     try std.testing.expectEqualStrings("export WORK=1\n", work_out);
 
     // The default directive never gates: the enclosing `when` alone decides
-    // whether its sibling content emits. The gate is scoped (`# mox: end`),
-    // not a whole-file gate, so a false condition composes to empty content
-    // rather than omitting the file.
+    // whether its sibling content emits. The gate is scoped (`# mox: end`), so
+    // it is not a whole-file existence gate -- but a false condition still
+    // leaves the file composing to nothing, so it is omitted (a directive-
+    // bearing template that renders empty), the same as any empty render.
     var personal = std.StringHashMap([]const u8).init(a);
     var personal_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &personal } };
     try personal.put("profile", "personal");
-    const personal_out = (try mox.compose.catB.compose(a, io, tree.files[0], &personal_r, null)).?;
-    try std.testing.expectEqualStrings("", personal_out);
+    const personal_out = try mox.compose.catB.compose(a, io, tree.files[0], &personal_r, null);
+    try std.testing.expect(personal_out == null);
 }
 
 test "compose catB: a default directive nested in a for-loop body is stripped from every row" {
@@ -1037,11 +1146,10 @@ test "compose catB: for-loop with when filter (machine doesn't match) suppresses
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-    // env=WSL not bound -- loop should be suppressed.
-
+    // env=WSL not bound -- loop suppressed, so the whole file (nothing but the
+    // loop) composes to nothing and is omitted.
     const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
-    try std.testing.expect(out != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.?, "abbr") == null);
+    try std.testing.expect(out == null);
 }
 
 test "compose catB: repo-relative loop data source resolves private layer first" {
@@ -1670,13 +1778,14 @@ test "compose catA toml: a terminated whole-file when...end region is not an exi
     try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "inner = 8") != null);
 
-    // Region gated off: the file still materializes (empty), it is not absent.
+    // Region gated off: with no content left, the file composes to nothing and
+    // is omitted -- not because the scoped region is a whole-file existence
+    // gate (it is not), but because an empty render means no file.
     var off = std.StringHashMap([]const u8).init(arena.allocator());
     var off_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &off } };
     try off.put("os", "linux");
     const gated = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &off_r, null, null);
-    try std.testing.expect(gated != null);
-    try std.testing.expectEqual(@as(usize, 0), gated.?.len);
+    try std.testing.expect(gated == null);
 }
 
 test "compose catB: extensionless file with #! shebang infers # marker" {
@@ -3375,8 +3484,10 @@ test "compose catB: for inside a top-level when composes when the gate passes" {
     var off = std.StringHashMap([]const u8).init(arena.allocator());
     var off_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &off } };
     try off.put("os", "linux");
-    const out_off = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &off_r, null)).?;
-    try std.testing.expect(std.mem.indexOf(u8, out_off, "item") == null);
+    // Gate off: nothing composes, so the file (nothing but the gated loop) is
+    // omitted.
+    const out_off = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &off_r, null);
+    try std.testing.expect(out_off == null);
 }
 
 test "compose catB: pathologically deep nesting terminates with RecursionTooDeep" {

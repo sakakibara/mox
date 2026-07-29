@@ -229,6 +229,12 @@ pub const Directive = struct {
         secret: struct {
             uri: []const u8,
         },
+        /// `# mox: keep-empty` - line-level, no arguments. Marks a template to
+        /// materialize even when it composes to nothing, instead of being
+        /// omitted (the default for a directive-bearing file that renders
+        /// empty). Emits and gates nothing; stripped from output. A whole-file
+        /// existence gate still wins: an off gate omits the file regardless.
+        keep_empty,
         /// `# mox: default <name>="<value>"` - line-level. Declares the
         /// interview default for fact `<name>`; stripped from output, never
         /// gates or emits anything, and compose semantics are otherwise

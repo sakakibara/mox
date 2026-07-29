@@ -577,7 +577,7 @@ const Discoverer = struct {
                 }
             },
             .completions => |k| if (k.when) |w| try self.recordAxisExpr(w, source_key, ctx),
-            .from, .secret, .default => {},
+            .from, .secret, .default, .keep_empty => {},
         }
     }
 
@@ -772,7 +772,7 @@ const Discoverer = struct {
                 };
                 try self.scanBody(loop.body_template, source_key, inner);
             },
-            .completions, .secret, .default => {},
+            .completions, .secret, .default, .keep_empty => {},
         }
     }
 
