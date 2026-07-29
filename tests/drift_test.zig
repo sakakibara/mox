@@ -275,6 +275,35 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 }
 
+test "migration: many pre-existing first-contact files collapse into one block on a real apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    const names = [_][]const u8{ "f0", "f1", "f2", "f3", "f4", "f5", "f6" };
+    for (names) |n| {
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "repo/src/{s}", .{n}), .data = "source\n" });
+    }
+    const c = try cliSetup(a, io, &tmp);
+    // A fresh machine: every one of the 7 files already exists, pre-dating
+    // mox entirely (no prior apply, so no applied record for any of them).
+    for (names) |n| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(n), .data = "pre-existing\n" });
+    }
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "first apply / migration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "not written by mox") == null);
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    for (names) |n| try std.testing.expectEqualStrings("source\n", try read(io, a, try c.homePath(n)));
+}
+
 // -- exit codes: 0, 1, 2, asserted distinctly --
 
 test "exit codes: 0 clean, 1 drift, 2 a genuine failure -- distinct on the same command" {
@@ -398,7 +427,31 @@ test "status and apply agree on the drift set for the same tree" {
     try std.testing.expect(std.mem.indexOf(u8, ar.out, "app.toml") != null);
     try std.testing.expect(std.mem.indexOf(u8, sr.out, "app.toml") != null);
 
+    // The shared renderer's own rows -- one per drifted unit -- are byte-
+    // identical between the two commands: same paths, same "what drifted",
+    // same overwrite/keep guidance, same order. (Apply's stats line above the
+    // rows and status's per-file table above ITS rows legitimately differ;
+    // only the renderer's own output has to agree.)
+    try std.testing.expectEqualStrings(try driftRows(a, ar.out), try driftRows(a, sr.out));
+
     // Resolving every unit apply named leaves both commands clean.
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
+}
+
+/// Every line of the shared drift-report renderer's own unit table (each
+/// line ends in the row's fixed "keep: mox commit" suffix), newline-joined in
+/// the order they appeared -- used to compare `apply` and `status` renderer
+/// output directly, ignoring the different, legitimately caller-specific
+/// content each prints around it.
+fn driftRows(a: std.mem.Allocator, out: []const u8) ![]const u8 {
+    var rows: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (std.mem.endsWith(u8, line, "keep: mox commit")) {
+            try rows.appendSlice(a, line);
+            try rows.append(a, '\n');
+        }
+    }
+    return rows.toOwnedSlice(a);
 }

@@ -3,6 +3,9 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
+const tty = @import("tty.zig");
+const style = @import("style.zig");
+const drift_report = @import("drift_report.zig");
 
 /// One status cell: the label to print and whether it counts against the
 /// exit code (the scripting contract: rc 1 when any file needs attention).
@@ -21,6 +24,7 @@ fn cellFor(disp: mox.apply.applied.Disposition) Cell {
 }
 
 const Spec = struct {
+    color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -82,6 +86,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     var problems: usize = 0;
+    // Every drifted unit this run finds, classified the same way `mox apply`
+    // does (same classifier, `apply/drift.zig`) -- fed to the shared renderer
+    // below so the two commands' drift summaries can never disagree. The
+    // per-file clean/OUTDATED/DRIFT/MISSING/ERROR table above stays as is;
+    // this is a second, independent pass over the same disposition values.
+    var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
@@ -107,6 +117,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 problems += 1;
                 continue;
             }) |outputs| {
+                // The drift summary scopes a generator to its OWN row (D4):
+                // any one drifted leaf is enough to add it once, regardless
+                // of how many leaves under it drifted.
+                var gen_drifted = false;
                 for (outputs) |o| {
                     // Kind guard BEFORE the open: a FIFO here would block the
                     // read and brick the whole report.
@@ -125,10 +139,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         },
                     };
                     const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, o.live_path);
-                    const cell = cellFor(mox.apply.applied.classify(recorded, live, o.content));
+                    const disp = mox.apply.applied.classify(recorded, live, o.content);
+                    if (disp == .drift) gen_drifted = true;
+                    const cell = cellFor(disp);
                     if (cell.problem) problems += 1;
                     try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, o.live_path });
                 }
+                if (gen_drifted) try units.append(ctx.alloc, mox.apply.drift.generatedSet(file.live_path));
                 continue;
             }
         }
@@ -167,6 +184,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             const disp = mox.apply.drift.symlinkDisposition(site, recorded_target, target);
             const cell = cellFor(disp);
             if (cell.problem) problems += 1;
+            if (mox.apply.drift.symlink(file.live_path, site, recorded_target, target)) |u| try units.append(ctx.alloc, u);
             try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
             continue;
         }
@@ -191,7 +209,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A partial file is classified on its owned subtree only;
         // program activity outside the declared paths can never surface.
         if (file.own_paths.len > 0) {
-            const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?);
+            const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?, &units);
             if (cell.problem) problems += 1;
             try ctx.out.print("  {s:<8} {s}{s}\n", .{ cell.label, file.live_path, annot });
             continue;
@@ -219,8 +237,21 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const disp = mox.apply.applied.classify(recorded, live, composed.?);
         const cell = cellFor(disp);
         if (cell.problem) problems += 1;
+        if (mox.apply.drift.wholeFile(file.live_path, recorded, live, composed.?)) |u| try units.append(ctx.alloc, u);
         try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
     }
+
+    const sty = style.Style{ .on = style.enabled(
+        tty.isInteractive(1),
+        context.env.get(ctx.alloc, "NO_COLOR") != null,
+        a.color orelse .auto,
+    ) };
+    try drift_report.render(ctx.alloc, ctx.out, units.items, .{
+        .home = home,
+        .sty = sty,
+        .width = tty.terminalWidth(80),
+    });
+
     try printProbeLog(ctx, m_state);
     try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
     return if (problems > 0) 1 else 0;
@@ -297,7 +328,7 @@ fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![
 /// document (OUTDATED), clean when all equal. A composed document violating
 /// its declaration, or an unparseable composed/live file, is ERROR --
 /// the same shapes apply refuses.
-fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8) !Cell {
+fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit)) !Cell {
     const partial_mod = mox.apply.partial;
     const owned_mod = mox.apply.owned;
     const err_cell: Cell = .{ .label = "ERROR", .problem = true };
@@ -336,7 +367,9 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 
     const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, file.live_path);
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
-    return switch (try owned_mod.classifyMode(ctx.alloc, mode, &owned, &live_doc, file.own_paths, record, record_paths)) {
+    const class = try owned_mod.classifyMode(ctx.alloc, mode, &owned, &live_doc, file.own_paths, record, record_paths);
+    if (mox.apply.drift.ownedFile(file.live_path, class, record)) |u| try units.append(ctx.alloc, u);
+    return switch (class) {
         .clean => cellFor(.unchanged),
         .outdated => cellFor(.safe_overwrite),
         .drift => cellFor(.drift),
