@@ -70,11 +70,13 @@ pub fn render(arena: std.mem.Allocator, out: *std.Io.Writer, units: []Unit, opts
         try out.writeAll(" entries in exact dirs / orphaned generator leaves need attention (see messages above; mox apply --overwrite to remove)\n");
     }
 
-    // A collapsed migration block already carries its own guidance (the
-    // unscoped overwrite IS the point of a first-apply migration); a
-    // second, more cautious guidance block right under it would contradict
-    // it as much as it would repeat it.
-    if (units.len > 0 and !collapse) try renderGuidance(out, units);
+    // A collapsed migration block already carries its own guidance for the
+    // first-contact files it swallowed (the unscoped overwrite IS the point
+    // of a first-apply migration); repeating it here would contradict it as
+    // much as it would repeat it. Any OTHER row -- a file mox did write,
+    // since edited -- is not covered by that guidance and still needs its
+    // own scoped pre-fill, collapsed or not.
+    if (rows.items.len > 0) try renderGuidance(out, rows.items);
 }
 
 fn renderSuccessLine(out: *std.Io.Writer, opts: Options, total: usize) !void {
@@ -374,6 +376,25 @@ test "render: many first-contact units collapse into one migration block" {
     try testing.expect(std.mem.indexOf(u8, s, "not written by mox") == null);
     try testing.expect(std.mem.indexOf(u8, s, "overwrite it:") == null);
     try testing.expect(std.mem.indexOf(u8, s, "overwrite one:") == null);
+}
+
+test "render: a collapsed migration block still scopes guidance to an edited unit alongside it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var units: [8]Unit = undefined;
+    const names = [_][]const u8{ ".zshrc", ".gitconfig", ".vimrc", ".bashrc", ".profile", ".tmux.conf", ".editorconfig" };
+    for (names, 0..) |n, i| {
+        units[i] = .{ .path = try std.fmt.allocPrint(a, "/home/u/{s}", .{n}), .kind = .whole_file, .first_contact = true };
+    }
+    units[7] = .{ .path = "/home/u/.ssh/config", .kind = .whole_file, .first_contact = false };
+    const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 200 });
+    // The migration block's own unscoped guidance still shows.
+    try testing.expect(std.mem.indexOf(u8, s, "take the repo's version: mox apply --overwrite") != null);
+    // The edited unit is not swallowed by the collapse: it still gets a row
+    // and its own scoped pre-fill, not just the migration block's unscoped one.
+    try testing.expect(std.mem.indexOf(u8, s, "~/.ssh/config") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite /home/u/.ssh/config\n") != null);
 }
 
 test "render: a small first-contact set does not collapse, rows normally instead" {

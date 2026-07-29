@@ -307,6 +307,42 @@ test "migration: many pre-existing first-contact files collapse into one block o
     for (names) |n| try std.testing.expectEqualStrings("source\n", try read(io, a, try c.homePath(n)));
 }
 
+test "migration: a collapsed first-contact block still scopes guidance to an edited managed file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    const names = [_][]const u8{ "f0", "f1", "f2", "f3", "f4", "f5", "f6" };
+    for (names) |n| {
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "repo/src/{s}", .{n}), .data = "source\n" });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/edited.conf", .data = "source\n" });
+    const c = try cliSetup(a, io, &tmp);
+    // The 7 collapse into a migration block; edited.conf has no live file yet,
+    // so this first apply writes it cleanly (not first-contact).
+    for (names) |n| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(n), .data = "pre-existing\n" });
+    }
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r1.rc);
+
+    // Hand-edit the file mox just wrote: drift, but not first-contact.
+    const edited_live = try c.homePath("edited.conf");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = edited_live, .data = "hand-edited\n" });
+
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "first apply / migration") != null);
+    // The edited file is not swallowed by the migration collapse: it still
+    // gets its own scoped overwrite pre-fill, not only the migration
+    // block's unscoped one.
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{edited_live})) != null);
+}
+
 // -- exit codes: 0, 1, 2, asserted distinctly --
 
 test "exit codes: 0 clean, 1 drift, 2 a genuine failure -- distinct on the same command" {
