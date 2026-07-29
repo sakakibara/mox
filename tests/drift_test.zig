@@ -268,6 +268,10 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
         if (std.mem.indexOf(u8, line, "generated set drifted") != null) lines += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), lines);
+    // One scopeable unit (the generator itself), even though it carries two
+    // drifted leaves: the safe scoped pre-fill still applies -- the fold-1
+    // gap this closes.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{gen_live})) != null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", gen_live })).rc);
     try std.testing.expectEqualStrings("key=a\n", try read(io, a, leaf_a));
