@@ -857,6 +857,16 @@ fn omitFile(
     // latter can be kept as an empty file, so only it earns the keep-empty hint.
     const gated = (mox.compose.wholeFileGateAxisExpr(ctx.alloc, ctx.io, file) catch null) != null;
 
+    // Guard the live read, like every other live-read site: a FIFO/socket/
+    // device/directory where a managed file was must never be opened (a FIFO
+    // would block the whole apply) or removed (not mox's kind to delete).
+    // Mirror status, which reports it and changes nothing -- so the two agree.
+    if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) {
+        counts.skip += 1;
+        try ctx.out.print("  skipped {s} (not a regular file)\n", .{live_path});
+        return;
+    }
+
     const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
     const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch null;
 
@@ -903,6 +913,15 @@ fn omitFile(
         return;
     };
     snapshotted.* = true;
+    // TOCTOU guard, as the overwrite path has before its write: an external
+    // writer landing between the read and the unlink would have its content
+    // destroyed with only the pre-edit bytes snapshotted. Re-check right before
+    // the delete and refuse when the live file changed since the initial read.
+    if (!liveMatchesInitial(ctx.io, ctx.alloc, live_path, live)) {
+        try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{live_path});
+        counts.fail += 1;
+        return;
+    }
     std.Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
         try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ live_path, @errorName(e) });
         counts.fail += 1;

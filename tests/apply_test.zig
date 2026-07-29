@@ -513,6 +513,46 @@ test "apply: an emptied file the user edited is reported as drift, not silently 
     try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "id one\nhand edit\n"));
 }
 
+test "apply: an emptied file whose live path is now a special inode is skipped, its record kept" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config/git");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/git/ids.inc",
+        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath(".config/git/ids.inc");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The data empties, and the live path is replaced by a directory (a
+    // non-regular inode -- the FIFO case would block an unguarded read).
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ c.repo, "data", "ids.toml" }),
+        .data = "ids = []\n",
+    });
+    try Io.Dir.cwd().deleteFile(io, live);
+    try Io.Dir.cwd().createDirPath(io, live);
+
+    // Apply must not read or remove it (never mox's kind to delete), must not
+    // hang, and must leave the applied record intact -- the same as status,
+    // which reports it without reading. Removing it (forgetting the record) here
+    // would diverge from status.
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, live));
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, live, .{})).kind == .directory);
+    try std.testing.expect((try mox.apply.applied.read(a, io, c.state, live)) != null);
+}
+
 fn modeOf(io: Io, path: []const u8) !u32 {
     const st = try Io.Dir.cwd().statFile(io, path, .{});
     return @intCast(st.permissions.toMode() & 0o777);
