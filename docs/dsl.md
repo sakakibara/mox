@@ -34,10 +34,13 @@ whose output ends up empty -- a `for` over an empty data set, a `when`/region
 that gated everything away -- and matches the generator rule, where zero rows
 already produce zero files.
 
-A file with **no** directives is exempt: a genuinely empty source (`.hushlogin`,
-a `.keep`) is written verbatim as an empty file. To keep a directive-bearing
-file present even when it renders empty -- a conditionally-present but empty
-file -- add `# mox: keep-empty`.
+Two kinds of file are exempt. A file with **no** directives: a genuinely empty
+source (`.hushlogin`, a `.keep`) is written verbatim as an empty file. And a
+partially owned file (an `own`/`disown` head): mox patches only its declared
+keys into a file a program also writes, so an empty render there means "mox owns
+nothing here", not "no file". To keep an ordinary directive-bearing file present
+even when it renders empty -- a conditionally-present but empty file -- add
+`# mox: keep-empty`.
 
 When a file that mox previously wrote starts composing to nothing, `mox apply`
 removes the stale live copy (snapshot-first, so `mox rollback` recovers it). A
