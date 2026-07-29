@@ -204,19 +204,26 @@ fn homeRelative(arena: std.mem.Allocator, home: []const u8, live_path: []const u
     return live_path;
 }
 
-/// `s` shortened to exactly `max` bytes when longer, keeping the basename
+/// `s` shortened to at most `max` bytes when longer, keeping the basename
 /// whole and a leading slice of `s` before a `...` marker -- "the middle
 /// goes missing, the filename never does". Falls back to the basename's own
 /// tail when `max` is too narrow to fit the marker plus the basename at all.
+/// A cut that would land inside a multibyte UTF-8 codepoint backs off to the
+/// nearest earlier boundary instead, so the result is always valid UTF-8
+/// (a path component can be non-ASCII, e.g. a kana directory name); this can
+/// make the result up to a few bytes shorter than `max`, never longer.
 fn truncateMiddle(arena: std.mem.Allocator, s: []const u8, max: usize) ![]const u8 {
     if (s.len <= max) return s;
     const base = std.fs.path.basename(s);
     const marker = "...";
     if (base.len + marker.len >= max) {
         if (base.len <= max) return base;
-        return base[base.len - max ..];
+        var tail_start = base.len - max;
+        while (tail_start < base.len and base[tail_start] & 0xC0 == 0x80) tail_start += 1;
+        return base[tail_start..];
     }
-    const head_len = max - marker.len - base.len;
+    var head_len = max - marker.len - base.len;
+    while (head_len > 0 and s[head_len] & 0xC0 == 0x80) head_len -= 1;
     return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ s[0..head_len], marker, base });
 }
 
@@ -432,4 +439,41 @@ test "truncateMiddle: exact length, basename preserved" {
     try testing.expect(std.mem.endsWith(u8, t, "settings.json"));
     try testing.expect(std.mem.indexOf(u8, t, "...") != null);
     try testing.expectEqualStrings(long, try truncateMiddle(a, long, long.len));
+}
+
+test "truncateMiddle: a head cut that would split a multibyte codepoint backs off to the boundary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 14 ASCII bytes, then U+3042 (3 bytes), then 4 more ASCII bytes, then
+    // "/file.txt" -- max=26 computes a head cut of 15 bytes, landing on the
+    // second byte of the 3-byte codepoint.
+    const s = "aaaaaaaaaaaaaa" ++ "\u{3042}" ++ "bbbb" ++ "/file.txt";
+    const t = try truncateMiddle(a, s, 26);
+    try testing.expect(std.unicode.utf8ValidateSlice(t));
+    try testing.expect(std.mem.endsWith(u8, t, "file.txt"));
+    try testing.expect(std.mem.indexOf(u8, t, "...") != null);
+}
+
+test "truncateMiddle: a basename-tail cut that would split a multibyte codepoint backs off to the boundary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Basename alone (with the marker) already exceeds max, so the fallback
+    // keeps a tail slice of the basename -- U+3042 sits right at the cut.
+    const s = "/dir/aa" ++ "\u{3042}" ++ "settings.json";
+    const t = try truncateMiddle(a, s, 15);
+    try testing.expect(std.unicode.utf8ValidateSlice(t));
+}
+
+test "render: a narrow terminal middle-truncates a kana path into valid UTF-8" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var units = [_]Unit{
+        .{ .path = "/home/u/.config/" ++ "\u{3075}\u{308a}\u{304c}\u{306a}" ** 6 ++ "/settings.json", .kind = .whole_file, .first_contact = false },
+    };
+    const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 100 });
+    try testing.expect(std.unicode.utf8ValidateSlice(s));
+    try testing.expect(std.mem.indexOf(u8, s, "settings.json") != null);
 }
