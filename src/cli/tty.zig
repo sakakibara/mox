@@ -28,10 +28,51 @@ const win = struct {
         hConsoleHandle: std.os.windows.HANDLE,
         lpMode: *std.os.windows.DWORD,
     ) callconv(.winapi) std.os.windows.BOOL;
+
+    const COORD = extern struct { X: std.os.windows.SHORT, Y: std.os.windows.SHORT };
+    const SMALL_RECT = extern struct {
+        Left: std.os.windows.SHORT,
+        Top: std.os.windows.SHORT,
+        Right: std.os.windows.SHORT,
+        Bottom: std.os.windows.SHORT,
+    };
+    const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+        dwSize: COORD,
+        dwCursorPosition: COORD,
+        wAttributes: std.os.windows.WORD,
+        srWindow: SMALL_RECT,
+        dwMaximumWindowSize: COORD,
+    };
+    extern "kernel32" fn GetConsoleScreenBufferInfo(
+        hConsoleOutput: std.os.windows.HANDLE,
+        lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO,
+    ) callconv(.winapi) std.os.windows.BOOL;
 };
+
+/// Best-effort stdout column count: the terminal's own report when stdout is
+/// a real console, `fallback` otherwise (piped, redirected, or the query
+/// itself fails). Never blocks and never errors -- a report that cannot
+/// learn the real width degrades to the fallback instead of failing.
+pub fn terminalWidth(fallback: usize) usize {
+    if (!isInteractive(1)) return fallback;
+    if (builtin.os.tag == .windows) {
+        var info: win.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+        const handle = std.os.windows.peb().ProcessParameters.hStdOutput;
+        if (!win.GetConsoleScreenBufferInfo(handle, &info).toBool()) return fallback;
+        const cols = @as(isize, info.srWindow.Right) - @as(isize, info.srWindow.Left) + 1;
+        return if (cols > 0) @intCast(cols) else fallback;
+    }
+    var ws: std.posix.winsize = undefined;
+    if (std.c.ioctl(1, std.c.T.IOCGWINSZ, &ws) != 0) return fallback;
+    return if (ws.col > 0) ws.col else fallback;
+}
 
 test "isInteractive is callable for a standard fd" {
     // A test runner's stdin is typically not a console; assert the call
     // returns without panicking rather than a specific value.
     _ = isInteractive(0);
+}
+
+test "terminalWidth: falls back when stdout is not a console (the test runner's pipe)" {
+    try std.testing.expectEqual(@as(usize, 80), terminalWidth(80));
 }

@@ -36,6 +36,9 @@ pub const Style = struct {
     pub fn cyan(self: Style, out: *std.Io.Writer) !void {
         try self.open("36", out);
     }
+    pub fn yellow(self: Style, out: *std.Io.Writer) !void {
+        try self.open("33", out);
+    }
 };
 
 test "enabled: TTY x NO_COLOR x flag truth table" {
@@ -71,6 +74,7 @@ test "Style: palette helpers emit the right code" {
         .{ "dim", "\x1b[2m" },
         .{ "bold", "\x1b[1m" },
         .{ "cyan", "\x1b[36m" },
+        .{ "yellow", "\x1b[33m" },
     };
     const on = Style{ .on = true };
     inline for (cases) |case| {

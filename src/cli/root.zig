@@ -26,10 +26,12 @@ pub const sync_cmd = @import("sync.zig");
 pub const upgrade_cmd = @import("upgrade.zig");
 pub const lock = @import("lock.zig");
 pub const rollback_cmd = @import("rollback.zig");
+pub const drift_report = @import("drift_report.zig");
 pub const app = @import("app.zig");
 
 test {
     _ = app;
+    _ = drift_report;
     _ = rollback_cmd;
     _ = apply_cmd;
     _ = secret_cmd;
