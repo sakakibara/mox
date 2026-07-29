@@ -271,6 +271,10 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
     // One scopeable unit (the generator itself), even though it carries two
     // drifted leaves: the safe scoped pre-fill still applies.
     try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{gen_live})) != null);
+    // The stats line and the drift report must not contradict each other:
+    // one generator drifted, so both count it once, not once per leaf.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Applied: 0 written, 0 unchanged, 0 skipped, 1 drifted, 0 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "1 drifted, left untouched") != null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", gen_live })).rc);
     try std.testing.expectEqualStrings("key=a\n", try read(io, a, leaf_a));

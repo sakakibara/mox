@@ -531,10 +531,12 @@ fn applyPass(
         }, g.prior, &keep_set, ctx.out, ctx.err);
         if (prune.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += prune.error_refused;
-        counts.drift += prune.drift_refused;
+        // Counted once per generator, not once per refused-prune leaf, to
+        // match the ONE unit this folds into below.
         if (prune.drift_refused > 0 and !reported_generators.contains(g.live_path)) {
             try reported_generators.put(g.live_path, {});
             try units.append(ctx.alloc, mox.apply.drift.generatedSet(g.live_path));
+            counts.drift += 1;
         }
         if (!dry_run) try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, g.live_path, g.current);
     }
@@ -868,16 +870,21 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     const disposition = mox.apply.applied.classify(recorded, live, in.bytes);
     switch (disposition) {
         .drift => if (!in.force) {
-            counts.drift += 1;
             if (in.gen_scope) |gen_live_path| {
-                // No per-leaf row: the whole generator collapses to one unit.
+                // No per-leaf row, and no per-leaf count: the whole generator
+                // collapses to one unit, counted once regardless of how many
+                // of its leaves drifted.
                 const reported = in.gen_reported.?;
                 if (!reported.contains(gen_live_path)) {
                     try reported.put(gen_live_path, {});
                     try in.units.append(ctx.alloc, mox.apply.drift.generatedSet(gen_live_path));
+                    counts.drift += 1;
                 }
-            } else if (mox.apply.drift.wholeFile(in.live_path, recorded, live, in.bytes)) |u| {
-                try in.units.append(ctx.alloc, u);
+            } else {
+                counts.drift += 1;
+                if (mox.apply.drift.wholeFile(in.live_path, recorded, live, in.bytes)) |u| {
+                    try in.units.append(ctx.alloc, u);
+                }
             }
             return;
         },
