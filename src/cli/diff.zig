@@ -297,8 +297,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 try ctx.err.print("mox diff:   failing item: {s}\n", .{cap});
             continue;
         };
-        // Axis-gated off for this machine: nothing to compose, nothing to diff.
-        const composed_bytes = composed orelse continue;
+        // Composes to nothing on this machine. If mox wrote a whole file here,
+        // apply would remove it: show the live content on the removed side. A
+        // path mox never wrote (no record) or an already-absent file is not
+        // mox's to remove -- nothing to diff.
+        const composed_bytes = composed orelse {
+            if (file.own_paths.len == 0) {
+                const rec = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+                if (rec != null) try diffOne(ctx, context.paths.state_dir, sty, stat_mode, file.live_path, "", &.{}, &total, &changed);
+            }
+            continue;
+        };
 
         // A partial file diffs its owned subtree only: canonical composed-owned
         // vs canonical live-owned, as text, labeled with the live path.

@@ -110,6 +110,28 @@ test "diff: a drifted file shows its hunk, a clean file shows nothing" {
     try std.testing.expect(std.mem.indexOf(u8, stat.out, "+1 -1") != null);
 }
 
+test "diff: a file whose source now composes to nothing shows the live content as removed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/git/ids.inc", "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nk = \"one\"\n");
+    _ = try h.run(&.{ "mox", "apply" });
+
+    // The data empties: the source composes to nothing, so apply would remove
+    // the file -- diff shows its live content on the removed side.
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "ids = []\n");
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "-id one\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "+id one\n") == null);
+}
+
 test "diff --color=always colors +/- lines; --color=never and the non-TTY default do not" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

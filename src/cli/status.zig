@@ -202,6 +202,29 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             continue;
         };
         if (composed == null) {
+            // Mirror apply's omit handling so status and apply never disagree
+            // on an emptied file. A whole file mox wrote whose source now
+            // composes to nothing is pending removal (live still matches the
+            // record: apply will remove it) or drift (edited since mox wrote
+            // it: apply keeps it and reports). A path with no whole-file record
+            // (a symlink, an owned file, or one mox never wrote) or an absent
+            // live file is simply not here -- GATED, no problem.
+            const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+            const live_omit: ?[]const u8 = if (recorded == null or mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special)
+                null
+            else
+                std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch null;
+            if (recorded != null and live_omit != null) {
+                const live_hash = mox.apply.applied.contentHashHex(live_omit.?);
+                problems += 1;
+                if (std.mem.eql(u8, &recorded.?, &live_hash)) {
+                    try ctx.out.print("  {s:<8} {s}{s}\n", .{ "STALE", file.live_path, annot });
+                } else {
+                    try units.append(ctx.alloc, mox.apply.drift.vanished(file.live_path));
+                    try ctx.out.print("  {s:<8} {s}{s}\n", .{ "DRIFT", file.live_path, annot });
+                }
+                continue;
+            }
             try ctx.out.print("  {s:<8} {s}{s}\n", .{ "GATED", file.live_path, annot });
             continue;
         }

@@ -770,6 +770,16 @@ pub fn commitImpl(
         // Only true drift (live != last-applied) is committable.
         if (std.mem.eql(u8, live, last_content)) continue;
 
+        // A whole-file source that now composes to nothing (an emptied loop, a
+        // gated-off region) has no file to route this edit into. The live copy
+        // is the user's alone: say how to resolve it rather than routing bytes
+        // nowhere, only for the recompose to reject them and roll back.
+        if (file.own_paths.len == 0 and (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, null) catch null) == null) {
+            try ctx.err.print("mox commit: {s}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{file.live_path});
+            pending = true;
+            continue;
+        }
+
         var prov = (try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
             try ctx.out.print("  manual: {s} (no provenance recorded)\n", .{file.live_path});
             manual_count += 1;
