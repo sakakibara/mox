@@ -143,6 +143,60 @@ test "kind matrix: whole_file first-contact -- skip, report as first contact (ne
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 }
 
+test "status --json / --porcelain / --drift: stable machine-readable drift set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "src a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "src b\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    // b.conf pre-exists, never written by mox -> first-contact drift.
+    const hb = try c.homePath("b.conf");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = hb, .data = "preexisting\n" });
+
+    _ = try c.run(&.{ "mox", "apply" }); // writes a.conf + app.toml, skips b.conf
+
+    const ha = try c.homePath("a.conf");
+    const happ = try c.homePath("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ha, .data = "edited\n" }); // whole_file drift
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = happ, .data = "[tui]\nk = 9\n" }); // owned_key drift
+
+    // --json: one array, sorted by path (a.conf, app.toml, b.conf), locked schema.
+    const j = try c.run(&.{ "mox", "status", "--json" });
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+    const want_json = try std.fmt.allocPrint(
+        a,
+        "[{{\"path\":\"{s}\",\"kind\":\"whole_file\",\"first_contact\":false}}," ++
+            "{{\"path\":\"{s}\",\"kind\":\"owned_key\",\"key\":\"tui\",\"first_contact\":false}}," ++
+            "{{\"path\":\"{s}\",\"kind\":\"whole_file\",\"first_contact\":true}}]\n",
+        .{ ha, happ, hb },
+    );
+    try std.testing.expectEqualStrings(want_json, j.out);
+
+    // --porcelain: kind \t key \t first_contact(0|1) \t path, one per line.
+    const p = try c.run(&.{ "mox", "status", "--porcelain" });
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+    const want_porc = try std.fmt.allocPrint(
+        a,
+        "whole_file\t\t0\t{s}\nowned_key\ttui\t0\t{s}\nwhole_file\t\t1\t{s}\n",
+        .{ ha, happ, hb },
+    );
+    try std.testing.expectEqualStrings(want_porc, p.out);
+
+    // --drift: the drift report only, no clean/gated per-file table.
+    const d = try c.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expectEqual(@as(u8, 1), d.rc);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "clean") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "a.conf") != null);
+}
+
 test "kind matrix: vanished -- status and apply agree; matching removes, edited is drift, commit refuses" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

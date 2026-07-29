@@ -25,6 +25,9 @@ fn cellFor(disp: mox.apply.applied.Disposition) Cell {
 
 const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
+    drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
+    json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -85,18 +88,26 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         };
     }
 
+    // `--drift` and the machine formats suppress the per-file table; the rows
+    // still compose (that is how the drift set is found) but write to a discard
+    // sink instead of stdout. The drift set below is then rendered (human) or
+    // serialized (machine) as the only output.
+    const machine = a.json or a.porcelain;
+    const show_table = !(a.drift or machine);
+    var discard_buf: [64]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&discard_buf);
+    const rows: *std.Io.Writer = if (show_table) ctx.out else &discarding.writer;
+
     var problems: usize = 0;
     // Every drifted unit this run finds, classified the same way `mox apply`
     // does (same classifier, `apply/drift.zig`) -- fed to the shared renderer
-    // below so the two commands' drift summaries can never disagree. The
-    // per-file clean/OUTDATED/DRIFT/MISSING/ERROR table above stays as is;
-    // this is a second, independent pass over the same disposition values.
+    // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
         if (file.head_error.len > 0) {
-            try ctx.out.print("  {s:<8} {s} ({s})\n", .{ "ERROR", file.live_path, file.head_error });
+            try rows.print("  {s:<8} {s} ({s})\n", .{ "ERROR", file.live_path, file.head_error });
             problems += 1;
             continue;
         }
@@ -110,9 +121,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             var gdiag: mox.compose.interp.Diag = .{};
             if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
                 if (gdiag.capture()) |cap| {
-                    try ctx.out.print("  {s:<8} {s} (compose failed: {s}: {s})\n", .{ "ERROR", file.live_path, @errorName(e), cap });
+                    try rows.print("  {s:<8} {s} (compose failed: {s}: {s})\n", .{ "ERROR", file.live_path, @errorName(e), cap });
                 } else {
-                    try ctx.out.print("  {s:<8} {s} (compose failed: {s})\n", .{ "ERROR", file.live_path, @errorName(e) });
+                    try rows.print("  {s:<8} {s} (compose failed: {s})\n", .{ "ERROR", file.live_path, @errorName(e) });
                 }
                 problems += 1;
                 continue;
@@ -125,7 +136,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     // Kind guard BEFORE the open: a FIFO here would block the
                     // read and brick the whole report.
                     if (mox.apply.write.guardLiveRead(ctx.io, o.live_path) == .special) {
-                        try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", o.live_path });
+                        try rows.print("  {s:<8} {s}\n", .{ "ERROR", o.live_path });
                         problems += 1;
                         continue;
                     }
@@ -133,7 +144,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         error.FileNotFound => null,
                         error.OutOfMemory => return e,
                         else => {
-                            try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", o.live_path });
+                            try rows.print("  {s:<8} {s}\n", .{ "ERROR", o.live_path });
                             problems += 1;
                             continue;
                         },
@@ -143,7 +154,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     if (disp == .drift) gen_drifted = true;
                     const cell = cellFor(disp);
                     if (cell.problem) problems += 1;
-                    try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, o.live_path });
+                    try rows.print("  {s:<8} {s}\n", .{ cell.label, o.live_path });
                 }
                 if (gen_drifted) try units.append(ctx.alloc, mox.apply.drift.generatedSet(file.live_path));
                 continue;
@@ -157,10 +168,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 break :blk true;
             };
             if (present) {
-                try ctx.out.print("  {s:<8} {s}\n", .{ "clean", file.live_path });
+                try rows.print("  {s:<8} {s}\n", .{ "clean", file.live_path });
             } else {
                 problems += 1;
-                try ctx.out.print("  {s:<8} {s}\n", .{ "MISSING", file.live_path });
+                try rows.print("  {s:<8} {s}\n", .{ "MISSING", file.live_path });
             }
             continue;
         }
@@ -170,12 +181,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // apply's symlink classification, read-only.
         if (file.is_symlink) {
             const composed = mox.compose.composeFile(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets) catch {
-                try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
+                try rows.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
                 problems += 1;
                 continue;
             };
             if (composed == null) {
-                try ctx.out.print("  {s:<8} {s}\n", .{ "GATED", file.live_path });
+                try rows.print("  {s:<8} {s}\n", .{ "GATED", file.live_path });
                 continue;
             }
             const target = std.mem.trim(u8, composed.?, " \t\r\n");
@@ -185,7 +196,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             const cell = cellFor(disp);
             if (cell.problem) problems += 1;
             if (mox.apply.drift.symlink(file.live_path, site, recorded_target, target)) |u| try units.append(ctx.alloc, u);
-            try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
+            try rows.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
             continue;
         }
         // Partial files carry their ownership inventory on every line, so the
@@ -194,9 +205,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, null, &diag) catch |e| {
             if (diag.capture()) |cap| {
-                try ctx.out.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ "ERROR", file.live_path, annot, @errorName(e), cap });
+                try rows.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ "ERROR", file.live_path, annot, @errorName(e), cap });
             } else {
-                try ctx.out.print("  {s:<8} {s}{s} (compose failed: {s})\n", .{ "ERROR", file.live_path, annot, @errorName(e) });
+                try rows.print("  {s:<8} {s}{s} (compose failed: {s})\n", .{ "ERROR", file.live_path, annot, @errorName(e) });
             }
             problems += 1;
             continue;
@@ -218,14 +229,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 const live_hash = mox.apply.applied.contentHashHex(live_omit.?);
                 problems += 1;
                 if (std.mem.eql(u8, &recorded.?, &live_hash)) {
-                    try ctx.out.print("  {s:<8} {s}{s}\n", .{ "STALE", file.live_path, annot });
+                    try rows.print("  {s:<8} {s}{s}\n", .{ "STALE", file.live_path, annot });
                 } else {
                     try units.append(ctx.alloc, mox.apply.drift.vanished(file.live_path));
-                    try ctx.out.print("  {s:<8} {s}{s}\n", .{ "DRIFT", file.live_path, annot });
+                    try rows.print("  {s:<8} {s}{s}\n", .{ "DRIFT", file.live_path, annot });
                 }
                 continue;
             }
-            try ctx.out.print("  {s:<8} {s}{s}\n", .{ "GATED", file.live_path, annot });
+            try rows.print("  {s:<8} {s}{s}\n", .{ "GATED", file.live_path, annot });
             continue;
         }
 
@@ -234,14 +245,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         if (file.own_paths.len > 0) {
             const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?, &units);
             if (cell.problem) problems += 1;
-            try ctx.out.print("  {s:<8} {s}{s}\n", .{ cell.label, file.live_path, annot });
+            try rows.print("  {s:<8} {s}{s}\n", .{ cell.label, file.live_path, annot });
             continue;
         }
 
         // Kind guard BEFORE the open: a FIFO here would block the read and
         // brick the whole report.
         if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
-            try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
+            try rows.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
             problems += 1;
             continue;
         }
@@ -251,7 +262,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             // reason to abort the whole status report.
             error.OutOfMemory => return e,
             else => {
-                try ctx.out.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
+                try rows.print("  {s:<8} {s}\n", .{ "ERROR", file.live_path });
                 problems += 1;
                 continue;
             },
@@ -261,7 +272,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const cell = cellFor(disp);
         if (cell.problem) problems += 1;
         if (mox.apply.drift.wholeFile(file.live_path, recorded, live, composed.?)) |u| try units.append(ctx.alloc, u);
-        try ctx.out.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
+        try rows.print("  {s:<8} {s}\n", .{ cell.label, file.live_path });
+    }
+
+    // One order for every consumer -- the report and both serializers -- so
+    // machine output is stable across runs, OSes, and pipes.
+    mox.apply.drift.sortByPath(units.items);
+
+    if (machine) {
+        if (a.json) try emitJson(ctx.out, units.items) else try emitPorcelain(ctx.out, units.items);
+        return if (problems > 0) 1 else 0;
     }
 
     const sty = style.Style{ .on = style.enabled(
@@ -275,9 +295,65 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         .width = tty.terminalWidth(80),
     });
 
-    try printProbeLog(ctx, m_state);
-    try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
+    // The probe log and unbound-facts sections are the full-report context, not
+    // part of the drift set, so `--drift` omits them.
+    if (show_table) {
+        try printProbeLog(ctx, m_state);
+        try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
+    }
     return if (problems > 0) 1 else 0;
+}
+
+/// Emit the drift set as JSON: an array of `{path, kind, [key], first_contact}`.
+/// `kind` is a stable tag (`whole_file`, `owned_key`, `symlink_target`,
+/// `generated_set`, `vanished`); `key` appears only for `owned_key` (its owned
+/// key path, or null for a secret whole-scope record). The schema is locked by
+/// test so tooling consumes this instead of parsing the human report.
+fn emitJson(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
+    try out.writeByte('[');
+    for (units, 0..) |u, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.writeAll("{\"path\":");
+        try writeJsonString(out, u.path);
+        try out.print(",\"kind\":\"{s}\"", .{@tagName(u.kind)});
+        switch (u.kind) {
+            .owned_key => |k| {
+                try out.writeAll(",\"key\":");
+                if (k) |key| try writeJsonString(out, key) else try out.writeAll("null");
+            },
+            else => {},
+        }
+        try out.writeAll(",\"first_contact\":");
+        try out.writeAll(if (u.first_contact) "true" else "false");
+        try out.writeByte('}');
+    }
+    try out.writeAll("]\n");
+}
+
+fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
+    try out.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try out.writeAll("\\\""),
+        '\\' => try out.writeAll("\\\\"),
+        '\n' => try out.writeAll("\\n"),
+        '\r' => try out.writeAll("\\r"),
+        '\t' => try out.writeAll("\\t"),
+        else => if (c < 0x20) try out.print("\\u{x:0>4}", .{c}) else try out.writeByte(c),
+    };
+    try out.writeByte('"');
+}
+
+/// Emit the drift set as stable tab-separated lines, one unit per line:
+/// `kind \t key \t first_contact(0|1) \t path`. `key` is empty except for an
+/// `owned_key`. Newline-terminated; parseable in a dependency-free shell.
+fn emitPorcelain(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
+    for (units) |u| {
+        const key: []const u8 = switch (u.kind) {
+            .owned_key => |k| k orelse "",
+            else => "",
+        };
+        try out.print("{s}\t{s}\t{s}\t{s}\n", .{ @tagName(u.kind), key, if (u.first_contact) "1" else "0", u.path });
+    }
 }
 
 /// This run's `unbound facts:` section: every discovered dimension that is
