@@ -6,6 +6,15 @@
 //! so lexicographic order is chronological order. Rollback deliberately
 //! leaves the last-applied records stale: the next apply then sees the
 //! restored files as drift and refuses to silently overwrite them again.
+//!
+//! `saveTree` extends this to a whole live directory (every descendant file
+//! and symlink, recursively) so apply can replace a directory with a
+//! managed symlink and still leave it recoverable: it captures the tree
+//! into memory before writing anything, so a descendant it cannot fully
+//! preserve refuses the whole snapshot rather than saving part of it.
+//! Restoring a directory snapshot needs no dedicated code -- the entries it
+//! writes are just more `save`/`saveSymlink` output, so `restore` walks
+//! them back the same way it does a single file or symlink.
 
 const std = @import("std");
 
@@ -100,6 +109,78 @@ pub fn saveSymlink(
     if (std.fs.path.dirname(dest)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
     Io.Dir.cwd().deleteFile(io, dest) catch {};
     try Io.Dir.cwd().symLink(io, target, dest, .{});
+}
+
+/// Bound on directory-tree snapshot recursion depth, matching the bound
+/// `exact.snapshotTree` uses for the same reason: a pathologically deep tree
+/// refuses rather than recursing without limit.
+const tree_max_depth: usize = 64;
+
+const TreeFile = struct { live: []const u8, content: []const u8 };
+const TreeSymlink = struct { live: []const u8, target: []const u8 };
+
+/// Collect every regular file and symlink under `dir_live`, recursively,
+/// into `files`/`symlinks`. Returns `error.Unsnapshottable` -- without
+/// partially filling either list's caller-visible use, since `saveTree`
+/// only writes after this returns successfully -- the instant it meets a
+/// descendant with no recoverable byte representation (a fifo, socket,
+/// device, or other special inode) or a read/open failure (permission
+/// denied, past the depth cap).
+fn captureTree(
+    arena: std.mem.Allocator,
+    io: Io,
+    dir_live: []const u8,
+    depth: usize,
+    files: *std.ArrayList(TreeFile),
+    symlinks: *std.ArrayList(TreeSymlink),
+) !void {
+    if (depth >= tree_max_depth) return error.Unsnapshottable;
+    var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch return error.Unsnapshottable;
+    defer dir.close(io);
+
+    for (try dirent.sorted(arena, io, dir)) |e| {
+        const child = try std.fs.path.join(arena, &.{ dir_live, e.name });
+        switch (e.kind) {
+            .file => {
+                const content = Io.Dir.cwd().readFileAlloc(io, child, arena, .limited(64 * 1024 * 1024)) catch return error.Unsnapshottable;
+                try files.append(arena, .{ .live = child, .content = content });
+            },
+            .sym_link => {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = Io.Dir.cwd().readLink(io, child, &buf) catch return error.Unsnapshottable;
+                try symlinks.append(arena, .{ .live = child, .target = try arena.dupe(u8, buf[0..n]) });
+            },
+            .directory => try captureTree(arena, io, child, depth + 1, files, symlinks),
+            // A fifo, socket, device, or other special inode carries no
+            // recoverable byte content: refuse the whole tree rather than
+            // silently dropping it, since the caller is about to delete the
+            // directory this snapshot is the only copy of.
+            else => return error.Unsnapshottable,
+        }
+    }
+}
+
+/// Snapshot every descendant of live directory `dir_live` -- every regular
+/// file's content and every symlink's target, recursively -- into snapshot
+/// `id`, so `mox rollback` can reconstruct the tree. The tree is captured
+/// into memory before anything is written: a descendant that cannot be
+/// fully preserved makes `error.Unsnapshottable` propagate with nothing
+/// written to the snapshot store, so the caller can delete the live
+/// directory only once this returns successfully.
+pub fn saveTree(
+    arena: std.mem.Allocator,
+    io: Io,
+    snapshots_dir: []const u8,
+    id: []const u8,
+    home: []const u8,
+    dir_live: []const u8,
+) !void {
+    var files: std.ArrayList(TreeFile) = .empty;
+    var symlinks: std.ArrayList(TreeSymlink) = .empty;
+    try captureTree(arena, io, dir_live, 0, &files, &symlinks);
+
+    for (files.items) |f| try save(arena, io, snapshots_dir, id, home, f.live, f.content);
+    for (symlinks.items) |s| try saveSymlink(arena, io, snapshots_dir, id, home, s.live, s.target);
 }
 
 /// List snapshot ids, oldest first.

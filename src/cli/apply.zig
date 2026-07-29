@@ -423,9 +423,33 @@ fn applyPass(
                     continue;
                 }
                 if (site == .directory) {
-                    // Never unlink a live directory to plant a symlink.
-                    try ctx.err.print("mox apply: {s}: refusing to replace a directory with a symlink\n", .{file.live_path});
-                    counts.fail += 1;
+                    // Snapshot the whole directory tree before deleting it: a
+                    // descendant with no recoverable byte representation (a
+                    // fifo/socket/device, or an unreadable entry) refuses the
+                    // replace with nothing touched, rather than destroying a
+                    // tree `mox rollback` could only partially restore.
+                    mox.apply.snapshot.saveTree(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, file.live_path) catch |e| {
+                        try ctx.err.print("mox apply: {s}: cannot fully back up the directory, refusing to replace it: {s}\n", .{ file.live_path, @errorName(e) });
+                        counts.fail += 1;
+                        continue;
+                    };
+                    snapshotted = true;
+                    std.Io.Dir.cwd().deleteTree(ctx.io, file.live_path) catch |e| {
+                        try ctx.err.print("mox apply: {s}: could not remove the directory: {s}\n", .{ file.live_path, @errorName(e) });
+                        counts.fail += 1;
+                        continue;
+                    };
+                    if (std.fs.path.dirname(file.live_path)) |parent| {
+                        std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
+                    }
+                    std.Io.Dir.cwd().symLink(ctx.io, target, file.live_path, .{}) catch |e| {
+                        try ctx.err.print("mox apply: {s}: symlink failed: {s}\n", .{ file.live_path, @errorName(e) });
+                        counts.fail += 1;
+                        continue;
+                    };
+                    try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
+                    counts.ok += 1;
+                    try ctx.out.print("  symlinked {s} -> {s} (directory backed up)\n", .{ file.live_path, target });
                     continue;
                 }
                 // Snapshot whatever is there before destroying it, and refuse

@@ -30,6 +30,17 @@ fn isSymlink(io: Io, path: []const u8) bool {
     return st.kind == .sym_link;
 }
 
+fn chmod(io: Io, a: std.mem.Allocator, path: []const u8, mode: u32) !void {
+    _ = io;
+    const z = try a.dupeZ(u8, path);
+    _ = std.c.chmod(z.ptr, @intCast(mode));
+}
+
+fn modeOf(io: Io, path: []const u8) !u32 {
+    const st = try Io.Dir.cwd().statFile(io, path, .{});
+    return @intCast(st.permissions.toMode() & 0o777);
+}
+
 const script_ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
 
 fn writeExecScript(io: Io, dir: Io.Dir, sub: []const u8, content: []const u8, abs_path: []const u8) !void {
@@ -195,7 +206,7 @@ test "kind matrix: symlink_target -- skip, report, --overwrite converges" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 }
 
-test "kind matrix: symlink over a directory reports drift and stays non-converging under --overwrite" {
+test "kind matrix: symlink over a directory -- --overwrite backs it up, replaces it, and converges" {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -213,19 +224,122 @@ test "kind matrix: symlink over a directory reports drift and stays non-convergi
     });
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("mylink");
-    // A directory already occupies the live path, never a symlink mox wrote.
-    try Io.Dir.cwd().createDirPath(io, live);
+    // A directory already occupies the live path, never a symlink mox wrote:
+    // a top-level file, a subdirectory, and a nested symlink inside it.
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ live, "sub" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ live, "top.txt" }), .data = "top content\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ live, "sub", "nested.txt" }), .data = "nested content\n" });
+    try Io.Dir.cwd().symLink(io, "/tmp/somewhere-else", try std.fs.path.join(a, &.{ live, "sub", "link.txt" }), .{});
 
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "symlink target") != null);
 
-    // Known, deliberate gap: --overwrite still refuses to replace a
-    // directory with a symlink, so this case never converges on its own.
+    // --overwrite snapshots the directory, deletes it, and plants the link.
     const forced = try c.run(&.{ "mox", "apply", "--overwrite", live });
-    try std.testing.expect(forced.rc != 0);
-    try std.testing.expect(std.mem.indexOf(u8, forced.err, "refusing to replace a directory with a symlink") != null);
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expect(isSymlink(io, live));
+    var buf: [512]u8 = undefined;
+    const n = try Io.Dir.cwd().readLink(io, live, &buf);
+    try std.testing.expectEqualStrings("/tmp/mox-drift-target-a", buf[0..n]);
+
+    // Converges: a second apply is clean.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+}
+
+test "kind matrix: symlink over a directory -- mox rollback reconstructs the tree exactly" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/mylink", .data = "/tmp/mox-drift-target-a\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data = "[\"mylink\"]\nsymlink = true\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("mylink");
+
+    const top = try std.fs.path.join(a, &.{ live, "top.txt" });
+    const sub_dir = try std.fs.path.join(a, &.{ live, "sub" });
+    const nested = try std.fs.path.join(a, &.{ sub_dir, "nested.txt" });
+    const nested_link = try std.fs.path.join(a, &.{ sub_dir, "link.txt" });
+
+    try Io.Dir.cwd().createDirPath(io, sub_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = top, .data = "top content\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = nested, .data = "nested content\n" });
+    try chmod(io, a, nested, 0o640);
+    try Io.Dir.cwd().symLink(io, "/tmp/somewhere-else", nested_link, .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", live })).rc);
+    try std.testing.expect(isSymlink(io, live));
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const listed = try c.run(&.{ "mox", "snapshot", "list" });
+    try std.testing.expectEqual(@as(u8, 0), listed.rc);
+    try std.testing.expect(std.mem.indexOf(u8, listed.out, ids[0]) != null);
+
+    // The link must go so rollback recreates a real directory at the same path.
+    try Io.Dir.cwd().deleteFile(io, live);
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
     try std.testing.expect(!isSymlink(io, live));
+    try std.testing.expectEqualStrings("top content\n", try read(io, a, top));
+    try std.testing.expectEqualStrings("nested content\n", try read(io, a, nested));
+    try std.testing.expectEqual(@as(u32, 0o640), try modeOf(io, nested));
+    var buf: [512]u8 = undefined;
+    const n = try Io.Dir.cwd().readLink(io, nested_link, &buf);
+    try std.testing.expectEqualStrings("/tmp/somewhere-else", buf[0..n]);
+}
+
+test "kind matrix: symlink over a directory -- an unsnapshottable descendant refuses, directory untouched" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/mylink", .data = "/tmp/mox-drift-target-a\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data = "[\"mylink\"]\nsymlink = true\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("mylink");
+
+    const readable = try std.fs.path.join(a, &.{ live, "readable.txt" });
+    const locked = try std.fs.path.join(a, &.{ live, "locked.txt" });
+    try Io.Dir.cwd().createDirPath(io, live);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = readable, .data = "r\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = locked, .data = "cannot snapshot\n" });
+    try chmod(io, a, locked, 0o000);
+    defer chmod(io, a, locked, 0o644) catch {};
+
+    // Cannot fully back up the tree (one entry is unreadable): refused
+    // outright, nothing deleted, nothing written to the snapshot store.
+    const r = try c.run(&.{ "mox", "apply", "--overwrite", live });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(!isSymlink(io, live));
+    try std.testing.expect(exists(io, readable));
+    try std.testing.expect(exists(io, locked));
+    try std.testing.expectEqualStrings("r\n", try read(io, a, readable));
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
 }
 
 test "kind matrix: generated_set -- one row for the whole generator despite two drifted leaves, --overwrite converges" {
