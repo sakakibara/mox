@@ -223,7 +223,10 @@ the clean/gated table and the probe/unbound context. `--json` and
 `--porcelain` serialize that set for tooling instead of the human report:
 `--json` as an array of `{path, kind, key?, first_contact}`, `--porcelain`
 as stable tab-separated lines (`kind`, `key`, `first_contact` 0/1,
-`path`). Both imply `--drift` and keep the same exit code.
+`path`). In `--porcelain` the free-form `key` and `path` fields are
+C-escaped (`\\`, `\t`, `\n`, `\r`) so a tab or newline in them can never
+break the framing; unescape those four to recover exact bytes. Both imply
+`--drift` and keep the same exit code.
 
 ## export
 

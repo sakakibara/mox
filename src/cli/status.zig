@@ -345,15 +345,33 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 
 /// Emit the drift set as stable tab-separated lines, one unit per line:
 /// `kind \t key \t first_contact(0|1) \t path`. `key` is empty except for an
-/// `owned_key`. Newline-terminated; parseable in a dependency-free shell.
+/// `owned_key`. The two free-form fields (`key` and `path`) are C-escaped so a
+/// literal tab or newline in them can never break the field or line framing:
+/// `\` -> `\\`, tab -> `\t`, newline -> `\n`, CR -> `\r`. `kind` and the flag
+/// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
+/// shell splits on tab and, if it needs exact bytes, unescapes those four.
 fn emitPorcelain(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
     for (units) |u| {
         const key: []const u8 = switch (u.kind) {
             .owned_key => |k| k orelse "",
             else => "",
         };
-        try out.print("{s}\t{s}\t{s}\t{s}\n", .{ @tagName(u.kind), key, if (u.first_contact) "1" else "0", u.path });
+        try out.print("{s}\t", .{@tagName(u.kind)});
+        try writePorcelainField(out, key);
+        try out.print("\t{s}\t", .{if (u.first_contact) "1" else "0"});
+        try writePorcelainField(out, u.path);
+        try out.writeByte('\n');
     }
+}
+
+fn writePorcelainField(out: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '\\' => try out.writeAll("\\\\"),
+        '\t' => try out.writeAll("\\t"),
+        '\n' => try out.writeAll("\\n"),
+        '\r' => try out.writeAll("\\r"),
+        else => try out.writeByte(c),
+    };
 }
 
 /// This run's `unbound facts:` section: every discovered dimension that is
@@ -478,7 +496,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, or ERROR.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift).",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -525,4 +543,36 @@ test "ownAnnotation: own and disown counts, empty for whole-file targets" {
     file.ownership = .disown;
     file.own_paths = paths[0..1];
     try testing.expectEqualStrings("  (disown 1)", try ownAnnotation(a, file));
+}
+
+test "emitPorcelain / emitJson: tab, newline, and backslash in a field cannot break the format" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // A path with a literal tab, newline, and backslash, and an owned key with
+    // a tab (a TOML key legally can): both are free-form fields.
+    const units = [_]mox.apply.drift.Unit{
+        .{ .path = "/h/a\tb\nc\\d", .kind = .{ .owned_key = "k\tey" }, .first_contact = false },
+        .{ .path = "/h/plain", .kind = .whole_file, .first_contact = true },
+    };
+
+    // Porcelain: each unit stays one line; the tab/newline/backslash in key and
+    // path are C-escaped, so a tab-split parser still sees exactly four fields.
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &units);
+    try testing.expectEqualStrings(
+        "owned_key\tk\\tey\t0\t/h/a\\tb\\nc\\\\d\n" ++
+            "whole_file\t\t1\t/h/plain\n",
+        pw.written(),
+    );
+
+    // JSON: the same bytes escaped per the JSON string grammar.
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &units);
+    try testing.expectEqualStrings(
+        "[{\"path\":\"/h/a\\tb\\nc\\\\d\",\"kind\":\"owned_key\",\"key\":\"k\\tey\",\"first_contact\":false}," ++
+            "{\"path\":\"/h/plain\",\"kind\":\"whole_file\",\"first_contact\":true}]\n",
+        jw.written(),
+    );
 }
