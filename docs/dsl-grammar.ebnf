@@ -15,7 +15,13 @@ directive     = marker "mox:" ( line_dir | region_open | "end" ) EOL ;
 line_dir      = "include" string [ "when" axis_expr ]
               | "secret" string
               | "default" fact_name "=" string
+              | "keep-empty"
               | "completions" shell string [ "when" axis_expr ] ;
+
+(* `keep-empty` takes no arguments; stripped from output, gates and emits
+   nothing. A directive-bearing file that composes to nothing is omitted (no
+   live file); `keep-empty` overrides that, materializing an empty file. It
+   does not un-gate a whole-file gate that evaluated false. *)
 
 (* `default` declares the interview default for fact `<name>`: stripped from
    output, never gates or emits anything, and is not a region -- no `end`.

@@ -4,6 +4,22 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `# mox: keep-empty` line directive: materialize a directive-bearing file
+  even when it composes to nothing, for a conditionally-present but empty file.
+
+### Changed
+- A directive-bearing file that composes to nothing is no longer written as a
+  0-byte file; it is omitted, matching the generator rule where zero data
+  already produces zero files. A file mox previously wrote whose source now
+  composes to nothing is removed on apply (snapshot-first, recoverable via
+  `mox rollback`); one edited since mox wrote it is reported as drift and kept
+  until resolved. `mox status` shows such a file as `STALE`, or `DRIFT` when
+  edited, and `mox diff` shows its live content as removed. A file with no
+  directives is unaffected: a genuinely empty file is still written verbatim.
+
 ## [0.7.1] - 2026-07-28
 
 ### Changed

@@ -121,6 +121,12 @@ content only, and its `check` hook (if any) must accept the candidate
 first. Under `--skip-scripts` the hook does not run and a check-bearing
 file is not written.
 
+A file mox previously wrote whose source now composes to nothing (an
+emptied data set, a region gated away) is removed rather than left as a
+stale copy -- snapshot-first, so `mox rollback` recovers it. One edited
+since mox wrote it is not deleted silently: it is reported as drift and
+kept until resolved. See `docs/dsl.md` (Empty output) and `keep-empty`.
+
 Every `scripts/pre/`/`scripts/post/` script lands in one of six outcomes,
 summarized on the closing line (`scripts: N ran, N skipped, N failed, N
 blocked, N declined`): `ran` (exit 0); `skipped` (its directory tuple or
@@ -191,14 +197,16 @@ candidate path when the source does not exist.
 ## status
 
 Show each managed file's state: `clean`, `OUTDATED`, `DRIFT`,
-`MISSING`, `GATED`, `ERROR`, plus this run's probe log (every
+`MISSING`, `STALE`, `GATED`, `ERROR`, plus this run's probe log (every
 `tool=`/`env=` name asked and whether it resolved) and, when non-empty,
 an `unbound facts:` section listing every discovered fact still
 eligible and unbound, each with its provenance -- its own section, not
-folded into the probe log. A partially owned file is classified on its
-owned content only, so the program's writes on the other side never
-surface. Exits 1 if any file is `OUTDATED`, `DRIFT`, `MISSING`, or
-`ERROR`.
+folded into the probe log. `STALE` is a file mox wrote whose source now
+composes to nothing: apply will remove it (an edited such file is
+`DRIFT` instead, kept until resolved). A partially owned file is
+classified on its owned content only, so the program's writes on the
+other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
+`MISSING`, `STALE`, or `ERROR`.
 
 ## export
 

@@ -24,6 +24,25 @@ One line, no body.
 | `include "<path>" [when <axis>]` | Splice fragment `<base>.d/<path>` in place, optionally gated by an axis expression. |
 | `secret "<uri>"` | Resolve a secret and emit its value. Schemes: `op://`, `pass://`, `env:`, `file://`, `cmd:` (runs the system shell -- `/bin/sh -c`, or `cmd.exe /c` on Windows -- and takes the first stdout line). |
 | `default <name>="<value>"` | Declare the interview default for fact `<name>`; stripped from output, never gates or emits anything. `<name>` is `[a-z][a-z0-9_]*`. |
+| `keep-empty` | Materialize the file even when it composes to nothing, instead of omitting it (see Empty output). No arguments; stripped from output. |
+
+## Empty output
+
+A file that composes to nothing is not written: an empty render means "no
+file", not "a 0-byte file". This applies to any source carrying a directive
+whose output ends up empty -- a `for` over an empty data set, a `when`/region
+that gated everything away -- and matches the generator rule, where zero rows
+already produce zero files.
+
+A file with **no** directives is exempt: a genuinely empty source (`.hushlogin`,
+a `.keep`) is written verbatim as an empty file. To keep a directive-bearing
+file present even when it renders empty -- a conditionally-present but empty
+file -- add `# mox: keep-empty`.
+
+When a file that mox previously wrote starts composing to nothing, `mox apply`
+removes the stale live copy (snapshot-first, so `mox rollback` recovers it). A
+live copy edited since mox wrote it is not deleted silently: it is reported as
+drift and kept until `mox apply --overwrite <path>` (or `--force`).
 
 ## Region directives
 
