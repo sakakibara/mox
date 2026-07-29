@@ -878,6 +878,36 @@ test "apply: --force exact sweep refuses a foreign subdir harboring a nested ign
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ignored") != null);
 }
 
+test "apply: a non-forced foreign subdir harboring a nested ignored file names the true reason, not --force" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.claude");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/.mox-exact", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.claude/CLAUDE.md", .data = "rules\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.moxignore", .data = "secret.txt\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const nested_dir = try c.homePath(".claude/oldtool/sub");
+    try Io.Dir.cwd().createDirPath(io, nested_dir);
+    const secret = try c.homePath(".claude/oldtool/sub/secret.txt");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
+
+    // Without --force, `--force to remove` would be a false promise: forcing
+    // this exact directory still refuses (the prior test), so the non-forced
+    // message must say so up front instead of sending the reader in a circle.
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(exists(io, secret));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "even with --force") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "--force to remove") == null);
+}
+
 test "facts set: a value with a control character is refused, facts file uncorrupted" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
