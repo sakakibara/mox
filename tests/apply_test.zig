@@ -432,6 +432,87 @@ test "apply+commit: an edited seed-once file is not offered by commit" {
     try std.testing.expectEqualStrings("line one\n", try read(io, a, try std.fs.path.join(a, &.{ c.repo, "src", "notes.txt" })));
 }
 
+test "apply: a file that stops composing to content is removed, its prior content snapshotted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config/git");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/git/ids.inc",
+        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath(".config/git/ids.inc");
+
+    // Data has a row -> the file materializes.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("id one\n", try read(io, a, live));
+
+    // The data empties -> the source now composes to nothing.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ c.repo, "data", "ids.toml" }),
+        .data = "ids = []\n",
+    });
+
+    // The stale live file is removed (not left behind), and its prior content
+    // is snapshotted so rollback can recover it.
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(!exists(io, live));
+    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "id one\n"));
+
+    // A third apply with the file already gone is a clean no-op.
+    const r3 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expect(!exists(io, live));
+}
+
+test "apply: an emptied file the user edited is reported as drift, not silently removed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config/git");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/git/ids.inc",
+        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath(".config/git/ids.inc");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The user edits the live file, THEN the source stops composing content.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "id one\nhand edit\n" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ c.repo, "data", "ids.toml" }),
+        .data = "ids = []\n",
+    });
+
+    // Removing it would destroy the user's edit: it is drift, exit 1, file kept.
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r2.rc);
+    try std.testing.expectEqualStrings("id one\nhand edit\n", try read(io, a, live));
+
+    // --force removes it, snapshotting the edit first.
+    const r3 = try c.run(&.{ "mox", "apply", "--force" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expect(!exists(io, live));
+    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "id one\nhand edit\n"));
+}
+
 fn modeOf(io: Io, path: []const u8) !u32 {
     const st = try Io.Dir.cwd().statFile(io, path, .{});
     return @intCast(st.permissions.toMode() & 0o777);
@@ -5387,10 +5468,11 @@ test "apply generator sweep: deleting the generator source prunes its set and ma
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
     try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
 
-    // The manifest is gone with it: a third apply has nothing to say.
+    // The manifest is gone with it: a third apply removes nothing.
     const again = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), again.rc);
-    try std.testing.expect(std.mem.indexOf(u8, again.out, "removed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, again.out, "0 removed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again.out, "  removed ") == null);
 }
 
 test "apply generator sweep: a source that stops being a generator prunes the old set" {

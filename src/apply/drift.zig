@@ -32,6 +32,11 @@ pub const Kind = union(enum) {
     /// individual leaf -- a leaf path is not in the managed-file tree, so it
     /// cannot be `--overwrite`-scoped on its own.
     generated_set,
+    /// A file mox wrote whose source now composes to nothing (an emptied
+    /// template): the live copy was edited, so removing it would lose the
+    /// edit. Its resolution REMOVES the file rather than rewriting it -- its
+    /// own kind because overwrite deletes here, it does not write.
+    vanished,
 };
 
 /// One drifted unit: a live path `mox apply` will skip (and `mox status`
@@ -55,6 +60,7 @@ pub fn overwriteScope(kind: Kind) []const u8 {
         .owned_key => "that key",
         .symlink_target => "re-point",
         .generated_set => "regenerate the set",
+        .vanished => "remove the file",
     };
 }
 
@@ -65,6 +71,7 @@ pub fn kindLabel(arena: std.mem.Allocator, kind: Kind) ![]const u8 {
         .owned_key => |k| if (k) |key| try std.fmt.allocPrint(arena, "owned key '{s}'", .{key}) else "owned content",
         .symlink_target => "symlink target",
         .generated_set => "generated set",
+        .vanished => "file to remove",
     };
 }
 
@@ -83,6 +90,7 @@ pub fn describe(arena: std.mem.Allocator, unit: Unit) ![]const u8 {
         },
         .symlink_target => "live entry was not written by mox; 'mox commit' it or re-run with --force",
         .generated_set => "generated set drifted; 'mox commit' it or re-run with --force",
+        .vanished => "mox no longer produces this file; re-run with --force to remove it (your copy is snapshotted first), or restore the data that filled it",
     };
 }
 
@@ -140,6 +148,14 @@ pub fn symlink(live_path: []const u8, site: applied.SymSite, recorded_target: ?[
 /// generator's own live path.
 pub fn generatedSet(gen_live_path: []const u8) Unit {
     return .{ .path = gen_live_path, .kind = .generated_set, .first_contact = false };
+}
+
+/// A file whose source now composes to nothing but whose edited live copy mox
+/// must not silently delete. Only ever emitted with a record present (an
+/// unrecorded live file mox never wrote is left alone, never vanished), so
+/// `first_contact` is always false.
+pub fn vanished(live_path: []const u8) Unit {
+    return .{ .path = live_path, .kind = .vanished, .first_contact = false };
 }
 
 fn lessByPath(_: void, a: Unit, b: Unit) bool {

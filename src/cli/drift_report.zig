@@ -193,6 +193,7 @@ fn whatDrifted(arena: std.mem.Allocator, u: Unit) ![]const u8 {
         .owned_key => |k| if (k) |key| try std.fmt.allocPrint(arena, "owned key '{s}'", .{key}) else "owned content changed",
         .symlink_target => "symlink target differs",
         .generated_set => "generated set drifted",
+        .vanished => "no longer composed; edited",
     };
 }
 

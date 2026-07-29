@@ -511,9 +511,7 @@ fn applyPass(
                 }, &counts, &snapshotted);
             }
         } else {
-            counts.skip += 1;
-            try ctx.out.print("  skipped {s} (axis-gated off)\n", .{file.live_path});
-            try warnBadWholeFileGateAxis(ctx, file);
+            try omitFile(ctx, file, snap_id, force, dry_run, &units, &counts, &snapshotted);
         }
     }
 
@@ -667,17 +665,17 @@ fn applyPass(
 
     if (dry_run) {
         try ctx.out.print(
-            "\nDry run: {d} would be written, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts not run\n",
-            .{ counts.ok, counts.unchanged, counts.skip, counts.drift, counts.fail },
+            "\nDry run: {d} would be written, {d} would be removed, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts not run\n",
+            .{ counts.ok, counts.removed, counts.unchanged, counts.skip, counts.drift, counts.fail },
         );
     } else {
         try ctx.out.print(
-            "\nApplied: {d} written, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed, {d} blocked, {d} declined\n",
+            "\nApplied: {d} written, {d} removed, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed, {d} blocked, {d} declined\n",
             .{
-                counts.ok,                                  counts.unchanged,                       counts.skip,
-                counts.drift,                               counts.fail,                            pre_result.ran + post_result.ran,
-                pre_result.skipped + post_result.skipped,   pre_result.failed + post_result.failed, pre_result.blocked + post_result.blocked,
-                pre_result.declined + post_result.declined,
+                counts.ok,                                counts.removed,                             counts.unchanged,
+                counts.skip,                              counts.drift,                               counts.fail,
+                pre_result.ran + post_result.ran,         pre_result.skipped + post_result.skipped,   pre_result.failed + post_result.failed,
+                pre_result.blocked + post_result.blocked, pre_result.declined + post_result.declined,
             },
         );
     }
@@ -825,6 +823,8 @@ const Counts = struct {
     ok: usize = 0,
     unchanged: usize = 0,
     skip: usize = 0,
+    /// Files removed because their source now composes to nothing.
+    removed: usize = 0,
     /// Drifted units skipped (or, when a scoped `--overwrite` names other
     /// paths, left drifted): one per `whole_file`/`owned_key`/
     /// `symlink_target` unit, and once per `generated_set` even when many
@@ -832,6 +832,87 @@ const Counts = struct {
     drift: usize = 0,
     fail: usize = 0,
 };
+
+/// Handle a managed file that composed to `null`: it does not materialize on
+/// this machine, because a whole-file gate is off or a directive-bearing
+/// template rendered empty. When mox previously wrote a whole file here,
+/// remove the stale live copy (snapshot-first) so an emptied template leaves
+/// no file behind; a live copy the user changed is drift, reported and kept
+/// unless forced. A path with no whole-file record (a symlink, an owned
+/// partial file, or a file mox never wrote) is left untouched.
+fn omitFile(
+    ctx: *app.Ctx,
+    file: mox.source.tree.ManagedFile,
+    snap_id: []const u8,
+    force: bool,
+    dry_run: bool,
+    units: *std.ArrayList(mox.apply.drift.Unit),
+    counts: *Counts,
+    snapshotted: *bool,
+) !void {
+    const context = ctx.context.?;
+    const live_path = file.live_path;
+    // A whole-file gate off means "no file here on this machine"; an empty
+    // render of an ungated template means "nothing left to write". Only the
+    // latter can be kept as an empty file, so only it earns the keep-empty hint.
+    const gated = (mox.compose.wholeFileGateAxisExpr(ctx.alloc, ctx.io, file) catch null) != null;
+
+    const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch null;
+
+    // Nothing of mox's whole-file writing to remove: no record (a symlink, an
+    // owned file, or a path mox never wrote), or the live file is already gone.
+    if (recorded == null or live == null) {
+        if (live == null and recorded != null and !dry_run) {
+            // mox's file is already gone: drop the stale record so a later
+            // apply stops reconsidering it.
+            try mox.apply.applied.forgetWholeFile(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+        }
+        counts.skip += 1;
+        if (gated) {
+            try ctx.out.print("  skipped {s} (axis-gated off)\n", .{live_path});
+        } else {
+            try ctx.out.print("  skipped {s} (composes to nothing)\n", .{live_path});
+        }
+        try warnBadWholeFileGateAxis(ctx, file);
+        return;
+    }
+
+    // A file mox wrote still sits here. Remove it only if it still matches what
+    // mox last wrote; an edited copy is drift -- removing it would lose the edit.
+    const live_hash = mox.apply.applied.contentHashHex(live.?);
+    const edited = !std.mem.eql(u8, &recorded.?, &live_hash);
+    if (edited and !force) {
+        counts.drift += 1;
+        try units.append(ctx.alloc, mox.apply.drift.vanished(live_path));
+        return;
+    }
+
+    if (dry_run) {
+        counts.removed += 1;
+        try ctx.out.print("  would remove {s} (composes to nothing)\n", .{live_path});
+        return;
+    }
+
+    // Snapshot the prior content (secret lines redacted) before removing, and
+    // refuse if the snapshot cannot be taken -- symmetric with an overwrite.
+    const snap_content = try redactedPriorContent(ctx, live_path, live.?);
+    mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, live_path, snap_content) catch |e| {
+        try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ live_path, @errorName(e) });
+        counts.fail += 1;
+        return;
+    };
+    snapshotted.* = true;
+    std.Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
+        try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ live_path, @errorName(e) });
+        counts.fail += 1;
+        return;
+    };
+    try mox.apply.applied.forgetWholeFile(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    counts.removed += 1;
+    try ctx.out.print("  removed {s} (composes to nothing)\n", .{live_path});
+    if (!gated) try ctx.out.print("    add \"# mox: keep-empty\" to keep it as an empty file\n", .{});
+}
 
 /// Inputs to `applyRegularFile`: everything the per-file write path needs that
 /// differs between a normal managed file and one generator output.

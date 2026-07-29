@@ -73,13 +73,13 @@ test "clean tree: apply writes, reports no drift, exit 0" {
     const r1 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r1.rc);
     try std.testing.expect(std.mem.indexOf(u8, r1.out, "DRIFT") == null);
-    try std.testing.expect(std.mem.indexOf(u8, r1.out, "Applied: 1 written, 0 unchanged, 0 skipped, 0 drifted, 0 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "Applied: 1 written, 0 removed, 0 unchanged, 0 skipped, 0 drifted, 0 failed") != null);
 
     // Second apply: nothing to write, still no drift report, exit 0.
     const r2 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expect(std.mem.indexOf(u8, r2.out, "DRIFT") == null);
-    try std.testing.expect(std.mem.indexOf(u8, r2.out, "Applied: 0 written, 1 unchanged, 0 skipped, 0 drifted, 0 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "Applied: 0 written, 0 removed, 1 unchanged, 0 skipped, 0 drifted, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
 }
 
@@ -387,7 +387,7 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
     try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{gen_live})) != null);
     // The stats line and the drift report must not contradict each other:
     // one generator drifted, so both count it once, not once per leaf.
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "Applied: 0 written, 0 unchanged, 0 skipped, 1 drifted, 0 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Applied: 0 written, 0 removed, 0 unchanged, 0 skipped, 1 drifted, 0 failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "1 drifted, left untouched") != null);
 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", gen_live })).rc);
