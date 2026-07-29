@@ -477,8 +477,9 @@ pub fn commitImpl(
     // A scoped commit routes only the named files: everything else is left
     // for a later `mox commit`, so `scoped_live` gates the main routing loop
     // rather than shrinking `tree.files` (which every fidx-indexed array
-    // below is still sized against). A generator's OWN live path (the report's
-    // scoped-drift row, D4) resolves here like any other managed file; a
+    // below is still sized against). A generator's OWN live path -- naming the
+    // generator source itself in a scoped commit, rather than one of its
+    // produced leaves -- resolves here like any other managed file; a
     // produced LEAF path does not (it is not in `tree.files` at all), so it is
     // tried separately below, against every generator's re-expanded output --
     // `scoped_leaves` then restricts that generator's keep to just the named
@@ -2702,6 +2703,24 @@ fn processSymlinkFile(
         return .cont;
     }
 
+    // A literal write is safe only when the composed target came from a
+    // plain, directiveless base passthrough -- one segment, `.base` origin.
+    // Any other shape (a region gate, an included fragment, a loop row) means
+    // the target varies by configuration; baking today's live target into the
+    // source would collapse every other configuration's target into this
+    // one, permanently. That structural loss carries no capture and no
+    // secret, so `has_capture` above never sees it -- this check does.
+    if (!isPlainLiteralTarget(prov.items)) {
+        try cc.stdout.print(
+            "  manual: {s} (symlink target changed, but its source varies by configuration; keeping would collapse that structure to one literal target -- edit the source directly)\n",
+            .{file.live_path},
+        );
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        return .cont;
+    }
+
     var accept = !cc.report_mode and !cc.interactive;
     if (cc.report_mode) {
         ra.pending.* = true;
@@ -2746,6 +2765,17 @@ fn hasInterpolated(segments: []const Segment) bool {
         if (s.origin == .interpolated) return true;
     }
     return false;
+}
+
+/// True when `segments` is exactly one segment whose origin is a plain
+/// base-file passthrough: the source is nothing but the target line, with no
+/// region, fragment, or loop structure that could compose a different target
+/// under a different configuration. Anything else -- a region gate and an
+/// included fragment both land as `.overlay`, a loop row as `.loop`, a
+/// private fragment as `.private` -- means literal-syncing would bake this
+/// machine's target over structure another configuration depends on.
+fn isPlainLiteralTarget(segments: []const Segment) bool {
+    return segments.len == 1 and segments[0].origin == .base;
 }
 
 /// Write every accepted symlink-target sync, one whole-file replace per

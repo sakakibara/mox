@@ -4089,6 +4089,70 @@ fn expectSymlinkTargetContains(io: Io, a: std.mem.Allocator, path: []const u8, n
     try std.testing.expect(std.mem.indexOf(u8, target, needle) != null);
 }
 
+/// Compose `mylink`'s target under a single axis binding, so a test can prove
+/// a configuration OTHER than this machine's still resolves correctly.
+fn composeSymlinkTargetUnder(a: std.mem.Allocator, io: Io, h: Harness, axis: []const u8, value: []const u8) !?[]const u8 {
+    const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
+    const tree = try mox.source.tree.walk(a, io, src_dir, h.home);
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put(axis, value);
+    for (tree.files) |f| {
+        if (!std.mem.endsWith(u8, f.live_path, "mylink")) continue;
+        return try mox.compose.composeFile(a, io, f, &bindings_r, null, null);
+    }
+    return error.FixtureFileMissing;
+}
+
+test "commit: symlink-target keep refuses a region-gated source instead of collapsing it" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/mylink", "# mox: when os=darwin\n" ++
+        "/tmp/darwin-target\n" ++
+        "# mox: end\n" ++
+        "# mox: when os=linux\n" ++
+        "/tmp/linux-target\n" ++
+        "# mox: end\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"mylink\"]\nsymlink = true\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("mylink");
+    try std.testing.expect(isSymlink(io, live));
+    try expectSymlinkTargetContains(io, a, live, "/tmp/darwin-target");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try Io.Dir.cwd().symLink(io, "/tmp/mox-new-target", live, .{});
+
+    const src_path = try h.srcOf("mylink");
+    const before = try read(io, a, src_path);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    // The region-gated source is never collapsed to one literal target: the
+    // source stays byte-identical, both regions survive, and the drift is
+    // reported as manual rather than silently destroying the linux region.
+    try std.testing.expectEqualStrings(before, try read(io, a, src_path));
+    try std.testing.expect(std.mem.indexOf(u8, before, "/tmp/darwin-target") != null);
+    try std.testing.expect(std.mem.indexOf(u8, before, "/tmp/linux-target") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mylink") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 manual") != null);
+
+    // A linux machine composing this same source still gets its own target --
+    // proof the region structure truly survived, not just the raw bytes.
+    const linux_target = try composeSymlinkTargetUnder(a, io, h, "os", "linux");
+    try std.testing.expect(linux_target != null);
+    try std.testing.expectEqualStrings("/tmp/linux-target", std.mem.trim(u8, linux_target.?, " \t\r\n"));
+
+    // Unresolved: a fresh status still reports drift.
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
+}
+
 // -- generated-leaf keep --
 
 /// A generator source at `src/.config/gen.inc` producing one file per row,
