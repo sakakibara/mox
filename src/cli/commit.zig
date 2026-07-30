@@ -519,7 +519,9 @@ pub fn commitImpl(
                 try set.put(gen.live_path, {});
                 const gop = try leaves.getOrPut(gen.live_path);
                 if (!gop.found_existing) gop.value_ptr.* = .init(ctx.alloc);
-                try gop.value_ptr.put(lp, {});
+                // Store in key form so the membership check against a produced
+                // leaf's `joinKeyOnto` path agrees on Windows (mixed separators).
+                try gop.value_ptr.put(try mox.source.path.toKey(ctx.alloc, lp), {});
             }
             scoped_leaves = leaves;
         }
@@ -2816,7 +2818,10 @@ fn processGeneratorFile(
 ) !HunkOutcome {
     for (outputs) |leaf| {
         if (only_leaves) |set| {
-            if (!set.contains(leaf.live_path)) continue;
+            // The set holds key-form paths (see the scoped-leaves build); a
+            // produced leaf's path can be `/`-joined even on Windows, so
+            // normalize it the same way before the membership test.
+            if (!set.contains(try mox.source.path.toKey(cc.arena, leaf.live_path))) continue;
         }
         switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, gen_row_edits, gen_leaf_commits)) {
             .cont => {},
@@ -4316,8 +4321,12 @@ fn findGeneratorLeaf(
         var diag: mox.compose.interp.Diag = .{};
         const gen = mox.compose.catB.composeGenerator(arena, io, f, resolver, m_state, secrets, &diag) catch continue;
         const outputs = gen orelse continue;
+        // A generator's produced path is `joinKeyOnto`'d, so it can carry `/`
+        // separators even on Windows, while `live_path` comes from a native
+        // path resolution. Compare in key form so the two agree on any OS.
+        const want = try mox.source.path.toKey(arena, live_path);
         for (outputs) |o| {
-            if (std.mem.eql(u8, o.live_path, live_path)) return f;
+            if (std.mem.eql(u8, try mox.source.path.toKey(arena, o.live_path), want)) return f;
         }
     }
     return null;
