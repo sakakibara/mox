@@ -6,6 +6,11 @@ const dirs = env_mod.dirs;
 
 pub const Paths = struct {
     home: []const u8,
+    /// False when the environment named no home and `home` holds the
+    /// placeholder that keeps the rest resolvable. A command that acts on a
+    /// live path must refuse rather than take the filesystem root for the
+    /// user's home and capture whatever sits under it.
+    home_named: bool,
     repo_dir: []const u8,
     state_dir: []const u8,
     private_dir: []const u8,
@@ -29,7 +34,11 @@ pub fn resolve(arena: std.mem.Allocator, env: Env) !Paths {
 pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag) !Paths {
     // A machine with no home named at all still gets a resolvable (if useless)
     // root rather than an error, so `mox --help` runs anywhere.
-    const home = dirs.home(arena, env) catch try arena.dupe(u8, "/");
+    var home_named = true;
+    const home = dirs.home(arena, env) catch blk: {
+        home_named = false;
+        break :blk try arena.dupe(u8, "/");
+    };
 
     const repo_dir = blk: {
         if (env.get(arena, "MOX_REPO")) |v| break :blk v;
@@ -52,6 +61,7 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
 
     return .{
         .home = home,
+        .home_named = home_named,
         .repo_dir = repo_dir,
         .state_dir = state_dir,
         .private_dir = private_dir,

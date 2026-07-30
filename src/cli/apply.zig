@@ -642,7 +642,7 @@ fn applyPass(
 
     if (snapshotted) {
         const keep = blk: {
-            const v = context.env.getAlloc(ctx.alloc, "MOX_SNAPSHOT_RETENTION") catch break :blk @as(usize, 10);
+            const v = context.env.get(ctx.alloc, "MOX_SNAPSHOT_RETENTION") orelse break :blk @as(usize, 10);
             const parsed = std.fmt.parseInt(usize, v, 10) catch parse_err: {
                 try ctx.err.print("mox apply: MOX_SNAPSHOT_RETENTION={s}: not an integer; using default (10)\n", .{v});
                 break :parse_err 10;

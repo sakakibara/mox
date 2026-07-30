@@ -584,10 +584,11 @@ fn collectRepeated(alloc: std.mem.Allocator, argv: []const []const u8, long: []c
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    const home = context.env.getAlloc(ctx.alloc, "HOME") catch {
-        try ctx.err.writeAll("mox add: HOME not set\n");
+    if (!context.paths.home_named) {
+        try ctx.err.writeAll("mox add: neither HOME nor USERPROFILE is set\n");
         return 1;
-    };
+    }
+    const home = context.paths.home;
     const live_path = edit.liveTarget(ctx.alloc, context.env, context.cwd, a.path) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => |f| return edit.reportTarget(ctx.err, "mox add", a.path, f),

@@ -117,6 +117,10 @@ pub const EnvPair = struct { name: []const u8, value: []const u8 };
 
 pub const SetupOpts = struct {
     editor: ?[]const u8 = null,
+    /// Which variable names the home directory, or null to name it in neither.
+    /// A Windows machine commonly sets only `USERPROFILE`, so the lookup order
+    /// is pinned here rather than left to depend on which runner builds this.
+    home_var: ?[]const u8 = "HOME",
     /// Extra environment entries visible to the command under test (e.g. a
     /// value an `env:` secret URI resolves).
     extra_env: []const EnvPair = &.{},
@@ -141,7 +145,7 @@ pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: Setup
     if (opts.create_repo_src) try tmp.dir.createDirPath(io, "repo/src");
 
     var map = std.process.Environ.Map.init(a);
-    try map.put("HOME", home);
+    if (opts.home_var) |v| try map.put(v, home);
     try map.put("USER", "tester");
     // Windows has no gethostname(); `machine.state.capture` reads COMPUTERNAME
     // from this same isolated environ instead, so it must be seeded here too,

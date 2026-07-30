@@ -86,10 +86,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         else => return err,
     };
 
-    const target_path = env.getAlloc(alloc, "MOX_UPGRADE_TARGET_BIN") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => try std.process.executablePathAlloc(io, alloc),
-        else => return err,
-    };
+    const target_path = env.get(alloc, "MOX_UPGRADE_TARGET_BIN") orelse
+        try std.process.executablePathAlloc(io, alloc);
 
     if (!auto_yes) {
         if (!try confirm(ctx, io, alloc, tag)) {

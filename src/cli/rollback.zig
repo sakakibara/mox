@@ -302,6 +302,7 @@ fn testCtx(a: std.mem.Allocator, io: Io, home: []const u8, snapshots_dir: []cons
             .env = Env{ .map = map_ptr },
             .paths = .{
                 .home = home,
+                .home_named = true,
                 .repo_dir = "",
                 .state_dir = "",
                 .private_dir = "",

@@ -2,9 +2,9 @@ const std = @import("std");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
+const dirs = @import("env").dirs;
 const EnvironMap = std.process.Environ.Map;
 const path_lookup = @import("path_lookup.zig");
-const source_path = @import("../source/path.zig");
 const facts_mod = @import("facts.zig");
 const derived_facts_mod = @import("derived_facts.zig");
 const path_registry = @import("path_registry.zig");
@@ -240,10 +240,11 @@ pub fn captureDiag(
         envOr(arena, environ, "USERPROFILE") orelse
         return error.HomeNotSet;
 
-    const xdg_config_home = try resolveXdg(arena, environ, "XDG_CONFIG_HOME", home, ".config");
-    const xdg_cache_home = try resolveXdg(arena, environ, "XDG_CACHE_HOME", home, ".cache");
-    const xdg_data_home = try resolveXdg(arena, environ, "XDG_DATA_HOME", home, ".local/share");
-    const xdg_state_home = try resolveXdg(arena, environ, "XDG_STATE_HOME", home, ".local/state");
+    const base_dirs = try xdgDirs(arena, environ, builtin.os.tag, home);
+    const xdg_config_home = base_dirs.config;
+    const xdg_cache_home = base_dirs.cache;
+    const xdg_data_home = base_dirs.data;
+    const xdg_state_home = base_dirs.state;
 
     // mox ships with zero built-in directory knowledge: `data/facts.toml`
     // (repo-derived) runs ahead of the `$PATH` scan, same reason the deleted
@@ -402,7 +403,7 @@ test "capture: a defined USER is used verbatim, username_fallback stays false" {
     try std.testing.expect(!m.username_fallback);
 }
 
-test "resolveXdg: an empty env value falls back to the home default" {
+test "xdgDirs: an empty env value falls back to the home default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -410,9 +411,31 @@ test "resolveXdg: an empty env value falls back to the home default" {
     // Present but empty: must be treated as unset, not as a cwd-relative "".
     try map.put("XDG_STATE_HOME", "");
     const env = Environ{ .map = &map };
-    const got = try resolveXdg(a, env, "XDG_STATE_HOME", "/home/x", ".local/state");
+    const got = try xdgDirs(a, env, .linux, "/home/x");
     const want = try std.fs.path.join(a, &.{ "/home/x", ".local", "state" });
-    try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqualStrings(want, got.state);
+}
+
+test "xdgDirs: the config home is the one mox reads facts.toml from, on every platform" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A real Windows machine: LOCALAPPDATA set, no XDG_*. The POSIX nesting
+    // under the home would name a directory mox never writes to, so an
+    // interview answer would be written and then never found again.
+    var map = EnvironMap.init(a);
+    try map.put("USERPROFILE", "C:\\Users\\bob");
+    try map.put("LOCALAPPDATA", "C:\\Users\\bob\\AppData\\Local");
+    const env = Environ{ .map = &map };
+
+    const paths = @import("../cli/paths.zig");
+    inline for (.{ .windows, .linux, .macos }) |os_tag| {
+        const got = try xdgDirs(a, env, os_tag, "C:\\Users\\bob");
+        const p = try paths.resolveFrom(a, env, os_tag);
+        const want = try std.fs.path.join(a, &.{ got.config, "mox", "facts.toml" });
+        try std.testing.expectEqualStrings(want, p.facts_path);
+    }
 }
 
 test "osAxisValue: macOS reports darwin, others pass through" {
@@ -431,18 +454,32 @@ fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub: []con
     return std.fs.path.join(allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path, sub });
 }
 
-fn resolveXdg(
+/// The XDG base directories for this machine, through the same resolution
+/// `cli/paths.zig` uses for mox's own files -- `$XDG_*`, then `%LOCALAPPDATA%`
+/// on Windows, then the POSIX nesting under `home`. Resolving them here a
+/// second way would let `<machine.xdg_config_home>` and the directory mox
+/// actually reads `facts.toml` from name different places, which is what
+/// happens on Windows the moment `%LOCALAPPDATA%` is set.
+///
+/// `os_tag` is a parameter rather than the host's, so a test pins every
+/// platform's answer from whichever one runs it.
+fn xdgDirs(
     arena: std.mem.Allocator,
     environ: Environ,
-    env_name: []const u8,
+    os_tag: std.Target.Os.Tag,
     home: []const u8,
-    fallback_subdir: []const u8,
-) ![]const u8 {
-    if (envOr(arena, environ, env_name)) |v| return v;
-    if (home.len == 0) return try arena.dupe(u8, "");
-    // The fallback is written `.local/state`, so joining it whole would leave
-    // the separators mixed where the platform's is not `/`.
-    return try source_path.joinKeyOnto(arena, home, fallback_subdir);
+) !struct {
+    config: []const u8,
+    cache: []const u8,
+    data: []const u8,
+    state: []const u8,
+} {
+    return .{
+        .config = try dirs.baseDirIn(arena, environ, os_tag, .config, home),
+        .cache = try dirs.baseDirIn(arena, environ, os_tag, .cache, home),
+        .data = try dirs.baseDirIn(arena, environ, os_tag, .data, home),
+        .state = try dirs.baseDirIn(arena, environ, os_tag, .state, home),
+    };
 }
 
 test "MachineState type is constructible" {

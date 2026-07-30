@@ -25,6 +25,10 @@ const Spec = struct {
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
+    if (!context.paths.home_named) {
+        try ctx.err.writeAll("mox add-tree: neither HOME nor USERPROFILE is set\n");
+        return 1;
+    }
     const dir_abs = edit.liveTarget(ctx.alloc, context.env, context.cwd, a.dir) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => |f| return edit.reportTarget(ctx.err, "mox add-tree", a.dir, f),
@@ -92,7 +96,7 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
     // every machine; entries are captured before the walk mutates the repo.
     const entries = try mox.source.dirent.sortedPath(ctx.alloc, ctx.io, dir_abs, .{ .iterate = true, .follow_symlinks = false });
 
-    const home = context.env.getAlloc(ctx.alloc, "HOME") catch context.paths.home;
+    const home = context.paths.home;
 
     for (entries) |entry| {
         const child = try std.fs.path.join(ctx.alloc, &.{ dir_abs, entry.name });

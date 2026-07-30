@@ -17,6 +17,23 @@ All notable changes to mox are documented here. The format follows
   relative to `$HOME` from elsewhere (`mox status .config/nvim/init.lua`)
   no longer resolves: spell it `~/.config/nvim/init.lua`.
 
+### Fixed
+- Windows: `facts.toml` is read from the directory it is written to. The
+  machine's `xdg_config_home` resolved to `%USERPROFILE%\.config` while mox
+  wrote the file under `%LOCALAPPDATA%`, so an interview answer was saved and
+  then never found again and every run re-asked. All four `xdg_*` machine
+  facts now resolve through the same base-directory rules as mox's own paths
+  (`$XDG_*`, then `%LOCALAPPDATA%` on Windows, then the POSIX nesting), so on
+  Windows they name `%LOCALAPPDATA%` where they previously named
+  `%USERPROFILE%\.config` and friends.
+- `mox add` and `mox add-tree` read the home directory the way every other
+  command does. `add` consulted only `HOME` and refused outright where just
+  `USERPROFILE` is set, and both treated an empty `HOME` as a home of `""`
+  rather than as unset -- keying a capture off the filesystem root. With no
+  home named at all, both now refuse instead of taking `/` for the user's home.
+- An empty `MOX_SNAPSHOT_RETENTION` or `MOX_UPGRADE_TARGET_BIN` is treated as
+  unset, matching every other variable mox reads.
+
 ### Added
 - A leading `~` in a path argument is expanded by mox, not only by the shell:
   a quoted `"~/x"`, a non-initial `--path=~/x`, PowerShell (which passes `~`

@@ -802,6 +802,72 @@ test "add: a relative path resolves against the current directory" {
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
 }
 
+test "add/add-tree: home comes from USERPROFILE when HOME names none" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // What a Windows machine looks like: USERPROFILE alone names the home.
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .home_var = "USERPROFILE" });
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+    try writeRepo(io, &tmp, "home/.config/app/a.conf", "x\n");
+
+    const r = try h.run(&.{ "mox", "add", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+
+    const rt = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    try std.testing.expectEqual(@as(u8, 0), rt.rc);
+    try std.testing.expect(exists(io, try h.srcOf(".config/app/a.conf")));
+}
+
+test "add: an empty HOME is unset, not an empty home" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // HOME present but empty must fall through to USERPROFILE, never read as
+    // a home of "" -- which would key every capture off the filesystem root.
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .home_var = "USERPROFILE",
+        .extra_env = &.{.{ .name = "HOME", .value = "" }},
+    });
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+
+    const r = try h.run(&.{ "mox", "add", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+}
+
+test "add/add-tree: refuse when no variable names a home, rather than taking the root for it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .home_var = null });
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+    const live = try std.fs.path.join(a, &.{ h.home, "notes.txt" });
+
+    const r = try h.run(&.{ "mox", "add", live });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "USERPROFILE") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
+
+    const rt = try h.run(&.{ "mox", "add-tree", h.home });
+    try std.testing.expectEqual(@as(u8, 1), rt.rc);
+    try std.testing.expect(std.mem.indexOf(u8, rt.err, "USERPROFILE") != null);
+}
+
 test "path args: a bare name is the current directory's file, not HOME's of the same name" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
