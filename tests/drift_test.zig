@@ -501,7 +501,7 @@ test "kind matrix: generated_set -- one row for the whole generator despite two 
     // drifted leaves: the safe scoped pre-fill still applies. Named the way
     // the report names every path, contracted against HOME.
     const shown = try std.fmt.allocPrint(a, "~{c}.config{c}gen.inc", .{ std.fs.path.sep, std.fs.path.sep });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{shown})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "take the repo's version:  mox apply --overwrite {s}\n", .{shown})) != null);
     // The stats line and the drift report must not contradict each other:
     // one generator drifted, so both count it once, not once per leaf.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Applied: 0 written, 0 removed, 0 unchanged, 0 skipped, 1 drifted, 0 failed") != null);
@@ -576,7 +576,7 @@ test "migration: a collapsed first-contact block still scopes guidance to an edi
     // gets its own scoped overwrite pre-fill, not only the migration
     // block's unscoped one.
     const edited_shown = try std.fmt.allocPrint(a, "~{c}edited.conf", .{std.fs.path.sep});
-    try std.testing.expect(std.mem.indexOf(u8, r2.out, try std.fmt.allocPrint(a, "overwrite it:  mox apply --overwrite {s}\n", .{edited_shown})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, try std.fmt.allocPrint(a, "take the repo's version:  mox apply --overwrite {s}\n", .{edited_shown})) != null);
 }
 
 // -- exit codes: 0, 1, 2, asserted distinctly --

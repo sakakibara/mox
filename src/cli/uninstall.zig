@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const cli = @import("cli");
+const display = @import("display.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const dirent = @import("../source/dirent.zig");
@@ -65,7 +66,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     for (names.items) |name| {
         const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, name });
         switch (actionFor(name, purge_private)) {
-            .preserve => try ctx.out.print("  kept {s}\n", .{path}),
+            .preserve => try ctx.out.print("  kept {f}\n", .{display.of(path, ctx.context.?.paths.home)}),
             .prompt => try prompt_names.append(ctx.alloc, name),
             .remove => try removeEntry(ctx, path, &removed),
         }
@@ -81,7 +82,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         if (do_delete) {
             try removeEntry(ctx, path, &removed);
         } else {
-            try ctx.out.print("  kept {s} (preserved; delete manually or re-run with --purge-{s})\n", .{ path, name });
+            try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-{s})\n", .{ display.of(path, ctx.context.?.paths.home), name });
         }
     }
 
@@ -95,9 +96,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 fn removeEntry(ctx: *app.Ctx, path: []const u8, removed: *usize) !void {
     if (deleteEntry(ctx.io, path)) |_| {
         removed.* += 1;
-        try ctx.out.print("  removed {s}\n", .{path});
+        try ctx.out.print("  removed {f}\n", .{display.of(path, ctx.context.?.paths.home)});
     } else |e| {
-        try ctx.err.print("  kept {s} (delete failed: {s})\n", .{ path, @errorName(e) });
+        try ctx.err.print("  kept {f} (delete failed: {s})\n", .{ display.of(path, ctx.context.?.paths.home), @errorName(e) });
     }
 }
 
@@ -117,7 +118,7 @@ fn confirm(ctx: *app.Ctx, name: []const u8, path: []const u8) !bool {
 
     var attempts: usize = 0;
     while (attempts < max_prompt_attempts) : (attempts += 1) {
-        try ctx.out.print("Delete {s} at {s}? [y/N] ", .{ name, path });
+        try ctx.out.print("Delete {s} at {f}? [y/N] ", .{ name, display.of(path, ctx.context.?.paths.home) });
         try ctx.out.flush();
         const line = (try input.takeDelimiter('\n')) orelse return false;
         const t = std.mem.trim(u8, line, " \t\r");

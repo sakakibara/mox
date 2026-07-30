@@ -44,6 +44,7 @@ const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const prompt = @import("prompt.zig");
 const scope = @import("scope.zig");
+const display = @import("display.zig");
 const style = @import("style.zig");
 const mox = @import("../root.zig");
 const commit_struct = @import("commit_struct.zig");
@@ -517,7 +518,7 @@ pub fn commitImpl(
             var leaves: std.StringHashMap(std.StringHashMap(void)) = .init(ctx.alloc);
             for (leaf_targets.items) |lp| {
                 const gen = (try findGeneratorLeaf(ctx.alloc, ctx.io, tree.files, &axis_resolver, &m_state, secrets, lp)) orelse {
-                    try ctx.err.print("mox commit: {s}: not managed\n", .{lp});
+                    try ctx.err.print("mox commit: {f}: not managed\n", .{display.of(lp, m_state.home)});
                     return 1;
                 };
                 try set.put(gen.live_path, {});
@@ -657,7 +658,7 @@ pub fn commitImpl(
         // A head declaration the walk could not honor: nothing of this file
         // can be routed; skip it with the diagnosis and keep committing.
         if (file.head_error.len > 0) {
-            try ctx.err.print("mox commit: {s}: skipped ({s})\n", .{ file.live_path, file.head_error });
+            try ctx.err.print("mox commit: {f}: skipped ({s})\n", .{ display.of(file.live_path, m_state.home), file.head_error });
             continue;
         }
 
@@ -669,7 +670,7 @@ pub fn commitImpl(
         {
             var gdiag: mox.compose.interp.Diag = .{};
             const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &gdiag) catch |e| {
-                try ctx.err.print("mox commit: {s}: generator failed to re-expand: {s}\n", .{ file.live_path, @errorName(e) });
+                try ctx.err.print("mox commit: {f}: generator failed to re-expand: {s}\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
                 continue;
             };
             if (gen) |outputs| {
@@ -729,7 +730,7 @@ pub fn commitImpl(
         // Kind guard BEFORE the open: a FIFO here would block the read and
         // brick the whole commit.
         if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
-            try ctx.err.print("mox commit: {s}: skipped (not a regular file)\n", .{file.live_path});
+            try ctx.err.print("mox commit: {f}: skipped (not a regular file)\n", .{display.of(file.live_path, m_state.home)});
             continue;
         }
         const live = Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -781,13 +782,13 @@ pub fn commitImpl(
         // is the user's alone: say how to resolve it rather than routing bytes
         // nowhere, only for the recompose to reject them and roll back.
         if (file.own_paths.len == 0 and (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, null) catch null) == null) {
-            try ctx.err.print("mox commit: {s}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{file.live_path});
+            try ctx.err.print("mox commit: {f}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{display.of(file.live_path, m_state.home)});
             pending = true;
             continue;
         }
 
         var prov = (try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
-            try ctx.out.print("  manual: {s} (no provenance recorded)\n", .{file.live_path});
+            try ctx.out.print("  manual: {f} (no provenance recorded)\n", .{display.of(file.live_path, m_state.home)});
             manual_count += 1;
             manual_hunks[fidx] += 1;
             pending = true;
@@ -812,7 +813,7 @@ pub fn commitImpl(
         const b_lines = try mox.diff.lines.splitLines(ctx.alloc, live);
         const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
             error.TooManyLines => {
-                try ctx.out.print("  manual: {s} (too large to diff)\n", .{file.live_path});
+                try ctx.out.print("  manual: {f} (too large to diff)\n", .{display.of(file.live_path, m_state.home)});
                 manual_count += 1;
                 manual_hunks[fidx] += 1;
                 pending = true;
@@ -1145,11 +1146,11 @@ pub fn commitImpl(
         if (!ok) {
             mismatch = true;
             try restoreRouted(ctx.io, sym_backup.items);
-            try ctx.err.print("mox commit: {s}: recomposed symlink target does not match; not committed\n", .{s.live_path});
+            try ctx.err.print("mox commit: {f}: recomposed symlink target does not match; not committed\n", .{display.of(s.live_path, m_state.home)});
             continue;
         }
         try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target);
-        try ctx.out.print("  committed {s}\n", .{s.live_path});
+        try ctx.out.print("  committed {f}\n", .{display.of(s.live_path, m_state.home)});
         committed_count += 1;
     }
 
@@ -1198,7 +1199,7 @@ pub fn commitImpl(
                         .{gc.leaf_live_path},
                     );
                 } else {
-                    try ctx.err.print("mox commit: {s}: recomposed generator output does not match; not committed\n", .{gc.leaf_live_path});
+                    try ctx.err.print("mox commit: {f}: recomposed generator output does not match; not committed\n", .{display.of(gc.leaf_live_path, m_state.home)});
                 }
             }
         } else {
@@ -1206,7 +1207,7 @@ pub fn commitImpl(
                 try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, live_now[i].?);
                 if (!leaf_secret[i]) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, live_now[i].?);
                 try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, leaf_prov[i].?);
-                try ctx.out.print("  committed {s}\n", .{gc.leaf_live_path});
+                try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
                 committed_count += 1;
             }
         }
@@ -1234,7 +1235,7 @@ pub fn commitImpl(
         const file2 = findByLive(tree2, file.live_path) orelse file;
         var prov2: std.ArrayList(Segment) = .empty;
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file2, &axis_resolver, &m_state, secrets, &prov2, null) catch |e| {
-            try ctx.err.print("mox commit: {s}: recompose failed; not committed: {s}\n", .{ file.live_path, @errorName(e) });
+            try ctx.err.print("mox commit: {f}: recompose failed; not committed: {s}\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
             mismatch = true;
             rolled_back[fidx] = true;
             if (is_coupling) {
@@ -1250,7 +1251,7 @@ pub fn commitImpl(
             // live; verify only that the source still composes and that the
             // sync does not diverge a configuration the user did not choose.
             if (composed == null) {
-                try ctx.err.print("mox commit: {s}: coupled update made the source uncomposable; not committed\n", .{file.source_base_abs});
+                try ctx.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, m_state.home)});
                 mismatch = true;
                 rolled_back[fidx] = true;
                 try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
@@ -1411,7 +1412,7 @@ pub fn commitImpl(
                     }
                 }
                 if (has_routed) {
-                    try ctx.out.print("  committed {s}\n", .{file.live_path});
+                    try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                     committed_count += 1;
                 }
                 continue;
@@ -1474,7 +1475,7 @@ pub fn commitImpl(
             }
             try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, prov2.items);
         }
-        try ctx.out.print("  committed {s}\n", .{file.live_path});
+        try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
         committed_count += 1;
     }
 
@@ -2253,7 +2254,7 @@ fn processStructFile(
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {s} (a reordered array cannot be routed by key)\n", .{file.live_path});
+            try cc.stdout.print("  manual: {f} (a reordered array cannot be routed by key)\n", .{display.of(file.live_path, cc.m_state.home)});
             return .cont;
         },
         error.OutOfMemory => return e,
@@ -2263,7 +2264,7 @@ fn processStructFile(
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {s} could not be parsed ({s}); edit its source directly\n", .{ file.live_path, @errorName(e) });
+            try cc.stdout.print("  manual: {f} could not be parsed ({s}); edit its source directly\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
             return .cont;
         },
     };
@@ -2276,7 +2277,7 @@ fn processStructFile(
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
         ra.pending.* = true;
-        try cc.stdout.print("  manual: {s} (comment, blank-line, or ordering drift has no key path)\n", .{file.live_path});
+        try cc.stdout.print("  manual: {f} (comment, blank-line, or ordering drift has no key path)\n", .{display.of(file.live_path, cc.m_state.home)});
         return .cont;
     }
 
@@ -2304,7 +2305,7 @@ fn routeStructChanges(
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {s}: a source layer could not be parsed ({s})\n", .{ file.live_path, @errorName(e) });
+            try cc.stdout.print("  manual: {f}: a source layer could not be parsed ({s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
             return .cont;
         },
     };
@@ -2316,7 +2317,7 @@ fn routeStructChanges(
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {s} {s}: {s}\n", .{ file.live_path, try keyPathLabel(cc.arena, change.path), res.skip_reason.? });
+            try cc.stdout.print("  manual: {f} {s}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path), res.skip_reason.? });
             continue;
         }
 
@@ -2432,7 +2433,7 @@ fn processFallbackFile(
                 .{ file.live_path, @errorName(e) },
             );
         } else {
-            try cc.stdout.print("  manual: {s} (compose failed: {s})\n", .{ file.live_path, @errorName(e) });
+            try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
         }
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
@@ -2506,7 +2507,7 @@ fn processFallbackFile(
     const b_lines = try mox.diff.lines.splitLines(cc.arena, live);
     const hunks = mox.diff.lines.diff(cc.arena, a_lines, b_lines) catch |e| switch (e) {
         error.TooManyLines => {
-            try cc.stdout.print("  manual: {s} (too large to diff)\n", .{file.live_path});
+            try cc.stdout.print("  manual: {f} (too large to diff)\n", .{display.of(file.live_path, cc.m_state.home)});
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
@@ -2568,7 +2569,7 @@ fn createFirstContactOverlay(
         try pairs.append(cc.arena, .{ .name = name.*, .value = value });
     }
     if (pairs.items.len == 0) {
-        try cc.stdout.print("  manual: {s} (no source matches this machine)\n", .{file.live_path});
+        try cc.stdout.print("  manual: {f} (no source matches this machine)\n", .{display.of(file.live_path, cc.m_state.home)});
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
         ra.pending.* = true;
@@ -2587,7 +2588,7 @@ fn createFirstContactOverlay(
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {s} could not be parsed as {s}; edit its source directly\n", .{ file.live_path, @tagName(format) });
+            try cc.stdout.print("  manual: {f} could not be parsed as {s}; edit its source directly\n", .{ display.of(file.live_path, cc.m_state.home), @tagName(format) });
             return .cont;
         },
     };
@@ -2627,7 +2628,7 @@ fn createFirstContactOverlay(
                         ra.manual_count.* += 1;
                         ra.manual_hunks[fidx] += 1;
                         ra.pending.* = true;
-                        try cc.stdout.print("  manual: {s} {s}: the new overlay cannot hold this key\n", .{ file.live_path, try keyPathLabel(cc.arena, change.path) });
+                        try cc.stdout.print("  manual: {f} {s}: the new overlay cannot hold this key\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path) });
                         continue;
                     },
                 }
@@ -2685,7 +2686,7 @@ fn processSymlinkFile(
 
     var prov: std.ArrayList(Segment) = .empty;
     const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
-        try cc.stdout.print("  manual: {s} (compose failed: {s})\n", .{ file.live_path, @errorName(e) });
+        try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
         ra.pending.* = true;
@@ -2741,7 +2742,7 @@ fn processSymlinkFile(
     if (cc.report_mode) {
         ra.pending.* = true;
         ra.routed_count.* += 1;
-        try cc.stdout.print("  would keep {s}: symlink target -> {s}\n", .{ file.live_path, live_target });
+        try cc.stdout.print("  would keep {f}: symlink target -> {s}\n", .{ display.of(file.live_path, cc.m_state.home), live_target });
         return .cont;
     }
     if (cc.interactive) {
@@ -2874,7 +2875,7 @@ fn processGeneratorLeaf(
     const b_lines = try mox.diff.lines.splitLines(cc.arena, live);
     const hunks = mox.diff.lines.diff(cc.arena, a_lines, b_lines) catch |e| switch (e) {
         error.TooManyLines => {
-            try cc.stdout.print("  manual: {s} (too large to diff)\n", .{leaf.live_path});
+            try cc.stdout.print("  manual: {f} (too large to diff)\n", .{display.of(leaf.live_path, cc.m_state.home)});
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
@@ -3035,7 +3036,7 @@ fn reportGeneratedManual(
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
         ra.pending.* = true;
-        try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ leaf.live_path, hunk.a_start + 1, reason });
+        try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(leaf.live_path, cc.m_state.home), hunk.a_start + 1, reason });
         return .cont;
     }
     try printHunkHeader(cc.stdout, cc.sty, leaf.live_path, "hunk", hunk_no, hunk_total, try std.fmt.allocPrint(cc.arena, "manual -- {s}", .{reason}));
@@ -3051,14 +3052,14 @@ fn reportGeneratedManual(
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
-                try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ leaf.live_path, hunk.a_start + 1, reason });
+                try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(leaf.live_path, cc.m_state.home), hunk.a_start + 1, reason });
             },
             else => {
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
-                try cc.stdout.print("  nothing to split: {s}:{d} lies in no single source\n", .{ leaf.live_path, hunk.a_start + 1 });
-                try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ leaf.live_path, hunk.a_start + 1, reason });
+                try cc.stdout.print("  nothing to split: {f}:{d} lies in no single source\n", .{ display.of(leaf.live_path, cc.m_state.home), hunk.a_start + 1 });
+                try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(leaf.live_path, cc.m_state.home), hunk.a_start + 1, reason });
             },
         },
         .abort => return .abort,
@@ -3801,7 +3802,7 @@ fn processHunk(
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
-                try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+                try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1, reason });
                 return .cont;
             }
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
@@ -3817,7 +3818,7 @@ fn processHunk(
                         ra.manual_count.* += 1;
                         ra.manual_hunks[fidx] += 1;
                         ra.pending.* = true;
-                        try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+                        try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1, reason });
                     },
                     else => {
                         const subs = try splitHunk(cc.arena, segments, hunk);
@@ -3829,8 +3830,8 @@ fn processHunk(
                             ra.manual_count.* += 1;
                             ra.manual_hunks[fidx] += 1;
                             ra.pending.* = true;
-                            try cc.stdout.print("  nothing to split: {s}:{d} lies in no single source\n", .{ file.live_path, hunk.a_start + 1 });
-                            try cc.stdout.print("  manual: {s}:{d} {s}\n", .{ file.live_path, hunk.a_start + 1, reason });
+                            try cc.stdout.print("  nothing to split: {f}:{d} lies in no single source\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
+                            try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1, reason });
                         } else {
                             for (subs) |sub| {
                                 const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total, secret_lines, first_contact);
@@ -3924,7 +3925,7 @@ fn processHunk(
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
-                try cc.stdout.print("  manual: {s}:{d} first contact, needs confirmation\n", .{ file.live_path, hunk.a_start + 1 });
+                try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
             }
             if (accept) {
                 try ra.line_edits.append(cc.arena, r.edit);
@@ -3970,7 +3971,7 @@ fn processHunk(
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
-                try cc.stdout.print("  manual: {s}:{d} first contact, needs confirmation\n", .{ file.live_path, hunk.a_start + 1 });
+                try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
             }
             if (accept) {
                 try ra.row_edits.append(cc.arena, r.edit);
@@ -3999,7 +4000,7 @@ fn processHunk(
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
-                try cc.stdout.print("  manual: {s}:{d} came from a capture\n", .{ file.live_path, hunk.a_start + 1 });
+                try cc.stdout.print("  manual: {f}:{d} came from a capture\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
                 return .cont;
             }
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));

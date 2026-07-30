@@ -71,11 +71,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // itself stays walkable (its children are all under HOME).
     if (try mox.source.path.liveKeyUnderHome(ctx.alloc, context.paths.home, dir_abs)) |rel| {
         if (mox.source.path.keyEscapes(rel)) {
-            try ctx.err.print("mox add-tree: {f}: outside HOME ({s})\n", .{display.of(dir_abs, context.paths.home), context.paths.home });
+            try ctx.err.print("mox add-tree: {f}: outside HOME ({s})\n", .{ display.of(dir_abs, context.paths.home), context.paths.home });
             return 1;
         }
     } else if (!add.isHomeItself(dir_abs, context.paths.home)) {
-        try ctx.err.print("mox add-tree: {f}: outside HOME ({s})\n", .{display.of(dir_abs, context.paths.home), context.paths.home });
+        try ctx.err.print("mox add-tree: {f}: outside HOME ({s})\n", .{ display.of(dir_abs, context.paths.home), context.paths.home });
         return 1;
     }
 

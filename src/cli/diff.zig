@@ -7,6 +7,7 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 const style = @import("style.zig");
 const tty = @import("tty.zig");
 const scope = @import("scope.zig");
@@ -258,7 +259,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
-            try ctx.err.print("mox diff: {s}: {s}\n", .{ file.live_path, file.head_error });
+            try ctx.err.print("mox diff: {f}: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
             continue;
         }
         // A tracked source matching an ignore rule (itself or a containing
@@ -276,7 +277,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         {
             var gdiag: mox.compose.interp.Diag = .{};
             if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
-                try ctx.err.print("mox diff: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
+                try ctx.err.print("mox diff: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
                 if (gdiag.capture()) |cap|
                     try ctx.err.print("mox diff:   failing item: {s}\n", .{cap});
                 continue;
@@ -294,7 +295,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &prov, &diag) catch |e| {
-            try ctx.err.print("mox diff: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
+            try ctx.err.print("mox diff: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
             if (diag.capture()) |cap|
                 try ctx.err.print("mox diff:   failing item: {s}\n", .{cap});
             continue;
@@ -347,7 +348,7 @@ fn diffOne(
     // Kind guard BEFORE the open: a FIFO here would block the read and brick
     // the whole diff.
     if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) {
-        try ctx.err.print("mox diff: {s}: not a regular file; skipped\n", .{live_path});
+        try ctx.err.print("mox diff: {f}: not a regular file; skipped\n", .{display.of(live_path, ctx.context.?.paths.home)});
         return;
     }
     const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -360,7 +361,7 @@ fn diffOne(
     const b_lines = try mox.diff.lines.splitLines(ctx.alloc, composed_bytes);
     const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
         error.TooManyLines => {
-            try ctx.err.print("mox diff: {s}: too large to diff\n", .{live_path});
+            try ctx.err.print("mox diff: {f}: too large to diff\n", .{display.of(live_path, ctx.context.?.paths.home)});
             return;
         },
         else => return e,
@@ -373,7 +374,7 @@ fn diffOne(
     total.removed += s.removed;
 
     if (stat_mode) {
-        try ctx.out.print(" {s} | +{d} -{d}\n", .{ live_path, s.added, s.removed });
+        try ctx.out.print(" {f} | +{d} -{d}\n", .{ display.of(live_path, ctx.context.?.paths.home), s.added, s.removed });
     } else {
         // Composed-side secrets come from this compose's provenance; live-side
         // secrets from the last-applied provenance mox persisted for the path
@@ -416,17 +417,17 @@ fn diffPartial(
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed_bytes) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
+            try ctx.err.print("  ERROR   {f} (composed source does not parse as {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
             return;
         },
     };
     switch (mode) {
         .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
-            try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+            try ctx.err.print("  ERROR   {f} (composed leaf {s} is outside the declared own paths)\n", .{ display.of(live_path, ctx.context.?.paths.home), leaf });
             return;
         },
         .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, own_paths)) |spelled| {
-            try ctx.err.print("  ERROR   {s} (composed source defines content under disowned path {s})\n", .{ live_path, spelled });
+            try ctx.err.print("  ERROR   {f} (composed source defines content under disowned path {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), spelled });
             return;
         },
     }
@@ -436,14 +437,14 @@ fn diffPartial(
     const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, live_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DanglingLink => {
-            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            try ctx.err.print("  ERROR   {f} (live path is a dangling symlink; fix or remove the link)\n", .{display.of(live_path, ctx.context.?.paths.home)});
             return;
         },
     };
     // Kind guard BEFORE the open: a FIFO here would block the read and brick
     // the whole diff.
     if (mox.apply.write.guardLiveRead(ctx.io, live_target) == .special) {
-        try ctx.err.print("  ERROR   {s} (not a regular file)\n", .{live_path});
+        try ctx.err.print("  ERROR   {f} (not a regular file)\n", .{display.of(live_path, ctx.context.?.paths.home)});
         return;
     }
     const live: []const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -453,7 +454,7 @@ fn diffPartial(
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (live file does not parse as {s})\n", .{ live_path, @tagName(format) });
+            try ctx.err.print("  ERROR   {f} (live file does not parse as {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
             return;
         },
     };
@@ -466,7 +467,7 @@ fn diffPartial(
     const flags = partial_mod.secretPathFlags(ctx.alloc, format, composed_bytes, secret_scope, prov_segments, &pdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ live_path, pdiag.text() });
+            try ctx.err.print("  ERROR   {f} (composed source: {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), pdiag.text() });
             return;
         },
     };
@@ -495,7 +496,7 @@ fn diffPartial(
         // Drift confined to secret paths: both sides mask to the same bytes,
         // and silence here would read as "no drift".
         if (!std.mem.eql(u8, live_x, composed_x)) {
-            try ctx.out.print("{s}: (no visible difference; the owned changes are under secret paths)\n", .{live_path});
+            try ctx.out.print("{f}: (no visible difference; the owned changes are under secret paths)\n", .{display.of(live_path, ctx.context.?.paths.home)});
         }
         return;
     }
@@ -504,7 +505,7 @@ fn diffPartial(
     const b_lines = try mox.diff.lines.splitLines(ctx.alloc, b_text);
     const hunks = mox.diff.lines.diff(ctx.alloc, a_lines, b_lines) catch |e| switch (e) {
         error.TooManyLines => {
-            try ctx.err.print("mox diff: {s}: too large to diff\n", .{live_path});
+            try ctx.err.print("mox diff: {f}: too large to diff\n", .{display.of(live_path, ctx.context.?.paths.home)});
             return;
         },
         else => return e,
@@ -516,7 +517,7 @@ fn diffPartial(
     total.added += s.added;
     total.removed += s.removed;
     if (stat_mode) {
-        try ctx.out.print(" {s} | +{d} -{d}\n", .{ live_path, s.added, s.removed });
+        try ctx.out.print(" {f} | +{d} -{d}\n", .{ display.of(live_path, ctx.context.?.paths.home), s.added, s.removed });
     } else {
         const rendered = try renderOwnedFile(ctx.alloc, live_path, a_lines, b_lines, hunks, sty);
         try ctx.out.writeAll(rendered);

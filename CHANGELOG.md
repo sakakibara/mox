@@ -35,13 +35,20 @@ All notable changes to mox are documented here. The format follows
   unset, matching every other variable mox reads.
 
 ### Changed
-- Human-facing output shows a live path under the home directory as `~/...`
-  rather than in full -- `status` rows, `apply`'s per-file lines, `add`,
-  `add-tree`, `remove`, `mv`, and the drift report, which previously
-  contracted its label but not the resolution command beside it. Those
-  commands are contracted now too: mox expands the tilde itself, so a pasted
-  line works quoted, in a script, and in a shell that expands none.
-  `--json`/`--porcelain` and `mox diff`'s headers stay absolute.
+- Human-facing output shows a path under the home directory as `~/...` rather
+  than in full, across every command that prints one -- previously only the
+  drift report's table label did, and not even the resolution command beside
+  it. Those commands are contracted now too: mox expands the tilde itself, so
+  a pasted line works quoted, in a script, and in a shell that expands none.
+  `--json`/`--porcelain` and `mox diff`'s unified-diff headers stay absolute,
+  since their consumer expands nothing.
+- The drift report no longer shortens the path to fit its other columns. At 80
+  columns the fixed columns left it about a dozen bytes, so the one thing on a
+  row that identifies a file was the one thing unreadable; the details now
+  move to a line under the path instead, and only a path wider than the
+  terminal itself is elided. The per-row `keep: mox commit`, identical on
+  every row, moved into the guidance, which now spells out both resolutions --
+  pre-filled with the path when exactly one file drifted.
 
 ### Added
 - A leading `~` in a path argument is expanded by mox, not only by the shell:

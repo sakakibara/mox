@@ -132,14 +132,22 @@ Applied: 1 written, 0 removed, 0 unchanged, 0 skipped, 1 drifted, 0 failed; scri
 
   Applied 1 files. 1 drifted, left untouched -- nothing was overwritten.
 
-    ~/.config/nvim/pack-lock.json  edited since mox wrote it  overwrite: whole file  keep: mox commit
+    ~/.config/nvim/pack-lock.json  edited since mox wrote it  overwrite: whole file
 
-  overwrite it:  mox apply --overwrite ~/.config/nvim/pack-lock.json
+  take the repo's version:  mox apply --overwrite ~/.config/nvim/pack-lock.json
+  keep your edit:           mox commit ~/.config/nvim/pack-lock.json
 ```
 
-Every path a human reads is shown against `~`; the table row shortens a long
-one in the middle to fit the terminal, and the command below it never does.
-`--json` and `--porcelain` emit the real absolute path.
+Both resolutions are always spelled out, and with exactly one drifted file
+each names it directly. With more than one they take a `<path>` instead: a
+pre-filled command that names the wrong file is worse than one you complete
+yourself.
+
+Every path a human reads is shown against `~`, including in those commands --
+mox expands the tilde itself, so they survive being pasted anywhere.
+`--json`/`--porcelain` emit the real absolute path. When a row's details do
+not fit the terminal they move under the path rather than shortening it; only
+a path wider than the terminal itself is elided, and never in the commands.
 
 `mox apply --overwrite <path>` discards the live edit and writes the composed
 output (snapshotted first, recoverable via `mox rollback`). `mox commit <path>`

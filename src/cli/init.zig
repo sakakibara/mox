@@ -3,6 +3,7 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const apply = @import("apply.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -82,7 +83,7 @@ fn resolveCloneUrl(arena: std.mem.Allocator, arg: []const u8) ![]const u8 {
 fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn, apply_now: bool) !u8 {
     const context = ctx.context.?;
     if (try dirNonEmpty(ctx.io, context.paths.repo_dir)) {
-        try ctx.err.print("mox init: refusing to clone into non-empty {s}\n", .{context.paths.repo_dir});
+        try ctx.err.print("mox init: refusing to clone into non-empty {f}\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
         return 1;
     }
     if (std.fs.path.dirname(context.paths.repo_dir)) |parent| {
@@ -92,7 +93,7 @@ fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn, apply_now: bool) 
         try ctx.err.print("mox init: git clone failed: {s}\n", .{@errorName(e)});
         return 1;
     };
-    try ctx.out.print("Cloned {s} to {s}\n", .{ url, context.paths.repo_dir });
+    try ctx.out.print("Cloned {s} to {f}\n", .{ url, display.of(context.paths.repo_dir, ctx.context.?.paths.home) });
     if (!apply_now) {
         try ctx.out.writeAll("Review the repository, then run 'mox apply' to interview for facts, write files, and run setup scripts.\n");
     }
@@ -156,9 +157,9 @@ fn initFresh(ctx: *app.Ctx) !u8 {
         return 1;
     };
 
-    try ctx.out.print("Initialized mox repo at {s}\n", .{context.paths.repo_dir});
-    try ctx.out.print("State directory: {s}\n", .{context.paths.state_dir});
-    try ctx.out.print("Private layer:   {s}\n", .{context.paths.private_dir});
+    try ctx.out.print("Initialized mox repo at {f}\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
+    try ctx.out.print("State directory: {f}\n", .{display.of(context.paths.state_dir, ctx.context.?.paths.home)});
+    try ctx.out.print("Private layer:   {f}\n", .{display.of(context.paths.private_dir, ctx.context.?.paths.home)});
     return 0;
 }
 

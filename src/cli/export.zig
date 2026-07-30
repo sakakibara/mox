@@ -10,6 +10,7 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 const AxisTuple = mox.source.tree.AxisTuple;
@@ -98,7 +99,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         {
             var gdiag: mox.compose.interp.Diag = .{};
             const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, &m_state, secrets, &gdiag) catch |e| {
-                try ctx.err.print("mox export: {s}: generator failed: {s}\n", .{ file.live_path, @errorName(e) });
+                try ctx.err.print("mox export: {f}: generator failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
                 if (gdiag.capture()) |cap|
                     try ctx.err.print("mox export:   failing item: {s}\n", .{cap});
                 failed += 1;
@@ -107,7 +108,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             if (gen) |outputs| {
                 for (outputs) |o| {
                     const dest = (try exportDest(ctx.alloc, out_dir, m_state.home, o.live_path)) orelse {
-                        try ctx.err.print("mox export: {s}: outside HOME, cannot place in export tree\n", .{o.live_path});
+                        try ctx.err.print("mox export: {f}: outside HOME, cannot place in export tree\n", .{display.of(o.live_path, ctx.context.?.paths.home)});
                         failed += 1;
                         continue;
                     };
@@ -127,7 +128,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, bindings, &m_state, secrets, null, &diag) catch |e| {
-            try ctx.err.print("mox export: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
+            try ctx.err.print("mox export: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
             if (diag.capture()) |cap|
                 try ctx.err.print("mox export:   failing item: {s}\n", .{cap});
             failed += 1;
@@ -139,7 +140,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         };
 
         const dest = (try exportDest(ctx.alloc, out_dir, m_state.home, file.live_path)) orelse {
-            try ctx.err.print("mox export: {s}: outside HOME, cannot place in export tree\n", .{file.live_path});
+            try ctx.err.print("mox export: {f}: outside HOME, cannot place in export tree\n", .{display.of(file.live_path, ctx.context.?.paths.home)});
             failed += 1;
             continue;
         };
@@ -153,19 +154,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             const owned_doc = partial.OwnedDoc.parse(ctx.alloc, format, bytes) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.OwnedUnparseable => {
-                    try ctx.err.print("mox export: {s}: composed source does not parse as {s}\n", .{ file.live_path, @tagName(format) });
+                    try ctx.err.print("mox export: {f}: composed source does not parse as {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @tagName(format) });
                     failed += 1;
                     continue;
                 },
             };
             if (file.ownership == .disown) {
                 if (try partial.populatedDisownPath(ctx.alloc, &owned_doc, file.own_paths)) |spelled| {
-                    try ctx.err.print("mox export: {s}: composed source defines content under disowned path {s}\n", .{ file.live_path, spelled });
+                    try ctx.err.print("mox export: {f}: composed source defines content under disowned path {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), spelled });
                     failed += 1;
                     continue;
                 }
             } else if (try partial.undeclaredLeaf(ctx.alloc, &owned_doc, file.own_paths)) |leaf| {
-                try ctx.err.print("mox export: {s}: composed leaf {s} is outside the declared own paths\n", .{ file.live_path, leaf });
+                try ctx.err.print("mox export: {f}: composed leaf {s} is outside the declared own paths\n", .{ display.of(file.live_path, ctx.context.?.paths.home), leaf });
                 failed += 1;
                 continue;
             }
@@ -214,7 +215,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         written += 1;
     }
 
-    try ctx.out.print("Exported {d} file(s) to {s} ({d} gated off, {d} failed)\n", .{ written, out_dir, skipped, failed });
+    try ctx.out.print("Exported {d} file(s) to {f} ({d} gated off, {d} failed)\n", .{ written, display.of(out_dir, ctx.context.?.paths.home), skipped, failed });
     return if (failed > 0) 1 else 0;
 }
 

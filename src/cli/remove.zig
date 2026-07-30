@@ -87,7 +87,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const dst = try std.fs.path.join(ctx.alloc, &.{ trash, file.source_base_path });
         try fileops.copyTree(ctx.io, ctx.alloc, file.source_base_abs, dst);
         Io.Dir.cwd().deleteFile(ctx.io, file.source_base_abs) catch |e| {
-            try ctx.err.print("mox remove: could not delete source {s}: {s}\n", .{ file.source_base_abs, @errorName(e) });
+            try ctx.err.print("mox remove: could not delete source {f}: {s}\n", .{ display.of(file.source_base_abs, ctx.context.?.paths.home), @errorName(e) });
             return 1;
         };
     }

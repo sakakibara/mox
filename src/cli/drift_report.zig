@@ -21,6 +21,9 @@ const collapse_sample: usize = 3;
 /// terminal -- past this point truncation buys nothing readable.
 const min_path_col: usize = 12;
 const row_indent = "    ";
+/// Where a row's details go when they do not fit beside the path: indented
+/// past it, so the pair reads as one entry rather than two rows.
+const cont_indent = "      ";
 const col_gap = 2;
 
 /// What the report renders with, resolved once by the caller: a real
@@ -119,13 +122,25 @@ fn renderMigrationBlock(out: *std.Io.Writer, units: []const Unit, count: usize, 
 
 const Row = struct { path: []const u8, what: []const u8, scope: []const u8, warn: bool };
 
-/// One row per non-collapsed unit, columns aligned to the widest cell in
-/// each, the path column budgeted (and, if still too wide, middle-truncated)
-/// to fit `opts.width`.
+/// One entry per non-collapsed unit.
+///
+/// The path is the only thing on a row that identifies a file, and the only
+/// thing the reader goes on to act on, so it is never the column that gives
+/// way. When the details do not fit beside it they move to a continuation
+/// line underneath instead -- at 80 columns the fixed columns leave the path
+/// a dozen bytes, and `~...init.lua` names nothing. Only a path that alone
+/// overruns the terminal is middle-truncated, and its whole spelling is still
+/// in the guidance below.
+///
+/// A file's `keep:` action is the same six words on every row, so it lives in
+/// the guidance once rather than N times.
 fn renderRows(arena: std.mem.Allocator, out: *std.Io.Writer, units: []const Unit, opts: Options) !void {
     var rows: std.ArrayList(Row) = .empty;
+    var path_w: usize = 0;
+    var what_w: usize = 0;
+    var scope_w: usize = 0;
     for (units) |u| {
-        try rows.append(arena, .{
+        const r: Row = .{
             .path = try display.alloc(arena, u.path, opts.home),
             .what = try whatDrifted(arena, u),
             .scope = mox.apply.drift.overwriteScope(u.kind),
@@ -133,60 +148,69 @@ fn renderRows(arena: std.mem.Allocator, out: *std.Io.Writer, units: []const Unit
                 .owned_key => false,
                 else => true,
             },
-        });
-    }
-
-    var what_w: usize = 0;
-    var scope_w: usize = 0;
-    for (rows.items) |r| {
+        };
+        path_w = @max(path_w, r.path.len);
         what_w = @max(what_w, r.what.len);
         scope_w = @max(scope_w, r.scope.len);
+        try rows.append(arena, r);
     }
 
-    const fixed = row_indent.len + col_gap + what_w + col_gap + "overwrite: ".len + scope_w + col_gap + "keep: mox commit".len;
-    var path_w: usize = 0;
-    for (rows.items) |r| path_w = @max(path_w, r.path.len);
-    if (fixed + path_w > opts.width) {
-        path_w = if (opts.width > fixed + min_path_col) opts.width - fixed else min_path_col;
-        for (rows.items) |*r| {
-            if (r.path.len > path_w) r.path = try truncateMiddle(arena, r.path, path_w);
-        }
-        path_w = 0;
-        for (rows.items) |r| path_w = @max(path_w, r.path.len);
-    }
+    const details_w = what_w + col_gap + "overwrite: ".len + scope_w;
+    const inline_fits = row_indent.len + path_w + col_gap + details_w <= opts.width;
 
     try out.writeAll("\n");
     for (rows.items) |r| {
         try out.writeAll(row_indent);
-        try out.writeAll(r.path);
-        try out.splatByteAll(' ', path_w - r.path.len + col_gap);
+        if (inline_fits) {
+            try out.writeAll(r.path);
+            try out.splatByteAll(' ', path_w - r.path.len + col_gap);
+        } else {
+            const room = opts.width -| row_indent.len;
+            const p = if (r.path.len > room and room >= min_path_col)
+                try truncateMiddle(arena, r.path, room)
+            else
+                r.path;
+            try out.writeAll(p);
+            try out.writeAll("\n");
+            try out.writeAll(cont_indent);
+        }
         try out.writeAll(r.what);
         try out.splatByteAll(' ', what_w - r.what.len + col_gap);
         try out.writeAll("overwrite: ");
         if (r.warn) try opts.sty.yellow(out);
         try out.writeAll(r.scope);
         if (r.warn) try opts.sty.close(out);
-        try out.splatByteAll(' ', scope_w - r.scope.len + col_gap);
-        try out.writeAll("keep: mox commit\n");
+        try out.writeAll("\n");
     }
 }
 
 /// Guidance for the non-collapsed case: exactly one drifted unit (the sole
 /// scopeable thing this run found, regardless of how much unrowed drift rides
-/// along with it) pre-fills its own path -- always safe, since the command
-/// names that one path and nothing else. More than one never pre-fills an
-/// all-paths overwrite: copy-pasting it would clobber a file the reader meant
-/// to leave alone.
+/// along with it) pre-fills its own path in BOTH resolutions -- always safe,
+/// since each command names that one path and nothing else. More than one
+/// never pre-fills an all-paths overwrite: copy-pasting it would clobber a
+/// file the reader meant to leave alone.
 ///
-/// The pre-filled path is contracted like every other one printed here: mox
+/// Both ways out are always named. Drift has exactly two resolutions, and a
+/// report that spells one of them and abbreviates the other reads as though
+/// overwriting were the expected answer.
+///
+/// A pre-filled path is contracted like every other one printed here: mox
 /// expands a leading `~` itself, so the line survives being pasted quoted,
 /// into a script, or into a shell that does not expand a tilde at all.
 fn renderGuidance(out: *std.Io.Writer, units: []const Unit, home: []const u8) !void {
     try out.writeAll("\n");
     if (units.len == 1) {
-        try out.print("  overwrite it:  mox apply --overwrite {f}\n", .{display.of(units[0].path, home)});
+        const p = display.of(units[0].path, home);
+        try out.print("  take the repo's version:  mox apply --overwrite {f}\n", .{p});
+        try out.print("  keep your edit:           mox commit {f}\n", .{p});
     } else {
-        try out.writeAll("  see the full list:  mox status\n  overwrite one:      mox apply --overwrite <path>\n");
+        try out.writeAll(
+            \\  take the repo's version:  mox apply --overwrite <path>
+            \\  keep your edit:           mox commit <path>
+            \\  see the full list:        mox status
+            \\
+        );
     }
 }
 
@@ -291,13 +315,40 @@ test "render: one row per kind, aligned columns, exact bytes" {
         \\
         \\  Applied 18 files. 4 drifted, left untouched -- nothing was overwritten.
         \\
-        \\    ~/.claude/CLAUDE.md      edited since mox wrote it   overwrite: whole file          keep: mox commit
-        \\    ~/.claude/hooks          symlink target differs      overwrite: re-point            keep: mox commit
-        \\    ~/.claude/settings.json  owned key 'enabledPlugins'  overwrite: that key            keep: mox commit
-        \\    ~/.config/gen.inc        generated set drifted       overwrite: regenerate the set  keep: mox commit
+        \\    ~/.claude/CLAUDE.md      edited since mox wrote it   overwrite: whole file
+        \\    ~/.claude/hooks          symlink target differs      overwrite: re-point
+        \\    ~/.claude/settings.json  owned key 'enabledPlugins'  overwrite: that key
+        \\    ~/.config/gen.inc        generated set drifted       overwrite: regenerate the set
         \\
-        \\  see the full list:  mox status
-        \\  overwrite one:      mox apply --overwrite <path>
+        \\  take the repo's version:  mox apply --overwrite <path>
+        \\  keep your edit:           mox commit <path>
+        \\  see the full list:        mox status
+        \\
+    , s);
+}
+
+test "render: a row too wide for the terminal stacks its details, never shortening the path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var units = [_]Unit{
+        .{ .path = "/home/u/.config/some/very/deeply/nested/application/settings.json", .kind = .whole_file, .first_contact = false },
+        .{ .path = "/home/u/.zshrc", .kind = .whole_file, .first_contact = false },
+    };
+    // 80 columns: the fixed columns alone would leave the path a dozen bytes.
+    const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 80 });
+    try testing.expectEqualStrings(
+        \\
+        \\  2 drifted, left untouched -- nothing was overwritten.
+        \\
+        \\    ~/.config/some/very/deeply/nested/application/settings.json
+        \\      edited since mox wrote it  overwrite: whole file
+        \\    ~/.zshrc
+        \\      edited since mox wrote it  overwrite: whole file
+        \\
+        \\  take the repo's version:  mox apply --overwrite <path>
+        \\  keep your edit:           mox commit <path>
+        \\  see the full list:        mox status
         \\
     , s);
 }
@@ -310,7 +361,7 @@ test "render: a single drifted unit pre-fills its own scoped overwrite, even alo
         .{ .path = "/home/u/.zshrc", .kind = .whole_file, .first_contact = false },
     };
     const s = try renderToString(a, &units, .{ .unrowed = 3, .home = test_home, .sty = off, .width = 80 });
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite ~/.zshrc\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "take the repo's version:  mox apply --overwrite ~/.zshrc\n") != null);
     try testing.expect(std.mem.indexOf(u8, s, "overwrite one:") == null);
     try testing.expect(std.mem.indexOf(u8, s, "3 entries in exact dirs / orphaned generator leaves need attention (see messages above; mox apply --overwrite to remove)") != null);
 }
@@ -324,9 +375,15 @@ test "render: more than one drifted unit never pre-fills an unscoped overwrite" 
         .{ .path = "/home/u/b", .kind = .whole_file, .first_contact = false },
     };
     const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 80 });
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:") == null);
-    try testing.expect(std.mem.indexOf(u8, s, "see the full list:  mox status") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite one:      mox apply --overwrite <path>") != null);
+    // Both resolutions are still named, but neither pre-fills a path: with
+    // more than one candidate, a copy-pasteable command would name the wrong
+    // file as readily as the right one.
+    try testing.expect(std.mem.indexOf(u8, s, "mox apply --overwrite <path>") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "mox commit <path>") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "see the full list:        mox status") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "~/a") != null); // named in its row
+    try testing.expect(std.mem.indexOf(u8, s, "--overwrite ~/a") == null); // never pre-filled
+    try testing.expect(std.mem.indexOf(u8, s, "--overwrite ~/b") == null);
     // Never the bare unscoped form on its own line.
     try testing.expect(std.mem.indexOf(u8, s, "mox apply --overwrite\n") == null);
 }
@@ -368,10 +425,11 @@ test "render: many first-contact units collapse into one migration block" {
         \\
     , s);
     // Collapsed: no per-file first-contact row, and no second (contradicting)
-    // scoped-guidance block under the migration block's own guidance.
+    // scoped-guidance block under the migration block's own guidance. The
+    // exact-bytes comparison above is the real check; these name the two ways
+    // a regression would show up.
     try testing.expect(std.mem.indexOf(u8, s, "not written by mox") == null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:") == null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite one:") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "see the full list:") == null);
 }
 
 test "render: a collapsed migration block still scopes guidance to an edited unit alongside it" {
@@ -390,7 +448,7 @@ test "render: a collapsed migration block still scopes guidance to an edited uni
     // The edited unit is not swallowed by the collapse: it still gets a row
     // and its own scoped pre-fill, not just the migration block's unscoped one.
     try testing.expect(std.mem.indexOf(u8, s, "~/.ssh/config") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite ~/.ssh/config\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "take the repo's version:  mox apply --overwrite ~/.ssh/config\n") != null);
 }
 
 test "render: a small first-contact set does not collapse, rows normally instead" {
@@ -403,7 +461,7 @@ test "render: a small first-contact set does not collapse, rows normally instead
     const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 80 });
     try testing.expect(std.mem.indexOf(u8, s, "first apply / migration") == null);
     try testing.expect(std.mem.indexOf(u8, s, "not written by mox") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite ~/.zshrc") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "take the repo's version:  mox apply --overwrite ~/.zshrc") != null);
 }
 
 test "render: color on, stripped, equals color off byte for byte" {
@@ -424,31 +482,48 @@ test "render: color on, stripped, equals color off byte for byte" {
     try testing.expectEqualStrings(plain, try stripAnsi(a, colored));
 }
 
-test "render: a narrow terminal truncates a long path in the middle, basename intact" {
+test "render: only a path that alone overruns the terminal is truncated, basename intact" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var units = [_]Unit{
         .{ .path = "/home/u/.config/some/very/deeply/nested/application/settings.json", .kind = .whole_file, .first_contact = false },
     };
-    const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 100 });
-    try testing.expect(std.mem.indexOf(u8, s, "settings.json") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "~/.config/so...settings.json") != null);
-    // The width budget governs the table row (an aligned column); the guidance
-    // line below it prints the whole path on purpose -- a command has to be
-    // copy-pasteable, not merely narrow. Contracted, not truncated: mox
+
+    // Wide enough for the path on its own line (58 + the indent), too narrow
+    // for the details beside it: stacked, and the path survives whole.
+    const roomy = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 100 });
+    try testing.expect(std.mem.indexOf(u8, roomy, "\n    ~/.config/some/very/deeply/nested/application/settings.json\n") != null);
+    try testing.expect(std.mem.indexOf(u8, roomy, "...") == null);
+
+    // Narrower than the path itself: now it gives way, middle-first.
+    const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 40 });
+    try testing.expect(std.mem.indexOf(u8, s, "...") != null);
+    try testing.expect(std.mem.endsWith(u8, "settings.json", "settings.json"));
+    try testing.expect(std.mem.indexOf(u8, s, "settings.json\n") != null);
+
+    // The guidance below prints the whole path either way -- a command has to
+    // be copy-pasteable, not merely narrow. Contracted, not truncated: mox
     // expands the `~` itself, so the line survives the paste.
-    try testing.expect(std.mem.indexOf(
-        u8,
-        s,
-        "mox apply --overwrite ~/.config/some/very/deeply/nested/application/settings.json\n",
-    ) != null);
-    var max_row_line: usize = 0;
+    for ([_][]const u8{ roomy, s }) |rendered| {
+        try testing.expect(std.mem.indexOf(
+            u8,
+            rendered,
+            "mox apply --overwrite ~/.config/some/very/deeply/nested/application/settings.json\n",
+        ) != null);
+    }
+
+    // The path line is what the budget governs. A details line carries fixed
+    // phrases that cannot shrink without losing their meaning, so on a
+    // terminal this narrow it is left to wrap rather than be mangled.
+    var max_path_line: usize = 0;
     var it = std.mem.splitScalar(u8, s, '\n');
     while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, row_indent)) max_row_line = @max(max_row_line, line.len);
+        const is_path_line = std.mem.startsWith(u8, line, row_indent) and
+            !std.mem.startsWith(u8, line, cont_indent);
+        if (is_path_line) max_path_line = @max(max_path_line, line.len);
     }
-    try testing.expect(max_row_line <= 100);
+    try testing.expect(max_path_line <= 40);
 }
 
 test "truncateMiddle: exact length, basename preserved" {

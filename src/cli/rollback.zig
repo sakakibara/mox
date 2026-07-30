@@ -4,6 +4,7 @@ const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const apply_cmd = @import("apply.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 const Env = @import("env").Env;
 
 const Io = std.Io;
@@ -105,7 +106,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var failed: usize = 0;
     for (withheld.items) |w| {
         const file = partials.get(w.live_path) orelse {
-            try ctx.err.print("  ERROR   {s} (partially owned, but its own declaration is unavailable; fix the source tree, then re-run)\n", .{w.live_path});
+            try ctx.err.print("  ERROR   {f} (partially owned, but its own declaration is unavailable; fix the source tree, then re-run)\n", .{display.of(w.live_path, ctx.context.?.paths.home)});
             failed += 1;
             continue;
         };
@@ -157,7 +158,7 @@ fn repatchPartial(
     const snap_doc = partial.OwnedDoc.parse(ctx.alloc, format, snap_content) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (snapshot does not parse as {s})\n", .{ live_path, @tagName(format) });
+            try ctx.err.print("  ERROR   {f} (snapshot does not parse as {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
             failed.* += 1;
             return false;
         },
@@ -167,7 +168,7 @@ fn repatchPartial(
         else => partial.ownedHasSecretMask(&snap_doc, file.own_paths),
     };
     if (masked) {
-        try ctx.err.print("  ERROR   {s} (snapshot masks a secret; placeholders are never written live -- re-apply the source instead)\n", .{live_path});
+        try ctx.err.print("  ERROR   {f} (snapshot masks a secret; placeholders are never written live -- re-apply the source instead)\n", .{display.of(live_path, ctx.context.?.paths.home)});
         failed.* += 1;
         return false;
     }
@@ -177,7 +178,7 @@ fn repatchPartial(
     const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, live_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DanglingLink => {
-            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            try ctx.err.print("  ERROR   {f} (live path is a dangling symlink; fix or remove the link)\n", .{display.of(live_path, ctx.context.?.paths.home)});
             failed.* += 1;
             return false;
         },
@@ -188,7 +189,7 @@ fn repatchPartial(
     const live: ?[]const u8 = Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => {
-            try ctx.err.print("mox rollback: {s}: read failed: {s}\n", .{ live_path, @errorName(e) });
+            try ctx.err.print("mox rollback: {f}: read failed: {s}\n", .{ display.of(live_path, ctx.context.?.paths.home), @errorName(e) });
             failed.* += 1;
             return false;
         },
@@ -198,7 +199,7 @@ fn repatchPartial(
     _ = partial.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (live file does not parse as {s}; mox cannot patch what it cannot preserve)\n", .{ live_path, @tagName(format) });
+            try ctx.err.print("  ERROR   {f} (live file does not parse as {s}; mox cannot patch what it cannot preserve)\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
             failed.* += 1;
             return false;
         },
@@ -212,7 +213,7 @@ fn repatchPartial(
         const snap_loc = partial.locateSpans(ctx.alloc, format, snap_content, file.own_paths, &pdiag) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                try ctx.err.print("  ERROR   {s} (snapshot: {s})\n", .{ live_path, pdiag.text() });
+                try ctx.err.print("  ERROR   {f} (snapshot: {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), pdiag.text() });
                 failed.* += 1;
                 return false;
             },
@@ -223,7 +224,7 @@ fn repatchPartial(
         partial.OwnedDoc.parse(ctx.alloc, format, snap_owned_text) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.OwnedUnparseable => {
-                try ctx.err.print("  ERROR   {s} (snapshot owned content does not parse as {s})\n", .{ live_path, @tagName(format) });
+                try ctx.err.print("  ERROR   {f} (snapshot owned content does not parse as {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
                 failed.* += 1;
                 return false;
             },
@@ -237,7 +238,7 @@ fn repatchPartial(
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} ({s})\n", .{ live_path, pdiag.text() });
+            try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(live_path, ctx.context.?.paths.home), pdiag.text() });
             failed.* += 1;
             return false;
         },
@@ -248,7 +249,7 @@ fn repatchPartial(
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} (invariant check failed: {s})\n", .{ live_path, pdiag.text() });
+            try ctx.err.print("  ERROR   {f} (invariant check failed: {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), pdiag.text() });
             failed.* += 1;
             return false;
         },
@@ -270,17 +271,17 @@ fn repatchPartial(
     };
     mox.apply.write.writeAtomicPartial(ctx.io, live_target, candidate, mode, live_stat) catch |e| switch (e) {
         error.LiveChangedDuringWrite => {
-            try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-rollback; re-run 'mox rollback')\n", .{live_path});
+            try ctx.err.print("  CONFLICT {f} (changed underneath mox mid-rollback; re-run 'mox rollback')\n", .{display.of(live_path, ctx.context.?.paths.home)});
             failed.* += 1;
             return false;
         },
         else => {
-            try ctx.err.print("mox rollback: {s}: write failed: {s}\n", .{ live_path, @errorName(e) });
+            try ctx.err.print("mox rollback: {f}: write failed: {s}\n", .{ display.of(live_path, ctx.context.?.paths.home), @errorName(e) });
             failed.* += 1;
             return false;
         },
     };
-    try ctx.out.print("  re-patched {s} (owned subtree from the snapshot; remainder kept current)\n", .{live_path});
+    try ctx.out.print("  re-patched {f} (owned subtree from the snapshot; remainder kept current)\n", .{display.of(live_path, ctx.context.?.paths.home)});
     return true;
 }
 

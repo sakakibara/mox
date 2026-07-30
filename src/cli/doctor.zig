@@ -13,6 +13,7 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -100,7 +101,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     } else {
         skipped += 1;
-        try ctx.out.print("  note: {s} is not a git working tree; the tracked-source check was skipped\n", .{context.paths.repo_dir});
+        try ctx.out.print("  note: {f} is not a git working tree; the tracked-source check was skipped\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
     }
 
     // Source modes git cannot carry (not 0644/0755) that are not recorded in

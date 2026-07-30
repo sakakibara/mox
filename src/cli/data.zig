@@ -4,6 +4,7 @@ const app = @import("app.zig");
 const toml = @import("toml");
 const json = @import("json");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -51,7 +52,7 @@ fn get(ctx: *app.Ctx, a: cli.Args(GetSpec)) anyerror!u8 {
     }
 
     const v = toml.parse(ctx.alloc, content, .{}) catch |e| {
-        try ctx.err.print("mox data get: {s}: TOML parse failed: {s}\n", .{ path, @errorName(e) });
+        try ctx.err.print("mox data get: {f}: TOML parse failed: {s}\n", .{ display.of(path, ctx.context.?.paths.home), @errorName(e) });
         return 1;
     };
     const jv = try tomlToJson(ctx.alloc, v);

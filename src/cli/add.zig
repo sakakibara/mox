@@ -675,7 +675,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     };
     switch (result.outcome) {
         .added => {
-            try ctx.out.print("Added {s} -> {s}\n", .{ shown, result.src_path });
+            try ctx.out.print("Added {s} -> {f}\n", .{ shown, display.of(result.src_path, home) });
             if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(live_path))) {
                 try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{shown});
             }
@@ -705,7 +705,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             return 1;
         },
         .already_managed => {
-            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ shown, result.src_path });
+            try ctx.err.print("mox add: {s}: already managed (source at {f})\n", .{ shown, display.of(result.src_path, home) });
             return 1;
         },
         .into_overlay_dir => {
@@ -744,7 +744,7 @@ fn runOwn(
     };
     switch (r.outcome) {
         .added => {
-            try ctx.out.print("Added {s} -> {s} (own: {d} key-path(s))\n", .{ shown, r.src_path, own_raws.len + absent_raws.len });
+            try ctx.out.print("Added {s} -> {f} (own: {d} key-path(s))\n", .{ shown, display.of(r.src_path, home), own_raws.len + absent_raws.len });
             if (r.unowned_top > 0) {
                 try ctx.out.print("  {d} top-level live entr{s} remain{s} unowned (the program's region)\n", .{
                     r.unowned_top,
@@ -780,7 +780,7 @@ fn runOwn(
             return 1;
         },
         .already_managed => {
-            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ shown, r.src_path });
+            try ctx.err.print("mox add: {s}: already managed (source at {f})\n", .{ shown, display.of(r.src_path, home) });
             return 1;
         },
         .into_overlay_dir => {
@@ -826,7 +826,7 @@ fn runDisown(
     };
     switch (r.outcome) {
         .added => {
-            try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ shown, r.src_path, disown_raws.len });
+            try ctx.out.print("Added {s} -> {f} (disown: {d} key-path(s) left to the program)\n", .{ shown, display.of(r.src_path, home), disown_raws.len });
             buildInitialCoupling(ctx, "add");
             return 0;
         },
@@ -855,7 +855,7 @@ fn runDisown(
             return 1;
         },
         .already_managed => {
-            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ shown, r.src_path });
+            try ctx.err.print("mox add: {s}: already managed (source at {f})\n", .{ shown, display.of(r.src_path, home) });
             return 1;
         },
         .into_overlay_dir => {
