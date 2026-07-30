@@ -2874,7 +2874,11 @@ test "add-tree: captures a symlink, reports a FIFO as skipped with a reason" {
     const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Added 2 file(s); 1 skipped, 0 failed") != null);
-    const skip_line = try std.fmt.allocPrint(a, "skipping {s} (not a regular file)", .{fifo});
+    const skip_line = try std.fmt.allocPrint(
+        a,
+        "skipping ~{c}.config{c}app{c}pipe (not a regular file)",
+        .{ std.fs.path.sep, std.fs.path.sep, std.fs.path.sep },
+    );
     try std.testing.expect(std.mem.indexOf(u8, r.out, skip_line) != null);
 
     // The symlink was captured like single add captures it: a regular source
@@ -2941,7 +2945,8 @@ test "status and diff: a FIFO at a live path is an ERROR line, never opened" {
 
     const st = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), st.rc);
-    const err_line = try std.fmt.allocPrint(a, "ERROR    {s}", .{fifo});
+    // Rows name a file the way a human reads it: contracted against HOME.
+    const err_line = try std.fmt.allocPrint(a, "ERROR    ~{c}.zshrc", .{std.fs.path.sep});
     try std.testing.expect(std.mem.indexOf(u8, st.out, err_line) != null);
     // The healthy sibling still reports (MISSING: not applied yet).
     try std.testing.expect(std.mem.indexOf(u8, st.out, "healthy.conf") != null);

@@ -34,6 +34,15 @@ All notable changes to mox are documented here. The format follows
 - An empty `MOX_SNAPSHOT_RETENTION` or `MOX_UPGRADE_TARGET_BIN` is treated as
   unset, matching every other variable mox reads.
 
+### Changed
+- Human-facing output shows a live path under the home directory as `~/...`
+  rather than in full -- `status` rows, `apply`'s per-file lines, `add`,
+  `add-tree`, `remove`, `mv`, and the drift report, which previously
+  contracted its label but not the resolution command beside it. Those
+  commands are contracted now too: mox expands the tilde itself, so a pasted
+  line works quoted, in a script, and in a shell that expands none.
+  `--json`/`--porcelain` and `mox diff`'s headers stay absolute.
+
 ### Added
 - A leading `~` in a path argument is expanded by mox, not only by the shell:
   a quoted `"~/x"`, a non-initial `--path=~/x`, PowerShell (which passes `~`

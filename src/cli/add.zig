@@ -4,6 +4,7 @@ const app = @import("app.zig");
 const edit = @import("edit.zig");
 const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -593,6 +594,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         error.OutOfMemory => return e,
         else => |f| return edit.reportTarget(ctx.err, "mox add", a.path, f),
     };
+    // Every line naming this file names it the way a human reads it; the real
+    // path is what gets captured.
+    const shown = try display.alloc(ctx.alloc, live_path, home);
 
     // add mutates the repo (source file, attributes, coupling graph), so it
     // takes the single-writer lock like every other mutator.
@@ -671,9 +675,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     };
     switch (result.outcome) {
         .added => {
-            try ctx.out.print("Added {s} -> {s}\n", .{ live_path, result.src_path });
+            try ctx.out.print("Added {s} -> {s}\n", .{ shown, result.src_path });
             if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(live_path))) {
-                try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{live_path});
+                try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{shown});
             }
             // Rebuild the coupling graph so the new file's tokens can couple
             // with existing sources on the next commit.
@@ -681,11 +685,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             return 0;
         },
         .not_found => {
-            try ctx.err.print("mox add: {s}: not found\n", .{live_path});
+            try ctx.err.print("mox add: {s}: not found\n", .{shown});
             return 1;
         },
         .outside_home => {
-            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ live_path, home });
+            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ shown, home });
             return 1;
         },
         .is_home => {
@@ -693,23 +697,23 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             return 1;
         },
         .is_directory => {
-            try ctx.err.print("mox add: {s}: is a directory (use 'mox add-tree' to add its contents)\n", .{live_path});
+            try ctx.err.print("mox add: {s}: is a directory (use 'mox add-tree' to add its contents)\n", .{shown});
             return 1;
         },
         .not_regular => {
-            try ctx.err.print("mox add: {s}: not a regular file\n", .{live_path});
+            try ctx.err.print("mox add: {s}: not a regular file\n", .{shown});
             return 1;
         },
         .already_managed => {
-            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ live_path, result.src_path });
+            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ shown, result.src_path });
             return 1;
         },
         .into_overlay_dir => {
-            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{live_path});
+            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{shown});
             return 1;
         },
         .partial_target => {
-            try ctx.err.print("mox add: {s}: partially owned (its source head declares ownership); edit the source, or remove the declaration first\n", .{live_path});
+            try ctx.err.print("mox add: {s}: partially owned (its source head declares ownership); edit the source, or remove the declaration first\n", .{shown});
             return 1;
         },
     }
@@ -726,6 +730,7 @@ fn runOwn(
 ) anyerror!u8 {
     const context = ctx.context.?;
     var attrs_diag: mox.source.attributes.Diag = .{};
+    const shown = try display.alloc(ctx.alloc, live_path, home);
     const r = addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws, gate, &attrs_diag) catch |e| switch (e) {
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
@@ -739,7 +744,7 @@ fn runOwn(
     };
     switch (r.outcome) {
         .added => {
-            try ctx.out.print("Added {s} -> {s} (own: {d} key-path(s))\n", .{ live_path, r.src_path, own_raws.len + absent_raws.len });
+            try ctx.out.print("Added {s} -> {s} (own: {d} key-path(s))\n", .{ shown, r.src_path, own_raws.len + absent_raws.len });
             if (r.unowned_top > 0) {
                 try ctx.out.print("  {d} top-level live entr{s} remain{s} unowned (the program's region)\n", .{
                     r.unowned_top,
@@ -751,11 +756,11 @@ fn runOwn(
             return 0;
         },
         .not_found => {
-            try ctx.err.print("mox add: {s}: not found\n", .{live_path});
+            try ctx.err.print("mox add: {s}: not found\n", .{shown});
             return 1;
         },
         .outside_home => {
-            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ live_path, home });
+            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ shown, home });
             return 1;
         },
         .is_home => {
@@ -763,27 +768,27 @@ fn runOwn(
             return 1;
         },
         .is_directory => {
-            try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
+            try ctx.err.print("mox add: {s}: is a directory\n", .{shown});
             return 1;
         },
         .not_regular => {
-            try ctx.err.print("mox add: {s}: not a regular file\n", .{live_path});
+            try ctx.err.print("mox add: {s}: not a regular file\n", .{shown});
             return 1;
         },
         .dangling_link => {
-            try ctx.err.print("mox add: {s}: live path is a dangling symlink; fix or remove the link\n", .{live_path});
+            try ctx.err.print("mox add: {s}: live path is a dangling symlink; fix or remove the link\n", .{shown});
             return 1;
         },
         .already_managed => {
-            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ live_path, r.src_path });
+            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ shown, r.src_path });
             return 1;
         },
         .into_overlay_dir => {
-            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{live_path});
+            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{shown});
             return 1;
         },
         .not_structured => {
-            try ctx.err.print("mox add: {s}: --own requires a structured target (toml/json/yaml/ini/gitconfig)\n", .{live_path});
+            try ctx.err.print("mox add: {s}: --own requires a structured target (toml/json/yaml/ini/gitconfig)\n", .{shown});
             return 1;
         },
         .invalid_path => {
@@ -791,7 +796,7 @@ fn runOwn(
             return 1;
         },
         .extract_failed => {
-            try ctx.err.print("mox add: {s}: cannot extract the declared paths: {s}\n", .{ live_path, r.detail });
+            try ctx.err.print("mox add: {s}: cannot extract the declared paths: {s}\n", .{ shown, r.detail });
             return 1;
         },
     }
@@ -807,6 +812,7 @@ fn runDisown(
 ) anyerror!u8 {
     const context = ctx.context.?;
     var attrs_diag: mox.source.attributes.Diag = .{};
+    const shown = try display.alloc(ctx.alloc, live_path, home);
     const r = addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws, gate, &attrs_diag) catch |e| switch (e) {
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
@@ -820,16 +826,16 @@ fn runDisown(
     };
     switch (r.outcome) {
         .added => {
-            try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ live_path, r.src_path, disown_raws.len });
+            try ctx.out.print("Added {s} -> {s} (disown: {d} key-path(s) left to the program)\n", .{ shown, r.src_path, disown_raws.len });
             buildInitialCoupling(ctx, "add");
             return 0;
         },
         .not_found => {
-            try ctx.err.print("mox add: {s}: not found\n", .{live_path});
+            try ctx.err.print("mox add: {s}: not found\n", .{shown});
             return 1;
         },
         .outside_home => {
-            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ live_path, home });
+            try ctx.err.print("mox add: {s}: outside HOME ({s})\n", .{ shown, home });
             return 1;
         },
         .is_home => {
@@ -837,27 +843,27 @@ fn runDisown(
             return 1;
         },
         .is_directory => {
-            try ctx.err.print("mox add: {s}: is a directory\n", .{live_path});
+            try ctx.err.print("mox add: {s}: is a directory\n", .{shown});
             return 1;
         },
         .not_regular => {
-            try ctx.err.print("mox add: {s}: not a regular file\n", .{live_path});
+            try ctx.err.print("mox add: {s}: not a regular file\n", .{shown});
             return 1;
         },
         .dangling_link => {
-            try ctx.err.print("mox add: {s}: live path is a dangling symlink; fix or remove the link\n", .{live_path});
+            try ctx.err.print("mox add: {s}: live path is a dangling symlink; fix or remove the link\n", .{shown});
             return 1;
         },
         .already_managed => {
-            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ live_path, r.src_path });
+            try ctx.err.print("mox add: {s}: already managed (source at {s})\n", .{ shown, r.src_path });
             return 1;
         },
         .into_overlay_dir => {
-            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{live_path});
+            try ctx.err.print("mox add: {s}: sits in a '.d/' overlay directory, which mox reserves for axis overlays\n", .{shown});
             return 1;
         },
         .not_structured => {
-            try ctx.err.print("mox add: {s}: --disown requires a structured target (toml/json/yaml/ini/gitconfig)\n", .{live_path});
+            try ctx.err.print("mox add: {s}: --disown requires a structured target (toml/json/yaml/ini/gitconfig)\n", .{shown});
             return 1;
         },
         .invalid_path => {
@@ -865,7 +871,7 @@ fn runDisown(
             return 1;
         },
         .extract_failed => {
-            try ctx.err.print("mox add: {s}: cannot extract the owned complement: {s}\n", .{ live_path, r.detail });
+            try ctx.err.print("mox add: {s}: cannot extract the owned complement: {s}\n", .{ shown, r.detail });
             return 1;
         },
     }

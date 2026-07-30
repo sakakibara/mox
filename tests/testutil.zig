@@ -200,7 +200,8 @@ test "canary: mox add against a path that does not exist reports not-found on st
     const got = try h.run(&.{ "mox", "add", missing });
     try testing.expectEqual(@as(u8, 1), got.rc);
     try testing.expectEqualStrings("", got.out);
-    const want = try std.fmt.allocPrint(a, "mox add: {s}: not found\n", .{missing});
+    // Human output names a path the way a human reads it, contracted to `~`.
+    const want = try std.fmt.allocPrint(a, "mox add: ~{c}nope.txt: not found\n", .{std.fs.path.sep});
     try testing.expectEqualStrings(want, got.err);
 }
 

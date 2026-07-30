@@ -2,6 +2,7 @@
 pub const paths = @import("paths.zig");
 pub const tty = @import("tty.zig");
 pub const style = @import("style.zig");
+pub const display = @import("display.zig");
 pub const prompt = @import("prompt.zig");
 pub const init_cmd = @import("init.zig");
 pub const add_cmd = @import("add.zig");
@@ -46,6 +47,7 @@ test {
     _ = mv_cmd;
     _ = remove_cmd;
     _ = scope;
+    _ = display;
     _ = addtree_cmd;
     _ = doctor_cmd;
     _ = uninstall_cmd;

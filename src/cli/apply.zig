@@ -8,6 +8,7 @@ const drift_report = @import("drift_report.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
 const edit = @import("edit.zig");
+const display = @import("display.zig");
 
 pub const Spec = struct {
     dry_run: cli.Flag(.{ .help = "report only, write nothing" }),
@@ -345,10 +346,13 @@ fn applyPass(
     var compose_failed: std.ArrayList([]const u8) = .empty;
 
     for (files) |file| {
+        // Every line about this file names it the way a human reads it; the
+        // real path is still what gets composed, snapshotted, and written.
+        const shown = try display.alloc(ctx.alloc, file.live_path, home);
         // A head declaration the walk could not honor is this file's error
         // alone; everything else still applies.
         if (file.head_error.len > 0) {
-            try ctx.err.print("  ERROR   {s} ({s})\n", .{ file.live_path, file.head_error });
+            try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, file.head_error });
             counts.fail += 1;
             continue;
         }
@@ -363,7 +367,7 @@ fn applyPass(
         // directory) is never composed or written.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
         if (ruleset.isPathIgnored(rel, false)) {
-            try ctx.out.print("  skipping {s} (ignored)\n", .{file.live_path});
+            try ctx.out.print("  skipping {s} (ignored)\n", .{shown});
             continue;
         }
 
@@ -377,7 +381,7 @@ fn applyPass(
             };
             if (present) {
                 counts.unchanged += 1;
-                try ctx.out.print("  present {s} (seed-once)\n", .{file.live_path});
+                try ctx.out.print("  present {s} (seed-once)\n", .{shown});
                 continue;
             }
         }
@@ -385,7 +389,7 @@ fn applyPass(
         var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &prov, &diag) catch |e| {
-            try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ file.live_path, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ shown, @errorName(e) });
             if (e == error.UnknownShell)
                 try ctx.err.print("mox apply:   accepted shells: fish, zsh, bash, powershell\n", .{});
             if (e == error.ReservedAxisName)
@@ -405,7 +409,7 @@ fn applyPass(
                 const target = std.mem.trim(u8, bytes, " \t\r\n");
                 if (dry_run) {
                     counts.ok += 1;
-                    try ctx.out.print("  would symlink {s} -> {s}\n", .{ file.live_path, target });
+                    try ctx.out.print("  would symlink {s} -> {s}\n", .{ shown, target });
                     continue;
                 }
 
@@ -419,7 +423,7 @@ fn applyPass(
                 if (disposition == .unchanged) {
                     counts.unchanged += 1;
                     try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
-                    try ctx.out.print("  unchanged {s} -> {s}\n", .{ file.live_path, target });
+                    try ctx.out.print("  unchanged {s} -> {s}\n", .{ shown, target });
                     continue;
                 }
                 if (disposition == .drift and !force) {
@@ -434,13 +438,13 @@ fn applyPass(
                     // replace with nothing touched, rather than destroying a
                     // tree `mox rollback` could only partially restore.
                     mox.apply.snapshot.saveTree(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, file.live_path) catch |e| {
-                        try ctx.err.print("mox apply: {s}: cannot fully back up the directory, refusing to replace it: {s}\n", .{ file.live_path, @errorName(e) });
+                        try ctx.err.print("mox apply: {s}: cannot fully back up the directory, refusing to replace it: {s}\n", .{ shown, @errorName(e) });
                         counts.fail += 1;
                         continue;
                     };
                     snapshotted = true;
                     std.Io.Dir.cwd().deleteTree(ctx.io, file.live_path) catch |e| {
-                        try ctx.err.print("mox apply: {s}: could not remove the directory: {s}\n", .{ file.live_path, @errorName(e) });
+                        try ctx.err.print("mox apply: {s}: could not remove the directory: {s}\n", .{ shown, @errorName(e) });
                         counts.fail += 1;
                         continue;
                     };
@@ -448,13 +452,13 @@ fn applyPass(
                         std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
                     }
                     std.Io.Dir.cwd().symLink(ctx.io, target, file.live_path, .{}) catch |e| {
-                        try ctx.err.print("mox apply: {s}: symlink failed: {s}\n", .{ file.live_path, @errorName(e) });
+                        try ctx.err.print("mox apply: {s}: symlink failed: {s}\n", .{ shown, @errorName(e) });
                         counts.fail += 1;
                         continue;
                     };
                     try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
                     counts.ok += 1;
-                    try ctx.out.print("  symlinked {s} -> {s} (directory backed up)\n", .{ file.live_path, target });
+                    try ctx.out.print("  symlinked {s} -> {s} (directory backed up)\n", .{ shown, target });
                     continue;
                 }
                 // Snapshot whatever is there before destroying it, and refuse
@@ -467,7 +471,7 @@ fn applyPass(
                         else => mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, file.live_path, snapshotContentForSite(ctx.io, ctx.alloc, file.live_path, site)),
                     };
                     snap_res catch |e| {
-                        try ctx.err.print("mox apply: {s}: snapshot failed, not replacing: {s}\n", .{ file.live_path, @errorName(e) });
+                        try ctx.err.print("mox apply: {s}: snapshot failed, not replacing: {s}\n", .{ shown, @errorName(e) });
                         counts.fail += 1;
                         continue;
                     };
@@ -479,13 +483,13 @@ fn applyPass(
                     std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
                 }
                 std.Io.Dir.cwd().symLink(ctx.io, target, file.live_path, .{}) catch |e| {
-                    try ctx.err.print("mox apply: {s}: symlink failed: {s}\n", .{ file.live_path, @errorName(e) });
+                    try ctx.err.print("mox apply: {s}: symlink failed: {s}\n", .{ shown, @errorName(e) });
                     counts.fail += 1;
                     continue;
                 };
                 try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
                 counts.ok += 1;
-                try ctx.out.print("  symlinked {s} -> {s}\n", .{ file.live_path, target });
+                try ctx.out.print("  symlinked {s} -> {s}\n", .{ shown, target });
             } else if (file.own_paths.len > 0) {
                 try applyPartialFile(ctx, .{
                     .file = file,
@@ -857,6 +861,7 @@ fn omitFile(
 ) !void {
     const context = ctx.context.?;
     const live_path = file.live_path;
+    const shown = try display.alloc(ctx.alloc, live_path, context.paths.home);
     // A whole-file gate off means "no file here on this machine"; an empty
     // render of an ungated template means "nothing left to write". Only the
     // latter can be kept as an empty file, so only it earns the keep-empty hint.
@@ -868,7 +873,7 @@ fn omitFile(
     // Mirror status, which reports it and changes nothing -- so the two agree.
     if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) {
         counts.skip += 1;
-        try ctx.out.print("  skipped {s} (not a regular file)\n", .{live_path});
+        try ctx.out.print("  skipped {s} (not a regular file)\n", .{shown});
         return;
     }
 
@@ -885,9 +890,9 @@ fn omitFile(
         }
         counts.skip += 1;
         if (gated) {
-            try ctx.out.print("  skipped {s} (axis-gated off)\n", .{live_path});
+            try ctx.out.print("  skipped {s} (axis-gated off)\n", .{shown});
         } else {
-            try ctx.out.print("  skipped {s} (composes to nothing)\n", .{live_path});
+            try ctx.out.print("  skipped {s} (composes to nothing)\n", .{shown});
         }
         try warnBadWholeFileGateAxis(ctx, file);
         return;
@@ -905,7 +910,7 @@ fn omitFile(
 
     if (dry_run) {
         counts.removed += 1;
-        try ctx.out.print("  would remove {s} (composes to nothing)\n", .{live_path});
+        try ctx.out.print("  would remove {s} (composes to nothing)\n", .{shown});
         return;
     }
 
@@ -913,7 +918,7 @@ fn omitFile(
     // refuse if the snapshot cannot be taken -- symmetric with an overwrite.
     const snap_content = try redactedPriorContent(ctx, live_path, live.?);
     mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, live_path, snap_content) catch |e| {
-        try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ live_path, @errorName(e) });
+        try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ shown, @errorName(e) });
         counts.fail += 1;
         return;
     };
@@ -923,18 +928,18 @@ fn omitFile(
     // destroyed with only the pre-edit bytes snapshotted. Re-check right before
     // the delete and refuse when the live file changed since the initial read.
     if (!liveMatchesInitial(ctx.io, ctx.alloc, live_path, live)) {
-        try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{live_path});
+        try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{shown});
         counts.fail += 1;
         return;
     }
     std.Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
-        try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ live_path, @errorName(e) });
+        try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ shown, @errorName(e) });
         counts.fail += 1;
         return;
     };
     try mox.apply.applied.forgetWholeFile(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
     counts.removed += 1;
-    try ctx.out.print("  removed {s} (composes to nothing)\n", .{live_path});
+    try ctx.out.print("  removed {s} (composes to nothing)\n", .{shown});
     if (!gated) try ctx.out.print("    add \"# mox: keep-empty\" to keep it as an empty file\n", .{});
 }
 
@@ -969,12 +974,13 @@ const RegularInput = struct {
 /// 1:1 write/snapshot/state machinery is not duplicated.
 fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotted: *bool) !void {
     const context = ctx.context.?;
+    const shown = try display.alloc(ctx.alloc, in.live_path, context.paths.home);
     // Kind guard BEFORE any open: a FIFO/socket/device at the live path would
     // block or misfire the read below, so it is reported and never opened.
     switch (mox.apply.write.guardLiveRead(ctx.io, in.live_path)) {
         .readable, .absent => {},
         .special => |k| {
-            try ctx.err.print("mox apply: {s}: not a regular file ({s}); not written\n", .{ in.live_path, @tagName(k) });
+            try ctx.err.print("mox apply: {s}: not a regular file ({s}); not written\n", .{ shown, @tagName(k) });
             counts.fail += 1;
             return;
         },
@@ -989,7 +995,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, in.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => {
-            try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ in.live_path, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ shown, @errorName(e) });
             counts.fail += 1;
             return;
         },
@@ -1024,7 +1030,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
                 // EXPLICITLY attributed mode. A default mode is left alone.
                 if ((in.mode_explicit or in.manager_secret) and !liveIsSymlink(ctx.io, in.live_path)) {
                     mox.apply.write.setMode(in.live_path, eff_mode) catch |e| {
-                        try ctx.err.print("mox apply: {s}: could not enforce mode: {s}\n", .{ in.live_path, @errorName(e) });
+                        try ctx.err.print("mox apply: {s}: could not enforce mode: {s}\n", .{ shown, @errorName(e) });
                     };
                 }
                 // A stale owned record from a formerly partial path would make
@@ -1036,7 +1042,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
                 }
                 try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.prov_items);
             }
-            try ctx.out.print("  unchanged {s}\n", .{in.live_path});
+            try ctx.out.print("  unchanged {s}\n", .{shown});
             return;
         },
         .fresh_write, .safe_overwrite => {},
@@ -1044,7 +1050,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
 
     if (in.dry_run) {
         counts.ok += 1;
-        try ctx.out.print("  would write {s}\n", .{in.live_path});
+        try ctx.out.print("  would write {s}\n", .{shown});
         return;
     }
     // About to replace existing content: snapshot it first (secret lines
@@ -1052,7 +1058,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     if (disposition != .fresh_write) {
         const snap_content = try redactedPriorContent(ctx, in.live_path, live.?);
         mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, in.live_path, snap_content) catch |e| {
-            try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ in.live_path, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             counts.fail += 1;
             return;
         };
@@ -1061,12 +1067,12 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     // TOCTOU guard: re-read right before the write to detect an interleaved
     // external edit that is not in the snapshot.
     if (!liveMatchesInitial(ctx.io, ctx.alloc, in.live_path, live)) {
-        try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{in.live_path});
+        try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{shown});
         counts.fail += 1;
         return;
     }
     mox.apply.write.writeAtomic(ctx.io, in.live_path, in.bytes, eff_mode) catch |e| {
-        try ctx.err.print("mox apply: {s}: write failed: {s}\n", .{ in.live_path, @errorName(e) });
+        try ctx.err.print("mox apply: {s}: write failed: {s}\n", .{ shown, @errorName(e) });
         counts.fail += 1;
         return;
     };
@@ -1079,7 +1085,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
         try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.prov_items);
     }
     counts.ok += 1;
-    try ctx.out.print("  {s} {s}\n", .{ if (in.create_once) "seeded" else "wrote", in.live_path });
+    try ctx.out.print("  {s} {s}\n", .{ if (in.create_once) "seeded" else "wrote", shown });
 }
 
 /// Inputs to `applyPartialFile`: the composed text plus everything the
@@ -1115,6 +1121,7 @@ const PartialInput = struct {
 /// rollback, which names no scripts of its own.
 pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize, extra_path_dirs: []const []const u8) !bool {
     const context = ctx.context.?;
+    const shown = try display.alloc(ctx.alloc, live_path, context.paths.home);
     // Keyed by live path: the state lock serializes applies, so no two runs
     // race on it, and a crash's leftover is overwritten on the next apply.
     const path_hash = mox.apply.applied.contentHashHex(live_path);
@@ -1138,7 +1145,7 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     defer std.Io.Dir.cwd().deleteTree(ctx.io, check_dir) catch {};
     defer std.Io.Dir.cwd().deleteFile(ctx.io, out_path) catch {};
     if (!materialized) {
-        try ctx.err.print("  ERROR   {s} (check {s} could not run: candidate not materialized)\n", .{ live_path, check_argv[0] });
+        try ctx.err.print("  ERROR   {s} (check {s} could not run: candidate not materialized)\n", .{ shown, check_argv[0] });
         fail_count.* += 1;
         return false;
     }
@@ -1153,13 +1160,13 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     const res = mox.apply.run_scripts.runCheck(ctx.alloc, ctx.io, context.paths.repo_dir, check_argv, &env_map, out_path, timeout_ms) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} (check {s} could not run: {s})\n", .{ live_path, check_argv[0], @errorName(e) });
+            try ctx.err.print("  ERROR   {s} (check {s} could not run: {s})\n", .{ shown, check_argv[0], @errorName(e) });
             fail_count.* += 1;
             return false;
         },
     };
     const why = res.refusal orelse return true;
-    try ctx.err.print("  ERROR   {s} (check {s} refused the candidate: {s})\n", .{ live_path, check_argv[0], why });
+    try ctx.err.print("  ERROR   {s} (check {s} refused the candidate: {s})\n", .{ shown, check_argv[0], why });
     if (res.tail.len > 0) {
         try ctx.err.print("mox apply:   check output:\n{s}", .{res.tail});
         if (res.tail[res.tail.len - 1] != '\n') try ctx.err.writeAll("\n");
@@ -1179,6 +1186,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const canon_mod = mox.apply.canonical;
     const owned_mod = mox.apply.owned;
     const live_path = in.file.live_path;
+    const shown = try display.alloc(ctx.alloc, live_path, context.paths.home);
     const own_paths = in.file.own_paths;
     // The walk only attaches own_paths to structured targets.
     const format = mox.source.format.formatOfPath(in.file.source_base_path).?;
@@ -1189,7 +1197,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, in.bytes) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
+            try ctx.err.print("  ERROR   {s} (composed source does not parse as {s})\n", .{ shown, @tagName(format) });
             counts.fail += 1;
             return;
         },
@@ -1200,12 +1208,12 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     // populated (disown), checked before live is read or touched.
     switch (mode) {
         .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
-            try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+            try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ shown, leaf });
             counts.fail += 1;
             return;
         },
         .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, own_paths)) |spelled| {
-            try ctx.err.print("  ERROR   {s} (composed source defines content under disowned path {s})\n", .{ live_path, spelled });
+            try ctx.err.print("  ERROR   {s} (composed source defines content under disowned path {s})\n", .{ shown, spelled });
             counts.fail += 1;
             return;
         },
@@ -1220,7 +1228,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const secret_flags = partial_mod.secretPathFlags(ctx.alloc, format, in.bytes, secret_scope, in.prov_items, &pdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ live_path, pdiag.text() });
+            try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ shown, pdiag.text() });
             counts.fail += 1;
             return;
         },
@@ -1241,7 +1249,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const live_target = mox.apply.write.resolvePartialLive(ctx.alloc, ctx.io, live_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DanglingLink => {
-            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            try ctx.err.print("  ERROR   {s} (live path is a dangling symlink; fix or remove the link)\n", .{shown});
             counts.fail += 1;
             return;
         },
@@ -1251,7 +1259,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     switch (mox.apply.write.guardLiveRead(ctx.io, live_target)) {
         .readable, .absent => {},
         .special => |k| {
-            try ctx.err.print("  ERROR   {s} (not a regular file: {s})\n", .{ live_path, @tagName(k) });
+            try ctx.err.print("  ERROR   {s} (not a regular file: {s})\n", .{ shown, @tagName(k) });
             counts.fail += 1;
             return;
         },
@@ -1263,7 +1271,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_target, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => {
-            try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ live_path, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ shown, @errorName(e) });
             counts.fail += 1;
             return;
         },
@@ -1274,7 +1282,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (live file does not parse as {s}; mox cannot patch what it cannot preserve)\n", .{ live_path, @tagName(format) });
+            try ctx.err.print("  ERROR   {s} (live file does not parse as {s}; mox cannot patch what it cannot preserve)\n", .{ shown, @tagName(format) });
             counts.fail += 1;
             return;
         },
@@ -1322,12 +1330,12 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     if (live_matches) {
         counts.unchanged += 1;
         if (in.dry_run or record_current) {
-            try ctx.out.print("  unchanged {s}\n", .{live_path});
+            try ctx.out.print("  unchanged {s}\n", .{shown});
         } else {
             // Clean adoption: the live owned content is already the composed
             // content, so only the record is established; no byte changes.
             try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items);
-            try ctx.out.print("  adopted {s} (live owned content matches the source)\n", .{live_path});
+            try ctx.out.print("  adopted {s} (live owned content matches the source)\n", .{shown});
         }
         return;
     }
@@ -1335,9 +1343,9 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     if (in.dry_run) {
         counts.ok += 1;
         if (live == null) {
-            try ctx.out.print("  would create {s}\n", .{live_path});
+            try ctx.out.print("  would create {s}\n", .{shown});
         } else {
-            try ctx.out.print("  would write {s}\n", .{live_path});
+            try ctx.out.print("  would write {s}\n", .{shown});
         }
         return;
     }
@@ -1346,7 +1354,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     // --skip-scripts the hook does not run, so the write is skipped too.
     if (in.skip_scripts and in.file.check_argv.len > 0) {
         counts.skip += 1;
-        try ctx.out.print("  skipped {s} (check skipped)\n", .{live_path});
+        try ctx.out.print("  skipped {s} (check skipped)\n", .{shown});
         return;
     }
 
@@ -1356,7 +1364,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     } catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} ({s})\n", .{ live_path, pdiag.text() });
+            try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, pdiag.text() });
             counts.fail += 1;
             return;
         },
@@ -1367,7 +1375,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try ctx.err.print("  ERROR   {s} (invariant check failed: {s})\n", .{ live_path, pdiag.text() });
+            try ctx.err.print("  ERROR   {s} (invariant check failed: {s})\n", .{ shown, pdiag.text() });
             counts.fail += 1;
             return;
         },
@@ -1389,13 +1397,13 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         const snap_content = partial_mod.maskSecretPaths(ctx.alloc, format, live_text, mask_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.MaskFailed => {
-                try ctx.err.print("mox apply: {s}: snapshot masking failed, not overwriting\n", .{live_path});
+                try ctx.err.print("mox apply: {s}: snapshot masking failed, not overwriting\n", .{shown});
                 counts.fail += 1;
                 return;
             },
         };
         mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, live_path, snap_content) catch |e| {
-            try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ live_path, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             counts.fail += 1;
             return;
         };
@@ -1405,12 +1413,12 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const eff_mode = mox.apply.write.secretRestrictedMode(in.manager_secret, in.file.mode_explicit, in.file.mode, currentMode(ctx.io, live_target));
     mox.apply.write.writeAtomicPartial(ctx.io, live_target, candidate, eff_mode, live_stat) catch |e| switch (e) {
         error.LiveChangedDuringWrite => {
-            try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{live_path});
+            try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{shown});
             counts.fail += 1;
             return;
         },
         else => {
-            try ctx.err.print("mox apply: {s}: write failed: {s}\n", .{ live_path, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: write failed: {s}\n", .{ shown, @errorName(e) });
             counts.fail += 1;
             return;
         },
@@ -1418,7 +1426,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
 
     try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items);
     counts.ok += 1;
-    try ctx.out.print("  {s} {s}\n", .{ if (live == null) "created" else "wrote", live_path });
+    try ctx.out.print("  {s} {s}\n", .{ if (live == null) "created" else "wrote", shown });
 }
 
 fn writeOwnedRecord(
@@ -1476,9 +1484,10 @@ fn applyGenerator(
     ruleset: *const mox.source.ignore.match.RuleSet,
     home: []const u8,
 ) !bool {
+    const shown = try display.alloc(ctx.alloc, file.live_path, home);
     var diag: mox.compose.interp.Diag = .{};
     const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, m_state, secrets, &diag) catch |e| {
-        try ctx.err.print("mox apply: {s}: generator failed: {s}\n", .{ file.live_path, @errorName(e) });
+        try ctx.err.print("mox apply: {s}: generator failed: {s}\n", .{ shown, @errorName(e) });
         if (diag.capture()) |cap|
             try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
         counts.fail += 1;
@@ -1499,13 +1508,13 @@ fn applyGenerator(
     for (outputs) |o| {
         const collides_regular = regular_live.contains(o.live_path) and !std.mem.eql(u8, o.live_path, file.live_path);
         if (collides_regular or produced.contains(o.live_path)) {
-            try ctx.err.print("mox apply: {s}: generated path collides with another managed file: {s}\n", .{ file.live_path, o.live_path });
+            try ctx.err.print("mox apply: {s}: generated path collides with another managed file: {f}\n", .{ shown, display.of(o.live_path, home) });
             counts.fail += 1;
             try recordFailedGenerator(ctx, file, gen_states);
             return true;
         }
         if (generatedParentEscapes(ctx.io, base_dir, o.live_path)) {
-            try ctx.err.print("mox apply: {s}: generated path escapes the target dir through a symlink: {s}\n", .{ file.live_path, o.live_path });
+            try ctx.err.print("mox apply: {s}: generated path escapes the target dir through a symlink: {f}\n", .{ shown, display.of(o.live_path, home) });
             counts.fail += 1;
             try recordFailedGenerator(ctx, file, gen_states);
             return true;
@@ -1520,7 +1529,7 @@ fn applyGenerator(
         // other source: never written, never added to the keep set.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, o.live_path);
         if (ruleset.isPathIgnored(rel, false)) {
-            try ctx.out.print("  skipping {s} (ignored)\n", .{o.live_path});
+            try ctx.out.print("  skipping {f} (ignored)\n", .{display.of(o.live_path, home)});
             continue;
         }
         try current.append(ctx.alloc, o.live_path);

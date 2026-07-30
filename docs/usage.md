@@ -126,13 +126,20 @@ are clean, leaves the drifted ones untouched, and prints a report of them:
 
 ```
 mox apply
-  3 written
+  wrote ~/.zshrc
 
-  1 drifted, left untouched
-    ~/.config/nvim/pack-lock.json   edited since mox wrote it
-      take the repo's version:  mox apply --overwrite ~/.config/nvim/pack-lock.json
-      keep your edit:           mox commit ~/.config/nvim/pack-lock.json
+Applied: 1 written, 0 removed, 0 unchanged, 0 skipped, 1 drifted, 0 failed; scripts: 0 ran, 0 skipped, 0 failed, 0 blocked, 0 declined
+
+  Applied 1 files. 1 drifted, left untouched -- nothing was overwritten.
+
+    ~/.config/nvim/pack-lock.json  edited since mox wrote it  overwrite: whole file  keep: mox commit
+
+  overwrite it:  mox apply --overwrite ~/.config/nvim/pack-lock.json
 ```
+
+Every path a human reads is shown against `~`; the table row shortens a long
+one in the middle to fit the terminal, and the command below it never does.
+`--json` and `--porcelain` emit the real absolute path.
 
 `mox apply --overwrite <path>` discards the live edit and writes the composed
 output (snapshotted first, recoverable via `mox rollback`). `mox commit <path>`

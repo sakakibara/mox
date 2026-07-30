@@ -10,6 +10,7 @@ const lock_mod = @import("lock.zig");
 const edit = @import("edit.zig");
 const add = @import("add.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -50,17 +51,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // would surface a raw NotDir instead of pointing at 'mox add'.
     const st = Io.Dir.cwd().statFile(ctx.io, dir_abs, .{}) catch |e| switch (e) {
         error.FileNotFound => {
-            try ctx.err.print("mox add-tree: {s}: not found\n", .{dir_abs});
+            try ctx.err.print("mox add-tree: {f}: not found\n", .{display.of(dir_abs, context.paths.home)});
             return 1;
         },
         error.NotDir => {
-            try ctx.err.print("mox add-tree: {s}: not a directory (use 'mox add' for a single file)\n", .{dir_abs});
+            try ctx.err.print("mox add-tree: {f}: not a directory (use 'mox add' for a single file)\n", .{display.of(dir_abs, context.paths.home)});
             return 1;
         },
         else => return e,
     };
     if (st.kind != .directory) {
-        try ctx.err.print("mox add-tree: {s}: not a directory (use 'mox add' for a single file)\n", .{dir_abs});
+        try ctx.err.print("mox add-tree: {f}: not a directory (use 'mox add' for a single file)\n", .{display.of(dir_abs, context.paths.home)});
         return 1;
     }
 
@@ -70,11 +71,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // itself stays walkable (its children are all under HOME).
     if (try mox.source.path.liveKeyUnderHome(ctx.alloc, context.paths.home, dir_abs)) |rel| {
         if (mox.source.path.keyEscapes(rel)) {
-            try ctx.err.print("mox add-tree: {s}: outside HOME ({s})\n", .{ dir_abs, context.paths.home });
+            try ctx.err.print("mox add-tree: {f}: outside HOME ({s})\n", .{display.of(dir_abs, context.paths.home), context.paths.home });
             return 1;
         }
     } else if (!add.isHomeItself(dir_abs, context.paths.home)) {
-        try ctx.err.print("mox add-tree: {s}: outside HOME ({s})\n", .{ dir_abs, context.paths.home });
+        try ctx.err.print("mox add-tree: {f}: outside HOME ({s})\n", .{display.of(dir_abs, context.paths.home), context.paths.home });
         return 1;
     }
 
@@ -126,9 +127,9 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                 switch (result.outcome) {
                     .added => {
                         counts.added += 1;
-                        try ctx.out.print("  added {s}\n", .{child});
+                        try ctx.out.print("  added {f}\n", .{display.of(child, home)});
                         if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(child))) {
-                            try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{child});
+                            try ctx.out.print("  note: {f} looks like a secret and will be committed\n", .{display.of(child, home)});
                         }
                     },
                     .already_managed => counts.skipped += 1,
@@ -136,11 +137,11 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
                     // whole-file capture would sweep the program's region in.
                     .partial_target => {
                         counts.skipped += 1;
-                        try ctx.out.print("  skipping {s} (partially owned; managed per key-path)\n", .{child});
+                        try ctx.out.print("  skipping {f} (partially owned; managed per key-path)\n", .{display.of(child, home)});
                     },
                     .not_regular => {
                         counts.skipped += 1;
-                        try ctx.out.print("  skipping {s} (not a regular file)\n", .{child});
+                        try ctx.out.print("  skipping {f} (not a regular file)\n", .{display.of(child, home)});
                     },
                     else => counts.skipped += 1,
                 }
@@ -150,7 +151,7 @@ fn walk(ctx: *app.Ctx, dir_abs: []const u8, ruleset: *const mox.source.ignore.ma
             // of pretending it was not there.
             else => {
                 counts.skipped += 1;
-                try ctx.out.print("  skipping {s} (not a regular file)\n", .{child});
+                try ctx.out.print("  skipping {f} (not a regular file)\n", .{display.of(child, home)});
             },
         }
     }

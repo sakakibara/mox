@@ -35,6 +35,13 @@ a directory named `~user`; on Windows, spell the tail with `/`.
 Environment variables are the shell's to expand, and mox does not: a
 literal `$HOME` reaches it only when something meant it literally.
 
+Paths are printed back the same way: a live path under the home
+directory is shown as `~/...`, including in the commands a report tells
+you to run -- mox expands the tilde itself, so those survive being
+pasted quoted, into a script, or into a shell that expands no tilde at
+all. `mox status --json`/`--porcelain` emit the real absolute path,
+since their consumer expands nothing.
+
 ## init
 
 Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>`

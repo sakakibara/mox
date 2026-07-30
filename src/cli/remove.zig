@@ -10,6 +10,7 @@ const lock_mod = @import("lock.zig");
 const edit = @import("edit.zig");
 const fileops = @import("fileops.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -180,11 +181,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // too rather than followed or left behind.
         switch (mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path)) {
             .absent => {
-                try ctx.out.print("  live file already absent: {s}\n", .{live_path});
+                try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
                 return 0;
             },
             .directory => {
-                try ctx.err.print("mox remove: live path is a directory, not deleting: {s}\n", .{live_path});
+                try ctx.err.print("mox remove: live path is a directory, not deleting: {f}\n", .{display.of(live_path, context.paths.home)});
                 return 1;
             },
             .symlink => |target| {
@@ -196,7 +197,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             .other => {
                 const live = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
                     error.FileNotFound => {
-                        try ctx.out.print("  live file already absent: {s}\n", .{live_path});
+                        try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
                         return 0;
                     },
                     else => return e,
@@ -208,12 +209,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             },
         }
         Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
-            try ctx.err.print("mox remove: could not delete live file {s}: {s}\n", .{ live_path, @errorName(e) });
+            try ctx.err.print("mox remove: could not delete live file {f}: {s}\n", .{ display.of(live_path, context.paths.home), @errorName(e) });
             return 1;
         };
-        try ctx.out.print("  purged live file: {s}\n", .{live_path});
+        try ctx.out.print("  purged live file: {f}\n", .{display.of(live_path, context.paths.home)});
     } else {
-        try ctx.out.print("  live file left in place: {s}\n", .{live_path});
+        try ctx.out.print("  live file left in place: {f}\n", .{display.of(live_path, context.paths.home)});
     }
     return 0;
 }

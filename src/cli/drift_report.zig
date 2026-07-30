@@ -7,6 +7,7 @@
 const std = @import("std");
 const mox = @import("../root.zig");
 const style = @import("style.zig");
+const display = @import("display.zig");
 
 pub const Unit = mox.apply.drift.Unit;
 
@@ -55,7 +56,7 @@ pub fn render(arena: std.mem.Allocator, out: *std.Io.Writer, units: []Unit, opts
 
     try renderSuccessLine(out, opts, total);
 
-    if (collapse) try renderMigrationBlock(arena, out, units, first_contact_count, opts);
+    if (collapse) try renderMigrationBlock(out, units, first_contact_count, opts);
 
     var rows: std.ArrayList(Unit) = .empty;
     for (units) |u| {
@@ -76,7 +77,7 @@ pub fn render(arena: std.mem.Allocator, out: *std.Io.Writer, units: []Unit, opts
     // much as it would repeat it. Any OTHER row -- a file mox did write,
     // since edited -- is not covered by that guidance and still needs its
     // own scoped pre-fill, collapsed or not.
-    if (rows.items.len > 0) try renderGuidance(out, rows.items);
+    if (rows.items.len > 0) try renderGuidance(out, rows.items, opts.home);
 }
 
 fn renderSuccessLine(out: *std.Io.Writer, opts: Options, total: usize) !void {
@@ -93,7 +94,7 @@ fn renderSuccessLine(out: *std.Io.Writer, opts: Options, total: usize) !void {
 /// The migration block: a fresh-machine `apply` may carry hundreds of
 /// first-contact files, so these collapse to a count, a short sample, and one
 /// set of guidance -- never a first-contact row per file.
-fn renderMigrationBlock(arena: std.mem.Allocator, out: *std.Io.Writer, units: []const Unit, count: usize, opts: Options) !void {
+fn renderMigrationBlock(out: *std.Io.Writer, units: []const Unit, count: usize, opts: Options) !void {
     try out.writeAll("\n  ");
     try dimNum(out, opts.sty, count);
     try out.writeAll(" files exist that mox did not write (first apply / migration)\n      ");
@@ -102,7 +103,7 @@ fn renderMigrationBlock(arena: std.mem.Allocator, out: *std.Io.Writer, units: []
     for (units) |u| {
         if (!u.first_contact) continue;
         if (shown > 0) try out.writeAll(", ");
-        try out.writeAll(try homeRelative(arena, opts.home, u.path));
+        try out.print("{f}", .{display.of(u.path, opts.home)});
         shown += 1;
         if (shown >= collapse_sample) break;
     }
@@ -122,10 +123,10 @@ const Row = struct { path: []const u8, what: []const u8, scope: []const u8, warn
 /// each, the path column budgeted (and, if still too wide, middle-truncated)
 /// to fit `opts.width`.
 fn renderRows(arena: std.mem.Allocator, out: *std.Io.Writer, units: []const Unit, opts: Options) !void {
-    var display: std.ArrayList(Row) = .empty;
+    var rows: std.ArrayList(Row) = .empty;
     for (units) |u| {
-        try display.append(arena, .{
-            .path = try homeRelative(arena, opts.home, u.path),
+        try rows.append(arena, .{
+            .path = try display.alloc(arena, u.path, opts.home),
             .what = try whatDrifted(arena, u),
             .scope = mox.apply.drift.overwriteScope(u.kind),
             .warn = switch (u.kind) {
@@ -137,25 +138,25 @@ fn renderRows(arena: std.mem.Allocator, out: *std.Io.Writer, units: []const Unit
 
     var what_w: usize = 0;
     var scope_w: usize = 0;
-    for (display.items) |r| {
+    for (rows.items) |r| {
         what_w = @max(what_w, r.what.len);
         scope_w = @max(scope_w, r.scope.len);
     }
 
     const fixed = row_indent.len + col_gap + what_w + col_gap + "overwrite: ".len + scope_w + col_gap + "keep: mox commit".len;
     var path_w: usize = 0;
-    for (display.items) |r| path_w = @max(path_w, r.path.len);
+    for (rows.items) |r| path_w = @max(path_w, r.path.len);
     if (fixed + path_w > opts.width) {
         path_w = if (opts.width > fixed + min_path_col) opts.width - fixed else min_path_col;
-        for (display.items) |*r| {
+        for (rows.items) |*r| {
             if (r.path.len > path_w) r.path = try truncateMiddle(arena, r.path, path_w);
         }
         path_w = 0;
-        for (display.items) |r| path_w = @max(path_w, r.path.len);
+        for (rows.items) |r| path_w = @max(path_w, r.path.len);
     }
 
     try out.writeAll("\n");
-    for (display.items) |r| {
+    for (rows.items) |r| {
         try out.writeAll(row_indent);
         try out.writeAll(r.path);
         try out.splatByteAll(' ', path_w - r.path.len + col_gap);
@@ -176,10 +177,14 @@ fn renderRows(arena: std.mem.Allocator, out: *std.Io.Writer, units: []const Unit
 /// names that one path and nothing else. More than one never pre-fills an
 /// all-paths overwrite: copy-pasting it would clobber a file the reader meant
 /// to leave alone.
-fn renderGuidance(out: *std.Io.Writer, units: []const Unit) !void {
+///
+/// The pre-filled path is contracted like every other one printed here: mox
+/// expands a leading `~` itself, so the line survives being pasted quoted,
+/// into a script, or into a shell that does not expand a tilde at all.
+fn renderGuidance(out: *std.Io.Writer, units: []const Unit, home: []const u8) !void {
     try out.writeAll("\n");
     if (units.len == 1) {
-        try out.print("  overwrite it:  mox apply --overwrite {s}\n", .{units[0].path});
+        try out.print("  overwrite it:  mox apply --overwrite {f}\n", .{display.of(units[0].path, home)});
     } else {
         try out.writeAll("  see the full list:  mox status\n  overwrite one:      mox apply --overwrite <path>\n");
     }
@@ -195,16 +200,6 @@ fn whatDrifted(arena: std.mem.Allocator, u: Unit) ![]const u8 {
         .generated_set => "generated set drifted",
         .vanished => "no longer composed; edited",
     };
-}
-
-/// `live_path` relative to `home` with a leading `~/`, or `live_path` itself
-/// when it does not sit under `home` (display only -- the actual resolution
-/// commands below still use the unit's real path).
-fn homeRelative(arena: std.mem.Allocator, home: []const u8, live_path: []const u8) ![]const u8 {
-    if (try mox.source.path.liveKeyUnderHome(arena, home, live_path)) |rel| {
-        return std.fmt.allocPrint(arena, "~/{s}", .{rel});
-    }
-    return live_path;
 }
 
 /// `s` shortened to at most `max` bytes when longer, keeping the basename
@@ -315,7 +310,7 @@ test "render: a single drifted unit pre-fills its own scoped overwrite, even alo
         .{ .path = "/home/u/.zshrc", .kind = .whole_file, .first_contact = false },
     };
     const s = try renderToString(a, &units, .{ .unrowed = 3, .home = test_home, .sty = off, .width = 80 });
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite /home/u/.zshrc\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite ~/.zshrc\n") != null);
     try testing.expect(std.mem.indexOf(u8, s, "overwrite one:") == null);
     try testing.expect(std.mem.indexOf(u8, s, "3 entries in exact dirs / orphaned generator leaves need attention (see messages above; mox apply --overwrite to remove)") != null);
 }
@@ -395,7 +390,7 @@ test "render: a collapsed migration block still scopes guidance to an edited uni
     // The edited unit is not swallowed by the collapse: it still gets a row
     // and its own scoped pre-fill, not just the migration block's unscoped one.
     try testing.expect(std.mem.indexOf(u8, s, "~/.ssh/config") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite /home/u/.ssh/config\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite ~/.ssh/config\n") != null);
 }
 
 test "render: a small first-contact set does not collapse, rows normally instead" {
@@ -408,7 +403,7 @@ test "render: a small first-contact set does not collapse, rows normally instead
     const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 80 });
     try testing.expect(std.mem.indexOf(u8, s, "first apply / migration") == null);
     try testing.expect(std.mem.indexOf(u8, s, "not written by mox") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite /home/u/.zshrc") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "overwrite it:  mox apply --overwrite ~/.zshrc") != null);
 }
 
 test "render: color on, stripped, equals color off byte for byte" {
@@ -439,10 +434,15 @@ test "render: a narrow terminal truncates a long path in the middle, basename in
     const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 100 });
     try testing.expect(std.mem.indexOf(u8, s, "settings.json") != null);
     try testing.expect(std.mem.indexOf(u8, s, "~/.config/so...settings.json") != null);
-    try testing.expect(std.mem.indexOf(u8, s, "~/.config/some/very/deeply/nested/application/settings.json") == null);
-    // The width budget governs the table row (an aligned column); the
-    // guidance line below it prints the real, untruncated path on purpose --
-    // a command has to be copy-pasteable, not merely narrow.
+    // The width budget governs the table row (an aligned column); the guidance
+    // line below it prints the whole path on purpose -- a command has to be
+    // copy-pasteable, not merely narrow. Contracted, not truncated: mox
+    // expands the `~` itself, so the line survives the paste.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        s,
+        "mox apply --overwrite ~/.config/some/very/deeply/nested/application/settings.json\n",
+    ) != null);
     var max_row_line: usize = 0;
     var it = std.mem.splitScalar(u8, s, '\n');
     while (it.next()) |line| {

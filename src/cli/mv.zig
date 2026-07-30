@@ -11,6 +11,7 @@ const lock_mod = @import("lock.zig");
 const edit = @import("edit.zig");
 const fileops = @import("fileops.zig");
 const mox = @import("../root.zig");
+const display = @import("display.zig");
 
 const Io = std.Io;
 
@@ -77,7 +78,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // A destination with a `..` segment would rename the source outside the repo
     // (path.join does not normalize) -- refuse the escape.
     if (mox.source.path.keyEscapes(new_base_rel)) {
-        try ctx.err.print("mox mv: unsafe destination '{s}' (escapes the source tree)\n", .{new_live});
+        try ctx.err.print("mox mv: unsafe destination '{f}' (escapes the source tree)\n", .{display.of(new_live, context.paths.home)});
         return 1;
     }
     const new_base_abs = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, new_base_rel });
@@ -87,14 +88,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // dir must be absent, else a rename of the base could succeed while the
     // overlay rename fails onto the existing dir, leaving a half-moved source.
     if (Io.Dir.cwd().access(ctx.io, new_base_abs, .{})) |_| {
-        try ctx.err.print("mox mv: destination already exists: {s}\n", .{new_base_abs});
+        try ctx.err.print("mox mv: destination already exists: {f}\n", .{display.of(new_base_abs, context.paths.home)});
         return 1;
     } else |e| switch (e) {
         error.FileNotFound => {},
         else => return e,
     }
     if (Io.Dir.cwd().access(ctx.io, new_dot_d_abs, .{})) |_| {
-        try ctx.err.print("mox mv: destination overlay dir already exists: {s}\n", .{new_dot_d_abs});
+        try ctx.err.print("mox mv: destination overlay dir already exists: {f}\n", .{display.of(new_dot_d_abs, context.paths.home)});
         return 1;
     } else |e| switch (e) {
         error.FileNotFound => {},
@@ -182,7 +183,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (file.own_paths.len > 0) {
         // Same orphan rule as a whole-file mv, stated: mox stops managing
         // the old path, it does not undo what it wrote there.
-        try ctx.out.print("  old live file keeps its owned content: {s}\n", .{old_live});
+        try ctx.out.print("  old live file keeps its owned content: {f}\n", .{display.of(old_live, context.paths.home)});
     }
     return 0;
 }
