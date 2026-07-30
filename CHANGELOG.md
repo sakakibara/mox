@@ -4,6 +4,26 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Breaking:** a non-absolute path argument is now relative to the current
+  directory, not to `$HOME`. Every command taking a live path (`add`,
+  `add-tree`, `apply`, `commit`, `diff`, `edit`, `mv`, `remove`, `status`)
+  reads it the same way, so `mox commit init.lua` inside `~/.config/nvim`
+  names that file -- which is what a shell's completion offers there --
+  rather than a `~/init.lua` that does not exist. `.` and `..` resolve, so
+  `../fish/config.fish` reaches the sibling directory. A path spelled
+  relative to `$HOME` from elsewhere (`mox status .config/nvim/init.lua`)
+  no longer resolves: spell it `~/.config/nvim/init.lua`.
+
+### Added
+- A leading `~` in a path argument is expanded by mox, not only by the shell:
+  a quoted `"~/x"`, a non-initial `--path=~/x`, PowerShell (which passes `~`
+  to a native program verbatim), and a caller that builds the argument
+  without a shell all reach the same file now. `~user` is refused rather than
+  read as a directory of that name.
+
 ## [0.8.0] - 2026-07-30
 
 ### Added

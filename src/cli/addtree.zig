@@ -25,7 +25,10 @@ const Spec = struct {
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    const dir_abs = try edit.liveTarget(ctx.alloc, a.dir, context.paths.home);
+    const dir_abs = edit.liveTarget(ctx.alloc, context.env, context.cwd, a.dir) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => |f| return edit.reportTarget(ctx.err, "mox add-tree", a.dir, f),
+    };
 
     const lk = (try lock_mod.acquireForCommand(ctx, "add-tree")) orelse return 1;
     defer lk.release();

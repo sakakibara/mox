@@ -490,7 +490,10 @@ pub fn commitImpl(
         var direct: std.ArrayList([]const u8) = .empty;
         var leaf_targets: std.ArrayList([]const u8) = .empty;
         for (paths) |p| {
-            const live = try edit_mod.liveTarget(ctx.alloc, p, m_state.home);
+            const live = edit_mod.liveTarget(ctx.alloc, context.env, context.cwd, p) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => |f| return edit_mod.reportTarget(ctx.err, "mox commit", p, f),
+            };
             if (findByLive(tree, live) != null) {
                 try direct.append(ctx.alloc, p);
             } else {
@@ -499,12 +502,13 @@ pub fn commitImpl(
         }
 
         var diag: scope.Diag = .{};
-        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, direct.items, &diag) catch |e| switch (e) {
+        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, direct.items, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox commit: {s}: not managed\n", .{diag.capture().?});
                 return 1;
             },
-            else => return e,
+            error.OutOfMemory => return e,
+            else => |f| return edit_mod.reportTarget(ctx.err, "mox commit", diag.capture().?, f),
         };
         var set: std.StringHashMap(void) = .init(ctx.alloc);
         for (scoped_files) |f| try set.put(f.live_path, {});

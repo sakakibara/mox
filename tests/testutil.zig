@@ -29,17 +29,37 @@ pub const Harness = struct {
         return h.runWithInput(argv, null);
     }
 
+    /// `run`, from `cwd` rather than the isolated HOME: a command resolves a
+    /// non-absolute path argument against it, so this is what places a test
+    /// somewhere else in the tree.
+    pub fn runIn(h: Harness, cwd: []const u8, argv: []const []const u8) !RunResult {
+        return h.runFrom(cwd, argv, null);
+    }
+
     /// `run`, with `stdin` (when non-null) scripting the command's interactive
     /// prompts: it stands in for the process's stdin and drives the command
     /// down its terminal path, so a prompt-only branch (choosing a
     /// non-default candidate) is reachable from a test.
     pub fn runWithInput(h: Harness, argv: []const []const u8, stdin: ?[]const u8) !RunResult {
+        return h.runFrom(h.home, argv, stdin);
+    }
+
+    /// The isolated HOME is the default `cwd` because the process's own is the
+    /// checkout the tests run from, which shares nothing with the tree a test
+    /// builds. Overriding it rather than moving the process keeps that choice
+    /// per-run: a cwd is process-global, and every test beside this one would
+    /// see the move.
+    fn runFrom(h: Harness, cwd: []const u8, argv: []const []const u8, stdin: ?[]const u8) !RunResult {
         var out_aw: Io.Writer.Allocating = .init(h.a);
         var err_aw: Io.Writer.Allocating = .init(h.a);
 
         const saved = mox.cli.app.environ_override;
         mox.cli.app.environ_override = h.env;
         defer mox.cli.app.environ_override = saved;
+
+        const saved_cwd = mox.cli.app.cwd_override;
+        mox.cli.app.cwd_override = cwd;
+        defer mox.cli.app.cwd_override = saved_cwd;
 
         var reader: Io.Reader = if (stdin) |s| .fixed(s) else undefined;
         const saved_stdin = mox.cli.app.stdin_override;

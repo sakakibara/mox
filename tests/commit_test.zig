@@ -110,6 +110,35 @@ test "commit: base-origin edit routes to src base and recompose is byte-identica
     try std.testing.expectEqual(@as(u8, 0), st.rc);
 }
 
+test "commit: a drifted file is scoped by the bare name its own directory gives it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/nvim/init.lua", "vim.o.number = true\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".config/nvim/init.lua");
+    try editLive(io, a, live, "number = true", "number = false");
+
+    // What tab-completion in that directory produces, which named HOME's
+    // `init.lua` -- nothing -- before a relative path meant the cwd's.
+    const nvim_dir = try std.fs.path.join(a, &.{ h.home, ".config", "nvim" });
+    const res = try h.runIn(nvim_dir, &.{ "mox", "commit", "--yes", "init.lua" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    try std.testing.expectEqualStrings(
+        "vim.o.number = false\n",
+        try read(io, a, try h.srcOf(".config/nvim/init.lua")),
+    );
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
 test "commit: a stored-baseline edit still refuses when the source changed since apply, not just when it is unmodified" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

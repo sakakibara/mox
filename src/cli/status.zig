@@ -3,6 +3,7 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
+const edit = @import("edit.zig");
 const tty = @import("tty.zig");
 const style = @import("style.zig");
 const drift_report = @import("drift_report.zig");
@@ -79,12 +80,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var files: []const mox.source.tree.ManagedFile = tree.files;
     if (a.paths.len > 0) {
         var diag: scope.Diag = .{};
-        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, a.paths, &diag) catch |e| switch (e) {
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, a.paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox status: {s}: not managed\n", .{diag.capture().?});
                 return 1;
             },
-            else => return e,
+            error.OutOfMemory => return e,
+            else => |f| return edit.reportTarget(ctx.err, "mox status", diag.capture().?, f),
         };
     }
 

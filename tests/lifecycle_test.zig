@@ -786,7 +786,7 @@ test "add-tree: rebuilds the coupling graph after a bulk add" {
     try std.testing.expect(std.mem.indexOf(u8, graph, "b.conf") != null);
 }
 
-test "add: a relative path resolves against HOME" {
+test "add: a relative path resolves against the current directory" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -800,6 +800,103 @@ test "add: a relative path resolves against HOME" {
     const r = try h.run(&.{ "mox", "add", "notes.txt" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+}
+
+test "path args: a bare name is the current directory's file, not HOME's of the same name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // The same basename in two directories: only the cwd's may be captured.
+    try writeRepo(io, &tmp, "home/notes.txt", "home copy\n");
+    try writeRepo(io, &tmp, "home/.config/app/notes.txt", "app copy\n");
+
+    const app_dir = try h.homePath(".config/app");
+    const r = try h.runIn(app_dir, &.{ "mox", "add", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    try std.testing.expectEqualStrings(
+        "app copy\n",
+        try read(io, a, try h.srcOf(".config/app/notes.txt")),
+    );
+    try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
+}
+
+test "path args: `..` reaches a sibling directory, as it does in a shell" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.config/fish/config.fish", "set -x\n");
+    try tmp.dir.createDirPath(io, "home/.config/nvim");
+
+    const nvim_dir = try h.homePath(".config/nvim");
+    const r = try h.runIn(nvim_dir, &.{ "mox", "add", "../fish/config.fish" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf(".config/fish/config.fish")));
+}
+
+test "path args: `~/x` expands when the shell did not, from any directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+    try tmp.dir.createDirPath(io, "home/.config/app");
+
+    // Quoting stops a shell expanding the tilde, so mox receives it verbatim.
+    const app_dir = try h.homePath(".config/app");
+    const r = try h.runIn(app_dir, &.{ "mox", "add", "~/notes.txt" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
+}
+
+test "path args: `~user` is refused, naming the unsupported form" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const r = try h.run(&.{ "mox", "add", "~root/.zshrc" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "~user") != null);
+    // Never silently treated as a directory literally named `~root`.
+    try std.testing.expect(!exists(io, try h.srcOf("~root/.zshrc")));
+}
+
+test "path args: a name managed only under HOME is not managed from elsewhere" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/notes.txt", "n\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "add", "notes.txt" })).rc);
+    try tmp.dir.createDirPath(io, "home/.config/app");
+
+    // `notes.txt` is managed at HOME, and names nothing here.
+    const app_dir = try h.homePath(".config/app");
+    const r = try h.runIn(app_dir, &.{ "mox", "status", "notes.txt" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not managed") != null);
 }
 
 test "add: an unknown attributes.toml key refuses with the friendly schema message, not a raw error name" {
@@ -850,7 +947,7 @@ test "add: a coupling-graph persistence failure warns, but the add itself still 
     try std.testing.expect(std.mem.indexOf(u8, r.err, "coupling graph not updated") != null);
 }
 
-test "add --own: a relative path resolves against HOME" {
+test "add --own: a relative path resolves against the current directory" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

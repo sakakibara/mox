@@ -8,6 +8,33 @@ Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `sync`,
 `state/mox.lock`; a second process is refused while the first runs. An
 unknown command exits 2.
 
+## Path arguments
+
+Every command taking a live path -- `add`, `add-tree`, `apply`,
+`commit`, `diff`, `edit`, `mv`, `remove`, `status` -- reads it the same
+way:
+
+| Spelling | Names |
+| --- | --- |
+| `/home/me/.config/nvim/init.lua` | itself |
+| `~/.config/nvim/init.lua` | the same file, tilde expanded against `$HOME` (`%USERPROFILE%` on Windows) |
+| `init.lua` | `init.lua` in the current directory |
+| `../fish/config.fish` | the sibling directory's file, as in a shell |
+
+A non-absolute path is relative to the current directory, like every
+other command's. `.` and `..` resolve, so any spelling of a path equals
+the file it names.
+
+The tilde is expanded by mox as well as by the shell, because a shell
+does not always get there first: quoting stops it (`"~/x"`), so does a
+non-initial position (`--path=~/x`), PowerShell passes `~` through to a
+native program verbatim, and a script may build the argument without a
+shell at all. `~user` is not expanded and is refused rather than read as
+a directory named `~user`; on Windows, spell the tail with `/`.
+
+Environment variables are the shell's to expand, and mox does not: a
+literal `$HOME` reaches it only when something meant it literally.
+
 ## init
 
 Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>`
@@ -197,8 +224,8 @@ masked on both sides. Read-only; takes no lock and always exits 0.
 
 ## edit
 
-Open the source file behind a managed live path (or src-relative name)
-in `$EDITOR`. `--axis <tuple>` edits the matching overlay or region
+Open the source file behind a managed live path (see [Path
+arguments](#path-arguments)) in `$EDITOR`. `--axis <tuple>` edits the matching overlay or region
 fragment instead of the base -- the way to reach a variant your current
 machine does not compose. Read-only; takes no lock, and reports the
 candidate path when the source does not exist.

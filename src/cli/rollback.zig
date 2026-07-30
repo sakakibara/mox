@@ -309,6 +309,8 @@ fn testCtx(a: std.mem.Allocator, io: Io, home: []const u8, snapshots_dir: []cons
                 .snapshots_dir = snapshots_dir,
                 .facts_path = "",
             },
+            // rollback takes a snapshot id, never a path argument.
+            .cwd = null,
         },
         .out = out,
         .err = err,

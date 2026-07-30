@@ -68,6 +68,11 @@ vim ~/.zshrc             # edit the real file, in place
 mox commit ~/.zshrc      # status, diff, apply, and commit all take paths
 ```
 
+A path argument is absolute, `~`-relative, or relative to the directory you
+are in -- so `cd ~/.config/nvim && mox commit init.lua` works, and tab
+completion there gives you an argument that means what it looks like. See
+[Path arguments](commands.md#path-arguments).
+
 Structure -- an overlay, a `# mox: when` region, a loop, anything about how
 the file *varies* -- lives only in sources. For that, edit the **source**
 and apply:

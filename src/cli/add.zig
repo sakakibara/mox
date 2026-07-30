@@ -588,9 +588,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.err.writeAll("mox add: HOME not set\n");
         return 1;
     };
-    // A relative argument resolves against HOME, as every live-path sibling
-    // (add-tree, edit, remove, mv) resolves its own.
-    const live_path = try edit.liveTarget(ctx.alloc, a.path, home);
+    const live_path = edit.liveTarget(ctx.alloc, context.env, context.cwd, a.path) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => |f| return edit.reportTarget(ctx.err, "mox add", a.path, f),
+    };
 
     // add mutates the repo (source file, attributes, coupling graph), so it
     // takes the single-writer lock like every other mutator.

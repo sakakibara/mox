@@ -7,6 +7,7 @@ const style = @import("style.zig");
 const drift_report = @import("drift_report.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
+const edit = @import("edit.zig");
 
 pub const Spec = struct {
     dry_run: cli.Flag(.{ .help = "report only, write nothing" }),
@@ -306,12 +307,16 @@ fn applyPass(
     var files: []const mox.source.tree.ManagedFile = tree.files;
     if (scoped) {
         var diag: scope.Diag = .{};
-        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, paths, &diag) catch |e| switch (e) {
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox apply: {s}: not managed\n", .{diag.capture().?});
                 return 2;
             },
-            else => return e,
+            error.OutOfMemory => return e,
+            else => |f| {
+                _ = try edit.reportTarget(ctx.err, "mox apply", diag.capture().?, f);
+                return 2;
+            },
         };
     }
 

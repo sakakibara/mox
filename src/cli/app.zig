@@ -21,6 +21,11 @@ pub const VERSION = @import("build_options").version;
 pub const Context = struct {
     env: Env,
     paths: paths_mod.Paths,
+    /// The directory a non-absolute path argument resolves against. Null when
+    /// the process has no readable current directory (an unlinked cwd): the
+    /// commands that take one report that for a relative argument, and resolve
+    /// an absolute or `~` one as usual.
+    cwd: ?[]const u8,
 };
 
 /// mox's help is currently flat (no sections); a single group is the safe
@@ -47,6 +52,13 @@ pub var environ_override: ?Env = null;
 /// as interactive, since the real fd-0 TTY check says nothing about it.
 pub var stdin_override: ?*std.Io.Reader = null;
 
+/// The directory a command resolves relative path arguments against, when it
+/// should not be the process's own. A caller that drives `run` in-process --
+/// the test harness -- sets this to place a command somewhere without moving
+/// the process, whose cwd is global and shared with every test running beside
+/// it. Null means the real one.
+pub var cwd_override: ?[]const u8 = null;
+
 /// Ports `context.zig`'s `init` into cli-zig's context-loader shape.
 /// `loadContext` is a plain function pointer with no access to
 /// `std.process.Init`, so the live process environment is read from the
@@ -54,13 +66,15 @@ pub var stdin_override: ?*std.Io.Reader = null;
 /// rather than being passed in. On a `paths_mod.resolve` failure, `diag`
 /// carries a message and the error propagates.
 pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) anyerror!Context {
-    _ = io;
     const env: Env = environ_override orelse Env.current();
     const paths = paths_mod.resolve(alloc, env) catch |err| {
         diag.message = std.fmt.allocPrint(alloc, "failed to resolve mox paths: {s}", .{@errorName(err)}) catch "";
         return err;
     };
-    return .{ .env = env, .paths = paths };
+    // An unreadable cwd is not a startup failure: only a relative path
+    // argument needs one, and every command that takes none runs regardless.
+    const cwd: ?[]const u8 = cwd_override orelse (std.process.currentPathAlloc(io, alloc) catch null);
+    return .{ .env = env, .paths = paths, .cwd = cwd };
 }
 
 /// mox's help footer: the Environment section (`MOX_REPO`/`MOX_STATE_DIR`/

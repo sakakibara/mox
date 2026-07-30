@@ -27,8 +27,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "mv")) orelse return 1;
     defer lk.release();
 
-    const old_live = try edit.liveTarget(ctx.alloc, old_name, context.paths.home);
-    const new_live = try edit.liveTarget(ctx.alloc, new_name, context.paths.home);
+    const old_live = edit.liveTarget(ctx.alloc, context.env, context.cwd, old_name) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => |f| return edit.reportTarget(ctx.err, "mox mv", old_name, f),
+    };
+    const new_live = edit.liveTarget(ctx.alloc, context.env, context.cwd, new_name) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => |f| return edit.reportTarget(ctx.err, "mox mv", new_name, f),
+    };
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     var walk_diag: mox.source.tree.Diag = .{};

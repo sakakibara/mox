@@ -28,7 +28,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "remove")) orelse return 1;
     defer lk.release();
 
-    const live_path = try edit.liveTarget(ctx.alloc, name, context.paths.home);
+    const live_path = edit.liveTarget(ctx.alloc, context.env, context.cwd, name) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => |f| return edit.reportTarget(ctx.err, "mox remove", name, f),
+    };
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     var walk_diag: mox.source.tree.Diag = .{};
