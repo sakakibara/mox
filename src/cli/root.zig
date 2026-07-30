@@ -20,7 +20,7 @@ pub const fileops = @import("fileops.zig");
 pub const mv_cmd = @import("mv.zig");
 pub const remove_cmd = @import("remove.zig");
 pub const scope = @import("scope.zig");
-pub const addtree_cmd = @import("addtree.zig");
+pub const addtree = @import("addtree.zig");
 pub const doctor_cmd = @import("doctor.zig");
 pub const uninstall_cmd = @import("uninstall.zig");
 pub const sync_cmd = @import("sync.zig");
@@ -48,7 +48,7 @@ test {
     _ = remove_cmd;
     _ = scope;
     _ = display;
-    _ = addtree_cmd;
+    _ = addtree;
     _ = doctor_cmd;
     _ = uninstall_cmd;
     _ = sync_cmd;

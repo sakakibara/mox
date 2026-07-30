@@ -5,6 +5,7 @@ const edit = @import("edit.zig");
 const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
+const addtree = @import("addtree.zig");
 
 const Io = std.Io;
 
@@ -78,7 +79,7 @@ fn realHomePair(arena: std.mem.Allocator, io: Io, home: []const u8, live_path: [
 
 /// Copy one live file into `src/` as a base file. Returns an Outcome the
 /// caller renders. Junk filtering and recursion are the caller's concern (see
-/// add-tree). A mode git cannot carry (not 0644/0755) is recorded in
+/// `addtree`, the walk behind `--recursive`). A mode git cannot carry (not 0644/0755) is recorded in
 /// `.mox/attributes.toml` so it survives a clone. A live symlink is captured as
 /// a regular source file whose content is the link target, flagged there too.
 /// `seed_once` records the explicit seed-once intent for this target.
@@ -96,8 +97,8 @@ pub fn addFile(
         error.FileNotFound => return .{ .outcome = .not_found },
         else => return e,
     };
-    // Single-file add refuses a directory (use add-tree to recurse); reading one
-    // would otherwise surface a raw IsDir error.
+    // A directory is refused here (`--recursive` is what walks one); reading
+    // it would otherwise surface a raw IsDir error.
     if (st.kind == .directory) return .{ .outcome = .is_directory };
     // A FIFO/socket/device is refused BEFORE any open: reading a FIFO blocks
     // until a peer connects, and none of these is capturable content.
@@ -551,13 +552,14 @@ fn parseOwnRaws(
 }
 
 const Spec = struct {
-    path: cli.Pos([]const u8, .{ .help = "live file to start managing" }),
+    path: cli.Pos([]const u8, .{ .help = "live file, or directory with --recursive" }),
+    recursive: cli.Flag(.{ .short = 'r', .help = "add every non-junk file under a directory" }),
     seed_once: cli.Flag(.{ .help = "seed the target once; never overwrite an existing one" }),
     force: cli.Flag(.{ .help = "add even if the path matches an ignore rule" }),
-    own: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable)" }),
-    own_absent: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable)" }),
-    disown: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable)" }),
-    gate: cli.Opt([]const u8, .{ .value_name = "axis-expr", .help = "gate the created partial source on this axis expression (with --own/--disown)" }),
+    own: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage only this key-path of the live file (repeatable; single file only)" }),
+    own_absent: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable; single file only)" }),
+    disown: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable; single file only)" }),
+    gate: cli.Opt([]const u8, .{ .value_name = "axis-expr", .help = "gate the created partial source on this axis expression (single file only)" }),
 };
 
 /// Every value the repeated `--<long>` option was given, in command-line
@@ -620,17 +622,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     }
 
+    // Recursion is a mode of this command, not a command of its own: the
+    // flags that mean the same thing per file (`--seed-once`, `--force`)
+    // carry over, and the ones that name a key path inside one file are
+    // refused by the declared conflict before this body runs.
+    if (a.recursive) return addtree.runRecursive(ctx, live_path, a.seed_once, a.force);
+
+    // `--disown` vs `--own`/`--own-absent`, and `--gate`'s dependency on one
+    // of them, are declared on the command (see `command` below) and refused
+    // by the parser before this body runs.
     const own_raws = try collectRepeated(ctx.alloc, ctx.argv, "own");
     const absent_raws = try collectRepeated(ctx.alloc, ctx.argv, "own-absent");
     const disown_raws = try collectRepeated(ctx.alloc, ctx.argv, "disown");
-    if (disown_raws.len > 0 and (own_raws.len > 0 or absent_raws.len > 0)) {
-        try ctx.err.writeAll("mox add: --disown cannot combine with --own/--own-absent (own and disown are exclusive per file)\n");
-        return 1;
-    }
-    if (a.gate != null and own_raws.len == 0 and absent_raws.len == 0 and disown_raws.len == 0) {
-        try ctx.err.writeAll("mox add: --gate requires --own or --disown (it gates the created partial source)\n");
-        return 1;
-    }
     // The gate is written into the created source head, so a malformed
     // expression must be refused here, not discovered on the next walk.
     if (a.gate) |expr| {
@@ -653,10 +656,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     }
     if (own_raws.len > 0 or absent_raws.len > 0 or disown_raws.len > 0) {
-        if (a.seed_once) {
-            try ctx.err.writeAll("mox add: --own/--disown cannot combine with --seed-once (a seed-once target is never re-composed)\n");
-            return 1;
-        }
         if (disown_raws.len > 0) return runDisown(ctx, home, live_path, disown_raws, a.gate);
         return runOwn(ctx, home, live_path, own_raws, absent_raws, a.gate);
     }
@@ -697,7 +696,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             return 1;
         },
         .is_directory => {
-            try ctx.err.print("mox add: {s}: is a directory (use 'mox add-tree' to add its contents)\n", .{shown});
+            try ctx.err.print("mox add: {s}: is a directory (use --recursive to add its contents)\n", .{shown});
             return 1;
         },
         .not_regular => {
@@ -879,10 +878,32 @@ fn runDisown(
 
 pub const command = app.command(Spec, .{
     .name = "add",
-    .summary = "Start managing a live file as a base file in src/",
-    .usage = "mox add [--seed-once] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... [--gate <axis-expr>] <path>",
+    .summary = "Start managing a live file, or a whole directory with -r",
+    .usage = "mox add [-r] [--seed-once] [--force] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... [--gate <axis-expr>] <path>",
     .group = .general,
     .needs_context = true,
+    .conflicts = &.{
+        .{
+            .any_of = &.{"recursive"},
+            .with = &.{ "own", "own_absent", "disown", "gate" },
+            .why = "a key path names one file",
+        },
+        .{
+            .any_of = &.{"disown"},
+            .with = &.{ "own", "own_absent" },
+            .why = "own and disown are exclusive per file",
+        },
+        .{
+            .any_of = &.{"seed_once"},
+            .with = &.{ "own", "own_absent", "disown" },
+            .why = "a seed-once target is never re-composed",
+        },
+    },
+    .requires = &.{.{
+        .field = "gate",
+        .any_of = &.{ "own", "own_absent", "disown" },
+        .why = "it gates the created partial source",
+    }},
 }, run);
 
 const testing = std.testing;
@@ -1060,7 +1081,7 @@ test "addFile: --seed-once records seed_once; a plain add does not" {
 
 /// Rebuild and persist the coupling graph over every base source file, keyed by
 /// absolute path (matching how `mox commit` and `mox doctor` build it).
-/// `cmd_name` names the calling command (`add`, `add-tree`) for the warning
+/// `cmd_name` names the calling command for the warning
 /// line, since both share this rebuild. A failure never aborts the calling
 /// command -- the file is already added -- but it must not be silent: a
 /// stale coupling graph means a later rename prompts forever for a file

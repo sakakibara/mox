@@ -7,15 +7,29 @@ All notable changes to mox are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- `add`'s flag relations (`--disown` against `--own`/`--own-absent`,
+  `--seed-once` against the key-path options, `--gate`'s dependency on one of
+  them, and the new `-r`) are declared on the command rather than checked in
+  its body, so `--help` states them under `Constraints:` and the schema
+  carries them. A violation is now a usage error (exit 2) like any other
+  malformed invocation, where the hand-rolled checks exited 1.
 - **Breaking:** a non-absolute path argument is now relative to the current
   directory, not to `$HOME`. Every command taking a live path (`add`,
-  `add-tree`, `apply`, `commit`, `diff`, `edit`, `mv`, `remove`, `status`)
+  `apply`, `commit`, `diff`, `edit`, `mv`, `remove`, `status`)
   reads it the same way, so `mox commit init.lua` inside `~/.config/nvim`
   names that file -- which is what a shell's completion offers there --
   rather than a `~/init.lua` that does not exist. `.` and `..` resolve, so
   `../fish/config.fish` reaches the sibling directory. A path spelled
   relative to `$HOME` from elsewhere (`mox status .config/nvim/init.lua`)
   no longer resolves: spell it `~/.config/nvim/init.lua`.
+
+### Removed
+- **Breaking:** `mox add-tree <dir>` is now `mox add -r <dir>`. Recursion is a
+  mode of `add`, as it is for `cp`, `rm`, `rsync`, and `git rm`, rather than a
+  command of its own -- so `--seed-once` and `--force` work over a tree, which
+  `add-tree` never accepted. The key-path options (`--own`, `--own-absent`,
+  `--disown`, `--gate`) name a location inside one file and are refused with
+  `-r`.
 
 ### Fixed
 - Windows: `facts.toml` is read from the directory it is written to. The
@@ -26,7 +40,7 @@ All notable changes to mox are documented here. The format follows
   (`$XDG_*`, then `%LOCALAPPDATA%` on Windows, then the POSIX nesting), so on
   Windows they name `%LOCALAPPDATA%` where they previously named
   `%USERPROFILE%\.config` and friends.
-- `mox add` and `mox add-tree` read the home directory the way every other
+- `mox add` reads the home directory the way every other
   command does. `add` consulted only `HOME` and refused outright where just
   `USERPROFILE` is set, and both treated an empty `HOME` as a home of `""`
   rather than as unset -- keying a capture off the filesystem root. With no

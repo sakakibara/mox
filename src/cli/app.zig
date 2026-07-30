@@ -167,7 +167,6 @@ const version_cmd = Command{
 
 const init_cmd = @import("init.zig");
 const add_cmd = @import("add.zig");
-const addtree_cmd = @import("addtree.zig");
 const apply_cmd = @import("apply.zig");
 const status_cmd = @import("status.zig");
 const secret_cmd = @import("secret.zig");
@@ -191,7 +190,6 @@ const upgrade_cmd = @import("upgrade.zig");
 pub const command_table = [_]Command{
     init_cmd.command,
     add_cmd.command,
-    addtree_cmd.command,
     apply_cmd.command,
     status_cmd.command,
     secret_cmd.command,

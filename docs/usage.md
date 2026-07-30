@@ -47,7 +47,7 @@ error.
 
 ```sh
 mox add ~/.config/fish/config.fish     # -> src/.config/fish/config.fish
-mox add-tree ~/.config/nvim            # every file under a directory
+mox add -r ~/.config/nvim             # every file under a directory
 ```
 
 The file is now managed. Check state any time:
@@ -234,7 +234,7 @@ resolves an `op://`/`pass://` secret is written 0600.
 
 A fresh repo from `mox init` already has a `.moxignore` guarding common
 credential paths (SSH keys, `*.pem`, Claude's credential files); `add` and
-`add-tree` refuse a path it matches (`add --force` overrides one), and
+`add` refuses a path it matches (`--force` overrides), and
 `apply` skips a tracked one that a rule now covers. Add your own patterns to
 `.moxignore` (gitignore syntax) to keep other paths out. Full reference:
 [docs/ignore.md](ignore.md).
@@ -334,7 +334,7 @@ A named path absent from the live file is an error; a key you want kept *out*
 everywhere is declared with `--own-absent <key-path>` instead (own mode only),
 and apply then enforces its absence. A plain `mox add` of a target whose
 source head declares ownership is refused (it is managed per key-path), and
-`add-tree` skips it.
+`add -r` skips it.
 
 Backing out of ownership is the head edit in reverse: delete the `mox: own`
 (or `mox: disown`) lines from the source, and the next `mox apply` returns

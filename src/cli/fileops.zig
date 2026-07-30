@@ -1,4 +1,4 @@
-//! Shared helpers for the file-lifecycle commands (mv / remove / add-tree):
+//! Shared helpers for the file-lifecycle commands (mv / remove / add):
 //! source-file location, trash pathing, rename-target computation, and a
 //! recursive copy into the trash backup.
 

@@ -1,6 +1,6 @@
 # Ignoring files
 
-mox never manages a file unless you `add` it -- but `add-tree` and a scaffolded
+mox never manages a file unless you `add` it -- but `add -r` and a scaffolded
 starter repo both want a way to say "never even offer this one," the way
 `.gitignore` does for git. An **ignore rule** is that: a repo-scoped,
 gitignore-syntax pattern that keeps a path out of mox entirely.
@@ -71,10 +71,11 @@ comment-marker inference needed.
 The same check -- has this home-relative path (or one of its ancestor
 directories) matched a rule -- applies everywhere mox touches a live path:
 
-- **`add` / `add-tree`** refuse an ignored path rather than starting to manage
+- **`add`** refuses an ignored path rather than starting to manage
   it. `add` reports `matches an ignore rule; use --force to add it anyway` and
   exits 1; `--force` overrides the refusal for that one invocation.
-  `add-tree` has no `--force`; it silently counts a matching file or directory
+  `add -r` honors `--force` too, over every file it walks; without it, a
+  matching file or directory is silently counted
   as skipped and continues the walk (an ignored directory is not descended
   into at all).
 - **`apply`** never composes or writes a tracked source whose live path
@@ -103,7 +104,7 @@ manage, and never refuses to manage a file that no ignore rule names.
 
 ## warn-on-add
 
-Independent of ignore rules, `add` and `add-tree` print a non-blocking
+Independent of ignore rules, `add` prints a non-blocking
 `note: <path> looks like a secret and will be committed` when the file being
 added has a name that looks credential-like (an SSH private key, a `.pem` or
 `.key` file, a `.credentials.json`). This is advisory only -- the file is

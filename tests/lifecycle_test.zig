@@ -655,7 +655,7 @@ test "mv: an unknown attributes.toml key refuses with the friendly schema messag
     try std.testing.expect(std.mem.indexOf(u8, r.err, "UnknownAttributeKey") == null);
 }
 
-test "add-tree: a coupling-graph persistence failure warns as add-tree, not add" {
+test "add -r: a coupling-graph persistence failure warns once for the whole walk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -670,12 +670,12 @@ test "add-tree: a coupling-graph persistence failure warns as add-tree, not add"
     try Io.Dir.cwd().createDirPath(io, h.state);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "coupling" }), .data = "" });
 
-    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    const r = try h.run(&.{ "mox", "add", "-r", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox add-tree: coupling graph not updated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox add: coupling graph not updated") != null);
 }
 
-test "add-tree: adds every non-junk file under a live dir, skipping junk" {
+test "add -r: adds every non-junk file under a live dir, skipping junk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -689,7 +689,7 @@ test "add-tree: adds every non-junk file under a live dir, skipping junk" {
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/sub/b.conf", .data = "b\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/.DS_Store", .data = "junk" });
 
-    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    const r = try h.run(&.{ "mox", "add", "-r", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Added 2 file(s)") != null);
 
@@ -699,7 +699,7 @@ test "add-tree: adds every non-junk file under a live dir, skipping junk" {
     try std.testing.expect(!exists(io, try h.srcOf(".config/app/.DS_Store")));
 }
 
-test "add-tree: ignore file refuses sensitive paths, adds the rest" {
+test "add -r: ignore file refuses sensitive paths, adds the rest" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -718,7 +718,7 @@ test "add-tree: ignore file refuses sensitive paths, adds the rest" {
 
     // A shell would have expanded `~/.claude` to this absolute path already.
     const dir = try h.homePath(".claude");
-    const r = try h.run(&.{ "mox", "add-tree", dir });
+    const r = try h.run(&.{ "mox", "add", "-r", dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
     // The good file is now a source; the secret and the ignored dir are not.
@@ -727,7 +727,7 @@ test "add-tree: ignore file refuses sensitive paths, adds the rest" {
     try std.testing.expect(!exists(io, try h.srcOf(".claude/projects/p.jsonl")));
 }
 
-test "add-tree: a missing directory fails with not found instead of adding nothing" {
+test "add -r: a missing directory fails with not found instead of adding nothing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -736,12 +736,12 @@ test "add-tree: a missing directory fails with not found instead of adding nothi
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    const r = try h.run(&.{ "mox", "add-tree", ".config/no-such-dir" });
+    const r = try h.run(&.{ "mox", "add", "-r", ".config/no-such-dir" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not found") != null);
 }
 
-test "add-tree: a file argument is refused as not a directory" {
+test "add -r: a file argument is refused as not a directory" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -752,13 +752,13 @@ test "add-tree: a file argument is refused as not a directory" {
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "home/notes.txt", "n\n");
 
-    const r = try h.run(&.{ "mox", "add-tree", "notes.txt" });
+    const r = try h.run(&.{ "mox", "add", "-r", "notes.txt" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "not a directory (use 'mox add' for a single file)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not a directory (drop --recursive for a single file)") != null);
     try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
 }
 
-test "add-tree: rebuilds the coupling graph after a bulk add" {
+test "add -r: rebuilds the coupling graph after a bulk add" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -773,7 +773,7 @@ test "add-tree: rebuilds the coupling graph after a bulk add" {
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/a.conf", .data = "name = sharedalias\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/b.conf", .data = "name = sharedalias\n" });
 
-    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    const r = try h.run(&.{ "mox", "add", "-r", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
     // The graph was rebuilt once over the bulk add, so both new sources'
@@ -802,7 +802,7 @@ test "add: a relative path resolves against the current directory" {
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
 }
 
-test "add/add-tree: home comes from USERPROFILE when HOME names none" {
+test "add/add -r: home comes from USERPROFILE when HOME names none" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -819,7 +819,7 @@ test "add/add-tree: home comes from USERPROFILE when HOME names none" {
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
 
-    const rt = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    const rt = try h.run(&.{ "mox", "add", "-r", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), rt.rc);
     try std.testing.expect(exists(io, try h.srcOf(".config/app/a.conf")));
 }
@@ -846,7 +846,7 @@ test "add: an empty HOME is unset, not an empty home" {
     try std.testing.expect(exists(io, try h.srcOf("notes.txt")));
 }
 
-test "add/add-tree: refuse when no variable names a home, rather than taking the root for it" {
+test "add/add -r: refuse when no variable names a home, rather than taking the root for it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -863,7 +863,7 @@ test "add/add-tree: refuse when no variable names a home, rather than taking the
     try std.testing.expect(std.mem.indexOf(u8, r.err, "USERPROFILE") != null);
     try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
 
-    const rt = try h.run(&.{ "mox", "add-tree", h.home });
+    const rt = try h.run(&.{ "mox", "add", "-r", h.home });
     try std.testing.expectEqual(@as(u8, 1), rt.rc);
     try std.testing.expect(std.mem.indexOf(u8, rt.err, "USERPROFILE") != null);
 }
@@ -2200,7 +2200,7 @@ test "apply: a relative $MOX_PATH line is a loud per-line warning, not a silent 
 }
 
 // Partial-ownership lifecycle: onboarding via `add --own` and the partial
-// semantics of add-tree, remove, mv, export, and doctor.
+// semantics of add -r, remove, mv, export, and doctor.
 
 test "add --own: extracts raw spans with comments, preserves attribute comments, apply adopts cleanly" {
     const io = std.testing.io;
@@ -2468,9 +2468,15 @@ test "add --gate: a malformed expression or a gate without ownership is refused"
     try std.testing.expect(!exists(io, try h.srcOf("app.toml")));
 
     // --gate gates the created partial source; a whole-file add has none.
+    // Declared on the command, so the parser refuses it as a usage error (2)
+    // before the body runs, and the reason comes from the declaration.
     const alone = try h.run(&.{ "mox", "add", "--gate", "os=darwin", live });
-    try std.testing.expectEqual(@as(u8, 1), alone.rc);
-    try std.testing.expect(std.mem.indexOf(u8, alone.err, "--gate requires --own or --disown") != null);
+    try std.testing.expectEqual(@as(u8, 2), alone.rc);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        alone.err,
+        "--gate requires one of --own, --own-absent, --disown (it gates the created partial source)",
+    ) != null);
     try std.testing.expect(!exists(io, try h.srcOf("app.toml")));
 }
 
@@ -2492,7 +2498,7 @@ test "add: a whole-file add of a partially owned target is refused" {
     try std.testing.expectEqualStrings("# mox: own tui\n[tui]\nk = 1\n", try read(io, a, try h.srcOf("app.toml")));
 }
 
-test "add-tree: a partially owned target is skipped with an explicit reason" {
+test "add -r: a partially owned target is skipped with an explicit reason" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2506,7 +2512,7 @@ test "add-tree: a partially owned target is skipped with an explicit reason" {
     try writeRepo(io, &tmp, "repo/src/cfg/app.toml", "# mox: own tui\n[tui]\nk = 1\n");
 
     const dir = try std.fs.path.join(a, &.{ h.home, "cfg" });
-    const r = try h.run(&.{ "mox", "add-tree", dir });
+    const r = try h.run(&.{ "mox", "add", "-r", dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "partially owned") != null);
     try std.testing.expect(exists(io, try h.srcOf("cfg/plain.txt")));
@@ -2631,8 +2637,9 @@ test "add --disown: the live file minus the program's spans becomes the source, 
     const live = try h.liveOf("settings.json");
 
     const bad = try h.run(&.{ "mox", "add", "--disown", "model", "--own", "theme", live });
-    try std.testing.expectEqual(@as(u8, 1), bad.rc);
-    try std.testing.expect(std.mem.indexOf(u8, bad.err, "exclusive") != null);
+    // A declared conflict: refused by the parser as a usage error (2).
+    try std.testing.expectEqual(@as(u8, 2), bad.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err, "own and disown are exclusive per file") != null);
 
     const r = try h.run(&.{ "mox", "add", "--disown", "model", live });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -2835,7 +2842,7 @@ test "add: refuses while another live process holds the lock" {
     try std.testing.expect(!exists(io, try h.srcOf("notes.txt")));
 }
 
-test "add-tree: a directory outside HOME is refused at the top level" {
+test "add -r: a directory outside HOME is refused at the top level" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2847,13 +2854,13 @@ test "add-tree: a directory outside HOME is refused at the top level" {
     try writeRepo(io, &tmp, "elsewhere/x.conf", "x\n");
     const outside = try std.fs.path.join(a, &.{ h.root, "elsewhere" });
 
-    const r = try h.run(&.{ "mox", "add-tree", outside });
+    const r = try h.run(&.{ "mox", "add", "-r", outside });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "outside HOME") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Added") == null);
 }
 
-test "add-tree: captures a symlink, reports a FIFO as skipped with a reason" {
+test "add -r: captures a symlink, reports a FIFO as skipped with a reason" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2871,7 +2878,7 @@ test "add-tree: captures a symlink, reports a FIFO as skipped with a reason" {
     var guard = try FifoGuard.start(a, io, fifo);
     defer guard.stop(io);
 
-    const r = try h.run(&.{ "mox", "add-tree", ".config/app" });
+    const r = try h.run(&.{ "mox", "add", "-r", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Added 2 file(s); 1 skipped, 0 failed") != null);
     const skip_line = try std.fmt.allocPrint(

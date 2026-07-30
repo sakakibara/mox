@@ -84,7 +84,7 @@ template language in the body.
 | Change a config | edit the live file, then `mox commit` |
 | Make something Mac-only (or per-profile) | `mox edit <path>` (`--axis` for an overlay), add a `foo.toml.d/os=darwin.toml` overlay or a `# mox: when os=darwin` block, then `mox apply` |
 | See what's managed and what changed | `mox status` (`mox diff` for the actual diff) |
-| Manage a new file / a whole dir | `mox add <path>` / `mox add-tree <dir>` |
+| Manage a new file / a whole dir | `mox add <path>` / `mox add -r <dir>` |
 | Preview before writing | `mox apply --dry-run` |
 | Use a per-machine value (email, key) | a *fact* -- `mox facts`, referenced as `<machine.email>` |
 | Share to another machine | `git push` in the repo, then `mox apply` there (or `mox sync`) |
@@ -159,7 +159,7 @@ Full behavioral contracts for every command are in
 | Command | What it does |
 | --- | --- |
 | `init` | Initialize a fresh repo; `--clone <url>` clones an existing one and stops for review (`--apply` to bootstrap in one step) |
-| `add <path>` / `add-tree <dir>` | Start managing a live file (or every file under a dir) as `src/` sources; `--own`/`--disown` key-paths onboard a partially owned file |
+| `add <path>` / `add -r <dir>` | Start managing a live file (or every file under a dir) as `src/` sources; `--own`/`--disown` key-paths onboard a partially owned file |
 | `apply` | Compose and write every managed file. Never silently overwrites a hand-edited live file: leaves drift untouched and reports it, resolved with `apply --overwrite <path>` or `commit <path>` |
 | `commit` | Route live-file edits back into their sources -- per hunk for text, per key for merged layers -- confirming each, and verifying that no configuration you did not choose changes |
 | `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, ...) plus the live probe log. `status` exits 1 on anything actionable |

@@ -10,7 +10,7 @@ unknown command exits 2.
 
 ## Path arguments
 
-Every command taking a live path -- `add`, `add-tree`, `apply`,
+Every command taking a live path -- `add`, `apply`,
 `commit`, `diff`, `edit`, `mv`, `remove`, `status` -- reads it the same
 way:
 
@@ -74,6 +74,14 @@ Start managing a live file as a base file in `src/`. A path matching a
 repo ignore rule (`.moxignore` / `.mox/ignore`) is refused (`--force`
 overrides).
 
+`-r`/`--recursive` takes a directory instead, capturing every non-junk
+regular file and symlink under it; already-managed files, junk (editor
+temp, OS metadata), non-regular entries, and ignored paths are counted as
+skipped, and the run reports `Added N file(s); M skipped, K failed`. A
+directory without `-r` is refused, as is `-r` on a file. `--seed-once`
+and `--force` mean the same thing in both modes; the key-path options
+below name a location inside one file and are refused with `-r`.
+
 Partial ownership at onboarding:
 
 - `--own <key-path>` (repeatable) takes partial ownership of a
@@ -91,12 +99,6 @@ Partial ownership at onboarding:
 
 A plain `add` of a target whose source head declares ownership is
 refused.
-
-## add-tree
-
-Recursively `add` every non-junk regular file under a live directory;
-already-managed files, junk, and paths matching a repo ignore rule are
-skipped.
 
 ## mv
 
