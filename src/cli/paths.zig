@@ -19,6 +19,27 @@ pub const Paths = struct {
     facts_path: []const u8,
 };
 
+/// The home in the one spelling everything else must agree on.
+///
+/// Every managed file's live path is this home joined with the file's key, and
+/// a path argument is compared against that string exactly. `std.fs.path`
+/// canonicalizes as it resolves -- upper-casing a Windows drive letter, among
+/// other things -- so a home spelled `c:\Users\me` would have the walk key a
+/// file `c:\...` while every argument resolved to `C:\...`, and a managed
+/// file would read as unmanaged. `USERPROFILE` is never spelled that way, but
+/// a hand-set `HOME` may be. Canonicalizing here, once, is what makes the two
+/// sides agree by construction rather than by luck.
+fn canonical(arena: std.mem.Allocator, home: []const u8, os_tag: std.Target.Os.Tag) []const u8 {
+    const resolved = if (os_tag == .windows)
+        std.fs.path.resolveWindows(arena, &.{home})
+    else
+        std.fs.path.resolvePosix(arena, &.{home});
+    // A home that will not resolve is left as it came: it is the caller's
+    // string either way, and refusing here would trade a working odd spelling
+    // for no home at all.
+    return resolved catch home;
+}
+
 /// Resolve all mox paths from the process environment for the host OS.
 /// All returned strings are arena-owned.
 pub fn resolve(arena: std.mem.Allocator, env: Env) !Paths {
@@ -42,10 +63,10 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
     // location and is rejected in favour of `USERPROFILE`, so a linux-tagged
     // resolution run from a Windows runner would otherwise find no home at all.
     var home_named = true;
-    const home = dirs.homeFor(arena, env, os_tag) catch blk: {
+    const home = canonical(arena, dirs.homeFor(arena, env, os_tag) catch blk: {
         home_named = false;
         break :blk try arena.dupe(u8, "/");
-    };
+    }, os_tag);
 
     const repo_dir = blk: {
         if (env.get(arena, "MOX_REPO")) |v| break :blk v;
@@ -147,6 +168,27 @@ test "resolveFrom: an empty XDG var falls back to the home default, not cwd" {
     const p = try resolveFrom(arena.allocator(), Env{ .map = &m }, .linux);
     try expectJoined(arena.allocator(), &.{ "/home/alice", ".local", "state", "mox" }, p.state_dir);
     try expectJoined(arena.allocator(), &.{ "/home/alice", ".local", "share", "mox", "dotfiles" }, p.repo_dir);
+}
+
+test "resolveFrom: a home's drive letter is canonicalized, so lookups agree with the walk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var m = std.process.Environ.Map.init(arena.allocator());
+    // Hand-set, lower-case drive: a legal Windows home that `std.fs.path`
+    // would upper-case the moment any argument was resolved through it.
+    try m.put("HOME", "c:\\Users\\bob");
+    const p = try resolveFrom(arena.allocator(), Env{ .map = &m }, .windows);
+    try std.testing.expectEqualStrings("C:\\Users\\bob", p.home);
+    try std.testing.expect(p.home_named);
+}
+
+test "resolveFrom: a trailing separator on the home is normalized away" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var m = std.process.Environ.Map.init(arena.allocator());
+    try m.put("HOME", "/home/alice/");
+    const p = try resolveFrom(arena.allocator(), Env{ .map = &m }, .linux);
+    try std.testing.expectEqualStrings("/home/alice", p.home);
 }
 
 test "resolveFrom: windows still honors XDG_DATA_HOME when set" {

@@ -37,6 +37,15 @@ All notable changes to mox are documented here. The format follows
   `-r`.
 
 ### Fixed
+- Windows: a home directory spelled with a lower-case drive letter no longer
+  makes every managed file read as unmanaged. `std.fs.path` upper-cases a
+  drive as it resolves, so the source walk keyed files under `c:\...` while
+  every path argument resolved to `C:\...` and matched nothing. The home is
+  canonicalized once, where it is resolved, so both sides agree by
+  construction. `USERPROFILE` is never spelled that way; a hand-set `HOME`
+  may be. On such a machine the first apply after upgrading reports its files
+  as first-contact drift (the applied records were keyed by the old spelling)
+  and leaves them untouched until resolved, as with any drift.
 - A secret that resolves to nothing is refused instead of written. Every
   backend can return an empty value from a lookup it calls successful -- a
   variable set to `""`, an empty file, a manager exiting 0 with no output --

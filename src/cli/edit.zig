@@ -43,6 +43,22 @@ pub fn liveTarget(
     cwd: ?[]const u8,
     name: []const u8,
 ) TargetError![]const u8 {
+    return liveTargetFor(arena, home, cwd, name, @import("builtin").os.tag);
+}
+
+/// `liveTarget` against a named OS rather than the host's, so a test can pin
+/// every platform's answer from whichever one runs it -- the same seam
+/// `paths.resolveFrom` and `env.dirs.homeFor` open, and for the same reason:
+/// what a path means is exactly the part that differs per platform, so it is
+/// the part a POSIX-only test proves nothing about.
+pub fn liveTargetFor(
+    arena: std.mem.Allocator,
+    home: []const u8,
+    cwd: ?[]const u8,
+    name: []const u8,
+    os_tag: std.Target.Os.Tag,
+) TargetError![]const u8 {
+    const windows = os_tag == .windows;
     // `expandTildeIn`, not `expandTilde`: mox already resolved its own home
     // (`Paths.home`, with `home_named` recording whether the environment
     // named one), and letting the tilde derive a second one from the Env
@@ -52,8 +68,18 @@ pub fn liveTarget(
     // untouched. Resolving either would silently name a directory whose first
     // component is a literal `~`, so neither reaches the filesystem.
     if (expanded.len > 0 and expanded[0] == '~') return error.UnsupportedTilde;
-    if (std.fs.path.isAbsolute(expanded)) return std.fs.path.resolve(arena, &.{expanded});
-    return std.fs.path.resolve(arena, &.{ cwd orelse return error.NoCwd, expanded });
+    const absolute = if (windows)
+        std.fs.path.isAbsoluteWindows(expanded)
+    else
+        std.fs.path.isAbsolutePosix(expanded);
+    const parts: []const []const u8 = if (absolute)
+        &.{expanded}
+    else
+        &.{ cwd orelse return error.NoCwd, expanded };
+    return if (windows)
+        std.fs.path.resolveWindows(arena, parts)
+    else
+        std.fs.path.resolvePosix(arena, parts);
 }
 
 /// Print why `name` names no live path, and return the exit code the caller
@@ -266,6 +292,52 @@ test "liveTarget: `.` and `..` resolve, so a spelling still equals the walked li
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ test_home, ".config", "app.conf" }),
         try liveTarget(a, test_home, null, dotted),
+    );
+}
+
+test "liveTargetFor: a Windows path resolves to what the source walk derived" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // What the tree walk produces for this file on Windows: the home joined
+    // with the file's key, in that platform's separator. Spelled out rather
+    // than built with `joinKeyOnto`, which joins with the HOST's separator
+    // and so would describe the running machine instead of the named one.
+    const home = "C:\\Users\\me";
+    const walked = "C:\\Users\\me\\.config\\nvim\\init.lua";
+
+    // Every spelling a user reaches the file by, minus the tilde ones: those
+    // turn on `expandTildeIn`, which reads the HOST's separator rule, so this
+    // seam cannot pose the question for another platform. env-zig owns that
+    // half and pins it per-platform in its own suite, on a real Windows
+    // runner; what is mox's own is the resolution below.
+    for ([_][]const u8{
+        "C:\\Users\\me\\.config\\nvim\\init.lua",
+        "C:/Users/me/.config/nvim/init.lua",
+        ".\\init.lua",
+        "init.lua",
+        "..\\nvim\\init.lua",
+    }) |spelling| {
+        const got = try liveTargetFor(a, home, "C:\\Users\\me\\.config\\nvim", spelling, .windows);
+        try testing.expectEqualStrings(walked, got);
+    }
+}
+
+test "liveTargetFor: a drive letter is canonicalized, so the home's own spelling must be too" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `resolveWindows` upper-cases a drive letter. A home spelled with a
+    // lower-case one -- which `USERPROFILE` never is, but a hand-set `HOME`
+    // may be -- would therefore have the walk key a file `c:\...` while every
+    // argument resolved to `C:\...`, and the file would read as unmanaged.
+    // `Paths` canonicalizes the home for exactly this reason; this pins the
+    // resolver half of that agreement.
+    try testing.expectEqualStrings(
+        "C:\\Users\\me\\.zshrc",
+        try liveTargetFor(a, "c:\\Users\\me", null, "c:\\Users\\me\\.zshrc", .windows),
     );
 }
 
