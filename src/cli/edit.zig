@@ -21,7 +21,6 @@ const AxisTuple = mox.source.tree.AxisTuple;
 pub const TargetFailure = error{
     UnsupportedTilde,
     NoCwd,
-    NoHomeDir,
 };
 
 pub const TargetError = TargetFailure || error{OutOfMemory};
@@ -40,11 +39,15 @@ pub const TargetError = TargetFailure || error{OutOfMemory};
 /// relative name is then unresolvable, an absolute or `~` one is unaffected.
 pub fn liveTarget(
     arena: std.mem.Allocator,
-    env: Env,
+    home: []const u8,
     cwd: ?[]const u8,
     name: []const u8,
 ) TargetError![]const u8 {
-    const expanded = try env_mod.dirs.expandTilde(arena, env, name);
+    // `expandTildeIn`, not `expandTilde`: mox already resolved its own home
+    // (`Paths.home`, with `home_named` recording whether the environment
+    // named one), and letting the tilde derive a second one from the Env
+    // would be a second answer to a question already settled.
+    const expanded = try env_mod.dirs.expandTildeIn(arena, home, name);
     // expandTilde passes `~user/x` -- and, on Windows, `~\x` -- through
     // untouched. Resolving either would silently name a directory whose first
     // component is a literal `~`, so neither reaches the filesystem.
@@ -62,7 +65,6 @@ pub fn reportTarget(w: *Io.Writer, cmd: []const u8, name: []const u8, err: Targe
         else
             "'~user' is not supported -- use an absolute path",
         error.NoCwd => "not absolute, and the current directory could not be read",
-        error.NoHomeDir => "cannot expand '~': neither HOME nor USERPROFILE is set",
     };
     try w.print("{s}: {s}: {s}\n", .{ cmd, name, why });
     return 1;
@@ -101,7 +103,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const name = a.name;
     const axis_str: ?[]const u8 = a.axis;
-    const live_path = liveTarget(ctx.alloc, context.env, context.cwd, name) catch |e| switch (e) {
+    const live_path = liveTarget(ctx.alloc, context.paths.home, context.cwd, name) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => |f| return reportTarget(ctx.err, "mox edit", name, f),
     };
@@ -222,32 +224,24 @@ const testing = std.testing;
 /// literal would take the cwd-relative branch there and resolve to nothing.
 const test_home = if (@import("builtin").os.tag == .windows) "C:\\home\\me" else "/home/me";
 
-fn testEnv(a: std.mem.Allocator, home: []const u8) !Env {
-    const map = try a.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(a);
-    try map.put("HOME", home);
-    return .{ .map = map };
-}
-
 test "liveTarget: an absolute name is used as given, a relative one resolves against cwd" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env = try testEnv(a, test_home);
 
     const zshrc = try std.fs.path.join(a, &.{ test_home, ".zshrc" });
-    try testing.expectEqualStrings(zshrc, try liveTarget(a, env, null, zshrc));
+    try testing.expectEqualStrings(zshrc, try liveTarget(a, test_home, null, zshrc));
 
     // The same name means different files from different directories.
     const nvim = try std.fs.path.join(a, &.{ test_home, ".config", "nvim" });
     const fish = try std.fs.path.join(a, &.{ test_home, ".config", "fish" });
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ nvim, "init.lua" }),
-        try liveTarget(a, env, nvim, "init.lua"),
+        try liveTarget(a, test_home, nvim, "init.lua"),
     );
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ fish, "init.lua" }),
-        try liveTarget(a, env, fish, "init.lua"),
+        try liveTarget(a, test_home, fish, "init.lua"),
     );
 }
 
@@ -255,24 +249,23 @@ test "liveTarget: `.` and `..` resolve, so a spelling still equals the walked li
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env = try testEnv(a, test_home);
     const nvim = try std.fs.path.join(a, &.{ test_home, ".config", "nvim" });
 
     const init_lua = try std.fs.path.join(a, &.{ nvim, "init.lua" });
-    try testing.expectEqualStrings(init_lua, try liveTarget(a, env, nvim, "./init.lua"));
-    try testing.expectEqualStrings(init_lua, try liveTarget(a, env, nvim, "init.lua"));
+    try testing.expectEqualStrings(init_lua, try liveTarget(a, test_home, nvim, "./init.lua"));
+    try testing.expectEqualStrings(init_lua, try liveTarget(a, test_home, nvim, "init.lua"));
 
     // `..` reaches a sibling config directory, as it does in a shell.
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ test_home, ".config", "fish", "config.fish" }),
-        try liveTarget(a, env, nvim, "../fish/config.fish"),
+        try liveTarget(a, test_home, nvim, "../fish/config.fish"),
     );
 
     // A `./`-spelled absolute name canonicalizes to its plain spelling.
     const dotted = try std.fs.path.join(a, &.{ test_home, ".config", ".", "app.conf" });
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ test_home, ".config", "app.conf" }),
-        try liveTarget(a, env, null, dotted),
+        try liveTarget(a, test_home, null, dotted),
     );
 }
 
@@ -280,12 +273,11 @@ test "liveTarget: `~` and `~/x` expand against the environment's home" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env = try testEnv(a, test_home);
     // cwd is null throughout: a tilde name never consults it.
-    try testing.expectEqualStrings(test_home, try liveTarget(a, env, null, "~"));
+    try testing.expectEqualStrings(test_home, try liveTarget(a, test_home, null, "~"));
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ test_home, ".config", "nvim", "init.lua" }),
-        try liveTarget(a, env, null, "~/.config/nvim/init.lua"),
+        try liveTarget(a, test_home, null, "~/.config/nvim/init.lua"),
     );
 }
 
@@ -293,18 +285,17 @@ test "liveTarget: an unexpandable tilde is refused rather than resolved as a dir
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env = try testEnv(a, test_home);
 
     // `~other/x` and `~\x` would otherwise name a directory literally called
     // `~other` or `~` under cwd.
-    try testing.expectError(error.UnsupportedTilde, liveTarget(a, env, test_home, "~other/.zshrc"));
-    try testing.expectError(error.UnsupportedTilde, liveTarget(a, env, test_home, "~\\.zshrc"));
+    try testing.expectError(error.UnsupportedTilde, liveTarget(a, test_home, test_home, "~other/.zshrc"));
+    try testing.expectError(error.UnsupportedTilde, liveTarget(a, test_home, test_home, "~\\.zshrc"));
 
     // A file whose name merely starts with `~` stays reachable, spelled as the
     // relative path it is.
     try testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ test_home, "~backup" }),
-        try liveTarget(a, env, test_home, "./~backup"),
+        try liveTarget(a, test_home, test_home, "./~backup"),
     );
 }
 
@@ -312,15 +303,13 @@ test "liveTarget: a relative name needs a cwd, a tilde or absolute one does not"
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env = try testEnv(a, test_home);
-    try testing.expectError(error.NoCwd, liveTarget(a, env, null, ".zshrc"));
+    try testing.expectError(error.NoCwd, liveTarget(a, test_home, null, ".zshrc"));
 
-    var empty = std.process.Environ.Map.init(a);
-    const homeless: Env = .{ .map = &empty };
-    try testing.expectError(error.NoHomeDir, liveTarget(a, homeless, test_home, "~/.zshrc"));
-    // No home needed when no tilde is involved.
+    // A path with no tilde in it never consults the home at all, so an empty
+    // one (the placeholder mox carries when the environment named none, see
+    // `Paths.home_named`) still resolves a plain relative name.
     const zshrc = try std.fs.path.join(a, &.{ test_home, ".zshrc" });
-    try testing.expectEqualStrings(zshrc, try liveTarget(a, homeless, test_home, ".zshrc"));
+    try testing.expectEqualStrings(zshrc, try liveTarget(a, "", test_home, ".zshrc"));
 }
 
 test "tupleFilename: renders sorted pairs joined by plus" {

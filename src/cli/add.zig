@@ -592,7 +592,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         return 1;
     }
     const home = context.paths.home;
-    const live_path = edit.liveTarget(ctx.alloc, context.env, context.cwd, a.path) catch |e| switch (e) {
+    const live_path = edit.liveTarget(ctx.alloc, home, context.cwd, a.path) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => |f| return edit.reportTarget(ctx.err, "mox add", a.path, f),
     };

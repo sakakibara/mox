@@ -16,6 +16,7 @@ const state_mod = @import("state.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
+const dirs = @import("env").dirs;
 
 pub const Diag = diag_mod.Diag;
 
@@ -202,7 +203,7 @@ fn resolveRow(
     }
     if (candidates_field) |cv| {
         for (cv.array_of_strings) |c| {
-            const expanded = try expandTilde(arena, c, home);
+            const expanded = try dirs.expandTildeIn(arena, home, c);
             if (dirExists(io, expanded)) return expanded;
         }
     }
@@ -214,16 +215,6 @@ fn resolveRow(
 fn dirExists(io: Io, path: []const u8) bool {
     const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return st.kind == .directory;
-}
-
-/// `~` expands to `home`; `~/rest` expands to `<home>/rest` (native join);
-/// anything else passes through verbatim.
-fn expandTilde(arena: std.mem.Allocator, candidate: []const u8, home: []const u8) ![]const u8 {
-    if (std.mem.eql(u8, candidate, "~")) return home;
-    if (std.mem.startsWith(u8, candidate, "~/")) {
-        return std.fs.path.join(arena, &.{ home, candidate[2..] });
-    }
-    return candidate;
 }
 
 test "load: missing file returns no facts" {

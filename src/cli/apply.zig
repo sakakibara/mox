@@ -308,7 +308,7 @@ fn applyPass(
     var files: []const mox.source.tree.ManagedFile = tree.files;
     if (scoped) {
         var diag: scope.Diag = .{};
-        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, paths, &diag) catch |e| switch (e) {
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, context.cwd, paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox apply: {s}: not managed\n", .{diag.capture().?});
                 if (diag.captureResolved()) |r|

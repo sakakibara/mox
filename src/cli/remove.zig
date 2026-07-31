@@ -29,7 +29,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "remove")) orelse return 1;
     defer lk.release();
 
-    const live_path = edit.liveTarget(ctx.alloc, context.env, context.cwd, name) catch |e| switch (e) {
+    const live_path = edit.liveTarget(ctx.alloc, context.paths.home, context.cwd, name) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => |f| return edit.reportTarget(ctx.err, "mox remove", name, f),
     };

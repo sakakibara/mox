@@ -6,7 +6,6 @@ const std = @import("std");
 const mox = @import("../root.zig");
 const edit = @import("edit.zig");
 
-const Env = @import("env").Env;
 const ManagedFile = mox.source.tree.ManagedFile;
 
 /// Carries the argument that failed to resolve when `filterTree` returns
@@ -63,7 +62,7 @@ pub fn filterTree(
     arena: std.mem.Allocator,
     io: std.Io,
     tree_files: []const ManagedFile,
-    env: Env,
+    home: []const u8,
     cwd: ?[]const u8,
     paths: []const []const u8,
     diag: *Diag,
@@ -72,7 +71,7 @@ pub fn filterTree(
     var out: std.ArrayList(ManagedFile) = .empty;
     var seen: std.StringHashMap(void) = .init(arena);
     for (paths) |p| {
-        const live = edit.liveTarget(arena, env, cwd, p) catch |e| {
+        const live = edit.liveTarget(arena, home, cwd, p) catch |e| {
             diag.set(p);
             return e;
         };
@@ -105,13 +104,6 @@ fn testHomePath(a: std.mem.Allocator, rel: []const u8) ![]const u8 {
     return mox.source.path.joinKeyOnto(a, test_home, rel);
 }
 
-fn testEnv(a: std.mem.Allocator) !Env {
-    const map = try a.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(a);
-    try map.put("HOME", test_home);
-    return .{ .map = map };
-}
-
 fn testFile(live_path: []const u8) ManagedFile {
     return .{
         .source_base_path = "",
@@ -131,20 +123,19 @@ test "filterTree: absolute, `~`-relative, and cwd-relative names all resolve to 
     const zshrc = try testHomePath(a, ".zshrc");
     const init_lua = try testHomePath(a, ".config/nvim/init.lua");
     const files = [_]ManagedFile{ testFile(zshrc), testFile(init_lua) };
-    const env = try testEnv(a);
     var diag: Diag = .{};
 
-    const abs = try filterTree(a, testing.io, &files, env, null, &.{zshrc}, &diag);
+    const abs = try filterTree(a, testing.io, &files, test_home, null, &.{zshrc}, &diag);
     try testing.expectEqual(@as(usize, 1), abs.len);
     try testing.expectEqualStrings(zshrc, abs[0].live_path);
 
-    const tilde = try filterTree(a, testing.io, &files, env, null, &.{"~/.config/nvim/init.lua"}, &diag);
+    const tilde = try filterTree(a, testing.io, &files, test_home, null, &.{"~/.config/nvim/init.lua"}, &diag);
     try testing.expectEqual(@as(usize, 1), tilde.len);
     try testing.expectEqualStrings(init_lua, tilde[0].live_path);
 
     // Named from the directory that holds it, as a shell completes it.
     const nvim_dir = try testHomePath(a, ".config/nvim");
-    const rel = try filterTree(a, testing.io, &files, env, nvim_dir, &.{"init.lua"}, &diag);
+    const rel = try filterTree(a, testing.io, &files, test_home, nvim_dir, &.{"init.lua"}, &diag);
     try testing.expectEqual(@as(usize, 1), rel.len);
     try testing.expectEqualStrings(init_lua, rel[0].live_path);
 }
@@ -156,16 +147,15 @@ test "filterTree: a name resolving outside the managed set errors, whatever its 
 
     const nope = try testHomePath(a, ".nope");
     const files = [_]ManagedFile{testFile(try testHomePath(a, ".zshrc"))};
-    const env = try testEnv(a);
     var diag: Diag = .{};
 
-    try testing.expectError(error.NotManaged, filterTree(a, testing.io, &files, env, null, &.{nope}, &diag));
+    try testing.expectError(error.NotManaged, filterTree(a, testing.io, &files, test_home, null, &.{nope}, &diag));
     try testing.expectEqualStrings(nope, diag.capture().?);
 
     // `.zshrc` names a managed file from home and nothing from anywhere else:
     // a relative argument is the directory's, not HOME's.
     const elsewhere = try testHomePath(a, ".config");
-    try testing.expectError(error.NotManaged, filterTree(a, testing.io, &files, env, elsewhere, &.{".zshrc"}, &diag));
+    try testing.expectError(error.NotManaged, filterTree(a, testing.io, &files, test_home, elsewhere, &.{".zshrc"}, &diag));
     try testing.expectEqualStrings(".zshrc", diag.capture().?);
 }
 
@@ -175,15 +165,14 @@ test "filterTree: an unresolvable name reports its own failure, with diag set" {
     const a = arena.allocator();
 
     const files = [_]ManagedFile{testFile(try testHomePath(a, ".zshrc"))};
-    const env = try testEnv(a);
     var diag: Diag = .{};
 
-    try testing.expectError(error.NoCwd, filterTree(a, testing.io, &files, env, null, &.{".zshrc"}, &diag));
+    try testing.expectError(error.NoCwd, filterTree(a, testing.io, &files, test_home, null, &.{".zshrc"}, &diag));
     try testing.expectEqualStrings(".zshrc", diag.capture().?);
 
     try testing.expectError(
         error.UnsupportedTilde,
-        filterTree(a, testing.io, &files, env, test_home, &.{"~root/.zshrc"}, &diag),
+        filterTree(a, testing.io, &files, test_home, test_home, &.{"~root/.zshrc"}, &diag),
     );
     try testing.expectEqualStrings("~root/.zshrc", diag.capture().?);
 }
@@ -195,10 +184,9 @@ test "filterTree: a path repeated in the arg list contributes its file once" {
 
     const zshrc = try testHomePath(a, ".zshrc");
     const files = [_]ManagedFile{ testFile(zshrc), testFile(try testHomePath(a, ".bashrc")) };
-    const env = try testEnv(a);
     var diag: Diag = .{};
 
-    const got = try filterTree(a, testing.io, &files, env, test_home, &.{ zshrc, ".zshrc" }, &diag);
+    const got = try filterTree(a, testing.io, &files, test_home, test_home, &.{ zshrc, ".zshrc" }, &diag);
     try testing.expectEqual(@as(usize, 1), got.len);
 }
 
@@ -210,6 +198,6 @@ test "filterTree: no paths given returns an empty slice" {
     const files = [_]ManagedFile{testFile(try testHomePath(a, ".zshrc"))};
     var diag: Diag = .{};
 
-    const got = try filterTree(a, testing.io, &files, try testEnv(a), null, &.{}, &diag);
+    const got = try filterTree(a, testing.io, &files, test_home, null, &.{}, &diag);
     try testing.expectEqual(@as(usize, 0), got.len);
 }

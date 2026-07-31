@@ -491,7 +491,7 @@ pub fn commitImpl(
         var direct: std.ArrayList([]const u8) = .empty;
         var leaf_targets: std.ArrayList([]const u8) = .empty;
         for (paths) |p| {
-            const live = edit_mod.liveTarget(ctx.alloc, context.env, context.cwd, p) catch |e| switch (e) {
+            const live = edit_mod.liveTarget(ctx.alloc, m_state.home, context.cwd, p) catch |e| switch (e) {
                 error.OutOfMemory => return e,
                 else => |f| return edit_mod.reportTarget(ctx.err, "mox commit", p, f),
             };
@@ -503,7 +503,7 @@ pub fn commitImpl(
         }
 
         var diag: scope.Diag = .{};
-        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, direct.items, &diag) catch |e| switch (e) {
+        const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, context.cwd, direct.items, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox commit: {s}: not managed\n", .{diag.capture().?});
                 if (diag.captureResolved()) |r|

@@ -21,8 +21,8 @@
             .hash = "cli-0.3.0-xmo03wjtBABDlKZlNQdlehkrYXuXAf_hkEjFB0QrRAC3",
         },
         .env = .{
-            .url = "https://github.com/sakakibara/env-zig/archive/refs/tags/v0.1.1.tar.gz",
-            .hash = "env-0.1.1-sTEXsnNyAADkVRj6KAJjvfbgZQZVq56Rg2I4CoTy63sG",
+            .url = "https://github.com/sakakibara/env-zig/archive/refs/tags/v0.2.1.tar.gz",
+            .hash = "env-0.2.1-sTEXssiOAACFP4MSdU4PdaA1p4FT7zdliMFEMZEJVG2x",
         },
         .ini = .{
             .url = "https://github.com/sakakibara/ini-zig/archive/refs/tags/v0.6.0.tar.gz",

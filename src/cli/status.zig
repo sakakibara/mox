@@ -81,7 +81,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var files: []const mox.source.tree.ManagedFile = tree.files;
     if (a.paths.len > 0) {
         var diag: scope.Diag = .{};
-        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, a.paths, &diag) catch |e| switch (e) {
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, context.cwd, a.paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox status: {s}: not managed\n", .{diag.capture().?});
                 if (diag.captureResolved()) |r|
