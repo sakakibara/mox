@@ -34,8 +34,15 @@ pub fn resolve(arena: std.mem.Allocator, env: Env) !Paths {
 pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag) !Paths {
     // A machine with no home named at all still gets a resolvable (if useless)
     // root rather than an error, so `mox --help` runs anywhere.
+    //
+    // `homeFor`, not `home`: this function is parameterized by `os_tag` so a
+    // test can pin every platform's answer from whichever host runs it, and
+    // resolving the home against the HOST instead would leave that promise
+    // half-kept. It matters -- on Windows a POSIX-form `HOME` names no stable
+    // location and is rejected in favour of `USERPROFILE`, so a linux-tagged
+    // resolution run from a Windows runner would otherwise find no home at all.
     var home_named = true;
-    const home = dirs.home(arena, env) catch blk: {
+    const home = dirs.homeFor(arena, env, os_tag) catch blk: {
         home_named = false;
         break :blk try arena.dupe(u8, "/");
     };

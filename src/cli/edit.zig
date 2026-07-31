@@ -286,10 +286,24 @@ test "liveTarget: an unexpandable tilde is refused rather than resolved as a dir
     defer arena.deinit();
     const a = arena.allocator();
 
-    // `~other/x` and `~\x` would otherwise name a directory literally called
-    // `~other` or `~` under cwd.
+    // `~other/x` names another account's home, which is not portably
+    // resolvable, so it is refused rather than read as a directory literally
+    // called `~other` under cwd.
     try testing.expectError(error.UnsupportedTilde, liveTarget(a, test_home, test_home, "~other/.zshrc"));
-    try testing.expectError(error.UnsupportedTilde, liveTarget(a, test_home, test_home, "~\\.zshrc"));
+
+    // `~\x` is a home reference exactly where a backslash separates paths.
+    // On Windows it expands -- PowerShell hands `~` to a native program
+    // verbatim, so this spelling is the one a user there actually types. On
+    // POSIX a backslash is an ordinary filename byte, so it stays a relative
+    // path whose first component begins with `~`, and is refused as one.
+    if (@import("builtin").os.tag == .windows) {
+        try testing.expectEqualStrings(
+            try std.fs.path.join(a, &.{ test_home, ".zshrc" }),
+            try liveTarget(a, test_home, test_home, "~\\.zshrc"),
+        );
+    } else {
+        try testing.expectError(error.UnsupportedTilde, liveTarget(a, test_home, test_home, "~\\.zshrc"));
+    }
 
     // A file whose name merely starts with `~` stays reachable, spelled as the
     // relative path it is.
