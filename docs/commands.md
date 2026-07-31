@@ -370,3 +370,29 @@ The private layer is preserved unless `--purge-private`; snapshots and
 trash -- your recoverable pre-mox originals -- are preserved unless
 `--purge-snapshots` / `--purge-trash` or confirmed on a terminal. The
 user's source repo is never touched.
+
+## For tooling
+
+Two surfaces exist for a program rather than a person, and neither is
+listed in `mox --help` -- they answer questions a human already has
+better answers to.
+
+`mox status --json` / `--porcelain` emit the drift set (see
+[status](#status)). Paths there are absolute, never contracted to `~`,
+since the consumer expands nothing.
+
+`mox __schema` emits the whole command table as one versioned JSON
+envelope -- every command with its flags, positionals, completion
+behavior, declared constraints, and subcommands, recursed:
+
+```
+{"version":2,"program":"mox","commands":[{"name":"add", ... }]}
+```
+
+It is derived from the same declarations the parser and `--help` are, so
+it cannot describe a flag argv does not accept. `constraints` carries the
+relations a command enforces (`--gate` requires one of `--own`,
+`--own-absent`, `--disown`; `--recursive` rules those out), so a caller
+composing an invocation can honour them instead of discovering them from
+a rejected one. `version` is bumped whenever the emitted shape changes in
+a way a consumer must branch on.

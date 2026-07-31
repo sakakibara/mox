@@ -10,20 +10,44 @@ const Env = @import("env").Env;
 const ManagedFile = mox.source.tree.ManagedFile;
 
 /// Carries the argument that failed to resolve when `filterTree` returns
-/// `error.NotManaged`. Fixed-size like `compose.interp.Diag`: no allocation
-/// on the error path.
+/// `error.NotManaged`, and the live path it resolved to. Fixed-size like
+/// `compose.interp.Diag`: no allocation on the error path.
+///
+/// Both are kept because a non-absolute argument is resolved against the
+/// current directory: `init.lua` naming nothing is only puzzling until the
+/// report says which `init.lua` was looked for.
 pub const Diag = struct {
     buf: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
+    resolved_buf: [std.fs.max_path_bytes]u8 = undefined,
+    resolved_len: usize = 0,
 
     pub fn set(self: *Diag, text: []const u8) void {
         const n = @min(text.len, self.buf.len);
         @memcpy(self.buf[0..n], text[0..n]);
         self.len = n;
+        self.resolved_len = 0;
+    }
+
+    /// `set`, plus the live path `text` resolved to.
+    pub fn setResolved(self: *Diag, text: []const u8, resolved: []const u8) void {
+        self.set(text);
+        const n = @min(resolved.len, self.resolved_buf.len);
+        @memcpy(self.resolved_buf[0..n], resolved[0..n]);
+        self.resolved_len = n;
     }
 
     pub fn capture(self: *const Diag) ?[]const u8 {
         return if (self.len == 0) null else self.buf[0..self.len];
+    }
+
+    /// The resolved live path, when it differs from the argument as written.
+    /// Null when they match, so a caller that already printed the argument
+    /// does not repeat it back.
+    pub fn captureResolved(self: *const Diag) ?[]const u8 {
+        if (self.resolved_len == 0) return null;
+        const r = self.resolved_buf[0..self.resolved_len];
+        return if (std.mem.eql(u8, r, self.buf[0..self.len])) null else r;
     }
 };
 
@@ -53,7 +77,7 @@ pub fn filterTree(
             return e;
         };
         const file = findByLive(tree_files, live) orelse {
-            diag.set(p);
+            diag.setResolved(p, live);
             return error.NotManaged;
         };
         const gop = try seen.getOrPut(file.live_path);

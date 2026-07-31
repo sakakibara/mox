@@ -7,6 +7,9 @@ All notable changes to mox are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- `not managed` names the path it looked for when that differs from the
+  argument as written, so a spelling resolved against the current directory
+  reports where it actually went rather than leaving the reader to guess.
 - `add`'s flag relations (`--disown` against `--own`/`--own-absent`,
   `--seed-once` against the key-path options, `--gate`'s dependency on one of
   them, and the new `-r`) are declared on the command rather than checked in
@@ -34,6 +37,14 @@ All notable changes to mox are documented here. The format follows
   `-r`.
 
 ### Fixed
+- A secret that resolves to nothing is refused instead of written. Every
+  backend can return an empty value from a lookup it calls successful -- a
+  variable set to `""`, an empty file, a manager exiting 0 with no output --
+  and mox composed that into the live file, replacing a working credential
+  with an empty one. Since a secret-bearing file is deliberately not
+  baselined in cleartext, drift detection could not flag the result either.
+  All five schemes now fail with `SecretEmpty`, distinct from `SecretNotFound`
+  so the message does not claim a variable that is plainly set is missing.
 - Windows: `facts.toml` is read from the directory it is written to. The
   machine's `xdg_config_home` resolved to `%USERPROFILE%\.config` while mox
   wrote the file under `%LOCALAPPDATA%`, so an interview answer was saved and
@@ -67,6 +78,10 @@ All notable changes to mox are documented here. The format follows
   pre-filled with the path when exactly one file drifted.
 
 ### Added
+- `docs/commands.md` documents the two surfaces meant for a program rather
+  than a person: `status --json`/`--porcelain`, and `mox __schema` (the whole
+  command table as versioned JSON, constraints included). Neither is listed in
+  `mox --help`, which is for finding a verb.
 - A leading `~` in a path argument is expanded by mox, not only by the shell:
   a quoted `"~/x"`, a non-initial `--path=~/x`, PowerShell (which passes `~`
   to a native program verbatim), and a caller that builds the argument

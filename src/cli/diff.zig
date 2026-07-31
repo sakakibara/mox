@@ -245,6 +245,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, a.paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox diff: {s}: not managed\n", .{diag.capture().?});
+                if (diag.captureResolved()) |r|
+                    try ctx.err.print("mox diff:   looked for {f}\n", .{display.of(r, home)});
                 return 1;
             },
             error.OutOfMemory => return e,

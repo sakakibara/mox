@@ -311,6 +311,8 @@ fn applyPass(
         files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, paths, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox apply: {s}: not managed\n", .{diag.capture().?});
+                if (diag.captureResolved()) |r|
+                    try ctx.err.print("mox apply:   looked for {f}\n", .{display.of(r, home)});
                 return 2;
             },
             error.OutOfMemory => return e,
@@ -394,6 +396,8 @@ fn applyPass(
                 try ctx.err.print("mox apply:   accepted shells: fish, zsh, bash, powershell\n", .{});
             if (e == error.ReservedAxisName)
                 try ctx.err.writeAll("mox apply:   \"path\" is a reserved axis name; the path= axis no longer exists\n");
+            if (e == error.SecretEmpty)
+                try ctx.err.writeAll("mox apply:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n");
             if (diag.capture()) |cap|
                 try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
             counts.fail += 1;

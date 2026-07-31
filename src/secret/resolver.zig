@@ -6,6 +6,11 @@ const cache_mod = @import("cache.zig");
 
 pub const ResolveError = error{
     SecretNotFound,
+    /// The backend answered, and answered with nothing. Distinct from
+    /// `SecretNotFound`, which would claim a variable that is plainly set (to
+    /// the empty string) does not exist, and send the reader hunting for a
+    /// typo in the URI instead of at the backend.
+    SecretEmpty,
     BackendUnavailable,
     BackendFailed,
     BackendTimeout,
@@ -25,19 +30,36 @@ const default_stdout_cap: usize = 8 * 1024 * 1024;
 /// Resolve a parsed secret URI to its plaintext value.
 /// `env:` and `file://` are pure-Zig; `op://` shells out to the 1Password
 /// CLI, `pass://` to password-store, and `cmd:` to an arbitrary shell command.
+///
+/// An empty result is refused for every scheme, at this one point where they
+/// all converge -- after `pass://` has taken its first line and `runBackend`
+/// has trimmed its trailing newline, so what is judged is the value that
+/// would have been written.
+///
+/// Every backend can return nothing from a lookup it calls successful: a
+/// variable set to "", an empty file, a manager exiting 0 with no output. An
+/// empty secret is indistinguishable from a lookup that failed without saying
+/// so, which is the likelier cause -- a renamed vault entry, a wrapper
+/// swallowing its own error, a half-provisioned machine. The two mistakes are
+/// not comparable: refusing costs one file left unwritten this run, named and
+/// reported, while accepting overwrites a working config with an empty
+/// credential -- and a secret-bearing file is deliberately not baselined in
+/// cleartext, so drift detection cannot flag the result either.
 pub fn resolve(
     arena: std.mem.Allocator,
     io: std.Io,
     env: Env,
     u: uri_mod.Uri,
 ) ![]u8 {
-    return switch (u.scheme) {
+    const value = try switch (u.scheme) {
         .env => resolveEnv(arena, env, u.payload),
         .file => resolveFile(arena, io, u.payload),
         .op => resolveOp(arena, io, env, u.payload),
         .pass => resolvePass(arena, io, env, u.payload),
         .cmd => resolveCmd(arena, io, env, u.payload),
     };
+    if (value.len == 0) return error.SecretEmpty;
+    return value;
 }
 
 /// Resolve a secret URI string through `cache`: a hit returns the stored
@@ -203,6 +225,66 @@ test "resolveEnv reads the variable from the environment it was given" {
     const u = uri_mod.Uri{ .scheme = .env, .payload = "MOX_TEST_SECRET_HOME" };
     const v = try resolve(a, std.testing.io, Env{ .map = &map }, u);
     try std.testing.expectEqualStrings("/home/tester", v);
+}
+
+test "an empty result is refused for every scheme, not just env:" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // env: a variable that is plainly set, to nothing.
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_TEST_EMPTY_SECRET", "");
+    try std.testing.expectError(error.SecretEmpty, resolve(
+        a,
+        std.testing.io,
+        Env{ .map = &map },
+        .{ .scheme = .env, .payload = "MOX_TEST_EMPTY_SECRET" },
+    ));
+
+    // file://: a file that exists and holds nothing.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "empty", .data = "" });
+    try std.testing.expectError(error.SecretEmpty, resolve(
+        a,
+        std.testing.io,
+        Env{ .map = &map },
+        .{ .scheme = .file, .payload = try std.fs.path.join(a, &.{ root, "empty" }) },
+    ));
+
+    // cmd:: a backend exiting 0 having printed nothing -- and one printing
+    // only a newline, which `runBackend` trims to nothing.
+    const payloads = if (builtin.os.tag == .windows)
+        [_][]const u8{ "cd .", "echo." }
+    else
+        [_][]const u8{ "true", "printf '\\n'" };
+    for (payloads) |payload| {
+        try std.testing.expectError(error.SecretEmpty, resolve(
+            a,
+            std.testing.io,
+            Env{ .map = &map },
+            .{ .scheme = .cmd, .payload = payload },
+        ));
+    }
+}
+
+test "a secret that resolves to a real value is unaffected by the empty check" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_TEST_SPACE_SECRET", " ");
+
+    // A single space is a value, not an absence: only a zero-length result is
+    // refused, so a secret whose content is whitespace still resolves.
+    const v = try resolve(a, std.testing.io, Env{ .map = &map }, .{
+        .scheme = .env,
+        .payload = "MOX_TEST_SPACE_SECRET",
+    });
+    try std.testing.expectEqualStrings(" ", v);
 }
 
 test "resolveEnv missing var errors" {

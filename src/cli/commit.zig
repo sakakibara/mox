@@ -506,6 +506,8 @@ pub fn commitImpl(
         const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, context.env, context.cwd, direct.items, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox commit: {s}: not managed\n", .{diag.capture().?});
+                if (diag.captureResolved()) |r|
+                    try ctx.err.print("mox commit:   looked for {f}\n", .{display.of(r, m_state.home)});
                 return 1;
             },
             error.OutOfMemory => return e,

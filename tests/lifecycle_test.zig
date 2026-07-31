@@ -899,6 +899,38 @@ test "add/add -r: refuse when no variable names a home, rather than taking the r
     try std.testing.expect(std.mem.indexOf(u8, rt.err, "USERPROFILE") != null);
 }
 
+test "path args: `not managed` names the path it looked for, when that is not what was typed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.zshrc", "z\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "add", ".zshrc" })).rc);
+    try tmp.dir.createDirPath(io, "home/.config/app");
+
+    // The mistake a cwd-relative rule invites: a spelling that used to mean
+    // HOME's file, typed from somewhere else. Saying only "not managed"
+    // leaves the reader looking at the right file and the wrong directory.
+    const app_dir = try h.homePath(".config/app");
+    const r = try h.runIn(app_dir, &.{ "mox", "status", ".zshrc" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ".zshrc: not managed") != null);
+    const looked = try std.fmt.allocPrint(a, "looked for ~{c}.config{c}app{c}.zshrc", .{
+        std.fs.path.sep, std.fs.path.sep, std.fs.path.sep,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, looked) != null);
+
+    // An absolute argument already says where it looked; no echo of itself.
+    const abs = try h.homePath("nope.conf");
+    const r2 = try h.run(&.{ "mox", "status", abs });
+    try std.testing.expectEqual(@as(u8, 1), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.err, "looked for") == null);
+}
+
 test "path args: a bare name is the current directory's file, not HOME's of the same name" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
