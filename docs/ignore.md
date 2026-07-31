@@ -74,10 +74,13 @@ directories) matched a rule -- applies everywhere mox touches a live path:
 - **`add`** refuses an ignored path rather than starting to manage
   it. `add` reports `matches an ignore rule; use --force to add it anyway` and
   exits 1; `--force` overrides the refusal for that one invocation.
-  `add -r` honors `--force` too, over every file it walks; without it, a
-  matching file or directory is silently counted
-  as skipped and continues the walk (an ignored directory is not descended
-  into at all).
+  `add -r` takes `--force` for the directory you name, and only that: the
+  rules inside the tree still hold, so forcing an ignored directory does not
+  also sweep in a `*.key` under it. Without it, a matching file or directory
+  is silently counted as skipped and the walk continues (an ignored directory
+  is not descended into at all). To stop a rule applying to a whole subtree,
+  edit the rule -- that decision belongs in the ignore file, where it is
+  reviewable and versioned, not in one invocation's flags.
 - **`apply`** never composes or writes a tracked source whose live path
   matches; it prints `skipping <path> (ignored)` for each one.
 - **`.mox-exact` pruning** -- a directory marked exact has its unmanaged live

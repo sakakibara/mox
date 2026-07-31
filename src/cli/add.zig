@@ -622,11 +622,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     }
 
-    // Recursion is a mode of this command, not a command of its own: the
-    // flags that mean the same thing per file (`--seed-once`, `--force`)
-    // carry over, and the ones that name a key path inside one file are
-    // refused by the declared conflict before this body runs.
-    if (a.recursive) return addtree.runRecursive(ctx, live_path, a.seed_once, a.force);
+    // Recursion is a mode of this command, not a command of its own:
+    // `--seed-once` means the same thing per file either way, and the options
+    // naming a key path inside one file are refused by the declared conflict
+    // before this body runs. `--force` was already applied to the named path
+    // by the ignore check above, and stops there -- see `runRecursive`.
+    if (a.recursive) return addtree.runRecursive(ctx, live_path, a.seed_once);
 
     // `--disown` vs `--own`/`--own-absent`, and `--gate`'s dependency on one
     // of them, are declared on the command (see `command` below) and refused

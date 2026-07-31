@@ -727,6 +727,37 @@ test "add -r: ignore file refuses sensitive paths, adds the rest" {
     try std.testing.expect(!exists(io, try h.srcOf(".claude/projects/p.jsonl")));
 }
 
+test "add -r --force overrides the rule naming the directory, never the rules inside it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "home/.claude/CLAUDE.md", "rules\n");
+    try writeRepo(io, &tmp, "home/.claude/.credentials.json", "SECRET\n");
+    // The directory itself is ignored, and so is a secret inside it.
+    try writeRepo(io, &tmp, "repo/.moxignore", ".claude/\n.claude/.credentials.json\n");
+
+    const dir = try h.homePath(".claude");
+
+    // Without --force the named directory is refused outright.
+    const refused = try h.run(&.{ "mox", "add", "-r", dir });
+    try std.testing.expectEqual(@as(u8, 1), refused.rc);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "matches an ignore rule") != null);
+
+    // With it, the rule naming THAT directory is overridden and the walk
+    // proceeds -- but every rule inside the tree still holds. One flag must
+    // never sweep a subtree past the ignore list; widening this is how a
+    // credential reaches a repo.
+    const forced = try h.run(&.{ "mox", "add", "-r", "--force", dir });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expect(exists(io, try h.srcOf(".claude/CLAUDE.md")));
+    try std.testing.expect(!exists(io, try h.srcOf(".claude/.credentials.json")));
+}
+
 test "add -r: a missing directory fails with not found instead of adding nothing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

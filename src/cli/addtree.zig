@@ -22,13 +22,20 @@ const Counts = struct {
 };
 
 /// Capture every eligible file under `dir_abs`. The caller has already
-/// resolved the path, taken the lock, and confirmed a home is named.
-/// `seed_once` and `force` carry the flags `mox add` accepts in both modes.
+/// resolved the path, taken the lock, confirmed a home is named, and applied
+/// `--force` to `dir_abs` itself.
+///
+/// `--force` deliberately stops there. It means "add the path I named
+/// despite the rule matching it", and under `-r` the path named is this
+/// directory -- not the files inside it, which the caller never saw. Carrying
+/// it down would let one flag sweep a whole subtree past every rule, and an
+/// ignore list is where a secret-bearing path is kept out of the repo. A rule
+/// that should no longer apply is an edit to `.moxignore`: persistent,
+/// reviewable, and in version control, unlike a flag on one invocation.
 pub fn runRecursive(
     ctx: *app.Ctx,
     dir_abs: []const u8,
     seed_once: bool,
-    force: bool,
 ) anyerror!u8 {
     const context = ctx.context.?;
 
@@ -74,7 +81,7 @@ pub fn runRecursive(
     }
 
     var counts: Counts = .{};
-    try walk(ctx, dir_abs, &ruleset, &counts, seed_once, force);
+    try walk(ctx, dir_abs, &ruleset, &counts, seed_once);
 
     // Rebuild the coupling graph once over the whole bulk add, so the new
     // files' tokens can couple with existing sources on the next commit
@@ -91,7 +98,6 @@ fn walk(
     ruleset: *const mox.source.ignore.match.RuleSet,
     counts: *Counts,
     seed_once: bool,
-    force: bool,
 ) !void {
     const context = ctx.context.?;
     // Sorted so a tree is added, reported, and recursed in the same order on
@@ -105,20 +111,17 @@ fn walk(
         switch (entry.kind) {
             .directory => {
                 const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, child);
-                if (!force and ruleset.isIgnored(rel, true)) {
+                if (ruleset.isIgnored(rel, true)) {
                     counts.skipped += 1;
                     continue;
                 }
-                try walk(ctx, child, ruleset, counts, seed_once, force);
+                try walk(ctx, child, ruleset, counts, seed_once);
             },
             // A symlink is captured like single add captures it: as a regular
             // source file holding the target string, flagged in attributes.
             .file, .sym_link => {
                 const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, child);
-                // Junk is never captured, `--force` or not: an editor swap
-                // file is noise in every repo, where an ignore rule is the
-                // user's own policy and theirs to override.
-                if (mox.source.junk.isJunk(entry.name) or (!force and ruleset.isIgnored(rel, false))) {
+                if (mox.source.junk.isJunk(entry.name) or ruleset.isIgnored(rel, false)) {
                     counts.skipped += 1;
                     continue;
                 }

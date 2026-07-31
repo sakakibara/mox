@@ -26,8 +26,10 @@ All notable changes to mox are documented here. The format follows
 ### Removed
 - **Breaking:** `mox add-tree <dir>` is now `mox add -r <dir>`. Recursion is a
   mode of `add`, as it is for `cp`, `rm`, `rsync`, and `git rm`, rather than a
-  command of its own -- so `--seed-once` and `--force` work over a tree, which
-  `add-tree` never accepted. The key-path options (`--own`, `--own-absent`,
+  command of its own -- so `--seed-once` works over a tree, and `--force`
+  applies to the directory you name, neither of which `add-tree` accepted.
+  `--force` stops at that directory: the rules inside the tree still hold, so
+  one flag can never sweep a subtree past an ignore list. The key-path options (`--own`, `--own-absent`,
   `--disown`, `--gate`) name a location inside one file and are refused with
   `-r`.
 

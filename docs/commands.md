@@ -79,8 +79,10 @@ regular file and symlink under it; already-managed files, junk (editor
 temp, OS metadata), non-regular entries, and ignored paths are counted as
 skipped, and the run reports `Added N file(s); M skipped, K failed`. A
 directory without `-r` is refused, as is `-r` on a file. `--seed-once`
-and `--force` mean the same thing in both modes; the key-path options
-below name a location inside one file and are refused with `-r`.
+applies to every file captured. `--force` overrides the ignore rule
+matching the path you named and no other, so forcing an ignored
+directory still honors the rules inside it. The key-path options below
+name a location inside one file and are refused with `-r`.
 
 Partial ownership at onboarding:
 
