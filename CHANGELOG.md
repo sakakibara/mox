@@ -6,25 +6,52 @@ All notable changes to mox are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-31
+
+### Added
+- A leading `~` in a path argument is expanded by mox, not only by the shell:
+  a quoted `"~/x"`, a non-initial `--path=~/x`, PowerShell (which passes `~`
+  to a native program verbatim), and a caller that builds the argument
+  without a shell all reach the same file now. `~user` is refused rather than
+  read as a directory of that name.
+- `docs/commands.md` documents the two surfaces meant for a program rather
+  than a person: `status --json`/`--porcelain`, and `mox __schema` (the whole
+  command table as versioned JSON, constraints included). Neither is listed in
+  `mox --help`, which is for finding a verb.
+
 ### Changed
+- **Breaking:** a non-absolute path argument is now relative to the current
+  directory, not to `$HOME`. Every command taking a live path (`add`,
+  `apply`, `commit`, `diff`, `edit`, `mv`, `remove`, `status`) reads it the
+  same way, so `mox commit init.lua` inside `~/.config/nvim` names that file
+  -- which is what a shell's completion offers there -- rather than a
+  `~/init.lua` that does not exist. `.` and `..` resolve, so
+  `../fish/config.fish` reaches the sibling directory. A path spelled
+  relative to `$HOME` from elsewhere (`mox status .config/nvim/init.lua`)
+  no longer resolves: spell it `~/.config/nvim/init.lua`.
+- Human-facing output shows a path under the home directory as `~/...` rather
+  than in full, across every command that prints one -- previously only the
+  drift report's table label did, and not even the resolution command beside
+  it. Those commands are contracted now too: mox expands the tilde itself, so
+  a pasted line works quoted, in a script, and in a shell that expands none.
+  `--json`/`--porcelain` and `mox diff`'s unified-diff headers stay absolute,
+  since their consumer expands nothing.
 - `not managed` names the path it looked for when that differs from the
   argument as written, so a spelling resolved against the current directory
   reports where it actually went rather than leaving the reader to guess.
+- The drift report no longer shortens the path to fit its other columns. At 80
+  columns the fixed columns left it about a dozen bytes, so the one thing on a
+  row that identifies a file was the one thing unreadable; the details now
+  move to a line under the path instead, and only a path wider than the
+  terminal itself is elided. The per-row `keep: mox commit`, identical on
+  every row, moved into the guidance, which now spells out both resolutions --
+  pre-filled with the path when exactly one file drifted.
 - `add`'s flag relations (`--disown` against `--own`/`--own-absent`,
   `--seed-once` against the key-path options, `--gate`'s dependency on one of
   them, and the new `-r`) are declared on the command rather than checked in
   its body, so `--help` states them under `Constraints:` and the schema
   carries them. A violation is now a usage error (exit 2) like any other
   malformed invocation, where the hand-rolled checks exited 1.
-- **Breaking:** a non-absolute path argument is now relative to the current
-  directory, not to `$HOME`. Every command taking a live path (`add`,
-  `apply`, `commit`, `diff`, `edit`, `mv`, `remove`, `status`)
-  reads it the same way, so `mox commit init.lua` inside `~/.config/nvim`
-  names that file -- which is what a shell's completion offers there --
-  rather than a `~/init.lua` that does not exist. `.` and `..` resolve, so
-  `../fish/config.fish` reaches the sibling directory. A path spelled
-  relative to `$HOME` from elsewhere (`mox status .config/nvim/init.lua`)
-  no longer resolves: spell it `~/.config/nvim/init.lua`.
 
 ### Removed
 - **Breaking:** `mox add-tree <dir>` is now `mox add -r <dir>`. Recursion is a
@@ -32,20 +59,11 @@ All notable changes to mox are documented here. The format follows
   command of its own -- so `--seed-once` works over a tree, and `--force`
   applies to the directory you name, neither of which `add-tree` accepted.
   `--force` stops at that directory: the rules inside the tree still hold, so
-  one flag can never sweep a subtree past an ignore list. The key-path options (`--own`, `--own-absent`,
-  `--disown`, `--gate`) name a location inside one file and are refused with
-  `-r`.
+  one flag can never sweep a subtree past an ignore list. The key-path options
+  (`--own`, `--own-absent`, `--disown`, `--gate`) name a location inside one
+  file and are refused with `-r`.
 
 ### Fixed
-- Windows: a home directory spelled with a lower-case drive letter no longer
-  makes every managed file read as unmanaged. `std.fs.path` upper-cases a
-  drive as it resolves, so the source walk keyed files under `c:\...` while
-  every path argument resolved to `C:\...` and matched nothing. The home is
-  canonicalized once, where it is resolved, so both sides agree by
-  construction. `USERPROFILE` is never spelled that way; a hand-set `HOME`
-  may be. On such a machine the first apply after upgrading reports its files
-  as first-contact drift (the applied records were keyed by the old spelling)
-  and leaves them untouched until resolved, as with any drift.
 - A secret that resolves to nothing is refused instead of written. Every
   backend can return an empty value from a lookup it calls successful -- a
   variable set to `""`, an empty file, a manager exiting 0 with no output --
@@ -62,40 +80,22 @@ All notable changes to mox are documented here. The format follows
   (`$XDG_*`, then `%LOCALAPPDATA%` on Windows, then the POSIX nesting), so on
   Windows they name `%LOCALAPPDATA%` where they previously named
   `%USERPROFILE%\.config` and friends.
-- `mox add` reads the home directory the way every other
-  command does. `add` consulted only `HOME` and refused outright where just
-  `USERPROFILE` is set, and both treated an empty `HOME` as a home of `""`
-  rather than as unset -- keying a capture off the filesystem root. With no
-  home named at all, both now refuse instead of taking `/` for the user's home.
+- Windows: a home directory spelled with a lower-case drive letter no longer
+  makes every managed file read as unmanaged. `std.fs.path` upper-cases a
+  drive as it resolves, so the source walk keyed files under `c:\...` while
+  every path argument resolved to `C:\...` and matched nothing. The home is
+  canonicalized once, where it is resolved, so both sides agree by
+  construction. `USERPROFILE` is never spelled that way; a hand-set `HOME`
+  may be. On such a machine the first apply after upgrading reports its files
+  as first-contact drift (the applied records were keyed by the old spelling)
+  and leaves them untouched until resolved, as with any drift.
+- `mox add` reads the home directory the way every other command does. It
+  consulted only `HOME` and refused outright where just `USERPROFILE` is set,
+  and treated an empty `HOME` as a home of `""` rather than as unset --
+  keying a capture off the filesystem root. With no home named at all, it now
+  refuses instead of taking `/` for the user's home.
 - An empty `MOX_SNAPSHOT_RETENTION` or `MOX_UPGRADE_TARGET_BIN` is treated as
   unset, matching every other variable mox reads.
-
-### Changed
-- Human-facing output shows a path under the home directory as `~/...` rather
-  than in full, across every command that prints one -- previously only the
-  drift report's table label did, and not even the resolution command beside
-  it. Those commands are contracted now too: mox expands the tilde itself, so
-  a pasted line works quoted, in a script, and in a shell that expands none.
-  `--json`/`--porcelain` and `mox diff`'s unified-diff headers stay absolute,
-  since their consumer expands nothing.
-- The drift report no longer shortens the path to fit its other columns. At 80
-  columns the fixed columns left it about a dozen bytes, so the one thing on a
-  row that identifies a file was the one thing unreadable; the details now
-  move to a line under the path instead, and only a path wider than the
-  terminal itself is elided. The per-row `keep: mox commit`, identical on
-  every row, moved into the guidance, which now spells out both resolutions --
-  pre-filled with the path when exactly one file drifted.
-
-### Added
-- `docs/commands.md` documents the two surfaces meant for a program rather
-  than a person: `status --json`/`--porcelain`, and `mox __schema` (the whole
-  command table as versioned JSON, constraints included). Neither is listed in
-  `mox --help`, which is for finding a verb.
-- A leading `~` in a path argument is expanded by mox, not only by the shell:
-  a quoted `"~/x"`, a non-initial `--path=~/x`, PowerShell (which passes `~`
-  to a native program verbatim), and a caller that builds the argument
-  without a shell all reach the same file now. `~user` is refused rather than
-  read as a directory of that name.
 
 ## [0.8.0] - 2026-07-30
 
