@@ -108,6 +108,16 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
+    // Docs/argv agreement at tests/docs_test.zig.
+    const docs_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/docs_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    docs_tests_mod.addImport("mox", lib_mod);
+    const docs_tests = b.addTest(.{ .root_module = docs_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(docs_tests).step);
+
     // Source tree integration tests at tests/source_test.zig.
     const source_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/source_test.zig"),

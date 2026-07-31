@@ -1,7 +1,12 @@
 # Command reference
 
-The behavioral contract of every command. `mox <cmd> --help` lists the
-flags; [usage.md](usage.md) walks through the day-to-day tasks.
+The behavioral contract of every command, with each one's flags in a
+table beneath it. Those tables are rendered from the same declarations
+`mox <cmd> --help`, shell completion, and `mox __schema` are derived
+from, and a test fails when they and argv disagree -- so a flag here is
+one mox accepts, spelled the way it accepts it. What a flag *means* is
+prose, and hand-written. [usage.md](usage.md) walks through the
+day-to-day tasks.
 
 Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `sync`,
 `upgrade`, `mv`, `remove`, `uninstall`) take a single-writer lock at
@@ -68,6 +73,14 @@ or `~` (local paths), an empty segment, or a character outside
 `[A-Za-z0-9._-]` is passed to `git clone` verbatim, so any host and any
 protocol git speaks keep working spelled out.
 
+<!-- generated: flags init -->
+| Flag | Description |
+| --- | --- |
+| `--clone <url>` | git clone <url> into the repo dir (review it, then run 'mox apply'); <owner>, <owner>/<repo>, and <host>/<owner>/<repo> are shorthand for https URLs (owner alone assumes a repo named dotfiles) |
+| `--apply` | after cloning, apply immediately (write files, run scripts) instead of stopping to review |
+| `--defaults` | with --apply: never prompt in the facts interview; bind declared defaults and decline the rest |
+<!-- /generated -->
+
 ## add
 
 Start managing a live file as a base file in `src/`. A path matching a
@@ -102,6 +115,18 @@ Partial ownership at onboarding:
 A plain `add` of a target whose source head declares ownership is
 refused.
 
+<!-- generated: flags add -->
+| Flag | Description |
+| --- | --- |
+| `--recursive, -r` | add every non-junk file under a directory |
+| `--seed-once` | seed the target once; never overwrite an existing one |
+| `--force` | add even if the path matches an ignore rule |
+| `--own <key-path>` | manage only this key-path of the live file (repeatable; single file only) |
+| `--own-absent <key-path>` | declare a key-path mox enforces as absent (repeatable; single file only) |
+| `--disown <key-path>` | manage the whole file except this key-path (repeatable; single file only) |
+| `--gate <axis-expr>` | gate the created partial source on this axis expression (single file only) |
+<!-- /generated -->
+
 ## mv
 
 Rename a managed file's source (base file and its `.d/` overlay dir) so
@@ -120,6 +145,12 @@ orphaned. mox forgets the path's applied state, so a later re-add
 starts from first contact. `--purge` also deletes the live file,
 snapshotting it first; it is refused for a partially owned file (the
 live remainder is not mox's to delete).
+
+<!-- generated: flags remove -->
+| Flag | Description |
+| --- | --- |
+| `--purge` | also delete the live file (snapshotted first) |
+<!-- /generated -->
 
 ## apply
 
@@ -177,6 +208,17 @@ under its own label); `failed` (nonzero exit or abnormal termination);
 timed out (also counted under `failed`). `--skip-scripts` skips scripts
 and their fact checks entirely.
 
+<!-- generated: flags apply -->
+| Flag | Description |
+| --- | --- |
+| `--dry-run` | report only, write nothing |
+| `--overwrite` | overwrite drifted files |
+| `--force` | alias of --overwrite |
+| `--skip-scripts` | compose and write files, run no scripts |
+| `--defaults` | never prompt: bind each unbound fact's default, decline the rest |
+| `--color <color>` | auto|always|never |
+<!-- /generated -->
+
 ## commit
 
 Route edits made to live files back into their sources.
@@ -226,12 +268,28 @@ A partially owned file always routes per key, over its owned content
 only; one whose owned content resolved a secret is skipped (its record
 is a hash -- edit the source directly).
 
+<!-- generated: flags commit -->
+| Flag | Description |
+| --- | --- |
+| `--dry-run` | report only, exit 1 if edits remain |
+| `--yes` | take defaults without prompting |
+| `--abort-on-prompt` | strict CI: rc 2 on the first prompt |
+| `--color <color>` | auto|always|never |
+<!-- /generated -->
+
 ## diff
 
 Show a unified diff of the composed output against each live file
 (`--stat` for a per-file added/removed summary). A partially owned
 file diffs its canonical owned content only, with secret-bearing keys
 masked on both sides. Read-only; takes no lock and always exits 0.
+
+<!-- generated: flags diff -->
+| Flag | Description |
+| --- | --- |
+| `--stat` | per-file added/removed summary instead of full hunks |
+| `--color <color>` | auto|always|never |
+<!-- /generated -->
 
 ## edit
 
@@ -240,6 +298,12 @@ arguments](#path-arguments)) in `$EDITOR`. `--axis <tuple>` edits the matching o
 fragment instead of the base -- the way to reach a variant your current
 machine does not compose. Read-only; takes no lock, and reports the
 candidate path when the source does not exist.
+
+<!-- generated: flags edit -->
+| Flag | Description |
+| --- | --- |
+| `--axis <tuple>` | edit the overlay/fragment for this axis tuple instead |
+<!-- /generated -->
 
 ## status
 
@@ -266,6 +330,15 @@ C-escaped (`\\`, `\t`, `\n`, `\r`) so a tab or newline in them can never
 break the framing; unescape those four to recover exact bytes. Both imply
 `--drift` and keep the same exit code.
 
+<!-- generated: flags status -->
+| Flag | Description |
+| --- | --- |
+| `--color <color>` | auto|always|never |
+| `--drift` | show only the drift set (suppress the clean/gated table) |
+| `--json` | emit the drift set as JSON (implies --drift) |
+| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path (implies --drift) |
+<!-- /generated -->
+
 ## export
 
 `export --resolved [--as <tuple>] <out>` bakes a flat resolved tree:
@@ -274,6 +347,13 @@ tuple) and write it under `<out>/<live-rel>`. A partially owned target
 exports its canonical owned serialization -- the ownership contract,
 not a whole live file. Read-only wrt mox state; the walk-away
 guarantee and CI parity input.
+
+<!-- generated: flags export -->
+| Flag | Description |
+| --- | --- |
+| `--resolved` | required: bake resolved output |
+| `--as <tuple>` | compose as if bound to this axis tuple |
+<!-- /generated -->
 
 ## facts
 
@@ -300,10 +380,22 @@ the standard interview, which never revisits a decline.
 `facts probe tool=<name>` / `facts probe env=<name>` resolves a single
 live probe scriptably (exit 0 present, 1 absent, 2 error), unchanged.
 
+<!-- generated: flags facts -->
+| Flag | Description |
+| --- | --- |
+| `--report` | print every dimension's state (bound/declined/UNBOUND), provenance, and asking-condition instead |
+<!-- /generated -->
+
 ## data get
 
 Print a data source as TOML or JSON (`--format=toml|json`); the
 private layer shadows the repo.
+
+<!-- generated: flags data get -->
+| Flag | Description |
+| --- | --- |
+| `--format <format>` | toml or json |
+<!-- /generated -->
 
 ## doctor
 
@@ -327,6 +419,14 @@ rescans source tokens and rewrites the stored coupling graph under
 `<state>/coupling/`; `--fix` performs the safe rebuilds. Mutating runs
 take the lock; exits 1 while problems remain.
 
+<!-- generated: flags doctor -->
+| Flag | Description |
+| --- | --- |
+| `--fix` | perform the safe rebuilds |
+| `--rebuild-provenance` | recompose every recorded file and re-record its provenance |
+| `--rebuild-coupling` | rescan source tokens and rebuild the coupling graph |
+<!-- /generated -->
+
 ## snapshot / rollback
 
 `snapshot list` lists apply snapshots (taken before every overwrite);
@@ -346,6 +446,13 @@ the upstream branch only: diverged local history is refused (merge or
 rebase it yourself, then re-run) rather than auto-merged and pushed,
 and a rejected push asks you to sync again.
 
+<!-- generated: flags sync -->
+| Flag | Description |
+| --- | --- |
+| `--no-pull` | skip the pull half |
+| `--no-push` | skip the push half |
+<!-- /generated -->
+
 ## secret
 
 Resolve a secret URI to stdout: `env:NAME`, `file://PATH`,
@@ -363,6 +470,12 @@ Download and install a newer mox release, verified against its
 `SHA256SUMS`, replacing the running binary. `mox upgrade <version>`
 for a specific one; never auto-downgrades; `--yes` skips the prompt.
 
+<!-- generated: flags upgrade -->
+| Flag | Description |
+| --- | --- |
+| `--yes` | skip the confirmation prompt |
+<!-- /generated -->
+
 ## uninstall
 
 Remove mox's machine-local state (applied records, provenance, ...).
@@ -370,6 +483,14 @@ The private layer is preserved unless `--purge-private`; snapshots and
 trash -- your recoverable pre-mox originals -- are preserved unless
 `--purge-snapshots` / `--purge-trash` or confirmed on a terminal. The
 user's source repo is never touched.
+
+<!-- generated: flags uninstall -->
+| Flag | Description |
+| --- | --- |
+| `--purge-private` | also delete the private layer |
+| `--purge-trash` | delete trash non-interactively |
+| `--purge-snapshots` | delete snapshots (pre-mox backups) non-interactively |
+<!-- /generated -->
 
 ## For tooling
 

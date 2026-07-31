@@ -6,6 +6,16 @@ All notable changes to mox are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `docs/commands.md` carries each command's flags in a table beneath it,
+  rendered from the same declarations `--help`, shell completion, and
+  `__schema` are derived from. A test re-renders every table and fails when
+  one disagrees with argv, printing the block to paste -- so a flag added,
+  renamed, or dropped cannot leave the reference describing a command that no
+  longer exists. It also refuses a table for a command that is gone, which is
+  the drift that actually misleads. The prose stays hand-written: a
+  declaration can say a flag exists, never what it means.
+
 ## [0.9.0] - 2026-07-31
 
 ### Added
