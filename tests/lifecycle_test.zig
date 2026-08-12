@@ -4,6 +4,7 @@ const mox = @import("mox");
 
 const Io = std.Io;
 
+const exe_options = @import("exe_options");
 const testutil = @import("testutil.zig");
 const Harness = testutil.Harness;
 const containsAnywhere = testutil.containsAnywhere;
@@ -3127,11 +3128,11 @@ fn requireGit(h: Harness) !void {
 /// Make `h.repo` a git clone of a bare remote under the harness root, with a
 /// committed `src/` so publish and update have history to move.
 ///
-/// Identity and signing are set in the repo's LOCAL config, not just in the
-/// fixture's environment: mox runs git with the real process environment (so a
-/// user's credentials and signing work), which means an ambient
-/// `commit.gpgsign = true` would have mox's own commit block on a signing
-/// agent waiting for a human. Local config is what mox's git reads.
+/// Identity is set in the repo's local config so no ambient one is consulted.
+/// Ambient *config* cannot reach here at all: mox spawns git with the
+/// environment the harness handed it, whose HOME is the isolated one, so git
+/// finds no `~/.gitconfig` -- and therefore none of the operator's commit
+/// signing or credential helpers.
 fn gitRepo(h: Harness, tmp: *std.testing.TmpDir) ![]const u8 {
     try requireGit(h);
     const remote = try std.fs.path.join(h.a, &.{ h.root, "remote.git" });
@@ -3139,8 +3140,6 @@ fn gitRepo(h: Harness, tmp: *std.testing.TmpDir) ![]const u8 {
     try gitOk(h, h.root, &.{ "git", "init", "-q", "-b", "main", h.repo });
     try gitOk(h, h.repo, &.{ "git", "config", "user.email", "mox-test@example.invalid" });
     try gitOk(h, h.repo, &.{ "git", "config", "user.name", "mox test" });
-    try gitOk(h, h.repo, &.{ "git", "config", "commit.gpgsign", "false" });
-    try gitOk(h, h.repo, &.{ "git", "config", "tag.gpgsign", "false" });
     try gitOk(h, h.repo, &.{ "git", "remote", "add", "origin", remote });
     try writeRepo(h.io, tmp, "repo/src/.zshrc", "export A=1\n");
     try gitOk(h, h.repo, &.{ "git", "add", "--", "src/.zshrc" });
@@ -3149,14 +3148,12 @@ fn gitRepo(h: Harness, tmp: *std.testing.TmpDir) ![]const u8 {
     return remote;
 }
 
-/// A clone of `remote` standing in for a second machine, configured the same
-/// way so its commits do not block on a signing agent either.
+/// A clone of `remote` standing in for a second machine.
 fn otherClone(h: Harness, remote: []const u8, name: []const u8) ![]const u8 {
     const dir = try std.fs.path.join(h.a, &.{ h.root, name });
     try gitOk(h, h.root, &.{ "git", "clone", "-q", remote, dir });
     try gitOk(h, dir, &.{ "git", "config", "user.email", "mox-test@example.invalid" });
     try gitOk(h, dir, &.{ "git", "config", "user.name", "mox test" });
-    try gitOk(h, dir, &.{ "git", "config", "commit.gpgsign", "false" });
     return dir;
 }
 
@@ -3181,7 +3178,29 @@ test "path: stdout is the repo dir alone, so cd $(mox path) works" {
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{h.repo}), r.out);
 }
 
-test "git: runs in the repo, not the caller's directory, and passes the exit code through" {
+/// Run the built mox binary as a real subprocess, under the harness's own
+/// environment. `mox git` inherits stdio to hand git the terminal, which is
+/// observable only from outside this test process -- in-process, git's output
+/// would land in the build runner's protocol stream rather than anywhere a
+/// test can read.
+fn runExe(h: Harness, argv: []const []const u8) !std.process.RunResult {
+    var env = try gitEnv(h);
+    try env.put("MOX_REPO", h.repo);
+    try env.put("MOX_STATE_DIR", h.state);
+    // The build emits a path relative to the build root, and this child runs
+    // with cwd HOME, so it has to be absolutized against the test process's
+    // own directory before it means anything to the child.
+    const exe = if (std.fs.path.isAbsolute(exe_options.mox_exe))
+        exe_options.mox_exe
+    else
+        try std.fs.path.join(h.a, &.{ try std.process.currentPathAlloc(h.io, h.a), exe_options.mox_exe });
+    var full: std.ArrayList([]const u8) = .empty;
+    try full.append(h.a, exe);
+    try full.appendSlice(h.a, argv);
+    return std.process.run(h.a, h.io, .{ .argv = full.items, .cwd = .{ .path = h.home }, .environ_map = &env });
+}
+
+test "git: hands git the terminal, runs in the repo, and passes the exit code through" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3191,24 +3210,19 @@ test "git: runs in the repo, not the caller's directory, and passes the exit cod
     const h = try setup(a, io, &tmp, null);
     _ = try gitRepo(h, &tmp);
 
-    // `git config` writes nothing on success, which matters here: the
-    // passthrough inherits stdio, and this suite runs mox in-process, so a
-    // subcommand that printed would write into the test runner's own stream
-    // rather than anywhere a test can read. What is asserted is the part that
-    // is mox's: git ran in the repo though the harness cwd is HOME.
-    const set = try h.run(&.{ "mox", "git", "--", "config", "--local", "mox.canary", "reached" });
-    try std.testing.expectEqual(@as(u8, 0), set.rc);
-    const cfg = try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".git", "config" }));
-    try std.testing.expect(std.mem.indexOf(u8, cfg, "reached") != null);
+    // git's own stdout reaches the caller verbatim -- the passthrough's whole
+    // contract -- and it ran in the repo though the process cwd is HOME.
+    const log = try runExe(h, &.{ "git", "--", "log", "--oneline" });
+    try std.testing.expectEqual(@as(u8, 0), log.term.exited);
+    try std.testing.expect(std.mem.indexOf(u8, log.stdout, "init") != null);
 
-    // git's own failure code reaches the caller rather than being flattened:
-    // --get on a missing key exits 1 and prints nothing.
-    const miss = try h.run(&.{ "mox", "git", "--", "config", "--get", "mox.absent" });
-    try std.testing.expectEqual(@as(u8, 1), miss.rc);
+    // git's failure code reaches the caller rather than being flattened.
+    const miss = try runExe(h, &.{ "git", "--", "cat-file", "-e", "0000000000000000000000000000000000000000" });
+    try std.testing.expect(miss.term.exited != 0);
 
-    const empty = try h.run(&.{ "mox", "git" });
-    try std.testing.expectEqual(@as(u8, 2), empty.rc);
-    try std.testing.expect(std.mem.indexOf(u8, empty.err, "usage") != null);
+    const empty = try runExe(h, &.{"git"});
+    try std.testing.expectEqual(@as(u8, 2), empty.term.exited);
+    try std.testing.expect(std.mem.indexOf(u8, empty.stderr, "usage") != null);
 }
 
 test "publish: commits only mox's own tree, never a stray file beside it" {

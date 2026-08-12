@@ -27,9 +27,19 @@ const mox = @import("../root.zig");
 
 const Io = std.Io;
 
-/// A `git` runner bound to one repo directory. `env` is null in production so
-/// git inherits the user's environment (their config, signing, credentials);
-/// tests supply a hermetic map to isolate the repo from any ambient config.
+/// A `git` runner bound to one repo directory.
+///
+/// `env` is the environment mox itself reads through, not the raw process one.
+/// In production those are the same value, so git still sees the user's config,
+/// signing, and credentials. They differ exactly when a caller hands mox a
+/// synthetic environment -- the test harness does -- and git seeing a different
+/// one than mox was given is the inconsistency this closes: a run told to use
+/// one HOME would otherwise resolve mox's paths from it while git read the
+/// operator's real `~/.gitconfig`, picking up their commit signing and
+/// credential helpers.
+///
+/// Null falls back to the process environment, for a caller with no Env to
+/// hand over (the unit tests below construct the seam directly).
 pub const Git = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -186,7 +196,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const lk = (try lock_mod.acquireForCommand(ctx, "update")) orelse return 2;
         defer lk.release();
 
-        const git = Git{ .gpa = ctx.alloc, .io = ctx.io, .dir = context.paths.repo_dir };
+        var env_map = try context.env.createMap(ctx.alloc);
+        const git = Git{ .gpa = ctx.alloc, .io = ctx.io, .dir = context.paths.repo_dir, .env = &env_map };
         const rc = try fetchRebase(git, ctx.out, ctx.err);
         if (rc != 0) return rc;
     }

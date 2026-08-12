@@ -148,7 +148,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         return 2;
     }
 
-    const git = Git{ .gpa = ctx.alloc, .io = ctx.io, .dir = context.paths.repo_dir };
+    var env_map = try context.env.createMap(ctx.alloc);
+    const git = Git{ .gpa = ctx.alloc, .io = ctx.io, .dir = context.paths.repo_dir, .env = &env_map };
     return publishRepo(git, a.message, ctx.out, ctx.err);
 }
 

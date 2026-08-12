@@ -35,6 +35,14 @@ All notable changes to mox are documented here. The format follows
   `edit`: and make it take effect.
 
 ### Fixed
+- Every `git` mox spawns now runs under the environment mox itself reads
+  through, rather than the raw process one. In production those are the same
+  value, so a user's git config, signing, and credential helpers keep working.
+  They differ when a caller hands mox a synthetic environment: such a run
+  resolved mox's own paths from it while git read the operator's real
+  `~/.gitconfig`, so a machine with commit signing enabled had mox's own
+  commit block on a signing agent waiting for a human that a non-interactive
+  caller does not have.
 - `mox export` composes every file before writing any of them, so the secret
   gate decides before cleartext reaches disk, and a run that cannot compose
   every file reports them all and writes nothing rather than leaving a tree

@@ -145,6 +145,12 @@ pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: Setup
     if (opts.create_repo_src) try tmp.dir.createDirPath(io, "repo/src");
 
     var map = std.process.Environ.Map.init(a);
+    // mox spawns git with the environment it was itself given, so a synthetic
+    // one still has to be able to FIND git. PATH is the only entry carried
+    // over from the real environment; everything else stays isolated, which is
+    // what keeps a test's git off the operator's ~/.gitconfig (and so off
+    // their commit signing and credential helpers).
+    try map.put("PATH", std.testing.environ.getAlloc(a, "PATH") catch "");
     if (opts.home_var) |v| try map.put(v, home);
     try map.put("USER", "tester");
     // Windows has no gethostname(); `machine.state.capture` reads COMPUTERNAME

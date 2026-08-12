@@ -273,6 +273,14 @@ pub fn build(b: *std.Build) void {
     });
     lifecycle_tests_mod.addImport("mox", lib_mod);
     lifecycle_tests_mod.addImport("json", json_mod);
+    // `mox git` hands the terminal to git: it spawns with inherited stdio, so
+    // running it inside this test process would write git's output into the
+    // build runner's own protocol stream. It is exercised against the built
+    // binary as a real subprocess instead, which is the only place that
+    // contract is observable at all.
+    const exe_options = b.addOptions();
+    exe_options.addOptionPath("mox_exe", exe.getEmittedBin());
+    lifecycle_tests_mod.addOptions("exe_options", exe_options);
     const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_tests_mod });
     test_step.dependOn(&b.addRunArtifact(lifecycle_tests).step);
 

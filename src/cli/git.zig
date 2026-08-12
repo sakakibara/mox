@@ -34,9 +34,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Inherited stdio: git's pager, colors, and prompts behave as they do in
     // a shell rooted at the repo, which is the whole point of the passthrough.
+    var env_map = try context.env.createMap(ctx.alloc);
     var child = std.process.spawn(ctx.io, .{
         .argv = argv.items,
         .cwd = .{ .path = context.paths.repo_dir },
+        .environ_map = &env_map,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
