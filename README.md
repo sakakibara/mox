@@ -87,8 +87,8 @@ template language in the body.
 | Manage a new file / a whole dir | `mox add <path>` / `mox add -r <dir>` |
 | Preview before writing | `mox apply --dry-run` |
 | Use a per-machine value (email, key) | a *fact* -- `mox facts`, referenced as `<machine.email>` |
-| Share to another machine | `git push` in the repo, then `mox apply` there (or `mox sync`) |
-| Undo a bad apply | `mox snapshot list`, then `mox rollback <id>` |
+| Share to another machine | `mox publish -m "..."` here, `mox update` there |
+| Undo a bad apply | `mox rollback` (the newest snapshot; `mox snapshot` lists them) |
 | Update mox itself | `mox upgrade` |
 
 A step-by-step walkthrough of each task is in [docs/usage.md](docs/usage.md).
@@ -169,8 +169,8 @@ Full behavioral contracts for every command are in
 | `facts` | List, set, and interview for facts; `facts probe` resolves one `tool=`/`env=` query scriptably |
 | `data get <name>` | Print a data source as TOML or JSON, private layer applied |
 | `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state); `--fix` performs the safe rebuilds |
-| `snapshot list` / `rollback <id>` | List pre-overwrite snapshots; restore live files from one |
-| `sync` | Fetch and fast-forward the repo; never pushes, and refuses uncommitted or diverged history rather than auto-merging |
+| `snapshot` / `rollback [<id>]` | List pre-overwrite snapshots; restore live files from one, newest by default |
+| `update` | Fetch, rebase, and apply -- the inbound edge; refuses uncommitted changes and stops on a rebase conflict |
 | `secret <uri>` | Resolve a secret URI to stdout |
 | `trigger ...` | Staleness primitives for setup scripts (`hash`, `seen-version`, `every`) |
 | `upgrade` / `uninstall` | Self-update, `SHA256SUMS`-verified / remove machine-local state, preserving your repo and recoverable trash |

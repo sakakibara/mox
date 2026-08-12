@@ -398,7 +398,7 @@ test "kind matrix: symlink over a directory -- mox rollback reconstructs the tre
     const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
     const ids = try mox.apply.snapshot.list(a, io, snaps);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
-    const listed = try c.run(&.{ "mox", "snapshot", "list" });
+    const listed = try c.run(&.{ "mox", "snapshot" });
     try std.testing.expectEqual(@as(u8, 0), listed.rc);
     try std.testing.expect(std.mem.indexOf(u8, listed.out, ids[0]) != null);
 
@@ -653,7 +653,7 @@ test "exit codes: 2 -- an unsnapshottable forced removal is a genuine failure, n
     const c = try cliSetup(a, io, &tmp);
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    // A foreign file --force cannot back up before deleting: chmod 000 makes
+    // A foreign file --overwrite cannot back up before deleting: chmod 000 makes
     // it unreadable, so the pre-delete snapshot read fails.
     const locked = try c.homePath(".config/app/locked.txt");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = locked, .data = "cannot snapshot\n" });
@@ -663,7 +663,7 @@ test "exit codes: 2 -- an unsnapshottable forced removal is a genuine failure, n
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(@ptrCast(&zbuf), 0));
     defer _ = std.c.chmod(@ptrCast(&zbuf), 0o644);
 
-    const r = try c.run(&.{ "mox", "apply", "--force" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "UNSNAPSHOTTABLE") != null);
     try std.testing.expect(exists(io, locked));

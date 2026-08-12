@@ -180,7 +180,7 @@ fn runSequence(gpa: std.mem.Allocator, io: Io, steps: []const Step) !void {
         try writeData(io, &tmp, a, "d2", "d2", s.g2);
 
         const argv: []const []const u8 = if (s.force)
-            &.{ "mox", "apply", "--force" }
+            &.{ "mox", "apply", "--overwrite" }
         else
             &.{ "mox", "apply" };
         const r = try c.run(argv);

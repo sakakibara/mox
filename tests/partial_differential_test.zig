@@ -195,7 +195,7 @@ test "codex differential: force reassertion matches the script's keymap and rema
     try std.testing.expectEqualStrings(live_fixture, try read(io, a, live));
 
     // The script's unconditional patch corresponds to consented reassertion.
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const patched = try read(io, a, live);
 
@@ -278,7 +278,7 @@ test "codex differential: a multiline-string decoy is patched with its bytes pre
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
     try std.testing.expectEqualStrings(decoy_live, try read(io, a, live));
 
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const patched = try read(io, a, live);
 
@@ -349,7 +349,7 @@ test "codex differential: the check hook stub validates the candidate and the wr
     const c = try testutil.setup(a, io, &tmp, .{});
     const live = try c.homePath(".codex/config.toml");
 
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const patched = try read(io, a, live);
     try expectKeymapMatchesScript(a, patched);

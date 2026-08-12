@@ -12,21 +12,21 @@ const max_bytes: usize = 4 * 1024 * 1024;
 
 pub const Format = enum { toml, json };
 
-const GetSpec = struct {
+const Spec = struct {
     name: cli.Pos([]const u8, .{ .help = "data source name (bare stem or *.toml path)" }),
     format: cli.Opt(Format, .{ .default = "toml", .value_name = "format", .help = "toml or json" }),
 };
 
-/// `mox data get <name> [--format=toml|json]`: print a TOML data source,
+/// `mox data <name> [--format=toml|json]`: print a TOML data source,
 /// resolving the private layer before the repo layer (private shadows repo).
 /// `<name>` is a bare stem (`.toml` appended) or an explicit `*.toml` path
 /// relative to the `data/` roots.
-fn get(ctx: *app.Ctx, a: cli.Args(GetSpec)) anyerror!u8 {
+fn get(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const name = a.name;
 
     if (escapesRoot(name)) {
-        try ctx.err.print("mox data get: invalid name '{s}': must not contain '..' or a leading '/'\n", .{name});
+        try ctx.err.print("mox data: invalid name '{s}': must not contain '..' or a leading '/'\n", .{name});
         return 2;
     }
 
@@ -38,7 +38,7 @@ fn get(ctx: *app.Ctx, a: cli.Args(GetSpec)) anyerror!u8 {
 
     const path = resolve(ctx.io, private_candidate, repo_candidate) orelse {
         try ctx.err.print(
-            "mox data get: no data source '{s}'; looked in:\n  {s}\n  {s}\n",
+            "mox data: no data source '{s}'; looked in:\n  {s}\n  {s}\n",
             .{ name, private_candidate, repo_candidate },
         );
         return 1;
@@ -52,7 +52,7 @@ fn get(ctx: *app.Ctx, a: cli.Args(GetSpec)) anyerror!u8 {
     }
 
     const v = toml.parse(ctx.alloc, content, .{}) catch |e| {
-        try ctx.err.print("mox data get: {f}: TOML parse failed: {s}\n", .{ display.of(path, ctx.context.?.paths.home), @errorName(e) });
+        try ctx.err.print("mox data: {f}: TOML parse failed: {s}\n", .{ display.of(path, ctx.context.?.paths.home), @errorName(e) });
         return 1;
     };
     const jv = try tomlToJson(ctx.alloc, v);
@@ -63,7 +63,7 @@ fn get(ctx: *app.Ctx, a: cli.Args(GetSpec)) anyerror!u8 {
 
 /// True when `name` could resolve outside the `data/` root: an absolute path or
 /// any `..` segment, on either separator (a Windows `\`/drive form must be
-/// caught even on POSIX and vice versa). Refused so `data get` cannot read
+/// caught even on POSIX and vice versa). Refused so `data` cannot read
 /// arbitrary files off the data sandbox.
 fn escapesRoot(name: []const u8) bool {
     return mox.source.path.keyEscapes(name);
@@ -150,26 +150,14 @@ fn writeTime(w: *Io.Writer, t: toml.Time) !void {
     try w.writeAll(buf[0..end]);
 }
 
-const get_cmd = app.command(GetSpec, .{
-    .name = "get",
+pub const command = app.command(Spec, .{
+    .name = "data",
     .summary = "Print a data source",
-    .usage = "mox data get <name> [--format=toml|json]",
+    .usage = "mox data <name> [--format=toml|json]",
     .details = "Private shadows repo.",
     .group = .general,
     .needs_context = true,
 }, get);
-
-fn dataUsage(ctx: *app.Ctx) anyerror!u8 {
-    return app.usageError(ctx, "usage: mox data get <name> [--format=toml|json]\n", .{});
-}
-
-pub const command = app.Command{
-    .name = "data",
-    .summary = "Print a data source",
-    .group = .general,
-    .run = dataUsage,
-    .subcommands = &.{get_cmd},
-};
 
 const testing = std.testing;
 

@@ -5,7 +5,7 @@
 //! source exactly. Removal is recoverable -- every deleted file is snapshotted
 //! first -- but still gated: a file mox itself wrote and that is unchanged is
 //! swept automatically, while anything foreign (never recorded) or drifted is
-//! refused unless `--force` is given, and reported either way.
+//! refused unless `--overwrite` is given, and reported either way.
 
 const std = @import("std");
 
@@ -33,10 +33,10 @@ pub const Options = struct {
 pub const Result = struct {
     /// Entries removed (or, under dry-run, that would be removed).
     removed: usize = 0,
-    /// Entries refused only for lacking `--force`/`--overwrite`: resolvable
+    /// Entries refused only for lacking `--overwrite`: resolvable
     /// by the caller re-running forced.
     drift_refused: usize = 0,
-    /// Entries refused for a reason `--force`/`--overwrite` cannot resolve
+    /// Entries refused for a reason `--overwrite` cannot resolve
     /// (unreadable/unsnapshottable, or a foreign subtree harboring an
     /// ignored entry mox will never delete).
     error_refused: usize = 0,
@@ -148,7 +148,7 @@ fn sweepFile(
 
     if (!clean_leftover and !opts.force) {
         result.drift_refused += 1;
-        try stderr.print("  UNMANAGED {s} (exact dir; --force to remove)\n", .{live_path});
+        try stderr.print("  UNMANAGED {s} (exact dir; --overwrite to remove)\n", .{live_path});
         return;
     }
     if (opts.dry_run) {
@@ -177,19 +177,19 @@ fn sweepDir(
     // path is ignored. A non-ignored foreign dir may still harbor an ignored
     // descendant several levels down; the guarantee that mox never deletes an
     // ignored file is absolute, so the entire subtree is refused rather than
-    // deleted around it. `--force` cannot resolve this (mox will never
+    // deleted around it. `--overwrite` cannot resolve this (mox will never
     // delete an ignored entry): checked BEFORE the force gate below, so a
-    // non-forced run names the true reason instead of offering `--force` as a
+    // non-forced run names the true reason instead of offering `--overwrite` as a
     // fix that would still refuse.
     if (try subtreeHasIgnored(arena, io, live_path, home, ruleset, 0)) {
         result.error_refused += 1;
-        try stderr.print("  UNMANAGED {s}/ contains ignored entries; not removed, even with --force -- clear them manually\n", .{live_path});
+        try stderr.print("  UNMANAGED {s}/ contains ignored entries; not removed, even with --overwrite -- clear them manually\n", .{live_path});
         return;
     }
-    // A foreign directory is otherwise always "unknown"; removing it needs --force.
+    // A foreign directory is otherwise always "unknown"; removing it needs --overwrite.
     if (!opts.force) {
         result.drift_refused += 1;
-        try stderr.print("  UNMANAGED {s}/ (exact dir; --force to remove)\n", .{live_path});
+        try stderr.print("  UNMANAGED {s}/ (exact dir; --overwrite to remove)\n", .{live_path});
         return;
     }
     if (opts.dry_run) {
@@ -221,7 +221,7 @@ fn sweepOther(
 ) !void {
     if (!opts.force) {
         result.drift_refused += 1;
-        try stderr.print("  UNMANAGED {s} (exact dir; --force to remove)\n", .{live_path});
+        try stderr.print("  UNMANAGED {s} (exact dir; --overwrite to remove)\n", .{live_path});
         return;
     }
     if (opts.dry_run) {

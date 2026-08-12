@@ -22,20 +22,39 @@ All notable changes to mox are documented here. The format follows
   files and running setup scripts from a half-applied revision. The refusal is
   a marker-file lookup in `.git`, so it needs no `git` on PATH, costs no
   subprocess, and reads a repo that is not a git checkout as idle. It holds
-  however the repo got there -- previously only `mox sync` refused, which the
+  however the repo got there -- previously only the git half refused, which the
   `git pull` the docs offered as its equivalent walked straight past.
 
 ### Changed
-- **Breaking:** `mox sync` no longer pushes. It fetches and fast-forwards, and
-  that is all; `--no-pull` and `--no-push` are gone with the half they gated.
-  A command named for bringing a machine up to date should not publish as a
-  side effect: the repo it pushed to may be public, suppressing it took a flag
-  the user had to remember every time, and forgetting that flag discloses
-  work, which no local undo reaches. Publishing is `git push`, which mox has
-  no reason to wrap. The pull half earns its wrapper -- it refuses a dirty
-  tree, refuses diverged history instead of fabricating a merge, and reports
-  how many commits it moved -- while the push half reported `Pushed` even when
-  the push sent nothing, since it checked only that git exited 0.
+- **Breaking:** `mox sync` is now `mox update`, and it applies. mox moves
+  configuration along one line -- live file, source, remote -- and named only
+  the local pair (`apply`, `commit`); `sync` was two directions crammed into
+  one verb, reaching outward to a remote it was never asked to publish to and
+  never inward to live files, so the machine it claimed to synchronize still
+  held stale dotfiles when it finished. `update` is the inbound edge end to
+  end: fetch, rebase, apply. `--no-apply` stops after the fetch for a
+  `mox diff` first; `--no-pull` and `--no-push` are gone with the halves they
+  gated, and publishing is `mox publish`.
+- **Breaking:** `update` rebases rather than fast-forwarding. The same repo
+  edited on several machines diverges as a matter of course, and `--ff-only`
+  handed that back as a manual rebase every time. Only commits absent from the
+  upstream are replayed, so published history is never rewritten; a conflict
+  stops mid-rebase, which `apply` and `commit` now refuse until it is resolved
+  or aborted. No `--autostash`: a dirty tree is refused before the fetch.
+- **Breaking:** `update` uses `apply`'s exit contract -- 0 clean, 1 drift left
+  for a decision, 2 a refusal or failure. Refusals moved from 1 to 2 so a
+  caller never has to ask which phase produced the code.
+- **Breaking:** `mox data get <name>` is now `mox data <name>`, and
+  `mox snapshot list` is now `mox snapshot`. Each group had exactly one
+  subcommand that removed no ambiguity, and bare `mox snapshot` already
+  listed snapshots identically.
+- **Breaking:** `apply --force` is gone; `--overwrite` is the only spelling.
+  It was a redundant alias on apply while meaning something unrelated on `add`
+  (bypass an ignore rule). Every diagnostic that said "re-run with --force"
+  now names `--overwrite`.
+- `mox rollback` with no id restores the newest snapshot, announcing which one
+  it took. Undoing the apply just run is the case that matters, and it
+  required reading an id back out of another command.
 
 ## [0.9.0] - 2026-07-31
 

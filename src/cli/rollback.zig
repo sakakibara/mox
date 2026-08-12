@@ -9,11 +9,12 @@ const Env = @import("env").Env;
 
 const Io = std.Io;
 
-/// `mox rollback <id>`: restore all live files captured in a snapshot.
+/// `mox rollback [<id>]`: restore all live files captured in a snapshot,
+/// defaulting to the newest one.
 ///
 /// Last-applied records are deliberately left stale, so the next `mox apply`
 /// sees the restored files as drift and refuses to overwrite them without
-/// --force. Rollback undoes live-file changes; it never touches the source
+/// --overwrite. Rollback undoes live-file changes; it never touches the source
 /// tree.
 ///
 /// A PARTIALLY owned target is never whole-file restored: that would clobber
@@ -23,15 +24,28 @@ const Io = std.Io;
 /// owned values were secret-masked is refused -- placeholders are never
 /// written live; re-apply the source instead.
 const Spec = struct {
-    id: cli.Pos([]const u8, .{ .help = "snapshot id (see 'mox snapshot list')" }),
+    id: cli.Pos([]const u8, .{ .optional = true, .help = "snapshot id (see 'mox snapshot'); the newest when omitted" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    const id = a.id;
 
     const lk = (try lock_mod.acquireForCommand(ctx, "rollback")) orelse return 1;
     defer lk.release();
+
+    // Undoing the apply just run is the case that matters, and making the user
+    // read an id back out of `mox snapshot` to reach it is pure friction. The
+    // chosen id is announced, so an unattended run still records what it took.
+    const id = a.id orelse blk: {
+        const ids = try mox.apply.snapshot.list(ctx.alloc, ctx.io, context.paths.snapshots_dir);
+        if (ids.len == 0) {
+            try ctx.err.writeAll("mox rollback: no snapshots to roll back to\n");
+            return 1;
+        }
+        const newest = ids[ids.len - 1];
+        try ctx.err.print("mox rollback: rolling back the newest snapshot, {s}\n", .{newest});
+        break :blk newest;
+    };
 
     // Resolved once per rollback run (not per re-patched partial file): an
     // unparseable override would otherwise warn once per file re-patched.
@@ -96,7 +110,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var withheld: std.ArrayList(mox.apply.snapshot.Withheld) = .empty;
     const restored = mox.apply.snapshot.restoreExcept(ctx.alloc, ctx.io, context.paths.snapshots_dir, id, context.paths.home, &skip, &withheld) catch |e| switch (e) {
         error.SnapshotNotFound => {
-            try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot list')\n", .{id});
+            try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
             return 1;
         },
         else => return e,

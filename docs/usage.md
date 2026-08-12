@@ -154,8 +154,7 @@ output (snapshotted first, recoverable via `mox rollback`). `mox commit <path>`
 keeps the live edit, routing it back into the source so the file ends in sync.
 `--overwrite` with no path takes the repo's version of every drifted file;
 `mox status --drift` lists them all (`--json`/`--porcelain` for tooling). The
-run exits 1 while any drift is unresolved, so a script notices. `--force` is a
-retained alias of `--overwrite`.
+run exits 1 while any drift is unresolved, so a script notices.
 
 ## A Mac-only (or per-profile) difference
 
@@ -413,21 +412,21 @@ mox does not commit or publish for you. Commit in the repo and `git push` it,
 then on the other machine:
 
 ```sh
-mox sync          # fetch and fast-forward
-mox apply
+mox update        # fetch, rebase, apply
 ```
 
-`sync` refuses to proceed with uncommitted changes or diverged history --
-resolve those yourself, so nothing is auto-merged. It never pushes, so a repo
-only reaches the remote when you send it there.
+`update` refuses to proceed with uncommitted changes, and a rebase conflict
+stops for you to resolve or abort rather than being auto-merged. It never
+publishes: work reaches the remote through `mox publish`.
 
 ## Undoing an apply
 
 Every overwrite is snapshotted first:
 
 ```sh
-mox snapshot list
-mox rollback <id>       # restore the live files from that snapshot
+mox rollback            # the newest snapshot, named as it goes
+mox snapshot            # list them, oldest first
+mox rollback <id>       # restore the live files from a specific one
 ```
 
 A [partially owned file](#a-file-a-program-also-writes) is not whole-file

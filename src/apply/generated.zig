@@ -5,7 +5,7 @@
 //! path per line). On the next apply, after the current set is written, any
 //! prior-set path no longer produced is removed -- snapshot-first, and only
 //! when the removal is safe: a path this generator no longer owns is deleted
-//! only if it is a clean mox-written leaf (or `--force`), never a foreign or
+//! only if it is a clean mox-written leaf (or `--overwrite`), never a foreign or
 //! drifted file. Removing the generator source removes its whole set.
 //!
 //! DATA SAFETY: pruning acts ONLY on paths in this generator's own manifest,
@@ -43,10 +43,10 @@ pub const Options = struct {
 pub const Result = struct {
     /// Leaves removed (or, under dry-run, that would be removed).
     removed: usize = 0,
-    /// Leaves refused because they drifted and `--force`/`--overwrite` was
+    /// Leaves refused because they drifted and `--overwrite` was
     /// not given: resolvable by the caller re-running forced.
     drift_refused: usize = 0,
-    /// Leaves refused for a reason `--force`/`--overwrite` cannot resolve
+    /// Leaves refused for a reason `--overwrite` cannot resolve
     /// (unsnapshottable, undeletable, or now a directory/special file).
     error_refused: usize = 0,
 };
@@ -190,7 +190,7 @@ fn removeLeaf(
             try forgetRecords(arena, io, opts.state_dir, live_path);
             return;
         },
-        // Never delete a directory that appeared where a leaf was. `--force`
+        // Never delete a directory that appeared where a leaf was. `--overwrite`
         // does not resolve this (there is no directory-replace primitive
         // here), so it is an error, not drift needing a decision.
         .directory => {
@@ -199,13 +199,13 @@ fn removeLeaf(
             return;
         },
         // mox only ever wrote a regular file as a generated leaf, so a symlink
-        // here is drift: refuse without --force, else snapshot the LINK (its
+        // here is drift: refuse without --overwrite, else snapshot the LINK (its
         // target string, not the dereferenced content) and remove it.
         .symlink => |target| {
             if (!opts.force) {
                 result.drift_refused += 1;
                 if (!opts.mute_drift_message)
-                    try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --force to prune)\n", .{live_path});
+                    try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --overwrite to prune)\n", .{live_path});
                 return;
             }
             if (opts.dry_run) {
@@ -258,13 +258,13 @@ fn removeLeaf(
     };
 
     // A clean leaf is exactly what mox last wrote here. A drifted one (edited,
-    // or never recorded) is refused without --force, mirroring the exact sweep.
+    // or never recorded) is refused without --overwrite, mirroring the exact sweep.
     const rec = try applied.read(arena, io, opts.state_dir, live_path);
     const clean = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
     if (!clean and !opts.force) {
         result.drift_refused += 1;
         if (!opts.mute_drift_message)
-            try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --force to prune)\n", .{live_path});
+            try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --overwrite to prune)\n", .{live_path});
         return;
     }
     if (opts.dry_run) {

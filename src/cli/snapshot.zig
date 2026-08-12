@@ -5,7 +5,7 @@ const mox = @import("../root.zig");
 
 const Spec = struct {};
 
-/// `mox snapshot` / `mox snapshot list`: list snapshot ids, oldest first.
+/// `mox snapshot`: list snapshot ids, oldest first.
 fn list(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const ids = try mox.apply.snapshot.list(ctx.alloc, ctx.io, context.paths.snapshots_dir);
@@ -19,20 +19,9 @@ fn list(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
     return 0;
 }
 
-const list_cmd = app.command(Spec, .{
-    .name = "list",
-    .summary = "List apply snapshots, oldest first",
+pub const command = app.command(Spec, .{
+    .name = "snapshot",
+    .summary = "List apply snapshots (taken before every overwrite)",
     .group = .general,
     .needs_context = true,
 }, list);
-
-pub const command = blk: {
-    var c = app.command(Spec, .{
-        .name = "snapshot",
-        .summary = "List apply snapshots (taken before every overwrite)",
-        .group = .general,
-        .needs_context = true,
-    }, list);
-    c.subcommands = &.{list_cmd};
-    break :blk c;
-};

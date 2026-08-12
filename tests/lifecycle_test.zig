@@ -2416,7 +2416,7 @@ test "add --own-absent: the declared path flows to enforced absence" {
     try std.testing.expect(std.mem.indexOf(u8, drift.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "[gone]") != null);
 
-    const forced = try h.run(&.{ "mox", "apply", "--force" });
+    const forced = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, after, "[gone]") == null);

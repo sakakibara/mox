@@ -13,9 +13,6 @@ const display = @import("display.zig");
 pub const Spec = struct {
     dry_run: cli.Flag(.{ .help = "report only, write nothing" }),
     overwrite: cli.Flag(.{ .help = "overwrite drifted files" }),
-    /// A retained alias of `--overwrite`: same behavior, kept so existing
-    /// muscle memory and scripts keep working.
-    force: cli.Flag(.{ .help = "alias of --overwrite" }),
     skip_scripts: cli.Flag(.{ .help = "compose and write files, run no scripts" }),
     defaults: cli.Flag(.{ .help = "never prompt: bind each unbound fact's default, decline the rest" }),
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
@@ -23,7 +20,7 @@ pub const Spec = struct {
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    return applyImpl(ctx, a.overwrite or a.force, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
+    return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
 }
 
 /// `machine.state.captureDiag`, reporting a `ReservedFactName` (a custom fact
@@ -114,7 +111,7 @@ fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.
 ///
 /// Non-interactive: apply never prompts. It writes every clean file, skips
 /// every drifted one (no write, no snapshot, no record), and reports the
-/// drift set at the end. `force` (`--overwrite`/`--force`) writes through
+/// drift set at the end. `force` (`--overwrite`) writes through
 /// drift instead of skipping it, scoped to `paths` when given. Returns 0
 /// (clean), 1 (drift was skipped and needs a decision), or 2 (a genuine
 /// failure -- see the exit-code split in `applyPass`).
@@ -1194,7 +1191,7 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
 /// Write one partially owned file: compose is already done, so this runs
 /// the declaration check, the per-path drift rule against the owned record,
 /// the span splice with its invariant, the masked snapshot, and the
-/// race-checked atomic write. Partial drift is skip-and-report; `--force`
+/// race-checked atomic write. Partial drift is skip-and-report; `--overwrite`
 /// (or a scoped `--overwrite`) reasserts.
 fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotted: *bool) !void {
     const context = ctx.context.?;
@@ -1675,7 +1672,7 @@ fn liveIsSymlink(io: std.Io, live_path: []const u8) bool {
 /// Recoverable bytes to snapshot before replacing a live entry with a symlink:
 /// a regular file's content, or a link's target string. Best-effort; an
 /// unreadable regular file yields its own snapshot-empty marker only after the
-/// caller has already decided to proceed under --force.
+/// caller has already decided to proceed under --overwrite.
 fn snapshotContentForSite(io: std.Io, arena: std.mem.Allocator, live_path: []const u8, site: mox.apply.applied.SymSite) []const u8 {
     return switch (site) {
         .symlink => |target| target,
@@ -1693,7 +1690,7 @@ fn snapshotContentForSite(io: std.Io, arena: std.mem.Allocator, live_path: []con
 pub const command = app.command(Spec, .{
     .name = "apply",
     .summary = "Compose all managed files and write to live paths",
-    .details = "Never prompts. --dry-run: report only; --overwrite (alias --force): write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
+    .details = "Never prompts. --dry-run: report only; --overwrite (alias --overwrite): write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
     .group = .general,
     .needs_context = true,
 }, run);

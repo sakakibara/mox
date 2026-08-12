@@ -8,7 +8,7 @@ one mox accepts, spelled the way it accepts it. What a flag *means* is
 prose, and hand-written. [usage.md](usage.md) walks through the
 day-to-day tasks.
 
-Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `sync`,
+Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `update`,
 `upgrade`, `mv`, `remove`, `uninstall`) take a single-writer lock at
 `state/mox.lock`; a second process is refused while the first runs. An
 unknown command exits 2.
@@ -156,7 +156,7 @@ live remainder is not mox's to delete).
 
 Compose all managed files and write them to their live paths
 (`--dry-run`, `--overwrite`, `--skip-scripts`, `--defaults`, or a list of
-paths to limit the run). `--force` is a retained alias of `--overwrite`.
+paths to limit the run).
 
 Before composing, apply discovers the repo's fact interview (below) and
 walks it: on a terminal it prompts for every
@@ -213,7 +213,6 @@ and their fact checks entirely.
 | --- | --- |
 | `--dry-run` | report only, write nothing |
 | `--overwrite` | overwrite drifted files |
-| `--force` | alias of --overwrite |
 | `--skip-scripts` | compose and write files, run no scripts |
 | `--defaults` | never prompt: bind each unbound fact's default, decline the rest |
 | `--color <color>` | auto|always|never |
@@ -386,12 +385,12 @@ live probe scriptably (exit 0 present, 1 absent, 2 error), unchanged.
 | `--report` | print every dimension's state (bound/declined/UNBOUND), provenance, and asking-condition instead |
 <!-- /generated -->
 
-## data get
+## data
 
 Print a data source as TOML or JSON (`--format=toml|json`); the
 private layer shadows the repo.
 
-<!-- generated: flags data get -->
+<!-- generated: flags data -->
 | Flag | Description |
 | --- | --- |
 | `--format <format>` | toml or json |
@@ -429,24 +428,42 @@ take the lock; exits 1 while problems remain.
 
 ## snapshot / rollback
 
-`snapshot list` lists apply snapshots (taken before every overwrite);
-`rollback <id>` restores live files from one. A partially owned file
+`snapshot` lists apply snapshots (taken before every overwrite);
+`rollback [<id>]` restores live files from one, defaulting to the
+newest and announcing which it took. A partially owned file
 is never whole-file restored: the snapshot's owned subtree is
 re-patched onto the current live file (the program's writes since then
 survive) through the same verification and `check` hook as apply, and
 a snapshot whose owned values were secret-masked is refused --
 re-apply the source instead.
 
-## sync
+## update
 
-Fetch and fast-forward the dotfiles repo. Any uncommitted change
-refuses the sync until you commit it; mox never commits on your
-behalf. Fast-forwards the upstream branch only: diverged local history
-is refused (merge or rebase it yourself, then re-run) rather than
-auto-merged.
+The inbound edge -- remote to source to live. Fetches, rebases onto
+the upstream, then applies, so the machine ends the run current rather
+than merely holding current sources. Any uncommitted change refuses
+the update until you commit it; mox never commits on your behalf.
 
-Pulling is all it does. Publishing is `git push`, so nothing leaves
-the machine except when you send it.
+Rebase rather than fast-forward-only, because the same repo edited on
+several machines diverges routinely and refusing that would hand back
+a manual rebase every time. Only commits absent from the upstream are
+replayed, so published history is never rewritten. A conflict stops
+mid-rebase for you to resolve and `git rebase --continue`, or abort.
+
+`--no-apply` stops after the fetch, for a `mox diff` before writing.
+That is mox's guarded fetch without the write -- a dirty tree refused,
+a missing upstream reported in mox's terms, the arriving commit count
+printed -- which `mox git -- pull --rebase` does not give you.
+
+Exit 0 clean, 1 drift left for a decision, 2 a refusal or failure, the
+same contract `apply` uses. Sending work the other way is `publish`.
+
+<!-- generated: flags update -->
+| Flag | Description |
+| --- | --- |
+| `--no-apply` | stop after the fetch; write no live files |
+| `--color <color>` | auto|always|never |
+<!-- /generated -->
 
 ## secret
 

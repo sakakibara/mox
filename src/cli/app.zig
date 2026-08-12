@@ -183,7 +183,7 @@ const mv_cmd = @import("mv.zig");
 const remove_cmd = @import("remove.zig");
 const doctor_cmd = @import("doctor.zig");
 const uninstall_cmd = @import("uninstall.zig");
-const sync_cmd = @import("sync.zig");
+const update_cmd = @import("update.zig");
 const upgrade_cmd = @import("upgrade.zig");
 
 /// Every registered top-level command.
@@ -206,7 +206,7 @@ pub const command_table = [_]Command{
     remove_cmd.command,
     doctor_cmd.command,
     uninstall_cmd.command,
-    sync_cmd.command,
+    update_cmd.command,
     upgrade_cmd.command,
     version_cmd,
 };

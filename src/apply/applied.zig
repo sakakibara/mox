@@ -2,7 +2,7 @@
 //!
 //! mox records the sha256 of every regular file it writes, so a later apply
 //! can tell "the live file still holds exactly what mox wrote" (safe to
-//! overwrite) apart from user drift (refused without --force, so live edits
+//! overwrite) apart from user drift (refused without --overwrite, so live edits
 //! are never silently destroyed). One record file per live path lives under
 //! `<state>/applied/`, named by the sha256 of the live path itself; the
 //! record holds the content hash in hex plus the live path for

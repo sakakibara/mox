@@ -506,8 +506,8 @@ test "apply: an emptied file the user edited is reported as drift, not silently 
     try std.testing.expectEqual(@as(u8, 1), r2.rc);
     try std.testing.expectEqualStrings("id one\nhand edit\n", try read(io, a, live));
 
-    // --force removes it, snapshotting the edit first.
-    const r3 = try c.run(&.{ "mox", "apply", "--force" });
+    // --overwrite removes it, snapshotting the edit first.
+    const r3 = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r3.rc);
     try std.testing.expect(!exists(io, live));
     try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "id one\nhand edit\n"));
@@ -814,9 +814,9 @@ test "apply: exact-dir sweep refuses to delete a subtree with an unsnapshottable
     try chmod(io, a, locked, 0o000);
     defer chmod(io, a, locked, 0o644) catch {};
 
-    // --force would remove a foreign dir, but the unsnapshottable entry must
+    // --overwrite would remove a foreign dir, but the unsnapshottable entry must
     // block the delete entirely: the subtree survives, and apply reports it.
-    const r = try c.run(&.{ "mox", "apply", "--force" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(exists(io, foreign_dir));
     try std.testing.expect(exists(io, locked));
@@ -907,7 +907,7 @@ test "apply: exact prune leaves an ignored live file alone" {
     try std.testing.expectEqualStrings("SECRET\n", try read(io, a, secret));
 }
 
-test "apply: --force exact sweep leaves an ignored direct-child file alone" {
+test "apply: --overwrite exact sweep leaves an ignored direct-child file alone" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -926,9 +926,9 @@ test "apply: --force exact sweep leaves an ignored direct-child file alone" {
     if (std.fs.path.dirname(secret)) |d| try Io.Dir.cwd().createDirPath(io, d);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
 
-    // --force would remove any other unmanaged file in this exact dir; the
+    // --overwrite would remove any other unmanaged file in this exact dir; the
     // ignored one must survive the actual deletion path, not just be refused.
-    const r = try c.run(&.{ "mox", "apply", "--force" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, secret));
     try std.testing.expectEqualStrings("SECRET\n", try read(io, a, secret));
@@ -956,13 +956,13 @@ test "apply: exact prune leaves an entry ignored only via a dir-only ancestor ru
     if (std.fs.path.dirname(token)) |d| try Io.Dir.cwd().createDirPath(io, d);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = token, .data = "TOKEN\n" });
 
-    const r = try c.run(&.{ "mox", "apply", "--force" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, token));
     try std.testing.expectEqualStrings("TOKEN\n", try read(io, a, token));
 }
 
-test "apply: --force exact sweep refuses a foreign subdir harboring a nested ignored file" {
+test "apply: --overwrite exact sweep refuses a foreign subdir harboring a nested ignored file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -987,9 +987,9 @@ test "apply: --force exact sweep refuses a foreign subdir harboring a nested ign
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = readme, .data = "notes\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
 
-    // --force would otherwise remove the whole foreign subtree; the buried
+    // --overwrite would otherwise remove the whole foreign subtree; the buried
     // ignored file must block the removal of the ENTIRE directory.
-    const r = try c.run(&.{ "mox", "apply", "--force" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(exists(io, oldtool_dir));
     try std.testing.expect(exists(io, readme));
@@ -999,7 +999,7 @@ test "apply: --force exact sweep refuses a foreign subdir harboring a nested ign
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ignored") != null);
 }
 
-test "apply: a non-forced foreign subdir harboring a nested ignored file names the true reason, not --force" {
+test "apply: a non-forced foreign subdir harboring a nested ignored file names the true reason, not --overwrite" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1018,15 +1018,15 @@ test "apply: a non-forced foreign subdir harboring a nested ignored file names t
     const secret = try c.homePath(".claude/oldtool/sub/secret.txt");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "SECRET\n" });
 
-    // Without --force, `--force to remove` would be a false promise: forcing
+    // Without --overwrite, `--overwrite to remove` would be a false promise: forcing
     // this exact directory still refuses (the prior test), so the non-forced
     // message must say so up front instead of sending the reader in a circle.
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(exists(io, secret));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ignored") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "even with --force") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "--force to remove") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "even with --overwrite") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "--overwrite to remove") == null);
 }
 
 test "facts set: a value with a control character is refused, facts file uncorrupted" {
@@ -2102,7 +2102,7 @@ fn expectLinkTarget(io: Io, a: std.mem.Allocator, path: []const u8, expected: []
     try std.testing.expectEqualStrings(expected, actual);
 }
 
-test "apply: a symlink-flagged source refuses a live regular file as drift, replaces with --force after snapshot" {
+test "apply: a symlink-flagged source refuses a live regular file as drift, replaces with --overwrite after snapshot" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2138,8 +2138,8 @@ test "apply: a symlink-flagged source refuses a live regular file as drift, repl
     try std.testing.expect(!isSymlink(io, live));
     try std.testing.expectEqualStrings("hand written user data\n", try read(io, a, live));
 
-    // With --force: the original is snapshotted, then replaced by the symlink.
-    const r2 = try c.run(&.{ "mox", "apply", "--force" });
+    // With --overwrite: the original is snapshotted, then replaced by the symlink.
+    const r2 = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expect(isSymlink(io, live));
     try expectLinkTarget(io, a, live, "/tmp/mox-symlink-target");
@@ -2240,7 +2240,7 @@ test "apply: .mox-exact removes a clean managed leftover and snapshots it" {
     try std.testing.expect(try snapshotHas(io, a, state, ".config/app/old.txt", "old\n"));
 }
 
-test "apply: .mox-exact refuses a foreign file without --force, removes with it" {
+test "apply: .mox-exact refuses a foreign file without --overwrite, removes with it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2259,14 +2259,14 @@ test "apply: .mox-exact refuses a foreign file without --force, removes with it"
     const foreign = try c.homePath(".config/app/foreign.txt");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = foreign, .data = "mine\n" });
 
-    // Refused without --force: nonzero rc, file remains.
+    // Refused without --overwrite: nonzero rc, file remains.
     const r1 = try c.run(&.{ "mox", "apply" });
     try std.testing.expect(r1.rc != 0);
     try std.testing.expect(exists(io, foreign));
     try std.testing.expect(std.mem.indexOf(u8, r1.err, "foreign.txt") != null);
 
-    // Removed with --force, and snapshotted.
-    const r2 = try c.run(&.{ "mox", "apply", "--force" });
+    // Removed with --overwrite, and snapshotted.
+    const r2 = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expect(!exists(io, foreign));
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
@@ -2292,7 +2292,7 @@ test "apply: .mox-exact keeps managed files including a nested managed dir" {
     const foreign = try c.homePath(".config/app/bar.txt");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = foreign, .data = "x\n" });
 
-    const r = try c.run(&.{ "mox", "apply", "--force" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!exists(io, foreign));
     try std.testing.expect(exists(io, try c.homePath(".config/app/keep.txt")));
@@ -2354,7 +2354,7 @@ test "apply: a scoped run skips the .mox-exact prune sweep entirely" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
     // A foreign file mox never wrote, inside the exact-marked directory. An
-    // unscoped apply would refuse (nonzero rc) without --force; a scoped
+    // unscoped apply would refuse (nonzero rc) without --overwrite; a scoped
     // apply naming only keep.txt must not even look at it.
     const foreign = try c.homePath(".config/app/foreign.txt");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = foreign, .data = "mine\n" });
@@ -3141,9 +3141,9 @@ test "apply generator: a leaf drifted into a symlink is pruned without dereferen
     try Io.Dir.cwd().deleteFile(io, leaf_b);
     try Io.Dir.cwd().symLink(io, secret, leaf_b, .{});
 
-    // Drop row b and re-apply with --force so the prune acts on the drifted leaf.
+    // Drop row b and re-apply with --overwrite so the prune acts on the drifted leaf.
     try writeGenFixture(io, &tmp, &.{"a"});
-    _ = try c.run(&.{ "mox", "apply", "--force" });
+    _ = try c.run(&.{ "mox", "apply", "--overwrite" });
 
     // The link's TARGET file is untouched, and its private content never reached
     // a snapshot (the link was snapshotted AS a link, never dereferenced).
@@ -3498,9 +3498,9 @@ test "apply: an unparseable MOX_SNAPSHOT_RETENTION warns and falls back to the d
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.homePath("a.conf"), .data = "damaged\n" });
 
-    // --force resolves drift by overwriting, which snapshots first and then
+    // --overwrite resolves drift by overwriting, which snapshots first and then
     // prunes -- the site where MOX_SNAPSHOT_RETENTION is read.
-    const res = try h.run(&.{ "mox", "apply", "--force" });
+    const res = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "MOX_SNAPSHOT_RETENTION=notanumber") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "using default") != null);
@@ -3574,7 +3574,7 @@ test "apply drift: an unscoped --overwrite resolves every drifted file, exit 0" 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
 }
 
-test "apply drift: non-interactive skip-and-report, --dry-run, and --force (--overwrite's retained alias)" {
+test "apply drift: non-interactive skip-and-report, --dry-run, and --overwrite (--overwrite's retained alias)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3600,9 +3600,9 @@ test "apply drift: non-interactive skip-and-report, --dry-run, and --force (--ov
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "Dry run:") != null);
 
-    // --force (the retained alias of --overwrite) still overwrites everything
+    // --overwrite (the retained alias of --overwrite) still overwrites everything
     // with no prompt.
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
 }
@@ -3803,7 +3803,7 @@ test "apply partial: a dangling symlinked live path refuses with the live untouc
     try std.testing.expect(std.mem.indexOf(u8, rs.out, "MISSING") == null);
 }
 
-test "apply partial: first-contact drift is skipped, --force reasserts the source" {
+test "apply partial: first-contact drift is skipped, --overwrite reasserts the source" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3832,7 +3832,7 @@ test "apply partial: first-contact drift is skipped, --force reasserts the sourc
     try std.testing.expect(std.mem.indexOf(u8, r1.out, "mox commit") != null);
     try std.testing.expectEqualStrings(drifted, try read(io, a, live));
 
-    const r2 = try c.run(&.{ "mox", "apply", "--force" });
+    const r2 = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expectEqualStrings(
         "theirs = 1\n\n[tui.keymap.global]\nsubmit = \"enter\"\n",
@@ -3881,7 +3881,7 @@ test "apply partial: enforced absence removes through the record and drifts past
     try std.testing.expect(std.mem.indexOf(u8, r.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "g = 99") != null);
 
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "gone") == null);
 }
 
@@ -3915,7 +3915,7 @@ test "apply partial: a path added to own is first contact, never a silent overwr
     try std.testing.expect(std.mem.indexOf(u8, r.out, "beta") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "theirs = true") != null);
 
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, after, "theirs = false") != null);
@@ -4169,7 +4169,7 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
 
     // A hand edit inside the secret-bearing owned path is drift (hash
-    // compare); --force reasserts, and the pre-write snapshot stores the
+    // compare); --overwrite reasserts, and the pre-write snapshot stores the
     // edited value MASKED, never in cleartext.
     const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), secret_value, "leaked-by-hand");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
@@ -4181,7 +4181,7 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "owned content changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "owned path owned content") == null);
 
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, "leaked-by-hand"));
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
@@ -4491,8 +4491,8 @@ test "apply partial: a CRLF live file splices and stays idempotent" {
     // A live file the program wrote with CRLF line endings throughout.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[tui]\r\nk = 0\r\n\r\n[program]\r\nstate = 42\r\n" });
 
-    // First contact with differing owned content: reassert with --force.
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    // First contact with differing owned content: reassert with --overwrite.
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const after = try read(io, a, live);
     // The program's CRLF bytes survive verbatim; the owned span is patched.
@@ -4674,7 +4674,7 @@ test "apply partial check: a rejecting hook refuses the file and reports its out
     // Update path: existing live content is left exactly as it was.
     const program_live = "[tui]\nk = 9\n\n[program]\nstate = 1\n";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
-    const r2 = try c.run(&.{ "mox", "apply", "--force" });
+    const r2 = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 2), r2.rc);
     try std.testing.expectEqualStrings(program_live, try read(io, a, live));
 }
@@ -4977,7 +4977,7 @@ test "rollback partial: a secret-masked snapshot is refused, live untouched" {
     // pre-write snapshot stores the owned values MASKED.
     const edited = try std.mem.replaceOwned(u8, a, try read(io, a, live), secret_value, "edited-by-hand");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
 
     const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
     const ids = try mox.apply.snapshot.list(a, io, snaps);
@@ -5143,7 +5143,7 @@ test "apply disown: creates, adopts the program's key, and never drifts on its w
     try std.testing.expectEqualStrings(rewritten, try read(io, a, live));
 }
 
-test "apply disown: a user-key live edit drifts and --force reasserts around the program's key" {
+test "apply disown: a user-key live edit drifts and --overwrite reasserts around the program's key" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5165,7 +5165,7 @@ test "apply disown: a user-key live edit drifts and --force reasserts around the
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "theme") != null);
 
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     try std.testing.expectEqualStrings(
         "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"test-model-4.1\"\n}\n",
@@ -5213,7 +5213,7 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
 
     // The list SHRINKS: model becomes owned content the composed source
     // does not define. Its live content is first contact -- drift, never a
-    // silent removal; --force removes it.
+    // silent removal; --overwrite removes it.
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/settings.json",
         .data = "// mox: disown survey\n{\n  \"theme\": \"dark\"\n}\n",
@@ -5224,7 +5224,7 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
     try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "model") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "model") != null);
 
-    const forced = try c.run(&.{ "mox", "apply", "--force" });
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, after, "model") == null);
@@ -5378,8 +5378,8 @@ test "apply disown: a shrunk disown list on a secret record is first contact, ne
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "survey") != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "survey") != null);
 
-    // --force removes it, keeps the still-disowned model, rotates the secret.
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--force" })).rc);
+    // --overwrite removes it, keeps the still-disowned model, rotates the secret.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
     const after = try read(io, a, live);
     try std.testing.expect(std.mem.indexOf(u8, after, "survey") == null);
     try std.testing.expect(std.mem.indexOf(u8, after, "\"model\": \"m1\"") != null);

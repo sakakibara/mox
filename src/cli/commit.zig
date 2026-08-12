@@ -3189,7 +3189,7 @@ fn processPartialFile(
     }
 
     const rec = record orelse {
-        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --force' reasserts the source)\n", .{live_path});
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --overwrite' reasserts the source)\n", .{live_path});
         return .cont;
     };
     if (rec.secret) {
@@ -3219,7 +3219,7 @@ fn processPartialFile(
                 const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
                 const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
                 if (!std.mem.eql(u8, live_sec, composed_sec)) {
-                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
+                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --overwrite' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
                 }
             }
             var last_blob: std.ArrayList(u8) = .empty;
@@ -3237,7 +3237,7 @@ fn processPartialFile(
                 const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
                 const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
                 if (!std.mem.eql(u8, live_sec, composed_sec)) {
-                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --force' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, r.segments) });
+                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --overwrite' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, r.segments) });
                 }
             }
             last_blob_text = owned_mod.recordComplement(arena, owned.format, rec, record_paths, own_paths) orelse {
