@@ -408,16 +408,38 @@ placeholders are never written live; re-apply the source instead.
 
 ## Syncing a second machine
 
-mox does not commit or publish for you. Commit in the repo and `git push` it,
-then on the other machine:
+Configuration moves along one line -- live file, source, remote -- and mox
+names each direction:
 
 ```sh
-mox update        # fetch, rebase, apply
+mox publish -m "..."   # here:  live -> source -> remote
+mox update             # there: remote -> source -> live
 ```
 
-`update` refuses to proceed with uncommitted changes, and a rebase conflict
-stops for you to resolve or abort rather than being auto-merged. It never
-publishes: work reaches the remote through `mox publish`.
+`publish` commits the repo's pending source changes and pushes them. It stages
+only mox's own directories, so a stray note or a pasted credential sitting
+beside your sources is reported rather than published; without `-m` it pushes
+what is already committed and refuses a dirty tree. Routing a *live-file* edit
+into its source is still `mox commit` -- publish never does that silently.
+
+`update` fetches, rebases onto the upstream, and applies, so the machine ends
+the run current rather than merely holding current sources. It refuses to
+proceed with uncommitted changes, and a rebase conflict stops for you to
+resolve or abort rather than being auto-merged. `--no-apply` stops after the
+fetch when you want a `mox diff` first. It never publishes.
+
+## Reaching the repo
+
+The repo lives at `$MOX_REPO` (`~/.local/share/mox/dotfiles` by default) --
+somewhere you never stand. Two ways in, from wherever you are:
+
+```sh
+cd $(mox path)              # the sole line on stdout is the path
+mox git -- log --oneline    # run git in the repo without leaving here
+```
+
+`mox git` passes git's output and exit code through untouched; put flags after
+`--` so mox does not read them as its own.
 
 ## Undoing an apply
 
