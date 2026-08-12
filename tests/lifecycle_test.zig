@@ -77,7 +77,59 @@ const FakeEditor = struct {
         try writeExecScript(io, tmp, "fake-editor.sh", body, abs);
         return .{ .command = abs };
     }
+
+    /// An editor that REWRITES the file it opens, rather than only recording
+    /// which one it was handed. `--apply` is only observable through a source
+    /// that actually changed, so proving it needs an editor that edits.
+    fn installWriter(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, root: []const u8, content: []const u8) !FakeEditor {
+        if (builtin.os.tag == .windows) {
+            const abs = try std.fs.path.join(a, &.{ root, "fake-writer.ps1" });
+            // Backtick-n is LF, and -NoNewline suppresses the CRLF Set-Content
+            // would otherwise append -- the composed bytes must not depend on
+            // which platform ran the fixture.
+            const body = try std.fmt.allocPrint(
+                a,
+                "Set-Content -LiteralPath $args[0] -NoNewline -Value \"{s}`n\"\r\n",
+                .{content},
+            );
+            try writeExecScript(io, tmp, "fake-writer.ps1", body, abs);
+            return .{ .command = try std.fmt.allocPrint(a, "powershell -NoProfile -File {s}", .{abs}) };
+        }
+        const abs = try std.fs.path.join(a, &.{ root, "fake-writer.sh" });
+        const body = try std.fmt.allocPrint(a, "#!/bin/sh\nprintf '{s}\\n' > \"$1\"\n", .{content});
+        try writeExecScript(io, tmp, "fake-writer.sh", body, abs);
+        return .{ .command = abs };
+    }
 };
+
+test "edit --apply: the edit reaches the live file; without it the live file stays stale" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const editor = try FakeEditor.installWriter(a, io, &tmp, root, "edited");
+
+    const h = try setup(a, io, &tmp, editor.command);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "original\n");
+    _ = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("original\n", try read(io, a, try h.liveOf(".zshrc")));
+
+    // Plain edit: the source moves, the live file deliberately does not.
+    const plain = try h.run(&.{ "mox", "edit", ".zshrc" });
+    try std.testing.expectEqual(@as(u8, 0), plain.rc);
+    try std.testing.expectEqualStrings("edited\n", try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expectEqualStrings("original\n", try read(io, a, try h.liveOf(".zshrc")));
+
+    // --apply carries it the rest of the way, in one command.
+    const applied = try h.run(&.{ "mox", "edit", "--apply", ".zshrc" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+    try std.testing.expectEqualStrings("edited\n", try read(io, a, try h.liveOf(".zshrc")));
+}
 
 test "diff: a drifted file shows its hunk, a clean file shows nothing" {
     const io = std.testing.io;
