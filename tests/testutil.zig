@@ -151,6 +151,13 @@ pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: Setup
     // what keeps a test's git off the operator's ~/.gitconfig (and so off
     // their commit signing and credential helpers).
     try map.put("PATH", std.testing.environ.getAlloc(a, "PATH") catch "");
+    if (@import("builtin").os.tag == .windows) {
+        // Resolving a bare `git` to `git.exe` is PATHEXT's job, and much of
+        // Windows' own process startup wants SystemRoot. A synthetic
+        // environment that omits them cannot spawn anything at all.
+        try map.put("PATHEXT", std.testing.environ.getAlloc(a, "PATHEXT") catch "");
+        try map.put("SystemRoot", std.testing.environ.getAlloc(a, "SystemRoot") catch "");
+    }
     if (opts.home_var) |v| try map.put(v, home);
     try map.put("USER", "tester");
     // Windows has no gethostname(); `machine.state.capture` reads COMPUTERNAME

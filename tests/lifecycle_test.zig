@@ -3099,6 +3099,10 @@ fn gitEnv(h: Harness) !std.process.Environ.Map {
     try m.put("GIT_CONFIG_GLOBAL", "/dev/null");
     try m.put("GIT_CONFIG_SYSTEM", "/dev/null");
     try m.put("GIT_TERMINAL_PROMPT", "0");
+    if (@import("builtin").os.tag == .windows) {
+        try m.put("PATHEXT", std.testing.environ.getAlloc(h.a, "PATHEXT") catch "");
+        try m.put("SystemRoot", std.testing.environ.getAlloc(h.a, "SystemRoot") catch "");
+    }
     return m;
 }
 
@@ -3140,6 +3144,10 @@ fn gitRepo(h: Harness, tmp: *std.testing.TmpDir) ![]const u8 {
     try gitOk(h, h.root, &.{ "git", "init", "-q", "-b", "main", h.repo });
     try gitOk(h, h.repo, &.{ "git", "config", "user.email", "mox-test@example.invalid" });
     try gitOk(h, h.repo, &.{ "git", "config", "user.name", "mox test" });
+    // Git for Windows defaults core.autocrlf=true, which rewrites LF to CRLF
+    // on checkout -- the fixture would then be asserting git's platform
+    // default rather than what mox composed.
+    try gitOk(h, h.repo, &.{ "git", "config", "core.autocrlf", "false" });
     try gitOk(h, h.repo, &.{ "git", "remote", "add", "origin", remote });
     try writeRepo(h.io, tmp, "repo/src/.zshrc", "export A=1\n");
     try gitOk(h, h.repo, &.{ "git", "add", "--", "src/.zshrc" });
@@ -3154,6 +3162,7 @@ fn otherClone(h: Harness, remote: []const u8, name: []const u8) ![]const u8 {
     try gitOk(h, h.root, &.{ "git", "clone", "-q", remote, dir });
     try gitOk(h, dir, &.{ "git", "config", "user.email", "mox-test@example.invalid" });
     try gitOk(h, dir, &.{ "git", "config", "user.name", "mox test" });
+    try gitOk(h, dir, &.{ "git", "config", "core.autocrlf", "false" });
     return dir;
 }
 
