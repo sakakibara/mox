@@ -193,10 +193,18 @@ fn runBackend(arena: std.mem.Allocator, io: std.Io, env: Env, argv: []const []co
     else
         .none;
 
+    // Spawned under the environment mox reads through, not the raw process
+    // one. In production they are the same value, so a manager still finds its
+    // agent socket, session token, and PATH. They differ when a caller hands
+    // mox an environment -- and a backend resolving a SECRET under a different
+    // environment than the one mox was told to use is the last place that
+    // should silently disagree.
+    var env_map = env.createMap(arena) catch return error.OutOfMemory;
     const result = std.process.run(arena, io, .{
         .argv = argv,
         .timeout = timeout,
         .stdout_limit = std.Io.Limit.limited(cap),
+        .environ_map = &env_map,
     }) catch |e| switch (e) {
         error.FileNotFound => return error.BackendUnavailable,
         error.OutOfMemory => return error.OutOfMemory,
