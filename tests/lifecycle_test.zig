@@ -3081,3 +3081,256 @@ test "doctor: an attributes entry no managed target derives is an advisory" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "orphaned-attribute .ssh/config") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "advisory item(s)") != null);
 }
+
+// Repo-reach and remote-edge commands. `mox path` and `mox git` are pure
+// reach; `publish` and `update` drive a real git remote, so those build a
+// bare repo and a clone inside the harness root -- nothing here ever touches
+// a network remote.
+
+/// Environment for the fixture's own git calls: no ambient user config, no
+/// terminal prompt, and a ceiling so git cannot walk up into mox's own
+/// checkout (the harness root lives inside it).
+fn gitEnv(h: Harness) !std.process.Environ.Map {
+    var m = std.process.Environ.Map.init(h.a);
+    try m.put("PATH", std.testing.environ.getAlloc(h.a, "PATH") catch "");
+    try m.put("HOME", h.root);
+    try m.put("GIT_CEILING_DIRECTORIES", h.root);
+    try m.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    try m.put("GIT_CONFIG_SYSTEM", "/dev/null");
+    try m.put("GIT_TERMINAL_PROMPT", "0");
+    return m;
+}
+
+fn git(h: Harness, dir: []const u8, argv: []const []const u8) !std.process.RunResult {
+    var env = try gitEnv(h);
+    return std.process.run(h.a, h.io, .{ .argv = argv, .cwd = .{ .path = dir }, .environ_map = &env });
+}
+
+fn gitOk(h: Harness, dir: []const u8, argv: []const []const u8) !void {
+    const r = try git(h, dir, argv);
+    switch (r.term) {
+        .exited => |c| if (c != 0) {
+            std.debug.print("git {s} failed in {s}: {s}\n", .{ argv[1], dir, r.stderr });
+            return error.GitFailed;
+        },
+        else => return error.GitFailed,
+    }
+}
+
+fn requireGit(h: Harness) !void {
+    _ = std.process.run(h.a, h.io, .{ .argv = &.{ "git", "--version" } }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
+/// Make `h.repo` a git clone of a bare remote under the harness root, with a
+/// committed `src/` so publish and update have history to move.
+///
+/// Identity and signing are set in the repo's LOCAL config, not just in the
+/// fixture's environment: mox runs git with the real process environment (so a
+/// user's credentials and signing work), which means an ambient
+/// `commit.gpgsign = true` would have mox's own commit block on a signing
+/// agent waiting for a human. Local config is what mox's git reads.
+fn gitRepo(h: Harness, tmp: *std.testing.TmpDir) ![]const u8 {
+    try requireGit(h);
+    const remote = try std.fs.path.join(h.a, &.{ h.root, "remote.git" });
+    try gitOk(h, h.root, &.{ "git", "init", "-q", "--bare", "-b", "main", remote });
+    try gitOk(h, h.root, &.{ "git", "init", "-q", "-b", "main", h.repo });
+    try gitOk(h, h.repo, &.{ "git", "config", "user.email", "mox-test@example.invalid" });
+    try gitOk(h, h.repo, &.{ "git", "config", "user.name", "mox test" });
+    try gitOk(h, h.repo, &.{ "git", "config", "commit.gpgsign", "false" });
+    try gitOk(h, h.repo, &.{ "git", "config", "tag.gpgsign", "false" });
+    try gitOk(h, h.repo, &.{ "git", "remote", "add", "origin", remote });
+    try writeRepo(h.io, tmp, "repo/src/.zshrc", "export A=1\n");
+    try gitOk(h, h.repo, &.{ "git", "add", "--", "src/.zshrc" });
+    try gitOk(h, h.repo, &.{ "git", "commit", "-qm", "init" });
+    try gitOk(h, h.repo, &.{ "git", "push", "-q", "-u", "origin", "main" });
+    return remote;
+}
+
+/// A clone of `remote` standing in for a second machine, configured the same
+/// way so its commits do not block on a signing agent either.
+fn otherClone(h: Harness, remote: []const u8, name: []const u8) ![]const u8 {
+    const dir = try std.fs.path.join(h.a, &.{ h.root, name });
+    try gitOk(h, h.root, &.{ "git", "clone", "-q", remote, dir });
+    try gitOk(h, dir, &.{ "git", "config", "user.email", "mox-test@example.invalid" });
+    try gitOk(h, dir, &.{ "git", "config", "user.name", "mox test" });
+    try gitOk(h, dir, &.{ "git", "config", "commit.gpgsign", "false" });
+    return dir;
+}
+
+fn headSubject(h: Harness, dir: []const u8) ![]const u8 {
+    const r = try git(h, dir, &.{ "git", "log", "-1", "--pretty=%s" });
+    return std.mem.trim(u8, r.stdout, " \t\r\n");
+}
+
+test "path: stdout is the repo dir alone, so cd $(mox path) works" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+
+    const r = try h.run(&.{ "mox", "path" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Exactly the path and a newline: no `~` contraction, no second line,
+    // nothing command substitution would carry into a cd.
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{h.repo}), r.out);
+}
+
+test "git: runs in the repo, not the caller's directory, and passes the exit code through" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    _ = try gitRepo(h, &tmp);
+
+    // `git config` writes nothing on success, which matters here: the
+    // passthrough inherits stdio, and this suite runs mox in-process, so a
+    // subcommand that printed would write into the test runner's own stream
+    // rather than anywhere a test can read. What is asserted is the part that
+    // is mox's: git ran in the repo though the harness cwd is HOME.
+    const set = try h.run(&.{ "mox", "git", "--", "config", "--local", "mox.canary", "reached" });
+    try std.testing.expectEqual(@as(u8, 0), set.rc);
+    const cfg = try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".git", "config" }));
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "reached") != null);
+
+    // git's own failure code reaches the caller rather than being flattened:
+    // --get on a missing key exits 1 and prints nothing.
+    const miss = try h.run(&.{ "mox", "git", "--", "config", "--get", "mox.absent" });
+    try std.testing.expectEqual(@as(u8, 1), miss.rc);
+
+    const empty = try h.run(&.{ "mox", "git" });
+    try std.testing.expectEqual(@as(u8, 2), empty.rc);
+    try std.testing.expect(std.mem.indexOf(u8, empty.err, "usage") != null);
+}
+
+test "publish: commits only mox's own tree, never a stray file beside it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+
+    // A source change, and beside it exactly what a blanket `git add -A`
+    // would have published: a pasted credential and a scratch note.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=2\n");
+    try writeRepo(io, &tmp, "repo/.env", "AWS_SECRET_ACCESS_KEY=hunter2\n");
+    try writeRepo(io, &tmp, "repo/notes.md", "todo\n");
+
+    const r = try h.run(&.{ "mox", "publish", "-m", "bump A" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "committed src/.zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ".env") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "notes.md") != null);
+
+    // The commit carries the source and nothing else.
+    const show = try git(h, h.repo, &.{ "git", "show", "--stat", "--format=", "HEAD" });
+    try std.testing.expect(std.mem.indexOf(u8, show.stdout, "src/.zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, show.stdout, ".env") == null);
+    try std.testing.expect(std.mem.indexOf(u8, show.stdout, "notes.md") == null);
+
+    // Both stray files are still untracked, so nothing reached the remote.
+    const status = try git(h, h.repo, &.{ "git", "status", "--porcelain" });
+    try std.testing.expect(std.mem.indexOf(u8, status.stdout, ".env") != null);
+    try std.testing.expectEqualStrings("bump A", try headSubject(h, remote));
+}
+
+test "publish: a dirty tree without -m is refused rather than half-published" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+    const before = try headSubject(h, remote);
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=3\n");
+    const r = try h.run(&.{ "mox", "publish" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "pass -m") != null);
+    try std.testing.expectEqualStrings(before, try headSubject(h, remote));
+}
+
+test "publish: nothing outgoing says so instead of reporting a push that sent nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    _ = try gitRepo(h, &tmp);
+
+    const r = try h.run(&.{ "mox", "publish" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Nothing to publish") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Published") == null);
+}
+
+test "update: fetches, rebases, and applies in one run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+
+    _ = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.liveOf(".zshrc")));
+
+    // A second machine publishes a change, reaching the shared remote.
+    const other = try otherClone(h, remote, "other");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ other, "src", ".zshrc" }),
+        .data = "export A=9\n",
+    });
+    try gitOk(h, other, &.{ "git", "commit", "-qam", "from the other machine" });
+    try gitOk(h, other, &.{ "git", "push", "-q" });
+
+    // One command carries it all the way to the live file.
+    const r = try h.run(&.{ "mox", "update" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Pulled 1") != null);
+    try std.testing.expectEqualStrings("export A=9\n", try read(io, a, try h.liveOf(".zshrc")));
+}
+
+test "update --no-apply: the fetch lands, the live file does not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+
+    _ = try h.run(&.{ "mox", "apply" });
+
+    const other = try otherClone(h, remote, "other");
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ other, "src", ".zshrc" }),
+        .data = "export A=42\n",
+    });
+    try gitOk(h, other, &.{ "git", "commit", "-qam", "second" });
+    try gitOk(h, other, &.{ "git", "push", "-q" });
+
+    const r = try h.run(&.{ "mox", "update", "--no-apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // The source moved; the live file is deliberately left for a mox diff.
+    try std.testing.expectEqualStrings("export A=42\n", try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.liveOf(".zshrc")));
+}
