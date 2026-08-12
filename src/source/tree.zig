@@ -149,7 +149,7 @@ pub const ManagedFile = struct {
     repo_dir: []const u8 = "",
     /// Root of the private layer, stamped by `private.layer.merge` on every
     /// merged file. Non-empty means repo-relative loop data sources are
-    /// looked up here first (private shadows repo), matching `mox data get`.
+    /// looked up here first (private shadows repo), matching `mox data`.
     /// Empty when there is no private layer.
     private_dir: []const u8 = "",
     /// Unix file mode to apply to the materialized live file. The native

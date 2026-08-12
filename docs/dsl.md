@@ -238,7 +238,7 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   `tool_path.<name>`, a custom fact, or a `data/facts.toml`-derived one.
 - `<env.NAME>` - a captured environment variable value.
 - `<data.FILE.KEY>` - a committed shared scalar from `data/FILE.toml` (the
-  private layer shadows the repo, exactly as `mox data get` resolves it).
+  private layer shadows the repo, exactly as `mox data` resolves it).
   `KEY` is a top-level key; `<data.FILE.TABLE.KEY>` reads a scalar one table
   deep. Only these two depths exist. A string renders as its exact bytes, an
   integer/bool as its TOML literal. A missing file or key is a compose error

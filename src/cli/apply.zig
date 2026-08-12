@@ -140,7 +140,7 @@ fn applyPass(
 
     // Composing from a work tree stopped mid-merge would write its conflict
     // markers into live files and run setup scripts from a half-applied
-    // revision. Refuse whatever put the repo there -- mox sync, a hand-run
+    // revision. Refuse whatever put the repo there -- mox update, a hand-run
     // git pull, a rebase left open in another terminal.
     if (try mox.source.vcs.inProgress(ctx.alloc, ctx.io, context.paths.repo_dir)) |operation| {
         try ctx.err.print(

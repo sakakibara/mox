@@ -87,7 +87,7 @@ pub fn isManagerSecretUri(uri: []const u8) bool {
 
 /// Context threaded through capture expansion. Bundles the machine facts and
 /// the roots needed to resolve `<data.FILE.KEY>` captures (the private layer
-/// shadows the repo, matching `mox data get`), plus the optional secret
+/// shadows the repo, matching `mox data`), plus the optional secret
 /// resolver for `<secret:URI>` captures and an optional diagnostic sink that
 /// records which capture failed when a resolution error fires.
 pub const Ctx = struct {

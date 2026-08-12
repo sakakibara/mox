@@ -20,7 +20,7 @@ pub fn loadFile(arena: std.mem.Allocator, io: Io, abs_path: []const u8) LoadErro
 pub const ScalarError = error{ NonScalarData, DataFileError } || std.mem.Allocator.Error;
 
 /// Look up a scalar in `data/<file>.toml`, the private layer shadowing the repo
-/// exactly as `mox data get` does. `table` (when non-null) then `key` navigate
+/// exactly as `mox data` does. `table` (when non-null) then `key` navigate
 /// one level deep. Returns the rendered scalar text (arena-owned), or null when
 /// the file, table, or key is absent (a `| default` may then rescue it). A
 /// present-but-non-scalar value (array/table) is `error.NonScalarData`; a read
