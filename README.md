@@ -171,6 +171,8 @@ Full behavioral contracts for every command are in
 | `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state); `--fix` performs the safe rebuilds |
 | `snapshot` / `rollback [<id>]` | List pre-overwrite snapshots; restore live files from one, newest by default |
 | `update` | Fetch, rebase, and apply -- the inbound edge; refuses uncommitted changes and stops on a rebase conflict |
+| `publish [-m <msg>]` | Commit the source tree and push -- the outbound edge; stages only mox's own directories |
+| `path` / `git -- <args>` | Print the repo dir (`cd $(mox path)`); run git in it from anywhere |
 | `secret <uri>` | Resolve a secret URI to stdout |
 | `trigger ...` | Staleness primitives for setup scripts (`hash`, `seen-version`, `every`) |
 | `upgrade` / `uninstall` | Self-update, `SHA256SUMS`-verified / remove machine-local state, preserving your repo and recoverable trash |

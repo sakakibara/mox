@@ -1,16 +1,20 @@
 //! `mox edit <name>`: open the source file behind a managed path in `$EDITOR`.
 //!
+//! `--apply` writes the edited file live once the editor exits, scoped to that
+//! one file: the inner loop is edit-then-apply, and it cost two commands.
+//!
 //! `<name>` is a live path: absolute, `~`-relative, or relative to the current
 //! directory. With no `--axis`, the base source file is edited; `--axis
 //! <tuple>` selects the matching overlay (Cat A/C) or region fragment (Cat B)
-//! instead. Read-only wrt mox state: takes no lock. When the requested source
-//! does not exist, the candidate paths are reported.
+//! instead. When the requested source does not exist, the candidate paths
+//! are reported. Takes no lock of its own; `--apply` takes apply's.
 
 const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 const env_mod = @import("env");
+const apply_cmd = @import("apply.zig");
 
 const Io = std.Io;
 const Env = env_mod.Env;
@@ -123,6 +127,7 @@ pub fn tuplesEqual(a: AxisTuple, b: AxisTuple) bool {
 const Spec = struct {
     name: cli.Pos([]const u8, .{ .help = "managed live path (absolute, ~-relative, or relative to the current directory)" }),
     axis: cli.Opt([]const u8, .{ .value_name = "tuple", .help = "edit the overlay/fragment for this axis tuple instead" }),
+    apply: cli.Flag(.{ .help = "apply the edited file after the editor exits" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
@@ -181,7 +186,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         break :blk file.source_base_abs;
     };
 
-    return editFile(ctx, target_path);
+    const rc = try editFile(ctx, target_path);
+    if (rc != 0 or !a.apply) return rc;
+
+    // Scoped to the file just edited: the inner loop is one file at a time,
+    // and a whole-tree apply would sweep in unrelated pending work the user
+    // did not open an editor over. `--apply` is the same word `init` and
+    // `update` use, meaning the same thing -- and make it take effect.
+    return apply_cmd.applyImpl(ctx, false, false, false, false, .auto, &.{live_path});
 }
 
 /// Absolute path of the overlay (Cat A/C) or region fragment (Cat B) on `file`
@@ -238,7 +250,8 @@ fn editFile(ctx: *app.Ctx, path: []const u8) !u8 {
 pub const command = app.command(Spec, .{
     .name = "edit",
     .summary = "Open the source behind a managed path in $EDITOR",
-    .usage = "mox edit <name> [--axis <tuple>]",
+    .usage = "mox edit <name> [--axis <tuple>] [--apply]",
+    .details = "Opens the source behind a live path. --apply writes that one file live after the editor exits.",
     .group = .general,
     .needs_context = true,
 }, run);

@@ -9,6 +9,7 @@ prose, and hand-written. [usage.md](usage.md) walks through the
 day-to-day tasks.
 
 Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `update`,
+`publish`,
 `upgrade`, `mv`, `remove`, `uninstall`) take a single-writer lock at
 `state/mox.lock`; a second process is refused while the first runs. An
 unknown command exits 2.
@@ -302,6 +303,7 @@ candidate path when the source does not exist.
 | Flag | Description |
 | --- | --- |
 | `--axis <tuple>` | edit the overlay/fragment for this axis tuple instead |
+| `--apply` | apply the edited file after the editor exits |
 <!-- /generated -->
 
 ## status
@@ -464,6 +466,45 @@ same contract `apply` uses. Sending work the other way is `publish`.
 | `--no-apply` | stop after the fetch; write no live files |
 | `--color <color>` | auto|always|never |
 <!-- /generated -->
+
+## publish
+
+The outbound edge -- live to source to remote. With `-m <message>` it
+commits the repo's pending source changes and pushes them; without it,
+it pushes what is already committed and refuses a dirty tree rather
+than inventing a message.
+
+Staging is by explicit path, never a blanket `git add -A`: only the
+directories mox owns (`src/`, `data/`, `scripts/`, `.mox/`, and
+`.moxignore`) are publish's to commit. A dotfiles repo is exactly where
+a stray note or a pasted credential ends up, and anything dirty outside
+those paths is reported and left for you to stage deliberately with
+`mox git -- add`.
+
+Refuses a repo part-way through a merge or rebase, as `apply` and
+`commit` do. Bringing work the other way is `update`.
+
+<!-- generated: flags publish -->
+| Flag | Description |
+| --- | --- |
+| `--message, -m <message>` | commit the source tree with this message before pushing |
+<!-- /generated -->
+
+## path
+
+Print the repo directory. The sole line on stdout is the path -- no
+`~` contraction, no trailing prose -- so `cd $(mox path)` works.
+
+## git
+
+Run git in the repo from wherever you are, passing its stdout, stderr,
+and exit code through untouched. Put flags after `--` so mox does not
+read them: `mox git -- log --oneline`.
+
+The repo lives under a data directory nobody stands in, so this and
+`path` are reach rather than sugar. Everything git does stays git's
+vocabulary; the two edges mox names (`update`, `publish`) earn their
+own commands by doing more than git, not by wrapping a verb.
 
 ## secret
 

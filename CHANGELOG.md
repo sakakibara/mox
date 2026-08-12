@@ -16,6 +16,25 @@ All notable changes to mox are documented here. The format follows
   the drift that actually misleads. The prose stays hand-written: a
   declaration can say a flag exists, never what it means.
 
+- `mox publish` sends this machine's work the other way: with `-m <message>` it
+  commits the repo's pending source changes and pushes them, without it pushes
+  what is already committed. It stages by explicit path -- only `src/`,
+  `data/`, `scripts/`, `.mox/`, and `.moxignore` -- never a blanket `git add
+  -A`, because a dotfiles repo is exactly where a stray note or a pasted
+  credential ends up; anything dirty outside those paths is reported and left
+  to stage deliberately. It is a verb rather than `update --push` because
+  outbound never defaults on: a wrong apply is snapshotted and reversible, a
+  push cannot be recalled.
+- `mox path` prints the repo directory as the sole line on stdout, so
+  `cd $(mox path)` works, and `mox git -- <args>` runs git in the repo from
+  anywhere with its output and exit code passed through. The repo lives under
+  a data directory nobody stands in, and until now mox offered no way to reach
+  it.
+- `mox edit --apply` writes the edited file live once the editor exits, scoped
+  to that one file. The inner loop is edit-then-apply and it cost two
+  commands. `--apply` now means the same thing on `init`, `update`, and
+  `edit`: and make it take effect.
+
 ### Fixed
 - `apply` and `commit` refuse a repo left part-way through a merge, rebase,
   cherry-pick, or revert, rather than composing its conflict markers into live

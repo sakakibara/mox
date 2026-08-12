@@ -184,6 +184,9 @@ const remove_cmd = @import("remove.zig");
 const doctor_cmd = @import("doctor.zig");
 const uninstall_cmd = @import("uninstall.zig");
 const update_cmd = @import("update.zig");
+const publish_cmd = @import("publish.zig");
+const path_cmd = @import("path.zig");
+const git_cmd = @import("git.zig");
 const upgrade_cmd = @import("upgrade.zig");
 
 /// Every registered top-level command.
@@ -207,6 +210,9 @@ pub const command_table = [_]Command{
     doctor_cmd.command,
     uninstall_cmd.command,
     update_cmd.command,
+    publish_cmd.command,
+    path_cmd.command,
+    git_cmd.command,
     upgrade_cmd.command,
     version_cmd,
 };
