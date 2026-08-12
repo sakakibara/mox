@@ -425,6 +425,16 @@ pub fn commitImpl(
     const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
     defer lk.release();
 
+    // Routing a live edit back into a source that is itself mid-merge would
+    // write over half-resolved content, so the same refusal apply makes.
+    if (try mox.source.vcs.inProgress(ctx.alloc, ctx.io, context.paths.repo_dir)) |operation| {
+        try ctx.err.print(
+            "mox commit: {s} is part-way through a {s}; finish or abort it first (its sources are half-resolved)\n",
+            .{ context.paths.repo_dir, operation },
+        );
+        return 1;
+    }
+
     // A fact write in the write phase re-captures this, so a routed file's
     // recompose (later in this same run) sees the new value.
     var m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);

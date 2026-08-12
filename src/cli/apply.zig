@@ -141,6 +141,18 @@ fn applyPass(
     const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 2;
     defer lk.release();
 
+    // Composing from a work tree stopped mid-merge would write its conflict
+    // markers into live files and run setup scripts from a half-applied
+    // revision. Refuse whatever put the repo there -- mox sync, a hand-run
+    // git pull, a rebase left open in another terminal.
+    if (try mox.source.vcs.inProgress(ctx.alloc, ctx.io, context.paths.repo_dir)) |operation| {
+        try ctx.err.print(
+            "mox apply: {s} is part-way through a {s}; finish or abort it first (a conflicted source composes its markers into live files)\n",
+            .{ context.paths.repo_dir, operation },
+        );
+        return 2;
+    }
+
     // Stale check-hook staging holds candidate cleartext (a crash skipped
     // the deferred cleanup); sweep before anything composes so a leftover
     // never survives past this run.

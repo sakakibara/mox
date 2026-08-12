@@ -16,6 +16,15 @@ All notable changes to mox are documented here. The format follows
   the drift that actually misleads. The prose stays hand-written: a
   declaration can say a flag exists, never what it means.
 
+### Fixed
+- `apply` and `commit` refuse a repo left part-way through a merge, rebase,
+  cherry-pick, or revert, rather than composing its conflict markers into live
+  files and running setup scripts from a half-applied revision. The refusal is
+  a marker-file lookup in `.git`, so it needs no `git` on PATH, costs no
+  subprocess, and reads a repo that is not a git checkout as idle. It holds
+  however the repo got there -- previously only `mox sync` refused, which the
+  `git pull` the docs offered as its equivalent walked straight past.
+
 ### Changed
 - **Breaking:** `mox sync` no longer pushes. It fetches and fast-forwards, and
   that is all; `--no-pull` and `--no-push` are gone with the half they gated.
