@@ -16,6 +16,18 @@ All notable changes to mox are documented here. The format follows
   the drift that actually misleads. The prose stays hand-written: a
   declaration can say a flag exists, never what it means.
 
+### Changed
+- **Breaking:** `mox sync` no longer pushes. It fetches and fast-forwards, and
+  that is all; `--no-pull` and `--no-push` are gone with the half they gated.
+  A command named for bringing a machine up to date should not publish as a
+  side effect: the repo it pushed to may be public, suppressing it took a flag
+  the user had to remember every time, and forgetting that flag discloses
+  work, which no local undo reaches. Publishing is `git push`, which mox has
+  no reason to wrap. The pull half earns its wrapper -- it refuses a dirty
+  tree, refuses diverged history instead of fabricating a merge, and reports
+  how many commits it moved -- while the push half reported `Pushed` even when
+  the push sent nothing, since it checked only that git exited 0.
+
 ## [0.9.0] - 2026-07-31
 
 ### Added

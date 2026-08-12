@@ -409,15 +409,17 @@ placeholders are never written live; re-apply the source instead.
 
 ## Syncing a second machine
 
-mox does not commit for you. Commit in the repo, then:
+mox does not commit or publish for you. Commit in the repo and `git push` it,
+then on the other machine:
 
 ```sh
-mox sync          # fetch, fast-forward, push (--no-pull / --no-push to skip a half)
+mox sync          # fetch and fast-forward
+mox apply
 ```
 
-On the other machine, `mox sync` (or `git pull`) then `mox apply`. `sync` refuses
-to proceed with uncommitted changes or diverged history -- resolve those
-yourself, so nothing is auto-merged or force-pushed.
+`sync` refuses to proceed with uncommitted changes or diverged history --
+resolve those yourself, so nothing is auto-merged. It never pushes, so a repo
+only reaches the remote when you send it there.
 
 ## Undoing an apply
 

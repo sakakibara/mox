@@ -170,7 +170,7 @@ Full behavioral contracts for every command are in
 | `data get <name>` | Print a data source as TOML or JSON, private layer applied |
 | `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state); `--fix` performs the safe rebuilds |
 | `snapshot list` / `rollback <id>` | List pre-overwrite snapshots; restore live files from one |
-| `sync` | Fetch, fast-forward, and push the repo; refuses uncommitted or diverged history rather than auto-merging |
+| `sync` | Fetch and fast-forward the repo; never pushes, and refuses uncommitted or diverged history rather than auto-merging |
 | `secret <uri>` | Resolve a secret URI to stdout |
 | `trigger ...` | Staleness primitives for setup scripts (`hash`, `seen-version`, `every`) |
 | `upgrade` / `uninstall` | Self-update, `SHA256SUMS`-verified / remove machine-local state, preserving your repo and recoverable trash |

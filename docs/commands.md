@@ -439,19 +439,14 @@ re-apply the source instead.
 
 ## sync
 
-Fetch, fast-forward, and push the dotfiles repo (`--no-pull` /
-`--no-push` skip a half). Any uncommitted change refuses the sync
-until you commit it; mox never commits on your behalf. Fast-forwards
-the upstream branch only: diverged local history is refused (merge or
-rebase it yourself, then re-run) rather than auto-merged and pushed,
-and a rejected push asks you to sync again.
+Fetch and fast-forward the dotfiles repo. Any uncommitted change
+refuses the sync until you commit it; mox never commits on your
+behalf. Fast-forwards the upstream branch only: diverged local history
+is refused (merge or rebase it yourself, then re-run) rather than
+auto-merged.
 
-<!-- generated: flags sync -->
-| Flag | Description |
-| --- | --- |
-| `--no-pull` | skip the pull half |
-| `--no-push` | skip the push half |
-<!-- /generated -->
+Pulling is all it does. Publishing is `git push`, so nothing leaves
+the machine except when you send it.
 
 ## secret
 

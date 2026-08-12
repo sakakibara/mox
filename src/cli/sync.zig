@@ -1,8 +1,10 @@
-//! `mox sync` - fetch, merge, and push the dotfiles repo under the mox lock.
+//! `mox sync` - fetch and fast-forward the dotfiles repo under the mox lock.
 //!
-//! Git is reached only through the `Git` seam (one `git` invocation rooted in
-//! the repo dir), so the decision logic is pure and unit-tested while the
-//! end-to-end fetch/merge/push cycle is exercised against a local bare remote.
+//! Pulling only: publishing is `git push`, which mox has no reason to wrap and
+//! must never do on its own initiative. Git is reached only through the `Git`
+//! seam (one `git` invocation rooted in the repo dir), so the decision logic is
+//! pure and unit-tested while the end-to-end fetch/merge cycle is exercised
+//! against a local bare remote.
 
 const std = @import("std");
 const EnvironMap = std.process.Environ.Map;
@@ -47,11 +49,6 @@ pub const Git = struct {
     }
 };
 
-pub const Options = struct {
-    pull: bool = true,
-    push: bool = true,
-};
-
 pub const DirtyKind = enum { clean, dirty };
 
 pub const Status = struct {
@@ -85,10 +82,10 @@ fn statusPath(line: []const u8) []const u8 {
     return rest;
 }
 
-/// Fetch/merge/push the repo behind `git`, honoring `opts`. Returns the process
-/// exit code (0 success, 1 refusal or failure). It takes no lock and no Context
-/// so it is drivable against any repo, e.g. a clone in a test tmp dir.
-pub fn syncRepo(git: Git, opts: Options, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
+/// Fetch and fast-forward the repo behind `git`. Returns the process exit code
+/// (0 success, 1 refusal or failure). It takes no lock and no Context so it is
+/// drivable against any repo, e.g. a clone in a test tmp dir.
+pub fn syncRepo(git: Git, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
     const wt = try git.run(&.{ "git", "rev-parse", "--is-inside-work-tree" });
     if (!wt.ok or !std.mem.eql(u8, std.mem.trim(u8, wt.stdout, " \t\r\n"), "true")) {
         try stderr.print("mox sync: {s} is not a git work tree\n", .{git.dir});
@@ -110,92 +107,70 @@ pub fn syncRepo(git: Git, opts: Options, stdout: *Io.Writer, stderr: *Io.Writer)
         .clean => {},
     }
 
-    if (opts.pull) {
-        const branch_res = try git.run(&.{ "git", "rev-parse", "--abbrev-ref", "HEAD" });
-        const branch = std.mem.trim(u8, branch_res.stdout, " \t\r\n");
-        const up = try git.run(&.{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" });
-        if (!up.ok) {
-            try stderr.print(
-                "mox sync: branch '{s}' has no upstream; set one with 'git branch --set-upstream-to'\n",
-                .{branch},
-            );
-            return 1;
-        }
-        const upstream = std.mem.trim(u8, up.stdout, " \t\r\n");
+    const branch_res = try git.run(&.{ "git", "rev-parse", "--abbrev-ref", "HEAD" });
+    const branch = std.mem.trim(u8, branch_res.stdout, " \t\r\n");
+    const up = try git.run(&.{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" });
+    if (!up.ok) {
+        try stderr.print(
+            "mox sync: branch '{s}' has no upstream; set one with 'git branch --set-upstream-to'\n",
+            .{branch},
+        );
+        return 1;
+    }
+    const upstream = std.mem.trim(u8, up.stdout, " \t\r\n");
 
-        const before = try git.run(&.{ "git", "rev-parse", "HEAD" });
-        const before_head = std.mem.trim(u8, before.stdout, " \t\r\n");
+    const before = try git.run(&.{ "git", "rev-parse", "HEAD" });
+    const before_head = std.mem.trim(u8, before.stdout, " \t\r\n");
 
-        const fetch = try git.run(&.{ "git", "fetch" });
-        if (!fetch.ok) {
-            try stderr.print("mox sync: git fetch failed: {s}", .{fetch.stderr});
-            return 1;
-        }
-
-        // --ff-only: fast-forward or fail. Never fabricate a merge commit for
-        // diverged local history and (with push on) push it unreviewed -- that
-        // is the user's call to merge or rebase.
-        const merge = try git.run(&.{ "git", "merge", "--ff-only", upstream });
-        if (!merge.ok) {
-            const conflicts = try git.run(&.{ "git", "diff", "--name-only", "--diff-filter=U" });
-            try stderr.writeAll("mox sync: cannot fast-forward (local history diverged or conflicts); merge or rebase manually, then re-run mox sync.\n");
-            var cit = std.mem.splitScalar(u8, conflicts.stdout, '\n');
-            while (cit.next()) |c| {
-                const cp = std.mem.trim(u8, c, " \t\r\n");
-                if (cp.len > 0) try stderr.print("  conflict: {s}\n", .{cp});
-            }
-            return 1;
-        }
-
-        const after = try git.run(&.{ "git", "rev-parse", "HEAD" });
-        const after_head = std.mem.trim(u8, after.stdout, " \t\r\n");
-        if (std.mem.eql(u8, before_head, after_head)) {
-            try stdout.writeAll("Already up to date\n");
-        } else {
-            const range = try std.fmt.allocPrint(git.gpa, "{s}..{s}", .{ before_head, after_head });
-            const count = try git.run(&.{ "git", "rev-list", "--count", range });
-            try stdout.print("Pulled {s} commit(s)\n", .{std.mem.trim(u8, count.stdout, " \t\r\n")});
-        }
+    const fetch = try git.run(&.{ "git", "fetch" });
+    if (!fetch.ok) {
+        try stderr.print("mox sync: git fetch failed: {s}", .{fetch.stderr});
+        return 1;
     }
 
-    if (opts.push) {
-        const push = try git.run(&.{ "git", "push" });
-        if (!push.ok) {
-            try stderr.print(
-                "mox sync: push rejected; run mox sync again to pull first:\n{s}",
-                .{push.stderr},
-            );
-            return 1;
+    // --ff-only: fast-forward or fail. Never fabricate a merge commit for
+    // diverged local history -- that is the user's call to merge or rebase.
+    const merge = try git.run(&.{ "git", "merge", "--ff-only", upstream });
+    if (!merge.ok) {
+        const conflicts = try git.run(&.{ "git", "diff", "--name-only", "--diff-filter=U" });
+        try stderr.writeAll("mox sync: cannot fast-forward (local history diverged or conflicts); merge or rebase manually, then re-run mox sync.\n");
+        var cit = std.mem.splitScalar(u8, conflicts.stdout, '\n');
+        while (cit.next()) |c| {
+            const cp = std.mem.trim(u8, c, " \t\r\n");
+            if (cp.len > 0) try stderr.print("  conflict: {s}\n", .{cp});
         }
-        try stdout.writeAll("Pushed\n");
+        return 1;
+    }
+
+    const after = try git.run(&.{ "git", "rev-parse", "HEAD" });
+    const after_head = std.mem.trim(u8, after.stdout, " \t\r\n");
+    if (std.mem.eql(u8, before_head, after_head)) {
+        try stdout.writeAll("Already up to date\n");
+    } else {
+        const range = try std.fmt.allocPrint(git.gpa, "{s}..{s}", .{ before_head, after_head });
+        const count = try git.run(&.{ "git", "rev-list", "--count", range });
+        try stdout.print("Pulled {s} commit(s)\n", .{std.mem.trim(u8, count.stdout, " \t\r\n")});
     }
 
     return 0;
 }
 
-const Spec = struct {
-    no_pull: cli.Flag(.{ .help = "skip the pull half" }),
-    no_push: cli.Flag(.{ .help = "skip the push half" }),
-};
+const Spec = struct {};
 
-fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+fn run(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    const opts = Options{
-        .pull = !a.no_pull,
-        .push = !a.no_push,
-    };
 
     const lk = (try lock_mod.acquireForCommand(ctx, "sync")) orelse return 1;
     defer lk.release();
 
     const git = Git{ .gpa = ctx.alloc, .io = ctx.io, .dir = context.paths.repo_dir };
-    return syncRepo(git, opts, ctx.out, ctx.err);
+    return syncRepo(git, ctx.out, ctx.err);
 }
 
 pub const command = app.command(Spec, .{
     .name = "sync",
-    .summary = "Fetch, fast-forward, and push the dotfiles repo",
-    .details = "Refuses on uncommitted changes; fast-forwards only, refusing diverged history for the user to merge or rebase.",
+    .summary = "Fetch and fast-forward the dotfiles repo",
+    .details = "Refuses on uncommitted changes; fast-forwards only, refusing diverged history for the user to merge or rebase. Never pushes: publish with 'git push'.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -335,12 +310,12 @@ test "sync: not a git repo is refused" {
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
     const git = Git{ .gpa = al, .io = testing.io, .dir = plain, .env = &env };
-    const rc = try syncRepo(git, .{}, &out.writer, &err.writer);
+    const rc = try syncRepo(git, &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 1), rc);
     try testing.expect(std.mem.indexOf(u8, err.written(), "not a git work tree") != null);
 }
 
-test "sync: clean tree with pull and push off is a no-op" {
+test "sync: a clean tree level with the remote reports up to date and moves nothing" {
     try requireGit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -355,8 +330,9 @@ test "sync: clean tree with pull and push off is a no-op" {
     const before = try fx.logSubject(fx.b);
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(fx.seam(fx.b), .{ .pull = false, .push = false }, &out.writer, &err.writer);
+    const rc = try syncRepo(fx.seam(fx.b), &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 0), rc);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Already up to date") != null);
     try testing.expectEqualStrings(before, try fx.logSubject(fx.b));
 }
 
@@ -379,7 +355,7 @@ test "sync: fast-forwards N commits from the remote" {
 
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(fx.seam(fx.b), .{ .pull = true, .push = false }, &out.writer, &err.writer);
+    const rc = try syncRepo(fx.seam(fx.b), &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 0), rc);
     try testing.expect(std.mem.indexOf(u8, out.written(), "Pulled 1") != null);
 
@@ -404,7 +380,7 @@ test "sync: an untracked file is refused, never auto-committed" {
 
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(fx.seam(fx.b), .{ .pull = false, .push = true }, &out.writer, &err.writer);
+    const rc = try syncRepo(fx.seam(fx.b), &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 1), rc);
     try testing.expect(std.mem.indexOf(u8, err.written(), "untracked.toml") != null);
 
@@ -432,7 +408,7 @@ test "sync: dirty source is refused and nothing is committed" {
 
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(fx.seam(fx.b), .{ .pull = true, .push = true }, &out.writer, &err.writer);
+    const rc = try syncRepo(fx.seam(fx.b), &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 1), rc);
     try testing.expect(std.mem.indexOf(u8, err.written(), "src/.zshrc") != null);
     // HEAD unmoved: nothing was committed and the edit remains uncommitted.
@@ -465,10 +441,10 @@ test "sync: divergent history is refused, not auto-merged" {
 
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(fx.seam(fx.b), .{ .pull = true, .push = false }, &out.writer, &err.writer);
+    const rc = try syncRepo(fx.seam(fx.b), &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 1), rc);
     // --ff-only refuses to fabricate a merge commit for diverged history; it
-    // tells the user to merge or rebase rather than auto-merging (and pushing).
+    // tells the user to merge or rebase rather than auto-merging.
     try testing.expect(std.mem.indexOf(u8, err.written(), "cannot fast-forward") != null);
 
     // No merge was started: no unmerged entries and the consumer's own commit
@@ -500,13 +476,13 @@ test "sync: no upstream configured is refused" {
 
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(git, .{ .pull = true, .push = false }, &out.writer, &err.writer);
+    const rc = try syncRepo(git, &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 1), rc);
     try testing.expect(std.mem.indexOf(u8, err.written(), "upstream") != null);
     try testing.expect(std.mem.indexOf(u8, err.written(), "main") != null);
 }
 
-test "sync: no-pull pushes local commits to the bare remote" {
+test "sync: local commits are never published, only the user pushes" {
     try requireGit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -518,14 +494,22 @@ test "sync: no-pull pushes local commits to the bare remote" {
     defer env.deinit();
     const fx = try setupFixture(al, &env, &tmp, root);
 
+    const remote_before = try fx.logSubject(fx.remote);
+
     // A local commit that is not yet on the remote.
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/src/.zshrc", .data = "line\npush-only\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/src/.zshrc", .data = "line\nlocal\n" });
     try okRun(fx.seam(fx.a), &.{ "git", "commit", "-am", "local only" });
 
     var out: Io.Writer.Allocating = .init(al);
     var err: Io.Writer.Allocating = .init(al);
-    const rc = try syncRepo(fx.seam(fx.a), .{ .pull = false, .push = true }, &out.writer, &err.writer);
+    const rc = try syncRepo(fx.seam(fx.a), &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 0), rc);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "Pushed") != null);
-    try testing.expectEqualStrings("local only", try fx.logSubject(fx.remote));
+
+    // The remote is untouched: sync fetches and fast-forwards, and publishing
+    // stays the user's own `git push`.
+    try testing.expectEqualStrings(remote_before, try fx.logSubject(fx.remote));
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Pushed") == null);
+
+    // The local commit is intact -- nothing was reset underneath the user.
+    try testing.expectEqualStrings("local only", try fx.logSubject(fx.a));
 }
