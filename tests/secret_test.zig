@@ -103,9 +103,20 @@ test "inline secret: an escaped '>' survives as a real shell redirect" {
     try std.testing.expectEqualStrings("V=second", out);
 }
 
+/// A synthetic environment carrying only what a test names -- plus, on
+/// Windows, the entries a spawned shell cannot start without. The resolver
+/// runs a backend under the environment mox was handed, so an environment
+/// missing SystemRoot or ComSpec makes `cmd.exe` exit immediately rather than
+/// run the payload, and a test about timeouts or output caps would be
+/// measuring the wrong failure.
 fn envWith(a: std.mem.Allocator, pairs: []const [2][]const u8) !mox.env.Env {
     const map = try a.create(std.process.Environ.Map);
     map.* = std.process.Environ.Map.init(a);
+    if (builtin.os.tag == .windows) {
+        for ([_][]const u8{ "SystemRoot", "ComSpec", "PATH", "PATHEXT" }) |k| {
+            if (std.testing.environ.getAlloc(a, k) catch null) |v| try map.put(k, v);
+        }
+    }
     for (pairs) |p| try map.put(p[0], p[1]);
     return .{ .map = map };
 }
