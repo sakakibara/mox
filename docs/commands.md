@@ -342,17 +342,31 @@ break the framing; unescape those four to recover exact bytes. Both imply
 
 ## export
 
-`export --resolved [--as <tuple>] <out>` bakes a flat resolved tree:
-compose every managed file for the current machine (or the given axis
-tuple) and write it under `<out>/<live-rel>`. A partially owned target
-exports its canonical owned serialization -- the ownership contract,
-not a whole live file. Read-only wrt mox state; the walk-away
-guarantee and CI parity input.
+`export [--as <tuple>] <out>` bakes a flat resolved tree: compose every
+managed file for the current machine (or the given axis tuple) and
+write it under `<out>/<live-rel>`. A partially owned target exports its
+canonical owned serialization -- the ownership contract, not a whole
+live file. Read-only wrt mox state; the walk-away guarantee and CI
+parity input.
+
+Everything composes before anything is written, so a run that cannot
+compose every file reports them and writes nothing: an export is a
+deliverable, and a tree that silently lacks a file is worse than no
+tree. Composing still happens exactly once, which matters because a
+second pass would resolve every `op://` secret again -- another round
+trip, another biometric prompt.
+
+An export that would bake a resolved secret as cleartext names those
+files and refuses until `--cleartext-secrets` is passed, deciding
+before any of it reaches disk. The flag is demanded only when a secret
+is actually present: one required on every run is one you type unread,
+which is the attention a consent gate exists to keep. With it, each
+such file lands at 0600 and the count is reported.
 
 <!-- generated: flags export -->
 | Flag | Description |
 | --- | --- |
-| `--resolved` | required: bake resolved output |
+| `--cleartext-secrets` | required only when the export bakes a resolved secret as cleartext |
 | `--as <tuple>` | compose as if bound to this axis tuple |
 <!-- /generated -->
 

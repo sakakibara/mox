@@ -361,7 +361,7 @@ serialization: one `= <path>` header line per declared path, the subtree's
 keys sorted and indented under it (`key = value` for scalars, `key:` for
 nested tables). Each diff hunk is preceded by the `= <path>` header of the
 section it falls in, so a changed value always names its key. For a partial
-target, `mox export --resolved` writes exactly this serialization: the owned
+target, `mox export` writes exactly this serialization: the owned
 contract is the deliverable, never a whole live file that belongs partly to
 the program.
 

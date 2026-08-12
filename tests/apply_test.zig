@@ -3275,7 +3275,7 @@ test "export generator: renders every row into the export tree statelessly" {
     const out_dir = try std.fs.path.join(a, &.{ c.root, "export" });
     // Export WITHOUT a prior apply: it must render both rows from the current
     // data alone -- no manifest, no applied records, no deletion.
-    const r = try c.run(&.{ "mox", "export", "--resolved", out_dir });
+    const r = try c.run(&.{ "mox", "export", out_dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
     try std.testing.expectEqualStrings("key=a\n", try read(io, a, try std.fs.path.join(a, &.{ out_dir, ".config", "id-a.inc" })));

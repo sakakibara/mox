@@ -275,12 +275,13 @@ Captures must not be adjacent (`<a><b>`) and a name must not repeat within one
 template; both are compose-time errors. A malformed `data.` capture (`<data.x>`
 or one nested deeper than a table) is rejected up front.
 
-A resolved secret is kept out of mox's own on-disk state, but `mox export
---resolved` bakes the resolved cleartext into every file it writes -- that flat
-tree is the walk-away and CI-parity output. There too an `op://`/`pass://` file
-is written at 0600, and export announces on stderr each file into which it baked
-such a secret, so aiming it at a committed or CI directory cannot silently ship
-one unnoticed.
+A resolved secret is kept out of mox's own on-disk state, but `mox export`
+bakes the resolved cleartext into every file it writes -- that flat tree is the
+walk-away and CI-parity output. So an export that would bake one names those
+files and refuses until `--cleartext-secrets` is passed, decided before any
+content reaches disk; with the flag, each such file is written at 0600 and the
+count is reported. Aiming export at a committed or CI directory cannot ship a
+secret unnoticed.
 
 ## Fact and data model
 

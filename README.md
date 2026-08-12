@@ -165,7 +165,7 @@ Full behavioral contracts for every command are in
 | `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, ...) plus the live probe log. `status` exits 1 on anything actionable |
 | `edit <name>` | Open the source behind a live path in `$EDITOR`; `--axis <tuple>` opens the overlay or fragment for that variant |
 | `mv <old> <new>` / `remove <name>` | Rename a source (live target moves on next apply) / stop managing (source to recoverable trash; `--purge` also removes the live file) |
-| `export --resolved <out>` | Bake the fully composed tree to a directory (`--as <tuple>` for another machine's view) -- the walk-away guarantee |
+| `export <out>` | Bake the fully composed tree to a directory (`--as <tuple>` for another machine's view) -- the walk-away guarantee |
 | `facts` | List, set, and interview for facts; `facts probe` resolves one `tool=`/`env=` query scriptably |
 | `data get <name>` | Print a data source as TOML or JSON, private layer applied |
 | `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state); `--fix` performs the safe rebuilds |

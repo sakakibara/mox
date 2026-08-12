@@ -1,10 +1,18 @@
-//! `mox export --resolved [--as <tuple>] <out>`: bake a flat resolved tree.
+//! `mox export [--as <tuple>] <out>`: bake a flat resolved tree.
 //!
 //! Every managed file is composed for the current machine (or the axis tuple
 //! given by `--as`) and written under `<out>/<live-rel>`, where `<live-rel>`
 //! is the file's live path relative to HOME. This is the walk-away guarantee
 //! and the CI parity harness input. Read-only wrt mox state: no lock, no
 //! applied/provenance records touched.
+//!
+//! Composed in full before anything is written. Two reasons the phases have to
+//! be separate: whether the export bakes a resolved secret is knowable only
+//! after composing, and it must be knowable BEFORE the cleartext reaches disk;
+//! and an export is a deliverable, so a run that could not compose every file
+//! leaves nothing rather than a tree that silently lacks some. Composing is
+//! done once either way -- a second pass would resolve every `op://` secret
+//! again, costing another round trip and another biometric prompt.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -38,18 +46,25 @@ pub fn applyTupleOverride(arena: std.mem.Allocator, bindings: *std.StringHashMap
     }
 }
 
+/// One file the export will write, held until every file has composed. A
+/// symlink carries its target in `content` and no mode.
+const Planned = struct {
+    dest: []const u8,
+    live_path: []const u8,
+    content: []const u8,
+    mode: u32,
+    symlink: bool,
+    manager_secret: bool,
+};
+
 const Spec = struct {
-    resolved: cli.Flag(.{ .help = "required: bake resolved output" }),
+    cleartext_secrets: cli.Flag(.{ .help = "required only when the export bakes a resolved secret as cleartext" }),
     as: cli.Opt([]const u8, .{ .value_name = "tuple", .help = "compose as if bound to this axis tuple" }),
     out: cli.Pos([]const u8, .{ .help = "output directory" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    if (!a.resolved) {
-        try ctx.err.writeAll("mox export: usage: mox export --resolved [--as <tuple>] <out-dir>\n");
-        return 2;
-    }
     const out_dir = a.out;
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
@@ -89,6 +104,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     };
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 
+    var plan: std.ArrayList(Planned) = .empty;
     var written: usize = 0;
     var skipped: usize = 0;
     var failed: usize = 0;
@@ -112,15 +128,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         failed += 1;
                         continue;
                     };
-                    const eff_mode = mox.apply.write.secretRestrictedMode(o.manager_secret, false, 0o644, null);
-                    if (o.manager_secret)
-                        try ctx.err.print("mox export: {s}: baked a resolved op/pass secret (cleartext) at 0600\n", .{dest});
-                    mox.apply.write.writeAtomic(ctx.io, dest, o.content, eff_mode) catch |e| {
-                        try ctx.err.print("mox export: {s}: write failed: {s}\n", .{ dest, @errorName(e) });
-                        failed += 1;
-                        continue;
-                    };
-                    written += 1;
+                    try plan.append(ctx.alloc, .{
+                        .dest = dest,
+                        .live_path = o.live_path,
+                        .content = o.content,
+                        .mode = mox.apply.write.secretRestrictedMode(o.manager_secret, false, 0o644, null),
+                        .symlink = false,
+                        .manager_secret = o.manager_secret,
+                    });
                 }
                 continue;
             }
@@ -174,40 +189,70 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 try mox.apply.canonical.canonicalComplement(ctx.alloc, &owned_doc, file.own_paths)
             else
                 try mox.apply.canonical.canonicalOwned(ctx.alloc, &owned_doc, file.own_paths);
-            const eff_mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null);
-            if (diag.manager_secret) {
-                try ctx.err.print("mox export: {s}: baked a resolved op/pass secret (cleartext) at 0600\n", .{dest});
-            }
-            mox.apply.write.writeAtomic(ctx.io, dest, canon, eff_mode) catch |e| {
-                try ctx.err.print("mox export: {s}: write failed: {s}\n", .{ dest, @errorName(e) });
-                failed += 1;
-                continue;
-            };
-            written += 1;
+            try plan.append(ctx.alloc, .{
+                .dest = dest,
+                .live_path = file.live_path,
+                .content = canon,
+                .mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null),
+                .symlink = false,
+                .manager_secret = diag.manager_secret,
+            });
             continue;
         }
 
-        if (file.is_symlink) {
-            const target = std.mem.trim(u8, bytes, " \t\r\n");
-            if (std.fs.path.dirname(dest)) |parent| Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
-            Io.Dir.cwd().deleteFile(ctx.io, dest) catch {};
-            Io.Dir.cwd().symLink(ctx.io, target, dest, .{}) catch |e| {
-                try ctx.err.print("mox export: {s}: symlink failed: {s}\n", .{ dest, @errorName(e) });
+        // The export tree is written fresh, so there is no prior mode to
+        // respect: a manager secret lands at exactly 0600.
+        try plan.append(ctx.alloc, .{
+            .dest = dest,
+            .live_path = file.live_path,
+            .content = if (file.is_symlink) std.mem.trim(u8, bytes, " \t\r\n") else bytes,
+            .mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null),
+            .symlink = file.is_symlink,
+            .manager_secret = diag.manager_secret,
+        });
+    }
+
+    // An export is a deliverable: one file that could not compose makes the
+    // whole tree untrustworthy, so nothing is written rather than a tree that
+    // silently lacks it.
+    if (failed > 0) {
+        try ctx.err.print("mox export: {d} file(s) could not be composed; nothing was written\n", .{failed});
+        return 1;
+    }
+
+    // The cleartext gate, decided before any of it reaches disk. Demanded only
+    // when the export actually bakes a resolved secret -- a flag required on
+    // every run is one a user types unread, which is exactly the attention a
+    // consent gate needs to keep.
+    var secret_count: usize = 0;
+    for (plan.items) |p| {
+        if (p.manager_secret) secret_count += 1;
+    }
+    if (secret_count > 0 and !a.cleartext_secrets) {
+        try ctx.err.print(
+            "mox export: {d} file(s) would bake a resolved secret into {f} as cleartext:\n",
+            .{ secret_count, display.of(out_dir, ctx.context.?.paths.home) },
+        );
+        for (plan.items) |p| {
+            if (p.manager_secret)
+                try ctx.err.print("  {f}\n", .{display.of(p.live_path, ctx.context.?.paths.home)});
+        }
+        try ctx.err.writeAll("mox export: pass --cleartext-secrets to write them (each at 0600); nothing was written\n");
+        return 2;
+    }
+
+    for (plan.items) |p| {
+        if (p.symlink) {
+            if (std.fs.path.dirname(p.dest)) |parent| Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
+            Io.Dir.cwd().deleteFile(ctx.io, p.dest) catch {};
+            Io.Dir.cwd().symLink(ctx.io, p.content, p.dest, .{}) catch |e| {
+                try ctx.err.print("mox export: {s}: symlink failed: {s}\n", .{ p.dest, @errorName(e) });
                 failed += 1;
                 continue;
             };
         } else {
-            // A baked op/pass secret lands at 0600 here too (the export tree
-            // holds resolved cleartext), and is announced so pointing export at
-            // a committed/CI dir does not silently ship a secret.
-            // The export tree is written fresh, so there is no prior mode to
-            // respect: a manager secret lands at exactly 0600.
-            const eff_mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null);
-            if (diag.manager_secret) {
-                try ctx.err.print("mox export: {s}: baked a resolved op/pass secret (cleartext) at 0600\n", .{dest});
-            }
-            mox.apply.write.writeAtomic(ctx.io, dest, bytes, eff_mode) catch |e| {
-                try ctx.err.print("mox export: {s}: write failed: {s}\n", .{ dest, @errorName(e) });
+            mox.apply.write.writeAtomic(ctx.io, p.dest, p.content, p.mode) catch |e| {
+                try ctx.err.print("mox export: {s}: write failed: {s}\n", .{ p.dest, @errorName(e) });
                 failed += 1;
                 continue;
             };
@@ -215,6 +260,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         written += 1;
     }
 
+    if (secret_count > 0)
+        try ctx.err.print("mox export: baked {d} resolved secret(s) as cleartext, each at 0600\n", .{secret_count});
     try ctx.out.print("Exported {d} file(s) to {f} ({d} gated off, {d} failed)\n", .{ written, display.of(out_dir, ctx.context.?.paths.home), skipped, failed });
     return if (failed > 0) 1 else 0;
 }
@@ -222,8 +269,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 pub const command = app.command(Spec, .{
     .name = "export",
     .summary = "Bake a flat resolved tree into a dir",
-    .usage = "mox export --resolved [--as <tuple>] <out>",
-    .details = "Composes every file under <out>/<rel>. A partially owned target exports its canonical owned serialization (the '= <path>' sections) -- the ownership contract, not a whole live file.",
+    .usage = "mox export [--as <tuple>] [--cleartext-secrets] <out>",
+    .details = "Composes every file under <out>/<rel>. A partially owned target exports its canonical owned serialization (the '= <path>' sections) -- the ownership contract, not a whole live file. Everything is composed before anything is written, so a run that cannot compose every file writes nothing; an export that would bake a resolved secret as cleartext names those files and refuses until --cleartext-secrets is passed.",
     .group = .general,
     .needs_context = true,
 }, run);

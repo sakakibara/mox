@@ -15,7 +15,6 @@ All notable changes to mox are documented here. The format follows
   longer exists. It also refuses a table for a command that is gone, which is
   the drift that actually misleads. The prose stays hand-written: a
   declaration can say a flag exists, never what it means.
-
 - `mox publish` sends this machine's work the other way: with `-m <message>` it
   commits the repo's pending source changes and pushes them, without it pushes
   what is already committed. It stages by explicit path -- only `src/`,
@@ -36,6 +35,12 @@ All notable changes to mox are documented here. The format follows
   `edit`: and make it take effect.
 
 ### Fixed
+- `mox export` composes every file before writing any of them, so the secret
+  gate decides before cleartext reaches disk, and a run that cannot compose
+  every file reports them all and writes nothing rather than leaving a tree
+  that silently lacks one. Composing stays a single pass: a second would
+  resolve every `op://` secret again, costing another round trip and another
+  biometric prompt.
 - `apply` and `commit` refuse a repo left part-way through a merge, rebase,
   cherry-pick, or revert, rather than composing its conflict markers into live
   files and running setup scripts from a half-applied revision. The refusal is
@@ -45,6 +50,13 @@ All notable changes to mox are documented here. The format follows
   `git pull` the docs offered as its equivalent walked straight past.
 
 ### Changed
+- **Breaking:** `mox export --resolved` is now just `mox export`, and the
+  cleartext gate fires on the hazard instead of on every run. `--resolved` was
+  required on every invocation with only one legal value, which trains a user
+  to type it unread -- the opposite of what a consent gate needs. The real
+  hazard is narrower: export bakes resolved secrets to disk as cleartext. An
+  export that would do so now names those files and refuses until
+  `--cleartext-secrets` is passed, and a secret-free repo needs no flag.
 - **Breaking:** `mox sync` is now `mox update`, and it applies. mox moves
   configuration along one line -- live file, source, remote -- and named only
   the local pair (`apply`, `commit`); `sync` was two directions crammed into

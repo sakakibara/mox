@@ -479,7 +479,7 @@ test "edit: --axis resolves the matching overlay file" {
     try std.testing.expectEqualStrings(overlay_abs, edited);
 }
 
-test "export --resolved bakes the same bytes apply writes to live" {
+test "export bakes the same bytes apply writes to live" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -494,7 +494,7 @@ test "export --resolved bakes the same bytes apply writes to live" {
     _ = try h.run(&.{ "mox", "apply" });
 
     const out_dir = try std.fs.path.join(a, &.{ h.root, "baked" });
-    const r = try h.run(&.{ "mox", "export", "--resolved", out_dir });
+    const r = try h.run(&.{ "mox", "export", out_dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
     // Every exported file byte-matches the live file apply produced.
@@ -2652,7 +2652,7 @@ test "mv: re-keys the owned record for a partial target" {
     try std.testing.expect(std.mem.indexOf(u8, apply.out, "adopted") == null);
 }
 
-test "export --resolved: a partial target bakes its canonical owned serialization" {
+test "export: a partial target bakes its canonical owned serialization" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2665,7 +2665,7 @@ test "export --resolved: a partial target bakes its canonical owned serializatio
     try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui\n" ++ source);
 
     const out_dir = try std.fs.path.join(a, &.{ h.root, "baked" });
-    const r = try h.run(&.{ "mox", "export", "--resolved", out_dir });
+    const r = try h.run(&.{ "mox", "export", out_dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
     // The export is the owned contract in canonical form, not a whole file.
