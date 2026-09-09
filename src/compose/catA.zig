@@ -22,6 +22,14 @@ const Segment = prov_mod.map.Segment;
 pub const ComposeError = error{
     /// No base and no overlay matches the active bindings.
     NoBaseOrMatchingOverlay,
+    /// A layer of a structurally merged source carries an inline `mox:`
+    /// directive. Inline directives are the single-layer mechanism; overlays
+    /// are the multi-layer one. In a structural merge a directive line is only
+    /// a comment (parsed and dropped, or emitted as text), so a region's body
+    /// would land unconditionally and a `secret` or `default` would vanish --
+    /// silently, and in the unsafe direction. The diag names the layer and
+    /// the line.
+    InlineDirectiveWithOverlay,
 };
 
 const max_layer_bytes: usize = 4 * 1024 * 1024;
@@ -158,6 +166,7 @@ fn composeToml(
     // Single-layer base with `# mox:` content directives routes through Cat B for
     // include / from / when. A whole-file gate composes its body structurally.
     // The pass-through preserves comments, blank lines, and key ordering.
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "#", diag);
     if (layers.len == 1) {
         if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
@@ -198,6 +207,7 @@ fn composeJson(
     const hd = try readBaseHead(arena, io, file, layers[0], "//", bindings);
     if (hd.absent) return null;
 
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "//", diag);
     if (layers.len == 1) {
         if (!hd.gate_on and containsMoxDirectiveJson(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
@@ -245,6 +255,7 @@ fn composeYaml(
     const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
     if (hd.absent) return null;
 
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "#", diag);
     if (layers.len == 1) {
         if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
@@ -290,6 +301,7 @@ fn composeSectionMerge(
     const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
     if (hd.absent) return null;
 
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "#", diag);
     if (layers.len == 1) {
         if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
         return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
@@ -306,7 +318,7 @@ fn composeSectionMerge(
 }
 
 /// Heuristic: does `content` contain a `# mox: ...` line? Cheap substring
-/// check is fine — gitconfig comment marker is always `#`, and any false
+/// check is fine -- gitconfig comment marker is always `#`, and any false
 /// positive (`mox:` appearing inside a value) at worst routes through Cat B
 /// which would emit it unchanged anyway.
 fn containsMoxDirective(content: []const u8) bool {
@@ -317,6 +329,76 @@ fn containsMoxDirective(content: []const u8) bool {
 /// `//`, so directives look like `// mox: ...`.
 fn containsMoxDirectiveJson(content: []const u8) bool {
     return std.mem.indexOf(u8, content, "// mox:") != null;
+}
+
+/// The first `mox:` directive line in `content`, as its 1-based line and
+/// the line's text, or null. Every content directive counts: a region verb
+/// would emit its body unconditionally in a merge, and a line directive
+/// (`secret`, `default`, `include`, `keep-empty`) would be dropped as a
+/// comment. Head directives are the head parser's and are skipped.
+const DirectiveHit = struct { line: usize, text: []const u8 };
+fn directiveLine(content: []const u8, marker: []const u8) ?DirectiveHit {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var n: usize = 0;
+    while (it.next()) |line| {
+        n += 1;
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, t, marker)) continue;
+        const after = std.mem.trimStart(u8, t[marker.len..], " \t");
+        if (!std.mem.startsWith(u8, after, "mox:")) continue;
+        // A head directive is the walk's to recognise, inside its bounded
+        // head; past that bound it is inert comment content by design.
+        const verb = std.mem.trimStart(u8, after["mox:".len..], " \t");
+        if (std.mem.startsWith(u8, verb, "own") or std.mem.startsWith(u8, verb, "disown") or std.mem.startsWith(u8, verb, "check")) continue;
+        return .{ .line = n, .text = t };
+    }
+    return null;
+}
+
+/// The 1-based line of the first line whose trimmed text is `text`, in `raw`.
+fn lineOf(raw: []const u8, text: []const u8) usize {
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    var n: usize = 0;
+    while (it.next()) |line| {
+        n += 1;
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), text)) return n;
+    }
+    return 0;
+}
+
+/// A file with overlays is a structural merge, where a directive line is
+/// only a comment: a region's body would emit unconditionally and a line
+/// directive would vanish. Every layer is scanned, whether or not it
+/// matches this machine, so the refusal is a fact about the repo and not
+/// about who composes it: the base's head-processed text (so its own head
+/// directives are not mistaken for content), then each overlay as written.
+/// A hit names the layer and its line in the file as written.
+fn refuseRegionInLayers(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    base_text: []const u8,
+    marker: []const u8,
+    diag: ?*interp.Diag,
+) !void {
+    if (file.has_base) {
+        if (directiveLine(base_text, marker)) |hit| {
+            const raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_layer_bytes));
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: {s}", .{ file.source_base_abs, lineOf(raw, hit.text), hit.text }));
+            return error.InlineDirectiveWithOverlay;
+        }
+    }
+    for (file.overlays) |o| {
+        const path = o.path;
+        const raw = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes)) catch |e| {
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}: could not be read: {s}", .{ path, @errorName(e) }));
+            return e;
+        };
+        if (directiveLine(raw, marker)) |hit| {
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: {s}", .{ path, hit.line, hit.text }));
+            return error.InlineDirectiveWithOverlay;
+        }
+    }
 }
 
 /// The leading whole-file gate's parsed axis expression, or null when the

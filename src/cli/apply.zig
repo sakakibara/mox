@@ -23,6 +23,18 @@ pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
 }
 
+/// The line under a `compose failed` report that says what to do about the
+/// errors a user can act on; apply and export print the same one.
+pub fn explainComposeError(w: *std.Io.Writer, prefix: []const u8, e: anyerror) !void {
+    switch (e) {
+        error.UnknownShell => try w.print("{s}:   accepted shells: fish, zsh, bash, powershell\n", .{prefix}),
+        error.ReservedAxisName => try w.print("{s}:   \"path\" is a reserved axis name; the path= axis no longer exists\n", .{prefix}),
+        error.SecretEmpty => try w.print("{s}:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n", .{prefix}),
+        error.InlineDirectiveWithOverlay => try w.print("{s}:   an inline directive in a file merged from .d/ overlays is only a comment there: gate the content with an overlay instead, or keep the file single-layer\n", .{prefix}),
+        else => {},
+    }
+}
+
 /// `machine.state.captureWith`, reporting a `ReservedFactName` (a custom fact
 /// or `data/facts.toml` row colliding with a reserved axis or built-in
 /// field) or a malformed `data/facts.toml` row the same way `mox facts` does,
@@ -424,12 +436,7 @@ fn applyPass(
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &prov, &diag) catch |e| {
             try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ shown, @errorName(e) });
-            if (e == error.UnknownShell)
-                try ctx.err.print("mox apply:   accepted shells: fish, zsh, bash, powershell\n", .{});
-            if (e == error.ReservedAxisName)
-                try ctx.err.writeAll("mox apply:   \"path\" is a reserved axis name; the path= axis no longer exists\n");
-            if (e == error.SecretEmpty)
-                try ctx.err.writeAll("mox apply:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n");
+            try explainComposeError(ctx.err, "mox apply", e);
             if (diag.capture()) |cap|
                 try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
             counts.fail += 1;

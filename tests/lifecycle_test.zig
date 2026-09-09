@@ -4097,6 +4097,77 @@ test "apply: an overlay whose value is a Windows device name still applies; nami
     try std.testing.expectEqualStrings("a = 2\n", try read(io, a, try std.fs.path.join(a, &.{ h.root, "baked", ".config", "app.toml" })));
 }
 
+test "apply: a region directive under an overlay is explained, not just named" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "base = 1\n# mox: when profile=zzz\ngated = 1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=darwin.toml", "other = 2\n");
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "compose failed: InlineDirectiveWithOverlay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "gate the content with an overlay instead") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: # mox: when profile=zzz") != null);
+}
+
+test "apply: a directive in an overlay for another machine still refuses the merge" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "base = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=darwin.toml", "other = 2\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=linux.toml", "# mox: when profile=zzz\ngated = 1\n# mox: end\n");
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "compose failed: InlineDirectiveWithOverlay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "os=linux.toml:1: # mox: when profile=zzz") != null);
+}
+
+test "apply: an overlay that cannot be read is named, matching this machine or not" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no mode bits to close it with
+    if (std.c.getuid() == 0) return error.SkipZigTest; // root reads anything
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "a = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=plan9.toml", "b = 2\n");
+    const closed = try std.fs.path.join(a, &.{ h.repo, "src", ".config", "app.toml.d", "os=plan9.toml" });
+    try chmodPath(a, closed, 0o000);
+    defer chmodPath(a, closed, 0o644) catch {};
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "os=plan9.toml: could not be read: AccessDenied") != null);
+}
+
+test "export: a region directive under an overlay is explained here too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "base = 1\n# mox: when profile=zzz\ngated = 1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=darwin.toml", "other = 2\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", out });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "gate the content with an overlay instead") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: # mox: when profile=zzz") != null);
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {

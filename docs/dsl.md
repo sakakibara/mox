@@ -68,6 +68,17 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 | `when <axis>` | Emit the body only when the axis matches. |
 | `for <var> in <source> [when <axis>] [where <row>] [into "<path>"]` | Repeat the body once per data row; `into` makes the file a generator (see Generator directives). |
 
+A structurally merged source (a `.toml`, `.json`, `.yaml`, `.yml`, `.ini` or
+gitconfig file with `.d/` overlays) cannot carry a region directive in any of
+its layers, base or overlay, whether or not the layer matches the machine
+composing: in a merge a directive line is only a comment, so the region's
+body would land unconditionally. The same goes for a line directive
+(`secret`, `default`, `include`), which the merge would drop. The compose
+refuses with `InlineDirectiveWithOverlay`, naming the layer and line. A line
+that reads as a directive is one wherever it sits, a string value included:
+the DSL reads comment lines, not the format. Gate such content with an
+overlay instead, or keep the file single-layer.
+
 ## Axis expressions
 
 Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`, any

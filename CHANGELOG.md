@@ -29,6 +29,13 @@ All notable changes to mox are documented here. The format follows
   and `cmd:` included) without `--cleartext-secrets`; a secret-manager value
   lands at 0600 unless `.mox/attributes.toml` sets its mode, any other at the
   file's composed mode, and the report says how many of each.
+- BREAKING: a structurally merged source (`.toml`, `.json`, `.yaml`, `.yml`,
+  `.ini`, gitconfig with `.d/` overlays) carrying an inline `mox:` directive
+  in any layer, base or overlay, matching the composing machine or not, is
+  refused with `InlineDirectiveWithOverlay`, naming the layer and the line as
+  written, and a layer that cannot be read is named the same way; a merge
+  would emit a region's body unconditionally and drop a `secret` or `default`
+  as a comment. `apply` and `export` explain a compose failure the same way.
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the

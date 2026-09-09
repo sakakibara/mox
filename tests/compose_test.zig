@@ -1564,7 +1564,7 @@ test "compose catA toml: no matching overlay falls back to base" {
     const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-    // profile not bound — overlay should not match.
+    // profile not bound -- overlay should not match.
 
     const out = try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &bindings_r, null, null);
     try std.testing.expect(out != null);
@@ -1577,7 +1577,7 @@ test "compose catA toml: orphan (no base) with single matching overlay" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // aerospace.toml is darwin-only — no base, only an axis overlay.
+    // aerospace.toml is darwin-only -- no base, only an axis overlay.
     try writeFile(io, tmp.dir, "src/.config/aerospace/aerospace.toml.d/os=darwin.toml", "[gaps]\ninner.horizontal = 8\n");
 
     const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
@@ -1698,31 +1698,33 @@ test "compose catA toml: a leading whole-file gate composes with deep-merging ov
     try std.testing.expect((try result) == null);
 }
 
-test "compose catA toml: a leading gate on an orphan overlay is inert, not a whole-file gate" {
+test "compose catA toml: a leading gate on an orphan overlay is refused in a merge, never read as a whole-file gate" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
     // No base file: `layers[0]` is the least-specific overlay. A stray leading
-    // `# mox:` line there must not gate away the whole file (which would also
-    // drop the sibling overlay that matched).
+    // `# mox:` line there is neither a whole-file gate (which would drop the
+    // sibling overlay that matched) nor a comment the merge may swallow: the
+    // overlay is named, with its line, and the compose refuses.
     try writeFile(io, tmp.dir, "src/.config/x.toml.d/os=macos.toml", "# mox: when os=linux\n[a]\nx = 1\n");
     try writeFile(io, tmp.dir, "src/.config/x.toml.d/os=macos+arch=arm64.toml", "[b]\ny = 2\n");
-
     const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(src_dir);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
-
-    var b = std.StringHashMap([]const u8).init(arena.allocator());
+    const a = arena.allocator();
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
     var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
     try b.put("os", "macos");
     try b.put("arch", "arm64");
-    const out = (try mox.compose.composeFile(arena.allocator(), io, tree.files[0], &b_r, null, null)).?;
-    const parsed = try mox.toml.parse(arena.allocator(), out, .{});
-    try std.testing.expectEqual(@as(i64, 1), parsed.table.get("a").?.table.get("x").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), parsed.table.get("b").?.table.get("y").?.integer);
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(
+        error.InlineDirectiveWithOverlay,
+        mox.compose.composeFileTracked(a, io, tree.files[0], &b_r, null, null, null, &diag),
+    );
+    const cap = diag.capture() orelse return error.TestExpectedDiag;
+    try std.testing.expect(std.mem.indexOf(u8, cap, "x.toml.d/os=macos.toml:1: # mox: when os=linux") != null);
 }
 
 test "compose catA gitconfig: a leading whole-file gate is stripped in a multi-layer merge" {
@@ -1845,7 +1847,7 @@ test "compose catB: directiveless unknown-extension file with <machine.X> interp
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // git/allowed_signers has no extension → marker lookup fails, Gap 1 fix
+    // git/allowed_signers has no extension -> marker lookup fails, Gap 1 fix
     // routes to pass-through. The pass-through must still run <machine.X>
     // interp so user-baked facts substitute.
     try writeFile(io, tmp.dir, "src/.config/git/allowed_signers", "<machine.email> namespaces=\"git\" <machine.signing_key>\n");
@@ -2109,7 +2111,7 @@ test "compose catB: for-loop where-clause `tool=entry.X` substitutes then axis-c
     var bindings = std.StringHashMap([]const u8).init(arena.allocator());
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     try bindings.put("tool=fd", "1");
-    // tool=zk NOT in bindings — simulates "zk binary not on PATH"
+    // tool=zk NOT in bindings -- simulates "zk binary not on PATH"
 
     const out = try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, null);
     try std.testing.expect(out != null);
@@ -2432,7 +2434,7 @@ test "compose catA gitconfig: file with mox directives is processed Cat-B-style"
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // gitconfig with mox include directives — needs Cat B-style processing
+    // gitconfig with mox include directives -- needs Cat B-style processing
     // for the conditional sections, since the structural Cat A merge can't
     // express "include this block when X axis matches".
     try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n" ++
@@ -4757,4 +4759,134 @@ test "completions: zsh_dispatch on a row whose shells exclude zsh is dead" {
         \\zsh_dispatch = "_tool_complete"
         \\
     );
+}
+
+test "compose catA: an inline region in a merged structured source is refused, not silently emitted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Inline regions are the single-layer mechanism; overlays are the
+    // multi-layer one. In a structural merge a directive line is a comment,
+    // so the gated body would emit unconditionally; the compose refuses.
+    try writeFile(io, tmp.dir, "src/app.toml", "base = 1\n# mox: when profile=zzz\ngated = \"unreachable\"\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/os=darwin.toml", "other = 2\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("profile", "personal");
+    try std.testing.expectError(
+        error.InlineDirectiveWithOverlay,
+        mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null),
+    );
+}
+
+fn expectRegionRefused(io: Io, tmp: *std.testing.TmpDir, a: std.mem.Allocator, expect_layer_suffix: []const u8) !void {
+    const src_dir = try srcPathAlloc(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("profile", "personal");
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(
+        error.InlineDirectiveWithOverlay,
+        mox.compose.composeFileTracked(a, io, tree.files[0], &b_r, null, null, null, &diag),
+    );
+    // The diag names the layer and the line, so the user can find it.
+    const cap = diag.capture() orelse return error.TestExpectedDiag;
+    try std.testing.expect(std.mem.indexOf(u8, cap, expect_layer_suffix) != null);
+    try std.testing.expect(std.mem.endsWith(u8, cap, "mox: when profile=zzz"));
+}
+
+test "compose catA: a region in an overlay of a merged source is refused, and the overlay is named" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeFile(io, tmp.dir, "src/app.toml", "base = 1\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/os=darwin.toml", "other = 2\n# mox: when profile=zzz\ngated = \"unreachable\"\n# mox: end\n");
+    try expectRegionRefused(io, &tmp, a, "app.toml.d/os=darwin.toml:2:");
+}
+
+test "compose catA: a region in a merged json, yaml or gitconfig source is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.json", "{\n  // mox: when profile=zzz\n  \"gated\": 1\n  // mox: end\n}\n");
+    try writeFile(io, tmp.dir, "src/app.json.d/os=darwin.json", "{\"other\": 2}\n");
+    try expectRegionRefused(io, &tmp, a, "app.json:2:");
+
+    try tmp.dir.deleteTree(io, "src");
+    try writeFile(io, tmp.dir, "src/app.yaml", "base: 1\n# mox: when profile=zzz\ngated: 1\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/app.yaml.d/os=darwin.yaml", "other: 2\n");
+    try expectRegionRefused(io, &tmp, a, "app.yaml:2:");
+
+    try tmp.dir.deleteTree(io, "src");
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n\tname = me\n# mox: when profile=zzz\n[gated]\n\tx = 1\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/os=darwin", "[core]\n\tautocrlf = input\n");
+    try expectRegionRefused(io, &tmp, a, ".gitconfig:3:");
+}
+
+test "compose catA: a region in a merged ini source, or in a base-less merge, is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.ini", "[s]\nk = 1\n# mox: when profile=zzz\n[gated]\nx = 1\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/app.ini.d/os=darwin.ini", "[t]\ny = 2\n");
+    try expectRegionRefused(io, &tmp, a, "app.ini:3:");
+
+    // No base, two matching overlays: still a structural merge, still refused.
+    try tmp.dir.deleteTree(io, "src");
+    try writeFile(io, tmp.dir, "src/nobase.toml.d/os=darwin.toml", "a = 1\n# mox: when profile=zzz\ngated = \"unreachable\"\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/nobase.toml.d/profile=personal.toml", "b = 2\n");
+    try expectRegionRefused(io, &tmp, a, "nobase.toml.d/os=darwin.toml:2:");
+}
+
+test "compose catA: a line directive in a merged source is refused too, and the line counts head directives" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two head directives, then content, then a `secret` line at line 5: a
+    // merge would drop the secret as a comment, and the diag names line 5
+    // of the file as written, not of the head-stripped text.
+    try writeFile(io, tmp.dir, "src/hd.toml", "# mox: own section\n# mox: own other\n[section]\na = 1\n# mox: secret \"file:///nonexistent\"\n");
+    try writeFile(io, tmp.dir, "src/hd.toml.d/os=darwin.toml", "[other]\nb = 2\n");
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("profile", "personal");
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(
+        error.InlineDirectiveWithOverlay,
+        mox.compose.composeFileTracked(a, io, tree.files[0], &b_r, null, null, null, &diag),
+    );
+    const cap = diag.capture() orelse return error.TestExpectedDiag;
+    try std.testing.expect(std.mem.indexOf(u8, cap, "hd.toml:5: # mox: secret") != null);
 }
