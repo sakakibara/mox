@@ -3487,3 +3487,142 @@ test "secret resolver: a cmd backend runs under the environment mox was given" {
     const live = try read(io, a, try h.liveOf(".secretrc"));
     try std.testing.expectEqualStrings("token = s3cret", std.mem.trimEnd(u8, live, " \r\n"));
 }
+
+/// Leave `h.repo` looking part-way through a merge, the way an interrupted
+/// `git pull` does. The guard is a marker lookup, so no real history is needed.
+fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.createDirPath(h.io, "repo/.git");
+    try tmp.dir.writeFile(h.io, .{ .sub_path = "repo/.git/MERGE_HEAD", .data = "deadbeef\n" });
+}
+
+test "apply, commit, and publish refuse a repo left part-way through a merge" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    _ = try h.run(&.{ "mox", "apply" });
+    try markMidMerge(h, &tmp);
+
+    // Composing now would write conflict markers live and run scripts from a
+    // half-applied revision, so every mutating command stops.
+    for ([_][]const u8{ "apply", "commit", "publish" }) |cmd| {
+        const r = try h.run(&.{ "mox", cmd });
+        try std.testing.expect(r.rc != 0);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, "part-way through a merge") != null);
+    }
+
+    // The live file is untouched by the refusal.
+    try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.liveOf(".zshrc")));
+}
+
+test "rollback: no id restores the newest snapshot and names it; none at all is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+
+    // Nothing to roll back to yet.
+    const none = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), none.rc);
+    try std.testing.expect(std.mem.indexOf(u8, none.err, "no snapshots") != null);
+
+    _ = try h.run(&.{ "mox", "apply" });
+    // A live edit, then an overwrite: the overwrite snapshots the edit first.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "hand edit\n" });
+    _ = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.liveOf(".zshrc")));
+    // A second snapshot, a second later so its id sorts after the first.
+    io.sleep(.fromMilliseconds(1100), .awake) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "second hand edit\n" });
+    _ = try h.run(&.{ "mox", "apply", "--overwrite" });
+
+    // No id: the newest snapshot, and it says which one it took rather than
+    // leaving an unattended run with no record.
+    const back = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), back.rc);
+    try std.testing.expect(std.mem.indexOf(u8, back.err, "rolling back the newest snapshot") != null);
+    try std.testing.expectEqualStrings("second hand edit\n", try read(io, a, try h.liveOf(".zshrc")));
+}
+
+/// A stand-in `pass` on PATH, so a `pass://` URI resolves to a known value
+/// without a real password manager. Returns the PATH to hand the harness.
+fn stubPass(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, root: []const u8) ![]const u8 {
+    const dir = try std.fs.path.join(a, &.{ root, "stubbin" });
+    try tmp.dir.createDirPath(io, "stubbin");
+    // .cmd, not .ps1: the resolver spawns a bare `pass`, and PATHEXT carries
+    // .CMD but not .PS1, so a PowerShell stub would never be found.
+    const leaf = if (builtin.os.tag == .windows) "pass.cmd" else "pass";
+    const name = try std.fmt.allocPrint(a, "stubbin/{s}", .{leaf});
+    const abs = try std.fs.path.join(a, &.{ dir, leaf });
+    const body = if (builtin.os.tag == .windows)
+        "@echo off\r\necho s3cret\r\n"
+    else
+        "#!/bin/sh\nprintf 's3cret\\n'\n";
+    try writeExecScript(io, tmp, name, body, abs);
+    const real = std.testing.environ.getAlloc(a, "PATH") catch "";
+    const sep = if (builtin.os.tag == .windows) ";" else ":";
+    return std.fmt.allocPrint(a, "{s}{s}{s}", .{ dir, sep, real });
+}
+
+test "export: a run that would bake a resolved secret refuses, and writes nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const path = try stubPass(a, io, &tmp, h.root);
+    var env = try gitEnv(h);
+    try env.put("PATH", path);
+
+    try writeRepo(io, &tmp, "repo/src/.plainrc", "plain\n");
+    try writeRepo(io, &tmp, "repo/src/.secretrc", "token = <secret:pass://tokens/api>\n");
+
+    // Without the flag: names the file, refuses, and leaves no tree at all --
+    // the decision has to land before cleartext reaches disk.
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const refused = try runExeEnv(h, &env, &.{ "export", out });
+    try std.testing.expectEqual(@as(u8, 2), refused.term.exited);
+    try std.testing.expect(std.mem.indexOf(u8, refused.stderr, "cleartext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused.stderr, ".secretrc") != null);
+    try std.testing.expect(!exists(io, out));
+
+    // With it, both files land and the resolved value is what the stub gave.
+    const ok = try runExeEnv(h, &env, &.{ "export", "--cleartext-secrets", out });
+    try std.testing.expectEqual(@as(u8, 0), ok.term.exited);
+    try std.testing.expectEqualStrings("token = s3cret\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".secretrc" })));
+    try std.testing.expectEqualStrings("plain\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".plainrc" })));
+}
+
+test "export: one file that cannot compose leaves no tree behind" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.goodrc", "fine\n");
+    try writeRepo(io, &tmp, "repo/src/.badrc", "x = <secret:bogus://nope>\n");
+
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be composed") != null);
+    // An export feeds a parity harness; a tree silently missing a file is
+    // worse than no tree, so the good file is not written either.
+    try std.testing.expect(!exists(io, out));
+}
