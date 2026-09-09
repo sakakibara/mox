@@ -135,6 +135,39 @@ pub const SetupOpts = struct {
     arch: ?[]const u8 = null,
 };
 
+/// Make `repo` a git working tree with every file committed, so doctor's
+/// tracked-source check runs and finds nothing untracked. git runs under a
+/// synthetic environment that reads no config of the operator's; a step
+/// that fails fails the test, and only a git that cannot be spawned skips it.
+pub fn gitTracked(io: Io, a: std.mem.Allocator, repo: []const u8) !void {
+    var map = std.process.Environ.Map.init(a);
+    try map.put("PATH", std.testing.environ.getAlloc(a, "PATH") catch "");
+    try map.put("HOME", repo);
+    const no_config = try std.fmt.allocPrint(a, "{s}.no-gitconfig", .{repo});
+    try map.put("GIT_CONFIG_GLOBAL", no_config);
+    try map.put("GIT_CONFIG_SYSTEM", no_config);
+    if (@import("builtin").os.tag == .windows) {
+        try map.put("PATHEXT", std.testing.environ.getAlloc(a, "PATHEXT") catch "");
+        try map.put("SystemRoot", std.testing.environ.getAlloc(a, "SystemRoot") catch "");
+        try map.put("ComSpec", std.testing.environ.getAlloc(a, "ComSpec") catch "");
+    }
+    const steps = [_][]const []const u8{
+        &.{ "git", "init", "-q", repo },
+        &.{ "git", "-C", repo, "add", "-A" },
+        &.{ "git", "-C", repo, "-c", "user.name=mox test", "-c", "user.email=mox-test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "fixture" },
+    };
+    for (steps) |argv| {
+        const r = std.process.run(a, io, .{ .argv = argv, .environ_map = &map }) catch |e| switch (e) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return e,
+        };
+        switch (r.term) {
+            .exited => |code| if (code != 0) return error.GitFixtureStepFailed,
+            else => return error.GitFixtureStepFailed,
+        }
+    }
+}
+
 pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: SetupOpts) !Harness {
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
@@ -151,12 +184,16 @@ pub fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: Setup
     // what keeps a test's git off the operator's ~/.gitconfig (and so off
     // their commit signing and credential helpers).
     try map.put("PATH", std.testing.environ.getAlloc(a, "PATH") catch "");
+    // A fixture repo is a git working tree only when a test makes it one:
+    // git must not discover the checkout the suite itself runs inside.
+    try map.put("GIT_CEILING_DIRECTORIES", root);
     if (@import("builtin").os.tag == .windows) {
         // Resolving a bare `git` to `git.exe` is PATHEXT's job, and much of
         // Windows' own process startup wants SystemRoot. A synthetic
         // environment that omits them cannot spawn anything at all.
         try map.put("PATHEXT", std.testing.environ.getAlloc(a, "PATHEXT") catch "");
         try map.put("SystemRoot", std.testing.environ.getAlloc(a, "SystemRoot") catch "");
+        try map.put("ComSpec", std.testing.environ.getAlloc(a, "ComSpec") catch "");
     }
     if (opts.home_var) |v| try map.put(v, home);
     try map.put("USER", "tester");

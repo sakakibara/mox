@@ -1282,6 +1282,7 @@ test "doctor: a conventional `.d` config dir is healthy, not an orphan" {
     // every real dotfiles repo has (fish conf.d, profile.d, sources.list.d).
     try writeRepo(io, &tmp, "repo/src/.config/fish/conf.d/abbreviations.fish", "abbr -a -- e nvim\n");
 
+    try testutil.gitTracked(io, a, h.repo);
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "conf.d") == null);
@@ -1322,13 +1323,14 @@ test "doctor: a presence-fact gate is not a never-materializes false positive" {
     // that has the fact, so it must not be flagged as never-materializing.
     try writeRepo(io, &tmp, "repo/src/.config/gpg.toml", "# mox: when signing_key\nkey = 1\n");
 
+    try testutil.gitTracked(io, a, h.repo);
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "never-materializes") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "healthy") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
-test "doctor: a bound fact nothing in the repo consumes is an unused-fact advisory, not a failure" {
+test "doctor: a bound fact nothing in the repo consumes is an unused-fact advisory, and the rc says so" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1362,6 +1364,7 @@ test "doctor: a bound fact this repo's sources actually consume is never flagged
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "profile = \"work\"\n" });
 
+    try testutil.gitTracked(io, a, h.repo);
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "unused-fact") == null);
