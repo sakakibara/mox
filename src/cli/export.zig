@@ -39,11 +39,35 @@ pub fn exportDest(arena: std.mem.Allocator, out_dir: []const u8, home: []const u
 /// single-value axis (`os` -> `darwin`) and as a set-membership key
 /// (`os=darwin` -> `1`), so either axis style resolves against it.
 pub fn applyTupleOverride(arena: std.mem.Allocator, bindings: *std.StringHashMap([]const u8), tuple: AxisTuple) !void {
+    var names_machine = false;
     for (tuple.pairs) |p| {
+        if (std.mem.eql(u8, p.name, "machine")) names_machine = true;
         try bindings.put(p.name, p.value);
         const member = try std.fmt.allocPrint(arena, "{s}={s}", .{ p.name, p.value });
         try bindings.put(member, "1");
     }
+    // `machine` is derived from `hostname` on a real machine; a simulated
+    // hostname carries its label along unless the tuple binds it itself.
+    for (tuple.pairs) |p| {
+        if (!names_machine and std.mem.eql(u8, p.name, "hostname")) {
+            const label = mox.machine.bindings.firstLabel(p.value);
+            try bindings.put("machine", label);
+            try bindings.put(try std.fmt.allocPrint(arena, "machine={s}", .{label}), "1");
+        }
+    }
+}
+
+/// The repo data file a `DataFileError` came from: the first of the two the
+/// capture reads that exists and cannot be read as a file.
+fn unreadableDataFile(arena: std.mem.Allocator, io: std.Io, repo_dir: []const u8) ![]const u8 {
+    for ([_][]const u8{ "facts.toml", "paths.toml" }) |name| {
+        const path = try std.fs.path.join(arena, &.{ repo_dir, "data", name });
+        _ = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return path,
+        };
+    }
+    return try std.fs.path.join(arena, &.{ repo_dir, "data" });
 }
 
 /// One file the export will write, held until every file has composed. A
@@ -60,6 +84,7 @@ const Planned = struct {
 const Spec = struct {
     cleartext_secrets: cli.Flag(.{ .help = "required only when the export bakes a resolved secret as cleartext" }),
     as: cli.Opt([]const u8, .{ .value_name = "tuple", .help = "compose as if bound to this axis tuple" }),
+    facts: cli.Opt([]const u8, .{ .value_name = "path", .help = "read facts from this file instead of the machine's own" }),
     out: cli.Pos([]const u8, .{ .help = "output directory" }),
 };
 
@@ -67,7 +92,67 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const out_dir = a.out;
 
-    const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
+    // A tuple's values are filename-safe by grammar, so they cannot carry an
+    // address or a key. `--facts` replaces the machine's own facts.toml
+    // instead, which is what composing another machine takes; derived facts
+    // and tool probes still come from the running machine.
+    // `--facts` makes this file user-supplied, so every way it can be wrong
+    // has to name the file and the offending key rather than surfacing a bare
+    // error name. `facts_src` is what the user typed, or the machine's own.
+    const facts_src = a.facts orelse context.paths.facts_path;
+    var facts_diag: mox.machine.diag.Diag = .{};
+    const m_state = mox.machine.state.captureWith(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir, .{ .diag = &facts_diag, .facts_path = a.facts }) catch |e| switch (e) {
+        error.FactsFileNotFound => {
+            try ctx.err.print("mox export: no facts file at {s}\n", .{facts_src});
+            return 2;
+        },
+        error.IsDir => {
+            try ctx.err.print("mox export: {s} is a directory, not a facts file\n", .{facts_src});
+            return 2;
+        },
+        error.AccessDenied => {
+            try ctx.err.print("mox export: cannot read {s}\n", .{facts_src});
+            return 2;
+        },
+        // The machine facts file is the one `--facts` replaces, so its
+        // diagnostic gets the real path in place of the generic label.
+        error.ReservedFactName => {
+            try ctx.err.print("mox export: {s}: {s}\n", .{ facts_src, facts_diag.capture() orelse "a fact name collides with a reserved axis name" });
+            return 2;
+        },
+        // These come from the repo's own `data/facts.toml`, never from the
+        // file `--facts` names, so attributing them to it would misdirect.
+        error.ReservedFactsRowName, error.MalformedFactsRow => {
+            try ctx.err.print("mox export: {s}\n", .{
+                facts_diag.capture() orelse "a data/facts.toml row is malformed",
+            });
+            return 2;
+        },
+        error.DataFileError => {
+            try ctx.err.print("mox export: cannot read {s}: {s}\n", .{
+                try unreadableDataFile(ctx.alloc, ctx.io, context.paths.repo_dir),
+                facts_diag.capture() orelse "not a readable data file",
+            });
+            return 2;
+        },
+        error.TomlParseError => {
+            try ctx.err.print("mox export: cannot parse {s}: not valid TOML\n", .{facts_src});
+            return 2;
+        },
+        else => |other| {
+            try ctx.err.print("mox export: cannot read {s}: {s}\n", .{ facts_src, switch (other) {
+                error.PermissionDenied => "permission denied",
+                error.StreamTooLong => "larger than the 64 KiB a facts file may be",
+                else => @errorName(other),
+            } });
+            return 2;
+        },
+    };
+    // A row that is not a string binds nothing, so a gate naming it never
+    // matches. Silently that composes a tree missing whole regions.
+    for (m_state.skipped_fact_keys) |k| {
+        try ctx.err.print("mox export: {s}: {s}: {s}; ignored\n", .{ facts_src, k.name, k.reason });
+    }
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     const live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     const live_resolver: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
@@ -83,6 +168,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox export: invalid axis tuple '{s}'\n", .{as});
             return 2;
         };
+        for (tuple.pairs) |p| {
+            if (std.mem.eql(u8, p.name, "hostname") and mox.machine.bindings.firstLabel(p.value).len == 0) {
+                try ctx.err.print("mox export: --as hostname={s} has no label before its first dot, so it names no machine\n", .{p.value});
+                return 2;
+            }
+        }
         as_map = std.StringHashMap([]const u8).init(ctx.alloc);
         try applyTupleOverride(ctx.alloc, &as_map, tuple);
         // The override layer carries the `--as` tuple; it wins over the live
@@ -271,7 +362,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 pub const command = app.command(Spec, .{
     .name = "export",
     .summary = "Bake a flat resolved tree into a dir",
-    .usage = "mox export [--as <tuple>] [--cleartext-secrets] <out>",
+    .usage = "mox export [--as <tuple>] [--facts <path>] [--cleartext-secrets] <out>",
     .details = "Composes every file under <out>/<rel>. A partially owned target exports its canonical owned serialization (the '= <path>' sections) -- the ownership contract, not a whole live file. Everything is composed before anything is written, so a run that cannot compose every file writes nothing; an export that would bake a resolved secret as cleartext names those files and refuses until --cleartext-secrets is passed.",
     .group = .general,
     .needs_context = true,

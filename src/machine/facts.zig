@@ -13,8 +13,9 @@ const max_facts_bytes: usize = 64 * 1024;
 /// the drop silent.
 pub const LoadResult = struct {
     facts: []const state_mod.Fact,
-    /// Top-level keys whose value was not a string, in file order.
-    skipped: []const []const u8 = &.{},
+    /// Top-level keys that bind nothing, in file order, each with why: the
+    /// value is not a string, or the name is a built-in machine field.
+    skipped: []const state_mod.SkippedFact = &.{},
 };
 
 /// Names a reserved-axis-name collision (`error.ReservedFactName`): which key
@@ -48,20 +49,24 @@ pub fn load(arena: std.mem.Allocator, io: Io, path: []const u8, diag: ?*Diag) !L
     if (v != .table) return .{ .facts = &.{} };
 
     var out: std.ArrayList(state_mod.Fact) = .empty;
-    var skipped: std.ArrayList([]const u8) = .empty;
+    var skipped: std.ArrayList(state_mod.SkippedFact) = .empty;
     var it = v.table.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         if (source_axes.isReservedAxisName(name)) {
             if (diag) |d| d.set(
-                "facts.toml: \"{s}\" collides with the reserved axis names (tool, env, path); rename it",
+                "\"{s}\" collides with the reserved axis names (tool, env, path); rename it",
                 .{name},
             );
             return error.ReservedFactName;
         }
+        if (state_mod.isMachineAxis(name)) {
+            try skipped.append(arena, .{ .name = name, .reason = "names a machine axis; the machine's own value is used" });
+            continue;
+        }
         switch (entry.value_ptr.*) {
             .string => |s| try out.append(arena, .{ .name = name, .value = s }),
-            else => try skipped.append(arena, name),
+            else => try skipped.append(arena, .{ .name = name, .reason = "not a string; a gate naming it will never match" }),
         }
     }
     return .{ .facts = try out.toOwnedSlice(arena), .skipped = try skipped.toOwnedSlice(arena) };
@@ -136,9 +141,29 @@ test "load: skips non-string values, and names them in skipped" {
     try std.testing.expectEqualStrings("hello", r.facts[0].value);
 
     try std.testing.expectEqual(@as(usize, 3), r.skipped.len);
-    try std.testing.expectEqualStrings("count", r.skipped[0]);
-    try std.testing.expectEqualStrings("enabled", r.skipped[1]);
-    try std.testing.expectEqualStrings("places", r.skipped[2]);
+    try std.testing.expectEqualStrings("count", r.skipped[0].name);
+    try std.testing.expectEqualStrings("not a string; a gate naming it will never match", r.skipped[0].reason);
+    try std.testing.expectEqualStrings("enabled", r.skipped[1].name);
+    try std.testing.expectEqualStrings("places", r.skipped[2].name);
+}
+
+test "load: a row naming a built-in machine field binds nothing, and says why" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "facts.toml", .data = "os = \"plan9\"\nname = \"hello\"\n" });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cwd_path = try std.process.currentPathAlloc(io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd_path);
+    const facts_path = try std.fs.path.join(std.testing.allocator, &.{ cwd_path, ".zig-cache", "tmp", &tmp.sub_path, "facts.toml" });
+    defer std.testing.allocator.free(facts_path);
+    const r = try load(arena.allocator(), io, facts_path, null);
+    try std.testing.expectEqual(@as(usize, 1), r.facts.len);
+    try std.testing.expectEqualStrings("name", r.facts[0].name);
+    try std.testing.expectEqual(@as(usize, 1), r.skipped.len);
+    try std.testing.expectEqualStrings("os", r.skipped[0].name);
+    try std.testing.expectEqualStrings("names a machine axis; the machine's own value is used", r.skipped[0].reason);
 }
 
 /// Absolute path to a `facts.toml` written under `tmp`, using the canonical

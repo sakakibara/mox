@@ -342,7 +342,7 @@ break the framing; unescape those four to recover exact bytes. Both imply
 
 ## export
 
-`export [--as <tuple>] <out>` bakes a flat resolved tree: compose every
+`export [--as <tuple>] [--facts <path>] [--cleartext-secrets] <out>` bakes a flat resolved tree: compose every
 managed file for the current machine (or the given axis tuple) and
 write it under `<out>/<live-rel>`. A partially owned target exports its
 canonical owned serialization -- the ownership contract, not a whole
@@ -356,6 +356,14 @@ tree. Composing still happens exactly once, which matters because a
 second pass would resolve every `op://` secret again -- another round
 trip, another biometric prompt.
 
+`--as` binds axes by tuple, whose values are filename-safe by grammar
+(`[A-Za-z0-9_.-]` and non-ASCII bytes; `+` separates pairs and `=` splits them) and so cannot carry an address, a key, or anything
+holding a space. `--facts <path>` substitutes the whole fact set instead:
+compose against a machine that does not exist, without fabricating an
+`XDG_CONFIG_HOME` around a temporary `facts.toml`. The two compose --
+`--facts` supplies the values, `--as` and `MOX_OS` place the machine -- which
+is what a matrix check over a repo's config space needs.
+
 An export that would bake a resolved secret as cleartext names those
 files and refuses until `--cleartext-secrets` is passed, deciding
 before any of it reaches disk. The flag is demanded only when a secret
@@ -368,6 +376,7 @@ such file lands at 0600 and the count is reported.
 | --- | --- |
 | `--cleartext-secrets` | required only when the export bakes a resolved secret as cleartext |
 | `--as <tuple>` | compose as if bound to this axis tuple |
+| `--facts <path>` | read facts from this file instead of the machine's own |
 <!-- /generated -->
 
 ## facts
@@ -383,7 +392,9 @@ asked under.
 
 `facts set <name> <value>` writes one directly; an empty value is the
 scriptable decline (`mox facts set <name> ""`), identical to pressing
-Enter at an unanswered prompt with no default.
+Enter at an unanswered prompt with no default. A name that is a machine
+axis (os, arch, machine, hostname) is refused: the machine's own value
+is used, so a fact cannot set it.
 
 `facts ask [<name>]` re-runs the interview interactively (refuses off a
 terminal -- there is no non-interactive form of "ask again"). With

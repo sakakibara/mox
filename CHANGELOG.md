@@ -6,6 +6,26 @@ All notable changes to mox are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `export --facts <path>` composes against a facts file instead of the
+  machine's own; a missing, unreadable or malformed file is refused naming the
+  file, and a row that binds nothing (not a string, or naming a machine axis:
+  os, arch, machine, hostname) is reported by name and reason, for the
+  machine's own file too. An unreadable `data/facts.toml` is named as such
+  rather than as the file `--facts` named. `export --as hostname=<name>` binds
+  `machine` to the name's first label unless the tuple binds `machine` itself,
+  as a real machine does, and a hostname with no label before its first dot is
+  refused. A facts file behind an unreadable directory, or one over 64 KiB, is
+  named for what it is rather than as missing or by a bare error name, `apply`
+  names the machine's facts file the same way, and an unreadable
+  `data/paths.toml` is named as itself.
+
+### Changed
+- `mox facts` no longer lists a row naming a machine axis (os, arch, machine,
+  hostname), which never bound anything, and `facts set` refuses such a name;
+  `apply` and `facts` report a row that binds nothing in one wording, the
+  reason before `ignored`.
+
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
   fetch, in its help and both guides: the source tree is brought current, only

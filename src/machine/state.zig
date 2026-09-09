@@ -32,6 +32,26 @@ pub const builtin_field_names = [_][]const u8{
     "xdg_data_home", "xdg_state_home",
 };
 
+/// A facts.toml row that binds nothing, and why.
+pub const SkippedFact = struct { name: []const u8, reason: []const u8 };
+
+/// The built-in fields `machine.bindings.fromMachineState` binds as axes;
+/// a facts.toml row of such a name cannot bind anything.
+pub const machine_axis_names = builtin_field_names[0..4];
+
+pub fn isMachineAxis(name: []const u8) bool {
+    for (machine_axis_names) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+test "machine_axis_names: the four built-in fields bindings binds as axes" {
+    try std.testing.expectEqual(@as(usize, 4), machine_axis_names.len);
+    for ([_][]const u8{ "os", "arch", "machine", "hostname" }, machine_axis_names) |want, got| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expect(!isMachineAxis("username"));
+}
+
 pub fn isBuiltinField(field: []const u8) bool {
     for (builtin_field_names) |b| {
         if (std.mem.eql(u8, field, b)) return true;
@@ -76,10 +96,11 @@ pub const MachineState = struct {
     /// User-supplied facts from `$XDG_CONFIG_HOME/mox/facts.toml`. Empty when
     /// the file is absent. A built-in field with the same name takes priority.
     custom_facts: []const Fact = &.{},
-    /// Top-level `facts.toml` keys dropped for a non-string value. Loud on
-    /// capture use (a gate naming the key just never matches); named here so
-    /// a caller can warn instead of leaving the drop silent too.
-    skipped_fact_keys: []const []const u8 = &.{},
+    /// Top-level `facts.toml` keys that bind nothing, with why: a non-string
+    /// value (a gate naming the key never matches) or a built-in machine
+    /// field's name (the machine's own value is used). Named here so a
+    /// caller can warn instead of leaving the drop silent.
+    skipped_fact_keys: []const SkippedFact = &.{},
 
     /// This snapshot's lazy tool-probe layer, ready to hand to
     /// `dsl.resolver.Resolver.Live.probe`. Null only when `tool_probe` itself
@@ -191,23 +212,33 @@ pub fn schemaLeftoverNotice(arena: std.mem.Allocator, io: Io, repo_dir: []const 
 /// (probe-widening registry); pass `""` for either when no repo is in scope
 /// (registry-absent behavior: no derived facts, no extra probe directories).
 pub fn capture(arena: std.mem.Allocator, io: Io, environ: Environ, repo_dir: []const u8, private_dir: []const u8) !MachineState {
-    return captureDiag(arena, io, environ, repo_dir, private_dir, null);
+    return captureWith(arena, io, environ, repo_dir, private_dir, .{});
 }
 
-/// Same as `capture`, but a non-null `diag` is filled with the offending name
+/// What a caller may substitute for the machine's own state. Every field
+/// defaults to the machine, so `.{}` is a plain capture.
+pub const Overrides = struct {
+    /// Filled with the offending name on a reserved/malformed fact error.
+    diag: ?*diag_mod.Diag = null,
+    /// Read facts from this file instead of `$XDG_CONFIG_HOME/mox/facts.toml`,
+    /// so a harness can compose against a fact set no machine has to hold.
+    facts_path: ?[]const u8 = null,
+};
+
+/// Same as `capture`, but `ov.diag` (when non-null) is filled with the offending name
 /// when a custom fact or a `data/facts.toml` row collides with a reserved
 /// axis name or a built-in fact (`error.ReservedFactName`,
 /// `error.ReservedFactsRowName`), or names a malformed `data/facts.toml` row
 /// (`error.MalformedFactsRow`) -- the same message `mox facts`/`mox apply`
 /// print -- so a caller can report it instead of leaving the bare error name
 /// to speak for itself.
-pub fn captureDiag(
+pub fn captureWith(
     arena: std.mem.Allocator,
     io: Io,
     environ: Environ,
     repo_dir: []const u8,
     private_dir: []const u8,
-    diag: ?*diag_mod.Diag,
+    ov: Overrides,
 ) !MachineState {
     const builtin = @import("builtin");
 
@@ -253,10 +284,19 @@ pub fn captureDiag(
     // moment its directory exists, via `data/paths.toml` below, not just
     // once a shellenv line is itself applied and PATH grows on some LATER
     // process's re-exec.
-    const derived = try derived_facts_mod.load(arena, io, environ, repo_dir, private_dir, home, diag);
+    const derived = try derived_facts_mod.load(arena, io, environ, repo_dir, private_dir, home, ov.diag);
 
-    const facts_path = try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
-    const facts_result = try facts_mod.load(arena, io, facts_path, diag);
+    // A missing facts file is normal for the machine's own -- a machine may
+    // simply have none yet -- and a typo for one a caller named, where
+    // tolerating it composes a silently factless tree and reports success.
+    const facts_path = if (ov.facts_path) |p| blk: {
+        Io.Dir.cwd().access(io, p, .{}) catch |e| switch (e) {
+            error.FileNotFound => return error.FactsFileNotFound,
+            else => return e,
+        };
+        break :blk p;
+    } else try std.fs.path.join(arena, &.{ xdg_config_home, "mox", "facts.toml" });
+    const facts_result = try facts_mod.load(arena, io, facts_path, ov.diag);
 
     // Machine-local facts.toml wins over the repo's derived registry on a
     // name collision (checked here, not enforced -- distinct row spaces).
@@ -592,7 +632,7 @@ test "capture: a data/facts.toml row colliding with a built-in fact errors loudl
     var map = EnvironMap.init(a);
     try map.put("HOME", "/home/whoever");
     var d: diag_mod.Diag = .{};
-    try std.testing.expectError(error.ReservedFactsRowName, captureDiag(a, io, Environ{ .map = &map }, repo, "", &d));
+    try std.testing.expectError(error.ReservedFactsRowName, captureWith(a, io, Environ{ .map = &map }, repo, "", .{ .diag = &d }));
     try std.testing.expect(std.mem.indexOf(u8, d.capture().?, "home") != null);
 }
 

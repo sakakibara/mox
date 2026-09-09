@@ -23,7 +23,7 @@ pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
 }
 
-/// `machine.state.captureDiag`, reporting a `ReservedFactName` (a custom fact
+/// `machine.state.captureWith`, reporting a `ReservedFactName` (a custom fact
 /// or `data/facts.toml` row colliding with a reserved axis or built-in
 /// field) or a malformed `data/facts.toml` row the same way `mox facts` does,
 /// instead of letting the bare error name reach main's generic handler --
@@ -32,17 +32,38 @@ pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// error still propagates.
 fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, private_dir: []const u8) !?mox.machine.state.MachineState {
     var diag: mox.machine.diag.Diag = .{};
-    return mox.machine.state.captureDiag(ctx.alloc, ctx.io, env, repo_dir, private_dir, &diag) catch |e| switch (e) {
-        error.ReservedFactName, error.ReservedFactsRowName => {
+    const facts_path = ctx.context.?.paths.facts_path;
+    return mox.machine.state.captureWith(ctx.alloc, ctx.io, env, repo_dir, private_dir, .{ .diag = &diag }) catch |e| switch (e) {
+        error.ReservedFactName => {
+            try ctx.err.print("mox apply: {s}: {s}\n", .{ facts_path, diag.capture() orelse "a fact name collides with a reserved axis name" });
+            return null;
+        },
+        error.ReservedFactsRowName => {
             try ctx.err.print("mox apply: {s}\n", .{
                 diag.capture() orelse "a fact name collides with a reserved axis name",
             });
+            return null;
+        },
+        error.TomlParseError => {
+            try ctx.err.print("mox apply: cannot parse {s}: not valid TOML\n", .{facts_path});
+            return null;
+        },
+        error.IsDir => {
+            try ctx.err.print("mox apply: cannot read {s}: is a directory\n", .{facts_path});
+            return null;
+        },
+        error.StreamTooLong => {
+            try ctx.err.print("mox apply: cannot read {s}: larger than the 64 KiB a facts file may be\n", .{facts_path});
             return null;
         },
         error.MalformedFactsRow => {
             try ctx.err.print("mox apply: {s}\n", .{
                 diag.capture() orelse "a data/facts.toml row is malformed",
             });
+            return null;
+        },
+        error.AccessDenied, error.PermissionDenied => {
+            try ctx.err.print("mox apply: cannot read {s}\n", .{facts_path});
             return null;
         },
         else => return e,
@@ -177,8 +198,8 @@ fn applyPass(
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
     var bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
-    for (m_state.skipped_fact_keys) |key| {
-        try ctx.err.print("mox apply: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
+    for (m_state.skipped_fact_keys) |k| {
+        try ctx.err.print("mox apply: facts.toml: {s}: {s}; ignored\n", .{ k.name, k.reason });
     }
     if (m_state.hostname_fallback) {
         try ctx.err.writeAll("mox apply: hostname could not be determined; using \"unknown\"\n");

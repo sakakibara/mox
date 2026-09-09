@@ -535,6 +535,82 @@ test "edit: --axis resolves the matching overlay file" {
     try std.testing.expectEqualStrings(overlay_abs, edited);
 }
 
+test "export --facts: every way the file can be wrong names the file and the key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "x = 1\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+
+    // A reserved name: the user named this file, so the message must too,
+    // rather than the generic "facts.toml" label the diagnostic carries.
+    try writeRepo(io, &tmp, "reserved.toml", "tool = \"x\"\n");
+    const reserved = try std.fs.path.join(a, &.{ h.root, "reserved.toml" });
+    const r1 = try h.run(&.{ "mox", "export", "--facts", reserved, out });
+    try std.testing.expectEqual(@as(u8, 2), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.err, "reserved.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.err, "\"tool\"") != null);
+
+    // A directory is not a facts file; the absence guard only checked existence.
+    const dir = try std.fs.path.join(a, &.{ h.root, "adir" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const r2 = try h.run(&.{ "mox", "export", "--facts", dir, out });
+    try std.testing.expectEqual(@as(u8, 2), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.err, "is a directory") != null);
+
+    // A non-string row binds nothing, so a gate naming it never matches --
+    // which composes a tree missing whole regions if nobody says so.
+    try writeRepo(io, &tmp, "nonstr.toml", "profile = 42\n");
+    const nonstr = try std.fs.path.join(a, &.{ h.root, "nonstr.toml" });
+    const r3 = try h.run(&.{ "mox", "export", "--facts", nonstr, out });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r3.err, "profile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r3.err, "not a string") != null);
+
+    // Malformed TOML, and a file that cannot be read, name the file too.
+    try writeRepo(io, &tmp, "broken.toml", "profile = \n");
+    const broken = try std.fs.path.join(a, &.{ h.root, "broken.toml" });
+    const r4 = try h.run(&.{ "mox", "export", "--facts", broken, out });
+    try std.testing.expectEqual(@as(u8, 2), r4.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r4.err, "broken.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r4.err, "not valid TOML") != null);
+    if (builtin.os.tag != .windows and std.c.getuid() != 0) {
+        try writeRepo(io, &tmp, "sealed.toml", "profile = \"work\"\n");
+        const sealed = try std.fs.path.join(a, &.{ h.root, "sealed.toml" });
+        try chmodPath(a, sealed, 0o000);
+        defer chmodPath(a, sealed, 0o644) catch {};
+        const r5 = try h.run(&.{ "mox", "export", "--facts", sealed, out });
+        try std.testing.expectEqual(@as(u8, 2), r5.rc);
+        try std.testing.expect(std.mem.indexOf(u8, r5.err, "sealed.toml") != null);
+    }
+}
+
+test "export --facts: a path that is not there refuses instead of composing factless" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.mailrc", "# mox: when profile=work\nfrom = <machine.email>\n# mox: end\n");
+
+    // Tolerating this would compose every gate false and report success --
+    // a mistyped path that silently bakes the wrong tree.
+    const missing = try std.fs.path.join(a, &.{ h.root, "no-such-facts.toml" });
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--facts", missing, out });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no facts file at") != null);
+    try std.testing.expect(!exists(io, out));
+}
+
 test "export bakes the same bytes apply writes to live" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2428,6 +2504,63 @@ test "add --own: a symlinked live path captures through the link; apply patches 
     try std.testing.expect(!exists(io, try h.srcOf("dangling.toml")));
 }
 
+test "apply: a machine facts file that is a directory is named, not surfaced as an error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try tmp.dir.createDirPath(io, "home/.config/mox/facts.toml");
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: is a directory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "IsDir") == null);
+}
+
+test "apply: a machine facts file over the size limit is named, not surfaced as an error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    const big = try a.alloc(u8, (128 << 10));
+    @memset(big, 'a');
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = big });
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: larger than the 64 KiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "StreamTooLong") == null);
+}
+
+test "apply: a machine facts file behind an unreadable directory is named, not surfaced as an error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (builtin.os.tag == .windows or std.c.getuid() == 0) return; // a 0o000 dir is not a barrier here
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"work\"\n" });
+    const cfg = try std.fs.path.join(a, &.{ h.root, "home", ".config", "mox" });
+    try chmodPath(a, cfg, 0o000);
+    defer chmodPath(a, cfg, 0o755) catch {};
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "cannot read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "AccessDenied") == null);
+}
+
 test "edit: the editor is spawned under the environment mox was given, not the process's own" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3510,6 +3643,187 @@ test "export --as: a dotted value composes its own overlay and opens its own gat
     try std.testing.expectEqualStrings("keep = 1\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".gated" })));
 }
 
+test "export: a facts row that binds nothing is reported on the machine's own file too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "x\n");
+    const facts_dir = try std.fs.path.join(a, &.{ h.home, ".config", "mox" });
+    try Io.Dir.cwd().createDirPath(io, facts_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ facts_dir, "facts.toml" }), .data = "count = 42\nos = \"plan9\"\n" });
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: count: not a string; a gate naming it will never match; ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: os: names a machine axis; the machine's own value is used; ignored") != null);
+}
+
+test "export: a broken data/facts.toml is named, not the file --facts names" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.testrc", "fine\n");
+    try tmp.dir.createDirPath(io, "repo/data/facts.toml");
+    try tmp.dir.writeFile(io, .{ .sub_path = "good.toml", .data = "profile = \"work\"\n" });
+    const good = try std.fs.path.join(a, &.{ h.root, "good.toml" });
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--facts", good, out });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "good.toml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "data") != null);
+}
+
+test "export --as: a hostname carries its label along as machine" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "# mox: when hostname=\"studio.local\"\nhit-hostname\n# mox: end\n# mox: when machine=\"studio\"\nhit-machine\n# mox: end\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--as", "hostname=studio.local", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const baked = try read(io, a, try std.fs.path.join(a, &.{ out, ".rc" }));
+    try std.testing.expect(std.mem.indexOf(u8, baked, "hit-hostname") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baked, "hit-machine") != null);
+    // A tuple that binds machine itself is left alone.
+    const both = try h.run(&.{ "mox", "export", "--as", "hostname=studio.local+machine=other", try std.fs.path.join(a, &.{ h.root, "baked2" }) });
+    try std.testing.expectEqual(@as(u8, 0), both.rc);
+    const baked2 = try read(io, a, try std.fs.path.join(a, &.{ h.root, "baked2", ".rc" }));
+    try std.testing.expect(std.mem.indexOf(u8, baked2, "hit-machine") == null);
+}
+
+test "apply: a facts row named after a built-in field that is not an axis still binds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "username = \"alice\"\nos = \"plan9\"\n" });
+    try writeRepo(io, &tmp, "repo/src/.testrc", "# mox: when username=\"alice\"\nhit\n# mox: end\n");
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "username") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: os: names a machine axis") != null);
+    try std.testing.expectEqualStrings("hit\n", try read(io, a, try h.liveOf(".testrc")));
+}
+
+test "export --facts: a file behind an unreadable directory, or one over the size limit, is named for what it is" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no mode bits to close the directory with
+    if (std.c.getuid() == 0) return error.SkipZigTest; // root reads anything
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+
+    try writeRepo(io, &tmp, "nox/facts.toml", "profile = \"work\"\n");
+    const nox = try std.fs.path.join(a, &.{ h.root, "nox" });
+    try chmodPath(a, nox, 0o000);
+    defer chmodPath(a, nox, 0o755) catch {};
+    const hidden = try h.run(&.{ "mox", "export", "--facts", try std.fs.path.join(a, &.{ nox, "facts.toml" }), out });
+    try std.testing.expectEqual(@as(u8, 2), hidden.rc);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.err, "cannot read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.err, "no facts file") == null);
+
+    var big: std.Io.Writer.Allocating = .init(a);
+    try big.writer.writeAll("profile = \"work\"\n");
+    var n: usize = 0;
+    while (n < 20000) : (n += 1) try big.writer.writeAll("# pad\n");
+    try writeRepo(io, &tmp, "big.toml", big.written());
+    const over = try h.run(&.{ "mox", "export", "--facts", try std.fs.path.join(a, &.{ h.root, "big.toml" }), out });
+    try std.testing.expectEqual(@as(u8, 2), over.rc);
+    try std.testing.expect(std.mem.indexOf(u8, over.err, "64 KiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, over.err, "StreamTooLong") == null);
+}
+
+test "facts set: a name that is a machine axis is refused, since the machine's own value is used" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const refused = try h.run(&.{ "mox", "facts", "set", "os", "plan9" });
+    try std.testing.expectEqual(@as(u8, 2), refused.rc);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "os names a machine axis") != null);
+    const taken = try h.run(&.{ "mox", "facts", "set", "profile", "work" });
+    try std.testing.expectEqual(@as(u8, 0), taken.rc);
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"work\"\nos = \"plan9\"\n" });
+    const listed = try h.run(&.{ "mox", "facts" });
+    try std.testing.expect(std.mem.indexOf(u8, listed.out, "profile = \"work\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.out, "os = ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.err, "os: names a machine axis") != null);
+}
+
+test "export --as: a hostname with no label before its first dot names no machine and is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--as", "hostname=.local", out });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no label before its first dot") != null);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ out, ".rc" })));
+}
+
+test "export: a data/paths.toml that cannot be read is named as itself, not as data/facts.toml" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try tmp.dir.createDirPath(io, "repo/data/paths.toml");
+    const r = try h.run(&.{ "mox", "export", try std.fs.path.join(a, &.{ h.root, "baked" }) });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "data/paths.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "data/facts.toml") == null);
+}
+
+test "apply: a machine facts file that is not TOML is named, not surfaced as an error name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \n" });
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: not valid TOML") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "TomlParseError") == null);
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {
@@ -3626,6 +3940,48 @@ test "export: a run that would bake a resolved secret refuses, and writes nothin
     try std.testing.expectEqual(@as(u8, 0), ok.term.exited);
     try std.testing.expectEqualStrings("token = s3cret\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".secretrc" })));
     try std.testing.expectEqualStrings("plain\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".plainrc" })));
+}
+
+test "export --facts: composes against a fact set no machine holds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.mailrc", "# mox: when profile=work\nfrom = <machine.email>\n# mox: end\n");
+
+    // `@` is outside the axis-tuple value grammar, so `--as` could not carry
+    // this at all: substituting the fact set is the only way to compose it.
+    try writeRepo(io, &tmp, "work.toml", "profile = \"work\"\nemail = \"someone@example.com\"\n");
+    try writeRepo(io, &tmp, "home.toml", "profile = \"personal\"\nemail = \"me@example.com\"\n");
+
+    const work_facts = try std.fs.path.join(a, &.{ h.root, "work.toml" });
+    const work_out = try std.fs.path.join(a, &.{ h.root, "baked-work" });
+    const r = try h.run(&.{ "mox", "export", "--facts", work_facts, work_out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings(
+        "from = someone@example.com\n",
+        try read(io, a, try std.fs.path.join(a, &.{ work_out, ".mailrc" })),
+    );
+
+    // A different fact set composes differently from the same source, so the
+    // file is genuinely read rather than the machine's own state reused. The
+    // gate closes here, and an empty compose is no file at all.
+    const home_facts = try std.fs.path.join(a, &.{ h.root, "home.toml" });
+    const home_out = try std.fs.path.join(a, &.{ h.root, "baked-home" });
+    const r2 = try h.run(&.{ "mox", "export", "--facts", home_facts, home_out });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ home_out, ".mailrc" })));
+
+    // `--as` places the machine while `--facts` supplies the values.
+    try writeRepo(io, &tmp, "repo/src/.osrc", "# mox: when os=linux\nfrom-as\n# mox: end\n# mox: when profile=work\nfrom-facts\n# mox: end\n");
+    const both_out = try std.fs.path.join(a, &.{ h.root, "baked-both" });
+    const both = try h.run(&.{ "mox", "export", "--facts", work_facts, "--as", "os=linux", both_out });
+    try std.testing.expectEqual(@as(u8, 0), both.rc);
+    try std.testing.expectEqualStrings("from-as\nfrom-facts\n", try read(io, a, try std.fs.path.join(a, &.{ both_out, ".osrc" })));
 }
 
 test "export: one file that cannot compose leaves no tree behind" {

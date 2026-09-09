@@ -20,7 +20,7 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
     var facts_diag: mox.machine.facts.Diag = .{};
     const current = mox.machine.facts.load(ctx.alloc, ctx.io, context.paths.facts_path, &facts_diag) catch |e| switch (e) {
         error.ReservedFactName => {
-            try ctx.err.print("mox facts: {s}\n", .{facts_diag.capture() orelse "a fact name collides with a reserved axis name"});
+            try ctx.err.print("mox facts: {s}: {s}\n", .{ context.paths.facts_path, facts_diag.capture() orelse "a fact name collides with a reserved axis name" });
             return 1;
         },
         else => return e,
@@ -30,8 +30,8 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
             try ctx.out.print("{s} = \"{s}\"\n", .{ f.name, f.value });
         }
     }
-    for (current.skipped) |key| {
-        try ctx.err.print("mox facts: facts.toml: {s}: not a string; ignored (a gate naming it will never match)\n", .{key});
+    for (current.skipped) |k| {
+        try ctx.err.print("mox facts: facts.toml: {s}: {s}; ignored\n", .{ k.name, k.reason });
     }
 
     const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
@@ -128,6 +128,10 @@ const SetSpec = struct {
 
 fn setRun(ctx: *app.Ctx, a: cli.Args(SetSpec)) anyerror!u8 {
     const context = ctx.context.?;
+    if (mox.machine.state.isMachineAxis(a.name)) {
+        try ctx.err.print("mox facts set: {s} names a machine axis; the machine's own value is used, so a fact cannot set it\n", .{a.name});
+        return 2;
+    }
     const lk = (try lock_mod.acquireForCommand(ctx, "facts set")) orelse return 1;
     defer lk.release();
     const answers = [_]mox.machine.state.Fact{
