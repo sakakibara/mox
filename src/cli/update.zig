@@ -79,30 +79,37 @@ pub const Status = struct {
     paths: []const []const u8,
 };
 
-/// Classify a `git status --porcelain` dump: `dirty` with the changed paths as
-/// soon as any entry changed, `clean` when none did. mox writes nothing into
-/// the repo of its own accord, so every change is the user's to commit.
+/// Classify a `git status --porcelain -z` dump: `dirty` with the changed paths
+/// as soon as any entry changed, `clean` when none did. mox writes nothing
+/// into the repo of its own accord, so every change is the user's to commit.
+///
+/// `-z`, not the newline form: without it git C-quotes any path that is not
+/// plain ASCII, so a source file with an accented name comes back as
+/// `"src/na\303\257ve.txt"` and every later `git add` of it fails. NUL
+/// separation has no quoting at all.
 pub fn classifyStatus(arena: std.mem.Allocator, porcelain: []const u8) !Status {
     var paths: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, porcelain, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (line.len < 4) continue;
-        const path = statusPath(line);
+    var it = std.mem.splitScalar(u8, porcelain, 0);
+    while (it.next()) |entry| {
+        // "XY <path>": status in columns 0-1, a space, then the path.
+        if (entry.len < 4) continue;
+        const path = entry[3..];
         if (path.len == 0) continue;
         try paths.append(arena, path);
+        // Under `-z` a rename or copy emits the ORIGINAL path as the next
+        // NUL-terminated field rather than an `orig -> new` line. A rename
+        // deletes the original, so it is a changed path too and must be listed
+        // (else a caller committing by pathspec strands the deletion); a copy
+        // leaves the original untouched. Either way the field is consumed, or
+        // it reads as an entry whose first three bytes are path text.
+        const renamed = entry[0] == 'R' or entry[1] == 'R';
+        const copied = entry[0] == 'C' or entry[1] == 'C';
+        if (renamed or copied) {
+            const orig = it.next();
+            if (renamed) if (orig) |o| if (o.len > 0) try paths.append(arena, o);
+        }
     }
     return .{ .kind = if (paths.items.len > 0) .dirty else .clean, .paths = paths.items };
-}
-
-/// The working path from one porcelain v1 line. The status code is columns 0-1
-/// and column 2 is a space, so the path begins at column 3; a rename/copy is
-/// rendered "orig -> new" and the post-change path is the one that matters.
-fn statusPath(line: []const u8) []const u8 {
-    if (line.len < 4) return "";
-    const rest = line[3..];
-    if (std.mem.indexOf(u8, rest, " -> ")) |i| return rest[i + 4 ..];
-    return rest;
 }
 
 /// Fetch and rebase the repo behind `git`. Returns 0 on success and 2 on any
@@ -116,7 +123,7 @@ pub fn fetchRebase(git: Git, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
         return 2;
     }
 
-    const status = try git.run(&.{ "git", "status", "--porcelain" });
+    const status = try git.run(&.{ "git", "status", "--porcelain", "-z" });
     if (!status.ok) {
         try stderr.print("mox update: git status failed: {s}", .{status.stderr});
         return 2;
@@ -226,7 +233,7 @@ test "classifyStatus: empty tree is clean" {
 test "classifyStatus: dirty source is listed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const s = try classifyStatus(arena.allocator(), " M src/.zshrc\n");
+    const s = try classifyStatus(arena.allocator(), " M src/.zshrc\x00");
     try testing.expectEqual(DirtyKind.dirty, s.kind);
     try testing.expectEqual(@as(usize, 1), s.paths.len);
     try testing.expectEqualStrings("src/.zshrc", s.paths[0]);
@@ -235,13 +242,30 @@ test "classifyStatus: dirty source is listed" {
 test "classifyStatus: an untracked file is dirty too" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const s = try classifyStatus(arena.allocator(), "?? src/.new\nM  src/.zshrc\n");
+    const s = try classifyStatus(arena.allocator(), "?? src/.new\x00M  src/.zshrc\x00");
     try testing.expectEqual(DirtyKind.dirty, s.kind);
     try testing.expectEqual(@as(usize, 2), s.paths.len);
 }
 
-test "statusPath: rename yields the post-change path" {
-    try testing.expectEqualStrings("src/new", statusPath("R  src/old -> src/new"));
+test "classifyStatus: a rename yields both the post-change path and the deleted original" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Under `-z` a rename is two NUL-terminated fields, new then original.
+    // Both are changed paths: the new is added, the original is deleted.
+    const s = try classifyStatus(arena.allocator(), "R  src/new\x00src/old\x00");
+    try testing.expectEqual(@as(usize, 2), s.paths.len);
+    try testing.expectEqualStrings("src/new", s.paths[0]);
+    try testing.expectEqualStrings("src/old", s.paths[1]);
+}
+
+test "classifyStatus: a non-ASCII path arrives unquoted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The newline form C-quotes this to `"src/na\303\257ve.txt"`, which no
+    // later `git add` can match. `-z` hands over the real bytes.
+    const s = try classifyStatus(arena.allocator(), " M src/na\xc3\xafve.txt\x00");
+    try testing.expectEqual(@as(usize, 1), s.paths.len);
+    try testing.expectEqualStrings("src/na\xc3\xafve.txt", s.paths[0]);
 }
 
 // Integration tests: a local bare remote and clones inside the test tmp dir.

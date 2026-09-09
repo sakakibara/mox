@@ -3519,6 +3519,33 @@ test "publish: commits only mox's own tree, never a stray file beside it" {
     try std.testing.expectEqualStrings("bump A", try headSubject(h, remote));
 }
 
+test "publish -m: a rename inside mox's tree commits both halves, not a half-applied rename" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+
+    // Rename a tracked source: both ends are mox-owned, so the deletion of the
+    // old path and the addition of the new must reach the commit together. A
+    // pathspec listing only the new path would strand the deletion and push a
+    // half-applied rename.
+    try gitOk(h, h.repo, &.{ "git", "mv", "src/.zshrc", "src/.zshrc.renamed" });
+
+    const r = try h.run(&.{ "mox", "publish", "-m", "rename rc" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    const tree = try git(h, remote, &.{ "git", "ls-tree", "-r", "--name-only", "HEAD" });
+    try std.testing.expect(std.mem.indexOf(u8, tree.stdout, "src/.zshrc.renamed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tree.stdout, "src/.zshrc\n") == null);
+
+    const status = try git(h, h.repo, &.{ "git", "status", "--porcelain" });
+    try std.testing.expectEqualStrings("", std.mem.trim(u8, status.stdout, " \t\r\n"));
+}
+
 test "publish: a dirty tree without -m is refused rather than half-published" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4388,6 +4415,77 @@ test "apply: a merged source is refused for a directive even when only one layer
     const exported = try h.run(&.{ "mox", "export", out });
     try std.testing.expectEqual(@as(u8, 2), exported.rc);
     try std.testing.expect(std.mem.indexOf(u8, exported.err, "gate the content with an overlay instead") != null);
+}
+
+test "publish -m: a non-ASCII or spaced source path is staged, read from git status unquoted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+    try writeRepo(io, &tmp, "repo/src/na\xc3\xafve.txt", "x\n");
+    try writeRepo(io, &tmp, "repo/src/a b.txt", "y\n");
+    const r = try h.run(&.{ "mox", "publish", "-m", "add two" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "committed src/na\xc3\xafve.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "committed src/a b.txt") != null);
+    try std.testing.expectEqualStrings("add two", try headSubject(h, remote));
+}
+
+test "publish: strays outside mox's tree are reported and the push goes ahead, as with -m" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=2\n");
+    try gitOk(h, h.repo, &.{ "git", "add", "--", "src/.zshrc" });
+    try gitOk(h, h.repo, &.{ "git", "commit", "-qm", "second" });
+    try writeRepo(io, &tmp, "repo/NOTES.md", "scratch\n");
+    const r = try h.run(&.{ "mox", "publish" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not committed: NOTES.md") != null);
+    try std.testing.expectEqualStrings("second", try headSubject(h, remote));
+
+    // A dirty path of mox's own still refuses, and names the stray beside it.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=3\n");
+    const refused = try h.run(&.{ "mox", "publish" });
+    try std.testing.expectEqual(@as(u8, 2), refused.rc);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "pass -m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "and outside mox's tree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "NOTES.md") != null);
+    try std.testing.expectEqualStrings("second", try headSubject(h, remote));
+}
+
+test "publish -m: a stray the user staged beforehand stays staged and out of the commit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const remote = try gitRepo(h, &tmp);
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=2\n");
+    try writeRepo(io, &tmp, "repo/NOTES.md", "SECRET=abc\n");
+    try gitOk(h, h.repo, &.{ "git", "add", "--", "NOTES.md" });
+    const r = try h.run(&.{ "mox", "publish", "-m", "second" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not committed: NOTES.md") != null);
+    try std.testing.expectEqualStrings("second", try headSubject(h, remote));
+    const shown = try git(h, h.repo, &.{ "git", "show", "--stat", "--format=", "HEAD" });
+    try std.testing.expect(std.mem.indexOf(u8, shown.stdout, "src/.zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown.stdout, "NOTES.md") == null);
+    const status = try git(h, h.repo, &.{ "git", "status", "--porcelain" });
+    try std.testing.expect(std.mem.indexOf(u8, status.stdout, "A  NOTES.md") != null);
 }
 
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted

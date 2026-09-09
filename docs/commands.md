@@ -504,8 +504,8 @@ same contract `apply` uses. Sending work the other way is `publish`.
 
 The outbound edge -- live to source to remote. With `-m <message>` it
 commits the repo's pending source changes and pushes them; without it,
-it pushes what is already committed and refuses a dirty tree rather
-than inventing a message.
+it pushes what is already committed, and refuses rather than invent a
+message when a path mox owns is dirty.
 
 Staging is by explicit path, never a blanket `git add -A`: only the
 directories mox owns (`src/`, `data/`, `scripts/`, `.mox/`, and

@@ -43,6 +43,9 @@ All notable changes to mox are documented here. The format follows
   closed gate as in an open one; a closed gate's contents went unexamined
   before.
 - BREAKING: `export` exits 2 on any failure to compose or write; it exited 1.
+- BREAKING: a bare `publish` refuses only when a path mox owns is dirty,
+  naming those and any stray beside them; strays alone are reported and the
+  push goes ahead, as with `-m` (any dirty path refused before).
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
@@ -105,6 +108,11 @@ All notable changes to mox are documented here. The format follows
   diagnostics as `apply`, documents its exit codes, and notes an `--as` value
   no source names, since every gate on that axis then closes (a presence test,
   a negated comparison or a private-layer source counts as naming it).
+- `publish` and `update` read `git status` unquoted, so a path with non-ASCII
+  bytes or spaces is staged; `publish -m` commits by the paths it staged, so a
+  stray the user had staged beforehand stays staged and out of the commit, as
+  the report says; `publish --help` and the usage guide describe what a bare
+  `publish` does with strays.
 
 ## [0.10.0] - 2026-08-12
 

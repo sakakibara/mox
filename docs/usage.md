@@ -419,11 +419,11 @@ mox update             # there: remote -> source -> live
 
 `publish` commits the repo's pending source changes and pushes them. It stages
 only mox's own directories, so a stray note or a pasted credential sitting
-beside your sources is never published: with `-m` it is reported and left
-alone, and without `-m` it blocks the push until you commit or remove it,
-since a bare `publish` pushes what is already committed and refuses a dirty
-tree. Routing a *live-file* edit
-into its source is still `mox commit` -- publish never does that silently.
+beside your sources is never published: it is reported and left alone, with
+or without `-m`. A bare `publish` pushes what is already committed, and
+refuses rather than invent a message when a path mox owns is dirty. Routing
+a *live-file* edit into its source is still `mox commit` -- publish never
+does that silently.
 
 `update` fetches, rebases onto the upstream, and applies, so the machine ends
 the run current rather than merely holding current sources. It refuses to

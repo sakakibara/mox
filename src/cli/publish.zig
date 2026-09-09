@@ -32,7 +32,7 @@ pub fn publishRepo(git: Git, message: ?[]const u8, stdout: *Io.Writer, stderr: *
         return 2;
     }
 
-    const status = try git.run(&.{ "git", "status", "--porcelain" });
+    const status = try git.run(&.{ "git", "status", "--porcelain", "-z" });
     if (!status.ok) {
         try stderr.print("mox publish: git status failed: {s}", .{status.stderr});
         return 2;
@@ -54,15 +54,33 @@ pub fn publishRepo(git: Git, message: ?[]const u8, stdout: *Io.Writer, stderr: *
         if (ours.items.len == 0) {
             try stdout.writeAll("Nothing to commit\n");
         } else {
-            var argv: std.ArrayList([]const u8) = .empty;
-            try argv.appendSlice(git.gpa, &.{ "git", "add", "--" });
-            try argv.appendSlice(git.gpa, ours.items);
-            const add = try git.run(argv.items);
-            if (!add.ok) {
-                try stderr.print("mox publish: git add failed: {s}", .{add.stderr});
-                return 2;
+            // Stage owned working-tree changes. A rename's old half is
+            // already staged as a deletion by whatever moved it and no longer
+            // exists to `git add` by name; add only the paths still present and
+            // let the commit pathspec below carry the staged deletion.
+            var to_add: std.ArrayList([]const u8) = .empty;
+            for (ours.items) |p| {
+                const full = try std.fs.path.join(git.gpa, &.{ git.dir, p });
+                Io.Dir.cwd().access(git.io, full, .{}) catch continue;
+                try to_add.append(git.gpa, p);
             }
-            const commit = try git.run(&.{ "git", "commit", "-m", msg });
+            if (to_add.items.len > 0) {
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.appendSlice(git.gpa, &.{ "git", "add", "--" });
+                try argv.appendSlice(git.gpa, to_add.items);
+                const add = try git.run(argv.items);
+                if (!add.ok) {
+                    try stderr.print("mox publish: git add failed: {s}", .{add.stderr});
+                    return 2;
+                }
+            }
+            // Committed by pathspec over every owned path, a staged deletion
+            // included: a stray the user staged before this run stays in the
+            // index, uncommitted, as the report says.
+            var commit_argv: std.ArrayList([]const u8) = .empty;
+            try commit_argv.appendSlice(git.gpa, &.{ "git", "commit", "-m", msg, "--" });
+            try commit_argv.appendSlice(git.gpa, ours.items);
+            const commit = try git.run(commit_argv.items);
             if (!commit.ok) {
                 try stderr.print("mox publish: git commit failed: {s}", .{commit.stderr});
                 return 2;
@@ -74,11 +92,31 @@ pub fn publishRepo(git: Git, message: ?[]const u8, stdout: *Io.Writer, stderr: *
             try stderr.print("  not committed: {s} (outside mox's tree; stage it yourself with 'mox git -- add')\n", .{p});
         }
     } else if (cls.kind == .dirty) {
-        // No message and something to commit: refuse rather than invent one or
-        // silently publish a subset of the user's work.
-        try stderr.writeAll("mox publish: uncommitted changes; pass -m <message> to commit them, or commit them yourself:\n");
-        for (cls.paths) |p| try stderr.print("  {s}\n", .{p});
-        return 2;
+        var ours_n: usize = 0;
+        for (cls.paths) |p| {
+            if (isSourceTreePath(p)) ours_n += 1;
+        }
+        if (ours_n > 0) {
+            // No message and something of mox's to commit: refuse rather than
+            // invent one or silently publish a subset of the user's work.
+            try stderr.writeAll("mox publish: uncommitted changes; pass -m <message> to commit them, or commit them yourself:\n");
+            for (cls.paths) |p| {
+                if (isSourceTreePath(p)) try stderr.print("  {s}\n", .{p});
+            }
+            if (ours_n < cls.paths.len) {
+                try stderr.writeAll("mox publish: and outside mox's tree, which -m never commits; commit or remove them yourself:\n");
+                for (cls.paths) |p| {
+                    if (!isSourceTreePath(p)) try stderr.print("  {s}\n", .{p});
+                }
+            }
+            return 2;
+        }
+        // Only strays outside mox's tree: -m would leave them behind just the
+        // same, so they are reported the way it reports them and the push
+        // goes ahead.
+        for (cls.paths) |p| {
+            try stderr.print("  not committed: {s} (outside mox's tree; stage it yourself with 'mox git -- add')\n", .{p});
+        }
     }
 
     const branch_res = try git.run(&.{ "git", "rev-parse", "--abbrev-ref", "HEAD" });
@@ -157,7 +195,7 @@ pub const command = app.command(Spec, .{
     .name = "publish",
     .summary = "Commit the source tree and push",
     .usage = "mox publish [-m <message>]",
-    .details = "The outbound edge: sends this machine's work to the remote. With -m it commits the repo's pending source changes first; without it, it pushes what is already committed and refuses a dirty tree rather than inventing a message. Never routes live-file edits -- that is 'mox commit'. Bringing work the other way is 'mox update'.",
+    .details = "The outbound edge: sends this machine's work to the remote. With -m it commits the repo's pending source changes first; without it, it pushes what is already committed, refusing rather than inventing a message when a path mox owns is dirty; a stray outside mox's tree is reported and left either way. Never routes live-file edits -- that is 'mox commit'. Bringing work the other way is 'mox update'.",
     .group = .general,
     .needs_context = true,
 }, run);
