@@ -505,6 +505,7 @@ pub const GeneratedFile = struct {
     /// True when a dedicated-manager (op://|pass://) secret resolved into the
     /// body, so apply auto-restricts the file to 0600.
     manager_secret: bool,
+    resolved_secret: bool,
     /// 0-based index into the data source's row array (stable across `where`
     /// filtering) that produced this file. Meaningful only for a `for ...
     /// into` row (default 0 for a `completions` output, which has no row).
@@ -652,6 +653,7 @@ pub fn composeGenerator(
             .prov = try prov.toOwnedSlice(arena),
             .contains_secret = contains_secret,
             .manager_secret = row_diag.manager_secret,
+            .resolved_secret = row_diag.resolved_secret,
             .row = row_idx,
             .data_source = rows.data_path,
             .template = if (!nested) stripped else "",
@@ -954,6 +956,7 @@ fn composeCompletions(
             .prov = try prov.toOwnedSlice(arena),
             .contains_secret = false,
             .manager_secret = false,
+            .resolved_secret = false,
         });
     }
 
@@ -1154,8 +1157,11 @@ fn emitDirective(
         .secret => |s| {
             // A dedicated-manager secret marks the file for auto-0600 (set on
             // the resolve path before resolution; a failure aborts the compose).
-            if (secrets != null and interp.isManagerSecretUri(s.uri)) {
-                if (ctx.diag) |sink| sink.manager_secret = true;
+            if (secrets != null) {
+                if (ctx.diag) |sink| sink.resolved_secret = true;
+                if (interp.isManagerSecretUri(s.uri)) {
+                    if (ctx.diag) |sink| sink.manager_secret = true;
+                }
             }
             const value: ?[]const u8 = if (secrets) |sc|
                 try secret.resolver.resolveCached(arena, io, sc.env, sc.cache, s.uri)

@@ -79,6 +79,7 @@ const Planned = struct {
     mode: u32,
     symlink: bool,
     manager_secret: bool,
+    resolved_secret: bool,
 };
 
 const Spec = struct {
@@ -228,6 +229,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         .mode = mox.apply.write.secretRestrictedMode(o.manager_secret, false, 0o644, null),
                         .symlink = false,
                         .manager_secret = o.manager_secret,
+                        .resolved_secret = o.resolved_secret,
                     });
                 }
                 continue;
@@ -289,6 +291,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 .mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null),
                 .symlink = false,
                 .manager_secret = diag.manager_secret,
+                .resolved_secret = diag.resolved_secret,
             });
             continue;
         }
@@ -302,6 +305,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             .mode = mox.apply.write.secretRestrictedMode(diag.manager_secret, file.mode_explicit, file.mode, null),
             .symlink = file.is_symlink,
             .manager_secret = diag.manager_secret,
+            .resolved_secret = diag.resolved_secret,
         });
     }
 
@@ -318,8 +322,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // every run is one a user types unread, which is exactly the attention a
     // consent gate needs to keep.
     var secret_count: usize = 0;
+    var restricted_count: usize = 0;
     for (plan.items) |p| {
-        if (p.manager_secret) secret_count += 1;
+        if (p.resolved_secret) secret_count += 1;
+        if (p.resolved_secret and p.mode == 0o600) restricted_count += 1;
     }
     if (secret_count > 0 and !a.cleartext_secrets) {
         try ctx.err.print(
@@ -327,10 +333,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             .{ secret_count, display.of(out_dir, ctx.context.?.paths.home) },
         );
         for (plan.items) |p| {
-            if (p.manager_secret)
+            if (p.resolved_secret)
                 try ctx.err.print("  {f}\n", .{display.of(p.live_path, ctx.context.?.paths.home)});
         }
-        try ctx.err.writeAll("mox export: pass --cleartext-secrets to write them (each at 0600); nothing was written\n");
+        try ctx.err.writeAll("mox export: pass --cleartext-secrets to write them (a secret-manager value lands at 0600 unless .mox/attributes.toml sets its mode); nothing was written\n");
         return 2;
     }
 
@@ -353,8 +359,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         written += 1;
     }
 
-    if (secret_count > 0)
-        try ctx.err.print("mox export: baked {d} resolved secret(s) as cleartext, each at 0600\n", .{secret_count});
+    if (secret_count > 0) {
+        if (restricted_count == secret_count)
+            try ctx.err.print("mox export: baked {d} resolved secret(s) as cleartext, each at 0600\n", .{secret_count})
+        else if (restricted_count == 0)
+            try ctx.err.print("mox export: baked {d} resolved secret(s) as cleartext, each at its file's composed mode\n", .{secret_count})
+        else
+            try ctx.err.print("mox export: baked {d} resolved secret(s) as cleartext ({d} at 0600, the rest at their composed mode)\n", .{ secret_count, restricted_count });
+    }
     try ctx.out.print("Exported {d} file(s) to {f} ({d} gated off, {d} failed)\n", .{ written, display.of(out_dir, ctx.context.?.paths.home), skipped, failed });
     return if (failed > 0) 1 else 0;
 }

@@ -4031,6 +4031,55 @@ test "rollback: the state bin directory is left as it is when no check hook runs
     try std.testing.expect(exists(io, keep));
 }
 
+test "export --cleartext-secrets: a manager value lands at 0600, any other at its composed mode, and the report says which" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const bin_dir = try stubPass(a, io, &tmp, root);
+    const test_path = try std.fmt.allocPrint(a, "{s}{c}{s}", .{ bin_dir, std.fs.path.delimiter, std.testing.environ.getAlloc(a, "PATH") catch "" });
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .extra_env = &.{.{ .name = "PATH", .value = test_path }} });
+    try writeRepo(io, &tmp, "secret.txt", "TOPSECRET\n");
+    const secret_path = try std.fs.path.join(a, &.{ h.root, "secret.txt" });
+    try writeRepo(io, &tmp, "repo/src/.fromfile", try std.fmt.allocPrint(a, "token = <secret:file://{s}>\n", .{secret_path}));
+    try writeRepo(io, &tmp, "repo/src/.frompass", "token = <secret:pass://probe>\n");
+
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--cleartext-secrets", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "baked 2 resolved secret(s) as cleartext (1 at 0600, the rest at their composed mode)") != null);
+    if (builtin.os.tag != .windows) {
+        const manager = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ out, ".frompass" }), .{});
+        const other = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ out, ".fromfile" }), .{});
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(manager.permissions.toMode() & 0o777)));
+        try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(other.permissions.toMode() & 0o777)));
+    }
+
+    // All three shapes of the report sentence.
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".frompass"));
+    const only_other = try h.run(&.{ "mox", "export", "--cleartext-secrets", try std.fs.path.join(a, &.{ h.root, "baked2" }) });
+    try std.testing.expect(std.mem.indexOf(u8, only_other.err, "baked 1 resolved secret(s) as cleartext, each at its file's composed mode") != null);
+    try writeRepo(io, &tmp, "repo/src/.frompass", "token = <secret:pass://probe>\n");
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".fromfile"));
+    const only_manager = try h.run(&.{ "mox", "export", "--cleartext-secrets", try std.fs.path.join(a, &.{ h.root, "baked3" }) });
+    try std.testing.expect(std.mem.indexOf(u8, only_manager.err, "baked 1 resolved secret(s) as cleartext, each at 0600") != null);
+    // An explicit mode in the attributes wins over the auto-0600, and the
+    // report says so rather than claiming a protection the file lacks.
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".frompass\"]\nmode = \"0444\"\n");
+    const explicit_out = try std.fs.path.join(a, &.{ h.root, "baked4" });
+    const explicit = try h.run(&.{ "mox", "export", "--cleartext-secrets", explicit_out });
+    try std.testing.expectEqual(@as(u8, 0), explicit.rc);
+    try std.testing.expect(std.mem.indexOf(u8, explicit.err, "baked 1 resolved secret(s) as cleartext, each at its file's composed mode") != null);
+    if (builtin.os.tag != .windows) {
+        const st = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ explicit_out, ".frompass" }), .{});
+        try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {
@@ -4115,6 +4164,33 @@ fn stubPass(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, root: []cons
     const real = std.testing.environ.getAlloc(a, "PATH") catch "";
     const sep = if (builtin.os.tag == .windows) ";" else ":";
     return std.fmt.allocPrint(a, "{s}{s}{s}", .{ dir, sep, real });
+}
+
+test "export: the cleartext gate covers every secret scheme, not just the managers" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // `file://` is not a secret manager, so it does not warrant auto-0600 --
+    // but it still resolves a secret into the output, which is the question
+    // the consent gate asks, whatever mode the file lands at.
+    try writeRepo(io, &tmp, "secret.txt", "TOPSECRET\n");
+    const secret_path = try std.fs.path.join(a, &.{ h.root, "secret.txt" });
+    const src = try std.fmt.allocPrint(a, "token = <secret:file://{s}>\n", .{secret_path});
+    try writeRepo(io, &tmp, "repo/src/.netrc", src);
+    // The whole-line directive resolves the same way and is gated the same way.
+    try writeRepo(io, &tmp, "repo/src/.dline", try std.fmt.allocPrint(a, "# mox: secret \"file://{s}\"\n", .{secret_path}));
+
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "2 file(s) would bake a resolved secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ".dline") != null);
+    try std.testing.expect(!exists(io, out));
 }
 
 test "export: a run that would bake a resolved secret refuses, and writes nothing" {

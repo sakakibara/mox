@@ -279,9 +279,12 @@ A resolved secret is kept out of mox's own on-disk state, but `mox export`
 bakes the resolved cleartext into every file it writes -- that flat tree is the
 walk-away and CI-parity output. So an export that would bake one names those
 files and refuses until `--cleartext-secrets` is passed, decided before any
-content reaches disk; with the flag, each such file is written at 0600 and the
-count is reported. Aiming export at a committed or CI directory cannot ship a
-secret unnoticed.
+content reaches disk; with the flag, a file carrying a secret-manager value
+(`op://`, `pass://`) is written at 0600 unless `.mox/attributes.toml` sets an
+explicit mode, and the count is reported with the modes used. The consent
+gate covers every scheme; the 0600 mode is reserved for the unambiguous ones,
+since `env:`/`file://`/`cmd:` are often not secrets at all. Aiming export at a
+committed or CI directory cannot ship a secret unnoticed.
 
 ## Fact and data model
 

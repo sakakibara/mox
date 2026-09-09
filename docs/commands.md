@@ -364,12 +364,14 @@ compose against a machine that does not exist, without fabricating an
 `--facts` supplies the values, `--as` and `MOX_OS` place the machine -- which
 is what a matrix check over a repo's config space needs.
 
-An export that would bake a resolved secret as cleartext names those
-files and refuses until `--cleartext-secrets` is passed, deciding
-before any of it reaches disk. The flag is demanded only when a secret
-is actually present: one required on every run is one you type unread,
-which is the attention a consent gate exists to keep. With it, each
-such file lands at 0600 and the count is reported.
+An export that would bake a resolved secret as cleartext names those files and
+refuses until `--cleartext-secrets` is passed, deciding before any of it
+reaches disk. The flag is demanded only when a secret is actually present: one
+required on every run is one you type unread, which is the attention a consent
+gate exists to keep. With it, each such file is written and the count is
+reported; a secret-manager value lands at 0600 unless `.mox/attributes.toml`
+sets its mode, any other resolved secret at
+the file's composed mode.
 
 <!-- generated: flags export -->
 | Flag | Description |

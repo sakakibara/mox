@@ -66,6 +66,11 @@ pub const Diag = struct {
     /// these dedicated-manager schemes are treated as unambiguously sensitive;
     /// `env:`/`file://`/`cmd:` are general-purpose and left to an explicit mode.
     manager_secret: bool = false,
+    /// Whether ANY `<secret:...>` capture resolved into this file, whatever
+    /// its scheme. `manager_secret` answers "does this warrant auto-0600";
+    /// this answers "did a secret reach the output", which is the question
+    /// export's cleartext-consent gate has to ask.
+    resolved_secret: bool = false,
 
     pub fn set(self: *Diag, text: []const u8) void {
         const n = @min(text.len, self.buf.len);
@@ -565,6 +570,7 @@ fn appendSecret(
     if (ctx.secrets) |sc| {
         const io = ctx.io orelse return error.SecretRefWithoutContext;
         const uri = try unescapeSecretUri(arena, uri_str);
+        if (ctx.diag) |d| d.resolved_secret = true;
         // A dedicated-manager secret marks the file for auto-0600. Set before
         // resolving: a resolution failure aborts the file's compose, so the
         // flag is only ever consumed by apply on a successful compose.

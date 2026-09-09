@@ -25,6 +25,10 @@ All notable changes to mox are documented here. The format follows
   hostname), which never bound anything, and `facts set` refuses such a name;
   `apply` and `facts` report a row that binds nothing in one wording, the
   reason before `ignored`.
+- BREAKING: `export` refuses to bake any resolved secret (`env:`, `file://`
+  and `cmd:` included) without `--cleartext-secrets`; a secret-manager value
+  lands at 0600 unless `.mox/attributes.toml` sets its mode, any other at the
+  file's composed mode, and the report says how many of each.
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
