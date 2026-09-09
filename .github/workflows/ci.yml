@@ -70,6 +70,22 @@ jobs:
         run: zig build
       - name: test
         run: zig build test --summary all
+      - name: installer (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh tests/installer_test.sh
+      - name: installer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/installer_test.ps1
+      - name: installer parse (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "install.ps1 parses"
 
   fuzz:
     # Nightly only. Exercises the fuzz targets (tests/fuzz_test.zig) under a

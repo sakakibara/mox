@@ -18,15 +18,25 @@ $repoSlug = if ($env:MOX_REPO_SLUG) { $env:MOX_REPO_SLUG } else { 'sakakibara/mo
 $version  = if ($env:MOX_VERSION)   { $env:MOX_VERSION }   else { 'latest' }
 $binDir   = if ($env:BINDIR)        { $env:BINDIR }        else { Join-Path $env:USERPROFILE '.local\bin' }
 
-$arch = $env:PROCESSOR_ARCHITECTURE
-if ($arch -ne 'AMD64') { throw "mox install: unsupported architecture '$arch'" }
-$asset = 'mox-x86_64-windows.zip'
+# A 32-bit PowerShell host on a 64-bit machine reports x86 here and the real
+# architecture in PROCESSOR_ARCHITEW6432, so prefer that when it is set.
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$asset = switch ($arch) {
+    'AMD64' { 'mox-x86_64-windows.zip' }
+    'ARM64' { 'mox-aarch64-windows.zip' }
+    default { throw "mox install: unsupported architecture '$arch'" }
+}
 
 $base = if ($env:MOX_BASE_URL) { $env:MOX_BASE_URL }
         elseif ($version -eq 'latest') { "https://github.com/$repoSlug/releases/latest/download" }
         else { "https://github.com/$repoSlug/releases/download/$version" }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mox-install-" + [System.Guid]::NewGuid())
+$staged = $null
+$old = $null
+$target = $null
+$steppedAside = $false
+$installed = $false
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     Write-Host "mox install: downloading $asset ($version)"
@@ -49,8 +59,31 @@ try {
     if (-not (Test-Path $exe)) { throw "mox install: archive did not contain mox.exe" }
 
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-    Copy-Item $exe (Join-Path $binDir 'mox.exe') -Force
-    Write-Host "mox install: installed $(Join-Path $binDir 'mox.exe')"
+    # Staged beside the target and renamed into place: an interrupted or short
+    # write must not leave a truncated mox.exe where a working one was. Windows
+    # cannot rename over a running binary, so the old one steps aside first --
+    # the same dance `mox upgrade` does.
+    $target = Join-Path $binDir 'mox.exe'
+    $staged = "$target.new"
+    $old = "$target.old"
+    foreach ($p in @($target, $staged, $old)) {
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            throw "mox install: $p is a directory; remove it or set BINDIR"
+        }
+    }
+    Copy-Item -LiteralPath $exe -Destination $staged -Force
+    if (Test-Path -LiteralPath $target) {
+        Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $target -Destination $old -Force
+        $steppedAside = $true
+        Move-Item -LiteralPath $staged -Destination $target -Force
+        Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+    } else {
+        Move-Item -LiteralPath $staged -Destination $target -Force
+    }
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "mox install: $target is not a file after install" }
+    $installed = $true
+    Write-Host "mox install: installed $target"
 
     if (($env:PATH -split ';') -notcontains $binDir) {
         Write-Host "mox install: note: $binDir is not on your PATH -- add it to run 'mox' directly"
@@ -59,8 +92,24 @@ try {
     # Full pass-through: any arguments run against the freshly installed mox.
     if ($args.Count -gt 0) {
         Write-Host "mox install: running: mox $($args -join ' ')"
-        & (Join-Path $binDir 'mox.exe') @args
+        & $target @args
+        # A native command's exit code does not trip $ErrorActionPreference, so
+        # without this a failed `init --clone --apply` reports success.
+        $code = $LASTEXITCODE
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        # Run as a file, the exit code is the script's. Run as a script block
+        # in the caller's session, `exit` would close that session; the code
+        # is left in $LASTEXITCODE for the caller to read.
+        if ($MyInvocation.MyCommand.CommandType -eq 'ExternalScript') { exit $code }
+        $global:LASTEXITCODE = $code
+        return
     }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    # A failed run leaves neither a staging file nor a stepped-aside binary
+    # behind: the old binary goes back where it was.
+    if ($staged -and (Test-Path -LiteralPath $staged -PathType Leaf)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+    if ($steppedAside -and -not $installed -and (Test-Path -LiteralPath $old -PathType Leaf)) {
+        Move-Item -LiteralPath $old -Destination $target -Force -ErrorAction SilentlyContinue
+    }
 }

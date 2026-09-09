@@ -80,6 +80,13 @@ All notable changes to mox are documented here. The format follows
 - `doctor` reads the source tree's own git status under the environment mox
   was given, and a repository enclosing a repo that is not a git working tree
   no longer answers for it.
+- The installers name the aarch64 Windows asset, replace the binary
+  atomically, stage the download under `TMPDIR` and clean it before handing
+  over, refuse a directory at the target and leave no staging file behind, and
+  install.ps1 passes the bootstrapped command's exit code through without
+  closing an interactive session; a PowerShell installer suite runs on the
+  Windows CI leg, both installer suites gate a release too, and the README
+  names the digest tool the installer needs.
 
 ## [0.10.0] - 2026-08-12
 

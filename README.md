@@ -10,9 +10,9 @@ powers everything else.
 ## Install
 
 One command, depending on nothing a fresh machine lacks (a shell, curl or wget,
-and tar). It downloads the release binary for your platform, verifies it against
-the release's `SHA256SUMS`, and installs to `~/.local/bin` (override with
-`BINDIR`):
+tar, and sha256sum, shasum or openssl). It downloads the release binary for
+your platform, verifies it against the release's `SHA256SUMS`, and installs to
+`~/.local/bin` (override with `BINDIR`):
 
 ### sh & curl
 

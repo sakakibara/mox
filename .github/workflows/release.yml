@@ -63,8 +63,36 @@ jobs:
           Expand-Archive -LiteralPath zig.zip -DestinationPath $dst
           "$dst\zig-x86_64-windows-$env:ZIG_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
+      - name: fmt
+        run: zig fmt --check build.zig src tests
+      - name: ascii punctuation
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if LC_ALL=C grep -rnE $'\xe2\x80[\x93\x94\x98\x99\x9c\x9d\xa2\xa6\xb2]|\xe2\x86[\x90-\x99]|\xc2[\xa0\xb7]' build.zig src tests docs README.md CHANGELOG.md install.sh install.ps1; then
+            echo "non-ASCII punctuation found; write it in ASCII" >&2
+            exit 1
+          fi
+      - name: build
+        run: zig build
       - name: test
         run: zig build test --summary all
+      - name: installer (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh tests/installer_test.sh
+      - name: installer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/installer_test.ps1
+      - name: installer parse (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "install.ps1 parses"
 
   # One job cross-compiles every target (Zig cross-compiles from Linux), packages
   # them, writes SHA256SUMS, and publishes -- so no artifacts pass between jobs.
