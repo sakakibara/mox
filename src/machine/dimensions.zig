@@ -905,6 +905,7 @@ const Discoverer = struct {
         for (entries) |e| {
             const abs = try std.fs.path.join(self.arena, &.{ abs_dir, e.name });
             const rel = try source.path.joinKey(self.arena, &.{ rel_prefix, e.name });
+            if (source.junk.isJunk(e.name)) continue;
             switch (e.kind) {
                 .directory => {
                     if (isAxisTupleDirName(self.arena, e.name)) try self.scanGatedScriptsDir(abs, rel);
@@ -919,9 +920,14 @@ const Discoverer = struct {
     /// regular file directly inside a matching axis-tuple directory, no
     /// further subdirectories.
     fn scanGatedScriptsDir(self: *Discoverer, abs_dir: []const u8, rel_prefix: []const u8) !void {
-        const entries = try source.dirent.sortedPath(self.arena, self.io, abs_dir, .{ .iterate = true });
+        // A gate directory that cannot be read is apply's to report, as a
+        // failed script; there is nothing to discover in it.
+        const entries = source.dirent.sortedPath(self.arena, self.io, abs_dir, .{ .iterate = true }) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return,
+        };
         for (entries) |e| {
-            if (e.kind != .file) continue;
+            if (e.kind != .file or source.junk.isJunk(e.name)) continue;
             const abs = try std.fs.path.join(self.arena, &.{ abs_dir, e.name });
             const rel = try source.path.joinKey(self.arena, &.{ rel_prefix, e.name });
             try self.scanScriptFile(abs, rel);
@@ -1113,11 +1119,11 @@ const Discoverer = struct {
 };
 
 /// True when `name` parses as an axis tuple (`os=linux`, `os=linux+profile=work`),
-/// mirroring `apply.run_scripts.axisDirMatches`'s tuple-name validation --
+/// mirroring `apply.run_scripts.axisDirVerdict`'s tuple-name validation --
 /// discovery has no machine bindings to match against, so it validates shape
 /// only, the same test a script-tuple dir must pass to be gated at all.
 fn isAxisTupleDirName(arena: std.mem.Allocator, name: []const u8) bool {
-    _ = source.tuple.parseFilename(arena, name) catch return false;
+    _ = source.tuple.parseFilenameVerbatim(arena, name) catch return false;
     return true;
 }
 

@@ -44,6 +44,7 @@ const tuple_mod = @import("../source/tuple.zig");
 const mox_path = @import("mox_path.zig");
 const match_mod = @import("../compose/match.zig");
 const dsl = @import("../dsl/root.zig");
+const junk = @import("../source/junk.zig");
 const dirent = @import("../source/dirent.zig");
 const fact_env = @import("../source/fact_env.zig");
 const path_mod = @import("../source/path.zig");
@@ -514,14 +515,24 @@ pub fn runStage(
     };
     defer dir.close(io);
 
+    const GateDir = struct { name: []const u8, open: bool };
     var file_names: std.ArrayList([]const u8) = .empty;
-    var gated_dirs: std.ArrayList([]const u8) = .empty;
+    var gate_dirs: std.ArrayList(GateDir) = .empty;
+    var malformed: usize = 0;
     for (try dirent.sorted(arena, io, dir)) |entry| {
+        if (junk.isJunk(entry.name)) continue;
         if (entry.kind == .file) {
             try file_names.append(arena, entry.name);
         } else if (entry.kind == .directory) {
-            if (try axisDirMatches(arena, entry.name, bindings)) {
-                try gated_dirs.append(arena, entry.name);
+            switch (try axisDirVerdict(arena, entry.name, bindings)) {
+                .gate_open => try gate_dirs.append(arena, .{ .name = entry.name, .open = true }),
+                .gate_closed => try gate_dirs.append(arena, .{ .name = entry.name, .open = false }),
+                .not_a_gate => {},
+                .malformed => {
+                    const sub_path = try std.fs.path.join(arena, &.{ scripts_dir, entry.name });
+                    stderr.print("mox apply: {s}: named like an axis tuple but not one; a scripts subdirectory with '=' in its name is a gate (rename it, or move it out)\n", .{sub_path}) catch {};
+                    malformed += 1;
+                },
             }
         }
     }
@@ -530,32 +541,77 @@ pub fn runStage(
     // otherwise warn once per script in the stage.
     const timeout_ms = scriptTimeoutMs(environ_map, stderr);
 
-    var result: Result = .{};
+    var result: Result = .{ .failed = malformed };
     for (file_names.items) |name| {
         const path = try std.fs.path.join(arena, &.{ scripts_dir, name });
         const rel = try path_mod.joinKey(arena, &.{ rel_prefix, name });
         try runOne(arena, io, path, rel, bindings, environ_map, contracts, timeout_ms, stdout, stderr, &result);
     }
-    for (gated_dirs.items) |dname| {
-        const sub_path = try std.fs.path.join(arena, &.{ scripts_dir, dname });
-        const sub_rel = try path_mod.joinKey(arena, &.{ rel_prefix, dname });
-        try runGatedDir(arena, io, sub_path, sub_rel, bindings, environ_map, contracts, timeout_ms, stdout, stderr, &result);
+    // Gate directories in their sorted order, each run or reported as it
+    // comes. A gate that closed is reported per script inside it, which is
+    // what the outcome table promises: `skipped` covers the directory tuple
+    // as well as a `when` head.
+    for (gate_dirs.items) |g| {
+        const sub_path = try std.fs.path.join(arena, &.{ scripts_dir, g.name });
+        if (g.open) {
+            const sub_rel = try path_mod.joinKey(arena, &.{ rel_prefix, g.name });
+            try runGatedDir(arena, io, sub_path, sub_rel, bindings, environ_map, contracts, timeout_ms, stdout, stderr, &result);
+            continue;
+        }
+        var sub = Io.Dir.cwd().openDir(io, sub_path, .{ .iterate = true, .follow_symlinks = false }) catch |e| {
+            stderr.print("mox apply: {s}: cannot read the gated scripts directory: {s}\n", .{ sub_path, @errorName(e) }) catch {};
+            result.failed += 1;
+            continue;
+        };
+        defer sub.close(io);
+        for (try dirent.sorted(arena, io, sub)) |e| {
+            if (e.kind != .file or junk.isJunk(e.name)) continue;
+            const sub_file = try std.fs.path.join(arena, &.{ sub_path, e.name });
+            const st = sub.statFile(io, e.name, .{}) catch |err| {
+                stderr.print("mox apply: {s}: cannot stat: {s}\n", .{ sub_file, @errorName(err) }) catch {};
+                result.failed += 1;
+                continue;
+            };
+            if (!isExecutable(st)) {
+                stderr.print("mox apply: {s}: not executable; a scripts directory holds executables only (chmod +x it, or move it out)\n", .{sub_file}) catch {};
+                result.failed += 1;
+                continue;
+            }
+            stdout.print("  skipped {s}\n", .{sub_file}) catch {};
+            result.skipped += 1;
+        }
     }
     return result;
 }
 
-/// True when `name` is an axis tuple (`<axis>=<value>[+...]`) that matches the
-/// bindings. Non-axis directory names (no `=`, malformed) are not gated dirs.
-fn axisDirMatches(
+/// The rule a spawn enforces for an open gate, applied to a closed one:
+/// where the platform has an executable bit, a file without it is not a
+/// script. Elsewhere every regular file is.
+fn isExecutable(st: Io.File.Stat) bool {
+    if (!Io.File.Permissions.has_executable_bit) return true;
+    return (st.permissions.toMode() & 0o111) != 0;
+}
+
+/// What a subdirectory of a scripts stage is. A name with no `=` in it
+/// (`helpers/`) is a container, not a gate, and is nobody's business; one
+/// with an `=` that does not parse as a tuple is malformed and is named,
+/// since dropping it silently would look exactly like a gate that closed;
+/// a tuple that does not match IS a gate that closed, and a gate closing
+/// silently is indistinguishable from a script that was never there.
+const DirVerdict = enum { not_a_gate, malformed, gate_closed, gate_open };
+
+fn axisDirVerdict(
     arena: std.mem.Allocator,
     name: []const u8,
     bindings: *const dsl.resolver.Resolver,
-) !bool {
-    const tuple = tuple_mod.parseFilename(arena, name) catch |e| switch (e) {
+) !DirVerdict {
+    // A directory name carries no extension: `profile=work.v2` names the
+    // value `work.v2`, so the filename heuristic must not strip it.
+    const tuple = tuple_mod.parseFilenameVerbatim(arena, name) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
+        else => return if (std.mem.indexOfScalar(u8, name, '=') != null) .malformed else .not_a_gate,
     };
-    return match_mod.matches(tuple, bindings);
+    return if (match_mod.matches(tuple, bindings)) .gate_open else .gate_closed;
 }
 
 fn runGatedDir(
@@ -576,13 +632,17 @@ fn runGatedDir(
         .follow_symlinks = false,
     }) catch |e| switch (e) {
         error.FileNotFound => return,
-        else => return e,
+        else => {
+            stderr.print("mox apply: {s}: cannot read the gated scripts directory: {s}\n", .{ dir_path, @errorName(e) }) catch {};
+            result.failed += 1;
+            return;
+        },
     };
     defer dir.close(io);
 
     var names: std.ArrayList([]const u8) = .empty;
     for (try dirent.sorted(arena, io, dir)) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file or junk.isJunk(entry.name)) continue;
         try names.append(arena, entry.name);
     }
     for (names.items) |name| {
@@ -844,7 +904,14 @@ fn runOne(
     }
 
     var child = spawnScript(arena, io, path, environ_map) catch |e| {
-        stderr.print("mox apply: {s}: spawn failed: {s}\n", .{ path, @errorName(e) }) catch {};
+        // Every regular file in a scripts stage is spawned, so this is what a
+        // script that lost its exec bit AND a stray README.md both look like.
+        // Failing is right for the first; saying which is right for both.
+        if (e == error.AccessDenied) {
+            stderr.print("mox apply: {s}: not executable; a scripts directory holds executables only (chmod +x it, or move it out)\n", .{path}) catch {};
+        } else {
+            stderr.print("mox apply: {s}: spawn failed: {s}\n", .{ path, @errorName(e) }) catch {};
+        }
         result.failed += 1;
         return;
     };
@@ -1188,22 +1255,26 @@ test "findWhenHeader: absent, non-when directive, and near-miss keyword" {
     try testing.expect(findWhenHeader("# mox: whenever os=darwin\necho hi\n") == null);
 }
 
-test "axisDirMatches: gated by binding; non-axis dirs ignored" {
+test "axisDirVerdict: a matching tuple opens, a non-matching one closes, a plain name is no gate" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-
     var bindings = std.StringHashMap([]const u8).init(a);
     try bindings.put("os", "windows");
     try bindings.put("profile", "work");
     var bindings_r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-
-    try testing.expect(try axisDirMatches(a, "os=windows", &bindings_r));
-    try testing.expect(try axisDirMatches(a, "os=windows+profile=work", &bindings_r));
-    try testing.expect(!try axisDirMatches(a, "os=darwin", &bindings_r));
-    // A plain directory name is not an axis tuple: ignored, not an error.
-    try testing.expect(!try axisDirMatches(a, "windows", &bindings_r));
-    try testing.expect(!try axisDirMatches(a, "helpers", &bindings_r));
+    try testing.expectEqual(DirVerdict.gate_open, try axisDirVerdict(a, "os=windows", &bindings_r));
+    try testing.expectEqual(DirVerdict.gate_open, try axisDirVerdict(a, "os=windows+profile=work", &bindings_r));
+    try testing.expectEqual(DirVerdict.gate_closed, try axisDirVerdict(a, "os=darwin", &bindings_r));
+    try testing.expectEqual(DirVerdict.gate_closed, try axisDirVerdict(a, "os=windows+profile=personal", &bindings_r));
+    try testing.expectEqual(DirVerdict.not_a_gate, try axisDirVerdict(a, "windows", &bindings_r));
+    try testing.expectEqual(DirVerdict.not_a_gate, try axisDirVerdict(a, "helpers", &bindings_r));
+    // A dotted value is the value, not a name with an extension.
+    try bindings.put("profile", "work.v2");
+    try testing.expectEqual(DirVerdict.gate_open, try axisDirVerdict(a, "profile=work.v2", &bindings_r));
+    try testing.expectEqual(DirVerdict.gate_closed, try axisDirVerdict(a, "profile=work", &bindings_r));
+    try bindings.put("profile", "work");
+    try testing.expectEqual(DirVerdict.gate_closed, try axisDirVerdict(a, "profile=work.v2", &bindings_r));
 }
 
 // Script fact contract lane tests

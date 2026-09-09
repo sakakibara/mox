@@ -351,10 +351,20 @@ seen by the very same apply.
 
 ## Scripts
 
-Setup scripts under `scripts/pre/` and `scripts/post/` are gated the same way
-managed files are. A script inside a single-tuple subdir (`scripts/pre/os=darwin/`)
-runs only on a matching machine, and a script may add its own axis-expression
-gate as a `# mox: when <expr>` comment among its leading lines:
+Every regular file in a stage is spawned (OS noise such as `.DS_Store` and
+`._*` aside), so a stage holds executables only: a file without the
+executable bit fails the run and is named, whether its gate is open or
+closed, so a stray file fails the run on every machine, not
+only the one whose gate it opens. On Windows, which has no such bit, a `.ps1`
+runs under PowerShell and any other file must be a program; one that cannot
+be spawned fails the run and is named, and a closed gate is only skipped
+there. Setup scripts under `scripts/pre/` and
+`scripts/post/` are gated the same way managed files are. A script inside a
+single-tuple subdir (`scripts/pre/os=darwin/`) runs only on a matching
+machine; a subdirectory whose name carries an `=` but is not a tuple fails
+the run and is named, so a mistyped gate is never taken for one that closed.
+A script may add its own axis-expression gate as a `# mox: when <expr>`
+comment among its leading lines:
 
 ```
 #!/bin/sh

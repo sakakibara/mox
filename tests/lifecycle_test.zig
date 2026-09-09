@@ -4182,6 +4182,91 @@ test "doctor: a repo that is not a git working tree is not answered for by the r
     try std.testing.expect(std.mem.indexOf(u8, r.out, "tracked-source check was skipped") != null);
 }
 
+test "apply: a scripts subdirectory named like a tuple but not one is named, and its scripts are not demanded of the facts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
+    const body = if (builtin.os.tag == .windows) "# mox: needs ghost_fact\nexit 0\n" else "#!/bin/sh\n# mox: needs ghost_fact\nexit 0\n";
+    const sub = try std.fmt.allocPrint(a, "repo/scripts/pre/os=darwin.v1!/x{s}", .{ext});
+    try writeExecScript(io, &tmp, sub, body, try std.fs.path.join(a, &.{ root, sub }));
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    const applied = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), applied.rc);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "named like an axis tuple but not one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "ghost_fact") == null);
+}
+
+test "doctor: a gate directory's dotted value is read the way apply reads it, and an unreadable one is reported" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+    // `darwin.v2` is the value as apply reads it, and no machine binds it.
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/os=darwin.v2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/os=darwin.v2/10-run.sh", .data = "#!/bin/sh\nexit 0\n" });
+    try testutil.gitTracked(io, a, h.repo);
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bad-axis-value os=darwin.v2") != null);
+
+    if (builtin.os.tag != .windows and std.c.getuid() != 0) {
+        const gate = try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "os=darwin.v2" });
+        try chmodPath(a, gate, 0o000);
+        defer chmodPath(a, gate, 0o755) catch {};
+        const closed = try h.run(&.{ "mox", "doctor" });
+        try std.testing.expectEqual(@as(u8, 1), closed.rc);
+        try std.testing.expect(std.mem.indexOf(u8, closed.out, "unreadable-stage-dir scripts/pre/os=darwin.v2") != null);
+    }
+}
+
+test "apply: OS noise in a stage or a closed gate is neither spawned nor counted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/os=linux");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/.DS_Store", .data = "\x00\x01junk\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/os=linux/._10-run.sh", .data = "\x00\x05\x16\x07" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/pre/os=linux/.DS_Store", .data = "\x00\x01junk\n" });
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "scripts: 0 ran, 0 skipped, 0 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "DS_Store") == null);
+}
+
+test "doctor: OS noise in a stage is passed over, as apply passes over it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/os=linux~");
+    try tmp.dir.createDirPath(io, "repo/scripts/pre/os=linux.swp");
+    try testutil.gitTracked(io, a, h.repo);
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "bad-stage-tuple") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "bad-axis-value") == null);
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {

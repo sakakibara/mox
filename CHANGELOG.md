@@ -38,6 +38,10 @@ All notable changes to mox are documented here. The format follows
   as a comment. `apply` and `export` explain a compose failure the same way.
 - BREAKING: `doctor` exits 1 while any advisory remains or a check could not
   run, not only on problems, so it can gate CI; `--help` states the codes.
+- BREAKING: `apply` exits 2 on a stage file it cannot spawn, a gate directory
+  it cannot read, or a subdirectory named like a tuple that is not one, in a
+  closed gate as in an open one; a closed gate's contents went unexamined
+  before.
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
@@ -87,6 +91,15 @@ All notable changes to mox are documented here. The format follows
   closing an interactive session; a PowerShell installer suite runs on the
   Windows CI leg, both installer suites gate a release too, and the README
   names the digest tool the installer needs.
+- `apply` reports every script a closed gate directory skipped, in directory
+  order, reads a gate directory's tuple verbatim so a dotted value such as
+  `profile=work.v2` gates the machine bound to it, fails a gated directory it
+  cannot read instead of aborting the run, names a non-executable file in a
+  closed gate as it does in an open one, and names a subdirectory whose name
+  carries an `=` but is not a tuple instead of dropping it silently; OS noise
+  such as `.DS_Store` in a stage is passed over, by `doctor` as by `apply`,
+  and `doctor` reads a gate directory's name the same way and reports one it
+  cannot read.
 
 ## [0.10.0] - 2026-08-12
 

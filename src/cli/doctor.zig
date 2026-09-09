@@ -16,6 +16,7 @@ const mox = @import("../root.zig");
 const display = @import("display.zig");
 
 const Io = std.Io;
+const junk = @import("../source/junk.zig");
 
 const max_state_bytes: usize = 64 * 1024 * 1024;
 
@@ -397,7 +398,8 @@ fn orphanedAttributes(
 /// `Cpu.Arch` name. Such a literal matches no real machine, silently, the same
 /// class of bug an unknown completions shell is refused for. Null means the
 /// source tree or `scripts/` could not be read (the check could not run);
-/// deduplicated and sorted for a stable report. A dir name that fails tuple
+/// deduplicated and sorted for a stable report. A stage directory's name is
+/// read verbatim, the way apply reads it. A dir name that fails tuple
 /// parsing is left to the scripts-stage check to report; this one only
 /// inspects tuples that DID parse.
 fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const []const u8 {
@@ -422,7 +424,8 @@ fn closedAxisValueProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u
         defer sdir.close(io);
         for (try mox.source.dirent.sorted(arena, io, sdir)) |entry| {
             if (entry.kind != .directory or std.mem.indexOfScalar(u8, entry.name, '=') == null) continue;
-            const tuple = mox.source.tuple.parseFilename(arena, entry.name) catch continue;
+            if (junk.isJunk(entry.name)) continue;
+            const tuple = mox.source.tuple.parseFilenameVerbatim(arena, entry.name) catch continue;
             for (tuple.pairs) |p| {
                 if (std.mem.eql(u8, p.name, "os") and !mox.machine.state.isValidOsValue(p.value)) try bad_os.put(p.value, {});
                 if (std.mem.eql(u8, p.name, "arch") and !mox.machine.state.isValidArchValue(p.value)) try bad_arch.put(p.value, {});
@@ -499,14 +502,25 @@ fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !
         defer sdir.close(io);
         for (try mox.source.dirent.sorted(arena, io, sdir)) |entry| {
             if (entry.kind != .directory or std.mem.indexOfScalar(u8, entry.name, '=') == null) continue;
-            _ = mox.source.tuple.parseFilename(arena, entry.name) catch {
+            if (junk.isJunk(entry.name)) continue;
+            _ = mox.source.tuple.parseFilenameVerbatim(arena, entry.name) catch {
                 try out.append(arena, try std.fmt.allocPrint(
                     arena,
-                    "bad-stage-tuple scripts/{s}/{s} (does not parse as <axis>=<value>; it will never run -- plain-named helper dirs are exempt, but a name containing '=' must parse)",
+                    "bad-stage-tuple scripts/{s}/{s} (does not parse as <axis>=<value>; apply fails the run on it -- plain-named helper dirs are exempt, but a name containing '=' must parse)",
                     .{ stage, entry.name },
                 ));
                 continue;
             };
+            const gate_dir = try std.fs.path.join(arena, &.{ stage_dir, entry.name });
+            var gdir = Io.Dir.cwd().openDir(io, gate_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| {
+                try out.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "unreadable-stage-dir scripts/{s}/{s} ({s}; apply fails the run on it)",
+                    .{ stage, entry.name, @errorName(e) },
+                ));
+                continue;
+            };
+            gdir.close(io);
         }
     }
     return try out.toOwnedSlice(arena);

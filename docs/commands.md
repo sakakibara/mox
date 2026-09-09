@@ -205,9 +205,11 @@ blocked, N declined`): `ran` (exit 0); `skipped` (its directory tuple or
 bound but empty -- green, does not fail the run); `blocked` (a needed
 fact could not be resolved -- see Scripts in
 [dsl.md](dsl.md#scripts); counts into the failing exit like `failed`,
-under its own label); `failed` (nonzero exit or abnormal termination);
-timed out (also counted under `failed`). `--skip-scripts` skips scripts
-and their fact checks entirely.
+under its own label); `failed` (nonzero exit, abnormal termination, or a
+time-out). A stage file that cannot be spawned, a gate directory that
+cannot be read, and a subdirectory named like a tuple that is not one are
+counted under `failed` too, though none of them is a script.
+`--skip-scripts` skips scripts and their fact checks entirely.
 
 <!-- generated: flags apply -->
 | Flag | Description |

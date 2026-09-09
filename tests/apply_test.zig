@@ -216,7 +216,9 @@ test "run_scripts: a header does not bypass a non-matching axis dir" {
     const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
 
     try std.testing.expectEqual(@as(usize, 0), result.ran);
-    try std.testing.expectEqual(@as(usize, 0), result.skipped);
+    // Counted as skipped, not invisible: the gate closing is the reason the
+    // script did not run, and a reader has to be able to see that.
+    try std.testing.expectEqual(@as(usize, 1), result.skipped);
     try std.testing.expectEqual(@as(usize, 0), result.failed);
     // The script never ran: its log was never created.
     try std.testing.expect(!exists(io, log));
@@ -5746,4 +5748,231 @@ test "apply: a bare fact-presence gate on a name that used to be a path= member 
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ReservedAxisName") == null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "run_scripts: a closed gate directory is reported, a container directory is not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const log = try std.fs.path.join(a, &.{ root, "log" });
+
+    const on_rel = try std.fmt.allocPrint(a, "scripts/gate=on/10-run{s}", .{script_ext});
+    const off_rel = try std.fmt.allocPrint(a, "scripts/gate=off/20-skip{s}", .{script_ext});
+    // Not an axis tuple: a container, nobody's business, and it must stay quiet.
+    const lib_rel = try std.fmt.allocPrint(a, "scripts/helpers/lib{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, on_rel, try appendingScript(a, log, "on"), try std.fs.path.join(a, &.{ root, on_rel }));
+    try writeExecScript(io, tmp.dir, off_rel, try appendingScript(a, log, "off"), try std.fs.path.join(a, &.{ root, off_rel }));
+    try writeExecScript(io, tmp.dir, lib_rel, try appendingScript(a, log, "lib"), try std.fs.path.join(a, &.{ root, lib_rel }));
+
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("gate", "on");
+
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+
+    try std.testing.expectEqual(@as(usize, 1), result.ran);
+    // A gate that closed silently is indistinguishable from a script that was
+    // never there, so it is reported and counted like any other skip.
+    try std.testing.expectEqual(@as(usize, 1), result.skipped);
+    const out = out_aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "gate=off") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "helpers") == null);
+}
+
+test "run_scripts: a non-executable file in a stage says so" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no exec bit
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    // Every regular file in a stage is spawned, so a stray doc fails the run.
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "scripts/README.md", .data = "# notes\n" });
+
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "not executable") != null);
+}
+
+test "run_scripts: a subdirectory named like a tuple but not one is named and counted as failed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const log = try std.fs.path.join(a, &.{ root, "log" });
+    const bad_rel = try std.fmt.allocPrint(a, "scripts/gate=on!/10-run{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, bad_rel, try appendingScript(a, log, "bad"), try std.fs.path.join(a, &.{ root, bad_rel }));
+
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("gate", "on");
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+    try std.testing.expectEqual(@as(usize, 0), result.ran);
+    try std.testing.expectEqual(@as(usize, 0), result.skipped);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "gate=on!: named like an axis tuple but not one") != null);
+    try std.testing.expect(std.Io.Dir.cwd().access(io, log, .{}) == error.FileNotFound);
+}
+
+test "run_scripts: a closed gate holds executables only, like an open one" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no exec bit
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const log = try std.fs.path.join(a, &.{ root, "log" });
+    const off_rel = try std.fmt.allocPrint(a, "scripts/gate=off/10-skip{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, off_rel, try appendingScript(a, log, "off"), try std.fs.path.join(a, &.{ root, off_rel }));
+    try tmp.dir.writeFile(io, .{ .sub_path = "scripts/gate=off/README.md", .data = "# notes\n" });
+
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("gate", "on");
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+    try std.testing.expectEqual(@as(usize, 1), result.skipped);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "README.md: not executable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_aw.written(), "README.md") == null);
+}
+
+test "run_scripts: an unreadable gate directory is a failed script, not an aborted run" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no mode bits to close it with
+    if (std.c.getuid() == 0) return error.SkipZigTest; // root reads anything
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const log = try std.fs.path.join(a, &.{ root, "log" });
+    const on_rel = try std.fmt.allocPrint(a, "scripts/gate=on/10-run{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, on_rel, try appendingScript(a, log, "on"), try std.fs.path.join(a, &.{ root, on_rel }));
+    const gate_dir = try std.fs.path.join(a, &.{ root, "scripts", "gate=on" });
+    try chmodPath(gate_dir, 0o000);
+    defer chmodPath(gate_dir, 0o755) catch {};
+
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("gate", "on");
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "cannot read the gated scripts directory") != null);
+}
+
+test "run_scripts: an unreadable gate directory that is closed is reported the same way" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no mode bits to close it with
+    if (std.c.getuid() == 0) return error.SkipZigTest; // root reads anything
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const log = try std.fs.path.join(a, &.{ root, "log" });
+    const on_rel = try std.fmt.allocPrint(a, "scripts/gate=on/10-run{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, on_rel, try appendingScript(a, log, "on"), try std.fs.path.join(a, &.{ root, on_rel }));
+    const gate_dir = try std.fs.path.join(a, &.{ root, "scripts", "gate=on" });
+    try chmodPath(gate_dir, 0o000);
+    defer chmodPath(gate_dir, 0o755) catch {};
+
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("gate", "off");
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "gate=on") != null);
+}
+
+fn chmodPath(abs: []const u8, mode: u16) !void {
+    var zbuf: [4096]u8 = undefined;
+    @memcpy(zbuf[0..abs.len], abs);
+    zbuf[abs.len] = 0;
+    if (std.c.chmod(@ptrCast(&zbuf), mode) != 0) return error.ChmodFailed;
+}
+
+test "run_scripts: gate directories are run or reported in their sorted order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const log = try std.fs.path.join(a, &.{ root, "log" });
+    const run = try appendingScript(a, log, "run");
+    const later = try appendingScript(a, log, "later");
+    const closed_rel = try std.fmt.allocPrint(a, "scripts/gate=aaa/10-skip{s}", .{script_ext});
+    const open_rel = try std.fmt.allocPrint(a, "scripts/gate=mmm/10-run{s}", .{script_ext});
+    const closed2_rel = try std.fmt.allocPrint(a, "scripts/gate=zzz/10-skip{s}", .{script_ext});
+    try writeExecScript(io, tmp.dir, closed_rel, run, try std.fs.path.join(a, &.{ root, closed_rel }));
+    try writeExecScript(io, tmp.dir, open_rel, later, try std.fs.path.join(a, &.{ root, open_rel }));
+    try writeExecScript(io, tmp.dir, closed2_rel, run, try std.fs.path.join(a, &.{ root, closed2_rel }));
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("gate", "mmm");
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+    try std.testing.expectEqual(@as(usize, 1), result.ran);
+    try std.testing.expectEqual(@as(usize, 2), result.skipped);
+
+    // The report follows the directory order: aaa skipped, mmm ran, zzz skipped.
+    const out = out_aw.written();
+    const aaa = std.mem.indexOf(u8, out, "gate=aaa") orelse return error.TestExpectedAaa;
+    const mmm = std.mem.indexOf(u8, out, "gate=mmm") orelse return error.TestExpectedMmm;
+    const zzz = std.mem.indexOf(u8, out, "gate=zzz") orelse return error.TestExpectedZzz;
+    try std.testing.expect(aaa < mmm and mmm < zzz);
 }
