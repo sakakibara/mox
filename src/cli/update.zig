@@ -183,7 +183,7 @@ pub fn fetchRebase(git: Git, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
 }
 
 const Spec = struct {
-    no_apply: cli.Flag(.{ .help = "stop after the fetch; write no live files" }),
+    no_apply: cli.Flag(.{ .help = "stop after the rebase; write no live files" }),
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
 };
 

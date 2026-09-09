@@ -296,7 +296,7 @@ masked on both sides. Read-only; takes no lock and always exits 0.
 Open the source file behind a managed live path (see [Path
 arguments](#path-arguments)) in `$EDITOR`. `--axis <tuple>` edits the matching overlay or region
 fragment instead of the base -- the way to reach a variant your current
-machine does not compose. Read-only; takes no lock, and reports the
+machine does not compose. Takes no lock of its own (`--apply` takes apply's), and reports the
 candidate path when the source does not exist.
 
 <!-- generated: flags edit -->
@@ -466,7 +466,7 @@ a manual rebase every time. Only commits absent from the upstream are
 replayed, so published history is never rewritten. A conflict stops
 mid-rebase for you to resolve and `git rebase --continue`, or abort.
 
-`--no-apply` stops after the fetch, for a `mox diff` before writing.
+`--no-apply` stops after the rebase, for a `mox diff` before writing.
 That is mox's guarded fetch without the write -- a dirty tree refused,
 a missing upstream reported in mox's terms, the arriving commit count
 printed -- which `mox git -- pull --rebase` does not give you.
@@ -477,7 +477,7 @@ same contract `apply` uses. Sending work the other way is `publish`.
 <!-- generated: flags update -->
 | Flag | Description |
 | --- | --- |
-| `--no-apply` | stop after the fetch; write no live files |
+| `--no-apply` | stop after the rebase; write no live files |
 | `--color <color>` | auto|always|never |
 <!-- /generated -->
 

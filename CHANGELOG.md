@@ -4,6 +4,13 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `update --no-apply` is described as stopping after the rebase, not the
+  fetch, in its help and both guides: the source tree is brought current, only
+  the live files wait.
+
 ## [0.10.0] - 2026-08-12
 
 ### Added
