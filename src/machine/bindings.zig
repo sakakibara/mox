@@ -133,6 +133,7 @@ fn axesWithValue(a: std.mem.Allocator, key: []const u8) !source_axes.Axes {
         .values = std.StringHashMap(void).init(a),
         .compared = std.StringHashMap(void).init(a),
         .valuesOf = std.StringHashMap(std.ArrayList(source_axes.Value)).init(a),
+        .open = std.StringHashMap(void).init(a),
     };
     try ax.values.put(key, {});
     return ax;

@@ -23,18 +23,6 @@ pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
 }
 
-/// The line under a `compose failed` report that says what to do about the
-/// errors a user can act on; apply and export print the same one.
-pub fn explainComposeError(w: *std.Io.Writer, prefix: []const u8, e: anyerror) !void {
-    switch (e) {
-        error.UnknownShell => try w.print("{s}:   accepted shells: fish, zsh, bash, powershell\n", .{prefix}),
-        error.ReservedAxisName => try w.print("{s}:   \"path\" is a reserved axis name; the path= axis no longer exists\n", .{prefix}),
-        error.SecretEmpty => try w.print("{s}:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n", .{prefix}),
-        error.InlineDirectiveWithOverlay => try w.print("{s}:   an inline directive in a file merged from .d/ overlays is only a comment there: gate the content with an overlay instead, or keep the file single-layer\n", .{prefix}),
-        else => {},
-    }
-}
-
 /// `machine.state.captureWith`, reporting a `ReservedFactName` (a custom fact
 /// or `data/facts.toml` row colliding with a reserved axis or built-in
 /// field) or a malformed `data/facts.toml` row the same way `mox facts` does,
@@ -82,6 +70,18 @@ fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, privat
     };
 }
 
+/// The line under a `compose failed` report that says what to do about the
+/// errors a user can act on; apply and export print the same one.
+pub fn explainComposeError(w: *std.Io.Writer, prefix: []const u8, e: anyerror) !void {
+    switch (e) {
+        error.UnknownShell => try w.print("{s}:   accepted shells: fish, zsh, bash, powershell\n", .{prefix}),
+        error.ReservedAxisName => try w.print("{s}:   \"path\" is a reserved axis name; the path= axis no longer exists\n", .{prefix}),
+        error.SecretEmpty => try w.print("{s}:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n", .{prefix}),
+        error.InlineDirectiveWithOverlay => try w.print("{s}:   an inline directive in a file merged from .d/ overlays is only a comment there: gate the content with an overlay instead, or keep the file single-layer\n", .{prefix}),
+        else => {},
+    }
+}
+
 /// Walk the source tree, reporting a structural failure (a malformed
 /// ownership declaration, an invalid `.mox/attributes.toml` entry, a
 /// reserved or malformed overlay axis tuple, ...) with the offending file
@@ -90,11 +90,11 @@ fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, privat
 /// and the compose pass's own walk, so both report the same failure the same
 /// way. Null return means the caller already reported and should fail the
 /// run; any other error still propagates.
-fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.source.tree.ManagedTree {
+pub fn walkTreeOrReport(ctx: *app.Ctx, cmd: []const u8, src_dir: []const u8, home: []const u8) !?mox.source.tree.ManagedTree {
     var walk_diag: mox.source.tree.Diag = .{};
     return mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, home, &walk_diag) catch |e| switch (e) {
         error.FileNotFound => {
-            try ctx.err.print("mox apply: source tree not found at {s}\n", .{src_dir});
+            try ctx.err.print("{s}: source tree not found at {s}\n", .{ cmd, src_dir });
             try ctx.err.writeAll("Run 'mox init' first.\n");
             return null;
         },
@@ -107,27 +107,33 @@ fn walkTreeOrReport(ctx: *app.Ctx, src_dir: []const u8, home: []const u8) !?mox.
         error.InvalidCheckDirective,
         error.CheckWithoutOwnership,
         => {
-            try ctx.err.print("mox apply: ownership declaration: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.apply.owned.ownDiagText(e),
+            try ctx.err.print("{s}: ownership declaration: {s}: {s}\n", .{
+                cmd,
+                walk_diag.capture() orelse "?",
+                mox.apply.owned.ownDiagText(e),
             });
             return null;
         },
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
         => {
-            try ctx.err.print("mox apply: attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            try ctx.err.print("{s}: attributes.toml: {s}: {s}\n", .{
+                cmd,
+                walk_diag.capture() orelse "?",
+                mox.source.attributes.diagText(e),
             });
             return null;
         },
         error.ReservedAxisName => {
-            try ctx.err.print("mox apply: overlay filename: {s}: \"path\" is a reserved axis name; the path= axis no longer exists\n", .{
+            try ctx.err.print("{s}: overlay filename: {s}: \"path\" is a reserved axis name; the path= axis no longer exists\n", .{
+                cmd,
                 walk_diag.capture() orelse "?",
             });
             return null;
         },
         error.InvalidEntry => {
-            try ctx.err.print("mox apply: overlay filename: {s}: malformed axis tuple\n", .{
+            try ctx.err.print("{s}: overlay filename: {s}: malformed axis tuple\n", .{
+                cmd,
                 walk_diag.capture() orelse "?",
             });
             return null;
@@ -241,7 +247,7 @@ fn applyPass(
     // `tree_error` was non-null, so this is not new work on the healthy path.
     if (discovery.tree_error != null) {
         const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-        _ = (try walkTreeOrReport(ctx, src_dir, m_state.home)) orelse return 2;
+        _ = (try walkTreeOrReport(ctx, "mox apply", src_dir, m_state.home)) orelse return 2;
     }
 
     // Facts interview: resolve every eligible unbound dimension, persist the
@@ -341,7 +347,7 @@ fn applyPass(
     try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs, mox_bin_dir);
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    const base_tree = (try walkTreeOrReport(ctx, src_dir, m_state.home)) orelse return 2;
+    const base_tree = (try walkTreeOrReport(ctx, "mox apply", src_dir, m_state.home)) orelse return 2;
 
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 

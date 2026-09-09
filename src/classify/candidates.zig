@@ -123,6 +123,7 @@ test "compute: offers an axis compared by value, never a fact tested for presenc
         .values = std.StringHashMap(void).init(a),
         .compared = std.StringHashMap(void).init(a),
         .valuesOf = std.StringHashMap(std.ArrayList(source.axes.Value)).init(a),
+        .open = std.StringHashMap(void).init(a),
     };
     try ax.names.put("os", {});
     try ax.compared.put("os", {});
@@ -156,6 +157,7 @@ test "compute: universal first, axis candidates by name, then machine_local, the
         .values = std.StringHashMap(void).init(a),
         .compared = std.StringHashMap(void).init(a),
         .valuesOf = std.StringHashMap(std.ArrayList(source.axes.Value)).init(a),
+        .open = std.StringHashMap(void).init(a),
     };
     try ax.names.put("os", {});
     try ax.compared.put("os", {});

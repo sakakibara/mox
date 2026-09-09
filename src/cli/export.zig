@@ -163,6 +163,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var as_map: std.StringHashMap([]const u8) = undefined;
     var as_override: mox.dsl.resolver.Resolver.Override = undefined;
     var as_resolver: mox.dsl.resolver.Resolver = undefined;
+    var as_tuple: ?mox.source.tree.AxisTuple = null;
     if (a.as) |as| {
         // A CLI value is not a filename: `hostname=host.local` names the
         // value `host.local`, so the extension heuristic must not run on it.
@@ -176,6 +177,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 return 2;
             }
         }
+        as_tuple = tuple;
         as_map = std.StringHashMap([]const u8).init(ctx.alloc);
         try applyTupleOverride(ctx.alloc, &as_map, tuple);
         // The override layer carries the `--as` tuple; it wins over the live
@@ -190,14 +192,31 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
-    const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch |e| switch (e) {
-        error.FileNotFound => {
-            try ctx.err.print("mox export: source tree not found at {s}\n", .{src_dir});
-            return 1;
-        },
-        else => return e,
-    };
+    // Shared with apply, so an unwalkable tree names the offending file and
+    // says what is wrong with it here too, rather than surfacing a bare
+    // `InvalidEntry` and leaving the reader to guess which file it meant.
+    const base_tree = (try apply_cmd.walkTreeOrReport(ctx, "mox export", src_dir, m_state.home)) orelse return 2;
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+    if (as_tuple) |tuple| {
+        // A value nothing in the tree names composes with every gate on that
+        // axis closed and reports success; say so, since a mistyped value
+        // (or one that once read as a filename) looks like a clean run. The
+        // private layer counts as a source; a presence test or a negated
+        // comparison opens on values no source spells out, so it is silent.
+        const ax = try mox.source.axes.ofManagedTree(ctx.alloc, ctx.io, tree);
+        for (tuple.pairs) |pair| {
+            // A pair a later one overrode never bound; the last one is judged.
+            if (as_map.get(pair.name)) |bound| if (!std.mem.eql(u8, bound, pair.value)) continue;
+            if (!ax.referencesName(pair.name) or ax.opensOnAnyValue(pair.name)) continue;
+            const compound = try std.fmt.allocPrint(ctx.alloc, "{s}={s}", .{ pair.name, pair.value });
+            var named = ax.referencesValue(compound);
+            for (ax.valuesFor(pair.name)) |v| {
+                if (std.mem.eql(u8, v.value, pair.value) or (v.exact != null and std.mem.eql(u8, v.exact.?, pair.value))) named = true;
+            }
+            if (!named)
+                try ctx.err.print("mox export: note: no source names {s}; every gate on {s} closes\n", .{ compound, pair.name });
+        }
+    }
 
     var plan: std.ArrayList(Planned) = .empty;
     var written: usize = 0;
@@ -316,7 +335,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // silently lacks it.
     if (failed > 0) {
         try ctx.err.print("mox export: {d} file(s) could not be composed; nothing was written\n", .{failed});
-        return 1;
+        return 2;
     }
 
     // The cleartext gate, decided before any of it reaches disk. Demanded only
@@ -370,7 +389,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             try ctx.err.print("mox export: baked {d} resolved secret(s) as cleartext ({d} at 0600, the rest at their composed mode)\n", .{ secret_count, restricted_count });
     }
     try ctx.out.print("Exported {d} file(s) to {f} ({d} gated off, {d} failed)\n", .{ written, display.of(out_dir, ctx.context.?.paths.home), skipped, failed });
-    return if (failed > 0) 1 else 0;
+    return if (failed > 0) 2 else 0;
 }
 
 pub const command = app.command(Spec, .{

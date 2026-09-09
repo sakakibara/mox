@@ -71,6 +71,9 @@ pub const Axes = struct {
     compared: std.StringHashMap(void),
     /// Values seen for each `compared` axis.
     valuesOf: std.StringHashMap(std.ArrayList(Value)),
+    /// Axes some gate opens on a value no source spells out: a presence
+    /// test (`when signing_key`) or a comparison under `not`.
+    open: std.StringHashMap(void),
 
     pub fn referencesName(self: Axes, name: []const u8) bool {
         return self.names.contains(name);
@@ -87,6 +90,10 @@ pub const Axes = struct {
         const list = self.valuesOf.get(name) orelse return &.{};
         return list.items;
     }
+    /// True when some gate on `name` can open for a value no source names.
+    pub fn opensOnAnyValue(self: Axes, name: []const u8) bool {
+        return self.open.contains(name);
+    }
 };
 
 fn initAxes(arena: std.mem.Allocator) Axes {
@@ -95,6 +102,7 @@ fn initAxes(arena: std.mem.Allocator) Axes {
         .values = std.StringHashMap(void).init(arena),
         .compared = std.StringHashMap(void).init(arena),
         .valuesOf = std.StringHashMap(std.ArrayList(Value)).init(arena),
+        .open = std.StringHashMap(void).init(arena),
     };
 }
 
@@ -151,9 +159,14 @@ fn addDirective(ax: *Axes, d: dsl.ast.Directive) !void {
 }
 
 fn addAxisExpr(ax: *Axes, expr: *const dsl.ast.AxisExpr) !void {
+    try addAxisExprIn(ax, expr, false);
+}
+
+fn addAxisExprIn(ax: *Axes, expr: *const dsl.ast.AxisExpr, negated: bool) !void {
     switch (expr.*) {
         .eq => |e| {
             try addName(ax, e.axis);
+            if (negated) try ax.open.put(e.axis, {});
             if (isMultiValueAxis(e.axis)) {
                 try ax.values.put(try std.fmt.allocPrint(axesArena(ax), "{s}={s}", .{ e.axis, e.value }), {});
             } else {
@@ -162,15 +175,18 @@ fn addAxisExpr(ax: *Axes, expr: *const dsl.ast.AxisExpr) !void {
             }
         },
         // Presence only: this machine will publish the name, never the value.
-        .present => |n| try addName(ax, n),
-        .not => |inner| try addAxisExpr(ax, inner),
+        .present => |n| {
+            try addName(ax, n);
+            try ax.open.put(n, {});
+        },
+        .not => |inner| try addAxisExprIn(ax, inner, !negated),
         .and_ => |a| {
-            try addAxisExpr(ax, a.left);
-            try addAxisExpr(ax, a.right);
+            try addAxisExprIn(ax, a.left, negated);
+            try addAxisExprIn(ax, a.right, negated);
         },
         .or_ => |o| {
-            try addAxisExpr(ax, o.left);
-            try addAxisExpr(ax, o.right);
+            try addAxisExprIn(ax, o.left, negated);
+            try addAxisExprIn(ax, o.right, negated);
         },
     }
 }

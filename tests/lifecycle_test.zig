@@ -4148,7 +4148,7 @@ test "export: a region directive under an overlay is explained here too" {
     try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=darwin.toml", "other = 2\n");
     const out = try std.fs.path.join(a, &.{ h.root, "baked" });
     const r = try h.run(&.{ "mox", "export", out });
-    try std.testing.expect(r.rc != 0);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "gate the content with an overlay instead") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: # mox: when profile=zzz") != null);
 }
@@ -4265,6 +4265,129 @@ test "doctor: OS noise in a stage is passed over, as apply passes over it" {
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(std.mem.indexOf(u8, r.err, "bad-stage-tuple") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "bad-axis-value") == null);
+}
+
+test "export: an unwalkable tree is reported the way apply reports it, at exit 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "x\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".zshrc\"]\nbogus = true\n");
+
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const ra = try h.run(&.{ "mox", "apply" });
+    const re = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 2), ra.rc);
+    try std.testing.expectEqual(@as(u8, 2), re.rc);
+    // Same diagnostic, only the command name differs.
+    const apply_line = std.mem.sliceTo(ra.err, '\n');
+    const export_line = std.mem.sliceTo(re.err, '\n');
+    try std.testing.expect(std.mem.startsWith(u8, apply_line, "mox apply:"));
+    try std.testing.expect(std.mem.startsWith(u8, export_line, "mox export:"));
+    try std.testing.expectEqualStrings(apply_line["mox apply:".len..], export_line["mox export:".len..]);
+    try std.testing.expect(!exists(io, out));
+}
+
+test "export --as: a value no source names is noted, since every gate on that axis closes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.osgate", "# mox: when os=darwin\nD=1\n# mox: end\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--as", "os=darwin.lua", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "note: no source names os=darwin.lua") != null);
+    const named = try h.run(&.{ "mox", "export", "--as", "os=darwin", try std.fs.path.join(a, &.{ h.root, "baked2" }) });
+    try std.testing.expect(std.mem.indexOf(u8, named.err, "note: no source names") == null);
+}
+
+test "export --as: a presence test, a negated comparison and the private layer all name values, so no note" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.presence", "head\n# mox: when signing_key\nsigned\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.negated", "head\n# mox: when not role=client\nnotclient\n# mox: end\n");
+    try tmp.dir.createDirPath(io, "state/private");
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/private/.privrc", .data = "priv\n# mox: when hostname=secretbox\nprivate bit\n# mox: end\n" });
+
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--as", "signing_key=ABCDEF+role=server+hostname=secretbox", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "note: no source names") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try std.fs.path.join(a, &.{ out, ".presence" })), "signed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try std.fs.path.join(a, &.{ out, ".negated" })), "notclient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try std.fs.path.join(a, &.{ out, ".privrc" })), "private bit") != null);
+}
+
+test "export --as: a value a later pair of the same axis overrides is not noted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "# mox: when profile=work\nwork\n# mox: end\nbase\n");
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--as", "profile=nope+profile=work", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no source names") == null);
+    try std.testing.expectEqualStrings("work\nbase\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".rc" })));
+}
+
+test "export: a file that cannot be written fails the export at exit 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.testrc", "fine\n");
+    // The target's parent is a regular file, so nothing under it can land.
+    try tmp.dir.writeFile(io, .{ .sub_path = "blocker", .data = "x" });
+    const out = try std.fs.path.join(a, &.{ h.root, "blocker", "sub" });
+    const r = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+}
+
+test "apply: a merged source is refused for a directive even when only one layer matches this machine" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin" });
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "# mox: when profile=work\nwork = 1\n# mox: end\nbase = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=windows.toml", "win = 1\n");
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "compose failed: InlineDirectiveWithOverlay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "gate the content with an overlay instead") != null);
+
+    // The other way round, and export agrees with apply on the same tree.
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "base = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=windows.toml", "# mox: when profile=work\nwin = 1\n# mox: end\n");
+    const again = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 2), again.rc);
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const exported = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 2), exported.rc);
+    try std.testing.expect(std.mem.indexOf(u8, exported.err, "gate the content with an overlay instead") != null);
 }
 
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
@@ -4468,7 +4591,7 @@ test "export: one file that cannot compose leaves no tree behind" {
 
     const out = try std.fs.path.join(a, &.{ h.root, "baked" });
     const r = try h.run(&.{ "mox", "export", out });
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be composed") != null);
     // An export feeds a parity harness; a tree silently missing a file is
     // worse than no tree, so the good file is not written either.

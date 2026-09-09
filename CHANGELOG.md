@@ -42,6 +42,7 @@ All notable changes to mox are documented here. The format follows
   it cannot read, or a subdirectory named like a tuple that is not one, in a
   closed gate as in an open one; a closed gate's contents went unexamined
   before.
+- BREAKING: `export` exits 2 on any failure to compose or write; it exited 1.
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
@@ -100,6 +101,10 @@ All notable changes to mox are documented here. The format follows
   such as `.DS_Store` in a stage is passed over, by `doctor` as by `apply`,
   and `doctor` reads a gate directory's name the same way and reports one it
   cannot read.
+- `export` reports a missing or unwalkable source tree with the same
+  diagnostics as `apply`, documents its exit codes, and notes an `--as` value
+  no source names, since every gate on that axis then closes (a presence test,
+  a negated comparison or a private-layer source counts as naming it).
 
 ## [0.10.0] - 2026-08-12
 

@@ -420,6 +420,7 @@ fn axesFixture(
         .values = std.StringHashMap(void).init(a),
         .compared = std.StringHashMap(void).init(a),
         .valuesOf = std.StringHashMap(std.ArrayList(source.axes.Value)).init(a),
+        .open = std.StringHashMap(void).init(a),
     };
     for (compared) |pair| {
         try ax.names.put(pair[0], {});

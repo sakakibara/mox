@@ -383,6 +383,10 @@ the file's composed mode.
 | `--facts <path>` | read facts from this file instead of the machine's own |
 <!-- /generated -->
 
+Exit 0 when every file composed and was written, 2 on any failure: a source tree that is
+missing or cannot be walked, a facts file that cannot be read, a file that
+does not compose, or a resolved secret with no `--cleartext-secrets`.
+
 ## facts
 
 List facts (`name = "value"` lines, a machine-readable format kept
