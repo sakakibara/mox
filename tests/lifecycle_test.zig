@@ -3488,6 +3488,28 @@ test "secret resolver: a cmd backend runs under the environment mox was given" {
     try std.testing.expectEqualStrings("token = s3cret", std.mem.trimEnd(u8, live, " \r\n"));
 }
 
+test "export --as: a dotted value composes its own overlay and opens its own gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    // Read as a filename, `hostname=studio.local` would lose `.local` as an
+    // extension and bind the short sibling instead.
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/hostname=studio.local", "[x]\n\tkey = local\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/hostname=studio", "[x]\n\tkey = short\n");
+    try writeRepo(io, &tmp, "repo/src/.gated", "# mox: when hostname=studio.local\nkeep = 1\n# mox: end\n");
+
+    const out = try std.fs.path.join(a, &.{ h.root, "baked" });
+    const r = try h.run(&.{ "mox", "export", "--as", "hostname=studio.local", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try std.fs.path.join(a, &.{ out, ".gitconfig" })), "key = local") != null);
+    try std.testing.expectEqualStrings("keep = 1\n", try read(io, a, try std.fs.path.join(a, &.{ out, ".gated" })));
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {

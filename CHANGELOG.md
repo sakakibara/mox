@@ -15,6 +15,10 @@ All notable changes to mox are documented here. The format follows
   passing over a directory or an unrunnable file of its name the way a shell
   does. `mox edit` spawns the editor and `mox init --clone` spawns git under
   that environment as well.
+- `export --as` reads its tuple verbatim: a dotted value such as
+  `hostname=studio.local` no longer loses `.local` as if it were an extension,
+  and a value that once read as a filename with an extension now binds as
+  written.
 
 ## [0.10.0] - 2026-08-12
 

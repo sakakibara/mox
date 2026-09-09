@@ -77,7 +77,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var as_override: mox.dsl.resolver.Resolver.Override = undefined;
     var as_resolver: mox.dsl.resolver.Resolver = undefined;
     if (a.as) |as| {
-        const tuple = mox.source.tuple.parseFilename(ctx.alloc, as) catch {
+        // A CLI value is not a filename: `hostname=host.local` names the
+        // value `host.local`, so the extension heuristic must not run on it.
+        const tuple = mox.source.tuple.parseFilenameVerbatim(ctx.alloc, as) catch {
             try ctx.err.print("mox export: invalid axis tuple '{s}'\n", .{as});
             return 2;
         };
