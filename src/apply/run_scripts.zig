@@ -41,6 +41,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tuple_mod = @import("../source/tuple.zig");
+const mox_path = @import("mox_path.zig");
 const match_mod = @import("../compose/match.zig");
 const dsl = @import("../dsl/root.zig");
 const dirent = @import("../source/dirent.zig");
@@ -88,6 +89,11 @@ pub const Fact = struct { name: []const u8, value: []const u8 };
 /// facts left out of it.
 pub const ScriptEnv = struct {
     map: EnvironMap,
+    /// The state directory holding only the running mox, first on the
+    /// scripts' PATH; null, with the reason in `mox_bin_unavailable`, when
+    /// it could not be made so.
+    mox_bin_dir: ?[]const u8 = null,
+    mox_bin_unavailable: ?[]const u8 = null,
     /// Fact names not exposed as MOX_FACT_* because their name cannot be
     /// turned into a distinct env name: a non-ASCII byte can only sanitize to
     /// `_`, destroying the name, and two names that sanitize to the SAME
@@ -381,22 +387,88 @@ pub fn verdictForScript(arena: std.mem.Allocator, record: ?dimensions.ScriptReco
     return .{};
 }
 
+/// A directory under the state dir holding only the running mox, refreshed
+/// on every call, for scripts and check hooks to find `mox` on PATH. Every
+/// setup script calls `mox` (a `mox trigger` staleness gate is the idiom),
+/// but a bootstrap runs mox by absolute path before its directory is on PATH,
+/// so those calls would resolve to nothing and the script would report
+/// success having done nothing. Only mox is exposed: anything else found in
+/// the directory is removed, since the directory leads every script's PATH.
+/// On Windows the running binary is copied in (a `.cmd` shim would swallow a
+/// caller's `call` and re-split the arguments); elsewhere it is a symlink.
+/// Null, with the reason in `why`, when mox cannot locate itself or the
+/// directory cannot be made to hold it.
+pub fn moxBinDir(arena: std.mem.Allocator, io: Io, state_dir: []const u8, why: *?[]const u8) !?[]const u8 {
+    why.* = null;
+    const exe = std.process.executablePathAlloc(io, arena) catch {
+        why.* = "mox could not locate its own executable";
+        return null;
+    };
+    const dir = try std.fs.path.join(arena, &.{ state_dir, "bin" });
+    Io.Dir.cwd().createDirPath(io, dir) catch |e| {
+        why.* = try std.fmt.allocPrint(arena, "{s} could not be created: {s}", .{ dir, @errorName(e) });
+        return null;
+    };
+    const keep: []const u8 = if (builtin.os.tag == .windows) "mox.exe" else "mox";
+    var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| {
+        why.* = try std.fmt.allocPrint(arena, "{s} could not be opened: {s}", .{ dir, @errorName(e) });
+        return null;
+    };
+    defer d.close(io);
+    const entries = dirent.sorted(arena, io, d) catch |e| {
+        why.* = try std.fmt.allocPrint(arena, "{s} could not be read: {s}", .{ dir, @errorName(e) });
+        return null;
+    };
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, keep)) continue;
+        const stray = try std.fs.path.join(arena, &.{ dir, entry.name });
+        Io.Dir.cwd().deleteTree(io, stray) catch |e| {
+            why.* = try std.fmt.allocPrint(arena, "{s} could not be removed from {s}: {s}", .{ entry.name, dir, @errorName(e) });
+            return null;
+        };
+    }
+    const target = try std.fs.path.join(arena, &.{ dir, keep });
+    if (builtin.os.tag == .windows) {
+        Io.Dir.cwd().deleteTree(io, target) catch {};
+        Io.Dir.cwd().copyFile(exe, Io.Dir.cwd(), target, io, .{}) catch |e| {
+            why.* = try std.fmt.allocPrint(arena, "{s} could not be copied into {s}: {s}", .{ exe, dir, @errorName(e) });
+            return null;
+        };
+    } else {
+        Io.Dir.cwd().deleteTree(io, target) catch {};
+        Io.Dir.cwd().symLink(io, exe, target, .{}) catch |e| {
+            why.* = try std.fmt.allocPrint(arena, "{s} could not be linked into {s}: {s}", .{ exe, dir, @errorName(e) });
+            return null;
+        };
+    }
+    return dir;
+}
+
 /// Build the child environment for setup scripts: the parent environment
-/// augmented with MOX_REPO, MOX_STATE_DIR, MOX_HOME (the live root), and every
-/// fact as MOX_FACT_<UPPERCASE_NAME>. Characters outside [A-Z0-9_] in a fact
+/// augmented with MOX_REPO, MOX_STATE_DIR, MOX_HOME (the live root), a PATH
+/// led by the state bin dir this refreshes to hold only the running mox, and
+/// every fact as MOX_FACT_<UPPERCASE_NAME>. Characters outside [A-Z0-9_] in a fact
 /// name become '_'. All storage is arena-owned.
 pub fn buildScriptEnv(
     arena: std.mem.Allocator,
+    io: Io,
     parent: Environ,
     repo: []const u8,
     state_dir: []const u8,
     home: []const u8,
     facts: []const Fact,
+    refresh_bin: bool,
 ) !ScriptEnv {
     var map = try parent.createMap(arena);
     try map.put("MOX_REPO", repo);
     try map.put("MOX_STATE_DIR", state_dir);
     try map.put("MOX_HOME", home);
+
+    var mox_bin_why: ?[]const u8 = null;
+    const mox_bin_dir = if (refresh_bin) try moxBinDir(arena, io, state_dir, &mox_bin_why) else null;
+    if (mox_bin_dir) |dir| {
+        try map.put("PATH", try mox_path.prependToPath(arena, map.get("PATH"), &.{dir}));
+    }
 
     const names = try arena.alloc([]const u8, facts.len);
     for (facts, 0..) |f, i| names[i] = f.name;
@@ -410,7 +482,7 @@ pub fn buildScriptEnv(
         };
         try map.put(enc, f.value);
     }
-    return .{ .map = map, .skipped = try skipped.toOwnedSlice(arena) };
+    return .{ .map = map, .skipped = try skipped.toOwnedSlice(arena), .mox_bin_dir = mox_bin_dir, .mox_bin_unavailable = mox_bin_why };
 }
 
 /// Run every top-level regular file in `scripts_dir` lexicographically, then
@@ -937,15 +1009,18 @@ test "buildScriptEnv: injects mox vars and uppercased facts" {
         .{ .name = "cloud_backend", .value = "gdrive" },
     };
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     // An injected parent, so the assertion that it survives does not depend on
     // which variables the host defines (HOME is a POSIX spelling).
     var parent = EnvironMap.init(a);
     try parent.put("MOX_TEST_PARENT", "kept");
 
-    var result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    var result = try buildScriptEnv(a, std.testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &facts, true);
     try testing.expectEqualStrings("/repo", result.map.get("MOX_REPO").?);
-    try testing.expectEqualStrings("/state", result.map.get("MOX_STATE_DIR").?);
+    try testing.expectEqualStrings(state_dir, result.map.get("MOX_STATE_DIR").?);
     try testing.expectEqualStrings("/home/me", result.map.get("MOX_HOME").?);
     try testing.expectEqualStrings("work", result.map.get("MOX_FACT_PROFILE").?);
     try testing.expectEqualStrings("gdrive", result.map.get("MOX_FACT_CLOUD_BACKEND").?);
@@ -954,17 +1029,72 @@ test "buildScriptEnv: injects mox vars and uppercased facts" {
     try testing.expectEqual(@as(usize, 0), result.skipped.len);
 }
 
+test "buildScriptEnv: a script's PATH leads with a directory holding only the running mox" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(testing.io, a);
+    const state_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+
+    // A bootstrap runs mox by absolute path, before its directory is on PATH.
+    // Setup scripts call `mox` by name, so without this the call resolves to
+    // nothing and `mox trigger ... || exit 0` reports success having done
+    // nothing at all. Only mox is exposed, never its neighbours.
+    var parent = EnvironMap.init(a);
+    try parent.put("PATH", "/usr/bin:/bin");
+
+    const result = try buildScriptEnv(a, testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &.{}, true);
+    const path = result.map.get("PATH").?;
+    const bin = try std.fs.path.join(a, &.{ state_dir, "bin" });
+    try testing.expect(std.mem.startsWith(u8, path, bin));
+    // The inherited PATH is kept behind it, not replaced.
+    try testing.expect(std.mem.endsWith(u8, path, "/usr/bin:/bin"));
+
+    var dir = try Io.Dir.cwd().openDir(testing.io, bin, .{ .iterate = true });
+    defer dir.close(testing.io);
+    const entries = try dirent.sorted(a, testing.io, dir);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    const name = if (builtin.os.tag == .windows) "mox.exe" else "mox";
+    try testing.expectEqualStrings(name, entries[0].name);
+    if (builtin.os.tag != .windows) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try Io.Dir.cwd().readLink(testing.io, try std.fs.path.join(a, &.{ bin, "mox" }), &buf);
+        try testing.expectEqualStrings(try std.process.executablePathAlloc(testing.io, a), buf[0..n]);
+    }
+
+    // A stray beside mox would shadow the system tools for every script; it
+    // is removed on the next refresh, and a directory squatting on mox's
+    // name is replaced.
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ bin, "git" }), .data = "#!/bin/sh\n" });
+    try Io.Dir.cwd().deleteTree(testing.io, try std.fs.path.join(a, &.{ bin, name }));
+    try Io.Dir.cwd().createDirPath(testing.io, try std.fs.path.join(a, &.{ bin, name, "inner" }));
+    var why: ?[]const u8 = null;
+    try testing.expect((try moxBinDir(a, testing.io, state_dir, &why)) != null);
+    try testing.expect(why == null);
+    var dir2 = try Io.Dir.cwd().openDir(testing.io, bin, .{ .iterate = true });
+    defer dir2.close(testing.io);
+    const after = try dirent.sorted(a, testing.io, dir2);
+    try testing.expectEqual(@as(usize, 1), after.len);
+    try testing.expectEqualStrings(name, after[0].name);
+    try testing.expect((try Io.Dir.cwd().statFile(testing.io, try std.fs.path.join(a, &.{ bin, name }), .{})).kind != .directory);
+}
+
 test "buildScriptEnv: a non-ASCII fact name is skipped, not garbled into underscores" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
     var parent = EnvironMap.init(a);
     // "nihongo" (Japanese for "Japanese language") as raw UTF-8 bytes.
     const facts = [_]Fact{
         .{ .name = "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", .value = "x" },
         .{ .name = "profile", .value = "work" },
     };
-    var result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    var result = try buildScriptEnv(a, std.testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &facts, true);
     try testing.expectEqualStrings("work", result.map.get("MOX_FACT_PROFILE").?);
     try testing.expectEqual(@as(usize, 1), result.skipped.len);
     try testing.expectEqualStrings("\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", result.skipped[0]);
@@ -974,13 +1104,16 @@ test "buildScriptEnv: two names that sanitize identically are both skipped, neit
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
     var parent = EnvironMap.init(a);
     const facts = [_]Fact{
         .{ .name = "cloud.backend", .value = "gdrive" },
         .{ .name = "cloud-backend", .value = "dropbox" },
         .{ .name = "profile", .value = "work" },
     };
-    var result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    var result = try buildScriptEnv(a, std.testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &facts, true);
     try testing.expect(result.map.get("MOX_FACT_CLOUD_BACKEND") == null);
     try testing.expectEqualStrings("work", result.map.get("MOX_FACT_PROFILE").?);
     try testing.expectEqual(@as(usize, 2), result.skipped.len);
@@ -1231,6 +1364,9 @@ test "verdictForScript: a projection-collision-dropped bound fact is unavailable
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     // `cloud.backend` and `cloud-backend` both sanitize to
     // MOX_FACT_CLOUD_BACKEND: buildScriptEnv drops both (existing skip-both
@@ -1241,7 +1377,7 @@ test "verdictForScript: a projection-collision-dropped bound fact is unavailable
         .{ .name = "cloud.backend", .value = "gdrive" },
         .{ .name = "cloud-backend", .value = "dropbox" },
     };
-    var env_result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    var env_result = try buildScriptEnv(a, std.testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &facts, true);
     const dims = [_]dimensions.Dimension{testDim("cloud.backend")};
     const c = try buildContracts(a, &dims, &.{}, &.{}, &facts, env_result.skipped, &env_result.map);
 
@@ -1256,6 +1392,9 @@ test "verdictForScript: a scanned token landing on a projection collision -> blo
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     // Same collision as the needs-path test above, but reached via the
     // scanned-token path (no `# mox: needs` line): `token_to_name` has no
@@ -1267,7 +1406,7 @@ test "verdictForScript: a scanned token landing on a projection collision -> blo
         .{ .name = "cloud.backend", .value = "gdrive" },
         .{ .name = "cloud-backend", .value = "dropbox" },
     };
-    var env_result = try buildScriptEnv(a, Environ{ .map = &parent }, "/repo", "/state", "/home/me", &facts);
+    var env_result = try buildScriptEnv(a, std.testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &facts, true);
     const c = try buildContracts(a, &.{}, &.{}, &.{}, &facts, env_result.skipped, &env_result.map);
 
     const rec = testRecord("scripts/pre/x.sh", null, &.{"MOX_FACT_CLOUD_BACKEND"});

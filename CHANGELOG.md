@@ -48,6 +48,14 @@ All notable changes to mox are documented here. The format follows
 - The docs no longer name a `--force` alias `apply` never had, `apply --help`
   no longer names `--overwrite` as its own alias, and `rollback --help` says
   its id is optional.
+- Setup scripts and check hooks find the running mox first on PATH, through a
+  state directory that holds only it (anything else found there is removed,
+  and a directory that cannot be made, opened or read is reported and the run
+  goes on); it stays ahead of what `$MOX_PATH` adds (a directory already on
+  PATH is moved to the front, not repeated), and the warning for a bin
+  directory that cannot be made prints once per run; a dry run, which spawns
+  nothing, leaves the directory as it is, and rollback touches it only when a
+  check hook runs.
 
 ## [0.10.0] - 2026-08-12
 

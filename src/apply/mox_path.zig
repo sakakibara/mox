@@ -82,12 +82,29 @@ pub const Reader = struct {
 pub fn prependToPath(arena: std.mem.Allocator, existing: ?[]const u8, dirs: []const []const u8) ![]const u8 {
     if (dirs.len == 0) return arena.dupe(u8, existing orelse "");
     var out: std.ArrayList(u8) = .empty;
+    var kept: std.ArrayList([]const u8) = .empty;
     for (dirs) |d| {
+        if (contains(kept.items, d)) continue;
+        try kept.append(arena, d);
         try out.appendSlice(arena, d);
         try out.append(arena, std.fs.path.delimiter);
     }
-    if (existing) |e| try out.appendSlice(arena, e);
+    // A directory prepended again moves to the front rather than appearing
+    // twice; a repeated fold leaves PATH the length it was.
+    var first = true;
+    var it = std.mem.splitScalar(u8, existing orelse "", std.fs.path.delimiter);
+    while (it.next()) |e| {
+        if (contains(kept.items, e)) continue;
+        if (!first) try out.append(arena, std.fs.path.delimiter);
+        first = false;
+        try out.appendSlice(arena, e);
+    }
     return out.toOwnedSlice(arena);
+}
+
+fn contains(items: []const []const u8, needle: []const u8) bool {
+    for (items) |i| if (std.mem.eql(u8, i, needle)) return true;
+    return false;
 }
 
 const testing = std.testing;
@@ -223,4 +240,17 @@ test "prependToPath: a null existing PATH still yields the dirs" {
     const got = try prependToPath(a, null, &.{"/new/one"});
     const want = try std.fmt.allocPrint(a, "/new/one{c}", .{std.fs.path.delimiter});
     try testing.expectEqualStrings(want, got);
+}
+
+test "prependToPath: a directory already on PATH moves to the front instead of repeating" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = std.fs.path.delimiter;
+    const existing = try std.fmt.allocPrint(a, "/a{c}/b{c}/c", .{ d, d });
+    const want = try std.fmt.allocPrint(a, "/b{c}/a{c}/c", .{ d, d });
+    try testing.expectEqualStrings(want, try prependToPath(a, existing, &.{"/b"}));
+    const once = try std.fmt.allocPrint(a, "/x{c}/a", .{d});
+    try testing.expectEqualStrings(once, try prependToPath(a, "/a", &.{ "/x", "/x" }));
+    try testing.expectEqualStrings("/a", try prependToPath(a, "/a", &.{}));
 }

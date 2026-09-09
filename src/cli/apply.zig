@@ -275,7 +275,9 @@ fn applyPass(
     // fact notice prints once per run, not once per re-capture, when the
     // skipped set does not change.
     var notified_skipped: []const []const u8 = &.{};
-    try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped);
+    var notified_mox_bin = false;
+    var mox_bin_dir: ?[]const u8 = null;
+    try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped, &notified_mox_bin, &mox_bin_dir, !dry_run);
 
     // Resolved once per apply run (not per checked partial file): an
     // unparseable override would otherwise warn once per file checked.
@@ -318,13 +320,13 @@ fn applyPass(
         m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 2;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
-        try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped);
+        try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped, &notified_mox_bin, &mox_bin_dir, !dry_run);
         try script_env.put("MOX_PATH", mox_path_file);
     }
     // $MOX_PATH additions the pre stage named: fold into this run's probe
     // search space (on the FRESH state above, if it just recaptured) and
     // into PATH for every later script and check hook.
-    try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs);
+    try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs, mox_bin_dir);
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     const base_tree = (try walkTreeOrReport(ctx, src_dir, m_state.home)) orelse return 2;
@@ -537,6 +539,7 @@ fn applyPass(
                     .units = &units,
                     .check_timeout_ms = check_timeout_ms,
                     .extra_path_dirs = mox_path_dirs.items,
+                    .mox_bin_dir = mox_bin_dir,
                 }, &counts, &snapshotted);
             } else {
                 try applyRegularFile(ctx, .{
@@ -704,7 +707,7 @@ fn applyPass(
     // $MOX_PATH additions the post stage named: no script or check hook runs
     // after this in the same apply, but folding them in keeps the run's
     // bookkeeping (probe search space, PATH) consistent regardless of stage.
-    try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs);
+    try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs, mox_bin_dir);
 
     if (dry_run) {
         try ctx.out.print(
@@ -770,22 +773,34 @@ fn refreshScriptStage(
     script_env: *std.process.Environ.Map,
     contracts: *mox.apply.run_scripts.Contracts,
     notified_skipped: *[]const []const u8,
+    notified_mox_bin: *bool,
+    mox_bin_dir: *?[]const u8,
+    refresh_bin: bool,
 ) !void {
     const script_facts = try ctx.alloc.alloc(mox.apply.run_scripts.Fact, m_state.custom_facts.len);
     for (m_state.custom_facts, 0..) |f, i| script_facts[i] = .{ .name = f.name, .value = f.value };
     const script_env_result = try mox.apply.run_scripts.buildScriptEnv(
         ctx.alloc,
+        ctx.io,
         context.env,
         context.paths.repo_dir,
         context.paths.state_dir,
         context.paths.home,
         script_facts,
+        refresh_bin,
     );
-    // Printed once per run, not once per `refreshScriptStage` call: a
-    // re-capture between pre- and post-stage rebuilds this same notice from
-    // the same facts.toml far more often than the skipped set actually
-    // changes, and repeating an unchanged notice only trains the reader to
-    // skip past it.
+    mox_bin_dir.* = script_env_result.mox_bin_dir;
+    // Both notices print once per run, not once per `refreshScriptStage`
+    // call: a re-capture between pre- and post-stage rebuilds the same
+    // notice from the same inputs far more often than they actually change,
+    // and repeating an unchanged notice only trains the reader to skip past
+    // it.
+    if (script_env_result.mox_bin_unavailable) |why| {
+        if (!notified_mox_bin.*) {
+            try ctx.err.print("mox apply: warning: the running mox is not on the scripts' PATH: {s}\n", .{why});
+            notified_mox_bin.* = true;
+        }
+    }
     if (script_env_result.skipped.len > 0 and !sameSkippedNames(script_env_result.skipped, notified_skipped.*)) {
         try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
         for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
@@ -817,11 +832,17 @@ fn foldMoxPathAdditions(
     m_state: mox.machine.state.MachineState,
     script_env: *std.process.Environ.Map,
     dirs_so_far: *std.ArrayList([]const u8),
+    mox_bin_dir: ?[]const u8,
 ) !void {
     const new_dirs = try reader.readNew(ctx.alloc, ctx.io, ctx.err);
     if (new_dirs.len == 0) return;
     if (m_state.tool_probe) |tp| tp.extend(new_dirs);
     try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), new_dirs));
+    // The running mox stays ahead of whatever a script published: a `mox`
+    // beside a tool in `$MOX_PATH` must not displace it for later scripts.
+    if (mox_bin_dir) |dir| {
+        try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), &.{dir}));
+    }
     try dirs_so_far.appendSlice(ctx.alloc, new_dirs);
 }
 
@@ -1141,6 +1162,7 @@ const PartialInput = struct {
     /// this apply, prepended onto the check hook's PATH. Empty outside
     /// `mox apply` (rollback names no scripts, so it passes none).
     extra_path_dirs: []const []const u8 = &.{},
+    mox_bin_dir: ?[]const u8 = null,
 };
 
 /// Run a partial file's `check` hook against `candidate`, materialized
@@ -1153,7 +1175,7 @@ const PartialInput = struct {
 /// because rollback runs the same hook before re-patching a partial target.
 /// `extra_path_dirs` is prepended onto the child's PATH -- empty for
 /// rollback, which names no scripts of its own.
-pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize, extra_path_dirs: []const []const u8) !bool {
+pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_path: []const u8, candidate: []const u8, timeout_ms: i64, fail_count: *usize, extra_path_dirs: []const []const u8, mox_bin_dir: ?[]const u8) !bool {
     const context = ctx.context.?;
     const shown = try display.alloc(ctx.alloc, live_path, context.paths.home);
     // Keyed by live path: the state lock serializes applies, so no two runs
@@ -1189,6 +1211,9 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     try env_map.put("MOX_CHECK_DIR", check_dir);
     if (extra_path_dirs.len > 0) {
         try env_map.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, env_map.get("PATH"), extra_path_dirs));
+    }
+    if (mox_bin_dir) |dir| {
+        try env_map.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, env_map.get("PATH"), &.{dir}));
     }
 
     const res = mox.apply.run_scripts.runCheck(ctx.alloc, ctx.io, context.paths.repo_dir, check_argv, &env_map, out_path, timeout_ms) catch |e| switch (e) {
@@ -1415,7 +1440,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
     if (in.file.check_argv.len > 0) {
-        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, in.check_timeout_ms, &counts.fail, in.extra_path_dirs)) return;
+        if (!try partialCheckAccepts(ctx, in.file.check_argv, live_path, candidate, in.check_timeout_ms, &counts.fail, in.extra_path_dirs, in.mox_bin_dir)) return;
     }
 
     if (live != null) {

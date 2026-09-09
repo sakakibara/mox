@@ -118,13 +118,23 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     var repatched: usize = 0;
     var failed: usize = 0;
+    // Resolved on the first check hook, once for the run: a run that spawns
+    // none leaves the state directory as it is.
+    var mox_bin_dir: ?[]const u8 = null;
+    var mox_bin_resolved = false;
     for (withheld.items) |w| {
         const file = partials.get(w.live_path) orelse {
             try ctx.err.print("  ERROR   {f} (partially owned, but its own declaration is unavailable; fix the source tree, then re-run)\n", .{display.of(w.live_path, ctx.context.?.paths.home)});
             failed += 1;
             continue;
         };
-        if (try repatchPartial(ctx, file, w.content, check_timeout_ms, &failed)) repatched += 1;
+        if (file.check_argv.len > 0 and !mox_bin_resolved) {
+            mox_bin_resolved = true;
+            var mox_bin_why: ?[]const u8 = null;
+            mox_bin_dir = try mox.apply.run_scripts.moxBinDir(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, &mox_bin_why);
+            if (mox_bin_why) |why| try ctx.err.print("mox rollback: warning: the running mox is not on the check hooks' PATH: {s}\n", .{why});
+        }
+        if (try repatchPartial(ctx, file, w.content, check_timeout_ms, &failed, mox_bin_dir)) repatched += 1;
     }
 
     try ctx.out.print("Restored {d} file(s) from snapshot {s}\n", .{ restored.count + repatched, id });
@@ -163,6 +173,7 @@ fn repatchPartial(
     snap_content: []const u8,
     check_timeout_ms: i64,
     failed: *usize,
+    mox_bin_dir: ?[]const u8,
 ) !bool {
     const partial = mox.apply.partial;
     const live_path = file.live_path;
@@ -270,7 +281,7 @@ fn repatchPartial(
     };
     // A rollback must not install content the file's own validator rejects.
     if (file.check_argv.len > 0) {
-        if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, check_timeout_ms, failed, &.{})) return false;
+        if (!try apply_cmd.partialCheckAccepts(ctx, file.check_argv, live_path, candidate, check_timeout_ms, failed, &.{}, mox_bin_dir)) return false;
     }
 
     // A live target absent here is legitimate (this partial target was never

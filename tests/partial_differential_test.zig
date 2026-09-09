@@ -515,3 +515,37 @@ test "disown verify: a damaged trailing-space byte inside a protected span refus
         &diag,
     ));
 }
+
+test "check hook: the running mox leads the hook's PATH" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const check_rel = "scripts/check/probe" ++ script_ext;
+    const head = own_head ++ "# mox: check \"" ++ check_rel ++ "\"\n";
+    const checker: []const u8 = if (builtin.os.tag == .windows)
+        \\Set-Content -LiteralPath (Join-Path (Split-Path $env:MOX_CHECK_DIR) 'path-seen') -Value $env:PATH -NoNewline
+        \\exit 0
+        \\
+    else
+        \\#!/bin/sh
+        \\printf '%s' "$PATH" > "$MOX_CHECK_DIR/../path-seen"
+        \\exit 0
+        \\
+    ;
+    try writeFixture(io, &tmp, live_fixture, head);
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const abs = try std.fs.path.join(a, &.{ root, "repo", "scripts", "check", "probe" ++ script_ext });
+    try writeExecScript(io, &tmp, "repo/" ++ check_rel, checker, abs);
+
+    const c = try testutil.setup(a, io, &tmp, .{});
+    const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    const seen = try read(io, a, try std.fs.path.join(a, &.{ c.state, "path-seen" }));
+    const bin = try std.fs.path.join(a, &.{ c.state, "bin" });
+    try std.testing.expect(std.mem.startsWith(u8, seen, bin));
+}

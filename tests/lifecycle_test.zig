@@ -3913,6 +3913,124 @@ test "edit --axis: a file with both overlays and regions is told both were looke
     try std.testing.expect(std.mem.indexOf(u8, missing.err, "in each region's directory") != null);
 }
 
+test "apply: the running mox stays ahead of a mox a pre-script publishes through $MOX_PATH" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the decoy and the probe are POSIX shell
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const decoy_dir = try std.fs.path.join(a, &.{ root, "decoy" });
+    const marker = try std.fs.path.join(a, &.{ root, "which-mox.txt" });
+    const pre_body = try std.fmt.allocPrint(a, "#!/bin/sh\nmkdir -p \"{s}\"\nprintf '#!/bin/sh\\necho DECOY\\n' > \"{s}/mox\"\nchmod +x \"{s}/mox\"\necho \"{s}\" >> \"$MOX_PATH\"\n", .{ decoy_dir, decoy_dir, decoy_dir, decoy_dir });
+    const pre_abs = try std.fs.path.join(a, &.{ root, "repo/scripts/pre/00-decoy.sh" });
+    try writeExecScript(io, &tmp, "repo/scripts/pre/00-decoy.sh", pre_body, pre_abs);
+    const post_body = try std.fmt.allocPrint(a, "#!/bin/sh\ncommand -v mox > \"{s}\"\n", .{marker});
+    const post_abs = try std.fs.path.join(a, &.{ root, "repo/scripts/post/00-which.sh" });
+    try writeExecScript(io, &tmp, "repo/scripts/post/00-which.sh", post_body, post_abs);
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+    const which = std.mem.trimEnd(u8, try read(io, a, marker), "\r\n");
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ h.state, "bin", "mox" }), which);
+    // The decoy's directory is on PATH behind it, not dropped.
+    try std.testing.expect(std.mem.indexOf(u8, applied.err, "DECOY") == null);
+}
+
+test "apply: the mox-bin warning prints once per run, not once per stage" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+    // A regular file squats on the bin directory's path, so it cannot be made.
+    try tmp.dir.createDirPath(io, "state");
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/bin", .data = "not a directory\n" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const ext = if (builtin.os.tag == .windows) ".ps1" else ".sh";
+    const body = if (builtin.os.tag == .windows) "exit 0\n" else "#!/bin/sh\nexit 0\n";
+    const sub = try std.fmt.allocPrint(a, "repo/scripts/pre/00-ran{s}", .{ext});
+    try writeExecScript(io, &tmp, sub, body, try std.fs.path.join(a, &.{ root, sub }));
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const applied = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), applied.rc);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, applied.err, "not on the scripts' PATH"));
+}
+
+test "apply: a bin directory that cannot be opened is a warning, not an aborted run" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no mode bits to close it with
+    if (std.c.getuid() == 0) return error.SkipZigTest; // root opens anything
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/.testrc", "export BASE=1\n");
+    try tmp.dir.createDirPath(io, "state/bin");
+    const bin = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(io, a), ".zig-cache", "tmp", &tmp.sub_path, "state", "bin" });
+    try chmodPath(a, bin, 0o000);
+    defer chmodPath(a, bin, 0o755) catch {};
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not on the scripts' PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be opened") != null);
+}
+
+test "apply --dry-run: the state bin directory is left as it is, since nothing is spawned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    const bin = try std.fs.path.join(a, &.{ h.state, "bin" });
+    try Io.Dir.cwd().createDirPath(io, bin);
+    const keep = try std.fs.path.join(a, &.{ bin, "keep.txt" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = keep, .data = "mine\n" });
+    const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), dry.rc);
+    try std.testing.expect(exists(io, keep));
+    const real = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), real.rc);
+    try std.testing.expect(!exists(io, keep));
+}
+
+test "rollback: the state bin directory is left as it is when no check hook runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    _ = try h.run(&.{ "mox", "apply" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "hand edit\n" });
+    _ = try h.run(&.{ "mox", "apply", "--overwrite" });
+    const bin = try std.fs.path.join(a, &.{ h.state, "bin" });
+    try Io.Dir.cwd().createDirPath(io, bin);
+    const keep = try std.fs.path.join(a, &.{ bin, "keep.txt" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = keep, .data = "mine\n" });
+    const r = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("hand edit\n", try read(io, a, try h.liveOf(".zshrc")));
+    try std.testing.expect(exists(io, keep));
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {

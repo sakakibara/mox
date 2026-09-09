@@ -355,10 +355,12 @@ that script, not a silent skip.
 
 Every setup script (both stages) runs with mox's own environment plus
 `MOX_REPO` (the dotfiles repo root), `MOX_STATE_DIR`, `MOX_HOME` (the live
-root), and every fact as `MOX_FACT_<UPPERCASE_NAME>` (a character outside
-`[A-Z0-9_]` in the fact name becomes `_`; a name that cannot be encoded
-distinctly -- non-ASCII, or a collision with another fact's sanitized form --
-is left out and warned about instead of silently colliding).
+root), a `PATH` led by `<state dir>/bin`, a directory holding only the mox
+that is running the script (so `mox` resolves to it even from a bootstrap that
+ran mox by absolute path), and every fact as `MOX_FACT_<UPPERCASE_NAME>` (a
+character outside `[A-Z0-9_]` in the fact name becomes `_`; a name that cannot
+be encoded distinctly -- non-ASCII, or a collision with another fact's
+sanitized form -- is left out and warned about instead of silently colliding).
 
 ### Fact contracts
 
@@ -409,13 +411,18 @@ re-capture -- including the one a pre-stage script triggers by persisting a
 fact -- so a post-stage script sees and is judged against exactly the
 fresh, current env, never the pre-stage's stale projection.
 
+Setup scripts and check hooks find the running mox first on their `PATH`,
+through `<state dir>/bin`, a directory mox owns: it holds the running mox
+and nothing else, and anything else placed there is removed on every apply
+that is not a dry run (a dry run spawns nothing and leaves it alone).
 Every setup script (both stages) also gets `MOX_PATH`, naming a
 writable file private to this run (deleted when the run ends). A script that
 installs a tool somewhere `tool=` would not otherwise see -- neither `$PATH`
 nor this repo's `data/paths.toml` registry -- appends that directory there,
 one absolute path per line (modeled on GitHub Actions' `GITHUB_PATH`). After each stage, mox
 reads back whatever is new: it joins the `tool=` search space for the rest of
-the run and is prepended to `PATH` for every later script and check hook. A
+the run and is prepended to `PATH` for every later script and check hook,
+behind the running mox's own directory, which stays first. A
 relative or otherwise malformed line is a stderr warning naming the file and
 line, never a silent skip.
 

@@ -2372,6 +2372,9 @@ test "run_scripts: a hung script is killed within the configured timeout" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
@@ -2382,7 +2385,7 @@ test "run_scripts: a hung script is killed within the configured timeout" {
 
     var bindings = std.StringHashMap([]const u8).init(a);
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, std.testing.io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home", &.{}, true)).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "200");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -2400,6 +2403,9 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
@@ -2414,7 +2420,7 @@ test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls bac
 
     var bindings = std.StringHashMap([]const u8).init(a);
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
-    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home", &.{})).map;
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, std.testing.io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home", &.{}, true)).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "notanumber");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
@@ -2459,6 +2465,9 @@ test "fact_env: buildScriptEnv's skip set matches source.fact_env.project across
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     const names = [_][]const u8{
         "profile",
@@ -2471,7 +2480,7 @@ test "fact_env: buildScriptEnv's skip set matches source.fact_env.project across
     for (names, 0..) |n, i| facts[i] = .{ .name = n, .value = "v" };
 
     var parent = std.process.Environ.Map.init(a);
-    const built = try mox.apply.run_scripts.buildScriptEnv(a, Env{ .map = &parent }, "/repo", "/state", "/home", &facts);
+    const built = try mox.apply.run_scripts.buildScriptEnv(a, std.testing.io, Env{ .map = &parent }, "/repo", state_dir, "/home", &facts, true);
     const projected = try mox.source.fact_env.project(a, &names);
 
     for (names) |n| {
@@ -2493,6 +2502,9 @@ test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
@@ -2516,7 +2528,7 @@ test "run_scripts: a script sees MOX_HOME and MOX_FACT_* from the built env" {
     var bindings = std.StringHashMap([]const u8).init(a);
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const facts = [_]mox.apply.run_scripts.Fact{.{ .name = "profile", .value = "work" }};
-    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, std.testing.io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home/tester", &facts, true)).map;
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
     var err_aw: std.Io.Writer.Allocating = .init(a);
@@ -2533,6 +2545,9 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(std.testing.io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
 
     const cwd = try std.process.currentPathAlloc(io, a);
     const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
@@ -2549,7 +2564,7 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
     var bindings = std.StringHashMap([]const u8).init(a);
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     const facts = [_]mox.apply.run_scripts.Fact{};
-    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, Env{ .process = std.testing.environ }, "/repo", "/state", "/home/tester", &facts)).map;
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, std.testing.io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home/tester", &facts, true)).map;
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "500");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);
