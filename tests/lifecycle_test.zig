@@ -535,6 +535,35 @@ test "edit: --axis resolves the matching overlay file" {
     try std.testing.expectEqualStrings(overlay_abs, edited);
 }
 
+test "edit --axis: a dotted hostname value names its own overlay" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const marker = try std.fs.path.join(a, &.{ root, "edited-path" });
+    const editor = try FakeEditor.install(a, io, &tmp, root, marker);
+
+    const h = try setup(a, io, &tmp, editor.command);
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "[user]\n");
+    // Both overlays are needed to discriminate: with only the dotted one,
+    // reading the tuple as a filename strips `.local` on BOTH sides and the
+    // wrong reading still finds it. The sibling is what the stripped reading
+    // resolves to, so opening it is the failure this pins.
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/hostname=studio", "[user]\n  name = stripped\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/hostname=studio.local", "[user]\n  name = studio\n");
+
+    const r = try h.run(&.{ "mox", "edit", ".gitconfig", "--axis", "hostname=studio.local" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const edited = editedPath(try read(io, a, marker));
+    const overlay_abs = try h.srcOf(".gitconfig.d/hostname=studio.local");
+    try std.testing.expectEqualStrings(overlay_abs, edited);
+}
+
 test "export --facts: every way the file can be wrong names the file and the key" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3822,6 +3851,66 @@ test "apply: a machine facts file that is not TOML is named, not surfaced as an 
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "facts.toml: not valid TOML") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "TomlParseError") == null);
+}
+
+test "edit --axis: an overlay carrying the base's extension answers to its stripped tuple, as it composes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const marker = try std.fs.path.join(a, &.{ root, "edited-path" });
+    const editor = try FakeEditor.install(a, io, &tmp, root, marker);
+
+    const h = try setup(a, io, &tmp, editor.command);
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "a = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/os=darwin.toml", "a = 2\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "# mox: replace from \"os\"\nexport BASE=1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc.d/os/darwin.sh", "export MAC=1\n");
+
+    const r = try h.run(&.{ "mox", "edit", ".config/app.toml", "--axis", "os=darwin" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings(try h.srcOf(".config/app.toml.d/os=darwin.toml"), editedPath(try read(io, a, marker)));
+
+    const f = try h.run(&.{ "mox", "edit", ".zshrc", "--axis", "os=darwin" });
+    try std.testing.expectEqual(@as(u8, 0), f.rc);
+    try std.testing.expectEqualStrings(try h.srcOf(".zshrc.d/os/darwin.sh"), editedPath(try read(io, a, marker)));
+
+    // A missing overlay is reported with the base's extension, a missing
+    // fragment by the directory it would sit under.
+    const t = try h.run(&.{ "mox", "edit", ".config/app.toml", "--axis", "profile=home" });
+    try std.testing.expectEqual(@as(u8, 1), t.rc);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, t.err, ")\r\n"), "app.toml.d/profile=home.toml"));
+    const g = try h.run(&.{ "mox", "edit", ".zshrc", "--axis", "os=plan9" });
+    try std.testing.expectEqual(@as(u8, 1), g.rc);
+    try std.testing.expect(std.mem.indexOf(u8, g.err, "no fragment for 'os=plan9'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.err, ".zshrc.d in each region's directory") != null);
+}
+
+test "edit --axis: a file with both overlays and regions is told both were looked for" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const editor = try FakeEditor.install(a, io, &tmp, root, try std.fs.path.join(a, &.{ root, "edited-path" }));
+    const h = try setup(a, io, &tmp, editor.command);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "base\n# mox: replace from \"os\"\nx\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc.d/os/darwin", "y\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc.d/hostname=studio.local", "z\n");
+    const found = try h.run(&.{ "mox", "edit", ".zshrc", "--axis", "hostname=studio.local" });
+    try std.testing.expectEqual(@as(u8, 0), found.rc);
+    const missing = try h.run(&.{ "mox", "edit", ".zshrc", "--axis", "hostname=nope" });
+    try std.testing.expectEqual(@as(u8, 1), missing.rc);
+    try std.testing.expect(std.mem.indexOf(u8, missing.err, "no overlay or fragment for 'hostname=nope'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.err, "in each region's directory") != null);
 }
 
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted

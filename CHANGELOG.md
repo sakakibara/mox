@@ -39,6 +39,12 @@ All notable changes to mox are documented here. The format follows
   `hostname=studio.local` no longer loses `.local` as if it were an extension,
   and a value that once read as a filename with an extension now binds as
   written.
+- `edit --axis` reaches an overlay whose axis value carries a dot the way
+  compose does (the verbatim reading first, then the extension-stripped one),
+  the path reported for a missing overlay carries the base's extension, and a
+  missing fragment is reported by the directory it would sit under; a file
+  that has both overlays and regions is told that both were looked for when
+  neither matches.
 
 ## [0.10.0] - 2026-08-12
 

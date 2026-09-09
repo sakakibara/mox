@@ -166,16 +166,27 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         };
 
         if (axis_str) |as| {
-            const want = mox.source.tuple.parseFilename(ctx.alloc, as) catch {
+            // `--axis` names a tuple, not a filename: a `hostname` value is
+            // the full dotted name, so the extension heuristic must not run
+            // on it. The overlay's filename is built back from the tuple.
+            const want = mox.source.tuple.parseFilenameVerbatim(ctx.alloc, as) catch {
                 try ctx.err.print("mox edit: invalid axis tuple '{s}'\n", .{as});
                 return 2;
             };
             if (overlayFor(file, want)) |p| break :blk p;
-            const tuple_name = try tupleFilename(ctx.alloc, want);
             const base_abs = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, file.source_base_path });
             const overlay_dir = try std.fmt.allocPrint(ctx.alloc, "{s}.d", .{base_abs});
+            // An overlay carries its base's extension, so the path shown is
+            // the one that would have matched.
+            const tuple_name = try std.mem.concat(ctx.alloc, u8, &.{ try tupleFilename(ctx.alloc, want), std.fs.path.extension(file.source_base_path) });
             const cand = try mox.source.path.joinKeyOnto(ctx.alloc, overlay_dir, tuple_name);
-            try ctx.err.print("mox edit: no overlay for '{s}' on {s} (looked for {s})\n", .{ as, name, cand });
+            if (file.regions.len > 0 and file.overlays.len > 0) {
+                try ctx.err.print("mox edit: no overlay or fragment for '{s}' on {s} (looked for {s}, and under {s} in each region's directory)\n", .{ as, name, cand, overlay_dir });
+            } else if (file.regions.len > 0) {
+                try ctx.err.print("mox edit: no fragment for '{s}' on {s} (looked under {s} in each region's directory)\n", .{ as, name, overlay_dir });
+            } else {
+                try ctx.err.print("mox edit: no overlay for '{s}' on {s} (looked for {s})\n", .{ as, name, cand });
+            }
             return 1;
         }
 
@@ -199,6 +210,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// Absolute path of the overlay (Cat A/C) or region fragment (Cat B) on `file`
 /// whose tuple equals `want`, or null when none matches.
 fn overlayFor(file: mox.source.tree.ManagedFile, want: AxisTuple) ?[]const u8 {
+    // The walk keeps two readings of a filename whose value carries a dot
+    // the extension heuristic would strip, and compose prefers the verbatim
+    // one: so does this, over every candidate, before the stripped reading
+    // gets its turn. That is what makes `hostname=host.local` reachable while
+    // `os=darwin.toml` still answers to `os=darwin`.
+    for (file.overlays) |ov| {
+        if (ov.exact_tuple) |exact| if (tuplesEqual(exact, want)) return ov.path;
+    }
+    for (file.regions) |region| {
+        for (region.fragments) |frag| {
+            if (frag.exact_tuple) |exact| if (tuplesEqual(exact, want)) return frag.path;
+        }
+    }
     for (file.overlays) |ov| {
         if (tuplesEqual(ov.tuple, want)) return ov.path;
     }
