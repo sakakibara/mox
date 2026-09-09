@@ -113,6 +113,11 @@ All notable changes to mox are documented here. The format follows
   stray the user had staged beforehand stays staged and out of the commit, as
   the report says; `publish --help` and the usage guide describe what a bare
   `publish` does with strays.
+- The docs state all three empty-render exemptions, that a repeated `--as`
+  axis takes its last value, that a `$MOX_PATH` directory already on `PATH`
+  moves to the front rather than appearing twice, and that `--facts` replaces
+  only the machine's own facts file while derived facts and tool probes still
+  resolve on the running machine.
 
 ## [0.10.0] - 2026-08-12
 

@@ -34,13 +34,22 @@ whose output ends up empty -- a `for` over an empty data set, a `when`/region
 that gated everything away -- and matches the generator rule, where zero rows
 already produce zero files.
 
-Two kinds of file are exempt. A file with **no** directives: a genuinely empty
-source (`.hushlogin`, a `.keep`) is written verbatim as an empty file. And a
-partially owned file (an `own`/`disown` head): mox patches only its declared
-keys into a file a program also writes, so an empty render there means "mox owns
-nothing here", not "no file". To keep an ordinary directive-bearing file present
-even when it renders empty -- a conditionally-present but empty file -- add
-`# mox: keep-empty`.
+Three kinds of file are exempt. A file mox infers **no comment marker** for,
+so it could not carry a directive in the first place: a genuinely empty
+`.hushlogin` or `.keep` is written verbatim as an empty file. A structured
+file (`.toml`, `.json`, `.yaml`, `.yml`, `.ini`, gitconfig), which composes
+through the structural path rather than the region one. And a partially owned
+file (an `own`/`disown` head): mox patches only its declared keys into a file
+a program also writes, so an empty render there means "mox owns nothing here",
+not "no file".
+
+Note what the first exemption is NOT: it is the absence of an inferred comment
+marker, not the absence of directives. An empty `.sh`, `.zsh`, `.conf`, `.lua`
+or `.py` composes through the region path whether or not it holds a directive,
+so it renders empty and is not written. To keep such a file present -- a
+conditionally-present but empty file, or an empty placeholder with an
+extension -- add the `keep-empty` directive in the file's own comment marker
+(`# mox: keep-empty` in a `.sh`, `-- mox: keep-empty` in a `.lua`).
 
 When a file that mox previously wrote starts composing to nothing, `mox apply`
 removes the stale live copy (snapshot-first, so `mox rollback` recovers it). A
@@ -354,11 +363,11 @@ seen by the very same apply.
 Every regular file in a stage is spawned (OS noise such as `.DS_Store` and
 `._*` aside), so a stage holds executables only: a file without the
 executable bit fails the run and is named, whether its gate is open or
-closed, so a stray file fails the run on every machine, not
-only the one whose gate it opens. On Windows, which has no such bit, a `.ps1`
-runs under PowerShell and any other file must be a program; one that cannot
-be spawned fails the run and is named, and a closed gate is only skipped
-there. Setup scripts under `scripts/pre/` and
+closed, so a stray file fails the run on every machine, not only the one
+whose gate it opens. On Windows, which has no such bit, a `.ps1` runs under
+PowerShell and any other file must be a program; one that cannot be spawned
+fails the run and is named, and a closed gate is only skipped there. Setup
+scripts under `scripts/pre/` and
 `scripts/post/` are gated the same way managed files are. A script inside a
 single-tuple subdir (`scripts/pre/os=darwin/`) runs only on a matching
 machine; a subdirectory whose name carries an `=` but is not a tuple fails
@@ -372,10 +381,10 @@ comment among its leading lines:
 ```
 
 The expression is the axis language above. The header is found by scanning to
-the first content line (at most 16 lines in); `#` is the comment marker for both
-shell and `.ps1`. When a script sits in a gated subdir and also carries a header,
-both must hold for it to run. A header that fails to parse is a hard error for
-that script, not a silent skip.
+the first content line (at most 16 lines in); `#` is the comment marker for
+both shell and `.ps1`. When a script sits in a gated subdir and also carries a
+header, both must hold for it to run. A header that fails to parse is a hard
+error for that script, not a silent skip.
 
 Every setup script (both stages) runs with mox's own environment plus
 `MOX_REPO` (the dotfiles repo root), `MOX_STATE_DIR`, `MOX_HOME` (the live
@@ -439,16 +448,17 @@ Setup scripts and check hooks find the running mox first on their `PATH`,
 through `<state dir>/bin`, a directory mox owns: it holds the running mox
 and nothing else, and anything else placed there is removed on every apply
 that is not a dry run (a dry run spawns nothing and leaves it alone).
-Every setup script (both stages) also gets `MOX_PATH`, naming a
-writable file private to this run (deleted when the run ends). A script that
-installs a tool somewhere `tool=` would not otherwise see -- neither `$PATH`
-nor this repo's `data/paths.toml` registry -- appends that directory there,
-one absolute path per line (modeled on GitHub Actions' `GITHUB_PATH`). After each stage, mox
+Every setup script (both stages) also gets `MOX_PATH`, naming a writable file
+private to this run (deleted when the run ends). A script that installs a tool
+somewhere `tool=` would not otherwise see -- neither `$PATH` nor this repo's
+`data/paths.toml` registry -- appends that directory there, one absolute path
+per line (modeled on GitHub Actions' `GITHUB_PATH`). After each stage, mox
 reads back whatever is new: it joins the `tool=` search space for the rest of
 the run and is prepended to `PATH` for every later script and check hook,
-behind the running mox's own directory, which stays first. A
-relative or otherwise malformed line is a stderr warning naming the file and
-line, never a silent skip.
+behind the running mox's own directory, which stays first; a directory
+already on `PATH` moves to the front rather than appearing twice. A relative
+or otherwise malformed line is a stderr warning naming the file and line,
+never a silent skip.
 
 ## File attributes and head directives
 
@@ -519,10 +529,10 @@ The base may consist of nothing BUT its leading block: ownership directives,
 an optional `check`, an optional whole-file gate, zero content. Overlays in
 `<name>.d/` then supply all owned content, per machine. (This is general
 structured-merge behavior: a blank base -- or blank first layer -- of a
-multi-layer structured file composes from the remaining layers.) This is the way to
-declare ownership for a machine-gated file: the contract and the gate live in
-the base, the per-machine content in overlays, and a machine where the gate
-fails leaves the live file (and mox's records) completely untouched.
+multi-layer structured file composes from the remaining layers.) This is the
+way to declare ownership for a machine-gated file: the contract and the gate
+live in the base, the per-machine content in overlays, and a machine where the
+gate fails leaves the live file (and mox's records) completely untouched.
 
 A key-path is TOML dotted-key syntax, verbatim: bare segments
 (`A-Za-z0-9_-`), `"..."`/`'...'`-quoted segments, whitespace allowed around

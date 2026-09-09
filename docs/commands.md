@@ -296,10 +296,10 @@ masked on both sides. Read-only; takes no lock and always exits 0.
 ## edit
 
 Open the source file behind a managed live path (see [Path
-arguments](#path-arguments)) in `$EDITOR`. `--axis <tuple>` edits the matching overlay or region
-fragment instead of the base -- the way to reach a variant your current
-machine does not compose. Takes no lock of its own (`--apply` takes apply's), and reports the
-candidate path when the source does not exist.
+arguments](#path-arguments)) in `$EDITOR`. `--axis <tuple>` edits the matching
+overlay or region fragment instead of the base -- the way to reach a variant
+your current machine does not compose. Takes no lock of its own (`--apply`
+takes apply's), and reports the candidate path when the source does not exist.
 
 <!-- generated: flags edit -->
 | Flag | Description |
@@ -344,11 +344,11 @@ break the framing; unescape those four to recover exact bytes. Both imply
 
 ## export
 
-`export [--as <tuple>] [--facts <path>] [--cleartext-secrets] <out>` bakes a flat resolved tree: compose every
-managed file for the current machine (or the given axis tuple) and
-write it under `<out>/<live-rel>`. A partially owned target exports its
-canonical owned serialization -- the ownership contract, not a whole
-live file. Read-only wrt mox state; the walk-away guarantee and CI
+`export [--as <tuple>] [--facts <path>] [--cleartext-secrets] <out>` bakes a
+flat resolved tree: compose every managed file for the current machine (or the
+given axis tuple) and write it under `<out>/<live-rel>`. A partially owned
+target exports its canonical owned serialization -- the ownership contract,
+not a whole live file. Read-only wrt mox state; the walk-away guarantee and CI
 parity input.
 
 Everything composes before anything is written, so a run that cannot
@@ -359,12 +359,20 @@ second pass would resolve every `op://` secret again -- another round
 trip, another biometric prompt.
 
 `--as` binds axes by tuple, whose values are filename-safe by grammar
-(`[A-Za-z0-9_.-]` and non-ASCII bytes; `+` separates pairs and `=` splits them) and so cannot carry an address, a key, or anything
-holding a space. `--facts <path>` substitutes the whole fact set instead:
-compose against a machine that does not exist, without fabricating an
-`XDG_CONFIG_HOME` around a temporary `facts.toml`. The two compose --
-`--facts` supplies the values, `--as` and `MOX_OS` place the machine -- which
-is what a matrix check over a repo's config space needs.
+(`[A-Za-z0-9_.-]` and non-ASCII bytes; `+` separates pairs and `=` splits
+them) and so cannot carry an address, a key, or anything holding a space.
+`--facts <path>` replaces the machine's own `facts.toml` instead: compose
+against a machine that does not exist, without fabricating an
+`XDG_CONFIG_HOME` around a temporary file. Derived facts (`data/facts.toml`)
+and `tool=`/`env=` probes still resolve against the running machine. The two
+compose -- `--facts` supplies the values and `--as` places the
+machine -- which is what a matrix check over a repo's config space needs.
+
+A tuple naming the same axis twice is accepted and the LAST pair wins
+(`--as os=a+os=b` binds `os` to `b`). The same spelling in an overlay filename
+means something else: every pair must match, so `os=a+os=b` can never match
+and `os=a+os=a` matches whenever `os=a` does. Nothing warns about either; a
+duplicate axis is a mistake to catch by reading.
 
 An export that would bake a resolved secret as cleartext names those files and
 refuses until `--cleartext-secrets` is passed, deciding before any of it
@@ -433,25 +441,25 @@ private layer shadows the repo.
 
 ## doctor
 
-Health report: source files not tracked by git, source modes git
-cannot carry that are not yet in `.mox/attributes.toml` (lost on
-clone), sources that compose to nothing under every configuration (a
-contradictory or mistyped whole-file gate), malformed state
-(provenance), and a `facts.toml` fact bound on this machine that
-nothing in the repo consumes (`unused-fact <name> (bound but unused by
-this repo)`) -- advisory, since deleting or renaming a fact the repo no
-longer reads is the user's call. When the unused name is a probable
+Health report: source files not tracked by git, source modes git cannot carry
+that are not yet in `.mox/attributes.toml` (lost on clone), sources that
+compose to nothing under every configuration (a contradictory or mistyped
+whole-file gate), malformed state (provenance), and a `facts.toml` fact bound
+on this machine that nothing in the repo consumes (`unused-fact <name> (bound
+but unused by this repo)`) -- advisory, since deleting or renaming a fact the
+repo no longer reads is the user's call. When the unused name is a probable
 rename of some still-unbound fact (a short edit distance), the advisory
-bridges the two and names the migration directly:
-`unused-fact persona (bound but unused; unbound "profile" -- renamed?
-mox facts set profile <value>)`. A leftover `data/facts-schema.toml`
-gets its own one-line notice: it is no longer read (the interview
-derives from the repo's own sources), delete it. `--rebuild-provenance`
-recomposes and re-records every tracked file's provenance (partial
-targets keep no line provenance and are skipped); `--rebuild-coupling`
-rescans source tokens and rewrites the stored coupling graph under
-`<state>/coupling/`; `--fix` performs the safe rebuilds. Mutating runs
-take the lock; exits 1 while any problem or advisory remains, or a check could not run (a source tree outside git skips the tracked-source check), so it can gate CI.
+bridges the two and names the migration directly: `unused-fact persona (bound
+but unused; unbound "profile" -- renamed? mox facts set profile <value>)`. A
+leftover `data/facts-schema.toml` gets its own one-line notice: it is no
+longer read (the interview derives from the repo's own sources), delete it.
+`--rebuild-provenance` recomposes and re-records every tracked file's
+provenance (partial targets keep no line provenance and are skipped);
+`--rebuild-coupling` rescans source tokens and rewrites the stored coupling
+graph under `<state>/coupling/`; `--fix` performs the safe rebuilds. Mutating
+runs take the lock; exits 1 while any problem or advisory remains, or a check
+could not run (a source tree outside git skips the tracked-source check), so
+it can gate CI.
 
 <!-- generated: flags doctor -->
 | Flag | Description |
