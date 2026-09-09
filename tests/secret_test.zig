@@ -103,9 +103,24 @@ test "inline secret: an escaped '>' survives as a real shell redirect" {
     try std.testing.expectEqualStrings("V=second", out);
 }
 
+/// A synthetic environment carrying only what a test names -- plus, on
+/// Windows, the entries a spawned shell cannot start without. The resolver
+/// runs a backend under the environment mox was handed, so an environment
+/// missing SystemRoot or ComSpec makes `cmd.exe` exit immediately rather than
+/// run the payload, and a test about timeouts or output caps would be
+/// measuring the wrong failure.
 fn envWith(a: std.mem.Allocator, pairs: []const [2][]const u8) !mox.env.Env {
     const map = try a.create(std.process.Environ.Map);
     map.* = std.process.Environ.Map.init(a);
+    // PATH on every platform: without it a POSIX shell falls back to its
+    // compiled-in default, which ends in `.` -- so a payload's commands would
+    // resolve against the test's own working directory.
+    if (std.testing.environ.getAlloc(a, "PATH") catch null) |v| try map.put("PATH", v);
+    if (builtin.os.tag == .windows) {
+        for ([_][]const u8{ "SystemRoot", "ComSpec", "PATHEXT" }) |k| {
+            if (std.testing.environ.getAlloc(a, k) catch null) |v| try map.put(k, v);
+        }
+    }
     for (pairs) |p| try map.put(p[0], p[1]);
     return .{ .map = map };
 }
@@ -153,6 +168,22 @@ test "secret resolver: a blocking backend times out within the configured bound"
     );
 }
 
+test "secret resolver: the backend sees the supplied environment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Nothing else pins the environ hand-off, so a refactor that drops it
+    // would resolve every secret under the wrong environment in silence.
+    const env = try envWith(a, &.{.{ "MOX_TEST_MARKER", "seen" }});
+    const payload = if (builtin.os.tag == .windows)
+        "cmd:echo %MOX_TEST_MARKER%"
+    else
+        "cmd:printf '%s' \"$MOX_TEST_MARKER\"";
+    const u = try mox.secret.uri.parse(payload);
+    const got = try mox.secret.resolver.resolve(a, std.testing.io, env, u);
+    try std.testing.expectEqualStrings("seen", std.mem.trim(u8, got, " \r\n"));
+}
+
 test "secret resolver: an unbounded-output backend is capped, not OOMed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -165,4 +196,60 @@ test "secret resolver: an unbounded-output backend is capped, not OOMed" {
         error.BackendOutputTooLarge,
         mox.secret.resolver.resolve(a, std.testing.io, env, u),
     );
+}
+
+test "secret resolver: the backend program is found on the supplied PATH, not the process's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const bin = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "bin" });
+    try tmp.dir.createDirPath(io, "bin");
+    if (builtin.os.tag == .windows) {
+        try tmp.dir.writeFile(io, .{ .sub_path = "bin/pass.cmd", .data = "@echo stubbed-secret\r\n" });
+    } else {
+        try tmp.dir.writeFile(io, .{ .sub_path = "bin/pass", .data = "#!/bin/sh\necho stubbed-secret\n" });
+        const abs = try std.fs.path.join(a, &.{ bin, "pass" });
+        var zbuf: [4096]u8 = undefined;
+        @memcpy(zbuf[0..abs.len], abs);
+        zbuf[abs.len] = 0;
+        _ = std.c.chmod(@ptrCast(&zbuf), 0o755);
+    }
+    // The stub directory is on the supplied PATH only; the process's PATH
+    // does not hold it, so a lookup there would report the backend missing.
+    var pairs = [_][2][]const u8{.{ "PATH", bin }};
+    if (builtin.os.tag == .windows) pairs[0][1] = bin;
+    const env = try envWith(a, &pairs);
+    const got = try mox.secret.resolver.resolve(a, io, env, try mox.secret.uri.parse("pass://probe"));
+    try std.testing.expectEqualStrings("stubbed-secret", got);
+}
+
+test "secret resolver: a directory or an unrunnable file named like the backend is passed over on PATH" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no exec bit
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    try tmp.dir.createDirPath(io, "asdir/pass");
+    try tmp.dir.createDirPath(io, "plain");
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain/pass", .data = "not a program\n" });
+    try tmp.dir.createDirPath(io, "real");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pass", .data = "#!/bin/sh\necho real-secret\n" });
+    const real = try std.fs.path.join(a, &.{ root, "real", "pass" });
+    var zbuf: [4096]u8 = undefined;
+    @memcpy(zbuf[0..real.len], real);
+    zbuf[real.len] = 0;
+    _ = std.c.chmod(@ptrCast(&zbuf), 0o755);
+    const path = try std.fmt.allocPrint(a, "{s}/asdir:{s}/plain:{s}/real", .{ root, root, root });
+    var pairs = [_][2][]const u8{.{ "PATH", path }};
+    const env = try envWith(a, &pairs);
+    const got = try mox.secret.resolver.resolve(a, io, env, try mox.secret.uri.parse("pass://probe"));
+    try std.testing.expectEqualStrings("real-secret", got);
 }

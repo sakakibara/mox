@@ -112,8 +112,11 @@ fn resolvePass(arena: std.mem.Allocator, io: std.Io, env: Env, name: []const u8)
 /// The system shell that runs a `cmd:` payload: `/bin/sh -c` on POSIX, and
 /// `cmd.exe /c` on Windows -- its shell, and the one the payload's quoting is
 /// written against there.
-pub fn shellArgv(payload: []const u8) [3][]const u8 {
-    if (builtin.os.tag == .windows) return .{ "cmd.exe", "/c", payload };
+pub fn shellArgv(arena: std.mem.Allocator, env: Env, payload: []const u8) [3][]const u8 {
+    if (builtin.os.tag == .windows) {
+        const comspec = env.getAlloc(arena, "ComSpec") catch null;
+        return .{ if (comspec) |c| (if (c.len > 0) c else "cmd.exe") else "cmd.exe", "/c", payload };
+    }
     return .{ "/bin/sh", "-c", payload };
 }
 
@@ -131,7 +134,7 @@ fn resolveCmd(arena: std.mem.Allocator, io: std.Io, env: Env, payload: []const u
     if (builtin.os.tag == .windows and std.mem.indexOfScalar(u8, payload, '"') != null) {
         return resolveCmdViaScript(arena, io, env, payload);
     }
-    const argv = shellArgv(payload);
+    const argv = shellArgv(arena, env, payload);
     const out = try runBackend(arena, io, env, &argv);
     return firstLine(out);
 }
@@ -178,6 +181,45 @@ fn envInt(arena: std.mem.Allocator, env: Env, name: []const u8, fallback: i64) i
     return std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t\r\n"), 10) catch fallback;
 }
 
+/// `name` as the supplied environment's PATH resolves it: a name with a path
+/// separator is returned as given; a bare name is the first PATH entry that
+/// holds it (on Windows, with each PATHEXT suffix tried), or BackendUnavailable.
+fn programOnPath(arena: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map, name: []const u8) ResolveError![]const u8 {
+    if (std.mem.indexOfAny(u8, name, if (builtin.os.tag == .windows) "\\/" else "/") != null) return name;
+    const path = env_map.get("PATH") orelse return error.BackendUnavailable;
+    var exts_buf: [16][]const u8 = undefined;
+    var exts: []const []const u8 = &.{""};
+    if (builtin.os.tag == .windows) {
+        // The PATHEXT names first, as cmd.exe resolves them; the bare name
+        // last, for one written with its extension.
+        var n: usize = 0;
+        var eit = std.mem.splitScalar(u8, env_map.get("PATHEXT") orelse ".COM;.EXE;.BAT;.CMD", ';');
+        while (eit.next()) |e| {
+            if (e.len == 0 or n == exts_buf.len - 1) continue;
+            exts_buf[n] = e;
+            n += 1;
+        }
+        exts_buf[n] = "";
+        n += 1;
+        exts = exts_buf[0..n];
+    }
+    var it = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        for (exts) |ext| {
+            const candidate = std.fmt.allocPrint(arena, "{s}{c}{s}{s}", .{ dir, std.fs.path.sep, name, ext }) catch return error.OutOfMemory;
+            // execvp's rule, minus its reading of an empty PATH entry as the
+            // current directory: a directory or a file the caller cannot run
+            // under this name is passed over, not chosen.
+            const st = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch continue;
+            if (st.kind != .file) continue;
+            if (std.Io.File.Permissions.has_executable_bit) std.Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch continue;
+            return candidate;
+        }
+    }
+    return error.BackendUnavailable;
+}
+
 /// Run a secret backend under a wall-clock timeout and a stdout size cap. A
 /// timeout or an over-cap producer kills the child (std.process.run kills on
 /// error return) and surfaces a clear error, so a blocking/runaway backend can
@@ -193,10 +235,22 @@ fn runBackend(arena: std.mem.Allocator, io: std.Io, env: Env, argv: []const []co
     else
         .none;
 
+    // Spawned under the environment mox reads through, not the raw process
+    // one. In production they are the same value, so a manager still finds its
+    // agent socket, session token, and PATH. They differ when a caller hands
+    // mox an environment -- and a backend resolving a SECRET under a different
+    // environment than the one mox was told to use is the last place that
+    // should silently disagree. The program is looked up on that same PATH
+    // too: std resolves a bare name against the process's own PATH, which
+    // would pick the binary from one environment and run it under another.
+    var env_map = env.createMap(arena) catch return error.OutOfMemory;
+    const resolved = try arena.dupe([]const u8, argv);
+    resolved[0] = try programOnPath(arena, io, &env_map, argv[0]);
     const result = std.process.run(arena, io, .{
-        .argv = argv,
+        .argv = resolved,
         .timeout = timeout,
         .stdout_limit = std.Io.Limit.limited(cap),
+        .environ_map = &env_map,
     }) catch |e| switch (e) {
         error.FileNotFound => return error.BackendUnavailable,
         error.OutOfMemory => return error.OutOfMemory,
@@ -306,7 +360,7 @@ test "runBackend: missing binary is BackendUnavailable" {
 test "runBackend: captures stdout and strips the trailing newline" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const argv = shellArgv("echo hello");
+    const argv = shellArgv(arena.allocator(), Env{ .process = std.testing.environ }, "echo hello");
     const out = try runBackend(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ }, &argv);
     // cmd.exe emits CRLF; the trailing carriage return must not survive.
     try std.testing.expectEqualStrings("hello", out);
@@ -315,7 +369,7 @@ test "runBackend: captures stdout and strips the trailing newline" {
 test "runBackend: nonzero exit is SecretNotFound" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const argv = shellArgv("exit 3");
+    const argv = shellArgv(arena.allocator(), Env{ .process = std.testing.environ }, "exit 3");
     try std.testing.expectError(
         error.SecretNotFound,
         runBackend(arena.allocator(), std.testing.io, Env{ .process = std.testing.environ }, &argv),

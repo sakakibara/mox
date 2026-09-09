@@ -9,7 +9,7 @@ const Io = std.Io;
 
 /// Seam over `git clone` so the guard and orchestration can be tested without
 /// a real subprocess. The default is `gitClone`.
-const CloneFn = *const fn (std.mem.Allocator, Io, []const u8, []const u8) anyerror!void;
+const CloneFn = *const fn (std.mem.Allocator, Io, mox.env.Env, []const u8, []const u8) anyerror!void;
 
 const Spec = struct {
     clone: cli.Opt([]const u8, .{ .value_name = "url", .help = "git clone <url> into the repo dir (review it, then run 'mox apply'); <owner>, <owner>/<repo>, and <host>/<owner>/<repo> are shorthand for https URLs (owner alone assumes a repo named dotfiles)" }),
@@ -89,7 +89,7 @@ fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn, apply_now: bool) 
     if (std.fs.path.dirname(context.paths.repo_dir)) |parent| {
         Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
     }
-    clone_fn(ctx.alloc, ctx.io, url, context.paths.repo_dir) catch |e| {
+    clone_fn(ctx.alloc, ctx.io, context.env, url, context.paths.repo_dir) catch |e| {
         try ctx.err.print("mox init: git clone failed: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -117,12 +117,13 @@ fn dirNonEmpty(io: Io, path: []const u8) !bool {
     return false;
 }
 
-fn gitClone(arena: std.mem.Allocator, io: Io, url: []const u8, dest: []const u8) !void {
+fn gitClone(arena: std.mem.Allocator, io: Io, env: mox.env.Env, url: []const u8, dest: []const u8) !void {
+    var env_map = try env.createMap(arena);
     // Disable git's `ext::`/`file::` command transports so a hostile URL cannot
     // run a shell command during clone; `--` blocks option injection.
     // `core.autocrlf=false` keeps the checkout byte-exact: dotfiles are content
     // mox composes verbatim, so a Windows CRLF rewrite would corrupt them.
-    const result = std.process.run(arena, io, .{ .argv = &.{ "git", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=user", "-c", "core.autocrlf=false", "clone", "--", url, dest } }) catch |e| switch (e) {
+    const result = std.process.run(arena, io, .{ .argv = &.{ "git", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=user", "-c", "core.autocrlf=false", "clone", "--", url, dest }, .environ_map = &env_map }) catch |e| switch (e) {
         error.FileNotFound => return error.GitNotFound,
         else => return error.CloneFailed,
     };

@@ -10,6 +10,11 @@ All notable changes to mox are documented here. The format follows
 - `update --no-apply` is described as stopping after the rebase, not the
   fetch, in its help and both guides: the source tree is brought current, only
   the live files wait.
+- Secret backends run under the environment mox was given, not the process's
+  own, and the backend program is looked up on that environment's PATH,
+  passing over a directory or an unrunnable file of its name the way a shell
+  does. `mox edit` spawns the editor and `mox init --clone` spawns git under
+  that environment as well.
 
 ## [0.10.0] - 2026-08-12
 

@@ -2428,6 +2428,44 @@ test "add --own: a symlinked live path captures through the link; apply patches 
     try std.testing.expect(!exists(io, try h.srcOf("dangling.toml")));
 }
 
+test "edit: the editor is spawned under the environment mox was given, not the process's own" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const marker = try std.fs.path.join(a, &.{ root, "editor-env" });
+
+    // A stand-in $EDITOR that records the value of a variable only the
+    // environment mox supplies carries; the process running the test does not.
+    const editor = if (builtin.os.tag == .windows) cmd: {
+        const abs = try std.fs.path.join(a, &.{ root, "env-editor.ps1" });
+        const body = try std.fmt.allocPrint(a, "Set-Content -LiteralPath '{s}' -NoNewline -Value $env:MOX_PROBE_EDIT\r\n", .{marker});
+        try writeExecScript(io, &tmp, "env-editor.ps1", body, abs);
+        break :cmd try std.fmt.allocPrint(a, "powershell -NoProfile -File {s}", .{abs});
+    } else cmd: {
+        const abs = try std.fs.path.join(a, &.{ root, "env-editor.sh" });
+        const body = try std.fmt.allocPrint(a, "#!/bin/sh\nprintf '%s' \"$MOX_PROBE_EDIT\" > \"{s}\"\n", .{marker});
+        try writeExecScript(io, &tmp, "env-editor.sh", body, abs);
+        break :cmd abs;
+    };
+
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .editor = editor,
+        .extra_env = &.{.{ .name = "MOX_PROBE_EDIT", .value = "under-mox-env" }},
+    });
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "original\n");
+
+    const r = try h.run(&.{ "mox", "edit", ".zshrc" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("under-mox-env", std.mem.trimEnd(u8, try read(io, a, marker), "\r\n"));
+}
+
 test "add --own: a declared path absent from the live file is an error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3252,6 +3290,14 @@ test "path: stdout is the repo dir alone, so cd $(mox path) works" {
 /// test can read.
 fn runExe(h: Harness, argv: []const []const u8) !std.process.RunResult {
     var env = try gitEnv(h);
+    return runExeEnv(h, &env, argv);
+}
+
+/// `runExe` with a caller-prepared environment. A backend or editor stub has
+/// to be on the PATH of the process that spawns it -- Zig resolves a program
+/// name against the CALLER's PATH, not the environ_map handed to the child --
+/// so a test that stubs one has to be the parent, not a harness call.
+fn runExeEnv(h: Harness, env: *std.process.Environ.Map, argv: []const []const u8) !std.process.RunResult {
     try env.put("MOX_REPO", h.repo);
     try env.put("MOX_STATE_DIR", h.state);
     // The build emits a path relative to the build root, and this child runs
@@ -3264,7 +3310,7 @@ fn runExe(h: Harness, argv: []const []const u8) !std.process.RunResult {
     var full: std.ArrayList([]const u8) = .empty;
     try full.append(h.a, exe);
     try full.appendSlice(h.a, argv);
-    return std.process.run(h.a, h.io, .{ .argv = full.items, .cwd = .{ .path = h.home }, .environ_map = &env });
+    return std.process.run(h.a, h.io, .{ .argv = full.items, .cwd = .{ .path = h.home }, .environ_map = env });
 }
 
 test "git: hands git the terminal, runs in the repo, and passes the exit code through" {
@@ -3414,4 +3460,30 @@ test "update --no-apply: the fetch lands, the live file does not" {
     // The source moved; the live file is deliberately left for a mox diff.
     try std.testing.expectEqualStrings("export A=42\n", try read(io, a, try h.srcOf(".zshrc")));
     try std.testing.expectEqualStrings("export A=1\n", try read(io, a, try h.liveOf(".zshrc")));
+}
+
+test "secret resolver: a cmd backend runs under the environment mox was given" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The backend is spawned with the supplied environment, not the
+    // process's own: a value only that environment carries must reach it.
+    const h = try testutil.setup(a, io, &tmp, .{
+        .create_repo_src = true,
+        .extra_env = &.{.{ .name = "MOX_PROBE_SECRET", .value = "s3cret" }},
+    });
+    const payload = if (builtin.os.tag == .windows)
+        "token = <secret:cmd:echo %MOX_PROBE_SECRET%>\n"
+    else
+        "token = <secret:cmd:printf '%s' \"$MOX_PROBE_SECRET\">\n";
+    try writeRepo(io, &tmp, "repo/src/.secretrc", payload);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const live = try read(io, a, try h.liveOf(".secretrc"));
+    try std.testing.expectEqualStrings("token = s3cret", std.mem.trimEnd(u8, live, " \r\n"));
 }

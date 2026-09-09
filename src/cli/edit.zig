@@ -228,8 +228,10 @@ fn editFile(ctx: *app.Ctx, path: []const u8) !u8 {
     while (it.next()) |word| try argv.append(ctx.alloc, word);
     try argv.append(ctx.alloc, path);
 
+    var env_map = try context.env.createMap(ctx.alloc);
     var child = std.process.spawn(ctx.io, .{
         .argv = argv.items,
+        .environ_map = &env_map,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
