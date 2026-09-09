@@ -19,8 +19,9 @@ pub const ParseError = error{
 /// `os=darwin` (no extension). Returns the extension-stripped tuple.
 ///
 /// Filename grammar: `<axis>=<value>(+<axis>=<value>)*[.<ext>]`
-/// where `<axis>` matches `[a-z][a-z0-9_]*` and `<value>` matches
-/// `[A-Za-z0-9_.+-]+`. Extension is detected as the segment after the LAST
+/// where `<axis>` matches `[a-z][a-z0-9_]*` and `<value>` is any run of
+/// `[A-Za-z0-9_.-]` and non-ASCII bytes (`+` separates pairs, `=` splits
+/// them). Extension is detected as the segment after the LAST
 /// `.` provided that segment contains no `+` or `=`.
 pub fn parseFilename(arena: std.mem.Allocator, filename: []const u8) ParseError!AxisTuple {
     return parseStem(arena, stripExtension(filename));
@@ -90,18 +91,47 @@ pub fn isValidAxisName(name: []const u8) bool {
     return true;
 }
 
-fn isValidAxisValue(value: []const u8) bool {
+/// Whether VALUE may appear on the value side of an axis tuple, and so may
+/// name an overlay file. A caller synthesizing a filename from a binding must
+/// check this: a fact value is arbitrary text, and one holding `/`, `=` or `+`
+/// would otherwise build a path that leaves the source tree, or a tuple no
+/// filename can carry.
+pub fn isValidAxisValue(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |c| {
         // A byte >= 0x80 is a UTF-8 lead or continuation byte, never one of
         // the ASCII delimiters this grammar reserves (`+`, `=`, `.`), so a
         // non-ASCII value (a Kanji `machine=` value, say) passes through
         // unquoted -- filenames have no quoting syntax to borrow from the
-        // directive grammar's escape hatch.
+        // directive grammar's escape hatch. `+` separates pairs, so a value
+        // holding one would name a tuple no filename can carry.
         if (c >= 0x80) continue;
-        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '+' or c == '-')) return false;
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-')) return false;
     }
     return true;
+}
+
+/// True when `value` can also NAME a new overlay file on every platform mox
+/// runs on: Windows drops a trailing dot from a filename and reserves the
+/// device names whatever their extension, so such a value would name a
+/// file that cannot be written as spelled. Reading is `isValidAxisValue`.
+pub fn isNameableAxisValue(value: []const u8) bool {
+    if (!isValidAxisValue(value)) return false;
+    if (value[value.len - 1] == '.') return false;
+    if (isWindowsDeviceName(value)) return false;
+    return true;
+}
+
+fn isWindowsDeviceName(value: []const u8) bool {
+    const stem = value[0 .. std.mem.indexOfScalar(u8, value, '.') orelse value.len];
+    if (stem.len == 3) {
+        for ([_][]const u8{ "con", "prn", "aux", "nul" }) |d| if (std.ascii.eqlIgnoreCase(stem, d)) return true;
+        return false;
+    }
+    if (stem.len == 4 and stem[3] >= '1' and stem[3] <= '9') {
+        for ([_][]const u8{ "com", "lpt" }) |d| if (std.ascii.eqlIgnoreCase(stem[0..3], d)) return true;
+    }
+    return false;
 }
 
 test "parseFilename: single axis" {
@@ -172,6 +202,15 @@ test "parseFilename: path= is rejected as a reserved axis name, any value" {
     try std.testing.expectError(error.ReservedAxisName, result);
 }
 
+test "isValidAxisValue: the pair separator and the assignment are never value bytes" {
+    try std.testing.expect(isValidAxisValue("studio.local"));
+    try std.testing.expect(isValidAxisValue("fd-find_2"));
+    try std.testing.expect(isValidAxisValue("\xe6\x97\xa5\xe6\x9c\xac"));
+    try std.testing.expect(!isValidAxisValue("a+b"));
+    try std.testing.expect(!isValidAxisValue("a=b"));
+    try std.testing.expect(!isValidAxisValue(""));
+}
+
 test "parseFilenameVerbatim: keeps a dotted value parseFilename would strip" {
     var allocator_buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
@@ -179,4 +218,18 @@ test "parseFilenameVerbatim: keeps a dotted value parseFilename would strip" {
     try std.testing.expectEqualStrings("host", stripped.pairs[0].value);
     const verbatim = try parseFilenameVerbatim(fba.allocator(), "machine=host.local");
     try std.testing.expectEqualStrings("host.local", verbatim.pairs[0].value);
+}
+
+test "isNameableAxisValue: a value that names a new file must be writable on Windows too; reading stays permissive" {
+    try std.testing.expect(isNameableAxisValue("studio.local"));
+    try std.testing.expect(isNameableAxisValue("console"));
+    try std.testing.expect(isNameableAxisValue("com10"));
+    try std.testing.expect(!isNameableAxisValue("studio."));
+    try std.testing.expect(!isNameableAxisValue("con"));
+    try std.testing.expect(!isNameableAxisValue("NUL"));
+    try std.testing.expect(!isNameableAxisValue("aux.local"));
+    try std.testing.expect(!isNameableAxisValue("COM1"));
+    try std.testing.expect(!isNameableAxisValue("lpt9.txt"));
+    try std.testing.expect(isValidAxisValue("aux.local"));
+    try std.testing.expect(isValidAxisValue("studio."));
 }

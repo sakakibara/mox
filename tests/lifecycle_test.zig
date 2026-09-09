@@ -4080,6 +4080,23 @@ test "export --cleartext-secrets: a manager value lands at 0600, any other at it
     }
 }
 
+test "apply: an overlay whose value is a Windows device name still applies; naming one is what commit refuses" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml", "a = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.config/app.toml.d/hostname=aux.local.toml", "a = 2\n");
+    const r = try h.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const as = try h.run(&.{ "mox", "export", "--as", "hostname=aux.local", try std.fs.path.join(a, &.{ h.root, "baked" }) });
+    try std.testing.expectEqual(@as(u8, 0), as.rc);
+    try std.testing.expectEqualStrings("a = 2\n", try read(io, a, try std.fs.path.join(a, &.{ h.root, "baked", ".config", "app.toml" })));
+}
+
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted
 /// `git pull` does. The guard is a marker lookup, so no real history is needed.
 fn markMidMerge(h: Harness, tmp: *std.testing.TmpDir) !void {

@@ -60,6 +60,14 @@ All notable changes to mox are documented here. The format follows
   directory that cannot be made prints once per run; a dry run, which spawns
   nothing, leaves the directory as it is, and rollback touches it only when a
   check hook runs.
+- `commit` no longer crashes on a first-contact structured file whose live
+  copy holds no keys; it is nothing to commit.
+- `commit` refuses a fact value that cannot name an overlay (a path separator,
+  `=`, the `+` pair separator, a trailing dot or a Windows device name) in a
+  narrowed region's fragment as in a first-contact overlay, instead of writing
+  outside the repo or a file no later command can read; the refusal, like
+  every manual outcome, leaves the edit reported as uncommitted at exit 1;
+  reading such a value from an existing overlay's name stays as it was.
 
 ## [0.10.0] - 2026-08-12
 

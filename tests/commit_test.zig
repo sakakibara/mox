@@ -280,6 +280,71 @@ test "commit: a first-contact structured file with no matching layer creates one
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
 
+test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=linux.toml", "theme = \"light\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try h.liveOf("settings.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[[[not toml\n" });
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "could not be parsed as toml") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("settings.toml.d/os=darwin")));
+}
+
+test "commit: a first-contact structured file whose live copy holds no keys is nothing to commit, not a crash" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=linux.toml", "theme = \"light\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    const live = try h.liveOf("settings.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "\n" });
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(!exists(io, try h.srcOf("settings.toml.d/os=darwin")));
+}
+
+test "commit: a narrowing whose fact value cannot name a fragment file is left uncommitted, and writes nowhere" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The shared line composes into several configurations (the profile
+    // gate makes two), so commit asks where it belongs; `site` is bound to a
+    // value that could only name a fragment by leaving the tree.
+    try writeExistingRegionFixture(io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export EDITOR=vim\n# mox: when profile=work\nexport WORK=1\n# mox: end\n# mox: when site=\"../../escaped\"\nexport SITE=1\n# mox: end\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\nsite = \"../../escaped\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export EDITOR=vim", "export EDITOR=nvim");
+
+    const listing = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "?\nq\n");
+    const mark = std.mem.indexOf(u8, listing.out, "] site=") orelse {
+        std.debug.print("commit listed no site candidate:\n{s}\n{s}\n", .{ listing.out, listing.err });
+        return error.NoSiteCandidate;
+    };
+    const answer = try std.fmt.allocPrint(a, "{c}\n", .{listing.out[mark - 1]});
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, answer);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "cannot name a fragment file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "left uncommitted") != null);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.root, "escaped" })));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.repo, "escaped" })));
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export EDITOR=vim\n") != null);
+}
+
 test "commit: a changed secret value is shown without its old resolved value, and never routed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4303,4 +4368,76 @@ test "commit: a leaf path argument routes only that leaf, addressing its generat
     try std.testing.expectEqualStrings("key=92\n", try read(io, a, leaf_b));
     const st = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, st.out, "DRIFT") != null or std.mem.indexOf(u8, st.err, "DRIFT") != null);
+}
+
+test "commit: a fact value that cannot name an overlay routes to manual, not out of the repo" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Overlay-only, so a live edit has no base to route into and commit tries
+    // to synthesize a first-contact overlay named from this machine's binding.
+    try writeRepo(io, &tmp, "repo/src/.config/foo.toml.d/profile=other", "other = 1\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    // `mox facts set` takes arbitrary text; this value is about to be asked to
+    // name a file: unchecked, the path lands outside the repo entirely.
+    const fs_res = try h.run(&.{ "mox", "facts", "set", "profile", "../../../../ESCAPED" });
+    try std.testing.expectEqual(@as(u8, 0), fs_res.rc);
+    _ = try h.run(&.{ "mox", "apply", "--defaults" });
+
+    const live = try std.fs.path.join(a, &.{ h.home, ".config", "foo.toml" });
+    if (std.fs.path.dirname(live)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "edited = 2\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "cannot name an overlay") != null);
+    // Nothing escaped the repo, and nothing crashed on the way.
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.root, "ESCAPED" })));
+
+    // A Windows device name is a file no machine can hold.
+    _ = try h.run(&.{ "mox", "facts", "set", "profile", "aux" });
+    _ = try h.run(&.{ "mox", "apply", "--defaults" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "edited = 4\n" });
+    const device = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, device.out, "cannot name an overlay") != null);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.root, "repo", "src", ".config", "foo.toml.d", "profile=aux" })));
+    // A value holding the pair separator would name a tuple no filename can
+    // carry: the overlay would be written and every later command would
+    // refuse the repo over it.
+    _ = try h.run(&.{ "mox", "facts", "set", "profile", "a+b" });
+    _ = try h.run(&.{ "mox", "apply", "--defaults" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "edited = 3\n" });
+    const plus = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, plus.out, "cannot name an overlay") != null);
+    // A manual outcome is an uncommitted edit, and the exit code says so.
+    try std.testing.expectEqual(@as(u8, 1), plus.rc);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.root, "repo", "src", ".config", "foo.toml.d", "profile=a+b" })));
+    const after = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(after.rc != 1 or std.mem.indexOf(u8, after.err, "malformed axis tuple") == null);
+}
+
+test "commit: a first-contact structured file with no axis to name an overlay by is manual, not a crash" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The only layer is gated on a tool this machine lacks: no layer matches,
+    // and the file compares no single-value axis an overlay could be named by.
+    try writeRepo(io, &tmp, "repo/src/.config/foo.toml.d/tool=ghosttool.toml", "other = 1\n");
+    const h = try setup(a, io, &tmp, .{});
+    _ = try h.run(&.{ "mox", "apply", "--defaults" });
+    const live = try std.fs.path.join(a, &.{ h.home, ".config", "foo.toml" });
+    if (std.fs.path.dirname(live)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "edited = 2\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "no source matches this machine") != null);
 }

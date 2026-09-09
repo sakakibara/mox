@@ -2562,29 +2562,26 @@ fn createFirstContactOverlay(
     live: []const u8,
     repo_dir: []const u8,
 ) !HunkOutcome {
-    ra.affected[fidx] = true;
-
     const ax = try mox.source.axes.ofFile(cc.arena, cc.io, file);
     var pairs: std.ArrayList(mox.source.tree.AxisTuple.Pair) = .empty;
     var it = ax.compared.keyIterator();
     while (it.next()) |name| {
         const value = cc.this_bindings.get(name.*) orelse {
-            try cc.stdout.print(
-                "  manual: {s} (no source matches this machine; axis '{s}' is unbound here)\n",
-                .{ file.live_path, name.* },
-            );
-            ra.manual_count.* += 1;
-            ra.manual_hunks[fidx] += 1;
-            ra.pending.* = true;
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (no source matches this machine; axis '{s}' is unbound here)\n", .{ display.of(file.live_path, cc.m_state.home), name.* });
             return .cont;
         };
+        // A fact value is arbitrary text; this one is about to become a
+        // filename. Without the check, a value holding `/` builds an overlay
+        // path outside the source tree, and one holding `=` or `+` names a
+        // tuple no later command can read back.
+        if (!mox.source.tuple.isNameableAxisValue(value)) {
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (axis '{s}' is bound to a value that cannot name an overlay)\n", .{ display.of(file.live_path, cc.m_state.home), name.* });
+            return .cont;
+        }
         try pairs.append(cc.arena, .{ .name = name.*, .value = value });
     }
     if (pairs.items.len == 0) {
-        try cc.stdout.print("  manual: {f} (no source matches this machine)\n", .{display.of(file.live_path, cc.m_state.home)});
-        ra.manual_count.* += 1;
-        ra.manual_hunks[fidx] += 1;
-        ra.pending.* = true;
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (no source matches this machine)\n", .{display.of(file.live_path, cc.m_state.home)});
         return .cont;
     }
     std.mem.sort(mox.source.tree.AxisTuple.Pair, pairs.items, {}, lessPairName);
@@ -2597,15 +2594,13 @@ fn createFirstContactOverlay(
     const changes = commit_struct.changedKeyPaths(cc.arena, format, emptyDocText(format), live) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
-            ra.manual_count.* += 1;
-            ra.manual_hunks[fidx] += 1;
-            ra.pending.* = true;
-            try cc.stdout.print("  manual: {f} could not be parsed as {s}; edit its source directly\n", .{ display.of(file.live_path, cc.m_state.home), @tagName(format) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} could not be parsed as {s}; edit its source directly\n", .{ display.of(file.live_path, cc.m_state.home), @tagName(format) });
             return .cont;
         },
     };
     if (changes.len == 0) return .cont;
 
+    ra.affected[fidx] = true;
     if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
     const space = spaces[fidx].?;
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
@@ -4465,6 +4460,10 @@ fn classifyChoice(
     // (there is no machine axis to name).
     const axis_name = if (c.kind == .machine_local) "machine" else c.axis_name;
     const axis_value = if (c.kind == .machine_local) cc.machine else c.axis_value;
+    if (!mox.source.tuple.isNameableAxisValue(axis_value)) {
+        try cc.stdout.print("  {s}: {s}={s} cannot name a fragment file; left uncommitted (edit the source manually)\n", .{ desc, axis_name, axis_value });
+        return .unroutable;
+    }
     // Some narrowings cannot be synthesized without damaging or losing data:
     // one that wraps line 1 displaces a shebang or a whole-file gate, one
     // whose region name the file already uses hands its fragment to that
