@@ -3334,8 +3334,8 @@ test "doctor generator: flags a missing data source and a colliding pair, stays 
 
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "doctor" });
-    // Generator findings are advisories, not rc-gating problems.
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Generator findings are advisories, and an advisory sets the exit code.
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 
     try std.testing.expect(lineHasBoth(r.out, "gen_missing.inc", "data source missing"));
     try std.testing.expect(lineHasBoth(r.out, "gen_collide.inc", "two rows render the same path"));

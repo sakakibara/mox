@@ -36,6 +36,8 @@ All notable changes to mox are documented here. The format follows
   written, and a layer that cannot be read is named the same way; a merge
   would emit a region's body unconditionally and drop a `secret` or `default`
   as a comment. `apply` and `export` explain a compose failure the same way.
+- BREAKING: `doctor` exits 1 while any advisory remains or a check could not
+  run, not only on problems, so it can gate CI; `--help` states the codes.
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
@@ -75,6 +77,9 @@ All notable changes to mox are documented here. The format follows
   outside the repo or a file no later command can read; the refusal, like
   every manual outcome, leaves the edit reported as uncommitted at exit 1;
   reading such a value from an existing overlay's name stays as it was.
+- `doctor` reads the source tree's own git status under the environment mox
+  was given, and a repository enclosing a repo that is not a git working tree
+  no longer answers for it.
 
 ## [0.10.0] - 2026-08-12
 

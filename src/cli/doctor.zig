@@ -81,10 +81,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.err.print("mox doctor: {s}\n", .{notice});
     }
 
-    // `problems` are the rebuildable breakage the rc gates on and `--fix`
-    // remediates (malformed provenance). `advisories` are findings mox reports
-    // but deliberately does not auto-remediate (untracked sources); they never
-    // set the exit code, so the rc is consistent whether or not `--fix` ran.
+    // `problems` are the rebuildable breakage `--fix` remediates (malformed
+    // provenance). `advisories` are findings mox reports but deliberately does
+    // not auto-remediate (untracked sources, an uncarriable mode, a dead
+    // gate). Both set the exit code: a check nobody can gate on is a check
+    // that goes unread, and every advisory here is something that silently
+    // costs you a file on another machine.
     var advisories: usize = 0;
     // A check that could not run at all (vs. one that ran and found nothing):
     // counted separately so the summary never claims "healthy" over a report
@@ -94,14 +96,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // Source files not tracked by git. Null means the check could not run (the
     // repo is not a git working tree, or git is unavailable): note that, so a
     // clean report never implies every source is tracked when it was not checked.
-    if (try gitUntrackedSrc(ctx.alloc, ctx.io, context.paths.repo_dir)) |untracked| {
+    if (try gitUntrackedSrc(ctx.alloc, ctx.io, context.env, context.paths.repo_dir)) |untracked| {
         for (untracked) |u| {
             advisories += 1;
             try ctx.out.print("  untracked {s} (source not tracked by git)\n", .{u});
         }
     } else {
         skipped += 1;
-        try ctx.out.print("  note: {f} is not a git working tree; the tracked-source check was skipped\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
+        try ctx.out.print("  note: {f}: the tracked-source check was skipped (not its own git working tree, or git is unavailable)\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
     }
 
     // Source modes git cannot carry (not 0644/0755) that are not recorded in
@@ -227,17 +229,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (problems > 0) {
         try ctx.out.print("mox doctor: {d} problem(s) found\n", .{problems});
     } else if (advisories > 0) {
-        // Advisories are soft (exit 0), but the report is not "healthy" when it
-        // has items needing manual attention -- say so without contradicting.
         try ctx.out.print("mox doctor: {d} advisory item(s) need attention\n", .{advisories});
     } else if (skipped > 0) {
-        // Soft like an advisory (exit 0): a skipped check is not itself a
-        // finding, but "healthy" would wrongly claim full coverage.
+        // A skipped check is not a finding, but "healthy" would wrongly
+        // claim full coverage, so the summary says so and the exit code
+        // below does not vouch for the tree either.
         try ctx.out.print("mox doctor: {d} check(s) skipped (coverage incomplete)\n", .{skipped});
     } else {
         try ctx.out.writeAll("mox doctor: healthy\n");
     }
-    return if (problems > 0) 1 else 0;
+    return if (problems > 0 or advisories > 0 or skipped > 0) 1 else 0;
 }
 
 /// Source files that compose to null under every configuration in their own
@@ -716,10 +717,23 @@ fn lessString(_: void, a: []const u8, b: []const u8) bool {
 /// empty slice when the tree is fully tracked, and NULL when the check could not
 /// run -- the repo is not a git working tree, or git is unavailable -- so the
 /// caller can distinguish "all tracked" from "not checked".
-fn gitUntrackedSrc(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]const []const u8 {
+fn gitUntrackedSrc(arena: std.mem.Allocator, io: Io, env: mox.env.Env, repo_dir: []const u8) !?[]const []const u8 {
+    var env_map = try env.createMap(arena);
+    // The repo's own tree, not an enclosing repository that happens to
+    // ignore it: git answers for the nearest checkout above the directory.
+    const top = std.process.run(arena, io, .{ .argv = &.{
+        "git", "-C", repo_dir, "rev-parse", "--show-toplevel",
+    }, .environ_map = &env_map }) catch return null;
+    switch (top.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const found = std.mem.trim(u8, top.stdout, " \t\r\n");
+    const want = Io.Dir.cwd().realPathFileAlloc(io, repo_dir, arena) catch return null;
+    if (!sameDirectory(found, want)) return null;
     const result = std.process.run(arena, io, .{ .argv = &.{
         "git", "-C", repo_dir, "ls-files", "--others", "--exclude-standard", "--", "src",
-    } }) catch return null;
+    }, .environ_map = &env_map }) catch return null;
     switch (result.term) {
         .exited => |code| if (code != 0) return null,
         else => return null,
@@ -732,6 +746,19 @@ fn gitUntrackedSrc(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !?[]c
         try out.append(arena, try arena.dupe(u8, t));
     }
     return try out.toOwnedSlice(arena);
+}
+
+/// git prints a toplevel with forward slashes; on Windows the realpath has
+/// backslashes and a case that may differ.
+fn sameDirectory(git_path: []const u8, real_path: []const u8) bool {
+    if (@import("builtin").os.tag != .windows) return std.mem.eql(u8, git_path, real_path);
+    if (git_path.len != real_path.len) return false;
+    for (git_path, real_path) |g, r| {
+        const gn: u8 = if (g == '\\') '/' else std.ascii.toLower(g);
+        const rn: u8 = if (r == '\\') '/' else std.ascii.toLower(r);
+        if (gn != rn) return false;
+    }
+    return true;
 }
 
 /// Base source files whose on-disk mode git cannot carry (neither 0644 nor
@@ -768,7 +795,7 @@ fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_d
 pub const command = app.command(Spec, .{
     .name = "doctor",
     .summary = "Health report on the mox repo and machine-local state",
-    .details = "untracked src, unrecorded exotic modes, malformed state (--rebuild-provenance, --rebuild-coupling, --fix).",
+    .details = "untracked src, unrecorded exotic modes, malformed state (--rebuild-provenance, --rebuild-coupling, --fix). Exit 0 healthy, 1 while any problem or advisory remains or a check could not run.",
     .group = .general,
     .needs_context = true,
 }, run);

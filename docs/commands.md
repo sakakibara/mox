@@ -445,7 +445,7 @@ recomposes and re-records every tracked file's provenance (partial
 targets keep no line provenance and are skipped); `--rebuild-coupling`
 rescans source tokens and rewrites the stored coupling graph under
 `<state>/coupling/`; `--fix` performs the safe rebuilds. Mutating runs
-take the lock; exits 1 while problems remain.
+take the lock; exits 1 while any problem or advisory remains, or a check could not run (a source tree outside git skips the tracked-source check), so it can gate CI.
 
 <!-- generated: flags doctor -->
 | Flag | Description |

@@ -1422,8 +1422,8 @@ test "doctor: a malformed attributes.toml skips the checks that read it, and the
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "not valid toml [[[\n");
 
     const r = try h.run(&.{ "mox", "doctor" });
-    // A read failure is not a rebuildable problem, so the rc stays soft.
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // A check that could not run is not a clean bill: the rc gates on it.
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "check(s) skipped") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "healthy") == null);
 }
@@ -1467,7 +1467,7 @@ test "doctor: a gate that can never hold is a never-materializes advisory" {
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "never-materializes src/.config/broken.toml") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "mac-only") == null);
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
 
 test "doctor: a presence-fact gate is not a never-materializes false positive" {
@@ -1505,7 +1505,7 @@ test "doctor: a bound fact nothing in the repo consumes is an unused-fact adviso
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "leftover_fact = \"x\"\n" });
 
     const r = try h.run(&.{ "mox", "doctor" });
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "unused-fact leftover_fact (bound but unused by this repo)") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "advisory item(s) need attention") != null);
 }
@@ -1565,7 +1565,7 @@ fn gitInit(io: Io, a: std.mem.Allocator, repo: []const u8) !void {
     }
 }
 
-test "doctor: an untracked source is an advisory -- reported, and the rc stays 0" {
+test "doctor: an untracked source is an advisory -- reported, and the rc says so" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1581,8 +1581,8 @@ test "doctor: an untracked source is an advisory -- reported, and the rc stays 0
     try std.testing.expect(std.mem.indexOf(u8, r.out, "untracked src/.zshrc") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "1 advisory item(s)") != null);
     // An advisory is something mox reports for a human to act on, never
-    // something it remediates -- so it must not gate the exit code.
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // something it remediates; it still sets the exit code so CI can gate.
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
 
 test "apply: an unknown attributes.toml key refuses loudly instead of silently dropping it" {
@@ -1621,6 +1621,7 @@ test "doctor --fix rebuilds malformed provenance for tracked files" {
     // Corrupt the provenance record apply just wrote.
     try corruptAll(io, a, try std.fs.path.join(a, &.{ h.state, "provenance" }), "{ broken");
 
+    try testutil.gitTracked(io, a, h.repo);
     const fixed = try h.run(&.{ "mox", "doctor", "--fix" });
     try std.testing.expect(std.mem.indexOf(u8, fixed.out, "rebuilt provenance") != null);
 
@@ -1645,8 +1646,9 @@ test "doctor: flags a tracked source that matches an ignore rule" {
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "oldtool") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "ignore") != null);
-    // An advisory is never a rebuild-gating problem, so the rc stays 0.
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // An advisory is not auto-remediable, but it does gate the rc: a check
+    // nobody can fail on is a check that goes unread.
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
 
 test "doctor: a file ignored only under a `when`-gate for another machine is not flagged" {
@@ -1664,27 +1666,10 @@ test "doctor: a file ignored only under a `when`-gate for another machine is not
     // a real tracked-vs-ignored contradiction.
     try writeRepo(io, &tmp, "repo/.moxignore", "# mox: when os=darwin\n.config/gh.ps1\n# mox: end\n");
 
+    try testutil.gitTracked(io, a, h.repo);
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "tracked-and-ignored") == null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-}
-
-/// Seed a throwaway git repo at `repo` with a committed working tree so
-/// `mox init --clone` has something to clone. Skips the test if git is
-/// unavailable. The identity is throwaway test scaffolding, not a real repo.
-fn gitSeed(io: Io, a: std.mem.Allocator, repo: []const u8) !void {
-    const step = struct {
-        fn run(io_: Io, a_: std.mem.Allocator, argv: []const []const u8) !void {
-            const r = std.process.run(a_, io_, .{ .argv = argv }) catch return error.SkipZigTest;
-            switch (r.term) {
-                .exited => |c| if (c != 0) return error.SkipZigTest,
-                else => return error.SkipZigTest,
-            }
-        }
-    }.run;
-    try step(io, a, &.{ "git", "init", "-q", repo });
-    try step(io, a, &.{ "git", "-C", repo, "add", "src" });
-    try step(io, a, &.{ "git", "-C", repo, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-q", "-m", "seed" });
 }
 
 test "init --clone --apply: clones the repo and applies it in one command" {
@@ -1699,7 +1684,7 @@ test "init --clone --apply: clones the repo and applies it in one command" {
     try writeRepo(io, &tmp, "source/src/.zshrc", "hello from clone\n");
     const cwd = try std.process.currentPathAlloc(io, a);
     const source = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "source" });
-    try gitSeed(io, a, source);
+    try testutil.gitTracked(io, a, source);
 
     // Empty repo dir (no create_repo_src) so init --clone is allowed.
     const h = try testutil.setup(a, io, &tmp, .{});
@@ -3335,7 +3320,7 @@ test "doctor: an attributes entry no managed target derives is an advisory" {
     );
 
     const r = try h.run(&.{ "mox", "doctor" });
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "orphaned-attribute ./old.conf") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "orphaned-attribute .ssh/config") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "advisory item(s)") != null);
@@ -4166,6 +4151,35 @@ test "export: a region directive under an overlay is explained here too" {
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "gate the content with an overlay instead") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: # mox: when profile=zzz") != null);
+}
+
+test "doctor: a repo that is not a git working tree is not answered for by the repository enclosing it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The mox repo is a subdirectory of an outer git repo that ignores it. The
+    // outer repo must be DISCOVERABLE (its .git sits below the harness ceiling,
+    // at repo/, with mox's tree nested at repo/inner) so the skip comes from
+    // doctor's own-toplevel guard -- git answers with the outer toplevel, not
+    // the mox dir -- and not merely from git finding no repository at all.
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const inner = try std.fs.path.join(a, &.{ root, "repo", "inner" });
+    const h = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MOX_REPO", .value = inner }},
+    });
+    try tmp.dir.createDirPath(io, "repo/inner/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/inner/src/.zshrc", .data = "export A=1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.gitignore", .data = "inner/\n" });
+    try testutil.gitTracked(io, a, h.repo);
+
+    _ = try h.run(&.{ "mox", "apply" });
+    const r = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "tracked-source check was skipped") != null);
 }
 
 /// Leave `h.repo` looking part-way through a merge, the way an interrupted

@@ -790,6 +790,7 @@ test "commit: a coupled token change updates the other consumer" {
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     // Seed the coupling graph over both sources.
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     const live = try h.liveOf(".myenv");
@@ -817,6 +818,7 @@ test "commit: a declined coupled token is left unchanged" {
     const h = try setup(a, io, &tmp, .{});
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     // A global decline for the token suppresses the coupling prompt entirely.
@@ -862,6 +864,7 @@ test "commit: a coupling edit that would diverge an unaffected configuration abo
     const h = try setup(a, io, &tmp, .{});
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     const gitconfig_src = try h.srcOf(".gitconfig");
@@ -897,6 +900,7 @@ test "commit: dry-run writes neither the routed nor the coupled edit" {
     const h = try setup(a, io, &tmp, .{});
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     const live = try h.liveOf(".myenv");
@@ -953,6 +957,7 @@ test "commit: non-TTY report mode reports a pending coupling update and exits 1"
     const h = try setup(a, io, &tmp, .{});
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     const live = try h.liveOf(".myenv");
@@ -2607,6 +2612,7 @@ test "commit: a coupled token in a symlink target or seed-once body is not rewri
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     // Build the coupling graph while all three are plain: it genuinely indexes
     // the mylink and seed.local bodies (an occurrence of the token in each).
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     // Now mark the two as protected. The stored graph is stale: it still holds
@@ -2689,6 +2695,7 @@ test "commit: a path-scoped commit skips cross-file coupling" {
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     // Seed the coupling graph over both sources.
+    try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
 
     const live = try h.liveOf(".myenv");
