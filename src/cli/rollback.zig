@@ -302,7 +302,7 @@ fn repatchPartial(
 pub const command = app.command(Spec, .{
     .name = "rollback",
     .summary = "Restore live files from a snapshot",
-    .usage = "mox rollback <snapshot-id>",
+    .usage = "mox rollback [<id>]",
     .group = .general,
     .needs_context = true,
 }, run);

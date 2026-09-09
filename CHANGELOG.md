@@ -45,6 +45,9 @@ All notable changes to mox are documented here. The format follows
   missing fragment is reported by the directory it would sit under; a file
   that has both overlays and regions is told that both were looked for when
   neither matches.
+- The docs no longer name a `--force` alias `apply` never had, `apply --help`
+  no longer names `--overwrite` as its own alias, and `rollback --help` says
+  its id is optional.
 
 ## [0.10.0] - 2026-08-12
 

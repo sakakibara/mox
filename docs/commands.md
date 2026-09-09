@@ -178,7 +178,7 @@ migration). Drifted files are left untouched, listed in a report on
 stdout, and the run exits 1. The report names each file, what changed,
 and the exact command to resolve it: `mox apply --overwrite <path>`
 takes the repo's version, `mox commit <path>` keeps the live edit by
-routing it back into its source. `--overwrite` (alias `--force`) with no
+routing it back into its source. `--overwrite` with no
 paths overwrites every drifted file; a path list scopes it. `mox status
 --drift` lists the full set at any time, and `--json`/`--porcelain` emit
 it for tooling. A genuine failure -- an unresolvable fact contract, an

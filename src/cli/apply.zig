@@ -1711,7 +1711,7 @@ fn snapshotContentForSite(io: std.Io, arena: std.mem.Allocator, live_path: []con
 pub const command = app.command(Spec, .{
     .name = "apply",
     .summary = "Compose all managed files and write to live paths",
-    .details = "Never prompts. --dry-run: report only; --overwrite (alias --overwrite): write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
+    .details = "Never prompts. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
     .group = .general,
     .needs_context = true,
 }, run);

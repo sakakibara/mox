@@ -45,7 +45,7 @@ even when it renders empty -- a conditionally-present but empty file -- add
 When a file that mox previously wrote starts composing to nothing, `mox apply`
 removes the stale live copy (snapshot-first, so `mox rollback` recovers it). A
 live copy edited since mox wrote it is not deleted silently: it is reported as
-drift and kept until `mox apply --overwrite <path>` (or `--force`).
+drift and kept until `mox apply --overwrite <path>`.
 
 ## Region directives
 
