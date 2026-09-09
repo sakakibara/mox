@@ -341,8 +341,8 @@ pub fn composeTrackedContent(
     const ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
 
     const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse {
-        // No signal at all. Pass through verbatim — directiveless config
-        // files shouldn't need a marker — but still run `<machine.X>` interp
+        // No signal at all. Pass through verbatim -- directiveless config
+        // files shouldn't need a marker -- but still run `<machine.X>` interp
         // so user-baked facts substitute consistently with the directive
         // path.
         if (machine_state_opt) |_| {

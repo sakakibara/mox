@@ -450,14 +450,14 @@ fn walkDir(
         // Gap 6: an orphan `.d/` is treated as the overlay-dir of a phantom
         // managed file ONLY if it actually contains axis-named overlays.
         // Without that signal, treat the dir as a regular subdirectory and
-        // recurse — otherwise legitimate convention-named dirs like
+        // recurse -- otherwise legitimate convention-named dirs like
         // `~/.config/fish/conf.d/` get hijacked, hiding their real contents.
         if (overlays.len == 0) {
             const sub_rel = try path_mod.joinKey(arena, &.{ rel_prefix, name });
             const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, name });
             // Recurse, then close. We can't use `defer .close()` here because
             // we need to release the handle before the recursive walk also
-            // opens the same dir — Zig's Dir.openDir doesn't reuse handles.
+            // opens the same dir -- Zig's Dir.openDir doesn't reuse handles.
             try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs, diag);
             dot_d_dir.close(io);
             continue;

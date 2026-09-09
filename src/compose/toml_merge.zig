@@ -9,7 +9,7 @@
 //! who want concatenation can structure their overlay tree differently.
 //!
 //! All output (keys, table maps, array items) is allocated on `arena`.
-//! String payloads are reused by reference (not duped) — they remain
+//! String payloads are reused by reference (not duped) -- they remain
 //! valid for the same lifetime as the input arenas.
 
 const std = @import("std");

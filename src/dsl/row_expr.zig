@@ -131,7 +131,7 @@ pub const Parser = struct {
 
     fn parseAtom(self: *Parser) ParseError!*const RowExpr {
         const t = self.peek();
-        // Parenthesized sub-expression — restores `(A or B) and (C or D)` shape.
+        // Parenthesized sub-expression -- restores `(A or B) and (C or D)` shape.
         if (t.kind == .lparen) {
             self.advance();
             const inner = try self.parseExpr();
@@ -204,7 +204,7 @@ pub const Parser = struct {
             }
         }
 
-        // `<var>.field has "Y"` — membership.
+        // `<var>.field has "Y"` -- membership.
         if (isKw(self.peek(), "has")) {
             self.advance();
             const val = switch (self.peek().kind) {
@@ -217,7 +217,7 @@ pub const Parser = struct {
             return node;
         }
 
-        // Bare `<var>.field` / `<axis>` — presence check.
+        // Bare `<var>.field` / `<axis>` -- presence check.
         const node = try self.arena.create(RowExpr);
         node.* = .{ .present = name };
         return node;
@@ -354,7 +354,7 @@ fn axisWithField(
     };
     const v = rec.get(field) orelse return false;
     if (v.isEmpty()) return false;
-    // Format the field value (string for scalars, comma-joined for arrays —
+    // Format the field value (string for scalars, comma-joined for arrays --
     // arrays in this position are unusual; using the formatted form mirrors
     // how `<entry.X>` substitutes elsewhere).
     const formatted = try v.format(arena);

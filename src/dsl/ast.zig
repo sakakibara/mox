@@ -10,7 +10,7 @@ const std = @import("std");
 pub const AxisExpr = union(enum) {
     /// `axis_name=value` literal.
     eq: struct { axis: []const u8, value: []const u8 },
-    /// Bare `axis_name` — true when the axis is bound to any non-empty
+    /// Bare `axis_name` -- true when the axis is bound to any non-empty
     /// value. Used for "include this section if `email` is set" semantics.
     present: []const u8,
     /// `not <expr>`.

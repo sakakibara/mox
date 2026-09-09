@@ -118,7 +118,7 @@ fn wholeFileSegment(arena: std.mem.Allocator, prov: ?*std.ArrayList(Segment), by
 }
 
 /// Read enough of `path` to sniff the file category. Opens the file and
-/// reads only `peek_limit` bytes — large binary files (icons, fonts, etc.)
+/// reads only `peek_limit` bytes -- large binary files (icons, fonts, etc.)
 /// can be tens of MB and we don't want to load them just to detect Cat C.
 /// Memory is owned by `arena`.
 fn peekFile(io: Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {

@@ -211,7 +211,7 @@ fn markerForShebang(content: []const u8) ?[]const u8 {
     const interp_path = trimmed[0..first_word_end];
     const last_slash = std.mem.lastIndexOfScalar(u8, interp_path, '/');
     var interp_name: []const u8 = if (last_slash) |s| interp_path[s + 1 ..] else interp_path;
-    // `#!/usr/bin/env <name>` or `#!/usr/bin/env -S <name>` — pick the next word.
+    // `#!/usr/bin/env <name>` or `#!/usr/bin/env -S <name>` -- pick the next word.
     if (std.mem.eql(u8, interp_name, "env")) {
         const rest = std.mem.trimStart(u8, trimmed[first_word_end..], " \t");
         var skip: usize = 0;
@@ -247,7 +247,7 @@ fn markerForShebang(content: []const u8) ?[]const u8 {
 /// If `content` has any line of the form `<ws><1-3 non-alnum chars><ws>mox:`,
 /// return the marker chars (the comment-prefix preceding `mox:`). Otherwise
 /// null. Used to infer the comment marker for files whose extension isn't in
-/// the marker table — `# mox: ...` is itself proof that `#` is the marker.
+/// the marker table -- `# mox: ...` is itself proof that `#` is the marker.
 fn markerFromApparentDirective(content: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
