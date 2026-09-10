@@ -547,5 +547,14 @@ test "check hook: the running mox leads the hook's PATH" {
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     const seen = try read(io, a, try std.fs.path.join(a, &.{ c.state, "path-seen" }));
     const bin = try std.fs.path.join(a, &.{ c.state, "bin" });
-    try std.testing.expect(std.mem.startsWith(u8, seen, bin));
+    if (builtin.os.tag == .windows) {
+        // PowerShell prepends its own $PSHOME to a child's PATH, so mox's bin
+        // is not literally first; it must still lead the inherited PATH, i.e.
+        // come before the Windows system directories.
+        const bi = std.mem.indexOf(u8, seen, bin) orelse return error.TestMoxBinNotOnPath;
+        const wi = std.mem.indexOf(u8, seen, "\\Windows") orelse seen.len;
+        try std.testing.expect(bi < wi);
+    } else {
+        try std.testing.expect(std.mem.startsWith(u8, seen, bin));
+    }
 }
