@@ -289,6 +289,13 @@ test "an empty result is refused for every scheme, not just env:" {
     // env: a variable that is plainly set, to nothing.
     var map = std.process.Environ.Map.init(a);
     try map.put("MOX_TEST_EMPTY_SECRET", "");
+    // cmd: below runs through cmd.exe on Windows, which is found via ComSpec;
+    // the synthetic map has none, so hand it the runner's own.
+    if (builtin.os.tag == .windows) {
+        if (std.testing.environ.getAlloc(a, "ComSpec")) |cs| {
+            try map.put("ComSpec", cs);
+        } else |_| {}
+    }
     try std.testing.expectError(error.SecretEmpty, resolve(
         a,
         std.testing.io,
