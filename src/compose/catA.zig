@@ -8,6 +8,15 @@ const match_mod = @import("match.zig");
 const toml_merge = @import("toml_merge.zig");
 const json_merge = @import("json_merge.zig");
 const yaml_merge = @import("yaml_merge.zig");
+
+/// A filesystem path rendered in key form (`/`-separated) for a user-facing
+/// diagnostic, so a source file is named the same way on every platform.
+fn keyPath(arena: std.mem.Allocator, path: []const u8) []const u8 {
+    if (std.fs.path.sep == '/') return path;
+    const dup = arena.dupe(u8, path) catch return path;
+    std.mem.replaceScalar(u8, dup, std.fs.path.sep, '/');
+    return dup;
+}
 const ini_merge = @import("ini_merge.zig");
 const interp = @import("interp.zig");
 const catB = @import("catB.zig");
@@ -384,18 +393,18 @@ fn refuseRegionInLayers(
     if (file.has_base) {
         if (directiveLine(base_text, marker)) |hit| {
             const raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_layer_bytes));
-            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: {s}", .{ file.source_base_abs, lineOf(raw, hit.text), hit.text }));
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: {s}", .{ keyPath(arena, file.source_base_abs), lineOf(raw, hit.text), hit.text }));
             return error.InlineDirectiveWithOverlay;
         }
     }
     for (file.overlays) |o| {
         const path = o.path;
         const raw = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes)) catch |e| {
-            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}: could not be read: {s}", .{ path, @errorName(e) }));
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}: could not be read: {s}", .{ keyPath(arena, path), @errorName(e) }));
             return e;
         };
         if (directiveLine(raw, marker)) |hit| {
-            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: {s}", .{ path, hit.line, hit.text }));
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: {s}", .{ keyPath(arena, path), hit.line, hit.text }));
             return error.InlineDirectiveWithOverlay;
         }
     }
