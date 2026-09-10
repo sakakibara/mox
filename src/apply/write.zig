@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Io = std.Io;
 
@@ -176,14 +177,15 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
     // leave a restrictive-mode file (0600/0444) at the umask default (e.g.
     // 0644), exposing a secret: on failure, remove the temp file and fail the
     // write rather than materializing it with the wrong permissions.
-    var path_z_buf: [4096]u8 = undefined;
-    if (tmp_path.len + 1 > path_z_buf.len) return error.PathTooLong;
-    @memcpy(path_z_buf[0..tmp_path.len], tmp_path);
-    path_z_buf[tmp_path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_z_buf);
-    if (std.c.chmod(path_z, @intCast(mode)) != 0) {
-        Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        return error.ChmodFailed;
+    // On POSIX, chmod the tmp file before the rename so the target never
+    // appears at a wrong (umask) mode -- the atomicity a secret's 0600 needs.
+    // On Windows `mode` is only the read-only bit and a read-only file cannot
+    // be renamed, so there the mode is applied to the target after the rename.
+    if (builtin.os.tag != .windows) {
+        if (!chmodPath(tmp_path, mode)) {
+            Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            return error.ChmodFailed;
+        }
     }
 
     // Post-fsync, pre-rename recheck (partial targets only): the candidate
@@ -211,6 +213,22 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
 
     // Atomic rename.
     try Io.Dir.rename(Io.Dir.cwd(), tmp_path, Io.Dir.cwd(), live_path, io);
+
+    if (builtin.os.tag == .windows) {
+        if (!chmodPath(live_path, mode)) return error.ChmodFailed;
+    }
+}
+
+/// Set `path`'s mode via `std.c.chmod` (the cross-POSIX path std.posix does
+/// not expose in Zig 0.16; on Windows it toggles the read-only bit). Returns
+/// false on failure so the caller can fail the write rather than leave a
+/// restrictive-mode file at the umask default.
+fn chmodPath(path: []const u8, mode: u32) bool {
+    var buf: [4096]u8 = undefined;
+    if (path.len + 1 > buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return std.c.chmod(@ptrCast(&buf), @intCast(mode)) == 0;
 }
 
 fn failingFileSync(userdata: ?*anyopaque, file: Io.File) Io.File.SyncError!void {
