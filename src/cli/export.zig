@@ -65,10 +65,10 @@ fn unreadableDataFile(arena: std.mem.Allocator, io: std.Io, repo_dir: []const u8
         const path = try std.fs.path.join(arena, &.{ repo_dir, "data", name });
         _ = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => continue,
-            else => return path,
+            else => return try std.fmt.allocPrint(arena, "data/{s}", .{name}),
         };
     }
-    return try std.fs.path.join(arena, &.{ repo_dir, "data" });
+    return "data";
 }
 
 /// One file the export will write, held until every file has composed. A
