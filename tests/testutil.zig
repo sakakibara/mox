@@ -77,8 +77,9 @@ pub const Harness = struct {
     /// `rel` is a key (`.gitconfig.d/os=darwin`), so it joins natively rather
     /// than splicing a '/'-separated tail onto a '\'-separated root.
     pub fn srcOf(h: Harness, rel: []const u8) ![]u8 {
-        const src_root = try std.fs.path.join(h.a, &.{ h.repo, "src" });
-        return mox.source.path.joinKeyOnto(h.a, src_root, rel);
+        const native_rel = try h.a.dupe(u8, rel);
+        std.mem.replaceScalar(u8, native_rel, '/', std.fs.path.sep);
+        return std.fs.path.join(h.a, &.{ h.repo, "src", native_rel });
     }
 
     pub fn homePath(h: Harness, name: []const u8) ![]u8 {
