@@ -13,6 +13,15 @@ const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
+
+/// A filesystem path rendered in key form (`/`-separated) for a user-facing
+/// message, so a source file is named the same way on every platform.
+fn keyPath(arena: std.mem.Allocator, path: []const u8) []const u8 {
+    if (std.fs.path.sep == '/') return path;
+    const dup = arena.dupe(u8, path) catch return path;
+    std.mem.replaceScalar(u8, dup, std.fs.path.sep, '/');
+    return dup;
+}
 const env_mod = @import("env");
 const apply_cmd = @import("apply.zig");
 
@@ -181,11 +190,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             const tuple_name = try std.mem.concat(ctx.alloc, u8, &.{ try tupleFilename(ctx.alloc, want), std.fs.path.extension(file.source_base_path) });
             const cand = try mox.source.path.joinKeyOnto(ctx.alloc, overlay_dir, tuple_name);
             if (file.regions.len > 0 and file.overlays.len > 0) {
-                try ctx.err.print("mox edit: no overlay or fragment for '{s}' on {s} (looked for {s}, and under {s} in each region's directory)\n", .{ as, name, cand, overlay_dir });
+                try ctx.err.print("mox edit: no overlay or fragment for '{s}' on {s} (looked for {s}, and under {s} in each region's directory)\n", .{ as, name, keyPath(ctx.alloc, cand), keyPath(ctx.alloc, overlay_dir) });
             } else if (file.regions.len > 0) {
-                try ctx.err.print("mox edit: no fragment for '{s}' on {s} (looked under {s} in each region's directory)\n", .{ as, name, overlay_dir });
+                try ctx.err.print("mox edit: no fragment for '{s}' on {s} (looked under {s} in each region's directory)\n", .{ as, name, keyPath(ctx.alloc, overlay_dir) });
             } else {
-                try ctx.err.print("mox edit: no overlay for '{s}' on {s} (looked for {s})\n", .{ as, name, cand });
+                try ctx.err.print("mox edit: no overlay for '{s}' on {s} (looked for {s})\n", .{ as, name, keyPath(ctx.alloc, cand) });
             }
             return 1;
         }
