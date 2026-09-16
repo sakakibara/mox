@@ -327,6 +327,8 @@ fn applyPass(
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, "scripts/pre", &bindings, &script_env, &contracts, ctx.out, ctx.err);
 
+    const pkg_counts = try applyPackages(ctx, context, &bindings, dry_run);
+
     // A pre-script may install a tool or create a directory a `data/facts.toml`
     // row derives a fact from. Re-capture so this same apply composes against
     // the machine as the bootstrap left it, not as it began -- the
@@ -334,7 +336,7 @@ fn applyPass(
     // `contracts` are rebuilt in lockstep: a post-script must see and be
     // judged against exactly the facts this re-capture just bound, not the
     // pre-stage's stale projection.
-    if (pre_result.ran > 0) {
+    if (pre_result.ran > 0 or pkg_counts.installed > 0) {
         m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 2;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
@@ -727,6 +729,9 @@ fn applyPass(
             "\nDry run: {d} would be written, {d} would be removed, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts not run\n",
             .{ counts.ok, counts.removed, counts.unchanged, counts.skip, counts.drift, counts.fail },
         );
+        if (pkg_counts.in_use) {
+            try ctx.out.print("Packages: {d} would be installed\n", .{pkg_counts.would});
+        }
     } else {
         try ctx.out.print(
             "\nApplied: {d} written, {d} removed, {d} unchanged, {d} skipped, {d} drifted, {d} failed; scripts: {d} ran, {d} skipped, {d} failed, {d} blocked, {d} declined\n",
@@ -737,6 +742,12 @@ fn applyPass(
                 pre_result.blocked + post_result.blocked, pre_result.declined + post_result.declined,
             },
         );
+        if (pkg_counts.in_use) {
+            try ctx.out.print(
+                "Packages: {d} installed, {d} failed\n",
+                .{ pkg_counts.installed, pkg_counts.failed },
+            );
+        }
     }
 
     const sty = style.Style{ .on = style.enabled(
@@ -756,10 +767,90 @@ fn applyPass(
     // failure, an unwritable target, or lock contention is a genuine failure:
     // rc 2. Drift left untouched (skipped, not forced) is a normal, actionable
     // non-success: rc 1. Neither: rc 0.
-    const error_class = counts.fail + pre_result.failed + post_result.failed + pre_result.blocked + post_result.blocked;
+    const error_class = counts.fail + pre_result.failed + post_result.failed +
+        pre_result.blocked + post_result.blocked + pkg_counts.failed;
     if (error_class > 0) return 2;
     if (counts.drift > 0) return 1;
     return 0;
+}
+
+/// What one apply did to this machine's packages.
+const PackageCounts = struct {
+    in_use: bool = false,
+    installed: usize = 0,
+    would: usize = 0,
+    failed: usize = 0,
+};
+
+/// Install every package the manifest declares and this machine lacks.
+///
+/// Runs AFTER the pre stage and BEFORE its re-capture. After, because a
+/// pre-script is what installs the package manager itself on a fresh machine
+/// -- running first would find no brew, treat every row as inert, and install
+/// nothing at all on the one apply that matters most. Before, because a
+/// package installed here is a tool the re-capture has to see, exactly like
+/// one a script installed.
+///
+/// Only ever installs. An untracked package is reported by `mox status` and
+/// reconciled by `mox commit`; nothing here removes one.
+fn applyPackages(
+    ctx: *app.Ctx,
+    context: app.Context,
+    bindings: *const mox.dsl.resolver.Resolver,
+    dry_run: bool,
+) !PackageCounts {
+    var proc: mox.packages.exec.Process = .{ .io = ctx.io };
+    var brew: mox.packages.brew.Brew = .{ .runner = proc.runner() };
+    var backends = [_]mox.packages.backend.Backend{brew.backend()};
+    const registry: mox.packages.backend.Registry = .{ .backends = &backends };
+
+    var diag: mox.packages.manifest.Diag = .{};
+    const rep = mox.packages.report.gather(
+        ctx.alloc,
+        ctx.io,
+        registry,
+        context.paths.repo_dir,
+        context.paths.private_dir,
+        bindings,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .failed = 1 };
+        },
+    };
+    if (!rep.in_use) return .{};
+
+    var counts: PackageCounts = .{ .in_use = true };
+    for (rep.backends) |b| {
+        const backend = registry.find(b.backend) orelse continue;
+        for (b.drift.missing) |m| {
+            if (dry_run) {
+                try ctx.out.print("  would install  {s} {s}\n", .{ b.backend, m.row.name });
+                counts.would += 1;
+                continue;
+            }
+            // One row per call so a failure names its own package and leaves
+            // the rest of the list to proceed: a bad formula halfway down
+            // must not strand everything after it.
+            backend.install(ctx.alloc, &.{m.row}) catch |e| {
+                try ctx.err.print(
+                    "mox apply: {s} {s}: install failed: {s}\n",
+                    .{ b.backend, m.row.name, @errorName(e) },
+                );
+                counts.failed += 1;
+                continue;
+            };
+            try ctx.out.print("  installed      {s} {s}\n", .{ b.backend, m.row.name });
+            counts.installed += 1;
+        }
+    }
+    return counts;
 }
 
 /// True when `a` and `b` name the same facts in the same order (the order

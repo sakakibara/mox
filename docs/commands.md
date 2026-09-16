@@ -171,6 +171,17 @@ facts left unbound (`unbound facts: <names>`) and how to resolve them.
 There is no global refusal for an unresolved fact -- that is a
 per-script concern (below), not this pass's to fail wholesale.
 
+A repo carrying a `data/packages/` manifest also installs what that
+manifest declares and the machine lacks, after the pre stage and before
+its re-capture: a pre-script is what installs the package manager itself
+on a fresh machine, and a package installed here is a tool the re-capture
+must see. Each is installed on its own, so a failure names its package
+and leaves the rest of the list to proceed; any failure is an error class
+(rc 2). apply only ever installs -- an untracked package is reported by
+`mox status` and reconciled by `mox commit`, never uninstalled. Under
+`--dry-run` nothing is installed and the run lists what it would install.
+A repo without `data/packages/` never queries a package manager.
+
 apply is non-interactive. It writes every file that is clean or absent
 and never silently changes one that has drifted -- a live file edited
 since mox last wrote it, or one mox never wrote (a first apply or
