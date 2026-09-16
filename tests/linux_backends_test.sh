@@ -130,7 +130,7 @@ EOF
   before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
   after="$(sed -n '/--- after ---/,$p' "$out")"
 
-  if echo "$before" | grep -q "MISSING   $backend $pkg"; then
+  if echo "$before" | grep -qE "MISSING[[:space:]]+$backend $pkg"; then
     ok "$backend ($image): a declared package the machine lacks is MISSING"
   else
     no "$backend ($image): expected '$pkg' MISSING before apply" "$(echo "$before" | tail -5)"
@@ -142,7 +142,7 @@ EOF
     no "$backend ($image): apply did not report a successful install" "$(grep -i 'packages:\|failed' "$out" | tail -3)"
   fi
 
-  if echo "$after" | grep -q "MISSING   $backend $pkg"; then
+  if echo "$after" | grep -qE "MISSING[[:space:]]+$backend $pkg"; then
     no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
   else
     ok "$backend ($image): the drift is clean after apply"
@@ -235,7 +235,8 @@ EOF
   apply="$(sed -n '/--- apply ---/,/--- after ---/p' "$out")"
   after="$(sed -n '/--- after ---/,$p' "$out")"
 
-  if echo "$apply" | grep -q "bootstrapping  $backend"; then
+  # The label column's width is mox's business, not this gate's.
+  if echo "$apply" | grep -qE "bootstrapping[[:space:]]+$backend"; then
     ok "$backend ($image): an absent manager is bootstrapped from its declared installer"
   else
     no "$backend ($image): apply did not bootstrap $backend" "$(echo "$apply" | tail -5)"
@@ -247,13 +248,13 @@ EOF
     no "$backend ($image): apply did not report a successful install" "$(echo "$apply" | grep -i 'packages:\|failed\|bootstrap' | tail -3)"
   fi
 
-  if echo "$after" | grep -q "clean     $backend\|UNTRACKED $backend "; then
+  if echo "$after" | grep -qE "clean[[:space:]]+$backend$|UNTRACKED[[:space:]]+$backend "; then
     ok "$backend ($image): the bootstrapped manager answers a fresh status"
   else
     no "$backend ($image): status after apply got no answer from $backend" "$(echo "$after" | tail -5)"
   fi
 
-  if echo "$after" | grep -q "MISSING   $backend $pkg"; then
+  if echo "$after" | grep -qE "MISSING[[:space:]]+$backend $pkg"; then
     no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
   else
     ok "$backend ($image): the drift is clean after apply"

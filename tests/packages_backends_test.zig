@@ -6,12 +6,14 @@
 //! flags an adapter depends on, this goes red.
 //!
 //! Every check here is READ-ONLY: nothing installs, taps, trusts, or removes.
-//! Each is DIFFERENTIAL against an INDEPENDENT oracle: brew's machine-readable
-//! inventory (`brew info --json=v2 --installed`), never the same command the
-//! adapter runs. An adapter that asks brew the wrong question agrees with
-//! itself; it cannot agree with the inventory. A check with no data to work
-//! on skips rather than passing on nothing, and under CI an absent brew is a
-//! failure -- the runner is supposed to have one.
+//! The two that decide whether the adapter asks brew the right question are
+//! DIFFERENTIAL against an INDEPENDENT oracle -- brew's own install receipts
+//! under the Cellar and the Caskroom, never a `brew list` -- because an
+//! adapter running the wrong query agrees with itself. The rest compare
+//! spelling and arity against `brew list` itself, which is the right oracle
+//! for "is this string verbatim". A check with no data to work on skips
+//! rather than passing on nothing, and under CI both an absent brew and an
+//! empty comparison are failures: the runner is seeded so neither happens.
 
 const std = @import("std");
 const mox = @import("mox");
@@ -213,6 +215,10 @@ test "brew: available agrees with brew answering for itself" {
     var p: packages.exec.Process = .{ .io = io };
     var b: packages.brew.Brew = .{ .runner = p.runner() };
 
+    // Off CI both answers may be "absent" and agree; on CI the runner has
+    // brew, so agreeing on absence would prove nothing about the path that
+    // matters.
+    if (onCi()) try needBrew(a, io);
     const available = (b.backend().available(a) catch .absent) == .present;
     const answered = blk: {
         const res = std.process.run(a, io, .{ .argv = &.{ "brew", "--version" } }) catch break :blk false;
@@ -305,6 +311,8 @@ test "brew: the adapter reports exactly what brew reports, nothing extra" {
     const ids = try brewIds(a, io);
     const formulae = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
     const casks = try rawLines(a, io, &.{ "brew", "list", "--cask", "--full-name" });
+    // 0 == 0 would satisfy the count without comparing anything.
+    if (formulae.len + casks.len == 0) return skipUnlessCi("brew lists nothing installed on request");
     try testing.expectEqual(formulae.len + casks.len, ids.len);
 }
 
