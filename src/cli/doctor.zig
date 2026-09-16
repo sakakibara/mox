@@ -485,10 +485,12 @@ fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !
         // invoked by explicit path from a `# mox: check "scripts/check/..."`
         // head directive -- but it is docs/dsl.md's documented conventional
         // home for them, so it is a recognized name, not an unknown one.
-        if (std.mem.eql(u8, entry.name, "check")) continue;
+        // Not stages, but directories of executables mox invokes under a
+        // contract: check hooks and package backends.
+        if (std.mem.eql(u8, entry.name, "check") or std.mem.eql(u8, entry.name, "backends")) continue;
         try out.append(arena, try std.fmt.allocPrint(
             arena,
-            "unknown-stage scripts/{s} (only pre/ and post/ run; rename or remove it)",
+            "unknown-stage scripts/{s} (only pre/ and post/ run, and check/ and backends/ are read; rename or remove it)",
             .{entry.name},
         ));
     }
@@ -981,6 +983,21 @@ test "scriptStageProblems: flags an unknown top-level stage and an unparseable t
     try testing.expect(std.mem.indexOf(u8, bad[1], "bad-stage-tuple scripts/pre/OS=darwin") != null);
     // A plain-named helper dir (no '=') is exempt: never mentioned.
     for (bad) |msg| try testing.expect(std.mem.indexOf(u8, msg, "helpers") == null);
+}
+
+test "scriptStageProblems: scripts/backends holds package backends and is never an unknown stage" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports", .data = "true\n" });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try scriptStageProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 0), bad.len);
 }
 
 test "scriptStageProblems: a well-formed pre/post tree has nothing to report" {
