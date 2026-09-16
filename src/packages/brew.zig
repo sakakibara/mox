@@ -101,7 +101,7 @@ pub const Brew = struct {
     /// `--version` is answered before brew reaches anything that fetches.
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Brew = @ptrCast(@alignCast(ctx));
-        return Backend.probeAvailability(self.exe, self.runner.run(arena, &.{ self.exe, "--version" }));
+        return Backend.probeAvailability(try std.fmt.allocPrint(arena, "{s} --version", .{self.exe}), self.runner.run(arena, &.{ self.exe, "--version" }));
     }
 
     /// `brew list` refreshes the formula and cask API data when the cached
@@ -427,7 +427,7 @@ test "available: a brew that is there but cannot answer is broken, not absent" {
     var b: Brew = .{ .runner = fake.runner(), .exe = "/opt/homebrew/bin/brew" };
     const got = try b.backend().available(a);
     try testing.expectEqual(@as(u8, 1), got.broken.code);
-    try testing.expectEqualStrings("/opt/homebrew/bin/brew", got.broken.argv0);
+    try testing.expectEqualStrings("/opt/homebrew/bin/brew --version", got.broken.probe);
 }
 
 test "available: a failure other than an absent brew is not reported as absent" {

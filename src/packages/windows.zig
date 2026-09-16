@@ -105,7 +105,7 @@ pub const Scoop = struct {
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        return Backend.probeAvailability("scoop", self.call(arena, &.{"--version"}, false));
+        return Backend.probeAvailability("scoop --version", self.call(arena, &.{"--version"}, false));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
@@ -259,7 +259,7 @@ pub const Winget = struct {
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Winget = @ptrCast(@alignCast(ctx));
-        return Backend.probeAvailability("winget", self.runner.run(arena, &.{ "winget", "--version" }));
+        return Backend.probeAvailability("winget --version", self.runner.run(arena, &.{ "winget", "--version" }));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
@@ -849,7 +849,7 @@ test "available: present, absent and broken on both managers" {
     try testing.expect((try s.backend().available(a)) == .present);
     const sb = try s.backend().available(a);
     try testing.expectEqual(@as(u8, 1), sb.broken.code);
-    try testing.expectEqualStrings("scoop", sb.broken.argv0);
+    try testing.expectEqualStrings("scoop --version", sb.broken.probe);
 
     var wf: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "winget --version", .fail = error.FileNotFound, .once = true },
@@ -859,7 +859,7 @@ test "available: present, absent and broken on both managers" {
     try testing.expect((try w.backend().available(a)) == .absent);
     const wb = try w.backend().available(a);
     try testing.expectEqual(@as(u8, 255), wb.broken.code);
-    try testing.expectEqualStrings("winget", wb.broken.argv0);
+    try testing.expectEqualStrings("winget --version", wb.broken.probe);
 }
 
 test "declare: an observed id round-trips on both managers" {

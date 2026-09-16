@@ -12,9 +12,10 @@
 //!     <plugin> list               stdout: one id per line, explicitly installed
 //!     <plugin> install            stdin: rows, one per line; stdio streamed
 //!     <plugin> declare <id>       stdout: a TOML row body naming this id
-//!     <plugin> bootstrap <path> <out>  optional: install the manager from the
-//!                                 verified file, streamed; write the bin
-//!                                 dir, if any, as one line into <out>
+//!     <plugin> bootstrap <path> <out>  optional: install the manager from
+//!                                 the verified file, streamed; write the
+//!                                 bin dir, if any, as one absolute path
+//!                                 on a line of its own into <out>
 //!     <plugin> limitation         optional: one line on what it cannot see
 //!
 //! Exit 64 from any verb means "not implemented"; any other nonzero exit is
@@ -147,7 +148,13 @@ pub const Plugin = struct {
         const res = try self.call(arena, "available", &.{}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
-        if (res.code > 1) return Error.PluginFailed;
+        // Anything but the two answers the protocol defines is a plugin
+        // that cannot say whether its manager is here: broken, the same as
+        // a shipped adapter whose probe cannot answer.
+        if (res.code > 1) return .{ .broken = .{
+            .code = res.code,
+            .probe = try std.fmt.allocPrint(arena, "{s} available", .{self.name}),
+        } };
         return if (res.ok) .present else .absent;
     }
 
@@ -261,13 +268,11 @@ pub const Plugin = struct {
         return decl;
     }
 
-    /// Progress goes to the terminal; the one line on stdout, if any, is a
-    /// directory to put on PATH so this same run can use what it installed.
-    /// It must be one line and an absolute path: progress text that leaked
-    /// onto stdout would otherwise land on PATH.
     /// Streamed like an install: an installer talks to the terminal and may
-    /// take as long as one. The bin dir therefore cannot come back on
-    /// stdout; the plugin writes it to the file named by the second argument.
+    /// take as long as one, so the bin dir cannot come back on stdout. The
+    /// plugin writes it into the file named by the second argument, as one
+    /// line holding an absolute path, and mox puts it on PATH so this same
+    /// run can use what it installed.
     fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
         const out_path = try std.fmt.allocPrint(arena, "{s}.bindir", .{installer_path});
@@ -411,7 +416,7 @@ test "not runnable: no bootstrap, no limitation, and nothing is ever spawned" {
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
-test "available: exit 0 is present, exit 1 is absent, and neither is broken" {
+test "available: exit 0 is present, exit 1 is absent, and anything else is broken" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -424,7 +429,10 @@ test "available: exit 0 is present, exit 1 is absent, and neither is broken" {
     var p = pluginWith(&fake);
     try testing.expect((try p.backend().available(a)) == .present);
     try testing.expect((try p.backend().available(a)) == .absent);
-    try testing.expectError(Error.PluginFailed, p.backend().available(a));
+    const broken = try p.backend().available(a);
+    try testing.expect(broken == .broken);
+    try testing.expectEqual(@as(u8, 2), broken.broken.code);
+    try testing.expectEqualStrings("macports available", broken.broken.probe);
 }
 
 test "a .ps1 plugin runs through powershell when pwsh is not there" {

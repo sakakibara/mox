@@ -60,7 +60,7 @@ pub const Zypper = struct {
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
-        return Backend.probeAvailability("zypper", self.runner.run(arena, &.{ "zypper", "--version" }));
+        return Backend.probeAvailability("zypper --version", self.runner.run(arena, &.{ "zypper", "--version" }));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {

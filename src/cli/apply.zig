@@ -1094,10 +1094,19 @@ fn applyPackages(
         },
     };
     for (rep.notes) |note| try ctx.out.print("  note            {s}\n", .{note});
+    // A manager that cannot answer cannot be converged: say which, and fail
+    // the run rather than report success over a machine left as it was.
+    for (rep.broken) |b| {
+        try ctx.err.print(
+            "mox apply: {s}: {s} exited {d}; its packages were left alone\n",
+            .{ b.backend, b.probe, b.code },
+        );
+        try ctx.err.flush();
+    }
     var counts: PackageCounts = .{
         .in_use = true,
         .bootstrapped = bootstrapped,
-        .failed = bootstrap_failed,
+        .failed = bootstrap_failed + rep.broken.len,
         .would_bootstrap = would_bootstrap.items.len,
     };
     for (rep.backends) |b| {

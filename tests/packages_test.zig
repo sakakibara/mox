@@ -2185,9 +2185,9 @@ test "status: a plugin's note reaches the terminal before the plugin runs" {
     var err_aw: Io.Writer.Allocating = .init(a);
     const rc = try runWith(h, &.{ "mox", "status" }, &out_w.interface, &err_aw.writer);
     try out_w.interface.flush();
-    // The hermetic stubs are managers whose `--version` exits 1: BROKEN,
-    // which is drift, so the run exits 1 with the report intact.
-    try std.testing.expectEqual(@as(u8, 1), rc);
+    // The hermetic stubs are managers whose `--version` exits 1, but no row
+    // names them, so they are notes rather than this repo's drift.
+    try std.testing.expectEqual(@as(u8, 0), rc);
 
     const seen = try Io.Dir.cwd().readFileAlloc(io, copy_path, a, .limited(1 << 20));
     try std.testing.expect(std.mem.indexOf(u8, seen, "note      backend copier: scripts/backends/copier\n") != null);
@@ -2270,7 +2270,7 @@ test "status: a plugin no row names failing its probe is a note, and the rest st
     try writeManifest(io, h, a, "ports.toml", "backend = \"fakeports\"\n\n[[packages]]\nname = \"ripgrep\"\n");
 
     const r = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      crashy: available failed: PluginFailed; treated as absent\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      crashy: crashy available exited 3; no row names it, so nothing here needs it\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "crashy") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   fakeports ripgrep") != null);
 }

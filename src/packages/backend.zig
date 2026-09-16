@@ -73,7 +73,9 @@ pub const Backend = struct {
             /// The exit code of the probe.
             code: u8,
             /// The probe's argv[0], as it was invoked.
-            argv0: []const u8,
+            /// What was asked, for a message: `brew --version`, or a
+            /// plugin's `macports available`.
+            probe: []const u8,
         };
     };
 
@@ -119,17 +121,17 @@ pub const Backend = struct {
         return self.vtable.available(self.ctx, arena);
     }
 
-    /// The availability a `--version` probe of `argv0` answers: not there at
+    /// The availability a probe answers: not there at
     /// all is absent, exit 0 is present, any other exit is broken. A spawn
     /// failure other than an absent executable is an error, never absent.
-    pub fn probeAvailability(argv0: []const u8, probe: anyerror!exec.Result) anyerror!Availability {
-        const res = probe catch |e| switch (e) {
+    pub fn probeAvailability(probe: []const u8, result: anyerror!exec.Result) anyerror!Availability {
+        const res = result catch |e| switch (e) {
             error.FileNotFound => return .absent,
             else => return e,
         };
         try exec.checkTimedOut(res);
         if (res.ok) return .present;
-        return .{ .broken = .{ .code = res.code, .argv0 = argv0 } };
+        return .{ .broken = .{ .code = res.code, .probe = probe } };
     }
 
     pub fn validate(self: Backend, row: Row, diag: ?*Diag) anyerror!void {

@@ -90,7 +90,7 @@ pub const Distro = struct {
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         const exe = self.manager.exe();
-        return Backend.probeAvailability(exe, self.runner.run(arena, &.{ exe, "--version" }));
+        return Backend.probeAvailability(try std.fmt.allocPrint(arena, "{s} --version", .{exe}), self.runner.run(arena, &.{ exe, "--version" }));
     }
 
     /// These managers take no row keys of their own. Refusing an unknown
@@ -389,7 +389,7 @@ test "available: absent means not usable, any other failure propagates" {
     var d4: Distro = .{ .manager = .apt, .runner = broken.runner() };
     const got = try d4.backend().available(a);
     try testing.expectEqual(@as(u8, 100), got.broken.code);
-    try testing.expectEqualStrings("apt-get", got.broken.argv0);
+    try testing.expectEqualStrings("apt-get --version", got.broken.probe);
 }
 
 test "declare: an observed name round-trips to a bare row" {

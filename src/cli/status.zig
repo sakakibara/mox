@@ -29,7 +29,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -325,7 +325,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Package drift is drift, so it shows under `--drift` too; the probe log
     // and unbound-facts sections are full-report context and are not.
-    const pkgs: Packages = if (a.paths.len == 0) try printPackages(ctx, context, &bindings, m_state) else .{};
+    const pkgs: Packages = if (a.paths.len == 0) try printPackages(ctx, context, &bindings, m_state, a.drift) else .{};
     problems += pkgs.problems();
     if (show_table) {
         try printProbeLog(ctx, m_state);
@@ -461,6 +461,9 @@ fn printPackages(
     context: app.Context,
     bindings: *const mox.dsl.resolver.Resolver,
     m_state: mox.machine.state.MachineState,
+    /// `--drift`: the drift set alone, so a backend with nothing to report
+    /// says nothing, exactly as a clean file is not listed there.
+    drift_only: bool,
 ) !Packages {
     const prep = try preparePackages(ctx, context, m_state);
     if (!prep.inUse()) return reportPackages(ctx, prep, bindings);
@@ -474,13 +477,13 @@ fn printPackages(
     // manager that is there but broken -- drift, since the machine is not
     // in the state the manifest describes.
     for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
-    for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} --version exited {d})\n", .{ "BROKEN", b.backend, b.argv0, b.code });
+    for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
         if (b.limitation) |note| try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
         if (b.drift.clean()) {
-            try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
+            if (!drift_only) try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
             continue;
         }
         for (b.drift.missing) |m| {
@@ -895,7 +898,7 @@ test "emitPorcelain / emitJson: a broken manager is a record of its own" {
     defer arena.deinit();
     const al = arena.allocator();
 
-    const broken = [_]mox.packages.report.Broken{.{ .backend = "brew", .argv0 = "brew", .code = 1 }};
+    const broken = [_]mox.packages.report.Broken{.{ .backend = "brew", .probe = "brew --version", .code = 1 }};
     const rep: mox.packages.report.Report = .{ .in_use = true, .broken = &broken };
 
     var pw: std.Io.Writer.Allocating = .init(al);

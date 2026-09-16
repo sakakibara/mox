@@ -39,12 +39,9 @@ pub const BackendDrift = struct {
 /// broken is not a clean machine.
 pub const Broken = struct {
     backend: []const u8,
-    argv0: []const u8,
+    /// What was asked of it, for the message.
+    probe: []const u8,
     code: u8,
-
-    pub fn format(self: Broken, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{s}: `{s} --version` exited {d}; treated as absent", .{ self.backend, self.argv0, self.code });
-    }
 };
 
 pub const Report = struct {
@@ -55,7 +52,10 @@ pub const Report = struct {
     notes: []const []const u8 = &.{},
     broken: []const Broken = &.{},
 
+    /// Nothing to do here: no drift under any backend, and every manager
+    /// that should have answered did.
     pub fn clean(self: Report) bool {
+        if (self.broken.len > 0) return false;
         for (self.backends) |b| {
             if (!b.drift.clean()) return false;
         }
@@ -100,7 +100,8 @@ pub fn gather(
 /// is assumed the same way without being named: `apply` would bootstrap it
 /// and install every row, so a report that called the machine clean would
 /// contradict what apply is about to do. A manager that is there but cannot
-/// answer its probe is treated as absent and said so, never silently.
+/// answer its probe is reported broken: its rows cannot be judged, and a
+/// machine in that state is not a clean one.
 pub fn fromManifest(
     arena: std.mem.Allocator,
     m: manifest_mod.Manifest,
@@ -145,7 +146,18 @@ pub fn fromManifest(
                 continue;
             },
             .absent => {},
-            .broken => |why| try broken.append(arena, .{ .backend = b.name, .argv0 = why.argv0, .code = why.code }),
+            // Broken is drift only for a manager the manifest asks about:
+            // one no row names has nothing here to go wrong, and a machine
+            // whose unrelated manager is damaged is not this repo's drift.
+            .broken => |why| if (named(m, b.name)) {
+                try broken.append(arena, .{ .backend = b.name, .probe = why.probe, .code = why.code });
+            } else {
+                try notes.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "{s}: {s} exited {d}; no row names it, so nothing here needs it",
+                    .{ b.name, why.probe, why.code },
+                ));
+            },
         }
         if (b.inert) continue;
         if (try willBootstrap(arena, m, b.name, r)) {
@@ -492,13 +504,12 @@ test "fromManifest: a broken backend is treated as absent and listed as broken" 
 
     const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
-    try testing.expect(rep.clean());
+    // Broken is drift of its own: nothing to install, but nothing clean.
+    try testing.expect(!rep.clean());
     try testing.expectEqual(@as(usize, 1), rep.broken.len);
     try testing.expectEqualStrings("brew", rep.broken[0].backend);
-    try testing.expectEqualStrings("brew", rep.broken[0].argv0);
+    try testing.expectEqualStrings("brew --version", rep.broken[0].probe);
     try testing.expectEqual(@as(u8, 1), rep.broken[0].code);
-    const line = try std.fmt.allocPrint(a, "{f}", .{rep.broken[0]});
-    try testing.expectEqualStrings("brew: `brew --version` exited 1; treated as absent", line);
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
     try testing.expectEqualStrings("no package manager is usable on this machine", rep.notes[0]);
     try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
