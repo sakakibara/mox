@@ -98,7 +98,7 @@ const Downloader = struct {
         self.calls += 1;
         // `curl -fsSL -o <path> <url>`
         try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = argv[3], .data = self.body });
-        return .{ .code = 0, .ok = true, .stdout = "", .stderr = "" };
+        return .{ .code = 0, .ok = true, .stdout = "" };
     }
 };
 

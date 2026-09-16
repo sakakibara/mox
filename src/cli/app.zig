@@ -103,7 +103,8 @@ pub const PackageBackends = struct {
     /// that follow in the same run. Plugins are discovered only when
     /// `discover_plugins`: a repo that carries no manifest is not using the
     /// subsystem, and must not have its executables run by a `status`.
-    /// `diag` names a plugin that cannot be discovered (bad name, missing
+    /// `out`/`err` are flushed before every spawn, so what mox printed about a
+    /// call precedes the call's own output. `diag` names a plugin that cannot be discovered (bad name, missing
     /// executable bit, two files for one name). Nothing here runs a plugin.
     pub fn registry(
         self: *PackageBackends,
@@ -114,6 +115,7 @@ pub const PackageBackends = struct {
         env: ?*const std.process.Environ.Map,
         repo_dir: []const u8,
         discover_plugins: bool,
+        out: *std.Io.Writer,
         err: *std.Io.Writer,
         diag: ?*mox.packages.manifest.Diag,
     ) !mox.packages.backend.Registry {
@@ -122,6 +124,8 @@ pub const PackageBackends = struct {
             .env = env,
             .scratch_dir = scratch_dir,
             .timeout_ms = mox.packages.exec.timeoutFromEnv(env, err),
+            .out = out,
+            .err = err,
         };
         const r = self.runner();
         self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };

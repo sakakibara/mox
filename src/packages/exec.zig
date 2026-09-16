@@ -55,7 +55,6 @@ pub const Result = struct {
     code: u8,
     ok: bool,
     stdout: []const u8,
-    stderr: []const u8,
     /// The call was killed for exceeding its bound; `code` is meaningless.
     timed_out: bool = false,
 };
@@ -65,14 +64,14 @@ pub const Runner = struct {
     runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result,
     streamFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result,
 
-    /// Run and capture stdout and stderr: for a query whose output mox parses.
+    /// Run and capture stdout: for a query whose output mox parses. stderr
+    /// is the terminal's, so a manager's or plugin's own diagnostics reach
+    /// the user as written.
     pub fn run(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
         return self.runFn(self.ctx, arena, argv, null);
     }
 
-    /// `run` with bytes on the child's stdin, stdout captured and stderr left
-    /// on the terminal: a plugin's own refusal reason reaches the user as
-    /// written, and one pipe cannot deadlock against another.
+    /// `run` with bytes on the child's stdin.
     pub fn runInput(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: []const u8) anyerror!Result {
         return self.runFn(self.ctx, arena, argv, stdin);
     }
@@ -80,7 +79,7 @@ pub const Runner = struct {
     /// Run with mox's own stdout and stderr: for work the user waits on. An
     /// install compiles, downloads, and asks about disk space; capturing that
     /// would replace minutes of progress with a silent hang and throw the
-    /// manager's own diagnostics away. `stdout`/`stderr` come back empty.
+    /// manager's own diagnostics away. `stdout` comes back empty.
     pub fn stream(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
         return self.streamFn(self.ctx, arena, argv, null);
     }
@@ -91,16 +90,24 @@ pub const Runner = struct {
     }
 };
 
+/// The most stdout a query may answer with. A manager's explicit-install
+/// list is kilobytes; megabytes is a manager that never stops writing.
+pub const max_capture_bytes: usize = 8 << 20;
+
 /// Runs the argv as a real child process. `env` is the environment mox itself
 /// reads through, so a manager invoked here sees the same HOME and PATH mox
 /// resolved its own paths from; null falls back to the process environment.
 /// `scratch_dir` backs a child's stdin with a file, which cannot deadlock the
-/// way a pipe written alongside a pipe read can.
+/// way a pipe written alongside a pipe read can. `out`/`err` are mox's own
+/// buffered writers, flushed before every spawn so what mox said about a
+/// call reaches the terminal before the call's own output does.
 pub const Process = struct {
     io: Io,
     env: ?*const EnvironMap = null,
     scratch_dir: []const u8 = "",
     timeout_ms: i64 = default_timeout_ms,
+    out: ?*Io.Writer = null,
+    err: ?*Io.Writer = null,
 
     pub fn runner(self: *Process) Runner {
         return .{ .ctx = self, .runFn = runImpl, .streamFn = streamImpl };
@@ -113,33 +120,26 @@ pub const Process = struct {
 
     fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        if (stdin) |bytes| return self.spawnWithStdin(arena, argv, bytes, .pipe, .inherit);
-
-        const res = std.process.run(arena, self.io, .{
-            .argv = argv,
-            .environ_map = self.env,
-            .timeout = self.timeout(),
-        }) catch |e| switch (e) {
-            error.Timeout => return .{ .code = 255, .ok = false, .stdout = "", .stderr = "", .timed_out = true },
-            else => return e,
-        };
-        return fromTerm(res.term, res.stdout, res.stderr);
+        return self.spawn(arena, argv, stdin, .pipe);
     }
 
     fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawnWithStdin(arena, argv, stdin, .inherit, .inherit);
+        return self.spawn(arena, argv, stdin, .inherit);
     }
 
-    /// Spawn with stdin backed by a scratch file holding `stdin` (closed when
-    /// null), the given stdout/stderr dispositions, and the timeout kill.
-    fn spawnWithStdin(
+    /// Spawn in its own process group with stdin backed by a scratch file
+    /// holding `stdin` (closed when null), stderr on the terminal, and stdout
+    /// captured or inherited. One deadline bounds the whole call: reading
+    /// what the child writes and waiting for it to exit. Exceeding it kills
+    /// the group, so a manager blocked behind a helper it spawned (`port |
+    /// awk`, `sudo apt-get`) goes with it rather than holding the pipe open.
+    fn spawn(
         self: *Process,
         arena: std.mem.Allocator,
         argv: []const []const u8,
         stdin: ?[]const u8,
         stdout_io: std.process.SpawnOptions.StdIo,
-        stderr_io: std.process.SpawnOptions.StdIo,
     ) anyerror!Result {
         const io = self.io;
 
@@ -162,41 +162,69 @@ pub const Process = struct {
             stdin_io = .{ .file = stdin_file.? };
         }
 
+        if (self.out) |w| w.flush() catch {};
+        if (self.err) |w| w.flush() catch {};
+
         var child = try std.process.spawn(io, .{
             .argv = argv,
             .environ_map = self.env,
             .stdin = stdin_io,
             .stdout = stdout_io,
-            .stderr = stderr_io,
+            .stderr = .inherit,
+            .pgid = own_group,
         });
-
-        var timed_out = false;
-        var killer: ?Io.Future(void) = null;
-        if (self.timeout_ms > 0) {
-            if (child.id) |id| killer = io.async(run_scripts.killAfter, .{ io, self.timeout(), id, &timed_out });
-        }
+        const deadline = self.timeout().toDeadline(io);
 
         var out: []const u8 = "";
         if (child.stdout) |f| {
-            var buf: [4096]u8 = undefined;
-            var r = f.reader(io, &buf);
-            // A read that fails or overruns the bound is an error, never an
-            // empty answer: an empty `list` would make every row missing.
-            out = r.interface.allocRemaining(arena, .limited(8 << 20)) catch |e| {
-                if (killer) |*k| _ = k.cancel(io);
-                _ = child.wait(io) catch {};
+            var streams: Io.File.MultiReader.Buffer(1) = undefined;
+            var mr: Io.File.MultiReader = undefined;
+            mr.init(arena, io, streams.toStreams(), &.{f});
+            defer mr.deinit();
+            const rd = mr.reader(0);
+            // A read that fails, overruns the cap, or outlives the bound is an
+            // error, never an empty answer: an empty `list` would make every
+            // row missing.
+            while (mr.fill(4096, deadline)) |_| {
+                if (rd.buffered().len > max_capture_bytes) {
+                    killGroup(io, &child);
+                    return error.StreamTooLong;
+                }
+            } else |e| switch (e) {
+                error.EndOfStream => {},
+                error.Timeout => {
+                    killGroup(io, &child);
+                    return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
+                },
+                else => {
+                    killGroup(io, &child);
+                    return e;
+                },
+            }
+            mr.checkAnyError() catch |e| {
+                killGroup(io, &child);
                 return e;
             };
+            out = try mr.toOwnedSlice(0);
         }
 
+        // The wait is bounded too: a child that closed stdout and lingers
+        // must not hold `mox status` any longer than the read may.
+        var guard: Guard = .{};
+        var killer: ?Io.Future(void) = null;
+        if (deadline != .none) {
+            if (child.id) |id| killer = io.async(killGroupAfter, .{ io, deadline, id, &guard });
+        }
         const term = child.wait(io) catch |e| {
+            guard.reaped.store(true, .release);
             if (killer) |*k| _ = k.cancel(io);
             return e;
         };
+        guard.reaped.store(true, .release);
         if (killer) |*k| _ = k.cancel(io);
 
-        var res = fromTerm(term, out, "");
-        if (timed_out) {
+        var res = fromTerm(term, out);
+        if (guard.fired) {
             res.ok = false;
             res.timed_out = true;
         }
@@ -204,7 +232,43 @@ pub const Process = struct {
     }
 };
 
-fn fromTerm(term: std.process.Child.Term, stdout: []const u8, stderr: []const u8) Result {
+/// A child is the leader of its own process group everywhere that has one;
+/// Windows has no groups, so its kill reaches the direct child only.
+const own_group: ?std.posix.pid_t = if (builtin.os.tag == .windows) null else 0;
+
+/// Shared between the waiter and the deadline task: the waiter marks the
+/// child reaped so a kill never lands on a recycled pid, and the task marks
+/// that it fired so the result is reported as a timeout.
+const Guard = struct {
+    reaped: std.atomic.Value(bool) = .init(false),
+    fired: bool = false,
+};
+
+/// Kill the child's whole process group, then reap it. `Child.kill` alone
+/// sends SIGTERM and waits, which a child that ignores SIGTERM turns into
+/// the hang this exists to end.
+fn killGroup(io: Io, child: *std.process.Child) void {
+    if (child.id) |id| killGroupOf(id);
+    child.kill(io);
+}
+
+fn killGroupOf(id: std.process.Child.Id) void {
+    if (builtin.os.tag == .windows) {
+        run_scripts.killProcess(id);
+    } else {
+        std.posix.kill(-id, .KILL) catch {};
+        std.posix.kill(id, .KILL) catch {};
+    }
+}
+
+fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard: *Guard) void {
+    deadline.sleep(io) catch return;
+    if (guard.reaped.load(.acquire)) return;
+    guard.fired = true;
+    killGroupOf(id);
+}
+
+fn fromTerm(term: std.process.Child.Term, stdout: []const u8) Result {
     const code: u8 = switch (term) {
         .exited => |c| c,
         else => 255,
@@ -213,7 +277,6 @@ fn fromTerm(term: std.process.Child.Term, stdout: []const u8, stderr: []const u8
         .code = code,
         .ok = term == .exited and code == 0,
         .stdout = stdout,
-        .stderr = stderr,
     };
 }
 
@@ -229,11 +292,12 @@ pub const Fake = struct {
         argv: []const u8,
         match: Match = .exact,
         stdout: []const u8 = "",
-        stderr: []const u8 = "",
         code: u8 = 0,
         /// Raised instead of answering, for the failures a manager reports by
         /// not being there at all.
         fail: ?anyerror = null,
+        /// Answer as a call killed at its bound.
+        timed_out: bool = false,
         /// Write `stdout` to the file the argument after this flag names,
         /// instead of returning it: what `curl -o <path>` does.
         write_after: ?[]const u8 = null,
@@ -287,6 +351,7 @@ pub const Fake = struct {
             if (!hit) continue;
             if (e.once) self.spent.items[i] = true;
             if (e.fail) |err| return err;
+            if (e.timed_out) return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
             if (e.write_after) |flag| {
                 for (argv, 0..) |a, j| {
                     if (std.mem.eql(u8, a, flag) and j + 1 < argv.len) {
@@ -294,13 +359,12 @@ pub const Fake = struct {
                         break;
                     }
                 }
-                return .{ .code = e.code, .ok = e.code == 0, .stdout = "", .stderr = "" };
+                return .{ .code = e.code, .ok = e.code == 0, .stdout = "" };
             }
             return .{
                 .code = e.code,
                 .ok = e.code == 0,
                 .stdout = try arena.dupe(u8, e.stdout),
-                .stderr = try arena.dupe(u8, e.stderr),
             };
         }
         return error.UnexpectedCommand;
@@ -358,7 +422,7 @@ test "Fake: a nonzero scripted code is not ok" {
 
     var fake: Fake = .{
         .arena = a,
-        .entries = &.{.{ .argv = "brew --version", .code = 127, .stderr = "not found" }},
+        .entries = &.{.{ .argv = "brew --version", .code = 127 }},
     };
     const r = fake.runner();
 
@@ -389,6 +453,52 @@ test "Process: a real command that exceeds its bound is killed and reported" {
     const res = try p.runner().stream(a, &.{ "sleep", "5" });
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
+}
+
+test "Process: a helper the child left holding the pipe dies with it at the bound" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // `sleep` keeps the pipe's write end after `sh` would have exited; a
+    // kill that reached only `sh` would leave the read blocked for 5s.
+    var p: Process = .{ .io = io, .timeout_ms = 300 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().run(a, &.{ "sh", "-c", "sleep 5 | cat" });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(elapsed_ms < 3000);
+}
+
+test "Process: a child that never stops writing is ended at the cap, not waited on" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    var p: Process = .{ .io = io, .timeout_ms = 10_000 };
+    const started = Io.Clock.awake.now(io);
+    try testing.expectError(error.StreamTooLong, p.runner().run(a, &.{ "sh", "-c", "yes" }));
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(elapsed_ms < 8000);
+}
+
+test "Process: a child that ignores SIGTERM is still ended at the bound" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    var p: Process = .{ .io = io, .timeout_ms = 300 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().run(a, &.{ "sh", "-c", "trap '' TERM; sleep 5" });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(elapsed_ms < 3000);
 }
 
 test "Process: stdin bytes reach the child and stdout is captured" {

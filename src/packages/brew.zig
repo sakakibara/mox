@@ -376,7 +376,7 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     // An empty list would read as "nothing installed" and make every desired
     // package look missing.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew list --full-name --installed-on-request", .code = 1, .stderr = "boom" },
+        .{ .argv = "brew list --full-name --installed-on-request", .code = 1 },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();
@@ -524,7 +524,7 @@ test "install: a failed tap fails its row and the rows after it still run" {
     // The tapped row's trust and install are unscripted, so reaching either
     // would fail the test with a different error than the one asserted.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew tap owner/tap", .code = 1, .stderr = "no such tap" },
+        .{ .argv = "brew tap owner/tap", .code = 1 },
         .{ .argv = "brew install ripgrep" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
@@ -543,7 +543,7 @@ test "install: a failed trust fails its row and the rows after it still run" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew tap owner/tap" },
-        .{ .argv = "brew trust --cask owner/tap/somecask", .code = 1, .stderr = "refused" },
+        .{ .argv = "brew trust --cask owner/tap/somecask", .code = 1 },
         .{ .argv = "brew install --cask ghostty" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
@@ -563,7 +563,7 @@ test "install: a failed install is an error, not a silent skip" {
 
     var fake: exec.Fake = .{
         .arena = a,
-        .entries = &.{.{ .argv = "brew install ripgrep", .code = 1, .stderr = "no bottle" }},
+        .entries = &.{.{ .argv = "brew install ripgrep", .code = 1 }},
     };
     var b: Brew = .{ .runner = fake.runner() };
 

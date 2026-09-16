@@ -938,6 +938,7 @@ fn applyPackages(
         script_env,
         context.paths.repo_dir,
         true,
+        ctx.out,
         ctx.err,
         &diag,
     ) catch |e| switch (e) {
