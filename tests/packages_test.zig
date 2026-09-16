@@ -1823,7 +1823,7 @@ test "commit: an empty data/packages directory records nothing until a file decl
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend \"brew\"; add one to record its 1 untracked package(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file that holds on this machine declares backend \"brew\"; add one to record its 1 untracked package(s)") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     // Nothing was created on the user's behalf.
     var d = try Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
@@ -1956,7 +1956,7 @@ test "commit: a file whose gate excludes this machine is never appended to" {
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend \"brew\"; add one to record its 1 untracked package(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file that holds on this machine declares backend \"brew\"; add one to record its 1 untracked package(s)") != null);
     try std.testing.expectEqualStrings(original, try readManifest(io, h, a, "a.toml"));
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }

@@ -79,12 +79,19 @@ pub var brew_prefixes_override: ?[]const []const u8 = null;
 /// on the shipped backends and cannot recurse.
 pub const packages_depth_var = "MOX_PACKAGES_DEPTH";
 
-/// How many mox runs `env` already sits under. A value mox did not write
-/// (a hand-set marker) still says "a mox is above this one", which is the
-/// only thing the depth is read for.
+/// The most the marker counts to. The depth is read as a boolean, so the
+/// exact number past the first level buys nothing, and a bound keeps a
+/// hand-set value from overflowing the count the next run adds to it.
+pub const max_packages_depth: u32 = 1024;
+
+/// How many mox runs `env` already sits under, in `0` (unset) or
+/// `1...max_packages_depth`. A value mox did not write -- a hand-set marker,
+/// `0` and `yes` alike -- still says "a mox is above this one", which is the
+/// only thing the depth is read for, so any value present is at least one.
 fn packagesDepth(arena: std.mem.Allocator, env: Env) u32 {
     const v = env.get(arena, packages_depth_var) orelse return 0;
-    return std.fmt.parseInt(u32, v, 10) catch 1;
+    const parsed = std.fmt.parseInt(u32, v, 10) catch 1;
+    return std.math.clamp(parsed, 1, max_packages_depth);
 }
 
 /// Every package backend this run can use: the seven mox ships, then, for a
@@ -249,7 +256,7 @@ pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) 
 
 /// mox's help footer: the Environment section (`MOX_REPO`/`MOX_STATE_DIR`/
 /// `MOX_SNAPSHOT_RETENTION`/`MOX_CHECK_TIMEOUT_MS`/`MOX_SCRIPT_TIMEOUT_MS`/
-/// `MOX_INSTALL_TIMEOUT_MS`/`HOME`/`USER`). These are env vars, not CLI
+/// `MOX_INSTALL_TIMEOUT_MS`/`MOX_PACKAGES_DEPTH`/`HOME`/`USER`). These are env vars, not CLI
 /// flags, so cli-zig's generated per-command help has nowhere else to
 /// surface them.
 pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void {
@@ -263,6 +270,7 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
         \\  MOX_CHECK_TIMEOUT_MS  Wall-clock bound on check hooks in ms (default: 30000; <= 0 disables)
         \\  MOX_SCRIPT_TIMEOUT_MS  Wall-clock bound on setup scripts and every captured package-manager call in ms (default: 600000; <= 0 disables)
         \\  MOX_INSTALL_TIMEOUT_MS  Wall-clock bound on a package install or bootstrap in ms (default: 0, no bound; interrupted, then killed 10s later)
+        \\  MOX_PACKAGES_DEPTH  Set in every backend plugin's environment; any value present makes this run discover no plugin, so one that calls mox cannot recurse
         \\  HOME, USER     Standard POSIX env
         \\
         \\See the project README for the full design spec.
@@ -493,6 +501,14 @@ test "packagesDepth: absent is none, and any value set is a mox above this one" 
     try std.testing.expectEqual(@as(u32, 3), packagesDepth(a, env));
     try map.put(packages_depth_var, "yes");
     try std.testing.expectEqual(@as(u32, 1), packagesDepth(a, env));
+    // A hand-set "0" is still a mox above this one: read as no depth at all,
+    // it would defeat the guard the marker exists to be.
+    try map.put(packages_depth_var, "0");
+    try std.testing.expectEqual(@as(u32, 1), packagesDepth(a, env));
+    // And a hand-set value with nowhere left to count to saturates, so the
+    // next run's `+ 1` has room.
+    try map.put(packages_depth_var, "4294967295");
+    try std.testing.expectEqual(max_packages_depth, packagesDepth(a, env));
 }
 
 test "PackageBackends.registry: a mox running under a plugin discovers none, and says so" {
@@ -536,6 +552,19 @@ test "PackageBackends.registry: a mox running under a plugin discovers none, and
         "no plugin is discovered: this mox runs under one (MOX_PACKAGES_DEPTH is set); the built-in backends stay",
         pkg.notes[0],
     );
+
+    // A marker mox did not write says the same thing. Read as a number, "0"
+    // would put this run at the top of the chain and hand the plugin back to
+    // the mox the plugin itself called.
+    try map.put(packages_depth_var, "0");
+    var hand_set: PackageBackends = .{};
+    const hand_set_reg = try hand_set.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    try std.testing.expectEqual(@as(usize, 0), hand_set.plugins.len);
+    try std.testing.expect(hand_set_reg.find("macports") == null);
+    try std.testing.expectEqualStrings(
+        "no plugin is discovered: this mox runs under one (MOX_PACKAGES_DEPTH is set); the built-in backends stay",
+        hand_set.notes[0],
+    );
 }
 
 /// The environment every package backend and plugin runs under, for a
@@ -564,7 +593,7 @@ pub fn packageEnv(
     );
     const map = try ctx.alloc.create(std.process.Environ.Map);
     map.* = built.map;
-    const depth = packagesDepth(ctx.alloc, context.env) + 1;
+    const depth = @min(max_packages_depth, packagesDepth(ctx.alloc, context.env) + 1);
     try map.put(packages_depth_var, try std.fmt.allocPrint(ctx.alloc, "{d}", .{depth}));
     return map;
 }

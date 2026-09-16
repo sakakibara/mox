@@ -41,6 +41,11 @@ pub const Error = error{ NoManifestFileForBackend, TooManySymlinkHops };
 /// manifest unless the user says otherwise -- and within a layer, one whose
 /// own default backend matches before one that merely carries a row for it.
 /// Basename order breaks ties so the same machine always picks the same file.
+///
+/// When no repo file is eligible -- for a blacklist row, every one of them
+/// gated -- an ungated private file takes it. That is narrower than the gate
+/// `eligible` refuses, and narrower is what the private layer means: the row
+/// holds on this machine and is in no other machine's manifest to be inert in.
 pub fn targetFor(arena: std.mem.Allocator, m: Manifest, backend: []const u8, r: *const Resolver, array: Array) !?Source {
     for ([_]bool{ false, true }) |private| {
         for (m.sources) |src| {
@@ -65,6 +70,13 @@ pub fn targetFor(arena: std.mem.Allocator, m: Manifest, backend: []const u8, r: 
 /// blacklist holds regardless of which machine asks, so its file carries no
 /// gate at all -- `manifest.load` refuses one that does, which would make the
 /// row mox just wrote refuse the whole manifest on the next command.
+///
+/// An ungated file in the private layer is eligible for a blacklist row, and
+/// is where one lands when every repo file is gated. The gate is refused
+/// because a repo file is SHARED: the row would hold here and sit inert in
+/// every other machine's copy of it. A private file is this machine's alone,
+/// so the same narrowing is what the layer already is, and `mox commit` prints
+/// the layer it wrote to, leaving nothing to discover later.
 fn eligible(arena: std.mem.Allocator, src: Source, r: *const Resolver, array: Array) !bool {
     return switch (array) {
         .packages => try gateHolds(arena, src, r),
@@ -482,6 +494,33 @@ test "targetFor: a blacklist row never goes in a gated file, which would refuse 
     } };
     try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, both, "brew", &r, .packages)).?.path);
     try testing.expectEqualStrings("/r/shared.toml", (try targetFor(a, both, "brew", &r, .blacklist)).?.path);
+}
+
+test "targetFor: with every repo file gated, a blacklist row goes to the ungated private file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const m: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/darwin.toml", "/r/darwin.toml", "brew", "os=darwin"),
+        sourceOf("data/packages/local.toml", "/p/local.toml", "brew", true),
+    } };
+    // The package row still prefers the repo layer, whose gate holds here.
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, m, "brew", &r, .packages)).?.path);
+    // The blacklist row takes the private file: machine-local by construction,
+    // which is narrower than the gate on the shared file and is the layer's
+    // own meaning rather than a row inert everywhere else.
+    try testing.expectEqualStrings("/p/local.toml", (try targetFor(a, m, "brew", &r, .blacklist)).?.path);
+
+    // The gate itself is what is refused, in either layer.
+    const gated_private: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/darwin.toml", "/r/darwin.toml", "brew", "os=darwin"),
+        .{ .path = "/p/local.toml", .label = "data/packages/local.toml", .default_backend = "brew", .when = "os=darwin", .private = true },
+    } };
+    try testing.expect((try targetFor(a, gated_private, "brew", &r, .blacklist)) == null);
 }
 
 test "render: DEL is escaped, as a TOML basic string requires" {

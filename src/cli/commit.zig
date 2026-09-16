@@ -531,7 +531,7 @@ fn reconcilePackages(
                     // the summary that counts these as skipped.
                     try ctx.out.flush();
                     try ctx.err.print(
-                        "mox commit: no data/packages file declares backend \"{s}\"; add one to record its {d} untracked package(s)\n",
+                        "mox commit: no data/packages file that holds on this machine declares backend \"{s}\"; add one to record its {d} untracked package(s)\n",
                         .{ b.backend, b.drift.untracked.len },
                     );
                     try ctx.err.flush();

@@ -869,7 +869,7 @@ fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_d
 pub const command = app.command(Spec, .{
     .name = "doctor",
     .summary = "Health report on the mox repo and machine-local state",
-    .details = "untracked src, unrecorded exotic modes, malformed state (--rebuild-provenance, --rebuild-coupling, --fix). Exit 0 healthy, 1 while any problem or advisory remains or a check could not run.",
+    .details = "untracked src, unrecorded exotic modes, malformed state, a private data/ file nothing applies, an unused fact (--rebuild-provenance, --rebuild-coupling, --fix). Exit 0 healthy, 1 while any problem or advisory remains or a check could not run.",
     .group = .general,
     .needs_context = true,
 }, run);
