@@ -202,26 +202,81 @@ Whether the manager actually **has** a package of that name is a separate
 question, asked where the install is rather than at load, since only the
 manager can answer it and a manifest must read the same on every machine.
 Before an apt install, mox asks `apt-cache --generate pkgnames` -- apt's one
-literal-matching query -- and refuses a batch naming anything absent from it:
-`apt-get install` otherwise falls back to reading the operand as an unanchored
-regular expression, so `libz.dev` installs ten packages the manifest never
-declared and `ruby.dev` installs hundreds. Before a dnf install, mox asks
-`dnf repoquery` the same question, and a name that is only an rpm capability
-rather than a package -- `zlib-devel`, which `zlib-ng-compat-devel` provides
--- is refused with the name to declare in its place. Before a pacman install,
-mox asks `pacman -Slq`, and a name that is a package **group** rather than a
-package -- `xfce4`, which holds fourteen -- is refused with the members named,
-since `pacman -S` installs every one of them and `pacman -Qeq` reports the
-members and never the group.
+literal-matching whole-universe query -- and refuses a row naming anything
+absent from it: `apt-get install` otherwise falls back to reading the operand
+as an unanchored regular expression, so `libz.dev` installs ten packages the
+manifest never declared and `ruby.dev` installs hundreds. That listing holds
+bare names alone, and it omits a package that exists only for a foreign
+architecture -- `wine32` is in no listing on an amd64 or arm64 machine, while
+apt installs `wine32:i386` and `apt-mark showmanual` reports exactly that --
+so a row carrying an architecture is asked about as written, with
+`apt-cache madison`, the query verified to match a qualified name literally
+where `apt-cache show` and `apt-cache policy` both fall back to a regex.
+Before a dnf install, mox asks `dnf repoquery` the same question, and a name
+that is only an rpm capability rather than a package -- `zlib-devel`, which
+`zlib-ng-compat-devel` provides -- is refused with the name to declare in its
+place. Before a pacman install, mox reads `pacman -Slq`, and a name that is a
+package **group** rather than a package -- `xfce4`, which holds fourteen --
+is refused with the members named, since `pacman -S` installs every one of
+them and `pacman -Qeq` reports the members and never the group. That check
+only reads: pacman's database is downloaded only if the listing comes back
+empty, which is a machine that has never synced, and what runs then is the
+full `pacman -Syu` the install itself was about to run, never a bare
+`pacman -Sy` -- which would leave the database ahead of the installed
+packages, a state Arch does not support, on every path that then refuses a
+row or fails.
 
-Every one of those refusals installs nothing at all. An apt row qualified with
-the machine's own architecture is refused the same way, as are apt's
-`:native`, `:all` and `:any`, which apt resolves to the native package that
-`apt-mark` then reports bare.
+An apt row qualified with the machine's own architecture is refused the same
+way, as are apt's `:native`, `:all` and `:any`, which apt resolves to the
+native package that `apt-mark` then reports bare.
+
+A refused row installs nothing, and it is refused alone: the rows beside it
+in the same manifest are installed, and the run counts the refusal as that
+row's own failure and exits non-zero over it. One row nobody can install does
+not keep every other package off the machine.
 
 These checks run the manager, so `mox apply --dry-run` does not run them: a
 dry run lists a row a real apply would refuse as one it would install, and
 says so in a note beside the rows it left unchecked.
+
+### What a brew, scoop or winget row may name
+
+These three have grammars of their own, so each has its own class.
+
+A brew `name` is one formula or cask, or a tap-qualified `owner/tap/name`.
+Each part begins with a letter or a digit and holds only letters, digits and
+`.`, `_`, `+`, `-` or `@` -- `@` because `openssl@3` and `emacs-plus@30` are
+real formulae. Everything else a brew operand can be is refused: an option
+(`brew install --help` exits 0 having installed nothing, so such a row would
+be counted installed, reported missing by the query that follows, and
+installed again on every apply), a local Ruby file (`brew install ./x.rb`
+runs it), a URL, and `owner/tap` alone, which names a tap rather than
+anything `brew list` can report back. Beyond the check, every name mox hands
+brew comes after a `--`.
+
+A scoop `name` is one app: a single token of letters, digits and `.`, `_`,
+`+` or `-`. So a row cannot be a manifest path or a URL (scoop installs
+either), a bucket-qualified name (the bucket is a key of its own), or a
+pinned version: `scoop install git@2.1` installs a version that
+`scoop export` reports under the bare name, which reads as missing on every
+status after.
+
+A winget `name` is one `PackageIdentifier`, and that one is deliberately
+wider: an identifier is the publisher's own string (`Notepad++.Notepad++`, a
+bare store id), mox cannot enumerate them, and a class narrower than
+winget's would refuse a package someone really has. So the rule names what
+would make the value something else instead -- it begins with a letter or a
+digit, and holds none of `\`, `/`, `:`, `*`, `?`, `"`, `<`, `>` or `|`,
+which is what a path, a URL, a pattern or an option needs.
+
+The field values that reach a manager's argv are checked too, because they
+land where a name lands. scoop's `bucket` and winget's `source` are each one
+token, and are held to the single-token class. winget's `override` is not, and
+cannot be -- it exists to hand a command line on to the package's own
+installer, so a space and a slash are what it is for -- but it may hold no
+`"` and no control byte: those are the bytes no argv carries intact across
+both of Windows' command-line parsers, so a value holding one is not the
+value the installer would receive.
 
 ### brew taps
 

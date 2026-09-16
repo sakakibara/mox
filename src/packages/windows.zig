@@ -35,8 +35,11 @@ pub const Backend = backend_mod.Backend;
 
 pub const Error = error{
     UnknownScoopKey,
+    BadScoopValue,
+    ScoopNameNotAnApp,
     UnknownWingetKey,
     BadWingetValue,
+    WingetNameNotAnIdentifier,
     ScoopQueryFailed,
     ScoopBucketListFailed,
     ScoopInstallFailed,
@@ -59,6 +62,10 @@ pub const Scoop = struct {
     /// own shim script through pwsh, because a child's PATH is never used to
     /// resolve argv[0] and a freshly installed scoop is on no PATH yet.
     argv0: []const []const u8 = &.{"scoop"},
+    /// Whether the last `install` ran `scoop install`, which `installSpawned`
+    /// answers with: a `bucket list` that fails stops the batch before any
+    /// install, and nothing it named can have landed.
+    spawned: bool = false,
 
     pub fn backend(self: *Scoop) Backend {
         return .{ .name = "scoop", .ctx = self, .vtable = &vtable };
@@ -70,6 +77,7 @@ pub const Scoop = struct {
         .idOf = idOfImpl,
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
+        .installSpawned = installSpawnedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
     };
@@ -122,7 +130,28 @@ pub const Scoop = struct {
         return Backend.probeAvailability("scoop --version", self.call(arena, &.{"--version"}, false));
     }
 
+    /// A row names one app, and takes `bucket` alone.
+    ///
+    /// scoop takes a manifest path or a URL wherever an app name goes, so a
+    /// row could otherwise install a manifest from anywhere; `scoop install
+    /// git@2.1` installs a version that `scoop export` reports under the bare
+    /// name, which reads as missing on every status after. The bucket is a
+    /// field rather than part of the name, so nothing in a name needs a `/`.
+    ///
+    /// The bucket is held to the same class, because it lands in the same
+    /// place: `scoop bucket add <bucket>` takes the bucket's repository as a
+    /// SECOND operand, and scoop is a PowerShell script -- whose `-File`
+    /// parser is not the one Zig serializes an argv for, so a value carrying
+    /// whitespace and a `"` together can leave its own argument and supply
+    /// that second operand itself.
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
+        if (backend_mod.nameProblem(row.name, .app)) |problem| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": scoop rows name an app: {s}",
+                .{ row.label, row.name, problem.text(.app) },
+            );
+            return Error.ScoopNameNotAnApp;
+        }
         for (row.fields) |p| {
             if (std.mem.eql(u8, p.key, "bucket")) {
                 if (p.value != .string) {
@@ -131,6 +160,13 @@ pub const Scoop = struct {
                         .{ row.label, row.name },
                     );
                     return Error.UnknownScoopKey;
+                }
+                if (backend_mod.valueProblem(p.value.string, .token)) |problem| {
+                    if (diag) |d| d.set(
+                        "{s}: row \"{s}\": \"bucket\" names a bucket, and a bucket name {s}",
+                        .{ row.label, row.name, problem.text(.token) },
+                    );
+                    return Error.BadScoopValue;
                 }
                 continue;
             }
@@ -159,6 +195,7 @@ pub const Scoop = struct {
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
+        self.spawned = false;
 
         // A bucket must exist before an app in it can resolve, exactly as a
         // brew tap must, and `scoop bucket add` fails (exit 2) on one already
@@ -194,11 +231,17 @@ pub const Scoop = struct {
                 try std.fmt.allocPrint(arena, "{s}/{s}", .{ bucket, row.name })
             else
                 row.name;
+            self.spawned = true;
             const res = try self.call(arena, &.{ "install", target }, true);
             try exec.checkTimedOut(res);
             if (!res.ok) failed = true;
         }
         if (failed) return Error.ScoopInstallFailed;
+    }
+
+    fn installSpawnedImpl(ctx: *anyopaque) bool {
+        const self: *Scoop = @ptrCast(@alignCast(ctx));
+        return self.spawned;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
@@ -292,7 +335,29 @@ pub const Winget = struct {
         return Backend.probeAvailability("winget --version", self.runner.run(arena, &.{ "winget", "--version" }));
     }
 
+    /// A row names one package identifier, and takes `source`, `scope` and
+    /// `override`.
+    ///
+    /// The identifier is the publisher's own string, so the rule names what
+    /// would make it something else -- a path, a URL, a pattern, an option --
+    /// rather than the bytes an identifier may hold: a class narrower than
+    /// winget's own would refuse a package someone really has.
+    ///
+    /// `source` is a source name, which is one token, so it is held to the
+    /// narrow class. `override` is held to neither, and cannot be: it exists
+    /// to hand arguments on to the package's own installer, so the space and
+    /// the slash an installer argument needs are what it is for. What it may
+    /// not hold is a `"` or a control byte -- bytes no argv can carry intact
+    /// across both of Windows' command-line parsers, so a value holding one
+    /// is not the value the installer would receive.
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
+        if (backend_mod.nameProblem(row.name, .identifier)) |problem| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": winget rows name a package identifier: {s}",
+                .{ row.label, row.name, problem.text(.identifier) },
+            );
+            return Error.WingetNameNotAnIdentifier;
+        }
         for (row.fields) |p| {
             const known = std.mem.eql(u8, p.key, "source") or
                 std.mem.eql(u8, p.key, "scope") or
@@ -320,6 +385,15 @@ pub const Winget = struct {
                     );
                     return Error.BadWingetValue;
                 }
+                continue;
+            }
+            const class: backend_mod.ValueClass = if (std.mem.eql(u8, p.key, "override")) .command_line else .token;
+            if (backend_mod.valueProblem(p.value.string, class)) |problem| {
+                if (diag) |d| d.set(
+                    "{s}: row \"{s}\": \"{s}\" {s}",
+                    .{ row.label, row.name, p.key, problem.text(class) },
+                );
+                return Error.BadWingetValue;
             }
         }
     }
@@ -358,6 +432,8 @@ pub const Winget = struct {
         return packageIdentifiers(arena, text);
     }
 
+    /// No `installSpawned`: nothing here runs before the install itself, so
+    /// the answer is always yes and the core's default says exactly that.
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Winget = @ptrCast(@alignCast(ctx));
         var failed = false;
@@ -994,4 +1070,143 @@ test "declare: an observed id round-trips on both managers" {
     const wd = try w.backend().declare(a, "Git.Git");
     try testing.expectEqualStrings("Git.Git", wd.name);
     try testing.expectEqualStrings("Git.Git", try w.backend().idOf(a, wingetRow(wd.name, wd.fields)));
+}
+
+test "validate: a scoop row names one app, and a bucket is one bucket name" {
+    var sf: exec.Fake = .{ .arena = testing.allocator, .entries = &.{} };
+    var s: Scoop = .{ .runner = sf.runner() };
+    const be = s.backend();
+
+    for ([_][]const u8{ "--help", "-g", "https://evil/x.json", ".\\evil.json", "extras/vscode", "git@2.1" }) |name| {
+        var d: Diag = .{};
+        try testing.expectError(Error.ScoopNameNotAnApp, be.validate(scoopRow(name, &.{}), &d));
+        try testing.expect(std.mem.indexOf(u8, d.capture().?, "scoop rows name an app") != null);
+    }
+    for ([_][]const u8{ "7zip", "nodejs-lts", "windows-terminal" }) |name| {
+        try be.validate(scoopRow(name, &.{}), null);
+    }
+    try be.validate(scoopRow("vscode", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }}), null);
+}
+
+test "validate: the bucket value that would leave its own argv on Windows is refused" {
+    var sf: exec.Fake = .{ .arena = testing.allocator, .entries = &.{} };
+    var s: Scoop = .{ .runner = sf.runner() };
+    const be = s.backend();
+
+    // The exact input the defence exists for. Zig serializes an argv for
+    // `CommandLineToArgvW`, escaping the embedded `"` as `\"`; PowerShell's
+    // `-File` parser reads that as a backslash and the END of quoting, so
+    // this one value becomes several whitespace-separated operands of
+    // `scoop bucket add <name> <repository>` -- whose second operand is the
+    // repository the bucket is cloned from.
+    const injection = "a\" extras https://evil/x\"b";
+    var d: Diag = .{};
+    try testing.expectError(
+        Error.BadScoopValue,
+        be.validate(scoopRow("ripgrep", &.{.{ .key = "bucket", .value = .{ .string = injection } }}), &d),
+    );
+    try testing.expectEqualStrings(
+        "data/packages/windows.toml: row \"ripgrep\": \"bucket\" names a bucket, and a bucket name holds no \" character, which Windows' two command-line parsers disagree about, so a value carrying one can leave its own argument and become several",
+        d.capture().?,
+    );
+
+    // The whitespace-only half of the same value does not break out -- the
+    // quoting PowerShell does honour holds it together -- and is refused for
+    // being more than one token rather than for the quote.
+    var d2: Diag = .{};
+    try testing.expectError(
+        Error.BadScoopValue,
+        be.validate(scoopRow("ripgrep", &.{.{ .key = "bucket", .value = .{ .string = "extras https://evil/x" } }}), &d2),
+    );
+    try testing.expect(std.mem.indexOf(u8, d2.capture().?, "holds only letters") != null);
+}
+
+test "install: a refused bucket never reaches scoop's argv" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The argv the adapter builds for a bucket it accepts, pinned: the value
+    // is one operand of `bucket add` and the prefix of one `install` target,
+    // so a value holding whitespace and a quote would supply operands of its
+    // own on both.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop bucket list", .stdout = "Name Source Updated Manifests\n" },
+        .{ .argv = "scoop bucket add extras" },
+        .{ .argv = "scoop install extras/vscode" },
+    } };
+    var s: Scoop = .{ .runner = fake.runner() };
+    try s.backend().install(a, &.{scoopRow("vscode", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }})});
+    try testing.expect(fake.called("scoop bucket add extras"));
+    try testing.expect(fake.called("scoop install extras/vscode"));
+}
+
+test "install: whether scoop's install ran is what says the rows may have landed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `scoop bucket list` runs before any install, and its failure stops the
+    // batch there: the only invocation was a query, so no row can have
+    // landed and a re-read must not be told they may have.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop bucket list", .code = 3 },
+    } };
+    var s: Scoop = .{ .runner = fake.runner() };
+    try testing.expectError(Error.ScoopBucketListFailed, s.backend().install(a, &.{
+        scoopRow("ripgrep", &.{.{ .key = "bucket", .value = .{ .string = "main" } }}),
+        scoopRow("fd", &.{}),
+    }));
+    try testing.expect(!s.backend().installSpawned());
+
+    var ran: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop install fd", .code = 1 },
+    } };
+    s.runner = ran.runner();
+    try testing.expectError(Error.ScoopInstallFailed, s.backend().install(a, &.{scoopRow("fd", &.{})}));
+    try testing.expect(s.backend().installSpawned());
+}
+
+test "validate: a winget row names an identifier, and its fields are shaped for an argv" {
+    var wf: exec.Fake = .{ .arena = testing.allocator, .entries = &.{} };
+    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    const be = w.backend();
+
+    for ([_][]const u8{ "--help", "-i", "msstore/Git.Git", "C:\\x\\evil.msi", "https://evil/x.msi", "Git.*" }) |name| {
+        try testing.expectError(Error.WingetNameNotAnIdentifier, be.validate(wingetRow(name, &.{}), null));
+    }
+    // An identifier is the publisher's own string: what winget really ships
+    // passes, including the ones no narrow class would admit.
+    for ([_][]const u8{
+        "Microsoft.PowerShell",
+        "Notepad++.Notepad++",
+        "7zip.7zip",
+        "9NBLGGH4NNS1",
+        "Mozilla.Firefox.ESR",
+    }) |name| {
+        try be.validate(wingetRow(name, &.{}), null);
+    }
+
+    var d: Diag = .{};
+    try testing.expectError(Error.BadWingetValue, be.validate(
+        wingetRow("Git.Git", &.{.{ .key = "source", .value = .{ .string = "a\" --source msstore\"b" } }}),
+        &d,
+    ));
+    try testing.expect(std.mem.indexOf(u8, d.capture().?, "\"source\"") != null);
+    try testing.expectError(Error.BadWingetValue, be.validate(
+        wingetRow("Git.Git", &.{.{ .key = "source", .value = .{ .string = "winget msstore" } }}),
+        null,
+    ));
+    try be.validate(wingetRow("Git.Git", &.{.{ .key = "source", .value = .{ .string = "winget" } }}), null);
+
+    // `override` is the installer's own command line, so the space and the
+    // slash it needs are what it is for; a quote is not, because no argv
+    // carries one intact across both of Windows' parsers.
+    try be.validate(wingetRow("Git.Git", &.{.{ .key = "override", .value = .{ .string = "/SILENT /NORESTART" } }}), null);
+    var d2: Diag = .{};
+    try testing.expectError(Error.BadWingetValue, be.validate(
+        wingetRow("Git.Git", &.{.{ .key = "override", .value = .{ .string = "/DIR=\"C:\\x\"" } }}),
+        &d2,
+    ));
+    try testing.expect(std.mem.indexOf(u8, d2.capture().?, "\"override\"") != null);
 }

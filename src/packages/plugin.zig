@@ -78,6 +78,11 @@ pub const Plugin = struct {
     /// contradiction checks, selection and drift each ask for the same row
     /// in one pass, and a plugin is a process spawn per question.
     ids: std.StringHashMapUnmanaged(anyerror![]const u8) = .empty,
+    /// Whether the last `install` reached the plugin's `install` verb, which
+    /// `installSpawned` answers with: a plugin this machine cannot run
+    /// installed nothing, and its rows must not be reported as possibly
+    /// landed.
+    spawned: bool = false,
 
     pub fn backend(self: *Plugin) Backend {
         return .{
@@ -94,6 +99,7 @@ pub const Plugin = struct {
         .idOf = idOfImpl,
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
+        .installSpawned = installSpawnedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
         .limitation = limitationImpl,
@@ -107,8 +113,14 @@ pub const Plugin = struct {
         .idOf = idOfImpl,
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
+        .installSpawned = installSpawnedImpl,
         .declare = declareImpl,
     };
+
+    fn installSpawnedImpl(ctx: *anyopaque) bool {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        return self.spawned;
+    }
 
     /// The one place a spawn's argv is built, so a file this machine cannot
     /// run is refused by name here rather than exec'd as a bare verb.
@@ -238,12 +250,19 @@ pub const Plugin = struct {
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
+        self.spawned = false;
         if (rows.len == 0) return;
         var input: std.ArrayList(u8) = .empty;
         for (rows) |row| {
             try input.appendSlice(arena, try write_mod.inlineRow(arena, row.name, row.fields));
             try input.append(arena, '\n');
         }
+        // Set before the call, as every adapter does: a spawn that fails
+        // after the process started is unknowable from here, and
+        // over-reporting a changed machine is the safe direction. The one
+        // case that is knowable is a plugin this machine cannot run, which
+        // `call` refuses without a spawn.
+        if (self.not_runnable == null) self.spawned = true;
         const res = try self.call(arena, "install", &.{}, input.items, true);
         if (res.timed_out) return Error.PluginTimedOut;
         if (!res.ok) return Error.PluginFailed;
@@ -780,4 +799,29 @@ test "available: a plugin that cannot be spawned is an error, not an absent mana
     } };
     var p = pluginWith(&fake);
     try testing.expectError(error.FileNotFound, p.backend().available(a));
+}
+
+test "install: a plugin this machine cannot run reports its rows as never handed over" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A `.ps1` on unix is registered and inert: its `install` verb is refused
+    // before any spawn, so its rows cannot have landed and a re-read must not
+    // be told they may have.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var inert = pluginWith(&fake);
+    inert.not_runnable = "a .ps1 plugin needs PowerShell";
+    try testing.expectError(Error.PluginNotRunnable, inert.backend().install(a, &.{rowOf("ripgrep", &.{})}));
+    try testing.expect(!inert.backend().installSpawned());
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    // A plugin that ran and failed is the other answer: its rows may be on
+    // the machine.
+    var ran: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports install", .code = 1 },
+    } };
+    var p = pluginWith(&ran);
+    try testing.expectError(Error.PluginFailed, p.backend().install(a, &.{rowOf("ripgrep", &.{})}));
+    try testing.expect(p.backend().installSpawned());
 }

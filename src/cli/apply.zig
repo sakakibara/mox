@@ -1139,8 +1139,8 @@ fn applyPackages(
             try rows.append(ctx.alloc, m.row);
         }
         // A real install asks the manager whether each row names a package it
-        // has, and refuses the batch when one does not. That check refreshes
-        // an index and elevates, neither of which a dry run may do, so what it
+        // has, and refuses the ones it has none for. That check refreshes an
+        // index and elevates, neither of which a dry run may do, so what it
         // would refuse is listed here as what it would install: said plainly,
         // rather than left to be discovered by the apply that follows.
         if (dry_run) {
@@ -1156,22 +1156,35 @@ fn applyPackages(
         // a batch in one pass (apt, pacman) must not be driven one package at
         // a time. The adapter streams its own output, so which package failed
         // is on the terminal from the manager itself.
+        var batch_failed = false;
         backend.install(ctx.alloc, rows.items) catch |e| {
+            // A batch that never got as far as running its manager did not
+            // fail to install: it failed before an install was attempted, and
+            // saying otherwise sends the reader looking for a manager that
+            // was never asked anything.
+            const spawned = backend.installSpawned();
             try ctx.err.print(
-                "mox apply: {s}: install failed: {s}\n",
-                .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()) },
+                "mox apply: {s}: {s}: {s}\n",
+                .{
+                    b.backend,
+                    if (spawned) "install failed" else "install did not run",
+                    try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()),
+                },
             );
             try ctx.err.flush();
+            batch_failed = true;
             counts.failed += 1;
-            // A batch that never got as far as running its manager landed
-            // nothing, so saying its rows may have is a hedge about work that
-            // never happened. The adapter is asked, rather than its error
-            // read: a check that runs before the install fails in the same
-            // ways the install does.
-            if (backend.installSpawned()) counts.attempted += rows.items.len;
-            continue;
+            // The adapter is asked whether its manager ran, rather than its
+            // error read: a check that runs before the install fails in the
+            // same ways the install does.
+            if (spawned) counts.attempted += rows.items.len - backend.installRefused();
         };
-        counts.installed += rows.items.len;
+        // A row the adapter refused is a failure of that row alone: the rows
+        // beside it were installed, so counting the batch instead would
+        // report work that happened as work that did not.
+        const refused = backend.installRefused();
+        counts.failed += refused;
+        if (!batch_failed) counts.installed += rows.items.len - refused;
     }
     return counts;
 }

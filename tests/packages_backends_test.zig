@@ -371,3 +371,33 @@ test "brew: a tap-qualified formula is reported the way a row spells it" {
     _ = parts.next();
     try testing.expect(parts.next() != null);
 }
+
+test "brew: a name after -- is a name, which is why the install argv carries one" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // Read-only: neither argv can install anything. `--help` prints help, and
+    // no formula may be named `--help`, brew names beginning with `-` being
+    // outside its own naming rules.
+    //
+    // The hazard first: brew's parser exits 0 on an option-shaped operand, so
+    // a row named `--help` would be counted installed, reported MISSING by
+    // the query that follows, and installed again on every apply. Then the
+    // defence: after a `--`, the same operand is a formula name brew does not
+    // have, and the install fails as it should.
+    const bare = try runBrew(a, io, &.{ "brew", "install", "--help" });
+    if (bare.term != .exited or bare.term.exited != 0) {
+        std.debug.print("brew install --help no longer exits 0; the hazard the name rule and the -- answer may have changed\n", .{});
+        return error.TestUnexpectedResult;
+    }
+
+    const guarded = try runBrew(a, io, &.{ "brew", "install", "--", "--help" });
+    if (guarded.term == .exited and guarded.term.exited == 0) {
+        std.debug.print("brew install -- --help exits 0; brew no longer stops its option scan at --, and the install argv must be reconsidered\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}

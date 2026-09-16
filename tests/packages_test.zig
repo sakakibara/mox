@@ -184,15 +184,15 @@ test "apply: installs what is missing, and a cask through --cask" {
     );
 
     const fake = try brewWith(a, "", "", &.{
-        .{ .argv = "brew install fd" },
-        .{ .argv = "brew install --cask ghostty" },
+        .{ .argv = "brew install -- fd" },
+        .{ .argv = "brew install --cask -- ghostty" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(fake.called("brew install fd"));
-    try std.testing.expect(fake.called("brew install --cask ghostty"));
+    try std.testing.expect(fake.called("brew install -- fd"));
+    try std.testing.expect(fake.called("brew install --cask -- ghostty"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 installed, 0 failed") != null);
 }
 
@@ -221,7 +221,7 @@ test "apply --dry-run: reports what it would install and installs nothing" {
     const r = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew fd") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 would be installed, 0 failed") != null);
-    try std.testing.expect(!fake.called("brew install fd"));
+    try std.testing.expect(!fake.called("brew install -- fd"));
 }
 
 test "apply: a tapped formula is tapped and trusted before install" {
@@ -242,9 +242,9 @@ test "apply: a tapped formula is tapped and trusted before install" {
     );
 
     const fake = try brewWith(a, "", "", &.{
-        .{ .argv = "brew tap d12frosted/emacs-plus" },
-        .{ .argv = "brew trust --formula d12frosted/emacs-plus/emacs-plus@30" },
-        .{ .argv = "brew install d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "brew tap -- d12frosted/emacs-plus" },
+        .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -252,9 +252,9 @@ test "apply: a tapped formula is tapped and trusted before install" {
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     // Tap, then trust, then install: each step needs the one before it.
-    const tap = indexOfCall(fake, "brew tap d12frosted/emacs-plus").?;
-    const trust = indexOfCall(fake, "brew trust --formula d12frosted/emacs-plus/emacs-plus@30").?;
-    const install = indexOfCall(fake, "brew install d12frosted/emacs-plus/emacs-plus@30").?;
+    const tap = indexOfCall(fake, "brew tap -- d12frosted/emacs-plus").?;
+    const trust = indexOfCall(fake, "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30").?;
+    const install = indexOfCall(fake, "brew install -- d12frosted/emacs-plus/emacs-plus@30").?;
     try std.testing.expect(tap < trust);
     try std.testing.expect(trust < install);
 }
@@ -734,7 +734,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
-    try entries.append(a, .{ .argv = "brew install ripgrep", .match = .suffix });
+    try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     mox.cli.app.package_runner_override = fake.runner();
@@ -1301,7 +1301,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
-    try entries.append(a, .{ .argv = "brew install ripgrep", .match = .suffix });
+    try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     mox.cli.app.package_runner_override = fake.runner();
@@ -2816,5 +2816,192 @@ test "status: an editor lock beside a manifest does not break every package comm
     try std.testing.expect(std.mem.indexOf(u8, r.err, "unreadable") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "TOML parse failed") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+/// Whether any call ended with `tail`. Suffix, because an install elevates
+/// through `sudo` unless the test process is already root, which a container
+/// runner is and a workstation is not.
+fn calledEndingWith(fake: *const mox.packages.exec.Fake, tail: []const u8) bool {
+    for (fake.calls.items) |c| {
+        if (std.mem.endsWith(u8, c, tail)) return true;
+    }
+    return false;
+}
+
+/// A machine whose only usable manager is apt, whose `apt-mark` reports
+/// `manual` and which answers `extra` for anything else.
+fn aptWith(
+    a: std.mem.Allocator,
+    manual: []const u8,
+    extra: []const mox.packages.exec.Fake.Entry,
+) !*mox.packages.exec.Fake {
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 3.0.3 (arm64)\n" });
+    try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = manual });
+    for ([_][]const u8{
+        "brew --version",
+        "dnf --version",
+        "pacman --version",
+        "scoop --version",
+        "winget --version",
+        "zypper --version",
+    }) |argv| {
+        try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
+    }
+    for (extra) |e| try entries.append(a, e);
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    return fake;
+}
+
+test "apply: a row no manager has fails alone, and the rows beside it install" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml",
+        \\backend = "apt"
+        \\
+        \\[[packages]]
+        \\name = "ruby.dev"
+        \\
+        \\[[packages]]
+        \\name = "sl"
+        \\
+    );
+
+    const fake = try aptWith(a, "", &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
+        .{ .argv = "apt-cache --generate pkgnames", .stdout = "sl\nbat\n" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl", .match = .suffix },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    // The good row landed, the bad one is its own failure, and the run still
+    // exits non-zero over it.
+    try std.testing.expect(calledEndingWith(fake, "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 1 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "row \"ruby.dev\" names no apt package") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+}
+
+test "apply: a foreign-architecture row apt's listing omits still installs" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml",
+        \\backend = "apt"
+        \\
+        \\[[packages]]
+        \\name = "wine32:armhf"
+        \\
+    );
+
+    // The listing omits `wine32` entirely -- measured on Debian trixie arm64
+    // with armhf added -- so the row can only be judged by asking about the
+    // name as written.
+    const fake = try aptWith(a, "", &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = "apt-cache madison wine32:armhf",
+            .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf", .match = .suffix },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "apply: an install that never ran says so, and claims no row may have landed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml",
+        \\backend = "apt"
+        \\
+        \\[[packages]]
+        \\name = "sl"
+        \\
+    );
+
+    // The index refresh is not the install: reporting it as one sends the
+    // reader looking for an apt-get that was never asked to install anything.
+    const fake = try aptWith(a, "", &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .code = 100, .match = .suffix },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: apt: install did not run: DistroRefreshFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+}
+
+test "commit then apply: a row commit records is a row apply installs, architecture and all" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml", "backend = \"apt\"\n");
+
+    // A foreign-architecture package installed by hand: `apt-mark showmanual`
+    // reports it qualified, which is the name commit records.
+    const fake = try aptWith(a, "wine32:armhf\n", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "untracked package: apt wine32:armhf") != null);
+    const after = try readManifest(io, h, a, "debian.toml");
+    try std.testing.expect(std.mem.indexOf(u8, after, "name = \"wine32:armhf\"") != null);
+
+    // The loop must close: a row mox wrote is a row mox installs. It is the
+    // same package name on a machine that has not got it yet, so apply must
+    // install it rather than refuse what commit had just recorded.
+    const fake2 = try aptWith(a, "", &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = "apt-cache madison wine32:armhf",
+            .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf", .match = .suffix },
+    });
+    useFake(fake2);
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }

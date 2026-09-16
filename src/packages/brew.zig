@@ -41,6 +41,7 @@ pub const Backend = backend_mod.Backend;
 pub const Error = error{
     UnknownBrewKey,
     BadBrewKind,
+    BrewNameNotAPackage,
 };
 
 pub const Kind = enum { formula, cask };
@@ -67,6 +68,10 @@ pub const Brew = struct {
     exe: []const u8 = "brew",
     /// Where the installer leaves `brew`; probed after a bootstrap.
     prefixes: []const []const u8 = &default_prefixes,
+    /// Whether the last `install` ran `brew install`, which `installSpawned`
+    /// answers with: a tap or a trust that fails stops the row before it, and
+    /// a batch of one such row never reaches brew's installer at all.
+    spawned: bool = false,
 
     pub fn backend(self: *Brew) Backend {
         return .{
@@ -83,6 +88,7 @@ pub const Brew = struct {
         .idOf = idOfImpl,
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
+        .installSpawned = installSpawnedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
     };
@@ -128,7 +134,26 @@ pub const Brew = struct {
     /// Through `env` because an adapter has no environment of its own.
     const query_env = [_][]const u8{ "env", "HOMEBREW_NO_AUTO_UPDATE=1" };
 
+    /// A row names one formula or cask, and takes `kind` alone.
+    ///
+    /// The name is judged by what brew accepts, which is not the distro rule:
+    /// `@` is in the class because `openssl@3` is a formula, and a
+    /// tap-qualified `owner/tap/name` is the one place a `/` belongs -- a row
+    /// that spells one IS the decision to trust that tap, which `install`
+    /// acts on. Everything else a brew operand can be is refused here.
+    /// `brew install --help` exits 0, so a row named `--help` would be
+    /// counted installed, reported missing by the query that follows, and
+    /// installed again on every apply; `brew install ./x.rb` runs a Ruby file
+    /// out of the working directory; `owner/tap` alone names a tap, which is
+    /// nothing `brew list` can ever report back.
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
+        if (backend_mod.nameProblem(row.name, .tapped)) |problem| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": brew rows name a formula or cask: {s}",
+                .{ row.label, row.name, problem.text(.tapped) },
+            );
+            return Error.BrewNameNotAPackage;
+        }
         for (row.fields) |p| {
             if (!std.mem.eql(u8, p.key, "kind")) {
                 if (diag) |d| d.set(
@@ -185,13 +210,20 @@ pub const Brew = struct {
     /// One `brew install` per row, every row attempted: a formula that fails
     /// halfway down the list must not leave the ones after it uninstalled.
     /// The batch then fails as a whole if any row did.
+    ///
+    /// `--` before the name, verified against Homebrew 7.0.1: `brew install
+    /// --help` exits 0 having installed nothing, while `brew install --
+    /// --help` reads the operand as a formula name and exits 1. `validate` is
+    /// what refuses such a name; this bounds what a name reaching brew can
+    /// do.
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Brew = @ptrCast(@alignCast(ctx));
+        self.spawned = false;
         var failed = false;
         for (rows) |row| {
             const kind = try kindOf(row);
             if (tapOf(row.name)) |tap| {
-                const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", tap });
+                const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", "--", tap });
                 try exec.checkTimedOut(tapped);
                 if (!tapped.ok) {
                     failed = true;
@@ -207,21 +239,27 @@ pub const Brew = struct {
                     .formula => "--formula",
                     .cask => "--cask",
                 };
-                const trusted = try self.runner.stream(arena, &.{ self.exe, "trust", flag, row.name });
+                const trusted = try self.runner.stream(arena, &.{ self.exe, "trust", flag, "--", row.name });
                 try exec.checkTimedOut(trusted);
                 if (!trusted.ok) {
                     failed = true;
                     continue;
                 }
             }
+            self.spawned = true;
             const res = switch (kind) {
-                .formula => try self.runner.stream(arena, &.{ self.exe, "install", row.name }),
-                .cask => try self.runner.stream(arena, &.{ self.exe, "install", "--cask", row.name }),
+                .formula => try self.runner.stream(arena, &.{ self.exe, "install", "--", row.name }),
+                .cask => try self.runner.stream(arena, &.{ self.exe, "install", "--cask", "--", row.name }),
             };
             try exec.checkTimedOut(res);
             if (!res.ok) failed = true;
         }
         if (failed) return error.BrewInstallFailed;
+    }
+
+    fn installSpawnedImpl(ctx: *anyopaque) bool {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        return self.spawned;
     }
 };
 
@@ -513,15 +551,15 @@ test "install: a tapped cask is trusted as a cask, not as a formula" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew tap owner/tap" },
-        .{ .argv = "brew trust --cask owner/tap/somecask" },
-        .{ .argv = "brew install --cask owner/tap/somecask" },
+        .{ .argv = "brew tap -- owner/tap" },
+        .{ .argv = "brew trust --cask -- owner/tap/somecask" },
+        .{ .argv = "brew install --cask -- owner/tap/somecask" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
 
     // The Fake errors on any unscripted command, so `--formula` here fails.
     try b.backend().install(a, &.{rowOf("owner/tap/somecask", &.{.{ .key = "kind", .value = .{ .string = "cask" } }})});
-    try testing.expect(fake.called("brew trust --cask owner/tap/somecask"));
+    try testing.expect(fake.called("brew trust --cask -- owner/tap/somecask"));
 }
 
 test "install: a tapped formula is tapped and trusted narrowly before installing" {
@@ -530,16 +568,16 @@ test "install: a tapped formula is tapped and trusted narrowly before installing
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew tap d12frosted/emacs-plus" },
-        .{ .argv = "brew trust --formula d12frosted/emacs-plus/emacs-plus@30" },
-        .{ .argv = "brew install d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "brew tap -- d12frosted/emacs-plus" },
+        .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
 
     try b.backend().install(a, &.{rowOf("d12frosted/emacs-plus/emacs-plus@30", &.{})});
-    try testing.expect(fake.called("brew tap d12frosted/emacs-plus"));
-    try testing.expect(fake.called("brew trust --formula d12frosted/emacs-plus/emacs-plus@30"));
-    try testing.expect(fake.called("brew install d12frosted/emacs-plus/emacs-plus@30"));
+    try testing.expect(fake.called("brew tap -- d12frosted/emacs-plus"));
+    try testing.expect(fake.called("brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30"));
+    try testing.expect(fake.called("brew install -- d12frosted/emacs-plus/emacs-plus@30"));
 }
 
 test "install: a core formula is neither tapped nor trusted" {
@@ -547,13 +585,13 @@ test "install: a core formula is neither tapped nor trusted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{.{ .argv = "brew install ripgrep" }} };
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{.{ .argv = "brew install -- ripgrep" }} };
     var b: Brew = .{ .runner = fake.runner() };
 
     // The Fake errors on any command it was not scripted for, so a stray tap
     // or trust here would fail the test rather than pass unnoticed.
     try b.backend().install(a, &.{rowOf("ripgrep", &.{})});
-    try testing.expect(fake.called("brew install ripgrep"));
+    try testing.expect(fake.called("brew install -- ripgrep"));
 }
 
 test "install: a cask installs through --cask" {
@@ -561,11 +599,11 @@ test "install: a cask installs through --cask" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{.{ .argv = "brew install --cask ghostty" }} };
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{.{ .argv = "brew install --cask -- ghostty" }} };
     var b: Brew = .{ .runner = fake.runner() };
 
     try b.backend().install(a, &.{rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }})});
-    try testing.expect(fake.called("brew install --cask ghostty"));
+    try testing.expect(fake.called("brew install --cask -- ghostty"));
 }
 
 test "bootstrap: after installing, brew is invoked by the path it landed at" {
@@ -616,8 +654,8 @@ test "install: a failed tap fails its row and the rows after it still run" {
     // The tapped row's trust and install are unscripted, so reaching either
     // would fail the test with a different error than the one asserted.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew tap owner/tap", .code = 1 },
-        .{ .argv = "brew install ripgrep" },
+        .{ .argv = "brew tap -- owner/tap", .code = 1 },
+        .{ .argv = "brew install -- ripgrep" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
 
@@ -625,7 +663,7 @@ test "install: a failed tap fails its row and the rows after it still run" {
         rowOf("owner/tap/thing", &.{}),
         rowOf("ripgrep", &.{}),
     }));
-    try testing.expect(fake.called("brew install ripgrep"));
+    try testing.expect(fake.called("brew install -- ripgrep"));
 }
 
 test "install: a failed trust fails its row and the rows after it still run" {
@@ -634,9 +672,9 @@ test "install: a failed trust fails its row and the rows after it still run" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew tap owner/tap" },
-        .{ .argv = "brew trust --cask owner/tap/somecask", .code = 1 },
-        .{ .argv = "brew install --cask ghostty" },
+        .{ .argv = "brew tap -- owner/tap" },
+        .{ .argv = "brew trust --cask -- owner/tap/somecask", .code = 1 },
+        .{ .argv = "brew install --cask -- ghostty" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
 
@@ -644,8 +682,8 @@ test "install: a failed trust fails its row and the rows after it still run" {
         rowOf("owner/tap/somecask", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
         rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
     }));
-    try testing.expect(!fake.called("brew install --cask owner/tap/somecask"));
-    try testing.expect(fake.called("brew install --cask ghostty"));
+    try testing.expect(!fake.called("brew install --cask -- owner/tap/somecask"));
+    try testing.expect(fake.called("brew install --cask -- ghostty"));
 }
 
 test "install: a failed install is an error, not a silent skip" {
@@ -655,9 +693,87 @@ test "install: a failed install is an error, not a silent skip" {
 
     var fake: exec.Fake = .{
         .arena = a,
-        .entries = &.{.{ .argv = "brew install ripgrep", .code = 1 }},
+        .entries = &.{.{ .argv = "brew install -- ripgrep", .code = 1 }},
     };
     var b: Brew = .{ .runner = fake.runner() };
 
     try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{rowOf("ripgrep", &.{})}));
+}
+
+test "validate: a row that is not a formula or cask name is refused" {
+    var b: Brew = .{ .runner = undefined };
+    const be = b.backend();
+
+    // Measured against Homebrew 7.0.1: `brew install --help` exits 0 having
+    // installed nothing, so this row would be counted installed, reported
+    // MISSING by the query that follows, and installed again forever.
+    for ([_][]const u8{ "--help", "-i", "./evil.rb", "/tmp/evil.rb", "https://evil/x.rb", "owner/tap" }) |name| {
+        var d: Diag = .{};
+        try testing.expectError(Error.BrewNameNotAPackage, be.validate(rowOf(name, &.{}), &d));
+        try testing.expect(std.mem.indexOf(u8, d.capture().?, "brew rows name a formula or cask") != null);
+    }
+
+    // What brew really ships still passes.
+    for ([_][]const u8{ "ripgrep", "openssl@3", "d12frosted/emacs-plus/emacs-plus@30", "font-fira-code-nerd-font" }) |name| {
+        try be.validate(rowOf(name, &.{}), null);
+    }
+}
+
+test "install: every name brew is handed comes after a --" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Verified against Homebrew 7.0.1: `brew install -- --help` reads the
+    // operand as a formula name and exits 1, where `brew install --help`
+    // exits 0. `brew tap` and `brew trust` answer a `--` the same way.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew tap -- owner/tap" },
+        .{ .argv = "brew trust --formula -- owner/tap/thing" },
+        .{ .argv = "brew install -- owner/tap/thing" },
+        .{ .argv = "brew install -- ripgrep" },
+        .{ .argv = "brew install --cask -- ghostty" },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    try b.backend().install(a, &.{
+        rowOf("owner/tap/thing", &.{}),
+        rowOf("ripgrep", &.{}),
+        rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+    });
+    for (fake.calls.items) |c| {
+        try testing.expect(std.mem.indexOf(u8, c, " -- ") != null);
+    }
+}
+
+test "install: whether brew's installer ran is what says the rows may have landed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A tap that fails stops its row before any install, so a batch of that
+    // one row reached brew's installer not at all and nothing can have
+    // landed.
+    var tap: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew tap -- owner/tap", .code = 1 },
+    } };
+    var b1: Brew = .{ .runner = tap.runner() };
+    try testing.expectError(error.BrewInstallFailed, b1.backend().install(a, &.{rowOf("owner/tap/thing", &.{})}));
+    try testing.expect(!b1.backend().installSpawned());
+
+    // An install that ran and failed is the other answer.
+    var ran: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew install -- ripgrep", .code = 1 },
+    } };
+    var b2: Brew = .{ .runner = ran.runner() };
+    try testing.expectError(error.BrewInstallFailed, b2.backend().install(a, &.{rowOf("ripgrep", &.{})}));
+    try testing.expect(b2.backend().installSpawned());
+
+    // And the answer is the last batch's, never the one before it.
+    var tap2: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew tap -- owner/tap", .code = 1 },
+    } };
+    b2.runner = tap2.runner();
+    try testing.expectError(error.BrewInstallFailed, b2.backend().install(a, &.{rowOf("owner/tap/thing", &.{})}));
+    try testing.expect(!b2.backend().installSpawned());
 }

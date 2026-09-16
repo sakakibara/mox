@@ -29,7 +29,11 @@ pub const Error = error{
     DistroSelectorRow,
     DistroQueryFailed,
     DistroInstallFailed,
-    DistroNameNotAPackage,
+    /// The index or database refresh an install resolves against failed, so
+    /// no install ran. Its own error because it is not an install failure:
+    /// reported as one, it says a manager was asked to install something when
+    /// it never was.
+    DistroRefreshFailed,
 };
 
 pub const Manager = enum {
@@ -104,6 +108,9 @@ pub const Distro = struct {
     /// Whether the last `install` ran the manager's install command, which
     /// `installSpawned` answers with.
     spawned: bool = false,
+    /// How many of the last `install`'s rows the manager was never handed,
+    /// which `installRefused` answers with.
+    refused: usize = 0,
 
     pub fn backend(self: *Distro) Backend {
         return .{
@@ -121,12 +128,18 @@ pub const Distro = struct {
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
         .installSpawned = installSpawnedImpl,
+        .installRefused = installRefusedImpl,
         .declare = declareImpl,
     };
 
     fn installSpawnedImpl(ctx: *anyopaque) bool {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         return self.spawned;
+    }
+
+    fn installRefusedImpl(ctx: *anyopaque) usize {
+        const self: *Distro = @ptrCast(@alignCast(ctx));
+        return self.refused;
     }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
@@ -203,9 +216,16 @@ pub const Distro = struct {
     /// The whole set in one invocation: these managers resolve a batch in a
     /// single pass, and pacman's `-Syu` syncs the database as it goes, so
     /// driving them one package at a time would repeat that work per package.
+    ///
+    /// A row the manager has no package for is refused and the rest of the
+    /// batch installed. One row nobody can install must not keep every other
+    /// package off the machine, and the refusal is the row's own failure
+    /// rather than the batch's: `installRefused` reports how many, so the run
+    /// counts them and exits non-zero.
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         self.spawned = false;
+        self.refused = 0;
         if (rows.len == 0) return;
 
         const elevate = self.elevates();
@@ -219,11 +239,15 @@ pub const Distro = struct {
             try up_argv.appendSlice(arena, &.{ "apt-get", "update" });
             const up = try self.runner.stream(arena, up_argv.items);
             try exec.checkTimedOut(up);
-            if (!up.ok) return Error.DistroInstallFailed;
-            try self.refuseAptNonNames(arena, rows);
+            if (!up.ok) return Error.DistroRefreshFailed;
         }
-        if (self.manager == .dnf) try self.refuseDnfNonPackages(arena, rows);
-        if (self.manager == .pacman) try self.refusePacmanNonPackages(arena, rows, elevate);
+        const keep = switch (self.manager) {
+            .apt => try self.refuseAptNonNames(arena, rows),
+            .dnf => try self.refuseDnfNonPackages(arena, rows),
+            .pacman => try self.refusePacmanNonPackages(arena, rows, elevate),
+        };
+        self.refused = rows.len - keep.len;
+        if (keep.len == 0) return;
 
         var argv: std.ArrayList([]const u8) = .empty;
         if (elevate) try argv.append(arena, "sudo");
@@ -238,13 +262,14 @@ pub const Distro = struct {
         // and pacman 7.1.0 both take one. It is not the fix -- `validate`
         // refuses a name that is not a package name, and apt reads its remove
         // suffix after a `--` all the same -- but it bounds what a name
-        // reaching the manager can do. dnf takes none at all: dnf5 5.2.x,
-        // which is every Fedora from 41 to 43, fails an install or a
-        // repoquery carrying one with `Unknown argument "--"` and exit 2.
+        // reaching the manager can do. dnf gets none, because the dnf5 range
+        // in use does not agree about it: 5.2.x, which is every Fedora from
+        // 41 to 43, fails an install or a repoquery carrying one with
+        // `Unknown argument "--"` and exit 2, while 5.4.3 accepts it.
         // Nothing is lost there, because the name class refuses a leading
         // `-`, so no operand mox passes can be read as an option.
         if (self.manager != .dnf) try argv.append(arena, "--");
-        for (rows) |row| try argv.append(arena, row.name);
+        for (keep) |row| try argv.append(arena, row.name);
 
         self.spawned = true;
         const res = try self.runner.stream(arena, argv.items);
@@ -264,9 +289,16 @@ pub const Distro = struct {
     /// `apt-cache policy` both take a regex -- and it lists the bare name
     /// alone, never a `:arch` form. About 1.2 MiB on Debian trixie and
     /// 1.8 MiB on Ubuntu 24.04, well inside a captured call's cap.
+    ///
+    /// It is the universe for a BARE name only. Measured on Debian trixie
+    /// arm64 with armhf added: of the 90 names the armhf index carries and
+    /// the arm64 index does not, this listing omits 12 -- `wine32` among them
+    /// -- while apt resolves and installs `wine32:armhf` and `apt-mark
+    /// showmanual` then reports exactly that. A qualified name is asked about
+    /// per row instead.
     const apt_names_argv = [_][]const u8{ "apt-cache", "--generate", "pkgnames" };
 
-    /// Refuse a batch carrying a name apt has no package for.
+    /// Refuse the rows apt has no package for, and answer with the rest.
     ///
     /// `apt-get install` falls back to matching an operand as an unanchored
     /// POSIX regex over every package name when no package is named exactly,
@@ -280,41 +312,88 @@ pub const Distro = struct {
     /// `validate` runs at manifest load on every machine, including one with
     /// no apt at all, and a rule that needs a manager query would make the
     /// same manifest load on one machine and be refused on another.
-    fn refuseAptNonNames(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
-        const known = try self.universeNames(arena, &apt_names_argv, "apt-cache --generate pkgnames");
+    ///
+    /// The qualifier is judged before the package list, because a row apt
+    /// resolves to the native package is wrong for a reason of its own and
+    /// must be told the bare name to declare rather than the regex warning.
+    fn refuseAptNonNames(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
+        // Each query is made only if a row needs it: the listing costs a
+        // megabyte and a rebuild of apt's cache, and dpkg is asked nothing at
+        // all by a batch that carries no qualifier.
+        var known: ?std.StringHashMap(void) = null;
+        var native: ?[]const u8 = null;
 
-        const native = try self.aptNativeArch(arena);
-        var refused = false;
+        var keep: std.ArrayList(Row) = .empty;
         for (rows) |row| {
             const bare = backend_mod.bareName(row.name);
-            if (!known.contains(bare)) {
-                refused = true;
+            if (backend_mod.archOf(row.name)) |arch| {
+                // apt-mark reports a package of the machine's own
+                // architecture without a qualifier, so a row that spells one
+                // installs and then reads as missing on every status after.
+                if (nativeAlias(arch)) {
+                    self.say(
+                        "mox: apt: row \"{s}\" carries the qualifier \"{s}\", which apt resolves to this machine's own architecture and apt-mark then reports bare, so the row could never read as installed; declare \"{s}\" instead\n",
+                        .{ row.name, arch, bare },
+                    );
+                    continue;
+                }
+                if (native == null) native = try self.aptNativeArch(arena);
+                if (std.mem.eql(u8, arch, native.?)) {
+                    self.say(
+                        "mox: apt: row \"{s}\" qualifies this machine's own architecture, which apt-mark reports bare, so the row could never read as installed; declare \"{s}\" instead\n",
+                        .{ row.name, bare },
+                    );
+                    continue;
+                }
+                if (try self.aptHasQualified(arena, row.name)) {
+                    try keep.append(arena, row);
+                    continue;
+                }
                 self.say(
-                    "mox: apt: row \"{s}\" names no apt package; apt-get would read it as a regular expression and install every package it matched, so nothing was installed\n",
-                    .{row.name},
+                    "mox: apt: row \"{s}\" names no apt package for the architecture \"{s}\", so it was not installed\n",
+                    .{ row.name, arch },
                 );
                 continue;
             }
-            // apt-mark reports a package of the machine's own architecture
-            // without a qualifier, so a row that spells one installs and then
-            // reads as missing on every status after.
-            const arch = backend_mod.archOf(row.name) orelse continue;
-            if (nativeAlias(arch)) {
-                refused = true;
-                self.say(
-                    "mox: apt: row \"{s}\" carries the qualifier \"{s}\", which apt resolves to this machine's own architecture and apt-mark then reports bare, so the row could never read as installed; declare \"{s}\" instead\n",
-                    .{ row.name, arch, bare },
-                );
+            if (known == null) known = try self.universeNames(arena, &apt_names_argv, "apt-cache --generate pkgnames");
+            if (known.?.contains(bare)) {
+                try keep.append(arena, row);
                 continue;
             }
-            if (!std.mem.eql(u8, arch, native)) continue;
-            refused = true;
             self.say(
-                "mox: apt: row \"{s}\" qualifies this machine's own architecture, which apt-mark reports bare, so the row could never read as installed; declare \"{s}\" instead\n",
-                .{ row.name, bare },
+                "mox: apt: row \"{s}\" names no apt package; apt-get would read it as a regular expression and install every package it matched, so it was not installed\n",
+                .{row.name},
             );
         }
-        if (refused) return Error.DistroNameNotAPackage;
+        return keep.toOwnedSlice(arena);
+    }
+
+    /// Whether apt has a binary package under this exact qualified name.
+    ///
+    /// `apt-cache madison` is the one query verified to answer LITERALLY for
+    /// a qualified name. Against apt 3.0.3 on Debian trixie: it answers
+    /// `wine32:armhf`, `g++` and `libstdc++6` -- names carrying the regex
+    /// metacharacters the class admits -- with their own line, and answers
+    /// `bsdextrautil.`, `w.ne32:armhf`, `libc.`, `^libc6$`, `libc6.*`, `g..`
+    /// and the prefix `wine3` with nothing at all, while `apt-cache show` and
+    /// `apt-cache policy` resolve those same patterns to a package. A purely
+    /// virtual name (`awk`) also answers with nothing, so a capability cannot
+    /// pass here either.
+    ///
+    /// Only a line naming a binary index counts: with `deb-src` configured
+    /// madison prints a `Sources` line too, and a source package is nothing
+    /// `apt-get install` can put on the machine.
+    fn aptHasQualified(self: *Distro, arena: std.mem.Allocator, name: []const u8) anyerror!bool {
+        const res = try self.runner.run(arena, &.{ "apt-cache", "madison", name });
+        try exec.checkTimedOut(res);
+        if (!res.ok) return Error.DistroQueryFailed;
+
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (std.mem.endsWith(u8, line, " Packages")) return true;
+        }
+        return false;
     }
 
     /// Whether `arch` is one of apt's own names for the native package rather
@@ -344,6 +423,25 @@ pub const Distro = struct {
         argv: []const []const u8,
         listing: []const u8,
     ) anyerror!std.StringHashMap(void) {
+        return (try self.universeNamesOrEmpty(arena, argv, listing)) orelse {
+            self.say(
+                "mox: {s}: `{s}` lists no packages at all, which is a machine with no repositories configured rather than a row that names none, so no row could be checked and nothing was installed\n",
+                .{ self.manager.name(), listing },
+            );
+            return Error.DistroQueryFailed;
+        };
+    }
+
+    /// The same, with an empty listing answered as null rather than as a
+    /// failure: pacman's listing is empty on a machine whose sync database
+    /// has never been downloaded, which is a state to act on rather than one
+    /// to report.
+    fn universeNamesOrEmpty(
+        self: *Distro,
+        arena: std.mem.Allocator,
+        argv: []const []const u8,
+        listing: []const u8,
+    ) anyerror!?std.StringHashMap(void) {
         const res = self.runner.run(arena, argv) catch |e| switch (e) {
             error.StreamTooLong => {
                 self.say(
@@ -364,13 +462,7 @@ pub const Distro = struct {
             if (line.len == 0) continue;
             try known.put(line, {});
         }
-        if (known.count() == 0) {
-            self.say(
-                "mox: {s}: `{s}` lists no packages at all, which is a machine with no repositories configured rather than a row that names none, so no row could be checked and nothing was installed\n",
-                .{ self.manager.name(), listing },
-            );
-            return Error.DistroQueryFailed;
-        }
+        if (known.count() == 0) return null;
         return known;
     }
 
@@ -383,7 +475,7 @@ pub const Distro = struct {
         return std.mem.trim(u8, res.stdout, " \t\r\n");
     }
 
-    /// Refuse a batch carrying a name dnf has no package for.
+    /// Refuse the rows dnf has no package for, and answer with the rest.
     ///
     /// An rpm virtual provide is spelled exactly like a package name, so it
     /// passes every shape rule there is: `zlib-devel` is not a package in
@@ -395,16 +487,18 @@ pub const Distro = struct {
     /// provider puts a package on the machine that no row declares -- the
     /// same harm as apt's regex fallback -- and leaves the user to work out
     /// what to write. The name to write is in the message instead.
-    fn refuseDnfNonPackages(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
+    fn refuseDnfNonPackages(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &dnf_names_argv);
         for (rows) |row| try argv.append(arena, row.name);
         const known = try self.dnfNameSet(arena, argv.items);
 
-        var refused = false;
+        var keep: std.ArrayList(Row) = .empty;
         for (rows) |row| {
-            if (known.contains(row.name)) continue;
-            refused = true;
+            if (known.contains(row.name)) {
+                try keep.append(arena, row);
+                continue;
+            }
             const providers = try self.dnfProvidersOf(arena, row.name);
             if (providers.len == 0) {
                 self.say(
@@ -423,7 +517,7 @@ pub const Distro = struct {
                 .{ row.name, list.written() },
             );
         }
-        if (refused) return Error.DistroNameNotAPackage;
+        return keep.toOwnedSlice(arena);
     }
 
     /// Which of the operands name a real package. `-q` and the trailing
@@ -478,8 +572,8 @@ pub const Distro = struct {
     /// per member and exits 1 on a name that is not a group.
     const pacman_names_argv = [_][]const u8{ "pacman", "-Slq" };
 
-    /// Refuse a batch carrying a name pacman would not install under that
-    /// name.
+    /// Refuse the rows pacman would not install under their own name, and
+    /// answer with the rest.
     ///
     /// A group is spelled exactly like a package and passes every shape rule
     /// there is. `pacman -S xfce4` installs all 14 of its members -- `gnome`
@@ -493,24 +587,44 @@ pub const Distro = struct {
     /// and not the group's kdevelop-php and kdevelop-python. `base` and
     /// `base-devel` are packages in their own right now, so they pass here
     /// while `pacman -Sg base-devel` says it is no group.
-    fn refusePacmanNonPackages(self: *Distro, arena: std.mem.Allocator, rows: []const Row, elevate: bool) anyerror!void {
+    fn refusePacmanNonPackages(self: *Distro, arena: std.mem.Allocator, rows: []const Row, elevate: bool) anyerror![]const Row {
         // Both queries read the sync database, and a container or a fresh
-        // machine has never downloaded one: unsynced, pacman answers that
-        // every name is unknown and every row would be refused. The install's
-        // own `-Syu` syncs again, which downloads nothing once current.
-        var sync: std.ArrayList([]const u8) = .empty;
-        if (elevate) try sync.append(arena, "sudo");
-        try sync.appendSlice(arena, &.{ "pacman", "-Sy", "--noconfirm" });
-        const up = try self.runner.stream(arena, sync.items);
-        try exec.checkTimedOut(up);
-        if (!up.ok) return Error.DistroInstallFailed;
+        // machine has never downloaded one: unsynced, `pacman -Slq` exits 0
+        // with nothing at all (verified against pacman 7.1.0) and every row
+        // would be refused for a reason none of them has.
+        //
+        // So the database is ASKED first and written only when its answer is
+        // unusable -- a check on a machine that has one changes nothing --
+        // and what is then run is the full `-Syu` the install itself was
+        // about to run, never a bare `-Sy`. A `-Sy` alone leaves the database
+        // ahead of the installed packages, which Arch documents as an
+        // unsupported partial-upgrade state, and every path out of here -- a
+        // refused row, an empty listing, a kill at the bound -- would leave
+        // the machine in it.
+        var universe = try self.universeNamesOrEmpty(arena, &pacman_names_argv, "pacman -Slq");
+        if (universe == null) {
+            var sync: std.ArrayList([]const u8) = .empty;
+            if (elevate) try sync.append(arena, "sudo");
+            try sync.appendSlice(arena, &.{ "pacman", "-Syu", "--noconfirm" });
+            const up = try self.runner.stream(arena, sync.items);
+            try exec.checkTimedOut(up);
+            if (!up.ok) return Error.DistroRefreshFailed;
+            universe = try self.universeNamesOrEmpty(arena, &pacman_names_argv, "pacman -Slq");
+        }
+        const known = universe orelse {
+            self.say(
+                "mox: pacman: `pacman -Slq` lists no packages at all, which is a machine with no repositories configured rather than a row that names none, so no row could be checked and nothing was installed\n",
+                .{},
+            );
+            return Error.DistroQueryFailed;
+        };
 
-        const known = try self.universeNames(arena, &pacman_names_argv, "pacman -Slq");
-
-        var refused = false;
+        var keep: std.ArrayList(Row) = .empty;
         for (rows) |row| {
-            if (known.contains(row.name)) continue;
-            refused = true;
+            if (known.contains(row.name)) {
+                try keep.append(arena, row);
+                continue;
+            }
             const members = try self.pacmanGroupMembers(arena, row.name);
             if (members.len == 0) {
                 self.say(
@@ -529,7 +643,7 @@ pub const Distro = struct {
                 .{ row.name, members.len, list.written() },
             );
         }
-        if (refused) return Error.DistroNameNotAPackage;
+        return keep.toOwnedSlice(arena);
     }
 
     /// The members of the group `name`, or nothing when `name` is no group.
@@ -678,7 +792,7 @@ test "install: apt refreshes the index, then installs the whole set at once, deb
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("fd-find", &.{}) });
     try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[0]);
-    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find", fake.calls.items[3]);
+    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find", fake.calls.items[fake.calls.items.len - 1]);
 }
 
 test "install: dnf takes one non-interactive command" {
@@ -947,14 +1061,13 @@ test "install: no argv dnf parses carries a --, which dnf5 5.2.x refuses" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat zlib-devel", .stdout = "bat\n" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
+        .{ .argv = "dnf install -y bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(
-        Error.DistroNameNotAPackage,
-        d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("zlib-devel", &.{}) }),
-    );
+    try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("zlib-devel", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     for (fake.calls.items) |c| {
         try testing.expect(!std.mem.startsWith(u8, c, "dnf --"));
         try testing.expect(std.mem.indexOf(u8, c, " -- ") == null);
@@ -982,57 +1095,97 @@ test "install: apt refuses a name it would resolve as a regular expression" {
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("bsdextrautil.", &.{})}));
+    try d.backend().install(a, &.{rowOf("bsdextrautil.", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
-        "mox: apt: row \"bsdextrautil.\" names no apt package; apt-get would read it as a regular expression and install every package it matched, so nothing was installed\n",
+        "mox: apt: row \"bsdextrautil.\" names no apt package; apt-get would read it as a regular expression and install every package it matched, so it was not installed\n",
         w.written(),
     );
-    // The batch never reached apt-get, so nothing undeclared was installed.
+    // The row never reached apt-get, so nothing undeclared was installed.
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "apt-get install") == null);
 }
 
-test "install: apt refuses a batch for one bad name, naming every one of them" {
+test "install: apt refuses the bad names and installs the rest of the batch" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    // One row nobody can install must not keep the others off the machine.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\n" },
-        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{
+    try d.backend().install(a, &.{
         rowOf("bat", &.{}),
         rowOf("ruby.dev", &.{}),
         rowOf("libz.dev", &.{}),
-    }));
+    });
+    try testing.expectEqual(@as(usize, 2), d.backend().installRefused());
     try testing.expect(std.mem.indexOf(u8, w.written(), "row \"ruby.dev\" names no apt package") != null);
     try testing.expect(std.mem.indexOf(u8, w.written(), "row \"libz.dev\" names no apt package") != null);
     try testing.expect(std.mem.indexOf(u8, w.written(), "\"bat\"") == null);
-    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "apt-get install") == null);
+    // Only the good row is an operand: a refused one is never passed on.
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat"));
 }
 
-test "install: apt takes a multiarch name, resolving the half apt lists" {
+test "install: a foreign-architecture row is asked about as written, never by its bare half" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // `apt-cache pkgnames` lists `libc6`, never `libc6:armhf`, while
-    // `apt-mark showmanual` reports the foreign-architecture package
-    // qualified -- so the row apt's query answers with must install.
+    // `apt-cache pkgnames` lists bare names alone and omits a package that
+    // exists only for a foreign architecture, so the bare half answers
+    // nothing about the row: `wine32` is in no listing on an arm64 machine,
+    // while apt installs `wine32:armhf` and `apt-mark showmanual` reports
+    // exactly that. madison is asked about the name as written instead.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "libc6\nbat\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
-        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- libc6:armhf" },
+        .{
+            .argv = "apt-cache madison wine32:armhf",
+            .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
 
-    try d.backend().install(a, &.{rowOf("libc6:armhf", &.{})});
-    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- libc6:armhf"));
+    try d.backend().install(a, &.{rowOf("wine32:armhf", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf"));
+    // The listing is never asked for: it could not answer about this row.
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "pkgnames") == null);
+}
+
+test "install: apt refuses a qualified name madison has no binary package for" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A `Sources` line is not a package `apt-get install` can put on the
+    // machine, and with `deb-src` configured madison prints one for a source
+    // package of the same name.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = "apt-cache madison wine:armhf",
+            .stdout = "      wine | 10.0~repack-6 | http://deb.debian.org/debian trixie/main Sources\n",
+        },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("wine:armhf", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"wine:armhf\" names no apt package for the architecture \"armhf\", so it was not installed\n",
+        w.written(),
+    );
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "apt-get install") == null);
 }
 
 test "install: apt refuses a qualifier naming this machine's own architecture" {
@@ -1051,7 +1204,8 @@ test "install: apt refuses a qualifier naming this machine's own architecture" {
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("bsdextrautils:arm64", &.{})}));
+    try d.backend().install(a, &.{rowOf("bsdextrautils:arm64", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
         "mox: apt: row \"bsdextrautils:arm64\" qualifies this machine's own architecture, which apt-mark reports bare, so the row could never read as installed; declare \"bsdextrautils\" instead\n",
         w.written(),
@@ -1092,7 +1246,8 @@ test "install: dnf refuses a virtual provide, naming the package that provides i
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("zlib-devel", &.{})}));
+    try d.backend().install(a, &.{rowOf("zlib-devel", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
         "mox: dnf: row \"zlib-devel\" names no dnf package; it is a capability provided by \"zlib-ng-compat-devel\", and rpm reports only the package name, so declare that instead\n",
         w.written(),
@@ -1115,7 +1270,8 @@ test "install: dnf names every provider of a capability several packages carry" 
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("java-devel", &.{})}));
+    try d.backend().install(a, &.{rowOf("java-devel", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
         "mox: dnf: row \"java-devel\" names no dnf package; it is a capability provided by \"java-17-openjdk-devel\", \"java-21-openjdk-devel\", and rpm reports only the package name, so declare that instead\n",
         w.written(),
@@ -1134,7 +1290,8 @@ test "install: dnf says so plainly when nothing provides the name either" {
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("ripgrepp", &.{})}));
+    try d.backend().install(a, &.{rowOf("ripgrepp", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
         "mox: dnf: row \"ripgrepp\" names no dnf package in this machine's repositories\n",
         w.written(),
@@ -1150,20 +1307,24 @@ test "install: pacman refuses a group, naming the packages to declare instead" {
     // installs libfprint and fprintd, and `pacman -Qeq` reports those two and
     // never fprint, so the row is MISSING on every status after.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "pacman -Sy --noconfirm" },
         .{ .argv = "pacman -Slq", .stdout = "bat\nfprintd\nlibfprint\n" },
         .{ .argv = "pacman -Sg fprint", .stdout = "fprint libfprint\nfprint fprintd\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("fprint", &.{})}));
+    try d.backend().install(a, &.{rowOf("fprint", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
         "mox: pacman: row \"fprint\" names no pacman package; it is a group of 2 packages (\"fprintd\", \"libfprint\"), and pacman reports each of them under its own name, so declare the ones you want instead\n",
         w.written(),
     );
-    // The batch never reached pacman, so no member of the group landed.
-    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-Syu") == null);
+    // The row never reached pacman, so no member of the group landed, and a
+    // check that refused it wrote nothing to the machine either.
+    for (fake.calls.items) |c| {
+        try testing.expect(std.mem.indexOf(u8, c, "-Syu") == null);
+        try testing.expect(std.mem.indexOf(u8, c, "-Sy ") == null);
+    }
 }
 
 test "install: pacman refuses a name no repository carries" {
@@ -1172,14 +1333,14 @@ test "install: pacman refuses a name no repository carries" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "pacman -Sy --noconfirm" },
         .{ .argv = "pacman -Slq", .stdout = "bat\nripgrep\n" },
         .{ .argv = "pacman -Sg ripgrepp", .code = 1 },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf("ripgrepp", &.{})}));
+    try d.backend().install(a, &.{rowOf("ripgrepp", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings(
         "mox: pacman: row \"ripgrepp\" names no pacman package in this machine's repositories\n",
         w.written(),
@@ -1197,7 +1358,6 @@ test "install: pacman takes a name that is a package and a group both" {
     // package universe is what decides. `base` and `base-devel` are plain
     // packages and go the same way.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "pacman -Sy --noconfirm" },
         .{ .argv = "pacman -Slq", .stdout = "base\nbase-devel\nkdevelop\nkdevelop-php\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- kdevelop base-devel base" },
     } };
@@ -1209,31 +1369,59 @@ test "install: pacman takes a name that is a package and a group both" {
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-Sg") == null);
 }
 
-test "install: pacman syncs before it reads the database it judges rows against" {
+test "install: a pacman check reads the database and never writes to it" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // An unsynced machine has no database at all, where every name reads as
-    // unknown and every row would be refused for a reason none of them has.
+    // A machine whose database is already there is asked and left alone: a
+    // check that syncs would leave the database ahead of the installed
+    // packages, which Arch documents as an unsupported partial upgrade, on
+    // every path that then refuses a row or fails.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "sudo pacman -Sy --noconfirm" },
         .{ .argv = "pacman -Slq", .stdout = "bat\n" },
         .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expectEqualStrings("sudo pacman -Sy --noconfirm", fake.calls.items[0]);
-    try testing.expectEqualStrings("pacman -Slq", fake.calls.items[1]);
+    try testing.expectEqualStrings("pacman -Slq", fake.calls.items[0]);
+    try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+}
 
-    // A sync that fails stops the install: the check cannot run, and the
-    // install's own `-Syu` would fail the same way.
+test "install: an unsynced pacman database is brought up by the upgrade the install was about to run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Verified against pacman 7.1.0: with no database downloaded, `pacman
+    // -Slq` exits 0 with nothing at all. Only then is anything done about it,
+    // and what runs is the full `-Syu` -- never a bare `-Sy`, which would
+    // leave the machine in the partial-upgrade state whichever way the rest
+    // of this went.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo pacman -Slq", .stdout = "" },
+        .{ .argv = "pacman -Slq", .stdout = "", .once = true },
+        .{ .argv = "sudo pacman -Syu --noconfirm" },
+        .{ .argv = "pacman -Slq", .stdout = "bat\n" },
+        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqualStrings("pacman -Slq", fake.calls.items[0]);
+    try testing.expectEqualStrings("sudo pacman -Syu --noconfirm", fake.calls.items[1]);
+    try testing.expectEqualStrings("pacman -Slq", fake.calls.items[2]);
+    try testing.expectEqualStrings("sudo pacman -Syu --needed --noconfirm -- bat", fake.calls.items[3]);
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-Sy ") == null);
+
+    // An upgrade that fails is not an install that failed: no install ran.
     var down: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "pacman -Sy --noconfirm", .code = 1 },
+        .{ .argv = "pacman -Slq", .stdout = "" },
+        .{ .argv = "pacman -Syu --noconfirm", .code = 1 },
     } };
     var d2: Distro = .{ .manager = .pacman, .runner = down.runner(), .force_elevate = false };
-    try testing.expectError(Error.DistroInstallFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expectError(Error.DistroRefreshFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expect(!d2.backend().installSpawned());
 }
 
@@ -1259,7 +1447,8 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
         var w: std.Io.Writer.Allocating = .init(a);
         var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-        try testing.expectError(Error.DistroNameNotAPackage, d.backend().install(a, &.{rowOf(c.name, &.{})}));
+        try d.backend().install(a, &.{rowOf(c.name, &.{})});
+        try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
         const want = try std.fmt.allocPrint(
             a,
             "mox: apt: row \"{s}\" carries the qualifier \"{s}\", which apt resolves to this machine's own architecture and apt-mark then reports bare, so the row could never read as installed; declare \"{s}\" instead\n",
@@ -1273,8 +1462,11 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
     // reports with a colon in it.
     var ok: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "libc6\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = "apt-cache madison libc6:armhf",
+            .stdout = "libc6:armhf | 2.41-12+deb13u4 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- libc6:armhf" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = ok.runner(), .force_elevate = false };
@@ -1303,9 +1495,11 @@ test "install: a listing that answers nothing stops the install, saying which" {
     );
     try testing.expect(!d.backend().installSpawned());
 
+    // pacman's listing is empty on a machine that has never synced, so it is
+    // reported only once the upgrade has run and it is still empty.
     var pac: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "pacman -Sy --noconfirm" },
         .{ .argv = "pacman -Slq", .stdout = "" },
+        .{ .argv = "pacman -Syu --noconfirm" },
     } };
     var w2: std.Io.Writer.Allocating = .init(a);
     var d2: Distro = .{ .manager = .pacman, .runner = pac.runner(), .force_elevate = false, .err = &w2.writer };
@@ -1351,7 +1545,7 @@ test "install: whether the manager ran is what says the rows may have landed" {
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .code = 100 },
     } };
     var d1: Distro = .{ .manager = .apt, .runner = refresh.runner(), .force_elevate = false };
-    try testing.expectError(Error.DistroInstallFailed, d1.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expectError(Error.DistroRefreshFailed, d1.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expect(!d1.backend().installSpawned());
 
     var timeout: exec.Fake = .{ .arena = a, .entries = &.{
@@ -1364,19 +1558,21 @@ test "install: whether the manager ran is what says the rows may have landed" {
 
     var arch: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\n" },
         .{ .argv = "dpkg --print-architecture", .code = 2 },
     } };
     var d3: Distro = .{ .manager = .apt, .runner = arch.runner(), .force_elevate = false };
-    try testing.expectError(Error.DistroQueryFailed, d3.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expectError(Error.DistroQueryFailed, d3.backend().install(a, &.{rowOf("bat:armhf", &.{})}));
     try testing.expect(!d3.backend().installSpawned());
 
+    // A batch whose every row is refused reaches no manager either: there is
+    // nothing left to hand it.
     var refused: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n zlib-devel", .stdout = "" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
     } };
     var d4: Distro = .{ .manager = .dnf, .runner = refused.runner(), .force_elevate = false };
-    try testing.expectError(Error.DistroNameNotAPackage, d4.backend().install(a, &.{rowOf("zlib-devel", &.{})}));
+    try d4.backend().install(a, &.{rowOf("zlib-devel", &.{})});
+    try testing.expectEqual(@as(usize, 1), d4.backend().installRefused());
     try testing.expect(!d4.backend().installSpawned());
 
     // A manager that ran and failed part-way through is the other answer: its
@@ -1396,6 +1592,68 @@ test "install: whether the manager ran is what says the rows may have landed" {
         .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides ripgrepp", .stdout = "" },
     } };
     d5.runner = again.runner();
-    try testing.expectError(Error.DistroNameNotAPackage, d5.backend().install(a, &.{rowOf("ripgrepp", &.{})}));
+    try d5.backend().install(a, &.{rowOf("ripgrepp", &.{})});
+    try testing.expectEqual(@as(usize, 1), d5.backend().installRefused());
     try testing.expect(!d5.backend().installSpawned());
+    // And the count is the last batch's, never the one before it.
+    var clean: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf install -y bat" },
+    } };
+    d5.runner = clean.runner();
+    try d5.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqual(@as(usize, 0), d5.backend().installRefused());
+}
+
+test "install: a qualifier apt reads as native is judged before the package list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `wine32` is in no `apt-cache pkgnames` listing on an arm64 machine, so
+    // asking the listing first would answer this row with the regex warning
+    // -- true of the bare name, and no use at all to someone who wrote
+    // `:native`. The qualifier is the row's problem, and the bare name is
+    // what to declare.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("wine32:native", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"wine32:native\" carries the qualifier \"native\", which apt resolves to this machine's own architecture and apt-mark then reports bare, so the row could never read as installed; declare \"wine32\" instead\n",
+        w.written(),
+    );
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "pkgnames") == null);
+}
+
+test "install: a foreign-architecture row beside a good one installs both" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on Debian trixie arm64 with armhf added: `apt-cache --generate
+    // pkgnames` lists neither `wine32` nor `wine32:armhf`, while apt installs
+    // `wine32:armhf` and `apt-mark showmanual` reports exactly that. Judged
+    // by the listing, the row is refused -- and with the batch refused with
+    // it, `sl` never lands either.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "apt-cache --generate pkgnames", .stdout = "sl\nbat\n" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = "apt-cache madison wine32:armhf",
+            .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf sl" },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
+
+    try d.backend().install(a, &.{ rowOf("wine32:armhf", &.{}), rowOf("sl", &.{}) });
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf sl"));
 }

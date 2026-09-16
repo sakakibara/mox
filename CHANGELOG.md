@@ -87,35 +87,57 @@ All notable changes to mox are documented here. The format follows
   `{"state":"refused"}` and `package_refused`), so a refusal is never read as
   a clean machine. `mox --help` names
   `MOX_SCRIPT_TIMEOUT_MS`, `MOX_INSTALL_TIMEOUT_MS` and
-  `MOX_PACKAGES_DEPTH`. A manifest refuses an unknown top-level key, a
-  `name` an install would read as an operation rather than a package -- one
-  beginning with anything but a letter or a digit, one carrying a character
-  outside `[A-Za-z0-9._+-]`, or one ending in `-`, which apt, dnf, pacman and
-  zypper each read as a request to REMOVE that package. A trailing `+` stays
-  legal, since `g++` is a package. A row naming a capability rather than a
+  `MOX_PACKAGES_DEPTH`. A manifest refuses a `name` its manager would read
+  as an operation rather than a package. Each manager has its own class,
+  because each has its own grammar. apt, dnf, pacman and zypper take a name
+  beginning with a letter or a digit and carrying only `[A-Za-z0-9._+-]`,
+  never ending in `-`, which all four read as a request to REMOVE that
+  package; a trailing `+` stays legal, since `g++` is a package, and an apt
+  name may carry one `:<arch>` qualifier, which is the one name apt itself
+  reports with a colon in it. brew takes a formula or cask, `@` included for
+  `openssl@3`, or a tap-qualified `owner/tap/name`, so a row cannot be an
+  option (`brew install --help` exits 0 having installed nothing, which
+  would count as installed and reinstall forever), a local Ruby file or a
+  URL. scoop takes one token, so a row cannot be a manifest path, a URL, a
+  bucket-qualified name or a pinned version that scoop then reports under
+  its bare name; winget's identifiers are the publisher's own strings, so
+  its rule refuses what would make one a path, a URL, a pattern or an option
+  rather than narrowing what an identifier may hold. A row naming a capability rather than a
   package (`pkgconfig(...)`), a version relation, or an architecture suffix
   is refused for the same reason: it installs under one name and is read back
   under another, so it would be reported missing and reinstalled forever.
-  `mox commit` puts a row it is about to write through that same check, so no
-  manager's answer can produce a file a later command refuses. Whether a
-  manager HAS a package of that name is asked of the manager itself before an
-  install -- apt against `apt-cache --generate pkgnames`, dnf against `dnf
-  repoquery`, pacman against `pacman -Slq` -- so a name apt would read as a
-  regular expression, a name that is only an rpm capability, a pacman group,
-  and an apt row carrying the machine's own architecture or apt's `:native`,
-  `:all` or `:any` are each refused with the name to declare instead, having
-  installed nothing. `mox apply --dry-run` runs none of those checks, and
-  names beside the rows the manager list it left them unchecked against. A manifest
-  also refuses an unknown top-level key, a
-  `name` that is blank or carries whitespace, a control byte or a byte that
-  is not UTF-8 or runs past 256 bytes -- one rule with the shape an id must
-  have, so a row an adapter writes is a row the loader reads back -- a
-  file-level `backend` naming no adapter, a byte order mark, a second
-  `[[bootstrap]]` row for one backend, and two rows naming one package
-  under the same gate, and a zypper row naming a pattern, patch, product,
-  source package or application rather than a package, which `rpm` could
-  never report back. `doctor` notes a file in the private layer's `data/`
-  that is not a data source, since nothing applies it.
+  The field values an adapter splices into its manager's argv -- scoop's
+  `bucket`, winget's `source` -- are held to the same class as a name, and
+  winget's `override`, which exists to carry an installer's own command
+  line, is held to what an argv can carry intact. `mox commit` puts a row it
+  is about to write through that same check, so no manager's answer can
+  produce a file a later command refuses.
+
+  Whether a manager HAS a package of that name is asked of the manager
+  itself before an install -- apt against `apt-cache --generate pkgnames`,
+  or against `apt-cache madison` for a name carrying an architecture, since
+  the listing omits a package that exists only for a foreign one, dnf
+  against `dnf repoquery`, pacman against `pacman -Slq` -- so a name apt
+  would read as a regular expression, a name that is only an rpm
+  capability, a pacman group, and an apt row carrying the machine's own
+  architecture or apt's `:native`, `:all` or `:any` are each refused with
+  the name to declare instead, having installed nothing. A refused row is
+  its own failure: the rows beside it are installed, since one bad row in a
+  manifest must not keep every other package off the machine. `mox apply
+  --dry-run` runs none of those checks -- they refresh an index and elevate,
+  which a dry run may not do -- and says, beside the rows it would install,
+  which manager list it left them unchecked against.
+
+  A manifest also refuses an unknown top-level key, a `name` that is blank
+  or carries whitespace, a control byte or a byte that is not UTF-8 or runs
+  past 256 bytes -- one rule with the shape an id must have, so a row an
+  adapter writes is a row the loader reads back -- a file-level `backend`
+  naming no adapter, a byte order mark, a second `[[bootstrap]]` row for one
+  backend, and two rows naming one package under the same gate, and a zypper
+  row naming a pattern, patch, product, source package or application rather
+  than a package, which `rpm` could never report back. `doctor` notes a file
+  in the private layer's `data/` that is not a data source, since nothing
+  applies it.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;

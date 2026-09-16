@@ -360,6 +360,9 @@ backend = "apt"
 
 [[packages]]
 name = "bsdextrautil."
+
+[[packages]]
+name = "sl"
 EOF
 
   out="$case_dir/out.txt"
@@ -369,12 +372,14 @@ EOF
       set -e
       export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
       dpkg -s bsdextrautils >/dev/null 2>&1 && { echo "the image ships bsdextrautils; the case cannot run"; exit 1; }
+      dpkg -s sl >/dev/null 2>&1 && { echo "the image ships sl; the case cannot run"; exit 1; }
       echo "--- apply ---"
       rc=0
       /w/mox apply || rc=$?
       echo "apply-exit=$rc"
       echo "--- collateral ---"
       dpkg -s bsdextrautils >/dev/null 2>&1 && echo "collateral=present" || echo "collateral=absent"
+      dpkg -s sl >/dev/null 2>&1 && echo "sibling=present" || echo "sibling=absent"
     ' >"$out" 2>&1; then
     no "$backend ($image): container run failed" "$(tail -3 "$out")"
     return
@@ -396,6 +401,92 @@ EOF
     ok "$backend ($image): bsdextrautils was never installed; the manifest declares no such package"
   else
     no "$backend ($image): apt installed a package the manifest never declared" "$(tail -5 "$out")"
+  fi
+
+  # One row nobody can install must not keep every other package off the
+  # machine: the refusal is that row's failure, not the batch's.
+  if grep -q "sibling=present" "$out" && grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed, and the refusal is counted as one row's failure"
+  else
+    no "$backend ($image): a refused row stopped the rows that were fine" \
+      "$(grep -E 'sibling=|Packages:' "$out" | tail -3)"
+  fi
+}
+
+# A package that exists ONLY for the foreign architecture is the case
+# `apt-cache --generate pkgnames` cannot answer: measured on Debian trixie,
+# that listing holds bare names alone and omits `wine32` altogether, while apt
+# resolves and installs `wine32:<foreign>` and `apt-mark showmanual` reports
+# exactly that. The row must round-trip, and the good row beside it must land.
+run_foreign_only_case() {
+  image="$1"
+  foreign="$2"
+  backend="apt foreign-only"
+
+  case_dir="$work/foreign-only"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<EOF
+backend = "apt"
+
+[[packages]]
+name = "wine32:$foreign"
+
+[[packages]]
+name = "sl"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      dpkg --add-architecture '"$foreign"'
+      apt-get update >/dev/null
+      # The premise of the case: the name exists for the foreign
+      # architecture and for no other, and apts own listing omits it.
+      apt-cache --generate pkgnames | grep -qx wine32 && { echo "this apt lists wine32 bare; the case cannot run"; exit 1; }
+      echo "--- before ---"
+      /w/mox status || true
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      /w/mox status || true
+      echo "--- showmanual ---"
+      apt-mark showmanual | grep -x "wine32:'"$foreign"'" || echo "not-manual"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- showmanual ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+apt wine32:$foreign"; then
+    ok "$backend ($image): a package only the foreign architecture has is MISSING"
+  else
+    no "$backend ($image): expected 'wine32:$foreign' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q "Packages: 2 installed, 0 failed" "$out"; then
+    ok "$backend ($image): it installed through the real apt, beside the row next to it"
+  else
+    no "$backend ($image): apply did not install both rows" "$(grep -i 'packages:\|^mox: apt' "$out" | tail -3)"
+  fi
+
+  # apt-mark is what mox reads back, so the qualified name must be in it.
+  if grep -qx "wine32:$foreign" "$out"; then
+    ok "$backend ($image): apt-mark reports it under the qualified name"
+  else
+    no "$backend ($image): apt-mark did not report wine32:$foreign" "$(sed -n '/--- showmanual ---/,$p' "$out")"
+  fi
+
+  if echo "$after" | grep -qE "(MISSING|UNTRACKED)[[:space:]]+apt wine32:$foreign"; then
+    no "$backend ($image): drift over wine32:$foreign survived apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
   fi
 }
 
@@ -660,6 +751,82 @@ EOF
   fi
 }
 
+# A pacman CHECK must only read. `pacman -Sy` without `-u` leaves the sync
+# database ahead of the installed packages, which Arch documents as an
+# unsupported partial upgrade -- and a check that runs it leaves the machine
+# in that state on every path out, a refused row included. Two phases: a
+# machine that has never synced, where the database has to be downloaded
+# before anything can be judged, and one that already has it, where nothing
+# may be written at all.
+run_pacman_sync_case() {
+  image="$1"
+  backend="pacman sync"
+
+  case_dir="$work/pacman-sync"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  # A group: refused, so every path after the database read is the failing
+  # one this case is about.
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "fprint"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      [ -f /var/lib/pacman/sync/core.db ] && { echo "this image ships a synced database; the case cannot run"; exit 1; }
+      echo "--- unsynced ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- pending upgrades ---"
+      pacman -Qu > /tmp/pending.txt 2>&1 || true
+      echo "pending=$(grep -c . /tmp/pending.txt)"
+      echo "--- synced ---"
+      touch /tmp/marker
+      sleep 1
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      if [ -n "$(find /var/lib/pacman/sync -newer /tmp/marker)" ]; then
+        echo "database=written"
+      else
+        echo "database=untouched"
+      fi
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  # A machine left with a synced database and un-upgraded packages has
+  # pending upgrades against a database it never asked for.
+  if grep -q "^pending=0" "$out"; then
+    ok "$backend ($image): an unsynced machine is left upgraded, never half-synced"
+  else
+    no "$backend ($image): the run left the machine in a partial-upgrade state" \
+      "$(grep -E '^pending=|^apply-exit=' "$out" | head -2)"
+  fi
+
+  if grep -q "database=untouched" "$out"; then
+    ok "$backend ($image): a check against a database that is already there writes nothing"
+  else
+    no "$backend ($image): a check wrote to the sync database" "$(grep -E 'database=' "$out")"
+  fi
+
+  if grep -q "names no pacman package" "$out"; then
+    ok "$backend ($image): the row is still refused, on both runs"
+  else
+    no "$backend ($image): the row was not refused" "$(tail -5 "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -673,6 +840,10 @@ else
   # The foreign architecture is whichever one the host is not: i386 beside
   # amd64 (Steam, wine), armhf beside arm64 (cross work).
   run_multiarch_case debian:stable "$foreign_arch"
+  # wine32 is built for i386 and armhf and for no 64-bit architecture, so it
+  # is the one name that exists for the foreign architecture alone on both
+  # kinds of host -- the case apt's own listing cannot answer.
+  run_foreign_only_case debian:stable "$foreign_arch"
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
@@ -690,6 +861,7 @@ else
   # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
+  run_pacman_sync_case archlinux:latest
   run_case debian:stable brew hello
 fi
 

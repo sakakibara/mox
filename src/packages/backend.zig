@@ -61,6 +61,21 @@ pub const NameClass = enum {
     plain,
     /// A plain name, optionally carrying one `:<arch>` qualifier.
     multiarch,
+    /// A Homebrew formula or cask, optionally tap-qualified as
+    /// `owner/tap/name`. `@` is in the class because `openssl@3` and
+    /// `emacs-plus@30` are real formulae.
+    tapped,
+    /// One scoop app name. scoop takes the bucket as a field of its own, so
+    /// nothing here needs a separator.
+    app,
+    /// One winget `PackageIdentifier`. Kept wider than `app` deliberately:
+    /// winget's identifiers are the publisher's own strings
+    /// (`Notepad++.Notepad++`, a bare store id), mox cannot enumerate them,
+    /// and a class narrower than winget's would refuse a package someone
+    /// really has. So this one names the bytes that make an identifier
+    /// something else -- a path, a URL, an option -- rather than the bytes a
+    /// name may hold.
+    identifier,
 };
 
 /// Why a name is not a package name, for an adapter whose manager takes
@@ -71,21 +86,31 @@ pub const NameProblem = enum {
     character,
     trailing_hyphen,
     arch,
+    segments,
 
     /// The clause a diagnostic states after naming the file and the row.
     pub fn text(self: NameProblem, class: NameClass) []const u8 {
         return switch (self) {
             .empty => "a name cannot be empty",
-            .leading => "a name begins with a letter or a digit",
+            .leading => switch (class) {
+                .tapped => "a name begins with a letter or a digit, and so does each part of a tap-qualified one",
+                else => "a name begins with a letter or a digit",
+            },
             .character => switch (class) {
                 .plain => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
                 .multiarch => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\", optionally followed by \":\" and an architecture",
+                .tapped => "a name holds only letters, digits and \".\", \"_\", \"+\", \"-\" or \"@\"",
+                .app => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+                .identifier => "an identifier holds none of \"\\\", \"/\", \":\", \"*\", \"?\", \"<\", \">\", \"|\" or a quotation mark, which would make it a path, a URL or a pattern",
             },
             // apt-get reads `nano-` as "remove nano" and zypper reads `-nano`
             // and `!nano` the same way, so a row can otherwise ask mox to
             // uninstall a package on every apply.
             .trailing_hyphen => "a name does not end with \"-\", which an install reads as a request to remove the package",
             .arch => "a name carries one \":\" at most, and an architecture holds only letters, digits and \"-\"",
+            // `brew install ./x.rb` installs a local Ruby file, and
+            // `owner/tap` alone names a tap rather than anything installable.
+            .segments => "a name is one formula or cask, or a tap-qualified \"owner/tap/name\"",
         };
     }
 };
@@ -105,27 +130,140 @@ pub const NameProblem = enum {
 /// apply.
 ///
 /// A trailing `+` stays legal: `g++` is a real package.
+///
+/// The classes beyond the distro pair answer those same two harms in their
+/// own grammars. brew exits 0 on `brew install --help`, so a row named
+/// `--help` reads as installed, is reported missing by the query that
+/// follows, and is "installed" again on every apply; `brew install ./x.rb`
+/// runs a local Ruby file. scoop takes a manifest path or a URL where an app
+/// name goes, and `scoop install git@2.1` installs a version that `scoop
+/// export` reports under the bare name. winget's identifier is the
+/// publisher's own string, so its class names what would make the value a
+/// path, a URL or a pattern instead.
 pub fn nameProblem(name: []const u8, class: NameClass) ?NameProblem {
     if (name.len == 0) return .empty;
+    switch (class) {
+        .app => return segmentProblem(name, class),
+        .identifier => {
+            if (!std.ascii.isAlphanumeric(name[0])) return .leading;
+            for (name) |c| {
+                switch (c) {
+                    '\\', '/', ':', '*', '?', '"', '<', '>', '|' => return .character,
+                    else => {},
+                }
+            }
+            return null;
+        },
+        .tapped => {
+            var parts = std.mem.splitScalar(u8, name, '/');
+            var count: usize = 0;
+            while (parts.next()) |part| {
+                count += 1;
+                if (count > 3) return .segments;
+                if (segmentProblem(part, class)) |p| return p;
+            }
+            if (count == 2) return .segments;
+            return null;
+        },
+        .plain, .multiarch => {},
+    }
     const base = switch (class) {
-        .plain => name,
         .multiarch => blk: {
             const colon = std.mem.indexOfScalar(u8, name, ':') orelse break :blk name;
             if (!isArchitecture(name[colon + 1 ..])) return .arch;
             break :blk name[0..colon];
         },
+        else => name,
     };
-    if (base.len == 0) return .leading;
-    if (!std.ascii.isAlphanumeric(base[0])) return .leading;
-    for (base) |c| {
+    if (segmentProblem(base, class)) |p| return p;
+    if (base[base.len - 1] == '-') return .trailing_hyphen;
+    return null;
+}
+
+/// Whether one run of a name -- a whole name, or one `/`-separated part of a
+/// tap-qualified one -- holds only what `class` admits.
+fn segmentProblem(s: []const u8, class: NameClass) ?NameProblem {
+    if (s.len == 0) return .leading;
+    if (!std.ascii.isAlphanumeric(s[0])) return .leading;
+    for (s) |c| {
         if (std.ascii.isAlphanumeric(c)) continue;
         switch (c) {
             '.', '_', '+', '-' => {},
+            '@' => if (class != .tapped) return .character,
             else => return .character,
         }
     }
-    if (base[base.len - 1] == '-') return .trailing_hyphen;
     return null;
+}
+
+/// How a field value an adapter splices into its manager's argv is read
+/// there.
+pub const ValueClass = enum {
+    /// One operand: a scoop bucket, a winget source.
+    token,
+    /// A whole command line handed on to something else, which is what
+    /// winget's `override` exists to be.
+    command_line,
+};
+
+/// Why a field value is not one of its class.
+///
+/// A value is checked because it lands where a name lands. On Windows the
+/// harm is worse than an odd operand: Zig serializes an argv for
+/// `CommandLineToArgvW`, escaping an embedded `"` by doubling backslashes,
+/// while PowerShell's `-File` parser reads `\"` as a backslash and a quote
+/// that ENDS quoting -- so a value carrying whitespace and a `"` together
+/// leaves its own argv element and becomes several operands of the command
+/// it was spliced into. A value with whitespace alone does not: the quoting
+/// PowerShell does honour holds it together.
+pub const ValueProblem = enum {
+    empty,
+    leading,
+    character,
+    quote,
+    control,
+
+    /// The clause a diagnostic states after naming the file, the row and the
+    /// key.
+    pub fn text(self: ValueProblem, class: ValueClass) []const u8 {
+        return switch (self) {
+            .empty => "cannot be empty",
+            .leading => "begins with a letter or a digit",
+            .character => switch (class) {
+                .token => "holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+                .command_line => "holds only text",
+            },
+            .quote => "holds no \" character, which Windows' two command-line parsers disagree about, so a value carrying one can leave its own argument and become several",
+            .control => "holds no control byte",
+        };
+    }
+};
+
+/// Whether `v` is a field value of `class`, and if not, which rule it broke.
+pub fn valueProblem(v: []const u8, class: ValueClass) ?ValueProblem {
+    if (v.len == 0) return .empty;
+    if (!std.unicode.utf8ValidateSlice(v)) return .character;
+    for (v) |c| {
+        if (std.ascii.isControl(c)) return .control;
+        if (c == '"') return .quote;
+    }
+    switch (class) {
+        // An installer's own arguments need the space and the slash that a
+        // token may not have; only the bytes no argv can carry across both
+        // Windows parsers are refused, which is the loop above.
+        .command_line => return null,
+        .token => {
+            if (!std.ascii.isAlphanumeric(v[0])) return .leading;
+            for (v) |c| {
+                if (std.ascii.isAlphanumeric(c)) continue;
+                switch (c) {
+                    '.', '_', '+', '-' => {},
+                    else => return .character,
+                }
+            }
+            return null;
+        },
+    }
 }
 
 /// Whether `s` has the shape of a dpkg architecture (`amd64`, `armhf`,
@@ -245,6 +383,10 @@ pub const Backend = struct {
         /// manager's install command. Absent for an adapter whose install
         /// runs it first thing, where the answer is always yes.
         installSpawned: ?*const fn (ctx: *anyopaque) bool = null,
+        /// How many of the last `install`'s rows the adapter refused without
+        /// handing them to its manager. Absent for an adapter that refuses
+        /// none, where the answer is always zero.
+        installRefused: ?*const fn (ctx: *anyopaque) usize = null,
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
@@ -311,6 +453,18 @@ pub const Backend = struct {
     /// changed machine rather than hiding one.
     pub fn installSpawned(self: Backend) bool {
         const f = self.vtable.installSpawned orelse return true;
+        return f(self.ctx);
+    }
+
+    /// How many rows the last `install` refused rather than handing to its
+    /// manager. A refused row is one failure; the rows beside it are
+    /// installed, because one bad row in a manifest must not stop every other
+    /// package on the machine. The adapter is asked, rather than the count
+    /// inferred from the error, because a refusal is no longer an error: an
+    /// install that refuses one row of three and installs the other two
+    /// returns cleanly.
+    pub fn installRefused(self: Backend) usize {
+        const f = self.vtable.installRefused orelse return 0;
         return f(self.ctx);
     }
 
@@ -512,4 +666,113 @@ test "rpmArchSuffix: an arch-qualified spec reads back under its bare name" {
     // is a qualifier.
     try testing.expectEqual(@as(?[]const u8, null), rpmArchSuffix("python3.11"));
     try testing.expectEqual(@as(?[]const u8, null), rpmArchSuffix("bat.x86"));
+}
+
+test "nameProblem: a brew name is a formula, a cask, or a tap-qualified one" {
+    // What brew really ships: `@` for a versioned formula, `+` for a name
+    // like `gtk+3`, and a three-part name for a third-party tap.
+    const inside = [_][]const u8{
+        "ripgrep",
+        "openssl@3",
+        "emacs-plus@30",
+        "d12frosted/emacs-plus/emacs-plus@30",
+        "font-fira-code-nerd-font",
+        "7zip",
+        "gtk+3",
+    };
+    for (inside) |s| try testing.expectEqual(@as(?NameProblem, null), nameProblem(s, .tapped));
+
+    // `brew install --help` exits 0, so an option-shaped row would count as
+    // installed and be installed again on every apply.
+    try testing.expectEqual(NameProblem.leading, nameProblem("--help", .tapped).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("-i", .tapped).?);
+    // A local Ruby file is arbitrary code, and brew installs one by path.
+    try testing.expectEqual(NameProblem.leading, nameProblem("./evil.rb", .tapped).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("/tmp/evil.rb", .tapped).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("../evil.rb", .tapped).?);
+    // A URL installs a formula from anywhere at all.
+    try testing.expectEqual(NameProblem.character, nameProblem("https://evil/x.rb", .tapped).?);
+    // Two parts name a tap, which nothing installs and no query reports.
+    try testing.expectEqual(NameProblem.segments, nameProblem("owner/tap", .tapped).?);
+    try testing.expectEqual(NameProblem.segments, nameProblem("a/b/c/d", .tapped).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("owner//name", .tapped).?);
+    try testing.expectEqual(NameProblem.empty, nameProblem("", .tapped).?);
+}
+
+test "nameProblem: an app name is one token, with no version and no path" {
+    const inside = [_][]const u8{
+        "ripgrep",
+        "nodejs-lts",
+        "7zip",
+        "Microsoft.PowerShell",
+        "Notepad++.Notepad++",
+        "JanDeDobbeleer.OhMyPosh",
+        "windows_terminal",
+    };
+    for (inside) |s| try testing.expectEqual(@as(?NameProblem, null), nameProblem(s, .app));
+
+    // `scoop install git@2.1` installs a version that `scoop export` reports
+    // under the bare name, so the row reads as missing on every status after.
+    try testing.expectEqual(NameProblem.character, nameProblem("git@2.1", .app).?);
+    // A bucket belongs in its own field, and a manifest path or a URL is not
+    // an app name at all.
+    try testing.expectEqual(NameProblem.character, nameProblem("extras/vscode", .app).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("https://evil/x.json", .app).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem(".\\evil.json", .app).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("--help", .app).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("-g", .app).?);
+}
+
+test "valueProblem: a field value spliced into an argv is held to its own class" {
+    // The value that breaks out on Windows: Zig serializes an argv for
+    // `CommandLineToArgvW` and escapes the `"` as `\"`, which PowerShell's
+    // `-File` parser reads as a backslash and the END of quoting -- so this
+    // one value becomes several operands of `scoop bucket add`, whose second
+    // operand is the bucket's repository URL.
+    try testing.expectEqual(ValueProblem.quote, valueProblem("a\" extras https://evil/x\"b", .token).?);
+    try testing.expectEqual(ValueProblem.quote, valueProblem("a\" extras https://evil/x\"b", .command_line).?);
+
+    // Whitespace alone does not break out -- PowerShell honours the quoting
+    // Zig added -- but a bucket is still one token.
+    try testing.expectEqual(ValueProblem.character, valueProblem("extras https://evil/x", .token).?);
+    try testing.expectEqual(ValueProblem.leading, valueProblem("-Force", .token).?);
+    try testing.expectEqual(ValueProblem.empty, valueProblem("", .token).?);
+    try testing.expectEqual(ValueProblem.control, valueProblem("extras\nmain", .token).?);
+    for ([_][]const u8{ "extras", "nerd-fonts", "main", "versions", "winget", "msstore" }) |s| {
+        try testing.expectEqual(@as(?ValueProblem, null), valueProblem(s, .token));
+    }
+
+    // An installer's own arguments need the space, the slash and the dash
+    // that a token may not have; only what no argv can carry is refused.
+    for ([_][]const u8{ "/SILENT /NORESTART", "-y --quiet", "/DIR=C:\\Program Files\\x" }) |s| {
+        try testing.expectEqual(@as(?ValueProblem, null), valueProblem(s, .command_line));
+    }
+    try testing.expectEqual(ValueProblem.control, valueProblem("/SILENT\r\n/DIR=x", .command_line).?);
+    try testing.expectEqual(ValueProblem.empty, valueProblem("", .command_line).?);
+}
+
+test "nameProblem: a winget identifier is the publisher's string, minus what makes it something else" {
+    // Identifiers mox cannot enumerate and must not refuse: a `+` that a
+    // narrow class would reject, a bare store id with no publisher part, a
+    // third segment.
+    const inside = [_][]const u8{
+        "Microsoft.PowerShell",
+        "Notepad++.Notepad++",
+        "9NBLGGH4NNS1",
+        "Mozilla.Firefox.ESR",
+        "JanDeDobbeleer.OhMyPosh",
+        "M2Team.NanaZip",
+    };
+    for (inside) |s| try testing.expectEqual(@as(?NameProblem, null), nameProblem(s, .identifier));
+
+    // What would make the value something other than an identifier.
+    try testing.expectEqual(NameProblem.leading, nameProblem("--help", .identifier).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem("-i", .identifier).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem(".\\evil.msi", .identifier).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("C:\\x\\evil.msi", .identifier).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("https://evil/x.msi", .identifier).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("msstore/Git.Git", .identifier).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("Git.*", .identifier).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("Git\"Git", .identifier).?);
+    try testing.expectEqual(NameProblem.empty, nameProblem("", .identifier).?);
 }
