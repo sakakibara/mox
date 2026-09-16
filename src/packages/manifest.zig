@@ -104,6 +104,9 @@ pub const Source = struct {
     path: []const u8,
     label: []const u8,
     default_backend: ?[]const u8,
+    /// The file-level gate, raw. A row appended to a file whose gate does
+    /// not hold here would never be desired on the machine that recorded it.
+    when: ?[]const u8 = null,
     private: bool,
 };
 
@@ -205,6 +208,7 @@ pub fn load(
             .path = f.path,
             .label = f.label,
             .default_backend = file_backend,
+            .when = file_when,
             .private = f.private,
         });
 

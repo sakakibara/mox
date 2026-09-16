@@ -10,6 +10,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const apply_write = @import("../apply/write.zig");
+const axis = @import("../dsl/axis.zig");
+const resolver_mod = @import("../dsl/resolver.zig");
 const backend_mod = @import("backend.zig");
 const manifest_mod = @import("manifest.zig");
 
@@ -18,6 +20,7 @@ const Io = std.Io;
 pub const Declaration = backend_mod.Backend.Declaration;
 pub const Manifest = manifest_mod.Manifest;
 pub const Source = manifest_mod.Source;
+pub const Resolver = resolver_mod.Resolver;
 
 pub const Array = enum {
     packages,
@@ -31,27 +34,40 @@ pub const Array = enum {
     }
 };
 
-pub const Error = error{NoManifestFileForBackend};
+pub const Error = error{ NoManifestFileForBackend, TooManySymlinkHops };
 
 /// The file a row for `backend` belongs in. Every repo file is preferred over
 /// every private one -- a package belongs in the shared manifest unless the
 /// user says otherwise -- and within a layer, one whose own default backend
 /// matches before one that merely carries a row for it. Basename order breaks
-/// ties so the same machine always picks the same file.
-pub fn targetFor(m: Manifest, backend: []const u8) ?Source {
+/// ties so the same machine always picks the same file. A file whose own
+/// `when` does not hold on this machine is never the target: a row recorded
+/// there would not be desired on the machine that just recorded it.
+pub fn targetFor(arena: std.mem.Allocator, m: Manifest, backend: []const u8, r: *const Resolver) !?Source {
     for ([_]bool{ false, true }) |private| {
         for (m.sources) |src| {
             if (src.private != private) continue;
+            if (!try gateHolds(arena, src, r)) continue;
             if (src.default_backend) |d| {
                 if (std.mem.eql(u8, d, backend)) return src;
             }
         }
         for (m.sources) |src| {
             if (src.private != private) continue;
+            if (!try gateHolds(arena, src, r)) continue;
             if (carriesRow(m, src, backend)) return src;
         }
     }
     return null;
+}
+
+/// A file with no `when` is unconditional. `manifest.load` rejected a
+/// malformed gate, so a failure here is allocation, and is propagated rather
+/// than read as "excluded".
+fn gateHolds(arena: std.mem.Allocator, src: Source, r: *const Resolver) !bool {
+    const expr_src = src.when orelse return true;
+    const expr = try axis.parseString(arena, expr_src);
+    return axis.evaluate(expr, r);
 }
 
 /// Whether `src` already holds a row for `backend`: a package or a blacklist
@@ -125,8 +141,10 @@ pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const man
 
 /// Append the block to `path`, creating the file when it does not exist. The
 /// rewrite is atomic: a manifest in the private layer lives in no git repo,
-/// and a crash mid-write must not leave it empty.
-pub fn append(arena: std.mem.Allocator, io: Io, path: []const u8, block: []const u8) !void {
+/// and a crash mid-write must not leave it empty. A manifest that is a
+/// symlink is rewritten where the link points, so the link survives.
+pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, block: []const u8) !void {
+    const path = try resolveLinks(arena, io, link_path);
     const existing = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20)) catch |e| switch (e) {
         error.FileNotFound => {
             try apply_write.writeAtomic(io, path, std.mem.trimStart(u8, block, "\n"), 0o644);
@@ -144,6 +162,31 @@ pub fn append(arena: std.mem.Allocator, io: Io, path: []const u8, block: []const
     }
     try buf.appendSlice(arena, block);
     try apply_write.writeAtomic(io, path, buf.items, try modeOf(io, path));
+}
+
+const max_link_hops: usize = 8;
+
+/// The file `path` finally names, following a symlink chain with each
+/// relative target read against the directory of the link that holds it. A
+/// dangling link resolves to its missing target, which the caller then
+/// creates, making the link good rather than replacing it.
+fn resolveLinks(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
+    var cur = path;
+    var hops: usize = 0;
+    while (true) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = Io.Dir.cwd().readLink(io, cur, &buf) catch |e| switch (e) {
+            error.NotLink, error.FileNotFound => return cur,
+            else => return e,
+        };
+        if (hops == max_link_hops) return Error.TooManySymlinkHops;
+        hops += 1;
+        const target = buf[0..n];
+        cur = if (std.fs.path.isAbsolute(target))
+            try arena.dupe(u8, target)
+        else
+            try std.fs.path.resolve(arena, &.{ std.fs.path.dirname(cur) orelse ".", target });
+    }
 }
 
 /// The mode the rewrite keeps: a private manifest the user made 0600 must
@@ -190,7 +233,7 @@ const Quoted = struct {
             '\n' => try w.writeAll("\\n"),
             '\r' => try w.writeAll("\\r"),
             '\t' => try w.writeAll("\\t"),
-            else => if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
+            else => if (c < 0x20 or c == 0x7f) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
         };
         try w.writeByte('"');
     }
@@ -201,6 +244,15 @@ const testing = std.testing;
 fn sourceOf(label: []const u8, path: []const u8, default_backend: ?[]const u8, private: bool) Source {
     return .{ .path = path, .label = label, .default_backend = default_backend, .private = private };
 }
+
+fn gatedSource(label: []const u8, path: []const u8, default_backend: ?[]const u8, when: []const u8) Source {
+    return .{ .path = path, .label = label, .default_backend = default_backend, .when = when, .private = false };
+}
+
+/// A machine with no bindings at all: every gated file is excluded, every
+/// ungated one is in.
+const no_bindings: std.StringHashMap([]const u8) = .init(testing.allocator);
+const unbound: Resolver = .{ .live = &.{ .bindings = &no_bindings } };
 
 test "render: a bare formula is name only when the file declares the backend" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -298,7 +350,7 @@ test "targetFor: a file carrying only a blacklist row for the backend speaks it"
             sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
         },
     };
-    try testing.expectEqualStrings("/r/mixed.toml", targetFor(m, "brew").?.path);
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
 }
 
 test "targetFor: prefers a file whose own default names the backend" {
@@ -306,7 +358,7 @@ test "targetFor: prefers a file whose own default names the backend" {
         sourceOf("data/packages/a.toml", "/r/a.toml", "dnf", false),
         sourceOf("data/packages/b.toml", "/r/b.toml", "brew", false),
     } };
-    try testing.expectEqualStrings("/r/b.toml", targetFor(m, "brew").?.path);
+    try testing.expectEqualStrings("/r/b.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
 }
 
 test "targetFor: prefers the repo layer over the private one" {
@@ -314,7 +366,7 @@ test "targetFor: prefers the repo layer over the private one" {
         sourceOf("data/packages/local.toml", "/p/local.toml", "brew", true),
         sourceOf("data/packages/darwin.toml", "/r/darwin.toml", "brew", false),
     } };
-    try testing.expectEqualStrings("/r/darwin.toml", targetFor(m, "brew").?.path);
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
 }
 
 test "targetFor: a repo file merely carrying a row beats a private file declaring the default" {
@@ -334,7 +386,7 @@ test "targetFor: a repo file merely carrying a row beats a private file declarin
             sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
         },
     };
-    try testing.expectEqualStrings("/r/mixed.toml", targetFor(m, "brew").?.path);
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
 }
 
 test "targetFor: falls back to a file already carrying a row for the backend" {
@@ -351,12 +403,57 @@ test "targetFor: falls back to a file already carrying a row for the backend" {
         .packages = &.{row},
         .sources = &.{sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false)},
     };
-    try testing.expectEqualStrings("/r/mixed.toml", targetFor(m, "brew").?.path);
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
 }
 
 test "targetFor: no file speaks the backend" {
     const m: Manifest = .{ .sources = &.{sourceOf("data/packages/a.toml", "/r/a.toml", "dnf", false)} };
-    try testing.expect(targetFor(m, "brew") == null);
+    try testing.expect((try targetFor(testing.allocator, m, "brew", &unbound)) == null);
+}
+
+test "targetFor: a file whose gate excludes this machine is never the target" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const excluded: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/linux.toml", "/r/linux.toml", "brew", "os=linux"),
+    } };
+    try testing.expect((try targetFor(a, excluded, "brew", &r)) == null);
+
+    // The same file, gated to this machine, is the target as before.
+    const included: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/darwin.toml", "/r/darwin.toml", "brew", "os=darwin"),
+    } };
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, included, "brew", &r)).?.path);
+}
+
+test "targetFor: an excluded file is passed over for one that holds here" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // Basename order would pick a.toml; its gate hands the row to b.toml.
+    const m: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/a.toml", "/r/a.toml", "brew", "os=linux"),
+        sourceOf("data/packages/b.toml", "/r/b.toml", "brew", false),
+    } };
+    try testing.expectEqualStrings("/r/b.toml", (try targetFor(a, m, "brew", &r)).?.path);
+}
+
+test "render: DEL is escaped, as a TOML basic string requires" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try render(a, .packages, .{ .name = "a\x7fb\x01c" }, null);
+    try testing.expectEqualStrings("\n[[packages]]\nname = \"a\\u007fb\\u0001c\"\n", got);
 }
 
 test "append: adds a block and leaves every existing byte alone" {
@@ -425,6 +522,51 @@ test "append: an existing file keeps its mode" {
 
     const st = try Io.Dir.cwd().statFile(io, path, .{});
     try testing.expectEqual(@as(u32, 0o600), @as(u32, st.permissions.toMode() & 0o777));
+}
+
+test "append: a symlinked manifest is rewritten through the link, which survives" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real");
+    try tmp.dir.createDirPath(io, "repo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/p.toml", .data = "backend = \"brew\"\n" });
+    // A relative link, resolved against the link's own directory, through a
+    // second hop, so both the relative and the chained case are covered.
+    try tmp.dir.symLink(io, "../real/p.toml", "repo/mid.toml", .{});
+    try tmp.dir.symLink(io, "mid.toml", "repo/p.toml", .{});
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const link = try std.fs.path.join(a, &.{ root, "repo", "p.toml" });
+    const real = try std.fs.path.join(a, &.{ root, "real", "p.toml" });
+
+    try append(a, io, link, "\n[[packages]]\nname = \"htop\"\n");
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expectEqualStrings("mid.toml", buf[0..try Io.Dir.cwd().readLink(io, link, &buf)]);
+    const after = try Io.Dir.cwd().readFileAlloc(io, real, a, .limited(1 << 20));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n", after);
+}
+
+test "append: a symlink chain past the hop bound is refused by name" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(io, "l0", "l0", .{});
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "l0" });
+
+    try testing.expectError(Error.TooManySymlinkHops, append(a, io, link, "\n[[packages]]\nname = \"htop\"\n"));
 }
 
 test "append: a missing file is created without a leading blank line" {

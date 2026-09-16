@@ -516,7 +516,7 @@ fn reconcilePackages(
                 continue;
             }
 
-            const target = mox.packages.write.targetFor(m, b.backend) orelse {
+            const target = (try mox.packages.write.targetFor(ctx.alloc, m, b.backend, bindings)) orelse {
                 // Said once per backend: every untracked package of that
                 // backend has the same missing file.
                 if (!no_file_said) {
