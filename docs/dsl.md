@@ -418,7 +418,7 @@ Each needed fact (declared or scanned) is checked against THIS stage's
 actual projected environment, not an abstract name set -- so a projection
 collision (two names sanitizing to the same `MOX_FACT_*`, both dropped) or a
 name that maps to no fact at all is caught here, not assumed away. The
-script then lands in one of six outcomes, each its own printed line:
+script then lands in one of seven outcomes, each its own printed line:
 
 | Outcome | Printed | When |
 | --- | --- | --- |

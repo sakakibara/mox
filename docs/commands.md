@@ -373,10 +373,12 @@ toward the exit code exactly as file drift does, so `mox status` answers
 one question -- does this machine match what it declares -- over files
 and packages alike. A manifest that is itself malformed, a plugin that
 fails, or a manager query that fails is an error, not drift: the run exits
-1 with `mox status: packages: ...` on stderr, and under `--json` or
-`--porcelain` the package set on stdout is empty or partial, so tooling must
-treat rc 1 together with that stderr line as an error, not as a clean
-machine. Plugin notes go to stderr as `mox status: note: ...` in those modes.
+1 with `mox status: packages: ...` on stderr. A manifest mox would not read
+at all says so on stdout too, as a record of its own in both machine formats,
+so a refusal is never read as a clean machine; a plugin or query failure
+leaves the package set partial, so tooling reads rc 1 with that stderr line
+as an error. Plugin notes go to stderr as `mox status: note: ...` in those
+modes.
 
 `--drift` shows only the drift set (the report `mox apply` prints for the
 same tree, from the same classifier -- the two never disagree), dropping
@@ -391,7 +393,9 @@ and `commit` may record it instead). `--json` and
 
 `--json` emits `{"files": [...], "packages": [...]}`. A file is
 `{path, kind, key?, first_contact}`; a broken manager is
-`{backend, state: "broken", exit}`; a package is
+`{backend, state: "broken", exit}`; a manifest that would not load is
+`{state: "refused"}`, alone and leading the package set, since it is the
+whole pass rather than one backend; a package is
 `{backend, state, id, name?}`, where `state` is `missing` or `untracked`
 and `id` is the identity its backend compares by -- a brew cask carries
 its `cask:` prefix, so it can never be read as the formula of the same
@@ -402,7 +406,8 @@ missing package.
 the record kind as the first field. File records are `kind`, `key`,
 `first_contact` (0/1), `path`. Package records are `package_missing` or
 `package_untracked`, then `backend`, then `id`; a broken manager is
-`package_broken`, then `backend`, then the exit code. Field count varies by
+`package_broken`, then `backend`, then the exit code; a manifest that would
+not load is `package_refused`, a record of one field. Field count varies by
 kind, so switch on the first field before reading the rest. In
 `--porcelain` the free-form fields are
 C-escaped (`\\`, `\t`, `\n`, `\r`) so a tab or newline in them can never
@@ -520,7 +525,9 @@ private layer shadows the repo.
 Health report: source files not tracked by git, source modes git cannot carry
 that are not yet in `.mox/attributes.toml` (lost on clone), sources that
 compose to nothing under every configuration (a contradictory or mistyped
-whole-file gate), malformed state (provenance), and a `facts.toml` fact bound
+whole-file gate), malformed state (provenance), a file in the private layer's
+`data/` that is not a data source (`private-data <path>`), since nothing
+applies it, and a `facts.toml` fact bound
 on this machine that nothing in the repo consumes (`unused-fact <name> (bound
 but unused by this repo)`) -- advisory, since deleting or renaming a fact the
 repo no longer reads is the user's call. When the unused name is a probable

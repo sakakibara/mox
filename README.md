@@ -151,10 +151,13 @@ The rest of the model, briefly:
   (`scripts/pre/os=darwin/`) or a leading `# mox: when`, and guard
   expensive work with `mox trigger`.
 - **Packages** -- a `data/packages/*.toml` manifest declares what belongs on
-  a machine across brew, apt, dnf, pacman, zypper, scoop and winget. `status`
+  a machine across brew, apt, dnf, pacman, zypper, scoop and winget, any
+  other manager through an executable in `scripts/backends/`, and a manager
+  that is absent from its own pinned installer. `status`
   reports what is missing or untracked, `apply` installs the missing, and
-  `commit` records what you installed by hand. Never uninstalls. A repo
-  without that directory queries no package manager at all. See
+  `commit` records what you installed by hand. Never uninstalls. `status` and
+  `commit` run a repo's backend executables, which `apply` alone did before.
+  A repo without that directory queries no package manager at all. See
   [docs/packages.md](docs/packages.md).
 
 ## Commands

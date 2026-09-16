@@ -71,10 +71,15 @@ All notable changes to mox are documented here. The format follows
   and notes that apply will bootstrap it; a manager whose `--version` fails
   is reported `BROKEN` and counted in the exit code, with a
   `package_broken` porcelain record and a `{backend, state, exit}` JSON
-  entry. `mox --help` names `MOX_SCRIPT_TIMEOUT_MS` and
-  `MOX_INSTALL_TIMEOUT_MS`. A manifest refuses an unknown top-level key, a
+  entry, and a manifest mox will not read at all is a record of its own in
+  both machine formats (`{"state":"refused"}` and `package_refused`), so a
+  refusal is never read as a clean machine. `mox --help` names
+  `MOX_SCRIPT_TIMEOUT_MS`, `MOX_INSTALL_TIMEOUT_MS` and
+  `MOX_PACKAGES_DEPTH`. A manifest refuses an unknown top-level key, a
   `name` that is blank or carries whitespace, a control byte or a byte that
-  is not UTF-8, a file-level `backend` naming no adapter, a byte order mark, a second
+  is not UTF-8 or runs past 256 bytes -- one rule with the shape an id must
+  have, so a row an adapter writes is a row the loader reads back -- a
+  file-level `backend` naming no adapter, a byte order mark, a second
   `[[bootstrap]]` row for one backend, and two rows naming one package
   under the same gate, and a zypper row naming a pattern, patch, product,
   source package or application rather than a package, which `rpm` could
@@ -105,7 +110,8 @@ All notable changes to mox are documented here. The format follows
   would never be desired on the machine that recorded it. A blacklist row
   goes to an ungated file, and commit says so rather than writing one the
   next command would refuse. A diagnostic that names two files says which
-  layer each is in, and one about a row names the row by index.
+  layer a private file is in, and one about a row names that row's place in
+  its array.
 - A setup script and a `check` hook each lead their own process group, so a
   bound reaches what the script started rather than the script alone: an
   orphan holding mox's stdout would keep a `mox apply | ...` pipeline open
@@ -113,7 +119,12 @@ All notable changes to mox are documented here. The format follows
   way a streamed install is, so a `sudo` in a pre-script can prompt, Ctrl-C
   goes to the script, and Ctrl-Z suspends it; one that stops waiting for a
   terminal the run does not have (`mox apply &`, a CI job) is ended and
-  named rather than waited out to the bound.
+  named rather than waited out to the bound. Every child mox waits on itself
+  is waited on the same way, so a captured query or a `check` hook that stops
+  -- anything reaching for `sudo` from a background process group -- is ended
+  at once instead of sitting out its bound, or forever where the bound is
+  disabled. mox answers SIGQUIT as it answers SIGINT, SIGTERM and SIGHUP:
+  Ctrl-backslash takes the child's group with it rather than leaving it running.
 
 ### Fixed
 - The timeout watchdog for setup scripts and check hooks runs on its own

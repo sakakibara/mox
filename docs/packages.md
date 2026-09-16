@@ -58,13 +58,17 @@ beside the shared list without replacing it.
 | `backend` | Which manager. Per row, or once per file as a top-level default. Must name a registered adapter. |
 | `when` | An axis expression, the same grammar as `# mox: when` -- os, arch, profile, tool, env. Per row, or once per file as a top-level gate on every `[[packages]]` and `[[bootstrap]]` row in it; a row's own `when` narrows the file's (`(file) and (row)`). A `[[blacklist]]` row takes no gate and may not sit in a gated file. |
 
+A refusal names a row by its position in its array, counting from zero -- the
+same numbering `mox commit` uses for a data source's rows.
+
 Every other key belongs to the backend adapter (below). An unknown key, a
 missing required one, or a wrong type is an error naming the file and the
 row, checked on every machine rather than only where that manager runs. So
 is a top-level key the format does not define (`[[package]]`, singular,
 would otherwise load as no rows at all and report a clean machine), a `name`
-that is blank or carries whitespace, control characters, or bytes that are
-not UTF-8, a second
+that is blank, runs past 256 bytes, or carries whitespace, control
+characters or bytes that are not UTF-8 -- one rule with the shape an id must
+have, so a row an adapter writes is a row this loader reads back -- a second
 `[[bootstrap]]` row for one backend, and two `[[packages]]` rows that name
 one package under the same gate -- the last checked ungated, so a pair gated
 to another OS is refused here rather than on the machine it breaks. A file
@@ -81,6 +85,10 @@ regardless of which machine is asking -- and for the same reason a file whose
 top-level `when` would gate them is refused: put them in an ungated file.
 `mox commit` writes a blacklist row into an ungated file that declares the
 backend, and says so rather than writing one the next command would refuse.
+Where every repo file is gated, the row goes to an ungated file in the
+private layer: narrower than the gate the rule refuses, and narrower is what
+that layer means -- the row holds on this machine and is in no other
+machine's manifest to sit inert in. commit prints the layer it wrote to.
 
 Declaring the same package in `[[packages]]` and `[[blacklist]]` is a
 contradiction and is refused.
@@ -261,8 +269,8 @@ is the manager's own behavior, not a mox decision.)
   any file whose own `when` excludes this machine, since a row appended
   there would never be desired here. When no
   file remains, commit says so once per backend
-  (`no data/packages file declares backend "x"; add one to record its N
-  untracked package(s)`) and counts those packages as skipped: creating a
+  (`no data/packages file that holds on this machine
+  declares backend "x"; add one to record its N untracked package(s)`) and counts those packages as skipped: creating a
   file is a decision about where the rows live, not one to make silently.
 - **blacklist** -- append a `[[blacklist]]` row so it is never offered again
 - **skip** -- leave it untracked; the default, so `--yes` records nothing
@@ -302,8 +310,10 @@ POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`.
   as a note under `packages:`, so a MacPorts script in a shared repo neither
   breaks nor silently vanishes on a Windows machine.
 
-Any entry whose name begins with a dot is ignored, so a `.gitkeep` can keep
-an empty `scripts/backends/` in git. A directory there is an error naming the
+A `.gitkeep` or `.keep` is ignored, so an empty `scripts/backends/` can be
+kept in git; any other name is a backend, so one hidden by an accidental dot
+is named rather than silently skipped and then read as a typo from the
+manifest's side. A directory there is an error naming the
 path, never "no backend named x".
 
 There is no axis gating (`os=darwin/`) and no private-layer shadowing.
@@ -389,8 +399,8 @@ backend.
 - Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
   CRLF); an id that is empty, exceeds 256 bytes, or carries whitespace, a
   control byte or a byte that is not UTF-8 is an error naming the plugin.
-  That is the same class the manifest enforces on a `name`, so a row
-  `declare` writes is a row the next command can read back. That catches a lost line separator across a large
+  That is the same rule, in the same bytes, the manifest enforces on a
+  `name`, so a row `declare` writes is a row the next command can read back. That catches a lost line separator across a large
   set; a fixture test in your repo is the real defence.
 
 `bootstrap` runs only when the manifest declares a `[[bootstrap]]` row for
@@ -408,7 +418,9 @@ PATH.
 A plugin runs as you, at the trust `scripts/pre` already has, under the
 same environment a setup script gets: `MOX_REPO`, `MOX_STATE_DIR`,
 `MOX_HOME`, `PATH` and every fact as `MOX_FACT_*`, plus `MOX_PACKAGES_DEPTH`,
-which counts how deep in a plugin this mox is running. A mox reached from
+which counts how many mox runs already sit above this one. It is read as a
+yes or no -- any value present, `0` included, means a mox is above -- so a
+plugin cannot clear it by setting it. A mox reached from
 inside a plugin discovers no plugin at all and says so as a note, so a plugin
 that calls mox cannot multiply itself; the compiled backends still work
 there. That holds for `status`
