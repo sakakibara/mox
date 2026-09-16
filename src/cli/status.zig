@@ -29,7 +29,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -306,9 +306,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         } else .{};
         problems += pkgs.problems();
         if (a.json)
-            try emitJson(ctx.out, units.items, pkgs.report)
+            try emitJson(ctx.out, units.items, pkgs)
         else
-            try emitPorcelain(ctx.out, units.items, pkgs.report);
+            try emitPorcelain(ctx.out, units.items, pkgs);
         return if (problems > 0) 1 else 0;
     }
 
@@ -339,7 +339,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// package manager and never reports every installed package as untracked.
 ///
 /// `broken` is a manifest that will not load or check, which is an error
-/// rather than drift and is reported as such.
+/// rather than drift and is reported as such -- in every format, since an
+/// empty report reads as a clean machine in exactly the formats that have no
+/// word for the refusal.
 const Packages = struct {
     report: mox.packages.report.Report = .{},
     broken: bool = false,
@@ -498,7 +500,7 @@ fn printPackages(
     }
     // A manifest that failed to load or validate has said why on stderr;
     // without a word here the empty section reads as a clean machine.
-    if (pkgs.broken) try ctx.out.writeAll("  ERROR     the manifest was refused; see the message above\n");
+    if (pkgs.broken) try ctx.out.writeAll("  ERROR     the manifest was refused; the reason is the mox status: packages: line\n");
     for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
@@ -526,7 +528,11 @@ fn printPackages(
 /// backend compares by (a brew cask carries its `cask:` prefix, so it can
 /// never be confused with the formula of the same name). `name` is what the
 /// manifest row spells, present only for a missing package. A manager that
-/// is there but broken is `{backend, state: "broken", exit}`.
+/// is there but broken is `{backend, state: "broken", exit}`. A manifest that
+/// would not load or validate is `{"state":"refused"}`, carrying no `backend`
+/// because nothing was reached: without it the empty array is byte-identical
+/// to a machine whose every package is accounted for, and the reason is on
+/// stderr.
 /// `kind` is a stable tag (`whole_file`, `owned_key`, `symlink_target`,
 /// `generated_set`, `vanished`); `key` appears only for `owned_key` (its owned
 /// key path, or null for a secret whole-scope record). The schema is locked by
@@ -534,12 +540,12 @@ fn printPackages(
 fn emitJson(
     out: *std.Io.Writer,
     units: []const mox.apply.drift.Unit,
-    rep: mox.packages.report.Report,
+    pkgs: Packages,
 ) !void {
     try out.writeAll("{\"files\":");
     try emitJsonFiles(out, units);
     try out.writeAll(",\"packages\":");
-    try emitJsonPackages(out, rep);
+    try emitJsonPackages(out, pkgs);
     try out.writeAll("}\n");
 }
 
@@ -564,9 +570,14 @@ fn emitJsonFiles(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void
     try out.writeAll("]");
 }
 
-fn emitJsonPackages(out: *std.Io.Writer, rep: mox.packages.report.Report) !void {
+fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
+    const rep = pkgs.report;
     try out.writeByte('[');
     var first = true;
+    if (pkgs.broken) {
+        first = false;
+        try out.writeAll("{\"state\":\"refused\"}");
+    }
     for (rep.broken) |b| {
         if (!first) try out.writeByte(',');
         first = false;
@@ -620,12 +631,17 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
 /// A package record is `package_missing` / `package_untracked` \t backend \t
-/// id, or `package_broken` \t backend \t exit code.
+/// id, or `package_broken` \t backend \t exit code. A manifest that would not
+/// load or validate is the single field `package_refused`, with no backend
+/// because nothing was reached: without it the absence of package records is
+/// byte-identical to a machine whose every package is accounted for, and the
+/// reason is on stderr.
 fn emitPorcelain(
     out: *std.Io.Writer,
     units: []const mox.apply.drift.Unit,
-    rep: mox.packages.report.Report,
+    pkgs: Packages,
 ) !void {
+    const rep = pkgs.report;
     for (units) |u| {
         const key: []const u8 = switch (u.kind) {
             .owned_key => |k| k orelse "",
@@ -637,6 +653,7 @@ fn emitPorcelain(
         try writePorcelainField(out, u.path);
         try out.writeByte('\n');
     }
+    if (pkgs.broken) try out.writeAll("package_refused\n");
     for (rep.broken) |b| {
         try out.writeAll("package_broken\t");
         try writePorcelainField(out, b.backend);
@@ -792,7 +809,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, and each manager that is BROKEN, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, and each manager that is BROKEN, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A manifest mox refuses is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -900,7 +917,7 @@ test "emitPorcelain / emitJson: packages ride the same records, keyed by state" 
     // A missing cask carries the prefixed id it is compared by AND the name
     // the manifest spells, so neither has to be re-derived downstream.
     var pw: std.Io.Writer.Allocating = .init(al);
-    try emitPorcelain(&pw.writer, &.{}, rep);
+    try emitPorcelain(&pw.writer, &.{}, .{ .report = rep });
     try testing.expectEqualStrings(
         "package_missing\tbrew\tcask:ghostty\n" ++
             "package_untracked\tbrew\thtop\n",
@@ -908,7 +925,7 @@ test "emitPorcelain / emitJson: packages ride the same records, keyed by state" 
     );
 
     var jw: std.Io.Writer.Allocating = .init(al);
-    try emitJson(&jw.writer, &.{}, rep);
+    try emitJson(&jw.writer, &.{}, .{ .report = rep });
     try testing.expectEqualStrings(
         "{\"files\":[],\"packages\":[" ++
             "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"cask:ghostty\",\"name\":\"ghostty\"}," ++
@@ -926,13 +943,47 @@ test "emitPorcelain / emitJson: a broken manager is a record of its own" {
     const rep: mox.packages.report.Report = .{ .in_use = true, .broken = &broken };
 
     var pw: std.Io.Writer.Allocating = .init(al);
-    try emitPorcelain(&pw.writer, &.{}, rep);
+    try emitPorcelain(&pw.writer, &.{}, .{ .report = rep });
     try testing.expectEqualStrings("package_broken\tbrew\t1\n", pw.written());
 
     var jw: std.Io.Writer.Allocating = .init(al);
-    try emitJson(&jw.writer, &.{}, rep);
+    try emitJson(&jw.writer, &.{}, .{ .report = rep });
     try testing.expectEqualStrings(
         "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}]}\n",
         jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: a refused manifest is a record, never an empty package set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // What the machine formats saw of a refusal before: nothing at all, which
+    // is what a machine with every package accounted for looks like.
+    var clean_p: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&clean_p.writer, &.{}, .{});
+    try testing.expectEqualStrings("", clean_p.written());
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, .{ .broken = true });
+    try testing.expectEqualStrings("package_refused\n", pw.written());
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, .{ .broken = true });
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[{\"state\":\"refused\"}]}\n",
+        jw.written(),
+    );
+
+    // The refusal is the whole pass, so it leads; a manager reached before the
+    // manifest was rejected still gets its own record after it.
+    const broken = [_]mox.packages.report.Broken{.{ .backend = "brew", .probe = "brew --version", .code = 1 }};
+    var both: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&both.writer, &.{}, .{ .broken = true, .report = .{ .in_use = true, .broken = &broken } });
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[{\"state\":\"refused\"}," ++
+            "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}]}\n",
+        both.written(),
     );
 }

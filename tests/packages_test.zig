@@ -1569,13 +1569,17 @@ fn expectPorcelain(out: []const u8) !void {
         var n: usize = 1;
         while (fields.next()) |_| n += 1;
         const known = for ([_][]const u8{
-            "whole_file",      "owned_key",         "symlink_target", "generated_set", "vanished",
-            "package_missing", "package_untracked", "package_broken",
+            "whole_file",      "owned_key",         "symlink_target", "generated_set",   "vanished",
+            "package_missing", "package_untracked", "package_broken", "package_refused",
         }) |k| {
             if (std.mem.eql(u8, k, kind)) break true;
         } else false;
         try std.testing.expect(known);
-        const want: usize = if (std.mem.startsWith(u8, kind, "package_")) 3 else 4;
+        // A refused manifest reached no backend and no package, so the kind is
+        // the whole record.
+        const want: usize = if (std.mem.eql(u8, kind, "package_refused"))
+            1
+        else if (std.mem.startsWith(u8, kind, "package_")) 3 else 4;
         try std.testing.expectEqual(want, n);
     }
 }
@@ -2351,7 +2355,7 @@ test "status: a manifest that will not load prints the packages section, not sil
     // repo that never opted in.
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; see the message above\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; the reason is the mox status: packages: line\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
@@ -2359,7 +2363,7 @@ test "status: a manifest that will not load prints the packages section, not sil
     // `--drift` opens the section for it too: the refusal is the problem.
     const d = try h.run(&.{ "mox", "status", "--drift" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "\npackages:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d.out, "  ERROR     the manifest was refused; see the message above\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "  ERROR     the manifest was refused; the reason is the mox status: packages: line\n") != null);
     try std.testing.expectEqual(@as(u8, 1), d.rc);
 }
 
@@ -2388,9 +2392,46 @@ test "status: a manifest that will not validate prints the same ERROR row" {
 
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; see the message above\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; the reason is the mox status: packages: line\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: row \"ripgrep\": no backend named \"brw\"") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "status --json / --porcelain: a refused manifest is a record, not a clean machine" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A blacklist row in a gated file: refused, so no backend is ever reached
+    // and the drift set says nothing about this machine's packages.
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\when = "os=darwin"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+    );
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    try std.testing.expectEqualStrings("{\"files\":[],\"packages\":[{\"state\":\"refused\"}]}\n", j.out);
+    try std.testing.expect(std.mem.indexOf(u8, j.err, "mox status: packages: data/packages/darwin.toml") != null);
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try expectPorcelain(p.out);
+    try std.testing.expectEqualStrings("package_refused\n", p.out);
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
 test "status: a file-level backend naming no adapter is refused, and the file is what it names" {

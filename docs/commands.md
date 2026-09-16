@@ -415,7 +415,7 @@ break the framing; unescape those four to recover exact bytes. Both imply
 | `--color <color>` | auto|always|never |
 | `--drift` | show only the drift set (suppress the clean/gated table) |
 | `--json` | emit the drift set as JSON (implies --drift) |
-| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer (implies --drift) |
+| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
 <!-- /generated -->
 
 ## export
