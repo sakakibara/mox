@@ -147,6 +147,8 @@ pub const Error = error{
 };
 
 const core_keys = [_][]const u8{ "name", "backend", "when" };
+const file_keys = [_][]const u8{ "backend", "when", "packages", "blacklist", "bootstrap" };
+const utf8_bom = "\xEF\xBB\xBF";
 
 /// Load every `data/packages/*.toml` row from the repo and private layers.
 /// A missing directory in either layer is not an error. `diag` (when
@@ -171,12 +173,25 @@ pub fn load(
             if (diag) |d| d.set("{s}: unreadable: {s}", .{ f.label, @errorName(e) });
             return Error.MalformedPackageFile;
         };
+        if (std.mem.startsWith(u8, content, utf8_bom)) {
+            if (diag) |d| d.set("{s}: begins with a byte order mark; save the file without one", .{f.label});
+            return Error.MalformedPackageFile;
+        }
         const doc = toml.parse(arena, content, .{}) catch |e| {
             if (diag) |d| d.set("{s}: TOML parse failed: {s}", .{ f.label, @errorName(e) });
             return Error.MalformedPackageFile;
         };
         if (doc != .table) {
             if (diag) |d| d.set("{s}: not a TOML table", .{f.label});
+            return Error.MalformedPackageFile;
+        }
+        // `[[package]]` would otherwise load as zero rows and a clean report.
+        for (doc.table.keys()) |k| {
+            if (isFileKey(k)) continue;
+            if (diag) |d| d.set(
+                "{s}: unknown top-level key \"{s}\" (a manifest file takes \"backend\", \"when\", \"packages\", \"blacklist\", \"bootstrap\")",
+                .{ f.label, k },
+            );
             return Error.MalformedPackageFile;
         }
 
@@ -301,11 +316,17 @@ fn discover(
                 if (diag) |d| d.set("data/packages: not a directory: {s}", .{dir_path});
                 return e;
             },
-            else => return e,
+            else => {
+                if (diag) |d| d.set("data/packages: cannot open {s}: {s}", .{ dir_path, @errorName(e) });
+                return e;
+            },
         };
         defer dir.close(io);
         directory = true;
-        const entries = try dirent.sorted(arena, io, dir);
+        const entries = dirent.sorted(arena, io, dir) catch |e| {
+            if (diag) |d| d.set("data/packages: cannot read {s}: {s}", .{ dir_path, @errorName(e) });
+            return e;
+        };
         for (entries) |e| {
             if (e.kind != .file and e.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, e.name, ".toml")) continue;
@@ -351,6 +372,10 @@ fn parseRow(
         };
         if (v != .string or v.string.len == 0) {
             if (diag) |d| d.set("{s}: row {d}: \"name\" must be a non-empty string", .{ f.label, index });
+            return Error.MalformedPackageRow;
+        }
+        if (!nameShapeOk(v.string)) {
+            if (diag) |d| d.set("{s}: row {d}: \"name\" must not be blank or contain whitespace or control characters", .{ f.label, index });
             return Error.MalformedPackageRow;
         }
         break :blk v.string;
@@ -519,6 +544,10 @@ fn parseBlacklistRow(
             if (diag) |d| d.set("{s}: blacklist row {d}: \"name\" must be a non-empty string", .{ f.label, index });
             return Error.MalformedPackageRow;
         }
+        if (!nameShapeOk(v.string)) {
+            if (diag) |d| d.set("{s}: blacklist row {d}: \"name\" must not be blank or contain whitespace or control characters", .{ f.label, index });
+            return Error.MalformedPackageRow;
+        }
         break :blk v.string;
     };
 
@@ -574,6 +603,24 @@ fn isCoreKey(k: []const u8) bool {
         if (std.mem.eql(u8, k, c)) return true;
     }
     return false;
+}
+
+fn isFileKey(k: []const u8) bool {
+    for (file_keys) |c| {
+        if (std.mem.eql(u8, k, c)) return true;
+    }
+    return false;
+}
+
+/// A name a manager could be handed: no whitespace or control byte, and
+/// not blank. Checked here so `name = " "` is refused by the file and row
+/// it sits in rather than blamed on the adapter it reaches.
+fn nameShapeOk(name: []const u8) bool {
+    if (std.mem.trim(u8, name, " \t\r\n").len == 0) return false;
+    for (name) |c| {
+        if (std.ascii.isWhitespace(c) or std.ascii.isControl(c)) return false;
+    }
+    return true;
 }
 
 pub fn fieldOf(arena: std.mem.Allocator, v: toml.Value) !?Field {
@@ -1061,4 +1108,112 @@ test "load: a non-toml entry in the packages directory is ignored" {
 
     const m = try load(a, io, repo, "", null);
     try testing.expectEqual(@as(usize, 1), m.packages.len);
+}
+
+test "load: a byte order mark is named as the cause, not a bare parse error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data = utf8_bom ++ "backend = \"brew\"\n" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageFile, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: begins with a byte order mark; save the file without one",
+        d.capture().?,
+    );
+}
+
+test "load: an unknown top-level key is refused, so [[package]] cannot load as zero rows" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data =
+        \\backend = "brew"
+        \\
+        \\[[package]]
+        \\name = "ripgrep"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageFile, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: unknown top-level key \"package\" (a manifest file takes \"backend\", \"when\", \"packages\", \"blacklist\", \"bootstrap\")",
+        d.capture().?,
+    );
+}
+
+test "load: a blank name, or one with whitespace or a control character, is refused by file and row" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Written as TOML escapes: a raw control byte is refused by the parser
+    // before the row is ever built, which is a different error.
+    for ([_][]const u8{ " ", "rip grep", "ripgrep\\t", "rip\\u0001grep" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "repo/data/packages");
+        const body = try std.fmt.allocPrint(a, "backend = \"brew\"\n\n[[packages]]\nname = \"ok\"\n\n[[packages]]\nname = \"{s}\"\n", .{name});
+        try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data = body });
+        const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+        var d: Diag = .{};
+        try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+        try testing.expectEqualStrings(
+            "data/packages/a.toml: row 1: \"name\" must not be blank or contain whitespace or control characters",
+            d.capture().?,
+        );
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data = "backend = \"brew\"\n\n[[blacklist]]\nname = \" \"\n" });
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: blacklist row 0: \"name\" must not be blank or contain whitespace or control characters",
+        d.capture().?,
+    );
+}
+
+test "load: an unreadable data/packages directory is named" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+    const dir_path = try std.fs.path.join(a, &.{ repo, "data", "packages" });
+    try Io.Dir.cwd().setFilePermissions(io, dir_path, Io.File.Permissions.fromMode(0o000), .{});
+    defer Io.Dir.cwd().setFilePermissions(io, dir_path, Io.File.Permissions.fromMode(0o755), .{}) catch {};
+
+    var d: Diag = .{};
+    const got = load(a, io, repo, "", &d);
+    // root opens anything; the check is about the wording when the open fails.
+    if (got) |_| return error.SkipZigTest else |e| {
+        try testing.expectEqual(error.AccessDenied, e);
+        const want = try std.fmt.allocPrint(a, "data/packages: cannot open {s}: AccessDenied", .{dir_path});
+        try testing.expectEqualStrings(want, d.capture().?);
+    }
 }

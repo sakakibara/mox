@@ -54,8 +54,8 @@ pub fn select(
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ row.backend, id });
         if (seen.get(key)) |first| {
             if (diag) |d| d.set(
-                "{s} and {s} both declare \"{s}\" for backend \"{s}\" on this machine",
-                .{ first.label, row.label, row.name, row.backend },
+                "{s}: row {d} and {s}: row {d} both declare \"{s}\" for backend \"{s}\" on this machine",
+                .{ first.label, first.index, row.label, row.index, row.name, row.backend },
             );
             return Error.DuplicatePackageRow;
         }
@@ -169,15 +169,20 @@ test "select: the same package active twice is refused, naming both files" {
     var bindings = std.StringHashMap([]const u8).init(a);
     const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
 
+    // Different gates that both hold here: `validate.all` compares gate text
+    // and lets these through, so this is the check that catches them.
+    var first = rowOf("ripgrep", "brew", "os=darwin", "data/packages/darwin.toml");
+    first.index = 2;
     const m: Manifest = .{ .packages = &.{
-        rowOf("ripgrep", "brew", null, "data/packages/darwin.toml"),
+        first,
         rowOf("ripgrep", "brew", null, "data/packages/local.toml"),
     } };
+    try bindings.put("os", "darwin");
 
     var d: Diag = .{};
     try testing.expectError(Error.DuplicatePackageRow, select(a, m, &r, brewRegistry(), &.{"brew"}, &d));
     try testing.expectEqualStrings(
-        "data/packages/darwin.toml and data/packages/local.toml both declare \"ripgrep\" for backend \"brew\" on this machine",
+        "data/packages/darwin.toml: row 2 and data/packages/local.toml: row 0 both declare \"ripgrep\" for backend \"brew\" on this machine",
         d.capture().?,
     );
 }

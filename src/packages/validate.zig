@@ -19,6 +19,8 @@ pub const Error = error{
     UnknownBackend,
     BlacklistedPackageDeclared,
     BootstrapUnsupported,
+    DuplicateBootstrapRow,
+    DuplicatePackageRow,
 };
 
 /// Check every row against the registry and its adapter. `diag` (when
@@ -53,7 +55,17 @@ pub fn all(
 
     // A bootstrap row names its backend the same way, and a typo there would
     // otherwise surface only on the one apply that needs the installer.
+    var installers = std.StringHashMap(manifest_mod.BootstrapRow).init(arena);
+    defer installers.deinit();
     for (m.bootstrap) |b| {
+        if (installers.get(b.backend)) |first| {
+            if (diag) |d| d.set(
+                "{s}: bootstrap row {d} declares a second bootstrap row for backend \"{s}\"; one per backend (the first is {s}: bootstrap row {d})",
+                .{ b.label, b.index, b.backend, first.label, first.index },
+            );
+            return Error.DuplicateBootstrapRow;
+        }
+        try installers.put(b.backend, b);
         const backend = registry.find(b.backend) orelse {
             if (diag) |d| d.set(
                 "{s}: bootstrap row: no backend named \"{s}\"",
@@ -74,6 +86,39 @@ pub fn all(
     }
 
     try contradictions(arena, m, registry, diag);
+    try duplicates(arena, m, registry, diag);
+}
+
+/// Two `[[packages]]` rows naming one package (by backend id) under the
+/// same gate. Checked ungated: `desired.select` sees only the rows active
+/// here, so a pair gated to another OS would pass every machine but the one
+/// it breaks. Gates are compared as text -- two spellings of one condition
+/// are left to `desired.select`, which still refuses them where both hold.
+fn duplicates(
+    arena: std.mem.Allocator,
+    m: Manifest,
+    registry: Registry,
+    diag: ?*Diag,
+) !void {
+    var seen = std.StringHashMap(manifest_mod.Row).init(arena);
+    defer seen.deinit();
+    for (m.packages) |row| {
+        const b = registry.find(row.backend) orelse continue;
+        if (b.inert) continue;
+        const id = b.idOf(arena, row) catch |e| {
+            if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, @errorName(e) });
+            return e;
+        };
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{ row.backend, id, row.when orelse "" });
+        if (seen.get(key)) |first| {
+            if (diag) |d| d.set(
+                "{s}: row {d} and {s}: row {d} both declare \"{s}\" for backend \"{s}\" with the same gate",
+                .{ first.label, first.index, row.label, row.index, row.name, row.backend },
+            );
+            return Error.DuplicatePackageRow;
+        }
+        try seen.put(key, row);
+    }
 }
 
 /// A package both declared and blacklisted. Compared by backend id, so a
@@ -116,14 +161,30 @@ const testing = std.testing;
 const test_backend = @import("test_backend.zig");
 
 fn rowOf(name: []const u8, backend: []const u8, when: ?[]const u8) manifest_mod.Row {
+    return rowAt(name, backend, when, "data/packages/a.toml", 0);
+}
+
+fn rowAt(name: []const u8, backend: []const u8, when: ?[]const u8, label: []const u8, index: usize) manifest_mod.Row {
     return .{
         .name = name,
         .backend = backend,
         .when = when,
         .fields = &.{},
         .origin = "/tmp/x.toml",
-        .label = "data/packages/a.toml",
-        .index = 0,
+        .label = label,
+        .index = index,
+    };
+}
+
+fn bootstrapAt(backend: []const u8, label: []const u8, index: usize) manifest_mod.BootstrapRow {
+    return .{
+        .backend = backend,
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+        .when = null,
+        .origin = "/tmp/x.toml",
+        .label = label,
+        .index = index,
     };
 }
 
@@ -254,4 +315,84 @@ test "all: a blacklisted cask does contradict the declared cask" {
     };
 
     try testing.expectError(Error.BlacklistedPackageDeclared, all(a, m, registryOf(&.{brew}), null));
+}
+
+test "all: a second bootstrap row for one backend is refused, naming both" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.makeBootstrappable("brew");
+    const m: Manifest = .{ .bootstrap = &.{
+        bootstrapAt("brew", "data/packages/darwin.toml", 0),
+        bootstrapAt("brew", "data/packages/local.toml", 0),
+    } };
+
+    var d: Diag = .{};
+    try testing.expectError(Error.DuplicateBootstrapRow, all(a, m, registryOf(&.{brew}), &d));
+    try testing.expectEqualStrings(
+        "data/packages/local.toml: bootstrap row 0 declares a second bootstrap row for backend \"brew\"; one per backend (the first is data/packages/darwin.toml: bootstrap row 0)",
+        d.capture().?,
+    );
+}
+
+test "all: one bootstrap row per backend is fine" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.makeBootstrappable("brew");
+    const scoop = test_backend.makeBootstrappable("scoop");
+    const m: Manifest = .{ .bootstrap = &.{
+        bootstrapAt("brew", "data/packages/darwin.toml", 0),
+        bootstrapAt("scoop", "data/packages/windows.toml", 0),
+    } };
+    try all(a, m, registryOf(&.{ brew, scoop }), null);
+}
+
+test "all: two identical rows under a gate this machine fails are still a duplicate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Both gated to linux: on a mac `desired.select` never sees either.
+    const brew = test_backend.make("brew");
+    const m: Manifest = .{ .packages = &.{
+        rowAt("ripgrep", "brew", "os=linux", "data/packages/a.toml", 1),
+        rowAt("ripgrep", "brew", "os=linux", "data/packages/local.toml", 0),
+    } };
+
+    var d: Diag = .{};
+    try testing.expectError(Error.DuplicatePackageRow, all(a, m, registryOf(&.{brew}), &d));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: row 1 and data/packages/local.toml: row 0 both declare \"ripgrep\" for backend \"brew\" with the same gate",
+        d.capture().?,
+    );
+}
+
+test "all: the same package under different gates, or with no gate beside a gate, is not a duplicate here" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.make("brew");
+    const m: Manifest = .{ .packages = &.{
+        rowAt("ripgrep", "brew", "profile=work", "data/packages/a.toml", 0),
+        rowAt("ripgrep", "brew", "not profile=work", "data/packages/a.toml", 1),
+        rowAt("ripgrep", "brew", null, "data/packages/local.toml", 0),
+    } };
+    try all(a, m, registryOf(&.{brew}), null);
+}
+
+test "all: two ungated identical rows are a duplicate, and a cask is not the formula" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.make("brew");
+    const ok: Manifest = .{ .packages = &.{ rowOf("docker", "brew", null), caskRow("docker") } };
+    try all(a, ok, registryOf(&.{brew}), null);
+
+    const dup: Manifest = .{ .packages = &.{ rowOf("docker", "brew", null), rowOf("docker", "brew", null) } };
+    try testing.expectError(Error.DuplicatePackageRow, all(a, dup, registryOf(&.{brew}), null));
 }

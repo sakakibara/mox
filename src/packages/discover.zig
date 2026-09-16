@@ -54,7 +54,10 @@ pub fn discover(
     diag: ?*Diag,
 ) ![]const Found {
     const dir_path = try std.fs.path.join(arena, &.{ repo_dir, "scripts", "backends" });
-    const entries = try dirent.sortedPath(arena, io, dir_path, .{ .iterate = true });
+    const entries = dirent.sortedPath(arena, io, dir_path, .{ .iterate = true }) catch |e| {
+        if (diag) |d| d.set("{s}: cannot read: {s}", .{ dir_path, @errorName(e) });
+        return e;
+    };
 
     var out: std.ArrayList(Found) = .empty;
     var seen = std.StringHashMap([]const u8).init(arena);
@@ -67,7 +70,7 @@ pub fn discover(
         const name = stemOf(e.name, kind);
 
         if (!nameOk(name)) {
-            if (diag) |d| d.set("{s}: not a backend name (use [A-Za-z0-9_-])", .{path});
+            if (diag) |d| d.set("{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends", .{path});
             return Error.BadBackendName;
         }
 
@@ -346,6 +349,36 @@ test "discover: a name outside the charset is refused with its path" {
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/mac ports", .data = "" });
 
     var d: Diag = .{};
-    try testing.expectError(Error.BadBackendName, discover(a, io, try tmpRepo(a, io, &tmp.sub_path), &d));
-    try testing.expect(std.mem.indexOf(u8, d.capture().?, "mac ports") != null);
+    const repo = try tmpRepo(a, io, &tmp.sub_path);
+    try testing.expectError(Error.BadBackendName, discover(a, io, repo, &d));
+    const want = try std.fmt.allocPrint(
+        a,
+        "{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends",
+        .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", "mac ports" })},
+    );
+    try testing.expectEqualStrings(want, d.capture().?);
+}
+
+test "discover: an unreadable scripts/backends directory is named" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    const repo = try tmpRepo(a, io, &tmp.sub_path);
+    const dir_path = try std.fs.path.join(a, &.{ repo, "scripts", "backends" });
+    try Io.Dir.cwd().setFilePermissions(io, dir_path, Io.File.Permissions.fromMode(0o000), .{});
+    defer Io.Dir.cwd().setFilePermissions(io, dir_path, Io.File.Permissions.fromMode(0o755), .{}) catch {};
+
+    var d: Diag = .{};
+    const got = discover(a, io, repo, &d);
+    // root opens anything; the check is about the wording when the open fails.
+    if (got) |_| return error.SkipZigTest else |e| {
+        try testing.expectEqual(error.AccessDenied, e);
+        const want = try std.fmt.allocPrint(a, "{s}: cannot read: AccessDenied", .{dir_path});
+        try testing.expectEqualStrings(want, d.capture().?);
+    }
 }

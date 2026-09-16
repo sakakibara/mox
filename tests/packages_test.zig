@@ -1553,6 +1553,27 @@ test "commit: a row recorded into the private layer is data there, never a manag
     try std.testing.expect(std.mem.indexOf(u8, l.out, "clean     brew") != null);
     try std.testing.expectEqual(@as(u8, 0), l.rc);
 }
+test "status: a manifest with [[package]] is refused rather than read as an empty one" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[package]]\nname = \"ripgrep\"\n");
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: unknown top-level key \"package\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
 test "commit: a malformed manifest is named, and no manager is asked anything" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

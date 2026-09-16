@@ -17,6 +17,12 @@ pub fn make(name: []const u8) Backend {
     return .{ .name = name, .ctx = undefined, .vtable = &vtable };
 }
 
+/// The same stub for a manager that ships an installer, so a test about
+/// `[[bootstrap]]` rows is not answered by "this one ships with the OS".
+pub fn makeBootstrappable(name: []const u8) Backend {
+    return .{ .name = name, .ctx = undefined, .vtable = &bootstrappable_vtable };
+}
+
 const vtable: Backend.VTable = .{
     .available = unreachedAvailable,
     .validate = validate,
@@ -24,6 +30,16 @@ const vtable: Backend.VTable = .{
     .installedExplicit = unreachedInstalled,
     .install = unreachedInstall,
     .declare = declare,
+};
+
+const bootstrappable_vtable: Backend.VTable = .{
+    .available = unreachedAvailable,
+    .validate = validate,
+    .idOf = idOf,
+    .installedExplicit = unreachedInstalled,
+    .install = unreachedInstall,
+    .declare = declare,
+    .bootstrap = unreachedBootstrap,
 };
 
 fn idOf(_: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
@@ -55,5 +71,8 @@ fn unreachedInstalled(_: *anyopaque, _: std.mem.Allocator) anyerror![]const []co
     return error.Unreached;
 }
 fn unreachedInstall(_: *anyopaque, _: std.mem.Allocator, _: []const Row) anyerror!void {
+    return error.Unreached;
+}
+fn unreachedBootstrap(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?[]const u8 {
     return error.Unreached;
 }
