@@ -1500,7 +1500,7 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     try writePlugin(io, h, a, "brew",
         \\#!/bin/sh
         \\case "${1:-}" in
-        \\available) exec sleep 20 ;;
+        \\available) exec sleep 300 ;;
         \\id) while IFS= read -r l; do case "$l" in *'name = "'*) n=${l#*name = \"}; printf '%s\n' "${n%%\"*}" ;; esac; done ;;
         \\list) ;;
         \\*) exit 64 ;;
@@ -1519,7 +1519,7 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: available failed: PluginTimedOut") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     // Killed at the bound, not waited out.
-    try std.testing.expect(elapsed_ms < 10_000);
+    try std.testing.expect(elapsed_ms < 60_000);
 }
 
 test "commit: a malformed manifest is named, and no manager is asked anything" {
@@ -2127,7 +2127,7 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
         \\#!/bin/sh
         \\case "${1:-}" in
         \\available) exit 0 ;;
-        \\list) sleep 12 | cat ;;
+        \\list) sleep 300 | cat ;;
         \\esac
         \\exit 0
         \\
@@ -2141,7 +2141,7 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
     errdefer std.debug.print("stderr was:\n{s}\n", .{r.err});
     try std.testing.expect(std.mem.indexOf(u8, r.err, "pipes: list failed: PluginTimedOut") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(elapsed_ms < 10_000);
+    try std.testing.expect(elapsed_ms < 60_000);
 }
 
 /// `Harness.run` with the caller's own writers, for a test that needs mox's

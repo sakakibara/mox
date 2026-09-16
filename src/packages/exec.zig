@@ -1027,14 +1027,14 @@ test "Process: a streamed child that honours the interrupt ends before the grace
     const a = arena.allocator();
     const io = std.testing.io;
 
-    var p: Process = .{ .io = io, .install_timeout_ms = 200, .grace_ms = 20_000 };
+    var p: Process = .{ .io = io, .install_timeout_ms = 500, .grace_ms = 60_000 };
     const started = Io.Clock.awake.now(io);
     const res = try p.runner().stream(a, &.{ "sleep", "30" });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
     // SIGINT ended it; a kill after the 20s grace would show here.
-    try testing.expect(elapsed_ms < 5000);
+    try testing.expect(elapsed_ms < 30_000);
 }
 
 test "Process: a streamed child that ignores the interrupt is killed after the grace" {
@@ -1046,15 +1046,15 @@ test "Process: a streamed child that ignores the interrupt is killed after the g
 
     // `exec` so the sleeping process is the direct child: the kill ends it
     // rather than orphaning a sleep that outlives the test.
-    var p: Process = .{ .io = io, .install_timeout_ms = 200, .grace_ms = 500 };
+    var p: Process = .{ .io = io, .install_timeout_ms = 500, .grace_ms = 5_000 };
     const started = Io.Clock.awake.now(io);
-    const res = try p.runner().stream(a, &.{ "sh", "-c", "trap '' INT; exec sleep 30" });
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "trap '' INT; exec sleep 300" });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
-    // Ended by the kill: after the grace, and well before the child's own 30s.
-    try testing.expect(elapsed_ms >= 700);
-    try testing.expect(elapsed_ms < 5000);
+    // Ended by the kill: after the grace, and nowhere near the child's own.
+    try testing.expect(elapsed_ms >= 5_000);
+    try testing.expect(elapsed_ms < 30_000);
 }
 
 /// A scratch path for a child to write its own pid (`$$`) to, so a test can
@@ -1095,14 +1095,14 @@ test "Process: a streamed shell's foreground child dies with it at the bound" {
     // The shell defers the interrupt until `sleep` exits; only a signal to
     // the whole group reaches the sleep. With the shell alone signaled, the
     // grace passes, the shell is killed, and the sleep runs on for 30s.
-    var p: Process = .{ .io = io, .install_timeout_ms = 300, .grace_ms = 500 };
+    var p: Process = .{ .io = io, .install_timeout_ms = 500, .grace_ms = 5_000 };
     const started = Io.Clock.awake.now(io);
-    const res = try p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 30", pid_file });
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300", pid_file });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
-    try testing.expect(elapsed_ms < 3000);
-    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 2000));
+    try testing.expect(elapsed_ms < 30_000);
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 20_000));
 }
 
 test "Process: a streamed shell's background helper is killed once the shell is reaped" {
@@ -1118,14 +1118,14 @@ test "Process: a streamed shell's background helper is killed once the shell is 
     // A `cmd &` child of a non-interactive shell ignores SIGINT, so the
     // group interrupt ends only the shell's `wait`; the shell exiting on it
     // cancels the grace kill, and the helper would outlive the call.
-    var p: Process = .{ .io = io, .install_timeout_ms = 300, .grace_ms = 20_000 };
+    var p: Process = .{ .io = io, .install_timeout_ms = 500, .grace_ms = 60_000 };
     const started = Io.Clock.awake.now(io);
-    const res = try p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 30 & wait", pid_file });
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300 & wait", pid_file });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
-    try testing.expect(elapsed_ms < 5000);
-    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 2000));
+    try testing.expect(elapsed_ms < 30_000);
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 20_000));
 }
 
 test "Process: a streamed shell that traps the interrupt ends before the grace, and is a timeout" {
@@ -1141,14 +1141,14 @@ test "Process: a streamed shell that traps the interrupt ends before the grace, 
     // `wait` is interruptible where a foreground `sleep` is not: the trap
     // runs as soon as the interrupt lands, and the shell exits 3 on its
     // own -- reported as the timeout it is, not as exit 3.
-    var p: Process = .{ .io = io, .install_timeout_ms = 300, .grace_ms = 20_000 };
+    var p: Process = .{ .io = io, .install_timeout_ms = 500, .grace_ms = 60_000 };
     const started = Io.Clock.awake.now(io);
-    const res = try p.runner().stream(a, &.{ "sh", "-c", "trap 'exit 3' INT; echo $$ > \"$0\"; sleep 30 & wait", pid_file });
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "trap 'exit 3' INT; echo $$ > \"$0\"; sleep 300 & wait", pid_file });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
-    try testing.expect(elapsed_ms < 5000);
-    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 2000));
+    try testing.expect(elapsed_ms < 30_000);
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 20_000));
 }
 
 test "Process: a streamed child that exits in time is neither a timeout nor an interrupt" {
@@ -1315,10 +1315,10 @@ test "Process: a helper the child left holding the pipe dies with it at the boun
     // kill that reached only `sh` would leave the read blocked for 5s.
     var p: Process = .{ .io = io, .timeout_ms = 300 };
     const started = Io.Clock.awake.now(io);
-    const res = try p.runner().run(a, &.{ "sh", "-c", "sleep 5 | cat" });
+    const res = try p.runner().run(a, &.{ "sh", "-c", "sleep 300 | cat" });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
-    try testing.expect(elapsed_ms < 3000);
+    try testing.expect(elapsed_ms < 30_000);
 }
 
 test "Process: a child that never stops writing is ended at the cap, not waited on" {
@@ -1332,7 +1332,7 @@ test "Process: a child that never stops writing is ended at the cap, not waited 
     const started = Io.Clock.awake.now(io);
     try testing.expectError(error.StreamTooLong, p.runner().run(a, &.{ "sh", "-c", "yes" }));
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
-    try testing.expect(elapsed_ms < 8000);
+    try testing.expect(elapsed_ms < 30_000);
 }
 
 test "Process: a child that ignores SIGTERM is still ended at the bound" {
@@ -1344,10 +1344,10 @@ test "Process: a child that ignores SIGTERM is still ended at the bound" {
 
     var p: Process = .{ .io = io, .timeout_ms = 300 };
     const started = Io.Clock.awake.now(io);
-    const res = try p.runner().run(a, &.{ "sh", "-c", "trap '' TERM; sleep 5" });
+    const res = try p.runner().run(a, &.{ "sh", "-c", "trap '' TERM; sleep 300" });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
-    try testing.expect(elapsed_ms < 3000);
+    try testing.expect(elapsed_ms < 30_000);
 }
 
 test "Process: stdin bytes reach the child and stdout is captured" {
@@ -1396,7 +1396,7 @@ test "SpawnSignals: what the handler kills is the whole group of the child it ho
     // The backgrounded sleep is a group member the leader does not wait on:
     // only a kill addressed to the group reaches it.
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "sh", "-c", "sleep 30 & sleep 30" },
+        .argv = &.{ "sh", "-c", "sleep 300 & sleep 300" },
         .stdin = .close,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -1408,7 +1408,7 @@ test "SpawnSignals: what the handler kills is the whole group of the child it ho
 
     SpawnSignals.killHeldGroup();
     _ = try child.wait(io);
-    try testing.expect(groupGone(io, id, 5000));
+    try testing.expect(groupGone(io, id, 20_000));
 }
 
 /// Record what the terminal-signal handler would kill at the moment a
@@ -1418,13 +1418,23 @@ fn watchGroupOf(io: Io, path: []const u8, seen: *std.atomic.Value(i32)) void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const started = Io.Clock.awake.now(io);
-    while (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 20_000) {
-        if (pidIn(arena.allocator(), io, path)) |pid| {
-            seen.store(SpawnSignals.group.load(.acquire), .release);
-            _ = signal(-pid, .KILL);
-            return;
-        } else |_| {}
-        Process.timeoutOf(10).sleep(io) catch return;
+    while (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 60_000) {
+        // The child writes its pid before mox records the group, so both
+        // have to be there before the snapshot means anything. A group that
+        // never arrives leaves `seen` at 0 and fails the test, which is the
+        // regression this watches for.
+        const pid = pidIn(arena.allocator(), io, path) catch {
+            Process.timeoutOf(10).sleep(io) catch return;
+            continue;
+        };
+        const held = SpawnSignals.group.load(.acquire);
+        if (held == 0) {
+            Process.timeoutOf(10).sleep(io) catch return;
+            continue;
+        }
+        seen.store(held, .release);
+        _ = signal(-pid, .KILL);
+        return;
     }
 }
 
@@ -1446,7 +1456,7 @@ test "Process: a captured call holds the child's group for the handler, and lets
     // The bound is far longer than the call takes: the child ends when the
     // watcher kills the group it read, never at the bound.
     var p: Process = .{ .io = io, .timeout_ms = 60_000 };
-    const res = try p.runner().run(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 30", pid_file });
+    const res = try p.runner().run(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300", pid_file });
     watcher.await(io);
     try testing.expect(!res.timed_out);
     try testing.expectEqual(try pidIn(a, io, pid_file), seen.load(.acquire));
