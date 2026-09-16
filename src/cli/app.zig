@@ -59,6 +59,30 @@ pub var stdin_override: ?*std.Io.Reader = null;
 /// it. Null means the real one.
 pub var cwd_override: ?[]const u8 = null;
 
+/// The runner every backend adapter reaches its package manager through,
+/// when it should not be a real child process. A caller that drives `run`
+/// in-process -- the test harness -- sets this so the package path is
+/// exercised without a manager installed and without touching the machine
+/// running the suite. Null means spawn for real.
+pub var package_runner_override: ?mox.packages.exec.Runner = null;
+
+/// The backend registry every package-aware command works from, built once
+/// so `status`, `apply` and `commit` can never disagree about which managers
+/// exist or how they are reached.
+pub fn packageRegistry(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    backends: *[1]mox.packages.backend.Backend,
+    proc: *mox.packages.exec.Process,
+    brew: *mox.packages.brew.Brew,
+) mox.packages.backend.Registry {
+    _ = arena;
+    proc.* = .{ .io = io };
+    brew.* = .{ .runner = package_runner_override orelse proc.runner() };
+    backends[0] = brew.backend();
+    return .{ .backends = backends };
+}
+
 /// Ports `context.zig`'s `init` into cli-zig's context-loader shape.
 /// `loadContext` is a plain function pointer with no access to
 /// `std.process.Init`, so the live process environment is read from the

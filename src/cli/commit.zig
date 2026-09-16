@@ -401,6 +401,150 @@ fn fileSpace(
     return .{ .ax = ax, .configs = configs };
 }
 
+/// What one commit did to the package manifest.
+const PackageReconcile = struct {
+    added: usize = 0,
+    blacklisted: usize = 0,
+    skipped: usize = 0,
+    aborted: bool = false,
+
+    fn touched(self: PackageReconcile) bool {
+        return self.added > 0 or self.blacklisted > 0;
+    }
+
+    fn pending(self: PackageReconcile) bool {
+        return self.skipped > 0;
+    }
+};
+
+/// Offer every untracked package: record it in the manifest, blacklist it so
+/// it is never offered again, or skip it for now. This is the package analog
+/// of routing a live edit back to its source -- reality is the truth, and the
+/// manifest is what gets updated to match.
+///
+/// Never uninstalls: the three answers all leave the machine exactly as it
+/// is, and only the manifest changes. A path-scoped commit names files, so it
+/// skips this entirely.
+fn reconcilePackages(
+    ctx: *app.Ctx,
+    context: app.Context,
+    bindings: *const mox.dsl.resolver.Resolver,
+    ask_mode: prompt.Mode,
+    input: *Io.Reader,
+    report_only: bool,
+) !PackageReconcile {
+    var proc: mox.packages.exec.Process = undefined;
+    var brew: mox.packages.brew.Brew = undefined;
+    var backends: [1]mox.packages.backend.Backend = undefined;
+    const registry = app.packageRegistry(ctx.alloc, ctx.io, &backends, &proc, &brew);
+
+    var diag: mox.packages.manifest.Diag = .{};
+    const m = mox.packages.manifest.load(
+        ctx.alloc,
+        ctx.io,
+        context.paths.repo_dir,
+        context.paths.private_dir,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox commit: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{};
+        },
+    };
+    if (!m.inUse()) return .{};
+
+    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox commit: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{};
+        },
+    };
+
+    var res: PackageReconcile = .{};
+    const choices = [_]prompt.Choice{
+        .{ .key = "y", .label = "add", .help = "record it in the manifest so every machine installs it" },
+        .{ .key = "b", .label = "blacklist", .help = "never offer this package again" },
+        .{ .key = "s", .label = "skip", .help = "leave it untracked for now" },
+    };
+
+    for (rep.backends) |b| {
+        if (b.drift.untracked.len == 0) continue;
+        const backend = registry.find(b.backend) orelse continue;
+
+        for (b.drift.untracked) |id| {
+            if (report_only) {
+                try ctx.out.print("  untracked  {s} {s}\n", .{ b.backend, id });
+                res.skipped += 1;
+                continue;
+            }
+
+            const target = mox.packages.write.targetFor(m, b.backend) orelse {
+                try ctx.err.print(
+                    "mox commit: {s} {s}: no data/packages file declares backend \"{s}\"; add one to record it\n",
+                    .{ b.backend, id, b.backend },
+                );
+                res.skipped += 1;
+                continue;
+            };
+
+            try ctx.out.print("\nuntracked package: {s} {s}\n", .{ b.backend, id });
+            const question = try prompt.renderChoices(ctx.alloc, &choices);
+            const outcome = try prompt.ask(ask_mode, &choices, 2, question, input, ctx.out);
+            const chosen = switch (outcome) {
+                .chosen => |i| i,
+                .report_only => {
+                    res.skipped += 1;
+                    continue;
+                },
+                .abort => {
+                    res.aborted = true;
+                    return res;
+                },
+                .abort_strict => {
+                    res.aborted = true;
+                    return res;
+                },
+            };
+            if (chosen == 2) {
+                res.skipped += 1;
+                continue;
+            }
+
+            const decl = try backend.declare(ctx.alloc, id);
+            // The file's own default already names the backend; repeating it
+            // on the row would be a second spelling of one fact.
+            const needs_backend = target.default_backend == null or
+                !std.mem.eql(u8, target.default_backend.?, b.backend);
+            const array: mox.packages.write.Array = if (chosen == 0) .packages else .blacklist;
+            const block = try mox.packages.write.render(
+                ctx.alloc,
+                array,
+                decl,
+                if (needs_backend) b.backend else null,
+            );
+            try mox.packages.write.append(ctx.alloc, ctx.io, target.path, block);
+            if (chosen == 0) {
+                res.added += 1;
+                try ctx.out.print("  recorded in {s}\n", .{target.label});
+            } else {
+                res.blacklisted += 1;
+                try ctx.out.print("  blacklisted in {s}\n", .{target.label});
+            }
+        }
+    }
+    return res;
+}
+
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return commitImpl(ctx, a.dry_run, a.yes, a.abort_on_prompt, a.color orelse .auto, a.paths);
 }
@@ -565,6 +709,14 @@ pub fn commitImpl(
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), ctx.io, &stdin_buf);
     const input: *Io.Reader = scripted_input orelse &stdin_reader.interface;
+
+    // Packages are reconciled before the file pass and only for an unscoped
+    // commit: `mox commit <path>` names files, and reaching past them to the
+    // package manifest would be scope the user did not ask for.
+    const pkgs = if (paths.len == 0)
+        try reconcilePackages(ctx, context, &axis_resolver, ask_mode, input, report_mode)
+    else
+        PackageReconcile{};
 
     var claims: Claims = .empty;
 
@@ -903,7 +1055,8 @@ pub fn commitImpl(
         else
             0;
         if (coupled > 0) pending = true;
-        if (routed_count == 0 and manual_count == 0 and coupled == 0 and skipped_secret == 0) {
+        if (pkgs.pending()) pending = true;
+        if (routed_count == 0 and manual_count == 0 and coupled == 0 and skipped_secret == 0 and !pkgs.pending()) {
             try ctx.out.writeAll("mox commit: nothing to commit\n");
         } else if (skipped_secret > 0) {
             try ctx.out.print(
@@ -1523,7 +1676,13 @@ pub fn commitImpl(
             .{ committed_count, coupled_count, manual_count },
         );
     }
-    return if (mismatch or skipped_secret > 0) 1 else 0;
+    if (pkgs.touched() or pkgs.pending()) {
+        try ctx.out.print(
+            "mox commit: packages: {d} recorded, {d} blacklisted, {d} still untracked\n",
+            .{ pkgs.added, pkgs.blacklisted, pkgs.skipped },
+        );
+    }
+    return if (mismatch or skipped_secret > 0 or pkgs.pending()) 1 else 0;
 }
 
 /// Per-configuration guard outputs for a partial file: each composed text is
@@ -5178,7 +5337,7 @@ fn writeGlyph(out: *Io.Writer, c: prompt.Choice, is_default: bool, sty: style.St
 pub const command = app.command(Spec, .{
     .name = "commit",
     .summary = "Route live-file edits back into their sources",
-    .details = "Prompts [y/s] per hunk (--yes: take defaults; --dry-run: report only, exit 1 if edits remain; --abort-on-prompt: strict CI, rc 2 on the first prompt); a structured key change prompts [y/p/s] to accept the winning layer, pick another, or skip. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region); a changed token shared by other sources prompts to update them too.",
+    .details = "Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely. Prompts [y/s] per hunk (--yes: take defaults; --dry-run: report only, exit 1 if edits remain; --abort-on-prompt: strict CI, rc 2 on the first prompt); a structured key change prompts [y/p/s] to accept the winning layer, pick another, or skip. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region); a changed token shared by other sources prompts to update them too.",
     .group = .general,
     .needs_context = true,
 }, run);

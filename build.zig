@@ -98,6 +98,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // Package subsystem through the CLI at tests/packages_test.zig. Hermetic:
+    // every manager call goes through a scripted runner.
+    const packages_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/packages_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    packages_tests_mod.addImport("mox", lib_mod);
+    const packages_tests = b.addTest(.{ .root_module = packages_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(packages_tests).step);
+
     // Backend adapters against the real package managers, at
     // tests/packages_backends_test.zig. Deliberately NOT on `test`: the
     // hermetic suite must pass with no package manager installed and must

@@ -799,10 +799,10 @@ fn applyPackages(
     bindings: *const mox.dsl.resolver.Resolver,
     dry_run: bool,
 ) !PackageCounts {
-    var proc: mox.packages.exec.Process = .{ .io = ctx.io };
-    var brew: mox.packages.brew.Brew = .{ .runner = proc.runner() };
-    var backends = [_]mox.packages.backend.Backend{brew.backend()};
-    const registry: mox.packages.backend.Registry = .{ .backends = &backends };
+    var proc: mox.packages.exec.Process = undefined;
+    var brew: mox.packages.brew.Brew = undefined;
+    var backends: [1]mox.packages.backend.Backend = undefined;
+    const registry = app.packageRegistry(ctx.alloc, ctx.io, &backends, &proc, &brew);
 
     var diag: mox.packages.manifest.Diag = .{};
     const rep = mox.packages.report.gather(
