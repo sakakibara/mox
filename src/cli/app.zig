@@ -130,9 +130,12 @@ pub const PackageBackends = struct {
             .env = env,
             .scratch_dir = scratch_dir,
             .timeout_ms = mox.packages.exec.timeoutFromEnv(env, err),
+            .install_timeout_ms = mox.packages.exec.installTimeoutMs(env, err),
             .out = out,
             .err = err,
         };
+        // What a mox that died mid-call left staged for a call of its own.
+        mox.packages.exec.sweepScratch(io, arena, scratch_dir);
         const r = self.runner();
         self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
         if (brew_prefixes_override) |p| self.brew.prefixes = p;
@@ -213,8 +216,9 @@ pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) 
 
 /// mox's help footer: the Environment section (`MOX_REPO`/`MOX_STATE_DIR`/
 /// `MOX_SNAPSHOT_RETENTION`/`MOX_CHECK_TIMEOUT_MS`/`MOX_SCRIPT_TIMEOUT_MS`/
-/// `HOME`/`USER`). These are env vars, not CLI flags, so cli-zig's generated
-/// per-command help has nowhere else to surface them.
+/// `MOX_INSTALL_TIMEOUT_MS`/`HOME`/`USER`). These are env vars, not CLI
+/// flags, so cli-zig's generated per-command help has nowhere else to
+/// surface them.
 pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void {
     _ = prog_name;
     try w.writeAll(
@@ -224,7 +228,8 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
         \\  MOX_STATE_DIR  Path to mox state (default: $XDG_STATE_HOME/mox)
         \\  MOX_SNAPSHOT_RETENTION  Snapshots to keep (default: 10)
         \\  MOX_CHECK_TIMEOUT_MS  Wall-clock bound on check hooks in ms (default: 30000; <= 0 disables)
-        \\  MOX_SCRIPT_TIMEOUT_MS  Wall-clock bound on setup scripts and every package-manager call in ms (default: 600000; <= 0 disables)
+        \\  MOX_SCRIPT_TIMEOUT_MS  Wall-clock bound on setup scripts and every captured package-manager call in ms (default: 600000; <= 0 disables)
+        \\  MOX_INSTALL_TIMEOUT_MS  Wall-clock bound on a package install or bootstrap in ms (default: 0, no bound; interrupted, then killed 10s later)
         \\  HOME, USER     Standard POSIX env
         \\
         \\See the project README for the full design spec.

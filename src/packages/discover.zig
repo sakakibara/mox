@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const dirent = @import("../source/dirent.zig");
 const junk = @import("../source/junk.zig");
 const diag_mod = @import("../machine/diag.zig");
+const exec = @import("exec.zig");
 
 const Io = std.Io;
 
@@ -40,8 +41,6 @@ pub const Found = struct {
     /// package command on a Windows machine, nor vanish silently there.
     not_runnable: ?[]const u8 = null,
 };
-
-const ps_pwsh = "pwsh";
 
 /// Every plugin under `<repo>/scripts/backends`, name-ordered. A missing
 /// directory is no plugins. A name outside `[A-Za-z0-9_-]` or, on a
@@ -129,7 +128,8 @@ fn indexOf(items: []const Found, name: []const u8) usize {
 
 /// Decide how, or whether, this machine runs the file. Unix: a `.ps1` is a
 /// Windows-only kind and a plain file needs its executable bit. Windows: NTFS
-/// has no such bit, so runnability is by kind alone -- `.ps1` through pwsh,
+/// has no such bit, so runnability is by kind alone -- `.ps1` through
+/// PowerShell (spelled as `pwsh`; the spawn falls back to `powershell`),
 /// `.exe`/`.cmd` directly, anything else not runnable here.
 fn classify(
     arena: std.mem.Allocator,
@@ -145,7 +145,7 @@ fn classify(
                 .name = name,
                 .path = path,
                 .label = "",
-                .argv0 = try arena.dupe([]const u8, &.{ ps_pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path }),
+                .argv0 = try exec.powerShellArgv(arena, exec.powershell_hosts[0], &.{path}),
             },
             .exe, .cmd => .{ .name = name, .path = path, .label = "", .argv0 = try arena.dupe([]const u8, &.{path}) },
             .plain => .{

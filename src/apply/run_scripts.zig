@@ -673,18 +673,20 @@ pub fn scriptTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) 
 pub fn killAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
     timeout.sleep(io) catch return;
     fired.* = true;
-    killProcess(id);
+    _ = killProcess(id);
 }
 
 /// Forcibly end the process `id` names. Operates on a COPY of the OS
 /// handle/pid, never the shared Child, so it races safely alongside
 /// `child.wait` (which reaps). POSIX sends SIGKILL; Windows forcibly
-/// terminates via TerminateProcess.
-pub fn killProcess(id: std.process.Child.Id) void {
+/// terminates via TerminateProcess. Returns whether the kill reached a
+/// process: one already gone is not killed.
+pub fn killProcess(id: std.process.Child.Id) bool {
     if (builtin.os.tag == .windows) {
-        _ = TerminateProcess(id, 1);
+        return TerminateProcess(id, 1).toBool();
     } else {
-        std.posix.kill(id, .KILL) catch {};
+        std.posix.kill(id, .KILL) catch return false;
+        return true;
     }
 }
 
