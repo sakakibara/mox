@@ -13,21 +13,34 @@ All notable changes to mox are documented here. The format follows
   rows for what is installed but never to be offered, and `[[bootstrap]]`
   rows naming a manager's installer by URL and sha256. Files union across the
   repo and private layers with per-basename shadowing, and a file-level
-  `when` gates every row in the file, narrowed by a row's own. Seven
+  `when` gates every `[[packages]]` and `[[bootstrap]]` row in the file,
+  narrowed by a row's own; a `[[blacklist]]` row holds on every machine, so
+  it takes no gate and may not sit in a gated file. Seven
   backends ship:
   brew (formulae and casks as distinct namespaces; a tap-qualified name is
   the tap and the decision to trust that one formula or cask, never the
   whole tap), apt, dnf, pacman, zypper (no explicitly-installed query, so mox
   keeps a ledger and intersects it with what rpm reports present), scoop and
-  winget.
+  winget. A backend that cannot be asked what the user explicitly installed
+  says so as a note under itself: brew has no explicit-install query for
+  casks, and `winget export` reports only what a source supplied.
 - Any other manager is a plugin: an executable at `scripts/backends/<name>`
   speaking seven verbs (`available`, `id`, `list`, `install`, `declare`,
   `bootstrap`, `limitation`) on the same contract as a shipped backend. `id`
   is both validation and identity; a `declare` answer is handed back to `id`
-  and refused unless it round-trips; exit 64 names a verb the plugin lacks;
+  and refused unless it round-trips, against the same shape the manifest
+  enforces, so a row `declare` writes is a row the next command reads back;
+  exit 64 names an optional verb the plugin lacks, and `available` has none;
   a plugin named like a shipped backend overrides it and `status` says so.
-  Ids are opaque, calls are time-bounded, and an id that is empty, contains
-  whitespace, or exceeds 256 bytes is refused as a lost line separator.
+  Ids are opaque, calls are time-bounded, and an id that is empty, exceeds
+  256 bytes, or carries whitespace, a control byte or a byte that is not
+  UTF-8 is refused as a lost line separator. A `limitation` line is capped at
+  200 bytes and may carry no control byte. Plugins are handed
+  `MOX_PACKAGES_DEPTH`, and a mox reached from inside one discovers no
+  plugin and says so, so a plugin that calls mox cannot multiply itself. A
+  dotfile in `scripts/backends/` is ignored, so an empty directory can be
+  kept in git, and a directory named like a plugin says what it is rather
+  than that no such backend exists.
 - `status` reports each backend's MISSING and UNTRACKED packages, `apply`
   installs the missing (after the pre stage and its re-capture, and
   first installing a declared manager that is absent from its verified
@@ -60,7 +73,8 @@ All notable changes to mox are documented here. The format follows
   `package_broken` porcelain record and a `{backend, state, exit}` JSON
   entry. `mox --help` names `MOX_SCRIPT_TIMEOUT_MS` and
   `MOX_INSTALL_TIMEOUT_MS`. A manifest refuses an unknown top-level key, a
-  blank or whitespace-bearing `name`, a byte order mark, a second
+  `name` that is blank or carries whitespace, a control byte or a byte that
+  is not UTF-8, a file-level `backend` naming no adapter, a byte order mark, a second
   `[[bootstrap]]` row for one backend, and two rows naming one package
   under the same gate, and a zypper row naming a pattern, patch, product,
   source package or application rather than a package, which `rpm` could
@@ -87,9 +101,19 @@ All notable changes to mox are documented here. The format follows
   1 KiB instead of 200 bytes and end a message that still does not fit with
   `...` instead of cutting it silently.
 - `mox commit` skips a manifest file whose own `when` excludes this machine
-  when it looks for somewhere to record a row: a row appended there would
-  never be desired on the machine that recorded it. A diagnostic that names
-  two files says which layer each is in.
+  when it looks for somewhere to record a package row: a row appended there
+  would never be desired on the machine that recorded it. A blacklist row
+  goes to an ungated file, and commit says so rather than writing one the
+  next command would refuse. A diagnostic that names two files says which
+  layer each is in, and one about a row names the row by index.
+- A setup script and a `check` hook each lead their own process group, so a
+  bound reaches what the script started rather than the script alone: an
+  orphan holding mox's stdout would keep a `mox apply | ...` pipeline open
+  long after the run. A setup script is handed the terminal for its run, the
+  way a streamed install is, so a `sudo` in a pre-script can prompt, Ctrl-C
+  goes to the script, and Ctrl-Z suspends it; one that stops waiting for a
+  terminal the run does not have (`mox apply &`, a CI job) is ended and
+  named rather than waited out to the bound.
 
 ### Fixed
 - The timeout watchdog for setup scripts and check hooks runs on its own
