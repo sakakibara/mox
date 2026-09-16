@@ -304,31 +304,48 @@ pub const Brew = struct {
     /// the message instead.
     ///
     /// Only a name brew POSITIVELY resolves to another package is refused.
-    /// A tap-qualified row is not asked about at all: it names a tap this
-    /// same install has yet to add, so nothing could answer for it yet.
+    /// A tap-qualified row is asked about too, and refused when brew reports
+    /// the formula under another name: `brew info --json=v2 --formula --
+    /// homebrew/core/ripgrep` exits 0 answering `"full_name": "ripgrep"`, so
+    /// that row installs ripgrep and reads as missing for ever. A row naming
+    /// a tap this machine does not have gets no answer at all, so it is kept
+    /// -- declaring it is the decision to trust that tap.
     fn refuseAliases(self: *Brew, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
         var asked: [2]bool = .{ false, false };
-        // Canonical name -> itself, alias -> what it stands for.
-        var resolved = std.StringHashMap([]const u8).init(arena);
+        // Canonical name -> itself, and each other spelling -> the canonical
+        // one. One map per kind, because the two are separate namespaces
+        // that share names: 16 of Homebrew's formula aliases and old names
+        // are also canonical cask tokens (`dash`, `mediainfo`, `cutter`),
+        // and `docker` goes the other way -- a canonical formula name and an
+        // old token of the cask `docker-desktop`. One shared map would let
+        // whichever kind was asked first answer for the other and suppress
+        // its refusal.
+        var resolved: [2]std.StringHashMap([]const u8) = .{
+            std.StringHashMap([]const u8).init(arena),
+            std.StringHashMap([]const u8).init(arena),
+        };
 
         var keep: std.ArrayList(Row) = .empty;
         for (rows) |row| {
             const kind = try kindOf(row);
-            if (tapOf(row.name) != null) {
-                try keep.append(arena, row);
-                continue;
+            const slot = @intFromEnum(kind);
+            if (!asked[slot]) {
+                asked[slot] = true;
+                try self.resolveNames(arena, kind, rows, &resolved[slot]);
             }
-            const slot = &asked[@intFromEnum(kind)];
-            if (!slot.*) {
-                slot.* = true;
-                try self.resolveNames(arena, kind, rows, &resolved);
-            }
-            const canonical = resolved.get(row.name) orelse {
+            const canonical = resolved[slot].get(row.name) orelse {
                 try keep.append(arena, row);
                 continue;
             };
             if (std.mem.eql(u8, canonical, row.name)) {
                 try keep.append(arena, row);
+                continue;
+            }
+            if (tapOf(row.name) != null) {
+                self.say(
+                    "mox: brew: row \"{s}\" names the {s} \"{s}\", which is the name brew reports it under, so declare \"{s}\" instead\n",
+                    .{ row.name, @tagName(kind), canonical, canonical },
+                );
                 continue;
             }
             self.say(
@@ -350,11 +367,21 @@ pub const Brew = struct {
     /// warns once per formula, and exhausts a container's memory.
     ///
     /// A formula's `full_name` and a cask's `full_token` are the names `brew
-    /// list --full-name` reports, which is what a row must match. brew exits
-    /// non-zero when any operand names nothing it has, and answers for none
-    /// of them then; that leaves the batch unresolved, which keeps every row
-    /// rather than refusing one on no evidence. brew itself answers for a
-    /// name it does not have when the install runs.
+    /// list --full-name` reports, which is what a row must match.
+    ///
+    /// brew answers for NONE of a batch that carries one name it does not
+    /// have: `brew info --json=v2 --formula -- ag zzz-removed-formula` exits
+    /// 1 with empty stdout, while the same call without the bad name exits 0.
+    /// So a batch that fails is asked again one name at a time -- brew
+    /// answers each on its own -- rather than abandoning the check, which
+    /// would let one typo or one upstream removal disable alias refusal for
+    /// every other row of that kind. That fallback is one call per name and
+    /// only on a failed batch; a one-name batch is already its own per-name
+    /// call, so it is not repeated.
+    ///
+    /// A name brew still answers nothing for is left unresolved, which keeps
+    /// its row: brew itself answers for a name it does not have when the
+    /// install runs.
     fn resolveNames(
         self: *Brew,
         arena: std.mem.Allocator,
@@ -366,55 +393,103 @@ pub const Brew = struct {
             .formula => "--formula",
             .cask => "--cask",
         };
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &(query_env ++ .{ self.exe, "info", "--json=v2", flag, "--" }));
-        var any = false;
-        for (rows) |row| {
-            if (tapOf(row.name) != null) continue;
-            if (try kindOf(row) != kind) continue;
-            try argv.append(arena, row.name);
-            any = true;
-        }
-        if (!any) return;
+        const head = query_env ++ .{ self.exe, "info", "--json=v2", flag, "--" };
 
+        var names: std.ArrayList([]const u8) = .empty;
+        for (rows) |row| {
+            if (try kindOf(row) != kind) continue;
+            try names.append(arena, row.name);
+        }
+        if (names.items.len == 0) return;
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &head);
+        try argv.appendSlice(arena, names.items);
         const res = try self.runner.run(arena, argv.items);
         try exec.checkTimedOut(res);
-        if (!res.ok) return;
+        if (res.ok) {
+            try recordAnswers(arena, kind, res.stdout, into);
+            return;
+        }
+        if (names.items.len == 1) return;
 
-        const doc = json.parse(arena, res.stdout, .{}) catch return;
-        if (doc != .object) return;
-        const list = doc.get(switch (kind) {
-            .formula => "formulae",
-            .cask => "casks",
-        }) orelse return;
-        if (list != .array) return;
-
-        for (list.array) |entry| {
-            if (entry != .object) continue;
-            const canonical = entry.get(switch (kind) {
-                .formula => "full_name",
-                .cask => "full_token",
-            }) orelse continue;
-            if (canonical != .string or canonical.string.len == 0) continue;
-            try into.put(canonical.string, canonical.string);
-            for ([_][]const u8{
-                switch (kind) {
-                    .formula => "aliases",
-                    .cask => "old_tokens",
-                },
-                "oldnames",
-            }) |key| {
-                const names = entry.get(key) orelse continue;
-                if (names != .array) continue;
-                for (names.array) |n| {
-                    if (n != .string or n.string.len == 0) continue;
-                    if (into.contains(n.string)) continue;
-                    try into.put(n.string, canonical.string);
-                }
-            }
+        for (names.items) |name| {
+            var one: std.ArrayList([]const u8) = .empty;
+            try one.appendSlice(arena, &head);
+            try one.append(arena, name);
+            const got = try self.runner.run(arena, one.items);
+            try exec.checkTimedOut(got);
+            if (!got.ok) continue;
+            try recordAnswers(arena, kind, got.stdout, into);
         }
     }
 };
+
+/// Record one `brew info --json=v2` answer in `into`: the canonical name
+/// under itself, each alias and old name under the package it names, and the
+/// tap-qualified spelling of the package under the canonical name too.
+///
+/// The qualified key is what lets a tap-qualified row be judged: brew answers
+/// `homebrew/core/ripgrep` with `"tap": "homebrew/core"`, `"name":
+/// "ripgrep"` and `"full_name": "ripgrep"`, so the row's own spelling maps to
+/// the bare name brew reports. A third-party tap answers `"full_name":
+/// "owner/tap/name"`, which is the qualified spelling itself, so such a row
+/// resolves to what it already says.
+fn recordAnswers(
+    arena: std.mem.Allocator,
+    kind: Kind,
+    stdout: []const u8,
+    into: *std.StringHashMap([]const u8),
+) !void {
+    const doc = json.parse(arena, stdout, .{}) catch return;
+    if (doc != .object) return;
+    const list = doc.get(switch (kind) {
+        .formula => "formulae",
+        .cask => "casks",
+    }) orelse return;
+    if (list != .array) return;
+
+    for (list.array) |entry| {
+        if (entry != .object) continue;
+        const canonical = entry.get(switch (kind) {
+            .formula => "full_name",
+            .cask => "full_token",
+        }) orelse continue;
+        if (canonical != .string or canonical.string.len == 0) continue;
+        try into.put(canonical.string, canonical.string);
+        if (try qualifiedName(arena, kind, entry)) |qualified| {
+            if (!into.contains(qualified)) try into.put(qualified, canonical.string);
+        }
+        for ([_][]const u8{
+            switch (kind) {
+                .formula => "aliases",
+                .cask => "old_tokens",
+            },
+            "oldnames",
+        }) |key| {
+            const names = entry.get(key) orelse continue;
+            if (names != .array) continue;
+            for (names.array) |n| {
+                if (n != .string or n.string.len == 0) continue;
+                if (into.contains(n.string)) continue;
+                try into.put(n.string, canonical.string);
+            }
+        }
+    }
+}
+
+/// `<tap>/<name>` for one `brew info` entry, or null when it carries neither.
+fn qualifiedName(arena: std.mem.Allocator, kind: Kind, entry: json.Value) std.mem.Allocator.Error!?[]const u8 {
+    const tap = entry.get("tap") orelse return null;
+    if (tap != .string or tap.string.len == 0) return null;
+    const bare = entry.get(switch (kind) {
+        .formula => "name",
+        .cask => "token",
+    }) orelse return null;
+    if (bare != .string or bare.string.len == 0) return null;
+    const joined: []const u8 = try std.fmt.allocPrint(arena, "{s}/{s}", .{ tap.string, bare.string });
+    return joined;
+}
 
 fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
     if (std.mem.startsWith(u8, id, cask_prefix)) {
@@ -704,6 +779,7 @@ test "install: a tapped cask is trusted as a cask, not as a formula" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap" },
         .{ .argv = "brew trust --cask -- owner/tap/somecask" },
         .{ .argv = "brew install --cask -- owner/tap/somecask" },
@@ -721,6 +797,7 @@ test "install: a tapped formula is tapped and trusted narrowly before installing
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- d12frosted/emacs-plus" },
         .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
         .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
@@ -917,6 +994,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
     // one row reached brew's installer not at all and nothing can have
     // landed.
     var tap: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
     } };
     var b1: Brew = .{ .runner = tap.runner() };
@@ -934,6 +1012,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
 
     // And the answer is the last batch's, never the one before it.
     var tap2: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
     } };
     b2.runner = tap2.runner();
@@ -1019,15 +1098,18 @@ test "install: a name brew resolves to nothing is handed to brew, not refused he
     try testing.expect(fake.called("brew install -- nosuchthing"));
 }
 
-test "install: a tap-qualified row is not asked about, nothing having the tap yet" {
+test "install: a row naming a tap the machine lacks is kept, brew answering nothing for it" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The tap is added by this same install, so nothing asked before it can
-    // answer for the formula. The Fake errors on anything unscripted, so a
-    // resolution query here would fail the test.
+    // Verified against Homebrew 7.0.2: `brew info --json=v2 --formula --
+    // zzzowner/zzztap/thing` exits 1 with "This command requires the tap
+    // zzzowner/zzztap". Nothing resolved the row, so it reaches the tap and
+    // install this same run adds -- declaring it IS the decision to trust
+    // that tap.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30", .code = 1 },
         .{ .argv = "brew tap -- d12frosted/emacs-plus" },
         .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
         .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
@@ -1036,4 +1118,180 @@ test "install: a tap-qualified row is not asked about, nothing having the tap ye
 
     try b.backend().install(a, &.{rowOf("d12frosted/emacs-plus/emacs-plus@30", &.{})});
     try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
+}
+
+test "install: a row qualifying a tap brew reports bare is refused, naming the bare formula" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved read-only against Homebrew 7.0.2: `brew info --json=v2
+    // --formula -- homebrew/core/ripgrep` exits 0 with `"tap":
+    // "homebrew/core"`, `"name": "ripgrep"` and `"full_name": "ripgrep"`, and
+    // `brew list --full-name --installed-on-request` reports that formula
+    // `ripgrep` -- so the qualified row would read as missing for ever.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- homebrew/core/ripgrep",
+            .stdout =
+            \\{"formulae":[{"full_name":"ripgrep","name":"ripgrep","tap":"homebrew/core","aliases":[],"oldnames":[]}],"casks":[]}
+            ,
+        },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{rowOf("homebrew/core/ripgrep", &.{})});
+    try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: brew: row \"homebrew/core/ripgrep\" names the formula \"ripgrep\", which is the name brew reports it under, so declare \"ripgrep\" instead\n",
+        w.written(),
+    );
+    try testing.expect(!fake.called("brew tap -- homebrew/core"));
+    try testing.expect(!fake.called("brew install -- homebrew/core/ripgrep"));
+}
+
+test "install: a row qualifying a third-party tap is kept, brew reporting it qualified" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved read-only against Homebrew 7.0.2 with that tap present: the
+    // answer carries `"full_name": "d12frosted/emacs-plus/emacs-plus@30"`,
+    // which is the row's own spelling, so nothing is refused.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30",
+            .stdout =
+            \\{"formulae":[{"full_name":"d12frosted/emacs-plus/emacs-plus@30","name":"emacs-plus@30","tap":"d12frosted/emacs-plus","aliases":[],"oldnames":[]}],"casks":[]}
+            ,
+        },
+        .{ .argv = "brew tap -- d12frosted/emacs-plus" },
+        .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{rowOf("d12frosted/emacs-plus/emacs-plus@30", &.{})});
+    try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+}
+
+test "install: one unresolvable name does not disable alias refusal for the batch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved read-only against Homebrew 7.0.2: `brew info --json=v2
+    // --formula -- ag zzz-removed-formula` exits 1 with EMPTY stdout, while
+    // the same call without the bad name exits 0. On a fresh machine every
+    // brew row is missing, so the whole manifest is one batch and one typo
+    // would otherwise turn the check off for all of it.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag zzz-removed-formula", .code = 1 },
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
+            .stdout =
+            \\{"formulae":[{"full_name":"the_silver_searcher","name":"the_silver_searcher","tap":"homebrew/core","aliases":["ag"],"oldnames":[]}],"casks":[]}
+            ,
+        },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- zzz-removed-formula", .code = 1 },
+        .{ .argv = "brew install -- zzz-removed-formula", .code = 1 },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{
+        rowOf("ag", &.{}),
+        rowOf("zzz-removed-formula", &.{}),
+    }));
+    try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: brew: row \"ag\" is an alias for the formula \"the_silver_searcher\", and brew reports only the formula name, so declare \"the_silver_searcher\" instead\n",
+        w.written(),
+    );
+    // The alias never reached brew; the name brew could not resolve did.
+    try testing.expect(!fake.called("brew install -- ag"));
+    try testing.expect(fake.called("brew install -- zzz-removed-formula"));
+}
+
+test "install: a formula row and a cask row of one name each get their own answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved read-only against Homebrew 7.0.2: `docker` is a canonical
+    // FORMULA name and an old token of the cask `docker-desktop`. One map
+    // shared by both kinds let the formula answer claim the key and the cask
+    // row install docker-desktop, which `brew list --cask --full-name`
+    // reports under that name alone.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- docker",
+            .stdout =
+            \\{"formulae":[{"full_name":"docker","name":"docker","tap":"homebrew/core","aliases":[],"oldnames":[]}],"casks":[]}
+            ,
+        },
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- docker",
+            .stdout =
+            \\{"formulae":[],"casks":[{"token":"docker-desktop","full_token":"docker-desktop","tap":"homebrew/cask","old_tokens":["docker"]}]}
+            ,
+        },
+        .{ .argv = "brew install -- docker" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{
+        rowOf("docker", &.{}),
+        rowOf("docker", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+    });
+    try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: brew: row \"docker\" is an alias for the cask \"docker-desktop\", and brew reports only the cask name, so declare \"docker-desktop\" instead\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("brew install -- docker"));
+    try testing.expect(!fake.called("brew install --cask -- docker"));
+}
+
+test "install: a cask row and a formula row of one name each get their own answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The mirror case, and the one that proves the fix is not an ordering
+    // accident: `dash` is a canonical CASK token and an old name of the
+    // formula `dash-shell`, both verified read-only against Homebrew 7.0.2.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- dash",
+            .stdout =
+            \\{"formulae":[],"casks":[{"token":"dash","full_token":"dash","tap":"homebrew/cask","old_tokens":[]}]}
+            ,
+        },
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- dash",
+            .stdout =
+            \\{"formulae":[{"full_name":"dash-shell","name":"dash-shell","tap":"homebrew/core","aliases":[],"oldnames":["dash"]}],"casks":[]}
+            ,
+        },
+        .{ .argv = "brew install --cask -- dash" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{
+        rowOf("dash", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+        rowOf("dash", &.{}),
+    });
+    try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: brew: row \"dash\" is an alias for the formula \"dash-shell\", and brew reports only the formula name, so declare \"dash-shell\" instead\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("brew install --cask -- dash"));
+    try testing.expect(!fake.called("brew install -- dash"));
 }

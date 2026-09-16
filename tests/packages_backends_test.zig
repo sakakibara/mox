@@ -450,3 +450,140 @@ test "brew: a cask resolves through the same query, under its own key" {
     const want = try std.fmt.allocPrint(a, "\"full_token\": \"{s}\"", .{token});
     try testing.expect(std.mem.indexOf(u8, res.stdout, want) != null);
 }
+
+test "brew: a batch carrying one unresolvable name answers for none of them" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // The premise of asking each name on its own when a batch fails. If brew
+    // ever starts answering for the names it does have, the per-name pass
+    // becomes dead weight and this says so.
+    const batch = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "ag", "zzz-removed-formula" });
+    if (batch.term == .exited and batch.term.exited == 0) {
+        std.debug.print("brew info --json=v2 -- ag zzz-removed-formula now exits 0; the per-name pass may no longer be needed\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expectEqual(@as(usize, 0), std.mem.trim(u8, batch.stdout, " \t\r\n").len);
+
+    // And each name on its own is answered, which is what the fallback rests
+    // on: the good one resolves, the bad one does not.
+    const good = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "ag" });
+    if (good.term != .exited or good.term.exited != 0) {
+        std.debug.print("brew info --json=v2 -- ag did not answer on its own; one bad name would disable alias refusal for a whole batch\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(std.mem.indexOf(u8, good.stdout, "\"full_name\": \"the_silver_searcher\"") != null);
+
+    const bad = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "zzz-removed-formula" });
+    try testing.expect(bad.term != .exited or bad.term.exited != 0);
+}
+
+test "brew: a formula and a cask of one name resolve to different packages" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // The premise of one resolution map per kind. `docker` is a canonical
+    // formula name and an old token of the cask `docker-desktop`; `dash` is a
+    // canonical cask token and an old name of the formula `dash-shell`. One
+    // shared map would let whichever kind was asked first answer for the
+    // other, and the row of the other kind would install a package under a
+    // name brew reports differently.
+    const formula = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "docker", "dash" });
+    if (formula.term != .exited or formula.term.exited != 0) {
+        std.debug.print("brew info --json=v2 --formula -- docker dash did not answer; the collision premise cannot be checked\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(std.mem.indexOf(u8, formula.stdout, "\"full_name\": \"docker\"") != null);
+    try testing.expect(std.mem.indexOf(u8, formula.stdout, "\"full_name\": \"dash-shell\"") != null);
+
+    const cask = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--cask", "--", "docker", "dash" });
+    if (cask.term != .exited or cask.term.exited != 0) {
+        std.debug.print("brew info --json=v2 --cask -- docker dash did not answer; the collision premise cannot be checked\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(std.mem.indexOf(u8, cask.stdout, "\"full_token\": \"docker-desktop\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cask.stdout, "\"full_token\": \"dash\"") != null);
+}
+
+test "brew: a core tap qualifier resolves to the bare name brew reports back" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // The premise of asking about a tap-qualified row: brew answers for
+    // `homebrew/core`, whose formulae `brew list --full-name` reports BARE,
+    // so such a row would read as missing for ever.
+    const core = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "homebrew/core/ripgrep" });
+    if (core.term != .exited or core.term.exited != 0) {
+        std.debug.print("brew info --json=v2 -- homebrew/core/ripgrep no longer answers; the tap-qualified refusal rests on it\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(std.mem.indexOf(u8, core.stdout, "\"full_name\": \"ripgrep\"") != null);
+    try testing.expect(std.mem.indexOf(u8, core.stdout, "\"tap\": \"homebrew/core\"") != null);
+
+    // And a tap this machine does not have answers nothing at all, which is
+    // what keeps such a row: declaring it is the decision to trust the tap.
+    const unknown = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "zzzowner/zzztap/thing" });
+    if (unknown.term == .exited and unknown.term.exited == 0) {
+        std.debug.print("brew answered for a tap that is not installed; a row naming a new tap would now be judged against it\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "brew: a third-party tap's formula is reported under its qualified name" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // The other half: a row qualifying a tap that is NOT one of brew's
+    // defaults resolves to its own spelling, so it must not be refused.
+    // Read-only -- the tap is whichever one this machine already has.
+    const taps = try rawLines(a, io, &.{ "brew", "tap" });
+    var third: ?[]const u8 = null;
+    for (taps) |t| {
+        if (std.mem.startsWith(u8, t, "homebrew/")) continue;
+        third = t;
+        break;
+    }
+    const tap = third orelse {
+        std.debug.print("brew: no third-party tap here; the qualified-name check has nothing to ask about\n", .{});
+        return error.SkipZigTest;
+    };
+
+    const listed = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--formula" });
+    var qualified: ?[]const u8 = null;
+    const prefix = try std.fmt.allocPrint(a, "{s}/", .{tap});
+    for (listed) |name| {
+        if (!std.mem.startsWith(u8, name, prefix)) continue;
+        qualified = name;
+        break;
+    }
+    const name = qualified orelse {
+        std.debug.print("brew: nothing from {s} is installed; the qualified-name check has nothing to ask about\n", .{tap});
+        return error.SkipZigTest;
+    };
+
+    const res = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", name });
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("brew info --json=v2 -- {s} did not answer; a tapped row cannot be resolved\n", .{name});
+        return error.TestUnexpectedResult;
+    }
+    // brew reports it qualified, so the row already spells what brew answers
+    // with and nothing is refused.
+    const want = try std.fmt.allocPrint(a, "\"full_name\": \"{s}\"", .{name});
+    try testing.expect(std.mem.indexOf(u8, res.stdout, want) != null);
+}

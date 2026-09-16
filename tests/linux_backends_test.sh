@@ -40,8 +40,12 @@
 # naming either must go rather than the batch. One runs the round trip a
 # multiarch machine needs, which is the one place a colon in a name is the
 # name apt itself reports; one covers a machine with no package index, where
-# apt's listing must come back empty; and one covers a pacman database that
-# is merely old, where a name it lacks must still reach pacman. The hermetic
+# apt's listing must come back empty; one covers a pacman database that
+# is merely old, where a name it lacks must still reach pacman; one covers a
+# package no repository carries, installed from a .deb, which apt would
+# install and mox must therefore keep; and one covers a pacman database that
+# is SHORT rather than old, where a repository's groups all read as no group
+# at all. The hermetic
 # suite proves what the adapter does; only the real manager proves what the
 # row would have done. These run with the default set, not from the
 # image/backend/package arguments.
@@ -1154,6 +1158,251 @@ EOF
   fi
 }
 
+# Both halves of the oracle a BARE apt row is judged by, in one container.
+# A package installed from a .deb is in no repository, so the repository
+# listing cannot answer for it: marked auto it is absent from
+# `apt-mark showmanual` too, yet `apt-get install` of its bare name exits 0
+# and marks it manual, so the row converges and must be KEPT. The same query
+# is what still refuses a bare name whose package exists only for a foreign
+# architecture, where the install sets `name:<arch>` to manual instead and
+# apt-mark reports it qualified.
+run_apt_local_deb_case() {
+  image="$1"
+  foreign="$2"
+  backend="apt local-deb"
+
+  case_dir="$work/apt-local-deb"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "moxlocaldemo"
+
+[[packages]]
+name = "moxforeigndemo"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      dpkg --add-architecture '"$foreign"'
+      apt-get update >/dev/null
+      native="$(dpkg --print-architecture)"
+      build() {
+        rm -rf /tmp/p
+        mkdir -p /tmp/p/DEBIAN
+        printf "Package: %s\nVersion: 1.0\nSection: misc\nPriority: optional\nArchitecture: %s\nMaintainer: mox <mox@example.invalid>\nDescription: a package no repository carries\n" "$1" "$2" > /tmp/p/DEBIAN/control
+        dpkg-deb --build /tmp/p "/tmp/$1.deb" >/dev/null
+        dpkg -i --force-architecture "/tmp/$1.deb" >/dev/null
+        apt-mark auto "$1" >/dev/null 2>&1 || apt-mark auto "$1:$2" >/dev/null 2>&1
+      }
+      build moxlocaldemo "$native"
+      build moxforeigndemo '"$foreign"'
+      # The premises: neither is manual, so both rows read as MISSING, and
+      # the repository listing holds neither.
+      apt-mark showmanual | grep -qx moxlocaldemo && { echo "the local package is already manual; the case cannot run"; exit 1; }
+      apt-cache -o "APT::Architectures=$native" -o Dir::State::status=/dev/null --generate pkgnames > /tmp/listing.txt
+      grep -qx moxlocaldemo /tmp/listing.txt && { echo "a repository carries moxlocaldemo; the case cannot run"; exit 1; }
+      grep -qx moxforeigndemo /tmp/listing.txt && { echo "a repository carries moxforeigndemo; the case cannot run"; exit 1; }
+      echo "--- before ---"
+      /w/mox status || true
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- after ---"
+      /w/mox status || true
+      echo "--- showmanual ---"
+      apt-mark showmanual | grep -x moxlocaldemo || echo "local-not-manual"
+      apt-mark showmanual | grep -x "moxforeigndemo:'"$foreign"'" || echo "foreign-not-manual"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- showmanual ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+apt moxlocaldemo"; then
+    ok "$backend ($image): a locally installed package marked auto reads as MISSING"
+  else
+    no "$backend ($image): expected 'moxlocaldemo' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  # The half this case exists for: the row apt WOULD install must not be
+  # refused, whatever the repository listing says.
+  if grep -q 'row "moxlocaldemo"' "$out"; then
+    no "$backend ($image): a row apt would have installed was refused" "$(grep 'row \"moxlocaldemo\"' "$out")"
+  else
+    ok "$backend ($image): a row no repository carries but dpkg has natively is kept"
+  fi
+
+  if grep -qx "moxlocaldemo" "$out"; then
+    ok "$backend ($image): the real apt marked it manually installed, so apt-mark reports it"
+  else
+    no "$backend ($image): apt-mark does not report moxlocaldemo" "$(sed -n '/--- showmanual ---/,$p' "$out")"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+apt moxlocaldemo"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift over the locally installed package is clean after apply"
+  fi
+
+  # The other half: a bare name whose package is only ever reported
+  # qualified must still go.
+  want="mox: apt: row \"moxforeigndemo\" names an apt package for the architecture \"$foreign\" alone, which apt-mark reports as \"moxforeigndemo:$foreign\", so the row could never read as installed; declare \"moxforeigndemo:$foreign\" instead"
+  if grep -qF "$want" "$out"; then
+    ok "$backend ($image): a bare name only the foreign architecture has is still refused"
+  else
+    no "$backend ($image): the foreign-architecture row was not refused with the qualified spelling" "$(grep '^mox: apt' "$out" | tail -3)"
+  fi
+
+  if grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the kept row installed and the refused one is counted as its own failure"
+  else
+    no "$backend ($image): apply did not install one row and refuse the other" "$(grep -i 'packages:\|apply-exit=' "$out" | tail -3)"
+  fi
+}
+
+# A name apt has as a VIRTUAL name rather than a package: `apt-get install
+# a52dec` installs `liba52-0.7.4-dev`, which apt-mark reports under its own
+# name. The row must be refused with what provides it named -- the regex
+# warning is not what apt would have done here.
+run_apt_virtual_name_case() {
+  image="$1"
+  backend="apt virtual"
+
+  case_dir="$work/apt-virtual"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "a52dec"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      apt-get update >/dev/null
+      native="$(dpkg --print-architecture)"
+      # The premise: no package by that name, and exactly one that provides it.
+      apt-cache -o "APT::Architectures=$native" -o Dir::State::status=/dev/null --generate pkgnames | grep -qx a52dec && { echo "this release has a52dec as a package; the case cannot run"; exit 1; }
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      dpkg-query -W -f "${Package}\n" liba52-0.7.4-dev 2>/dev/null && echo "collateral=liba52-0.7.4-dev" || true
+      echo "collateral-end"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -qF 'mox: apt: row "a52dec" names no apt package; it is a virtual name provided by "liba52-0.7.4-dev", and apt-mark reports only a package'"'"'s own name, so declare the one you want instead' "$out"; then
+    ok "$backend ($image): the row is refused with the package that provides it named"
+  else
+    no "$backend ($image): apply did not name the provider" "$(grep '^mox: apt' "$out" | tail -3)"
+  fi
+
+  if grep -q "^collateral=" "$out"; then
+    no "$backend ($image): apt installed a provider the manifest never declared" "$(grep '^collateral=' "$out")"
+  else
+    ok "$backend ($image): no provider landed; the row never reached apt-get"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# A PARTIALLY synced pacman database: one repository's database is missing
+# while another answers. `pacman -Sl` is then non-empty, so nothing about the
+# listing says it is short, and `pacman -Sg <group>` exits 1 for every group
+# the missing repository holds -- the same answer a real package gives. A
+# group declared in that state must still be refused, not installed.
+run_pacman_partial_db_case() {
+  image="$1"
+  backend="pacman partial-db"
+
+  case_dir="$work/pacman-partial-db"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "xfce4"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      [ -f /var/lib/pacman/sync/extra.db ] || { echo "this image has no extra database to drop; the case cannot run"; exit 1; }
+      rm -f /var/lib/pacman/sync/extra.db
+      # The premises: the listing still answers, and the group question does
+      # not -- which is exactly what a name that is no group answers too.
+      pacman -Sl 2>/dev/null | grep -q . || { echo "the listing is empty, not short; the case cannot run"; exit 1; }
+      pacman -Sg xfce4 >/dev/null 2>&1 && { echo "the missing database still answers; the case cannot run"; exit 1; }
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      for p in exo garcon xfce4-session xfce4-panel; do
+        pacman -Q "$p" >/dev/null 2>&1 && echo "collateral=$p" || true
+      done
+      echo "collateral-end"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no short database could be built" \
+      "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q 'mox: pacman: row "xfce4" names no pacman package; it is a group of' "$out"; then
+    ok "$backend ($image): a group in the repository whose database was missing is still refused"
+  else
+    no "$backend ($image): the group was not refused against a short database" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "^collateral=" "$out"; then
+    no "$backend ($image): pacman installed group members the manifest never declared" "$(grep '^collateral=' "$out")"
+  else
+    ok "$backend ($image): no member of the group landed"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -1174,6 +1423,10 @@ else
   # The other half of that: a foreign-only name apt's plain listing prints
   # BARE, which is the majority of them.
   run_foreign_only_bare_case debian:stable "$foreign_arch"
+  # The half no repository can answer for: a package installed from a .deb,
+  # beside a bare name whose package is only ever reported qualified.
+  run_apt_local_deb_case debian:stable "$foreign_arch"
+  run_apt_virtual_name_case debian:stable
   run_apt_hold_pin_case debian:stable
   run_apt_no_repositories_case debian:stable
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
@@ -1194,6 +1447,7 @@ else
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
   run_pacman_sync_case archlinux:latest
+  run_pacman_partial_db_case archlinux:latest
   run_pacman_stale_case archlinux:latest
   run_case debian:stable brew hello
 fi

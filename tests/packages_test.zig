@@ -2890,7 +2890,9 @@ test "apply: a row no manager has fails alone, and the rows beside it install" {
     const fake = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
         .{ .argv = "apt-cache -o APT::Architectures=arm64 -o Dir::State::status=/dev/null --generate pkgnames", .stdout = "sl\nbat\n" },
+        .{ .argv = "dpkg-query -W -f ${Package} ${Architecture} ${Status}\\n", .stdout = "sl arm64 install ok installed\n" },
         .{ .argv = "apt-cache madison ruby.dev", .stdout = "" },
+        .{ .argv = "apt-cache showpkg ruby.dev", .stdout = "" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl", .match = .suffix },
     });
     useFake(fake);

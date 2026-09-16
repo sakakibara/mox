@@ -221,6 +221,18 @@ so a row carrying an architecture is asked about as written, with
 `apt-cache madison`, the query verified to match a qualified name literally
 where `apt-cache show` and `apt-cache policy` both fall back to a regex.
 
+The repositories are not the whole answer, because a package installed from a
+`.deb` is in none of them. mox reads `dpkg-query` too, and a bare row whose
+package is installed under this machine's own architecture -- or under
+`all` -- is kept: `apt-get install` marks it manually installed and the row
+converges from there. The same query is what refuses a bare row whose package
+is installed only for a foreign architecture, where `apt-get install` sets
+`name:<arch>` to manual and `apt-mark showmanual` reports it qualified.
+
+A bare name apt has as a virtual name rather than a package is refused with
+what provides it named, the way a dnf capability is: `apt-get install a52dec`
+installs `liba52-0.7.4-dev`, which apt-mark then reports under its own name.
+
 A held or pinned package is refused too, and for a different reason: neither
 the index nor the package list knows about either, and `apt-get install`
 answers a batch carrying one by installing nothing at all -- so one such row
@@ -231,19 +243,24 @@ row. A hold is the user's decision, so it is never overridden.
 Before a dnf install, mox asks `dnf repoquery` the same question, and a name
 that is only an rpm capability rather than a package -- `zlib-devel`, which
 `zlib-ng-compat-devel` provides -- is refused with the name to declare in its
-place. Before a pacman install, mox reads `pacman -Slq`, and a name that is a
+place. Before a pacman install, mox reads `pacman -Sl`, and a name that is a
 package **group** rather than a package -- `xfce4`, which holds fourteen --
 is refused with the members named, since `pacman -S` installs every one of
 them and `pacman -Qeq` reports the members and never the group. Only a group
 is refused there: a name the listing lacks is still handed to pacman, because
 that listing is whatever the machine last synced and the install argv is
-`pacman -Syu`, which syncs before it resolves. That check only reads:
-pacman's database is downloaded only if the listing comes back empty,
-which is a machine that has never synced, and what runs then is the
-full `pacman -Syu` the install itself was about to run, never a bare
-`pacman -Sy` -- which would leave the database ahead of the installed
-packages, a state Arch does not support, on every path that then refuses a
-row or fails.
+`pacman -Syu`, which syncs before it resolves.
+
+"This is no group" is acted on, though, so it is asked of a database every
+configured repository answered for. With one repository's database missing,
+`pacman -Sl` still lists the others and `pacman -Sg` says the missing
+repository's groups are no groups at all -- the same answer a real package
+gives. So mox compares the repositories that answered against
+`pacman-conf --repo-list`, and syncs when one of them did not. That check
+otherwise only reads, and what runs when it does sync is the full
+`pacman -Syu` the install itself was about to run, never a bare `pacman -Sy`
+-- which would leave the database ahead of the installed packages, a state
+Arch does not support, on every path that then refuses a row or fails.
 
 An apt row qualified with the machine's own architecture is refused the same
 way, as are apt's `:native`, `:all` and `:any`, which apt resolves to the
@@ -278,8 +295,22 @@ stands for, and refuses a row naming an **alias** rather than the package
 brew reports back: `brew install ag` installs `the_silver_searcher`, which is
 the name `brew list --full-name --installed-on-request` answers with, so an
 `ag` row would read as missing and that formula as untracked on every run.
-The refusal names the formula or cask to declare instead. A tap-qualified row
-is not asked about: it names a tap the same install has yet to add.
+The refusal names the formula or cask to declare instead.
+
+Formulae and casks are asked about separately, because the two namespaces
+share names: `docker` is a formula of its own and an old token of the cask
+`docker-desktop`, and `dash` is a cask of its own and an old name of the
+formula `dash-shell`, so one answer must never stand in for the other. brew
+answers for none of a batch carrying a name it does not have, so mox then
+asks about each name on its own rather than letting one bad row turn the
+check off for the rest.
+
+A tap-qualified row is asked about too. `homebrew/core/ripgrep` is answered
+with `ripgrep`, which is the name brew reports back, so that row is refused
+with the bare name to declare; a third-party tap's formula is answered with
+its own qualified name, and such a row stands. A row naming a tap this
+machine does not have yet gets no answer at all and is kept -- declaring it
+is the decision to trust that tap.
 
 A scoop `name` is one app: a single token of letters, digits and `.`, `_`,
 `+` or `-`. So a row cannot be a manifest path or a URL (scoop installs

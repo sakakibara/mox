@@ -120,16 +120,29 @@ All notable changes to mox are documented here. The format follows
   `apt-cache madison` for a name carrying an architecture, dnf against `dnf
   repoquery`, pacman against `pacman -Sg`, brew against `brew info
   --json=v2` -- so a name apt would read as a regular expression, a name apt
-  has only for a foreign architecture, a name that is only an rpm
-  capability, a pacman group, a brew alias, and an apt row carrying the
-  machine's own architecture or apt's `:native`, `:all` or `:any` are each
-  refused with the name to declare instead, having installed nothing. apt is
+  has only for a foreign architecture, a name apt has as a virtual name
+  rather than a package, a name that is only an rpm capability, a pacman
+  group, a brew alias, and an apt row carrying the machine's own
+  architecture or apt's `:native`, `:all` or `:any` are each refused with
+  the name to declare instead, having installed nothing. The repositories
+  are not apt's whole answer: `dpkg-query` says which architecture an
+  already-installed package is under, so a bare row whose package came from
+  a `.deb` and is native (or `all`) is kept -- apt-get marks it manual and
+  the row converges -- while one whose package is installed only for a
+  foreign architecture is refused with the qualified spelling. apt is
   asked two more questions, because a held package and a pinned one each
   make `apt-get install` install nothing at all: `apt-mark showhold` and
   `apt-cache policy` name the row to refuse, and a hold is never overridden.
-  A name a manager merely cannot find is not refused where absence is no
-  evidence: pacman's database is whatever the machine last synced, and the
-  install syncs it. A refused row is its own failure: the rows beside it are
+  brew is asked once per kind, formulae and casks being separate namespaces
+  that share names, and about tap-qualified rows as well, since brew reports
+  a `homebrew/core` formula bare; a batch brew answers for none of is asked
+  again one name at a time, so one name brew cannot resolve does not turn
+  the check off for the rest. A name a manager merely cannot find is not
+  refused where absence is no evidence: pacman's database is whatever the
+  machine last synced, and the install syncs it. pacman's "this is no
+  group" answer IS acted on, so it is asked of a database every repository
+  in `pacman-conf --repo-list` answered for, and mox syncs first when one of
+  them did not. A refused row is its own failure: the rows beside it are
   installed, since one bad row in a manifest must not keep every other
   package off the machine. `mox apply --dry-run` runs none of those checks --
   they refresh an index and elevate,

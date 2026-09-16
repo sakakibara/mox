@@ -95,6 +95,9 @@ pub fn fetchVerified(
     // installer of exactly the cap through, as curl's own cap does.
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_installer_bytes + 1)) catch |e| switch (e) {
         error.StreamTooLong => return Error.BootstrapInstallerTooLarge,
+        // The allocator running out is not a download that failed, and
+        // naming it one would send the user looking at the network.
+        error.OutOfMemory => return e,
         else => return Error.BootstrapDownloadFailed,
     };
     const got = applied.contentHashHex(bytes);
@@ -173,6 +176,31 @@ test "fetchVerified: curl is told the size cap, and a partial download is not le
     try testing.expect(std.mem.indexOf(u8, fake.calls.items[0], " --max-filesize 67108864 ") != null);
     try testing.expect(std.mem.endsWith(u8, fake.calls.items[0], " -- https://example.invalid/install.sh"));
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "fetchVerified: an allocator that ran out is not a download that failed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+
+    // The download succeeded and the bytes are on disk; only reading them
+    // back runs out of memory, which is nothing the network did.
+    const body = "#" ** 8192;
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = body, .write_after = "-o", .io = io },
+    } };
+
+    // Room for the argv and the staged path, none for the installer itself.
+    var buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try testing.expectError(error.OutOfMemory, fetchVerified(fba.allocator(), io, fake.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+    }));
 }
 
 test "fetchVerified: the URL follows an end of options for curl and wget alike" {
