@@ -8,6 +8,7 @@ pub const exec = @import("exec.zig");
 pub const backend = @import("backend.zig");
 pub const validate = @import("validate.zig");
 pub const brew = @import("brew.zig");
+pub const report = @import("report.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -19,4 +20,5 @@ test {
     _ = backend;
     _ = validate;
     _ = brew;
+    _ = report;
 }

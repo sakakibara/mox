@@ -98,6 +98,15 @@ pub const BlacklistRow = struct {
 pub const Manifest = struct {
     packages: []const Row = &.{},
     blacklist: []const BlacklistRow = &.{},
+    /// How many manifest files were read. Zero means the subsystem is not in
+    /// use on this repo, which is not the same as a manifest that declares
+    /// nothing: without this, a machine that has never opted in would see
+    /// every installed package reported as untracked.
+    files: usize = 0,
+
+    pub fn inUse(self: Manifest) bool {
+        return self.files > 0;
+    }
 };
 
 pub const Error = error{
@@ -177,6 +186,7 @@ pub fn load(
     return .{
         .packages = try packages.toOwnedSlice(arena),
         .blacklist = try blacklist.toOwnedSlice(arena),
+        .files = files.len,
     };
 }
 
@@ -705,6 +715,28 @@ test "load: a gate on a blacklist row is an error" {
     try testing.expect(std.mem.indexOf(u8, d.capture().?, "no \"when\"") != null);
 }
 
+test "load: an empty manifest directory is in use, an absent one is not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data =
+        \\backend = "brew"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    // A file that declares nothing still opts in: everything installed is
+    // then genuinely untracked.
+    const m = try load(a, io, repo, "", null);
+    try testing.expect(m.inUse());
+    try testing.expectEqual(@as(usize, 0), m.packages.len);
+}
+
 test "load: a missing packages directory yields an empty manifest" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -719,6 +751,7 @@ test "load: a missing packages directory yields an empty manifest" {
     const m = try load(a, io, repo, "", null);
     try testing.expectEqual(@as(usize, 0), m.packages.len);
     try testing.expectEqual(@as(usize, 0), m.blacklist.len);
+    try testing.expect(!m.inUse());
 }
 
 test "load: files are read in basename order across layers" {
