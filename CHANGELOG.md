@@ -97,7 +97,15 @@ All notable changes to mox are documented here. The format follows
   is refused for the same reason: it installs under one name and is read back
   under another, so it would be reported missing and reinstalled forever.
   `mox commit` puts a row it is about to write through that same check, so no
-  manager's answer can produce a file a later command refuses. A manifest
+  manager's answer can produce a file a later command refuses. Whether a
+  manager HAS a package of that name is asked of the manager itself before an
+  install -- apt against `apt-cache --generate pkgnames`, dnf against `dnf
+  repoquery`, pacman against `pacman -Slq` -- so a name apt would read as a
+  regular expression, a name that is only an rpm capability, a pacman group,
+  and an apt row carrying the machine's own architecture or apt's `:native`,
+  `:all` or `:any` are each refused with the name to declare instead, having
+  installed nothing. `mox apply --dry-run` runs none of those checks, and
+  names beside the rows the manager list it left them unchecked against. A manifest
   also refuses an unknown top-level key, a
   `name` that is blank or carries whitespace, a control byte or a byte that
   is not UTF-8 or runs past 256 bytes -- one rule with the shape an id must

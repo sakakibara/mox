@@ -105,18 +105,6 @@ pub const NameProblem = enum {
 /// apply.
 ///
 /// A trailing `+` stays legal: `g++` is a real package.
-/// Whether a failed install refused the batch before running it, so nothing
-/// it named can have landed. An adapter that checks a row against its own
-/// manager before installing raises one of these; a manager that failed
-/// part-way through a batch does not, and what it already did is the
-/// caller's to report.
-pub fn refusedBeforeRunning(e: anyerror) bool {
-    return switch (e) {
-        error.DistroNameNotAPackage, error.ZypperSelectorRow, error.UnknownZypperKey => true,
-        else => false,
-    };
-}
-
 pub fn nameProblem(name: []const u8, class: NameClass) ?NameProblem {
     if (name.len == 0) return .empty;
     const base = switch (class) {
@@ -214,6 +202,11 @@ pub const Backend = struct {
     /// that there is nothing -- so the gap is stated rather than left to be
     /// discovered.
     limitation: ?[]const u8 = null,
+    /// What this adapter's install checks a row against before running its
+    /// manager, named so a dry run can say what it did not check. The check
+    /// itself refreshes an index and elevates, which a dry run must not do,
+    /// so a row a real apply would refuse is listed as one it would install.
+    install_check: ?[]const u8 = null,
 
     /// What probing a manager found. `broken` is a manager that is there but
     /// cannot answer its own version query: reading that as absent would make
@@ -248,6 +241,10 @@ pub const Backend = struct {
         installedExplicit: *const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8,
         /// Install these rows, leaving resolution to the manager.
         install: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void,
+        /// Whether the last `install` reached the point of running its
+        /// manager's install command. Absent for an adapter whose install
+        /// runs it first thing, where the answer is always yes.
+        installSpawned: ?*const fn (ctx: *anyopaque) bool = null,
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
@@ -302,6 +299,19 @@ pub const Backend = struct {
 
     pub fn install(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         return self.vtable.install(self.ctx, arena, rows);
+    }
+
+    /// Whether a failed `install` got as far as spawning its manager, so its
+    /// rows may have landed. Asked of the adapter, which is the only thing
+    /// that knows: the error alone cannot answer it, because a pre-check and
+    /// the install itself fail in the same ways -- a query that timed out, an
+    /// argv that could not run -- and a pre-check that grows a failure mode
+    /// would silently start reporting rows as possibly landed. An adapter
+    /// that does not answer is read as having spawned, which over-reports a
+    /// changed machine rather than hiding one.
+    pub fn installSpawned(self: Backend) bool {
+        const f = self.vtable.installSpawned orelse return true;
+        return f(self.ctx);
     }
 
     pub fn declare(self: Backend, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration {

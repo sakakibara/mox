@@ -25,17 +25,28 @@
 # the same fetch, digest check and non-interactive install a fresh machine
 # gets -- before installing the package through it.
 #
-# Four cases run the other way round, because a name a manager resolves to
+# Six cases run the other way round, because a name a manager resolves to
 # something other than itself is a fact about the manager that no fake can
 # establish: `apt-get install -y vim nano-` removes nano; `apt-get install --
 # bsdextrautil.` installs bsdextrautils, apt having matched the operand as a
-# regular expression; and `dnf install zlib-devel` installs
-# zlib-ng-compat-devel, `zlib-devel` being a capability rather than a package.
-# The hermetic suite proves the adapter refuses each row; only the real
-# manager proves what the row would have done. A fifth runs the round trip a
-# multiarch machine needs, which is the one place a colon in a name is the
-# name apt itself reports. These five run with the default set, not from the
-# image/backend/package arguments.
+# regular expression; `dnf install zlib-devel` installs zlib-ng-compat-devel,
+# `zlib-devel` being a capability rather than a package; `pacman -S xfce4`
+# installs all fourteen members of a group that `pacman -Qeq` never reports;
+# and `apt-get install sl:any` installs sl, which `apt-mark showmanual` then
+# reports bare. The hermetic suite proves the adapter refuses each row; only
+# the real manager proves what the row would have done. A sixth runs the
+# round trip a multiarch machine needs, which is the one place a colon in a
+# name is the name apt itself reports. These six run with the default set,
+# not from the image/backend/package arguments.
+#
+# A manager's IMAGE TAGS are part of what this suite covers. A floating tag
+# is ONE point in a manager's version range, and an adapter can be whole at
+# that point and broken a release behind it: dnf5 5.4.x (Fedora 44) accepts a
+# `--` before the operands that dnf5 5.2.x (Fedora 41, 42 and 43) exits 2 on,
+# so a suite running `latest` alone can be green over an adapter that installs
+# nothing at all on three current releases -- and green again the day `latest`
+# moves on. Cover the range: pin at least one release behind the floating tag,
+# and keep the pin when the tag moves.
 
 set -eu
 
@@ -513,6 +524,142 @@ EOF
   fi
 }
 
+# apt reads `:native`, `:all` and `:any` as the native package, and `apt-mark
+# showmanual` reports what it installed under the bare name -- so a row
+# spelling one installs and is MISSING on every status after. Each must be
+# refused with the bare name to declare instead, and nothing installed.
+run_apt_native_alias_case() {
+  image="$1"
+  backend="apt native-alias"
+
+  case_dir="$work/native-alias"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "bsdextrautils:native"
+
+[[packages]]
+name = "bsdmainutils:all"
+
+[[packages]]
+name = "sl:any"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      for p in bsdextrautils bsdmainutils sl; do
+        dpkg -s "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      for p in bsdextrautils bsdmainutils sl; do
+        dpkg -s "$p" >/dev/null 2>&1 && echo "collateral=$p" || true
+      done
+      echo "collateral-end"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  missed=""
+  for pair in 'bsdextrautils:native bsdextrautils' 'bsdmainutils:all bsdmainutils' 'sl:any sl'; do
+    row="${pair% *}"
+    bare="${pair#* }"
+    grep -q "row \"$row\" carries the qualifier .*declare \"$bare\" instead" "$out" || missed="$missed $row"
+  done
+  if [ -z "$missed" ]; then
+    ok "$backend ($image): every qualifier apt reads as native is refused, naming the bare row"
+  else
+    no "$backend ($image): rows not refused with the bare name to declare:$missed" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+
+  if grep -q "^collateral=" "$out"; then
+    no "$backend ($image): apt installed a package under a name the row could never read back" "$(grep '^collateral=' "$out")"
+  else
+    ok "$backend ($image): none of the three landed; the rows never reached apt"
+  fi
+}
+
+# `fprint` is a package GROUP: `pacman -S fprint` installs libfprint and
+# fprintd, and `pacman -Qeq` reports those two and never the group -- so the
+# row is MISSING on every status while the machine carries two packages no
+# manifest declares. The row must be refused, naming the members.
+run_pacman_group_case() {
+  image="$1"
+  backend="pacman group"
+
+  case_dir="$work/pacman-group"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "fprint"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      for p in libfprint fprintd; do
+        pacman -Q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      for p in libfprint fprintd; do
+        pacman -Q "$p" >/dev/null 2>&1 && echo "collateral=$p" || true
+      done
+      echo "collateral-end"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  # The message must name the members, or the user is left with a row that
+  # fails on every apply and nothing to write in its place.
+  if grep -q 'mox: pacman: row "fprint" names no pacman package; it is a group of 2 packages ("fprintd", "libfprint")' "$out"; then
+    ok "$backend ($image): the row is refused, naming the packages the group holds"
+  else
+    no "$backend ($image): apply did not refuse the group with its members named" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+
+  if grep -q "^collateral=" "$out"; then
+    no "$backend ($image): pacman installed group members the manifest never declared" "$(grep '^collateral=' "$out")"
+  else
+    ok "$backend ($image): no member of the group landed; the row never reached pacman"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -522,6 +669,7 @@ else
   run_case debian:stable apt ripgrep
   run_remove_suffix_case debian:stable
   run_regex_operand_case debian:stable
+  run_apt_native_alias_case debian:stable
   # The foreign architecture is whichever one the host is not: i386 beside
   # amd64 (Steam, wine), armhf beside arm64 (cross work).
   run_multiarch_case debian:stable "$foreign_arch"
@@ -530,12 +678,18 @@ else
   # a package name.
   run_case fedora:latest dnf ripgrep
   run_provide_name_case fedora:latest
+  # A pinned release behind the floating one, because an adapter is broken or
+  # whole per version range: dnf5 5.2.x (Fedora 41, 42 and 43) exits 2 on a
+  # `--` before the operands that dnf5 5.4.x (Fedora 44) accepts. Only a
+  # pinned tag can hold a range still while `latest` moves.
+  run_case fedora:42 dnf ripgrep
   # jq, not ripgrep: Rocky 9's default repos carry no ripgrep -- it lives in
   # EPEL, which the stock image does not enable, so that case could only fail.
   run_case rockylinux:9 dnf jq
   run_case opensuse/tumbleweed zypper ripgrep
-  # Arch publishes no arm64 image, so this case skips on an arm64 host.
+  # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
+  run_pacman_group_case archlinux:latest
   run_case debian:stable brew hello
 fi
 

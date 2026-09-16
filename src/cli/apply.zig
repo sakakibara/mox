@@ -1138,6 +1138,18 @@ fn applyPackages(
             try ctx.out.print("  installing      {s} {s}\n", .{ b.backend, m.row.name });
             try rows.append(ctx.alloc, m.row);
         }
+        // A real install asks the manager whether each row names a package it
+        // has, and refuses the batch when one does not. That check refreshes
+        // an index and elevates, neither of which a dry run may do, so what it
+        // would refuse is listed here as what it would install: said plainly,
+        // rather than left to be discovered by the apply that follows.
+        if (dry_run) {
+            if (backend.install_check) |what| try ctx.out.print(
+                "  note            a dry run leaves these rows unchecked against {s}; a real apply checks them there and refuses a row that names no package\n",
+                .{what},
+            );
+            continue;
+        }
         if (rows.items.len == 0) continue;
 
         // The whole set goes to the adapter at once: a manager that resolves
@@ -1151,9 +1163,12 @@ fn applyPackages(
             );
             try ctx.err.flush();
             counts.failed += 1;
-            // A batch refused before it ran landed nothing, so saying its rows
-            // may have is a hedge about work that never happened.
-            if (!mox.packages.backend.refusedBeforeRunning(e)) counts.attempted += rows.items.len;
+            // A batch that never got as far as running its manager landed
+            // nothing, so saying its rows may have is a hedge about work that
+            // never happened. The adapter is asked, rather than its error
+            // read: a check that runs before the install fails in the same
+            // ways the install does.
+            if (backend.installSpawned()) counts.attempted += rows.items.len;
             continue;
         };
         counts.installed += rows.items.len;

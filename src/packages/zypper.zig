@@ -44,6 +44,10 @@ pub const Zypper = struct {
     /// Overrides the root check, so a test can exercise both paths on a host
     /// whose own uid it does not control.
     force_elevate: ?bool = null,
+    /// Whether the last `install` ran zypper's install command, which
+    /// `installSpawned` answers with: a refresh that fails stops the install
+    /// before it, and nothing it named can have landed.
+    spawned: bool = false,
 
     pub fn backend(self: *Zypper) Backend {
         return .{
@@ -60,8 +64,14 @@ pub const Zypper = struct {
         .idOf = idOfImpl,
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
+        .installSpawned = installSpawnedImpl,
         .declare = declareImpl,
     };
+
+    fn installSpawnedImpl(ctx: *anyopaque) bool {
+        const self: *Zypper = @ptrCast(@alignCast(ctx));
+        return self.spawned;
+    }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
@@ -168,6 +178,7 @@ pub const Zypper = struct {
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
+        self.spawned = false;
         if (rows.len == 0) return;
 
         const elevate = if (self.force_elevate) |f| f else !exec.isRoot();
@@ -187,6 +198,7 @@ pub const Zypper = struct {
         try argv.appendSlice(arena, &.{ "zypper", "--non-interactive", "install", "--" });
         for (rows) |row| try argv.append(arena, row.name);
 
+        self.spawned = true;
         const res = try self.runner.stream(arena, argv.items);
 
         var ids: std.ArrayList([]const u8) = .empty;

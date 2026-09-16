@@ -450,8 +450,8 @@ test "linux: a dnf machine reports and installs through the same core" {
     // Both spellings are scripted: whether an install elevates depends on the
     // uid running this suite, and the fixture must not depend on that.
     const fake = try dnfWith(a, "bat\nhtop\n", &.{
-        .{ .argv = "sudo dnf install -y -- ripgrep" },
-        .{ .argv = "dnf install -y -- ripgrep" },
+        .{ .argv = "sudo dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -464,13 +464,69 @@ test "linux: a dnf machine reports and installs through the same core" {
     // rpm virtual provide is spelled like one and would otherwise install a
     // package of another name.
     const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n -- ripgrep", .stdout = "ripgrep\n" },
-        .{ .argv = "sudo dnf install -y -- ripgrep" },
-        .{ .argv = "dnf install -y -- ripgrep" },
+        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "sudo dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y ripgrep" },
     });
     useFake(fake2);
     _ = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(fake2.called("sudo dnf install -y -- ripgrep"));
+    try std.testing.expect(fake2.called("sudo dnf install -y ripgrep"));
+}
+
+test "apply: a check that could not run reports nothing landed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "fedora.toml", "backend = \"dnf\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    // The check that runs before the install fails. No install argv was ever
+    // built, so the machine is exactly as it was, and a hedge about rows that
+    // may have landed would send the user looking for a change nothing made.
+    const fake = try dnfWith(a, "bat\n", &.{
+        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .code = 1 },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+}
+
+test "apply --dry-run: says which rows it left unchecked" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "fedora.toml", "backend = \"dnf\"\n\n[[packages]]\nname = \"zlib-devel\"\n");
+
+    // A row a real apply refuses -- an rpm capability, not a package -- is
+    // still listed as one the run would install, because the check that
+    // refuses it needs the manager. Nothing is scripted past the report, so a
+    // dry run that asked dnf anything would error out here.
+    const fake = try dnfWith(a, "bat\n", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply", "--dry-run" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   dnf zlib-devel") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "note            a dry run leaves these rows unchecked against the packages dnf's repositories carry; a real apply checks them there and refuses a row that names no package\n",
+    ) != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
 test "linux: a manifest for a manager this machine lacks is inert, not an error" {

@@ -208,9 +208,20 @@ regular expression, so `libz.dev` installs ten packages the manifest never
 declared and `ruby.dev` installs hundreds. Before a dnf install, mox asks
 `dnf repoquery` the same question, and a name that is only an rpm capability
 rather than a package -- `zlib-devel`, which `zlib-ng-compat-devel` provides
--- is refused with the name to declare in its place. Both refusals install
-nothing at all; an apt row qualified with the machine's own architecture is
-refused the same way, since `apt-mark` reports that one bare.
+-- is refused with the name to declare in its place. Before a pacman install,
+mox asks `pacman -Slq`, and a name that is a package **group** rather than a
+package -- `xfce4`, which holds fourteen -- is refused with the members named,
+since `pacman -S` installs every one of them and `pacman -Qeq` reports the
+members and never the group.
+
+Every one of those refusals installs nothing at all. An apt row qualified with
+the machine's own architecture is refused the same way, as are apt's
+`:native`, `:all` and `:any`, which apt resolves to the native package that
+`apt-mark` then reports bare.
+
+These checks run the manager, so `mox apply --dry-run` does not run them: a
+dry run lists a row a real apply would refuse as one it would install, and
+says so in a note beside the rows it left unchecked.
 
 ### brew taps
 
