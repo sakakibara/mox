@@ -13,6 +13,24 @@ const manifest_mod = @import("manifest.zig");
 pub const Row = manifest_mod.Row;
 pub const Diag = manifest_mod.Diag;
 
+/// Every adapter mox knows, whether or not this machine can use it. A row
+/// naming something outside it is a typo, not a machine difference, so the
+/// two are never the same branch.
+pub const Registry = struct {
+    backends: []const Backend,
+
+    pub fn find(self: Registry, name: []const u8) ?Backend {
+        for (self.backends) |b| {
+            if (std.mem.eql(u8, b.name, name)) return b;
+        }
+        return null;
+    }
+
+    pub fn has(self: Registry, name: []const u8) bool {
+        return self.find(name) != null;
+    }
+};
+
 pub const Backend = struct {
     /// The `backend = "..."` spelling a manifest row selects this adapter by.
     name: []const u8,

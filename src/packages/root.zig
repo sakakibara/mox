@@ -6,6 +6,7 @@ pub const desired = @import("desired.zig");
 pub const drift = @import("drift.zig");
 pub const exec = @import("exec.zig");
 pub const backend = @import("backend.zig");
+pub const validate = @import("validate.zig");
 pub const brew = @import("brew.zig");
 
 test {
@@ -16,5 +17,6 @@ test {
     _ = drift;
     _ = exec;
     _ = backend;
+    _ = validate;
     _ = brew;
 }

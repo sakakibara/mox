@@ -67,6 +67,9 @@ pub const Fake = struct {
         stdout: []const u8 = "",
         stderr: []const u8 = "",
         code: u8 = 0,
+        /// Raised instead of answering, for the failures a manager reports by
+        /// not being there at all.
+        fail: ?anyerror = null,
     };
 
     entries: []const Entry,
@@ -90,6 +93,7 @@ pub const Fake = struct {
         try self.calls.append(self.arena, joined);
         for (self.entries) |e| {
             if (std.mem.eql(u8, e.argv, joined)) {
+                if (e.fail) |err| return err;
                 return .{
                     .code = e.code,
                     .ok = e.code == 0,
@@ -130,6 +134,20 @@ test "Fake: an unscripted command fails rather than returning empty output" {
     const r = fake.runner();
 
     try testing.expectError(error.UnexpectedCommand, r.run(a, &.{ "brew", "install", "ripgrep" }));
+}
+
+test "Fake: a scripted failure is raised, not answered" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "brew --version", .fail = error.FileNotFound }},
+    };
+    const r = fake.runner();
+
+    try testing.expectError(error.FileNotFound, r.run(a, &.{ "brew", "--version" }));
 }
 
 test "Fake: a nonzero scripted code is not ok" {

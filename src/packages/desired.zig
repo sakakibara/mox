@@ -1,48 +1,56 @@
 //! The desired set: the manifest rows that belong on THIS machine.
 //!
-//! A row is desired when its backend is active here and its `when` gate
-//! holds. Backend activation is decided by the caller and passed in as a
-//! list of names, so the core never learns which executable a manager ships
-//! or which OS it runs on -- that is the adapter's knowledge.
+//! A row is desired when its backend is usable here and its `when` gate
+//! holds. Which backends are usable is decided by the caller and passed in by
+//! name, so the core never learns which executable a manager ships or which
+//! OS it runs on -- that is the adapter's knowledge. A row naming a backend
+//! that is registered but unusable here is inert; one naming a backend that
+//! does not exist is a typo, and `validate.all` has already refused it.
 //!
-//! Two contradictions are refused rather than resolved: the same package
-//! desired twice on one machine, and a package both desired and blacklisted.
-//! Gates that are disjoint (a pinned row for one profile, a plain row for
-//! the rest) are not duplicates, because only one of them is ever active.
+//! Identity is the adapter's `idOf`, never the raw name, so a brew formula
+//! and the cask of the same name are two packages here exactly as they are
+//! everywhere else. Gates that are disjoint (a pinned row for one profile, a
+//! plain row for the rest) are not duplicates, because only one is active.
 
 const std = @import("std");
 
 const axis = @import("../dsl/axis.zig");
 const resolver_mod = @import("../dsl/resolver.zig");
+const backend_mod = @import("backend.zig");
 const manifest_mod = @import("manifest.zig");
 
 pub const Resolver = resolver_mod.Resolver;
+pub const Registry = backend_mod.Registry;
 pub const Row = manifest_mod.Row;
 pub const Manifest = manifest_mod.Manifest;
 pub const Diag = manifest_mod.Diag;
 
 pub const Error = error{
     DuplicatePackageRow,
-    BlacklistedPackageDesired,
 };
 
-/// The rows to install on this machine, in manifest order. `active_backends`
-/// names the backends usable here; rows for any other backend are inert.
+/// The rows to install on this machine, in manifest order. `active` names the
+/// backends usable here; rows for any other registered backend are inert.
 pub fn select(
     arena: std.mem.Allocator,
     m: Manifest,
     r: *const Resolver,
-    active_backends: []const []const u8,
+    registry: Registry,
+    active: []const []const u8,
     diag: ?*Diag,
 ) ![]const Row {
     var out: std.ArrayList(Row) = .empty;
     var seen = std.StringHashMap(Row).init(arena);
 
     for (m.packages) |row| {
-        if (!contains(active_backends, row.backend)) continue;
-        if (!gateHolds(arena, row, r)) continue;
+        if (!contains(active, row.backend)) continue;
+        const b = registry.find(row.backend) orelse continue;
+        if (!try gateHolds(arena, row, r)) continue;
 
-        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ row.backend, row.name });
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{
+            row.backend,
+            try b.idOf(arena, row),
+        });
         if (seen.get(key)) |first| {
             if (diag) |d| d.set(
                 "{s} and {s} both declare \"{s}\" for backend \"{s}\" on this machine",
@@ -52,40 +60,19 @@ pub fn select(
         }
         try seen.put(key, row);
 
-        if (blacklistEntry(m, row.backend, row.name)) |b| {
-            if (diag) |d| d.set(
-                "{s} declares \"{s}\" for backend \"{s}\", which {s} blacklists",
-                .{ row.label, row.name, row.backend, b.label },
-            );
-            return Error.BlacklistedPackageDesired;
-        }
-
         try out.append(arena, row);
     }
 
     return out.toOwnedSlice(arena);
 }
 
-/// Whether a package is blacklisted for a backend, regardless of gating: a
-/// blacklist row suppresses the untracked report, which has no gate of its
-/// own.
-pub fn isBlacklisted(m: Manifest, backend: []const u8, name: []const u8) bool {
-    return blacklistEntry(m, backend, name) != null;
-}
-
-fn blacklistEntry(m: Manifest, backend: []const u8, name: []const u8) ?manifest_mod.BlacklistRow {
-    for (m.blacklist) |b| {
-        if (std.mem.eql(u8, b.backend, backend) and std.mem.eql(u8, b.name, name)) return b;
-    }
-    return null;
-}
-
-/// A row with no `when` is unconditional. A `when` that fails to parse here
-/// cannot happen: `manifest.load` already rejected it, so a parse failure at
-/// this point excludes the row rather than inventing a second diagnostic.
-fn gateHolds(arena: std.mem.Allocator, row: Row, r: *const Resolver) bool {
+/// A row with no `when` is unconditional. A parse failure is propagated
+/// rather than read as "excluded": `manifest.load` rejects a malformed gate,
+/// so what reaches here is an allocation failure, and silently dropping a
+/// package on one would be a package quietly missing from the machine.
+fn gateHolds(arena: std.mem.Allocator, row: Row, r: *const Resolver) !bool {
     const src = row.when orelse return true;
-    const expr = axis.parseString(arena, src) catch return false;
+    const expr = try axis.parseString(arena, src);
     return axis.evaluate(expr, r);
 }
 
@@ -97,6 +84,7 @@ fn contains(haystack: []const []const u8, needle: []const u8) bool {
 }
 
 const testing = std.testing;
+const test_backend = @import("test_backend.zig");
 
 fn rowOf(name: []const u8, backend: []const u8, when: ?[]const u8, label: []const u8) Row {
     return .{
@@ -108,6 +96,28 @@ fn rowOf(name: []const u8, backend: []const u8, when: ?[]const u8, label: []cons
         .label = label,
         .index = 0,
     };
+}
+
+fn caskRow(name: []const u8, label: []const u8) Row {
+    return .{
+        .name = name,
+        .backend = "brew",
+        .when = null,
+        .fields = &.{.{ .key = "kind", .value = .{ .string = "cask" } }},
+        .origin = "/tmp/x.toml",
+        .label = label,
+        .index = 0,
+    };
+}
+
+fn brewRegistry() Registry {
+    const backends = struct {
+        const list = [_]backend_mod.Backend{
+            test_backend.make("brew"),
+            test_backend.make("dnf"),
+        };
+    };
+    return .{ .backends = &backends.list };
 }
 
 test "select: keeps rows whose backend is active and whose gate holds" {
@@ -126,7 +136,7 @@ test "select: keeps rows whose backend is active and whose gate holds" {
         rowOf("work-tool", "brew", "profile=work", "data/packages/darwin.toml"),
     } };
 
-    const got = try select(a, m, &r, &.{"brew"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null);
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualStrings("ripgrep", got[0].name);
     try testing.expectEqualStrings("steam", got[1].name);
@@ -145,7 +155,7 @@ test "select: a row for an inactive backend is inert" {
         rowOf("bat", "dnf", null, "data/packages/fedora.toml"),
     } };
 
-    const got = try select(a, m, &r, &.{"dnf"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"dnf"}, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings("bat", got[0].name);
 }
@@ -164,11 +174,29 @@ test "select: the same package active twice is refused, naming both files" {
     } };
 
     var d: Diag = .{};
-    try testing.expectError(Error.DuplicatePackageRow, select(a, m, &r, &.{"brew"}, &d));
+    try testing.expectError(Error.DuplicatePackageRow, select(a, m, &r, brewRegistry(), &.{"brew"}, &d));
     try testing.expectEqualStrings(
         "data/packages/darwin.toml and data/packages/local.toml both declare \"ripgrep\" for backend \"brew\" on this machine",
         d.capture().?,
     );
+}
+
+test "select: a formula and the cask of the same name are two packages" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // brew keeps these apart, so the manifest must be able to declare both.
+    const m: Manifest = .{ .packages = &.{
+        rowOf("docker", "brew", null, "data/packages/darwin.toml"),
+        caskRow("docker", "data/packages/darwin.toml"),
+    } };
+
+    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null);
+    try testing.expectEqual(@as(usize, 2), got.len);
 }
 
 test "select: disjoint gates for one package are not a duplicate" {
@@ -185,7 +213,7 @@ test "select: disjoint gates for one package are not a duplicate" {
         rowOf("ripgrep", "brew", "not profile=work", "data/packages/darwin.toml"),
     } };
 
-    const got = try select(a, m, &r, &.{"brew"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings("profile=work", got[0].when.?);
 }
@@ -203,43 +231,6 @@ test "select: the same name on two backends is not a duplicate" {
         rowOf("ripgrep", "dnf", null, "data/packages/fedora.toml"),
     } };
 
-    const got = try select(a, m, &r, &.{ "brew", "dnf" }, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{ "brew", "dnf" }, null);
     try testing.expectEqual(@as(usize, 2), got.len);
-}
-
-test "select: a desired package that is also blacklisted is refused" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var bindings = std.StringHashMap([]const u8).init(a);
-    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
-
-    const m: Manifest = .{
-        .packages = &.{rowOf("usage", "brew", null, "data/packages/darwin.toml")},
-        .blacklist = &.{.{
-            .name = "usage",
-            .backend = "brew",
-            .origin = "/tmp/x.toml",
-            .label = "data/packages/local.toml",
-            .index = 0,
-        }},
-    };
-
-    var d: Diag = .{};
-    try testing.expectError(Error.BlacklistedPackageDesired, select(a, m, &r, &.{"brew"}, &d));
-    try testing.expect(std.mem.indexOf(u8, d.capture().?, "blacklists") != null);
-}
-
-test "isBlacklisted: matches on backend and name together" {
-    const m: Manifest = .{ .blacklist = &.{.{
-        .name = "usage",
-        .backend = "brew",
-        .origin = "/tmp/x.toml",
-        .label = "data/packages/a.toml",
-        .index = 0,
-    }} };
-    try testing.expect(isBlacklisted(m, "brew", "usage"));
-    try testing.expect(!isBlacklisted(m, "dnf", "usage"));
-    try testing.expect(!isBlacklisted(m, "brew", "ripgrep"));
 }

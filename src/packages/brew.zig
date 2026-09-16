@@ -9,7 +9,8 @@
 //! Names need no translation: `brew leaves --installed-on-request` reports a
 //! core formula bare and a tapped one fully qualified, exactly as a row
 //! spells it. Casks are a separate namespace that can collide with a formula
-//! of the same name, so a cask's id carries its kind.
+//! of the same name, so a cask's id carries its kind -- and a cask can come
+//! from a third-party tap just as a formula can.
 
 const std = @import("std");
 
@@ -49,7 +50,13 @@ pub const Brew = struct {
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Brew = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ "brew", "--version" }) catch return false;
+        const res = self.runner.run(arena, &.{ "brew", "--version" }) catch |e| switch (e) {
+            // Absent is the one failure that means "not usable here"; an
+            // allocation or spawn failure must not read as a missing brew and
+            // silently make every brew row inert.
+            error.FileNotFound => return false,
+            else => return e,
+        };
         return res.ok;
     }
 
@@ -83,7 +90,7 @@ pub const Brew = struct {
     }
 
     fn idOfImpl(_: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
-        return switch (kindOf(row)) {
+        return switch (try kindOf(row)) {
             .formula => row.name,
             .cask => std.fmt.allocPrint(arena, "{s}{s}", .{ cask_prefix, row.name }),
         };
@@ -108,17 +115,24 @@ pub const Brew = struct {
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         for (rows) |row| {
+            const kind = try kindOf(row);
             if (tapOf(row.name)) |tap| {
                 const tapped = try self.runner.run(arena, &.{ "brew", "tap", tap });
                 if (!tapped.ok) return error.BrewTapFailed;
-                // Trust the one formula named, never the whole tap: an
+                // Trust the one thing named, never the whole tap: an
                 // untrusted third-party tap is ignored outright since
                 // Homebrew 6.0, and whole-tap trust would extend to every
-                // formula it ever adds.
-                const trusted = try self.runner.run(arena, &.{ "brew", "trust", "--formula", row.name });
+                // formula and cask it ever adds. brew keeps the two target
+                // kinds apart, so a cask trusted as a formula is recorded in
+                // the wrong namespace and stays untrusted.
+                const flag: []const u8 = switch (kind) {
+                    .formula => "--formula",
+                    .cask => "--cask",
+                };
+                const trusted = try self.runner.run(arena, &.{ "brew", "trust", flag, row.name });
                 if (!trusted.ok) return error.BrewTrustFailed;
             }
-            const res = switch (kindOf(row)) {
+            const res = switch (kind) {
                 .formula => try self.runner.run(arena, &.{ "brew", "install", row.name }),
                 .cask => try self.runner.run(arena, &.{ "brew", "install", "--cask", row.name }),
             };
@@ -127,16 +141,22 @@ pub const Brew = struct {
     }
 };
 
-fn kindOf(row: Row) Kind {
+/// `validate` has already refused anything but `"formula"` or `"cask"`, so
+/// an unexpected value here is a caller that skipped validation, not user
+/// input to paper over.
+fn kindOf(row: Row) !Kind {
     const f = row.field("kind") orelse return .formula;
-    return switch (f) {
-        .string => |s| if (std.mem.eql(u8, s, "cask")) .cask else .formula,
-        else => .formula,
+    const s = switch (f) {
+        .string => |v| v,
+        else => return Error.BadBrewKind,
     };
+    if (std.mem.eql(u8, s, "formula")) return .formula;
+    if (std.mem.eql(u8, s, "cask")) return .cask;
+    return Error.BadBrewKind;
 }
 
-/// The tap a qualified name belongs to (`owner/tap` of `owner/tap/formula`),
-/// or null for a core formula. A cask name never qualifies this way.
+/// The tap a qualified name belongs to (`owner/tap` of `owner/tap/name`), or
+/// null for a core formula or cask.
 fn tapOf(name: []const u8) ?[]const u8 {
     const first = std.mem.indexOfScalar(u8, name, '/') orelse return null;
     const rest = name[first + 1 ..];
@@ -277,9 +297,56 @@ test "available: true when brew answers, false when it is absent" {
     var ok_brew: Brew = .{ .runner = ok_fake.runner() };
     try testing.expect(try ok_brew.backend().available(a));
 
-    var missing: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var missing: exec.Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "brew --version", .fail = error.FileNotFound }},
+    };
     var missing_brew: Brew = .{ .runner = missing.runner() };
     try testing.expect(!try missing_brew.backend().available(a));
+}
+
+test "available: a failure other than an absent brew is not reported as absent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Reading this as "brew is missing" would make every brew row inert with
+    // no diagnostic anywhere.
+    var broken: exec.Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "brew --version", .fail = error.AccessDenied }},
+    };
+    var b: Brew = .{ .runner = broken.runner() };
+    try testing.expectError(error.AccessDenied, b.backend().available(a));
+}
+
+test "kindOf: a value validate would refuse is an error, not a formula" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b: Brew = .{ .runner = undefined };
+
+    // Capitalised, so not the accepted spelling: installing it as a formula
+    // would run `brew install` against a cask.
+    const row = rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "Cask" } }});
+    try testing.expectError(Error.BadBrewKind, b.backend().idOf(a, row));
+}
+
+test "install: a tapped cask is trusted as a cask, not as a formula" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew tap owner/tap" },
+        .{ .argv = "brew trust --cask owner/tap/somecask" },
+        .{ .argv = "brew install --cask owner/tap/somecask" },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    // The Fake errors on any unscripted command, so `--formula` here fails.
+    try b.backend().install(a, &.{rowOf("owner/tap/somecask", &.{.{ .key = "kind", .value = .{ .string = "cask" } }})});
+    try testing.expect(fake.called("brew trust --cask owner/tap/somecask"));
 }
 
 test "install: a tapped formula is tapped and trusted narrowly before installing" {

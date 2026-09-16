@@ -61,8 +61,12 @@ pub fn compute(
     }
 
     var untracked: std.ArrayList([]const u8) = .empty;
+    var reported = std.StringHashMap(void).init(arena);
     for (installed) |i| {
-        if (!declared.contains(i)) try untracked.append(arena, i);
+        if (declared.contains(i)) continue;
+        if (reported.contains(i)) continue;
+        try reported.put(i, {});
+        try untracked.append(arena, i);
     }
 
     return .{
@@ -72,46 +76,7 @@ pub fn compute(
 }
 
 const testing = std.testing;
-
-/// A backend whose ids mirror brew's two namespaces, so the collision a flat
-/// name comparison would miss is exercised without depending on the brew
-/// adapter. Only `idOf` and `name` are reached from here.
-const TestBackend = struct {
-    fn make(name: []const u8) Backend {
-        return .{ .name = name, .ctx = undefined, .vtable = &vt };
-    }
-
-    const vt: Backend.VTable = .{
-        .available = unreached_available,
-        .validate = unreached_validate,
-        .idOf = idOf,
-        .installedExplicit = unreached_installed,
-        .install = unreached_install,
-    };
-
-    fn idOf(_: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
-        const f = row.field("kind") orelse return row.name;
-        const s = switch (f) {
-            .string => |v| v,
-            else => return row.name,
-        };
-        if (!std.mem.eql(u8, s, "cask")) return row.name;
-        return std.fmt.allocPrint(arena, "cask:{s}", .{row.name});
-    }
-
-    fn unreached_available(_: *anyopaque, _: std.mem.Allocator) anyerror!bool {
-        return error.Unreached;
-    }
-    fn unreached_validate(_: *anyopaque, _: Row, _: ?*manifest_mod.Diag) anyerror!void {
-        return error.Unreached;
-    }
-    fn unreached_installed(_: *anyopaque, _: std.mem.Allocator) anyerror![]const []const u8 {
-        return error.Unreached;
-    }
-    fn unreached_install(_: *anyopaque, _: std.mem.Allocator, _: []const Row) anyerror!void {
-        return error.Unreached;
-    }
-};
+const test_backend = @import("test_backend.zig");
 
 fn rowOf(name: []const u8, backend: []const u8, when: ?[]const u8) Row {
     return .{
@@ -166,7 +131,7 @@ test "compute: missing is desired minus installed" {
     const desired = [_]Row{ rowOf("ripgrep", "brew", null), rowOf("fd", "brew", null) };
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, TestBackend.make("brew"), &desired, &.{"ripgrep"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, m);
     try testing.expectEqual(@as(usize, 1), d.missing.len);
     try testing.expectEqualStrings("fd", d.missing[0].name);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
@@ -180,7 +145,7 @@ test "compute: untracked is installed minus everything the manifest declares" {
     const desired = [_]Row{rowOf("ripgrep", "brew", null)};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, TestBackend.make("brew"), &desired, &.{ "ripgrep", "htop" }, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "htop" }, m);
     try testing.expectEqual(@as(usize, 1), d.untracked.len);
     try testing.expectEqualStrings("htop", d.untracked[0]);
 }
@@ -196,7 +161,7 @@ test "compute: a package gated to another machine is tracked, not untracked" {
     const desired = [_]Row{rowOf("ripgrep", "brew", null)};
     const m: Manifest = .{ .packages = &all };
 
-    const d = try compute(a, TestBackend.make("brew"), &desired, &.{ "ripgrep", "work-tool" }, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "work-tool" }, m);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
     try testing.expectEqual(@as(usize, 0), d.missing.len);
 }
@@ -208,7 +173,7 @@ test "compute: a blacklisted package is never untracked" {
 
     const m: Manifest = .{ .blacklist = &.{blacklistOf("usage", "brew")} };
 
-    const d = try compute(a, TestBackend.make("brew"), &.{}, &.{"usage"}, m);
+    const d = try compute(a, test_backend.make("brew"), &.{}, &.{"usage"}, m);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
 }
 
@@ -221,7 +186,7 @@ test "compute: another backend's rows and installs do not cross over" {
     const m: Manifest = .{ .packages = &all };
 
     // `bat` is declared for dnf only, so on brew it is untracked.
-    const d = try compute(a, TestBackend.make("brew"), &all, &.{ "ripgrep", "bat" }, m);
+    const d = try compute(a, test_backend.make("brew"), &all, &.{ "ripgrep", "bat" }, m);
     try testing.expectEqual(@as(usize, 1), d.untracked.len);
     try testing.expectEqualStrings("bat", d.untracked[0]);
     try testing.expectEqual(@as(usize, 0), d.missing.len);
@@ -236,7 +201,7 @@ test "compute: a cask is not satisfied by the formula of the same name" {
     const desired = [_]Row{caskRow("docker")};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, TestBackend.make("brew"), &desired, &.{"docker"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"docker"}, m);
     try testing.expectEqual(@as(usize, 1), d.missing.len);
     try testing.expectEqualStrings("docker", d.missing[0].name);
     // And the installed formula is untracked: nothing declares it.
@@ -252,7 +217,7 @@ test "compute: a declared cask matches its prefixed installed id" {
     const desired = [_]Row{caskRow("ghostty")};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, TestBackend.make("brew"), &desired, &.{"cask:ghostty"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"cask:ghostty"}, m);
     try testing.expect(d.clean());
 }
 
@@ -264,7 +229,7 @@ test "compute: clean reports no drift either way" {
     const desired = [_]Row{rowOf("ripgrep", "brew", null)};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, TestBackend.make("brew"), &desired, &.{"ripgrep"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, m);
     try testing.expect(d.clean());
 }
 
@@ -275,6 +240,6 @@ test "compute: a blacklisted cask is never untracked" {
 
     const m: Manifest = .{ .blacklist = &.{caskBlacklistOf("ghostty", "brew")} };
 
-    const d = try compute(a, TestBackend.make("brew"), &.{}, &.{"cask:ghostty"}, m);
+    const d = try compute(a, test_backend.make("brew"), &.{}, &.{"cask:ghostty"}, m);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
 }
