@@ -74,15 +74,31 @@ All notable changes to mox are documented here. The format follows
   and a path-scoped `apply`, `commit` or `status` reach no package. `status`
   reports the rows of an absent manager that has a bootstrap row as missing
   and notes that apply will bootstrap it; a manager whose `--version` fails
-  is reported `BROKEN` and counted in the exit code, with a
-  `package_broken` porcelain record and a `{backend, state, exit}` JSON
-  entry, and a package pass that produced nothing at all is a record of its
-  own on stdout and in both machine formats (`ERROR     the package pass was
-  refused; the reason is the mox status: packages: line`,
+  is reported `BROKEN` and counted in the exit code, as is one that answered
+  its probe and then failed a query -- one manager that cannot answer is that
+  manager's row, beside every other manager's results, never a refusal of the
+  whole pass. A `BROKEN` row says what was asked and why it could not answer;
+  the `package_broken` porcelain record carries backend, exit code and that
+  reason, and the JSON entry is `{backend, state, exit, probe, why?}`. A
+  package pass that produced nothing at all -- a manifest that would not load
+  or validate, or a plugin set that could not be discovered -- is a record of
+  its own on stdout and in both machine formats (`ERROR     the package pass
+  was refused; the reason is the mox status: packages: line`,
   `{"state":"refused"}` and `package_refused`), so a refusal is never read as
   a clean machine. `mox --help` names
   `MOX_SCRIPT_TIMEOUT_MS`, `MOX_INSTALL_TIMEOUT_MS` and
   `MOX_PACKAGES_DEPTH`. A manifest refuses an unknown top-level key, a
+  `name` an install would read as an operation rather than a package -- one
+  beginning with anything but a letter or a digit, one carrying a character
+  outside `[A-Za-z0-9._+-]`, or one ending in `-`, which apt, dnf, pacman and
+  zypper each read as a request to REMOVE that package. A trailing `+` stays
+  legal, since `g++` is a package. A row naming a capability rather than a
+  package (`pkgconfig(...)`), a version relation, or an architecture suffix
+  is refused for the same reason: it installs under one name and is read back
+  under another, so it would be reported missing and reinstalled forever.
+  `mox commit` puts a row it is about to write through that same check, so no
+  manager's answer can produce a file a later command refuses. A manifest
+  also refuses an unknown top-level key, a
   `name` that is blank or carries whitespace, a control byte or a byte that
   is not UTF-8 or runs past 256 bytes -- one rule with the shape an id must
   have, so a row an adapter writes is a row the loader reads back -- a
