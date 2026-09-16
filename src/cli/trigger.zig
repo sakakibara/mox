@@ -77,6 +77,7 @@ fn triggerUsage(ctx: *app.Ctx) anyerror!u8 {
 
 pub const command = app.Command{
     .name = "trigger",
+    .usage = "mox trigger <command>",
     .summary = "Setup-script staleness primitives",
     .details = "hash|seen-version|every.",
     .group = .general,

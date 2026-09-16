@@ -552,6 +552,11 @@ runs take the lock; exits 1 while any problem or advisory remains, or a check
 could not run (a source tree outside git skips the tracked-source check), so
 it can gate CI.
 
+The run ends on exactly one summary line: `mox doctor: N problem(s) found`,
+or `N advisory item(s) need attention` when there are no problems, or
+`N check(s) skipped (coverage incomplete)` when there are neither, or
+`healthy`.
+
 <!-- generated: flags doctor -->
 | Flag | Description |
 | --- | --- |
@@ -570,6 +575,9 @@ re-patched onto the current live file (the program's writes since then
 survive) through the same verification and `check` hook as apply, and
 a snapshot whose owned values were secret-masked is refused --
 re-apply the source instead.
+
+`MOX_SNAPSHOT_RETENTION` is how many to keep (default 10); apply prunes
+the rest. A value that is not an integer warns and the default stands.
 
 ## update
 
@@ -649,6 +657,12 @@ Resolve a secret URI to stdout: `env:NAME`, `file://PATH`,
 Setup-script staleness primitives (`hash`, `seen-version`, `every`)
 for guarding expensive work inside a setup script.
 
+## version
+
+Print the running build's version as `mox <version>`, one line on
+stdout and nothing else, so a script can read it without parsing. `mox
+--version` prints the same line.
+
 ## upgrade
 
 Download and install a newer mox release, verified against its
@@ -692,7 +706,7 @@ envelope -- every command with its flags, positionals, completion
 behavior, declared constraints, and subcommands, recursed:
 
 ```
-{"version":2,"program":"mox","commands":[{"name":"add", ... }]}
+{"version":2,"program":"mox","commands":[{"name":"init", ... }]}
 ```
 
 It is derived from the same declarations the parser and `--help` are, so

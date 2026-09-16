@@ -215,8 +215,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
 pub const command = app.command(Spec, .{
     .name = "update",
+    .usage = "mox update [--flags]",
     .summary = "Fetch, rebase, and apply",
-    .details = "Brings this machine up to date: fetches, rebases onto the upstream, then applies. Refuses on uncommitted changes; a rebase conflict stops for you to resolve or abort. --no-apply stops after the fetch so you can 'mox diff' first. Exit 0 clean, 1 drift left for a decision, 2 a refusal or failure. Sending work the other way is 'mox publish'.",
+    .details = "Brings this machine up to date: fetches, rebases onto the upstream, then applies. Refuses on uncommitted changes; a rebase conflict stops for you to resolve or abort. --no-apply stops after the rebase so you can 'mox diff' first. Exit 0 clean, 1 drift left for a decision, 2 a refusal or failure. Sending work the other way is 'mox publish'.",
     .group = .general,
     .needs_context = true,
 }, run);

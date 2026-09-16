@@ -350,6 +350,7 @@ fn versionRun(ctx: *Ctx) anyerror!u8 {
 
 const version_cmd = Command{
     .name = "version",
+    .usage = "mox version",
     .summary = "Show mox version",
     .group = .general,
     .run = versionRun,

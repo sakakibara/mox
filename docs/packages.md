@@ -162,6 +162,30 @@ codes cannot be told apart once truncated to a byte. zypper's ledger records wha
 landed, read back from `rpm`, so a package installed beside one that failed
 is not asked for again.
 
+### What an apt, dnf, pacman or zypper row may name
+
+`name` on these four is a plain package name, and mox checks it against what
+a package name is rather than against a list of what it is not: it begins
+with a letter or a digit, holds only letters, digits and `.`, `_`, `+` or
+`-`, and does not end with `-`. A trailing `+` is fine, since `g++` is a
+package.
+
+Two things sit outside that class. An install argv accepts more than package
+names -- `apt-get install -y vim nano-` removes nano, and `zypper install vim
+!nano` and `zypper install vim -nano` do the same -- and mox never uninstalls
+anything, so a row that would ask for one is refused rather than run. And a
+name a manager resolves to a package of a different name
+(`pkgconfig(libcrypto)` installs `libressl-devel`) is recorded under the name
+asked for, so it would read as missing on every status and be reinstalled on
+every apply.
+
+The refusal names the file, the row and the rule the name broke, and it is
+checked on every machine, not only where that manager runs. dnf takes a full
+NEVRA and a bare `name.arch` within that class, which `rpm` reports under the
+bare name; both are refused for the same reason. Beyond the check, the
+operands are passed after `--`, so nothing a row is named can be read as an
+option.
+
 ### brew taps
 
 A tap is not a key. A tap-qualified name names its own tap, and declaring
@@ -205,10 +229,11 @@ batch that failed part-way is read back the same way, so the rows that did
 land are recorded rather than retried forever.
 
 Because what is installed is read back from `rpm`, a zypper row names a
-package, plainly: a `pattern:`, `patch:`, `product:`, `srcpackage:` or
-`application:` selector is refused, and so is a version relation
-(`vim=9.0`) or an architecture suffix (`vim.x86_64`), since each would
-install and then read as missing on every status. The cost is that a package installed by hand is
+package, plainly -- the rule above, plus two spellings it names in its own
+words: a `pattern:`, `patch:`, `product:`, `srcpackage:` or `application:`
+selector, and a version relation (`vim=9.0`) or an architecture suffix
+(`vim.x86_64`), each of which would install and then read as missing on
+every status. The cost is that a package installed by hand is
 invisible to mox on zypper and will never be offered for tracking. `mox status` prints that as a note
 under the backend rather than leaving it to be discovered.
 
@@ -302,7 +327,10 @@ do -- there is no `remove` or `upgrade` verb, and adding one is a mox change.
 
 `scripts/backends/<name>`, flat, repo only. The name is the filename stem:
 `macports` and `macports.ps1` both name `macports`, so one plugin can ship a
-POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`.
+POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`. Two files that
+could both run here naming one backend is an error naming both; a runnable
+file beside a not-runnable twin is the cross-platform case, and the runnable
+one wins.
 
 - Unix runs a plain file directly; it must be executable (`chmod +x`), and
   one that is not is an error naming the file -- never "no such backend". A
@@ -398,6 +426,11 @@ backend.
   bound -- or forever, where the bound is disabled.
   Windows has neither process groups nor job control, so there a bound
   reaches the direct process alone and no terminal changes hands.
+  A killed call names the bound it ran under -- `timed out after <ms>ms
+  (MOX_INSTALL_TIMEOUT_MS), killed`, or `(MOX_SCRIPT_TIMEOUT_MS)` for a
+  captured one, or `timed out, killed` where neither was armed. One ended
+  for want of a terminal says `stopped, and this run has no terminal that
+  could resume it; killed`.
 - The shipped backends' own manager calls are bounded the same way, and a
   probe killed at the bound is a named failure, never read as an absent
   manager. A manager that answers its probe with anything but "here" or
@@ -452,7 +485,7 @@ MacPorts, as a POSIX script at `scripts/backends/macports`:
 #!/bin/sh
 set -eu
 cmd=${1:-}; shift || true
-name() { printf '%s\n' "$1" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; }
+name() { printf '%s\n' "$1" | sed -n 's/^{ *name = "\([^"]*\)".*/\1/p'; }
 case "$cmd" in
 available) command -v port >/dev/null 2>&1 ;;
 id)        IFS= read -r l && name "$l" ;;
@@ -476,6 +509,15 @@ first manager with a quirk it lacks would need a mox release again.
 runner, so it passes with no package manager installed and never touches the
 machine running it. That proves an adapter emits the argv it intends, and
 nothing more.
+
+A green run is not a silent one. Plugin stderr is the terminal's by design,
+so a fixture plugin that is meant to fail writes its complaint straight to
+the terminal, past the writers the harness captures: `fakeports: kind keg is
+not a thing`, and a `sh` syntax error for the plugin a test deliberately
+leaves unparseable. Zig's build runner prints `failed command:` for any step
+that wrote to stderr at all, so it prints one for that step too. The
+authoritative signal is the exit code and the `N passed` summary; those three
+lines on an exit-0 run are the fixtures working. Anything else is new.
 
 Whether that argv is *right* is a separate gate, because it cannot be
 answered without the real thing:

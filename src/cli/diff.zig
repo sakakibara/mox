@@ -547,6 +547,7 @@ pub fn maskOwnedSections(arena: std.mem.Allocator, blob: []const u8, spelled_pat
 
 pub const command = app.command(Spec, .{
     .name = "diff",
+    .usage = "mox diff [--flags] [<paths...>]",
     .summary = "Show a unified diff of composed output vs each live file",
     .details = "Read-only, always exits 0.",
     .group = .general,

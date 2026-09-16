@@ -119,6 +119,9 @@ Every routed edit is verified before it sticks: mox recomposes the file under
 every configuration the sources express, and anything you did not choose to
 affect composing differently rolls the file back.
 
+When the repo declares packages, the same run then offers each untracked one
+`[y/b/s]` -- see [Packages](#packages).
+
 ## When apply meets an edited live file
 
 `mox apply` never silently overwrites a live file you (or a program) edited
@@ -130,8 +133,9 @@ mox apply
   wrote ~/.zshrc
 
 Applied: 1 written, 0 removed, 0 unchanged, 0 skipped, 1 drifted, 0 failed; scripts: 0 ran, 0 skipped, 0 failed, 0 blocked, 0 declined
+Packages: 1 installed, 0 failed
 
-  Applied 1 files. 1 drifted, left untouched -- nothing was overwritten.
+  Applied 1 file. 1 drifted, left untouched -- nothing was overwritten.
 
     ~/.config/nvim/pack-lock.json  edited since mox wrote it  overwrite: whole file
 
@@ -406,6 +410,19 @@ keeps only a hash. The consequences: `mox diff` masks such keys on both sides
 route), snapshots store masked
 values, and `mox rollback` refuses a snapshot whose owned values were masked:
 placeholders are never written live; re-apply the source instead.
+
+## Packages
+
+A `data/packages/*.toml` manifest declares which packages belong on a machine,
+gated by the same axes your files use. `mox status` grows a `packages:` section
+naming what each manager is `MISSING` and what it has `UNTRACKED`; `mox apply`
+installs the missing ones, bootstrapping a declared manager that is not there
+yet; `mox commit` offers each untracked package `[y/b/s]` -- record it in the
+manifest, blacklist it so it is never offered again, or leave it. Apply only
+ever installs: nothing is uninstalled behind you. A repo with no
+`data/packages/` directory is not using any of this, and queries no package
+manager at all. The manifest format, the seven shipped backends, and the
+plugin contract for any other manager are in [packages.md](packages.md).
 
 ## Syncing a second machine
 

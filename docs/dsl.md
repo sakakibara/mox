@@ -418,7 +418,8 @@ Each needed fact (declared or scanned) is checked against THIS stage's
 actual projected environment, not an abstract name set -- so a projection
 collision (two names sanitizing to the same `MOX_FACT_*`, both dropped) or a
 name that maps to no fact at all is caught here, not assumed away. The
-script then lands in one of seven outcomes, each its own printed line:
+script then lands under one of five labels -- the ones the closing summary
+counts -- each printed as shown below; `failed` has several forms:
 
 | Outcome | Printed | When |
 | --- | --- | --- |
@@ -429,6 +430,11 @@ script then lands in one of seven outcomes, each its own printed line:
 | failed | `mox apply: <path>: exit <code>` (stderr) | nonzero exit |
 | failed | `mox apply: <path>: timed out after <ms>ms, killed` / `... terminated abnormally` (stderr) | killed after `MOX_SCRIPT_TIMEOUT_MS` (default 600000ms, `<= 0` disables), or exited abnormally |
 | failed | `mox apply: <path>: stopped, and this run has no terminal that could resume it; killed` (stderr) | the script asked the terminal something a run with none (`mox apply &`, a CI job) cannot answer |
+
+A stage file that cannot be spawned, a gate directory that cannot be read, a
+file that is not executable, and a subdirectory named like a tuple that is
+not one print their own `mox apply: <path>: ...` lines and count under
+`failed` too, though none of them is a script.
 
 A script leads its own process group, so the bound reaches what it started
 and not the script alone: an orphan holding mox's stdout would keep a

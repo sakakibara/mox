@@ -825,6 +825,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 
 pub const command = app.command(Spec, .{
     .name = "status",
+    .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
     .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
     .group = .general,
@@ -993,8 +994,9 @@ test "emitPorcelain / emitJson: a refused manifest is a record, never an empty p
         jw.written(),
     );
 
-    // The refusal is the whole pass, so it leads; a manager reached before the
-    // manifest was rejected still gets its own record after it.
+    // The refusal is the whole pass, so it leads. No path produces both today
+    // -- a refusal reaches no backend -- and the order is pinned so that a
+    // reader who meets both knows which one describes the run.
     const broken = [_]mox.packages.report.Broken{.{ .backend = "brew", .probe = "brew --version", .code = 1 }};
     var both: std.Io.Writer.Allocating = .init(al);
     try emitJson(&both.writer, &.{}, .{ .broken = true, .report = .{ .in_use = true, .broken = &broken } });

@@ -88,7 +88,7 @@ fn renderSuccessLine(out: *std.Io.Writer, opts: Options, total: usize) !void {
     if (opts.written) |n| {
         try greenText(out, opts.sty, "Applied ");
         try dimNum(out, opts.sty, n);
-        try greenText(out, opts.sty, " files. ");
+        try greenText(out, opts.sty, if (n == 1) " file. " else " files. ");
     }
     try dimNum(out, opts.sty, total);
     try greenText(out, opts.sty, " drifted, left untouched -- nothing was overwritten.\n");
@@ -351,6 +351,22 @@ test "render: a row too wide for the terminal stacks its details, never shorteni
         \\  see the full list:        mox status
         \\
     , s);
+}
+
+test "render: one written file is counted in the singular" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var units = [_]Unit{
+        .{ .path = "/home/u/.zshrc", .kind = .whole_file, .first_contact = false },
+    };
+    const one = try renderToString(a, &units, .{ .written = 1, .home = test_home, .sty = off, .width = 80 });
+    try testing.expect(std.mem.indexOf(u8, one, "Applied 1 file. 1 drifted") != null);
+    const two = try renderToString(a, &units, .{ .written = 2, .home = test_home, .sty = off, .width = 80 });
+    try testing.expect(std.mem.indexOf(u8, two, "Applied 2 files. 1 drifted") != null);
+    // Zero takes the plural, as English does.
+    const none = try renderToString(a, &units, .{ .written = 0, .home = test_home, .sty = off, .width = 80 });
+    try testing.expect(std.mem.indexOf(u8, none, "Applied 0 files. 1 drifted") != null);
 }
 
 test "render: a single drifted unit pre-fills its own scoped overwrite, even alongside unrowed drift" {

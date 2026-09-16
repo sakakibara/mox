@@ -134,6 +134,7 @@ fn confirm(ctx: *app.Ctx, name: []const u8, path: []const u8) !bool {
 
 pub const command = app.command(Spec, .{
     .name = "uninstall",
+    .usage = "mox uninstall [--flags]",
     .summary = "Remove mox state",
     .details = "Private preserved unless --purge-private; snapshots and trash preserved unless --purge-snapshots/--purge-trash or confirmed. The source repo is never touched.",
     .group = .general,

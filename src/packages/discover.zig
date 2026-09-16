@@ -82,8 +82,8 @@ pub fn discover(
             if (!isKeepFile(e.name)) {
                 try skipped.append(arena, try std.fmt.allocPrint(
                     arena,
-                    "{s}: ignored; a backend name never begins with a dot",
-                    .{path},
+                    "scripts/backends/{s}: ignored; a backend name never begins with a dot",
+                    .{e.name},
                 ));
             }
             continue;
@@ -403,14 +403,13 @@ test "discover: a hidden plugin is said, not silently dropped" {
     var skipped: std.ArrayList([]const u8) = .empty;
     const got = try discover(a, io, repo, null, &skipped);
     try testing.expectEqual(@as(usize, 0), got.len);
-    // The slip is named; what git keeps there is not worth remarking on.
+    // The slip is named; what git keeps there is not worth remarking on. The
+    // note is repo-relative, as every other note under `packages:` is.
     try testing.expectEqual(@as(usize, 1), skipped.items.len);
-    const want = try std.fmt.allocPrint(
-        a,
-        "{s}: ignored; a backend name never begins with a dot",
-        .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", ".macports" })},
+    try testing.expectEqualStrings(
+        "scripts/backends/.macports: ignored; a backend name never begins with a dot",
+        skipped.items[0],
     );
-    try testing.expectEqualStrings(want, skipped.items[0]);
 }
 
 test "discover: a directory named like a plugin says what it is, not that no such backend exists" {

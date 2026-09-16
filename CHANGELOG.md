@@ -76,9 +76,11 @@ All notable changes to mox are documented here. The format follows
   and notes that apply will bootstrap it; a manager whose `--version` fails
   is reported `BROKEN` and counted in the exit code, with a
   `package_broken` porcelain record and a `{backend, state, exit}` JSON
-  entry, and a manifest mox will not read at all is a record of its own in
-  both machine formats (`{"state":"refused"}` and `package_refused`), so a
-  refusal is never read as a clean machine. `mox --help` names
+  entry, and a package pass that produced nothing at all is a record of its
+  own on stdout and in both machine formats (`ERROR     the package pass was
+  refused; the reason is the mox status: packages: line`,
+  `{"state":"refused"}` and `package_refused`), so a refusal is never read as
+  a clean machine. `mox --help` names
   `MOX_SCRIPT_TIMEOUT_MS`, `MOX_INSTALL_TIMEOUT_MS` and
   `MOX_PACKAGES_DEPTH`. A manifest refuses an unknown top-level key, a
   `name` that is blank or carries whitespace, a control byte or a byte that
@@ -132,6 +134,8 @@ All notable changes to mox are documented here. The format follows
   asked what it is doing between reads. mox answers SIGQUIT as it answers
   SIGINT, SIGTERM and SIGHUP: Ctrl-backslash takes the child's group with it
   rather than leaving it running.
+- `mox upgrade`'s help no longer names a specific repository: it fetches from
+  the release the running build was built to look for.
 
 ### Fixed
 - The timeout watchdog for setup scripts and check hooks runs on its own
@@ -144,6 +148,8 @@ All notable changes to mox are documented here. The format follows
   and a symlinked one failed the run.
 - `doctor`'s unknown-stage message named only `pre/` and `post/`, though
   `check/` hooks and `backends/` plugins are run too.
+- `update --help`'s description says `--no-apply` stops after the rebase,
+  agreeing with the flag's own line and both guides; it said the fetch.
 
 ## [0.11.0] - 2026-09-09
 
@@ -190,8 +196,8 @@ All notable changes to mox are documented here. The format follows
 
 ### Fixed
 - `update --no-apply` is described as stopping after the rebase, not the
-  fetch, in its help and both guides: the source tree is brought current, only
-  the live files wait.
+  fetch, in its flag list and both guides: the source tree is brought
+  current, only the live files wait.
 - Secret backends run under the environment mox was given, not the process's
   own, and the backend program is looked up on that environment's PATH,
   passing over a directory or an unrunnable file of its name the way a shell

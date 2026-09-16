@@ -110,6 +110,52 @@ test "docs/commands.md flag tables match what argv accepts" {
     return error.DocsOutOfDate;
 }
 
+/// True when `heading` is the section for `name`. A heading may cover two
+/// commands that are one topic (`snapshot / rollback`), so each `/`-separated
+/// part is a name it documents.
+fn headingCovers(heading: []const u8, name: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, heading, '/');
+    while (parts.next()) |p| {
+        if (std.mem.eql(u8, std.mem.trim(u8, p, " "), name)) return true;
+    }
+    return false;
+}
+
+test "every top-level command has a section in docs/commands.md" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const docs = std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "docs/commands.md",
+        a,
+        .limited(1 << 20),
+    ) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+
+    var missing: std.ArrayList([]const u8) = .empty;
+    for (mox.cli.app.command_table) |cmd| {
+        var found = false;
+        var lines = std.mem.splitScalar(u8, docs, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "## ")) continue;
+            if (headingCovers(std.mem.trim(u8, line[3..], " \r"), cmd.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) try missing.append(a, cmd.name);
+    }
+
+    if (missing.items.len == 0) return;
+    std.debug.print("\ndocs/commands.md has no section for:\n", .{});
+    for (missing.items) |m| std.debug.print("  ## {s}\n", .{m});
+    return error.DocsOutOfDate;
+}
+
 test "every generated block in the docs names a real command" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

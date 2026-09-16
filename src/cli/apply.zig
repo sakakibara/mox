@@ -2224,6 +2224,7 @@ fn snapshotContentForSite(io: std.Io, arena: std.mem.Allocator, live_path: []con
 
 pub const command = app.command(Spec, .{
     .name = "apply",
+    .usage = "mox apply [--flags] [<paths...>]",
     .summary = "Compose all managed files and write to live paths",
     .details = "Never prompts. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
     .group = .general,

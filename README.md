@@ -169,15 +169,15 @@ Full behavioral contracts for every command are in
 | --- | --- |
 | `init` | Initialize a fresh repo; `--clone <url>` clones an existing one and stops for review (`--apply` to bootstrap in one step) |
 | `add <path>` / `add -r <dir>` | Start managing a live file (or every file under a dir) as `src/` sources; `--own`/`--disown` key-paths onboard a partially owned file |
-| `apply` | Compose and write every managed file. Never silently overwrites a hand-edited live file: leaves drift untouched and reports it, resolved with `apply --overwrite <path>` or `commit <path>` |
-| `commit` | Route live-file edits back into their sources -- per hunk for text, per key for merged layers -- confirming each, and verifying that no configuration you did not choose changes |
-| `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, ...) plus the live probe log. `status` exits 1 on anything actionable |
+| `apply` | Compose and write every managed file. Never silently overwrites a hand-edited live file: leaves drift untouched and reports it, resolved with `apply --overwrite <path>` or `commit <path>`; also installs the packages a `data/packages/` manifest declares, bootstrapping an absent manager first |
+| `commit` | Route live-file edits back into their sources -- per hunk for text, per key for merged layers -- confirming each, and verifying that no configuration you did not choose changes; also offers each untracked package to record or blacklist |
+| `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, ...) plus the live probe log, plus a `packages:` section when the repo declares one. `status` exits 1 on anything actionable |
 | `edit <name>` | Open the source behind a live path in `$EDITOR`; `--axis <tuple>` opens the overlay or fragment for that variant |
 | `mv <old> <new>` / `remove <name>` | Rename a source (live target moves on next apply) / stop managing (source to recoverable trash; `--purge` also removes the live file) |
 | `export <out>` | Bake the fully composed tree to a directory (`--as <tuple>` for another machine's view) -- the walk-away guarantee |
 | `facts` | List, set, and interview for facts; `facts probe` resolves one `tool=`/`env=` query scriptably |
 | `data get <name>` | Print a data source as TOML or JSON, private layer applied |
-| `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state); exits 1 while any problem or advisory remains or a check could not run; `--fix` performs the safe rebuilds |
+| `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state, a private `data/` file nothing applies); exits 1 while any problem or advisory remains or a check could not run; `--fix` performs the safe rebuilds |
 | `snapshot` / `rollback [<id>]` | List pre-overwrite snapshots; restore live files from one, newest by default |
 | `update` | Fetch, rebase, and apply -- the inbound edge; refuses uncommitted changes and stops on a rebase conflict |
 | `publish [-m <msg>]` | Commit the source tree and push -- the outbound edge; stages only mox's own directories |

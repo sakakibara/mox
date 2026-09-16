@@ -315,6 +315,7 @@ const ask_cmd = app.command(AskSpec, .{
 pub const command = blk: {
     var c = app.command(BareSpec, .{
         .name = "facts",
+        .usage = "mox facts [--flags] <command>",
         .summary = "List facts; interview for missing ones",
         .group = .general,
         .needs_context = true,

@@ -21,6 +21,7 @@ fn list(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
 
 pub const command = app.command(Spec, .{
     .name = "snapshot",
+    .usage = "mox snapshot",
     .summary = "List apply snapshots (taken before every overwrite)",
     .group = .general,
     .needs_context = true,
