@@ -21,6 +21,7 @@ pub const Error = error{
     BootstrapUnsupported,
     DuplicateBootstrapRow,
     DuplicatePackageRow,
+    MalformedBootstrapDigest,
 };
 
 /// Check every row against the registry and its adapter. `diag` (when
@@ -99,10 +100,31 @@ pub fn all(
             );
             return Error.BootstrapUnsupported;
         }
+        // A digest of any other shape passes every command that does not
+        // fetch, and fails as a mismatch on the one machine that does: a
+        // fresh one, where it is indistinguishable from a substituted
+        // installer.
+        if (!sha256ShapeOk(b.sha256)) {
+            if (diag) |d| d.set(
+                "{s}: bootstrap row {d}: backend \"{s}\": \"sha256\" must be 64 hexadecimal characters",
+                .{ b.label, b.index, b.backend },
+            );
+            return Error.MalformedBootstrapDigest;
+        }
     }
 
     try contradictions(arena, m, registry, diag);
     try duplicates(arena, m, registry, diag);
+}
+
+/// A SHA-256 as `bootstrap.fetchVerified` compares it: 64 hexadecimal
+/// characters, either case.
+fn sha256ShapeOk(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
 }
 
 /// An adapter is handed a blacklist row shaped as a package row, and titles
@@ -232,7 +254,7 @@ fn bootstrapAt(backend: []const u8, label: []const u8, index: usize) manifest_mo
     return .{
         .backend = backend,
         .url = "https://example.invalid/install.sh",
-        .sha256 = "00",
+        .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
         .when = null,
         .origin = "/tmp/x.toml",
         .label = label,
@@ -377,6 +399,36 @@ test "all: a bootstrap row naming no registered backend is refused, naming file 
         "data/packages/darwin.toml: bootstrap row 1: no backend named \"brw\"",
         d.capture().?,
     );
+}
+
+test "all: a bootstrap digest that is not 64 hex characters is refused, naming file and row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.makeBootstrappable("brew");
+    // A 63-character paste and a 64-character one with a non-hex byte: both
+    // pass every command that does not fetch, and both fail as a digest
+    // mismatch on the one machine that does.
+    for ([_][]const u8{ "0" ** 63, "0" ** 63 ++ "g", "", "sha256:" ++ "0" ** 64 }) |digest| {
+        var row = bootstrapAt("brew", "data/packages/darwin.toml", 1);
+        row.sha256 = digest;
+        const m: Manifest = .{ .bootstrap = &.{row} };
+
+        var d: Diag = .{};
+        try testing.expectError(Error.MalformedBootstrapDigest, all(a, m, registryOf(&.{brew}), &d));
+        try testing.expectEqualStrings(
+            "data/packages/darwin.toml: bootstrap row 1: backend \"brew\": \"sha256\" must be 64 hexadecimal characters",
+            d.capture().?,
+        );
+    }
+
+    // Either case of the real shape passes.
+    for ([_][]const u8{ "a" ** 64, "A" ** 64 }) |digest| {
+        var row = bootstrapAt("brew", "data/packages/darwin.toml", 1);
+        row.sha256 = digest;
+        try all(a, .{ .bootstrap = &.{row} }, registryOf(&.{brew}), null);
+    }
 }
 
 test "all: a blacklist row naming no registered backend is refused" {

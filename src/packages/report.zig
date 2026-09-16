@@ -443,7 +443,7 @@ fn bootstrapRowOf(backend: []const u8, when: ?[]const u8) manifest_mod.Bootstrap
     return .{
         .backend = backend,
         .url = "https://example.invalid/install.sh",
-        .sha256 = "00",
+        .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
         .when = when,
         .origin = "/tmp/x.toml",
         .label = "data/packages/a.toml",

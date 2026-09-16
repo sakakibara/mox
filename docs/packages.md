@@ -105,6 +105,11 @@ sha256 = "<hex>"
 when = "os=darwin"
 ```
 
+`sha256` is 64 hexadecimal characters, either case, and a value of any other
+shape is refused when the manifest loads rather than on the one machine that
+fetches, where a truncated paste is indistinguishable from a substituted
+installer.
+
 `backend` may come from the file default and `when` from the file gate, as
 for any row, and is checked the same way: a row for a manager that ships
 with its OS (apt, dnf, pacman, zypper, winget) is refused on every machine,
@@ -366,10 +371,10 @@ built-in keeps its place, so the rows it validates stay validated.
 | Verb | stdin | stdout | Exit |
 |---|---|---|---|
 | `available` | -- | -- | 0 usable here; 1 not usable here; anything else, 64 included, is a broken plugin |
-| `id` | one row, `{ name = "...", ... }` | exactly one id | 1: the row is refused, say why on stderr; 64: not implemented; anything else is a broken plugin |
-| `list` | -- | one id per line: what was explicitly installed | 64: not implemented; other nonzero: failed |
-| `install` | rows, one per line | streamed to the terminal | 64: not implemented; other nonzero: failed |
-| `declare <id>` | -- | a TOML row body: `name = "..."` plus adapter fields | 64: not implemented; other nonzero: failed |
+| `id` | one row, `{ name = "...", ... }` | exactly one id | 1: the row is refused, say why on stderr; anything else, 64 included, is a broken plugin |
+| `list` | -- | one id per line: what was explicitly installed | nonzero, 64 included: failed |
+| `install` | rows, one per line | streamed to the terminal | nonzero, 64 included: failed |
+| `declare <id>` | -- | a TOML row body: `name = "..."` plus adapter fields | nonzero, 64 included: failed |
 | `bootstrap <path> <out>` | -- | streamed to the terminal; the bin dir to put on PATH, if any, is written to the file `<out>` as one line, an absolute path (a second line, or a relative path, is bad output) | 64: not implemented; other nonzero: failed |
 | `limitation` | -- | one line on what it cannot see, at most 200 bytes and no control bytes | 64: none; other nonzero: failed |
 
@@ -398,10 +403,12 @@ backend.
 - **No ledger mode.** A manager with no explicitly-installed query keeps its
   own record under `$MOX_STATE_DIR` and intersects it in `list`; `list` has
   one meaning.
-- **Exit 64 means "this optional verb is not implemented"**, reported by
-  plugin and verb where it was needed. Nothing is substituted for a missing
-  verb. `available` is not optional, so 64 there is a broken plugin like any
-  other unexpected exit.
+- **Exit 64 means "this optional verb is not implemented"** -- `bootstrap` and
+  `limitation` are the optional ones -- reported by plugin and verb where it
+  was needed. Nothing is substituted for a missing verb. Every other verb is
+  required, so 64 from one of them carries no meaning: `available` reads it as
+  a broken plugin like any other unexpected exit, and `id`, `list`, `install`
+  and `declare` as a failure like any other nonzero exit.
 - Every captured call is time-bounded like a setup script
   (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the

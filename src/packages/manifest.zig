@@ -430,7 +430,16 @@ fn parseRow(
         };
         break :blk v.string;
     };
-    const when = try combineWhen(arena, file_when, own_when);
+    const when = combineWhen(arena, file_when, own_when) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": the file gate and this row's \"when\" do not combine into a valid axis expression: ({s}) and ({s})",
+                .{ f.label, name, file_when.?, own_when.? },
+            );
+            return Error.MalformedPackageRow;
+        },
+    };
 
     var fields: std.ArrayList(Pair) = .empty;
     for (t.keys(), t.values()) |k, v| {
@@ -456,11 +465,17 @@ fn parseRow(
     };
 }
 
-/// A file gate and a row gate both hold: `(file) and (row)`.
+/// A file gate and a row gate both hold: `(file) and (row)`. The combination
+/// is parsed here rather than assumed: the parens it adds cost depth, so two
+/// gates that each parse can exceed the limit together, and the refusal has to
+/// come from the loader, which knows the file and the row, rather than from an
+/// evaluation that knows neither.
 fn combineWhen(arena: std.mem.Allocator, file_when: ?[]const u8, own: ?[]const u8) !?[]const u8 {
     if (file_when == null) return own;
     if (own == null) return file_when;
-    return try std.fmt.allocPrint(arena, "({s}) and ({s})", .{ file_when.?, own.? });
+    const combined = try std.fmt.allocPrint(arena, "({s}) and ({s})", .{ file_when.?, own.? });
+    _ = try axis.parseString(arena, combined);
+    return combined;
 }
 
 fn parseBootstrapRow(
@@ -513,11 +528,22 @@ fn parseBootstrapRow(
         return Error.MalformedPackageRow;
     }
 
+    const when = combineWhen(arena, file_when, own_when) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag) |d| d.set(
+                "{s}: bootstrap row {d} for backend \"{s}\": the file gate and this row's \"when\" do not combine into a valid axis expression: ({s}) and ({s})",
+                .{ f.label, index, backend, file_when.?, own_when.? },
+            );
+            return Error.MalformedPackageRow;
+        },
+    };
+
     return .{
         .backend = backend,
         .url = url,
         .sha256 = sha256,
-        .when = try combineWhen(arena, file_when, own_when),
+        .when = when,
         .origin = f.path,
         .label = f.label,
         .index = index,
@@ -839,6 +865,73 @@ test "load: a malformed when fails at load, not silently at gate time" {
     var d: Diag = .{};
     try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
     try testing.expect(std.mem.indexOf(u8, d.capture().?, "not a valid axis expression") != null);
+}
+
+test "load: a file gate and a row gate that will not combine is refused, naming the row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Each gate parses alone; the parens the combination adds cost depth, so
+    // together they do not. Refusing at evaluation time would name neither
+    // the file nor the row.
+    const deep = try std.fmt.allocPrint(a, "{s}os=darwin{s}", .{ "(" ** 63, ")" ** 63 });
+    _ = try axis.parseString(a, deep);
+    const text = try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\when = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\when = "profile=work"
+        \\
+    , .{deep});
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data = text });
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+    const msg = d.capture().?;
+    try testing.expect(std.mem.indexOf(u8, msg, "data/packages/a.toml") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "row \"ripgrep\"") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "do not combine into a valid axis expression") != null);
+}
+
+test "load: a bootstrap row whose gate will not combine with the file's is refused by row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const deep = try std.fmt.allocPrint(a, "{s}os=darwin{s}", .{ "(" ** 63, ")" ** 63 });
+    const text = try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\when = "{s}"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\when = "profile=work"
+        \\
+    , .{ deep, "0" ** 64 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data = text });
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+    const msg = d.capture().?;
+    try testing.expect(std.mem.indexOf(u8, msg, "data/packages/a.toml") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "bootstrap row 0 for backend \"brew\"") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "do not combine into a valid axis expression") != null);
 }
 
 test "load: a valid when is kept verbatim" {
