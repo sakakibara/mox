@@ -233,7 +233,8 @@ bound but empty -- green, does not fail the run); `blocked` (a needed
 fact could not be resolved -- see Scripts in
 [dsl.md](dsl.md#scripts); counts into the failing exit like `failed`,
 under its own label); `failed` (nonzero exit, abnormal
-termination, a time-out, or a stop for a terminal the run does not have). A stage file that cannot be spawned, a gate directory that
+termination, a time-out, or a stop for a terminal the run does not
+have). A stage file that cannot be spawned, a gate directory that
 cannot be read, and a subdirectory named like a tuple that is not one are
 counted under `failed` too, though none of them is a script.
 `--skip-scripts` skips scripts and their fact checks entirely.

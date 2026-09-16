@@ -160,13 +160,14 @@ pub fn errorText(e: anyerror) []const u8 {
     };
 }
 
+/// The same, naming the bound for a reader who may want to change it.
+/// `bound_ms` and `bound_var` are what that call actually ran under: a
+/// download is a captured call bounded like a setup script, while the
+/// installer run it feeds is streamed and bounded as an install. A call with
+/// no bound cannot arrive here timed out, since nothing was armed to kill it.
 pub fn failureText(arena: std.mem.Allocator, e: anyerror, bound_ms: i64, bound_var: []const u8) ![]const u8 {
     return switch (e) {
-        error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
-        error.TimedOut => if (bound_ms > 0)
-            try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var })
-        else
-            try std.fmt.allocPrint(arena, "timed out, killed ({s} is unset)", .{bound_var}),
+        error.TimedOut => try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var }),
         else => errorText(e),
     };
 }
@@ -285,6 +286,14 @@ pub const max_query_bytes: usize = 8 << 20;
 /// enough that a stopped child is answered promptly, long enough that a
 /// chatty query costs a handful of extra syscalls.
 const read_step_ms: i64 = 200;
+
+/// End what the call still has running: the child and its group, or -- where
+/// the child was already reaped between reads -- whatever it left in that
+/// group, which is what still holds the pipe open.
+fn killWhatIsLeft(io: Io, child: *std.process.Child, group: ?std.process.Child.Id) void {
+    if (child.id != null) return job.killGroup(io, child);
+    if (group) |id| _ = job.killGroupOf(id);
+}
 
 /// Runs the argv as a real child process. `env` is the environment mox itself
 /// reads through, so a manager invoked here sees the same HOME and PATH mox
@@ -406,6 +415,9 @@ pub const Process = struct {
         // spawn would close that window and leave the child holding the
         // block, unable to be interrupted at all, which is worse.
         if (child.id) |id| signals.hold(id);
+        // Remembered here because both the read's own peek and the wait clear
+        // it as they reap, and what the child left in its group outlives both.
+        const child_group = child.id;
         const deadline = timeoutOf(if (captured) self.timeout_ms else self.install_timeout_ms).toDeadline(io);
         var tty: ?job.Terminal = null;
         if (!captured) {
@@ -414,7 +426,8 @@ pub const Process = struct {
 
         var out: []const u8 = "";
         // Set when the child was found already finished between reads, so the
-        // status is this and there is nothing left to wait for.
+        // status is this and there is nothing left to wait for. The pipe may
+        // still be held by something it left behind, so the read goes on.
         var read_term: ?std.process.Child.Term = null;
         if (child.stdout) |f| {
             var streams: Io.File.MultiReader.Buffer(1) = undefined;
@@ -423,58 +436,66 @@ pub const Process = struct {
             defer mr.deinit();
             const rd = mr.reader(0);
             const started = Io.Clock.awake.now(io);
+            const bound = if (captured) self.timeout_ms else self.install_timeout_ms;
             // A read that fails, overruns the cap, or outlives the bound is an
             // error, never an empty answer: an empty `list` would make every
             // row missing.
             //
-            // Read in steps rather than straight to the bound: this is the
-            // only place a captured child is observed at all, and one that
-            // stopped will never write again. Between steps it is asked what
-            // it is doing, so a child waiting on a terminal it does not have
-            // is ended here instead of holding the read for the whole bound,
-            // or forever where the bound is disabled. The bound is kept by
-            // hand for the same reason.
+            // One deadline governs the whole read; a step is only how often
+            // the child is looked at inside it, never a bound of its own.
+            // This is the only place a captured child is observed at all, and
+            // one that stopped will never write again -- so a child waiting
+            // on a terminal it does not have is ended here rather than
+            // holding the read for the whole bound, or forever where the
+            // bound is disabled. The remaining time is what each step waits
+            // for when that is shorter, so a bound below one step is still
+            // kept to the millisecond.
             read: while (true) {
-                mr.fill(4096, timeoutOf(read_step_ms).toDeadline(io)) catch |e| switch (e) {
+                var step_ms = read_step_ms;
+                if (bound > 0) {
+                    const left = bound - started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+                    if (left <= 0) {
+                        killWhatIsLeft(io, &child, child_group);
+                        signals.release();
+                        return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
+                    }
+                    if (left < step_ms) step_ms = left;
+                }
+                mr.fill(4096, timeoutOf(step_ms).toDeadline(io)) catch |e| switch (e) {
                     error.EndOfStream => break :read,
-                    error.Timeout => {
-                        const bound = if (captured) self.timeout_ms else self.install_timeout_ms;
-                        if (bound > 0 and started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() >= bound) {
-                            job.killGroup(io, &child);
+                    // The step expired with nothing read. Whether the bound
+                    // expired with it is decided at the top of the next turn.
+                    error.Timeout => switch (job.peek(&child)) {
+                        .running => continue :read,
+                        .stopped => {
+                            killWhatIsLeft(io, &child, child_group);
                             signals.release();
-                            return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
-                        }
-                        switch (job.peek(&child)) {
-                            .running => continue :read,
-                            .stopped => {
-                                job.killGroup(io, &child);
-                                signals.release();
-                                return error.StoppedWantingTerminal;
-                            },
-                            // Reaped by the asking, so its status is the one
-                            // the caller gets; whatever it wrote is buffered
-                            // and the last read drains it.
-                            .done => |t| {
-                                read_term = t;
-                                mr.fillRemaining(.none) catch {};
-                                break :read;
-                            },
-                        }
+                            return error.StoppedWantingTerminal;
+                        },
+                        // Reaped by the asking, so this is the status the
+                        // caller gets. Reading continues under the same bound
+                        // and the same cap: what still holds the pipe open is
+                        // something the child left behind, and it may hold it
+                        // for as long as it likes.
+                        .done => |t| {
+                            read_term = t;
+                            continue :read;
+                        },
                     },
                     else => {
-                        job.killGroup(io, &child);
+                        killWhatIsLeft(io, &child, child_group);
                         signals.release();
                         return e;
                     },
                 };
                 if (rd.buffered().len > cap) {
-                    job.killGroup(io, &child);
+                    killWhatIsLeft(io, &child, child_group);
                     signals.release();
                     return error.StreamTooLong;
                 }
             }
             mr.checkAnyError() catch |e| {
-                job.killGroup(io, &child);
+                killWhatIsLeft(io, &child, child_group);
                 signals.release();
                 return e;
             };
@@ -511,22 +532,20 @@ pub const Process = struct {
                 };
             }
         }
-        // `wait` clears `child.id` as it reaps, so the group to sweep must
-        // be remembered before it.
-        const group = child.id;
         const term = job.waitFor(io, &child, tty) catch |e| {
             guard.reaped.store(true, .release);
-            signals.release();
             if (killer) |*k| _ = k.cancel(io);
             if (tty) |t| t.takeBack();
             // A wait that failed leaves the child unreaped and its group
             // live, and `signals.restore` is about to let go of it: nothing
             // would ever end it. The stop path has already killed and
             // reaped, so only a pid the system may have handed on is left
-            // there.
+            // there. The group is let go after the kill, never before, or a
+            // signal arriving between the two reaches nothing.
             if (e != error.StoppedWantingTerminal) {
-                if (group) |id| _ = job.killGroupOf(id);
+                if (child_group) |id| _ = job.killGroupOf(id);
             }
+            signals.release();
             return e;
         };
         guard.reaped.store(true, .release);
@@ -536,7 +555,7 @@ pub const Process = struct {
         // A shell reaped on the interrupt leaves whatever it backgrounded
         // in its group; the call is over, so nothing there may outlive it.
         if (guard.fired) {
-            if (group) |id| job.killStragglersOf(id);
+            if (child_group) |id| job.killStragglersOf(id);
         }
 
         var res = fromTerm(term, out);
@@ -1146,6 +1165,63 @@ test "Process: a helper the child left holding the pipe dies with it at the boun
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(elapsed_ms < 30_000);
+}
+
+test "Process: a child that keeps writing is still ended at the bound" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // Writes far more often than the read looks at the child, so every read
+    // succeeds and none of them ever waits: a bound consulted only when a
+    // read comes back empty would never be consulted at all. The child stops
+    // on its own after some seconds, so a regression fails this assertion
+    // rather than running until the cap, hours from now.
+    var p: Process = .{ .io = io, .timeout_ms = 500 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().run(a, &.{ "sh", "-c", "i=0; while [ $i -lt 1500 ]; do printf x; sleep 0.01; i=$((i+1)); done" });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(elapsed_ms < 10_000);
+}
+
+test "Process: a bound shorter than one look at the child is still kept" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // Well under `read_step_ms`: a read that always waits a whole step would
+    // overshoot this several times over.
+    var p: Process = .{ .io = io, .timeout_ms = 40 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().run(a, &.{ "sleep", "300" });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(elapsed_ms < 10_000);
+}
+
+test "Process: a straggler holding the pipe after the child is reaped is bounded too" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // The shell exits at once and is reaped between reads, while the sleep it
+    // left behind holds the write end open. The read that follows is the
+    // call's, so it answers to the call's bound, not to the straggler. The
+    // straggler ends itself well before the suite would notice a hang, so a
+    // regression fails this assertion rather than waiting it out.
+    var p: Process = .{ .io = io, .timeout_ms = 400 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().run(a, &.{ "sh", "-c", "sleep 20 & printf ok\n" });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(elapsed_ms < 10_000);
 }
 
 test "Process: a child that never stops writing is ended at the cap, not waited on" {

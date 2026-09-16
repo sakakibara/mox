@@ -788,8 +788,9 @@ pub fn runCheck(
     // there for the whole bound -- or forever, where the bound is disabled.
     const term = job.waitFor(io, &child, null) catch |e| {
         guard.reaped.store(true, .release);
-        signals.release();
         if (killer) |*k| _ = k.cancel(io);
+        // Let the group go only once nothing is left in it.
+        defer signals.release();
         if (e != error.StoppedWantingTerminal) {
             if (child_group) |id| _ = job.killGroupOf(id);
         }
@@ -962,9 +963,10 @@ fn runOne(
     stderr.flush() catch {};
     const term = job.waitFor(io, &child, tty) catch |e| {
         guard.reaped.store(true, .release);
-        signals.release();
         if (killer) |*k| _ = k.cancel(io);
         if (tty) |t| t.takeBack();
+        // Let the group go only once nothing is left in it.
+        defer signals.release();
         if (e == error.StoppedWantingTerminal) {
             // Already killed and reaped by the wait; sweeping again would
             // signal a pid the system may have handed on.
