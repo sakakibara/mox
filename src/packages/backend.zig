@@ -52,6 +52,17 @@ pub const Backend = struct {
         installedExplicit: *const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8,
         /// Install these rows, leaving resolution to the manager.
         install: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void,
+        /// The row that would name an observed installed id: the inverse of
+        /// `idOf`, for writing a hand-installed package back into the
+        /// manifest. `idOf` of the result must equal the id given.
+        declare: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration,
+    };
+
+    /// What a reconciled row says: the `name` a manifest row carries, plus
+    /// whichever adapter fields identify it.
+    pub const Declaration = struct {
+        name: []const u8,
+        fields: []const manifest_mod.Pair = &.{},
     };
 
     pub fn available(self: Backend, arena: std.mem.Allocator) anyerror!bool {
@@ -72,5 +83,9 @@ pub const Backend = struct {
 
     pub fn install(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         return self.vtable.install(self.ctx, arena, rows);
+    }
+
+    pub fn declare(self: Backend, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration {
+        return self.vtable.declare(self.ctx, arena, id);
     }
 };

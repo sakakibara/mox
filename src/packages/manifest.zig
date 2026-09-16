@@ -95,9 +95,20 @@ pub const BlacklistRow = struct {
     }
 };
 
+/// A manifest file that was read, and what it declares by default. Kept so a
+/// reconciled row can be appended to a file that already speaks its backend
+/// rather than guessed at.
+pub const Source = struct {
+    path: []const u8,
+    label: []const u8,
+    default_backend: ?[]const u8,
+    private: bool,
+};
+
 pub const Manifest = struct {
     packages: []const Row = &.{},
     blacklist: []const BlacklistRow = &.{},
+    sources: []const Source = &.{},
     /// How many manifest files were read. Zero means the subsystem is not in
     /// use on this repo, which is not the same as a manifest that declares
     /// nothing: without this, a machine that has never opted in would see
@@ -130,6 +141,7 @@ pub fn load(
 
     var packages: std.ArrayList(Row) = .empty;
     var blacklist: std.ArrayList(BlacklistRow) = .empty;
+    var sources: std.ArrayList(Source) = .empty;
 
     for (files) |f| {
         const content = Io.Dir.cwd().readFileAlloc(io, f.path, arena, .limited(max_file_bytes)) catch |e| {
@@ -153,6 +165,13 @@ pub fn load(
             }
             break :blk v.string;
         };
+
+        try sources.append(arena, .{
+            .path = f.path,
+            .label = f.label,
+            .default_backend = file_backend,
+            .private = f.private,
+        });
 
         if (doc.table.get("packages")) |v| {
             if (v != .array) {
@@ -186,6 +205,7 @@ pub fn load(
     return .{
         .packages = try packages.toOwnedSlice(arena),
         .blacklist = try blacklist.toOwnedSlice(arena),
+        .sources = try sources.toOwnedSlice(arena),
         .files = files.len,
     };
 }
@@ -193,6 +213,7 @@ pub fn load(
 const SourceFile = struct {
     path: []const u8,
     label: []const u8,
+    private: bool,
 };
 
 /// Every `data/packages/*.toml` across both layers, basename-ordered, a
@@ -203,10 +224,11 @@ fn discover(
     repo_dir: []const u8,
     private_dir: []const u8,
 ) ![]const SourceFile {
-    var chosen = std.StringHashMap([]const u8).init(arena);
+    const Pick = struct { path: []const u8, private: bool };
+    var chosen = std.StringHashMap(Pick).init(arena);
     var names: std.ArrayList([]const u8) = .empty;
 
-    for ([_][]const u8{ repo_dir, private_dir }) |root| {
+    for ([_][]const u8{ repo_dir, private_dir }, 0..) |root, layer| {
         if (root.len == 0) continue;
         const dir_path = try std.fs.path.join(arena, &.{ root, "data", "packages" });
         const entries = try dirent.sortedPath(arena, io, dir_path, .{ .iterate = true });
@@ -214,7 +236,10 @@ fn discover(
             if (e.kind != .file and e.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, e.name, ".toml")) continue;
             if (!chosen.contains(e.name)) try names.append(arena, e.name);
-            try chosen.put(e.name, try std.fs.path.join(arena, &.{ dir_path, e.name }));
+            try chosen.put(e.name, .{
+                .path = try std.fs.path.join(arena, &.{ dir_path, e.name }),
+                .private = layer == 1,
+            });
         }
     }
 
@@ -222,9 +247,11 @@ fn discover(
 
     var out: std.ArrayList(SourceFile) = .empty;
     for (names.items) |n| {
+        const pick = chosen.get(n).?;
         try out.append(arena, .{
-            .path = chosen.get(n).?,
+            .path = pick.path,
             .label = try std.fmt.allocPrint(arena, "data/packages/{s}", .{n}),
+            .private = pick.private,
         });
     }
     return out.toOwnedSlice(arena);

@@ -46,6 +46,7 @@ pub const Brew = struct {
         .idOf = idOfImpl,
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
+        .declare = declareImpl,
     };
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
@@ -144,6 +145,16 @@ pub const Brew = struct {
 /// `validate` has already refused anything but `"formula"` or `"cask"`, so
 /// an unexpected value here is a caller that skipped validation, not user
 /// input to paper over.
+fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
+    if (std.mem.startsWith(u8, id, cask_prefix)) {
+        return .{
+            .name = id[cask_prefix.len..],
+            .fields = &.{.{ .key = "kind", .value = .{ .string = "cask" } }},
+        };
+    }
+    return .{ .name = id };
+}
+
 fn kindOf(row: Row) !Kind {
     const f = row.field("kind") orelse return .formula;
     const s = switch (f) {
@@ -230,6 +241,38 @@ test "validate: a bare row and an explicit kind both pass" {
 
     try be.validate(rowOf("ripgrep", &.{}), null);
     try be.validate(rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}), null);
+}
+
+test "declare: a cask id round-trips back to a cask row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b: Brew = .{ .runner = undefined };
+    const be = b.backend();
+
+    const d = try be.declare(a, "cask:ghostty");
+    try testing.expectEqualStrings("ghostty", d.name);
+    try testing.expectEqualStrings("cask", d.fields[0].value.string);
+
+    // The contract: idOf of what declare produced is the id it came from.
+    const row = rowOf(d.name, d.fields);
+    try testing.expectEqualStrings("cask:ghostty", try be.idOf(a, row));
+}
+
+test "declare: a formula id round-trips with no fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b: Brew = .{ .runner = undefined };
+    const be = b.backend();
+
+    const d = try be.declare(a, "d12frosted/emacs-plus/emacs-plus@30");
+    try testing.expectEqualStrings("d12frosted/emacs-plus/emacs-plus@30", d.name);
+    try testing.expectEqual(@as(usize, 0), d.fields.len);
+    try testing.expectEqualStrings(
+        "d12frosted/emacs-plus/emacs-plus@30",
+        try be.idOf(a, rowOf(d.name, d.fields)),
+    );
 }
 
 test "idOf: a cask id cannot collide with the formula of the same name" {

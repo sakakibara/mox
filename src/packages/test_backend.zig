@@ -23,6 +23,7 @@ const vtable: Backend.VTable = .{
     .idOf = idOf,
     .installedExplicit = unreachedInstalled,
     .install = unreachedInstall,
+    .declare = declare,
 };
 
 fn idOf(_: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
@@ -36,6 +37,16 @@ fn idOf(_: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
 }
 
 fn validate(_: *anyopaque, _: Row, _: ?*manifest_mod.Diag) anyerror!void {}
+
+fn declare(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!backend_mod.Backend.Declaration {
+    if (std.mem.startsWith(u8, id, "cask:")) {
+        return .{
+            .name = id["cask:".len..],
+            .fields = &.{.{ .key = "kind", .value = .{ .string = "cask" } }},
+        };
+    }
+    return .{ .name = id };
+}
 
 fn unreachedAvailable(_: *anyopaque, _: std.mem.Allocator) anyerror!bool {
     return error.Unreached;
