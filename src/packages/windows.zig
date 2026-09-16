@@ -96,6 +96,7 @@ pub const Scoop = struct {
             error.FileNotFound => return false,
             else => return e,
         };
+        try exec.checkTimedOut(res);
         return res.ok;
     }
 
@@ -216,6 +217,7 @@ pub const Winget = struct {
             error.FileNotFound => return false,
             else => return e,
         };
+        try exec.checkTimedOut(res);
         return res.ok;
     }
 
@@ -270,6 +272,7 @@ pub const Winget = struct {
             "-o",                         path,
             "--accept-source-agreements",
         });
+        try exec.checkTimedOut(res);
         if (!res.ok) return Error.WingetQueryFailed;
 
         const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(8 << 20)) catch

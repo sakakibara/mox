@@ -63,7 +63,7 @@ fn brewWith(
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .stdout = formulae });
-    try entries.append(a, .{ .argv = "brew list --cask", .stdout = casks });
+    try entries.append(a, .{ .argv = "brew list --cask --full-name", .stdout = casks });
     try absentLinuxManagers(a, &entries);
     for (extra) |e| try entries.append(a, e);
 
@@ -895,7 +895,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
-    try entries.append(a, .{ .argv = "brew list --cask", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew install ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };

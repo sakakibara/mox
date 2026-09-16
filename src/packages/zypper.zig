@@ -64,6 +64,7 @@ pub const Zypper = struct {
             error.FileNotFound => return false,
             else => return e,
         };
+        try exec.checkTimedOut(res);
         return res.ok;
     }
 
@@ -90,6 +91,7 @@ pub const Zypper = struct {
         if (recorded.len == 0) return &.{};
 
         const res = try self.runner.run(arena, &.{ "rpm", "-qa", "--qf", "%{NAME}\n" });
+        try exec.checkTimedOut(res);
         if (!res.ok) return Error.ZypperQueryFailed;
 
         var present = std.StringHashMap(void).init(arena);
@@ -117,6 +119,7 @@ pub const Zypper = struct {
         if (elevate) try refresh.append(arena, "sudo");
         try refresh.appendSlice(arena, &.{ "zypper", "--non-interactive", "refresh" });
         const up = try self.runner.stream(arena, refresh.items);
+        try exec.checkTimedOut(up);
         if (!up.ok) return Error.ZypperInstallFailed;
 
         var argv: std.ArrayList([]const u8) = .empty;

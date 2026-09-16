@@ -12,9 +12,10 @@
 //! asked for by name vanishes the moment anything needs it and is reported
 //! missing forever. `--full-name` spells a tapped formula the way a row does
 //! (`owner/tap/name`); without it the same formula comes back bare and never
-//! matches its row. Casks are queried separately and are a namespace that can
-//! collide with a formula of the same name, so a cask's id carries its kind
-//! -- and a cask can come from a third-party tap just as a formula can.
+//! matches its row. Casks are queried separately, with the same `--full-name`
+//! for the same reason, and are a namespace that can collide with a formula of
+//! the same name, so a cask's id carries its kind -- and a cask can come from a
+//! third-party tap just as a formula can.
 
 const std = @import("std");
 
@@ -96,6 +97,7 @@ pub const Brew = struct {
             error.FileNotFound => return false,
             else => return e,
         };
+        try exec.checkTimedOut(res);
         return res.ok;
     }
 
@@ -145,7 +147,8 @@ pub const Brew = struct {
         if (!formulae.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, formulae.stdout, "");
 
-        const casks = try self.runner.run(arena, &.{ self.exe, "list", "--cask" });
+        const casks = try self.runner.run(arena, &.{ self.exe, "list", "--cask", "--full-name" });
+        try exec.checkTimedOut(casks);
         if (!casks.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, casks.stdout, cask_prefix);
 
@@ -163,7 +166,10 @@ pub const Brew = struct {
             if (tapOf(row.name)) |tap| {
                 const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", tap });
                 try exec.checkTimedOut(tapped);
-                if (!tapped.ok) return error.BrewTapFailed;
+                if (!tapped.ok) {
+                    failed = true;
+                    continue;
+                }
                 // Trust the one thing named, never the whole tap: an
                 // untrusted third-party tap is ignored outright since
                 // Homebrew 6.0, and whole-tap trust would extend to every
@@ -175,7 +181,11 @@ pub const Brew = struct {
                     .cask => "--cask",
                 };
                 const trusted = try self.runner.stream(arena, &.{ self.exe, "trust", flag, row.name });
-                if (!trusted.ok) return error.BrewTrustFailed;
+                try exec.checkTimedOut(trusted);
+                if (!trusted.ok) {
+                    failed = true;
+                    continue;
+                }
             }
             const res = switch (kind) {
                 .formula => try self.runner.stream(arena, &.{ self.exe, "install", row.name }),
@@ -188,9 +198,6 @@ pub const Brew = struct {
     }
 };
 
-/// `validate` has already refused anything but `"formula"` or `"cask"`, so
-/// an unexpected value here is a caller that skipped validation, not user
-/// input to paper over.
 fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
     if (std.mem.startsWith(u8, id, cask_prefix)) {
         return .{
@@ -201,6 +208,9 @@ fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Bac
     return .{ .name = id };
 }
 
+/// `validate` has already refused anything but `"formula"` or `"cask"`, so
+/// an unexpected value here is a caller that skipped validation, not user
+/// input to paper over.
 fn kindOf(row: Row) !Kind {
     const f = row.field("kind") orelse return .formula;
     const s = switch (f) {
@@ -345,7 +355,7 @@ test "installedExplicit: formulae bare, tapped fully qualified, casks prefixed" 
             .argv = "brew list --full-name --installed-on-request",
             .stdout = "ripgrep\nd12frosted/emacs-plus/emacs-plus@30\n",
         },
-        .{ .argv = "brew list --cask", .stdout = "ghostty\n1password\n" },
+        .{ .argv = "brew list --cask --full-name", .stdout = "ghostty\n1password\n" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();
@@ -504,6 +514,46 @@ test "bootstrap: after installing, brew is invoked by the path it landed at" {
     // became absolute, or none was and it is unchanged; never something else.
     try testing.expect(std.mem.eql(u8, b.exe, before) or std.fs.path.isAbsolute(b.exe));
     if (std.fs.path.isAbsolute(b.exe)) try testing.expect(std.mem.endsWith(u8, b.exe, "/brew"));
+}
+
+test "install: a failed tap fails its row and the rows after it still run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The tapped row's trust and install are unscripted, so reaching either
+    // would fail the test with a different error than the one asserted.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew tap owner/tap", .code = 1, .stderr = "no such tap" },
+        .{ .argv = "brew install ripgrep" },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{
+        rowOf("owner/tap/thing", &.{}),
+        rowOf("ripgrep", &.{}),
+    }));
+    try testing.expect(fake.called("brew install ripgrep"));
+}
+
+test "install: a failed trust fails its row and the rows after it still run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew tap owner/tap" },
+        .{ .argv = "brew trust --cask owner/tap/somecask", .code = 1, .stderr = "refused" },
+        .{ .argv = "brew install --cask ghostty" },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{
+        rowOf("owner/tap/somecask", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+        rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+    }));
+    try testing.expect(!fake.called("brew install --cask owner/tap/somecask"));
+    try testing.expect(fake.called("brew install --cask ghostty"));
 }
 
 test "install: a failed install is an error, not a silent skip" {

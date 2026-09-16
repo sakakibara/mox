@@ -94,7 +94,7 @@ distinction is what lets one manifest carry every machine's packages.
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
-| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask` | `kind` (`formula`, `cask`) |
+| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name` | `kind` (`formula`, `cask`) |
 | `apt` | name | `apt-mark showmanual` | -- |
 | `dnf` | name | `dnf repoquery --userinstalled` | -- |
 | `pacman` | name | `pacman -Qeq` | -- |

@@ -126,7 +126,15 @@ EOF
   # trailing newline) runs every name together, which shows up as one absurd
   # untracked entry rather than many.
   longest="$(echo "$after" | grep "UNTRACKED $backend " | sed "s/.*UNTRACKED $backend //" | awk '{ print length }' | sort -rn | head -1)"
-  if [ -z "$longest" ] || [ "$longest" -lt 80 ]; then
+  if [ -z "$longest" ]; then
+    if [ "$backend" = zypper ]; then
+      skip "$backend ($image): installed names come back one per line" \
+        "zypper never reports UNTRACKED by design (mox tracks only what it installed), so there is no name to measure"
+    else
+      skip "$backend ($image): installed names come back one per line" \
+        "no UNTRACKED $backend entry after apply, so there is no name to measure"
+    fi
+  elif [ "$longest" -lt 80 ]; then
     ok "$backend ($image): installed names come back one per line"
   else
     no "$backend ($image): an untracked name is $longest chars; the query lost its separator" \

@@ -99,7 +99,7 @@ test "brew: every cask brew reports is an id under the cask prefix" {
     if (!brewPresent(a, io)) return error.SkipZigTest;
 
     const ids = try brewIds(a, io);
-    const raw = try rawLines(a, io, &.{ "brew", "list", "--cask" });
+    const raw = try rawLines(a, io, &.{ "brew", "list", "--cask", "--full-name" });
     if (raw.len == 0) return error.SkipZigTest;
 
     // Drops the prefix and this fails, which is the point: a cask sharing a
@@ -128,7 +128,7 @@ test "brew: the adapter reports exactly what brew reports, nothing extra" {
 
     const ids = try brewIds(a, io);
     const formulae = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
-    const casks = try rawLines(a, io, &.{ "brew", "list", "--cask" });
+    const casks = try rawLines(a, io, &.{ "brew", "list", "--cask", "--full-name" });
     try testing.expectEqual(formulae.len + casks.len, ids.len);
 }
 
@@ -150,7 +150,10 @@ test "brew: a tap-qualified formula is reported the way a row spells it" {
     }
     // Nothing tapped here: skip rather than pass on an empty search, so this
     // never reads as green coverage on a runner with no tapped formula.
-    const name = qualified orelse return error.SkipZigTest;
+    const name = qualified orelse {
+        std.debug.print("brew: no tapped formula installed here; the tap check has nothing to compare\n", .{});
+        return error.SkipZigTest;
+    };
 
     const ids = try brewIds(a, io);
     try testing.expect(contains(ids, name));

@@ -90,6 +90,7 @@ pub const Distro = struct {
             error.FileNotFound => return false,
             else => return e,
         };
+        try exec.checkTimedOut(res);
         return res.ok;
     }
 
@@ -144,6 +145,7 @@ pub const Distro = struct {
             if (elevate) try up_argv.append(arena, "sudo");
             try up_argv.appendSlice(arena, &.{ "apt-get", "update" });
             const up = try self.runner.stream(arena, up_argv.items);
+            try exec.checkTimedOut(up);
             if (!up.ok) return Error.DistroInstallFailed;
         }
 
