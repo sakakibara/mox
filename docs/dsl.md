@@ -428,7 +428,7 @@ script then lands in one of seven outcomes, each its own printed line:
 | blocked | `mox apply: <path>: blocked: <reason>` (stderr, one line per unresolved fact) | a needed fact could not be resolved -- fails the run under its own summary count, distinct from `failed` |
 | failed | `mox apply: <path>: exit <code>` (stderr) | nonzero exit |
 | failed | `mox apply: <path>: timed out after <ms>ms, killed` / `... terminated abnormally` (stderr) | killed after `MOX_SCRIPT_TIMEOUT_MS` (default 600000ms, `<= 0` disables), or exited abnormally |
-| failed | `mox apply: <path>: stopped waiting for a terminal this run does not have; killed` (stderr) | the script asked the terminal something a run with none (`mox apply &`, a CI job) cannot answer |
+| failed | `mox apply: <path>: stopped, and this run has no terminal that could resume it; killed` (stderr) | the script asked the terminal something a run with none (`mox apply &`, a CI job) cannot answer |
 
 A script leads its own process group, so the bound reaches what it started
 and not the script alone: an orphan holding mox's stdout would keep a

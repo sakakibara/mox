@@ -42,7 +42,8 @@ All notable changes to mox are documented here. The format follows
   kept in git, and a directory named like a plugin says what it is rather
   than that no such backend exists.
 - `status` reports each backend's MISSING and UNTRACKED packages, `apply`
-  installs the missing (after the pre stage and its re-capture, and
+  installs the missing and counts a plan's own failures under `--dry-run`
+  as the real run counts its own (after the pre stage and its re-capture, and
   first installing a declared manager that is absent from its verified
   installer, then using it in the same run -- brew and scoop by the path it
   landed at, a plugin by the bin dir it reports; `--dry-run` plans as though
@@ -123,8 +124,10 @@ All notable changes to mox are documented here. The format follows
   is waited on the same way, so a captured query or a `check` hook that stops
   -- anything reaching for `sudo` from a background process group -- is ended
   at once instead of sitting out its bound, or forever where the bound is
-  disabled. mox answers SIGQUIT as it answers SIGINT, SIGTERM and SIGHUP:
-  Ctrl-backslash takes the child's group with it rather than leaving it running.
+  disabled -- a captured child is read from rather than waited on, so it is
+  asked what it is doing between reads. mox answers SIGQUIT as it answers
+  SIGINT, SIGTERM and SIGHUP: Ctrl-backslash takes the child's group with it
+  rather than leaving it running.
 
 ### Fixed
 - The timeout watchdog for setup scripts and check hooks runs on its own

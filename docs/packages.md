@@ -386,7 +386,9 @@ backend.
   `MOX_INSTALL_TIMEOUT_MS` (none by default: a manager may compile for an
   hour), and at that bound its group is interrupted, then killed ten
   seconds later. A captured verb must never prompt: it is not the
-  foreground job, so a read from the terminal stops it until the bound.
+  foreground job, so a read from the terminal stops it, and mox ends a
+  captured child that stops the moment it stops rather than waiting out the
+  bound -- or forever, where the bound is disabled.
   Windows has neither process groups nor job control, so there a bound
   reaches the direct process alone and no terminal changes hands.
 - The shipped backends' own manager calls are bounded the same way, and a
@@ -418,9 +420,10 @@ PATH.
 A plugin runs as you, at the trust `scripts/pre` already has, under the
 same environment a setup script gets: `MOX_REPO`, `MOX_STATE_DIR`,
 `MOX_HOME`, `PATH` and every fact as `MOX_FACT_*`, plus `MOX_PACKAGES_DEPTH`,
-which counts how many mox runs already sit above this one. It is read as a
-yes or no -- any value present, `0` included, means a mox is above -- so a
-plugin cannot clear it by setting it. A mox reached from
+which says that a mox already sits above this one. It is read as a yes or no
+-- any value present, `0` included, means one is -- so a plugin cannot clear
+it by setting it, and the number it carries is capped rather than counted
+without end. A mox reached from
 inside a plugin discovers no plugin at all and says so as a note, so a plugin
 that calls mox cannot multiply itself; the compiled backends still work
 there. That holds for `status`
@@ -445,7 +448,7 @@ cmd=${1:-}; shift || true
 name() { printf '%s\n' "$1" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; }
 case "$cmd" in
 available) command -v port >/dev/null 2>&1 ;;
-id)        while IFS= read -r l; do [ -n "$l" ] || continue; name "$l"; done ;;
+id)        IFS= read -r l && name "$l" ;;
 list)      port -q echo requested | awk 'NF { print $1 }' ;;
 install)   set --; while IFS= read -r l; do [ -n "$l" ] || continue; set -- "$@" "$(name "$l")"; done
            sudo port -N install "$@" ;;
