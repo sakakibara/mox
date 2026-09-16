@@ -107,6 +107,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  note: {f}: the tracked-source check was skipped (not its own git working tree, or git is unavailable)\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
     }
 
+    // The private root's `data/` is data, never source: a file there is not
+    // managed, and a user who put one there meaning it to be would get
+    // silence otherwise.
+    if (try privateDataStrays(ctx.alloc, ctx.io, context.paths.private_dir)) |strays| {
+        for (strays) |stray| {
+            advisories += 1;
+            try ctx.out.print("  private-data {s} (the private layer's data/ holds data sources; this is not one, and nothing applies it)\n", .{stray});
+        }
+    }
+
     // Source modes git cannot carry (not 0644/0755) that are not recorded in
     // `.mox/attributes.toml`: git collapses them on clone, so the mode is lost.
     if (try unrecordedModes(ctx.alloc, ctx.io, context.paths.repo_dir, src_dir)) |unrecorded| {
@@ -247,6 +257,29 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// means machine state or the source tree could not be read at all (the
 /// check could not run); the caller must not read that the same as "ran and
 /// found nothing". Arena-owned display paths.
+/// Entries of the private layer's `data/` that are not data sources. That
+/// directory is read for `[[rows]]` files alone, and is deliberately not
+/// walked as a source tree, so anything else there is applied by nothing.
+/// Null when there is no private layer or no `data/` in it.
+fn privateDataStrays(arena: std.mem.Allocator, io: Io, private_dir: []const u8) !?[]const []const u8 {
+    if (private_dir.len == 0) return null;
+    const data_dir = try std.fs.path.join(arena, &.{ private_dir, "data" });
+    var dir = Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (junk.isJunk(entry.name)) continue;
+        // `data/packages/` is the package manifest's own directory.
+        if (entry.kind == .directory and std.mem.eql(u8, entry.name, "packages")) continue;
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".toml")) continue;
+        try out.append(arena, try std.fs.path.join(arena, &.{ data_dir, entry.name }));
+    }
+    std.mem.sort([]const u8, out.items, {}, lessString);
+    return out.items;
+}
+
 fn neverMaterializing(
     arena: std.mem.Allocator,
     io: Io,

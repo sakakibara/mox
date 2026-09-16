@@ -59,6 +59,9 @@ pub const Row = struct {
     label: []const u8,
     /// 0-based position within its file's array.
     index: usize,
+    /// Which layer the file belongs to: two files of one basename are told
+    /// apart by nothing else in a message.
+    private: bool = false,
 
     pub fn field(self: Row, key: []const u8) ?Field {
         for (self.fields) |p| {
@@ -82,6 +85,7 @@ pub const BlacklistRow = struct {
     origin: []const u8,
     label: []const u8,
     index: usize,
+    private: bool = false,
 
     /// The same package, shaped for the adapter's `idOf`.
     pub fn asRow(self: BlacklistRow) Row {
@@ -93,6 +97,7 @@ pub const BlacklistRow = struct {
             .origin = self.origin,
             .label = self.label,
             .index = self.index,
+            .private = self.private,
         };
     }
 };
@@ -121,6 +126,7 @@ pub const BootstrapRow = struct {
     origin: []const u8,
     label: []const u8,
     index: usize,
+    private: bool = false,
 };
 
 pub const Manifest = struct {
@@ -436,6 +442,7 @@ fn parseRow(
         .origin = f.path,
         .label = f.label,
         .index = index,
+        .private = f.private,
     };
 }
 
@@ -504,6 +511,7 @@ fn parseBootstrapRow(
         .origin = f.path,
         .label = f.label,
         .index = index,
+        .private = f.private,
     };
 }
 
@@ -595,6 +603,7 @@ fn parseBlacklistRow(
         .origin = f.path,
         .label = f.label,
         .index = index,
+        .private = f.private,
     };
 }
 

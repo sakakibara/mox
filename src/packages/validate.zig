@@ -23,6 +23,12 @@ pub const Error = error{
     DuplicatePackageRow,
 };
 
+/// A file's name plus which layer it is in: two files of one basename are
+/// told apart by nothing else in a message.
+fn where(label: []const u8, private: bool) struct { []const u8, []const u8 } {
+    return .{ label, if (private) " (private layer)" else "" };
+}
+
 /// Check every row against the registry and its adapter. `diag` (when
 /// non-null) names the file and row behind any failure.
 pub fn all(
@@ -59,10 +65,14 @@ pub fn all(
     defer installers.deinit();
     for (m.bootstrap) |b| {
         if (installers.get(b.backend)) |first| {
-            if (diag) |d| d.set(
-                "{s}: bootstrap row {d} declares a second bootstrap row for backend \"{s}\"; one per backend (the first is {s}: bootstrap row {d})",
-                .{ b.label, b.index, b.backend, first.label, first.index },
-            );
+            if (diag) |d| {
+                const a_at = where(b.label, b.private);
+                const b_at = where(first.label, first.private);
+                d.set(
+                    "{s}{s}: bootstrap row {d} declares a second bootstrap row for backend \"{s}\"; one per backend (the first is {s}{s}: bootstrap row {d})",
+                    .{ a_at[0], a_at[1], b.index, b.backend, b_at[0], b_at[1], first.index },
+                );
+            }
             return Error.DuplicateBootstrapRow;
         }
         try installers.put(b.backend, b);
@@ -111,10 +121,14 @@ fn duplicates(
         };
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{ row.backend, id, row.when orelse "" });
         if (seen.get(key)) |first| {
-            if (diag) |d| d.set(
-                "{s}: row {d} and {s}: row {d} both declare \"{s}\" for backend \"{s}\" with the same gate",
-                .{ first.label, first.index, row.label, row.index, row.name, row.backend },
-            );
+            if (diag) |d| {
+                const a_at = where(first.label, first.private);
+                const b_at = where(row.label, row.private);
+                d.set(
+                    "{s}{s}: row {d} and {s}{s}: row {d} both declare \"{s}\" for backend \"{s}\" with the same gate",
+                    .{ a_at[0], a_at[1], first.index, b_at[0], b_at[1], row.index, row.name, row.backend },
+                );
+            }
             return Error.DuplicatePackageRow;
         }
         try seen.put(key, row);
@@ -148,10 +162,14 @@ fn contradictions(
                 return e;
             };
             if (!std.mem.eql(u8, id, blocked)) continue;
-            if (diag) |d| d.set(
-                "{s} declares \"{s}\" for backend \"{s}\", which {s} blacklists",
-                .{ row.label, row.name, row.backend, bl.label },
-            );
+            if (diag) |d| {
+                const a_at = where(row.label, row.private);
+                const b_at = where(bl.label, bl.private);
+                d.set(
+                    "{s}{s} declares \"{s}\" for backend \"{s}\", which {s}{s} blacklists",
+                    .{ a_at[0], a_at[1], row.name, row.backend, b_at[0], b_at[1] },
+                );
+            }
             return Error.BlacklistedPackageDeclared;
         }
     }
