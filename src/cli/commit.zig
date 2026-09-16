@@ -497,6 +497,7 @@ fn reconcilePackages(
         },
     };
     for (rep.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
+    for (rep.broken) |b| try ctx.out.print("  note       {f}\n", .{b});
 
     var res: PackageReconcile = .{};
     const choices = [_]prompt.Choice{

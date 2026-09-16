@@ -34,12 +34,26 @@ pub const BackendDrift = struct {
     limitation: ?[]const u8 = null,
 };
 
+/// A manager that is there but cannot answer its own version query. Treated
+/// as absent for the rows, and reported as drift: a machine whose brew is
+/// broken is not a clean machine.
+pub const Broken = struct {
+    backend: []const u8,
+    argv0: []const u8,
+    code: u8,
+
+    pub fn format(self: Broken, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s}: `{s} --version` exited {d}; treated as absent", .{ self.backend, self.argv0, self.code });
+    }
+};
+
 pub const Report = struct {
     in_use: bool = false,
     backends: []const BackendDrift = &.{},
-    /// What the report has to say beyond any one backend's rows: a manager
-    /// that is there but broken, or no usable manager at all.
+    /// What the report has to say beyond any one backend's rows: a probe
+    /// that failed for a manager no row names, or no usable manager at all.
     notes: []const []const u8 = &.{},
+    broken: []const Broken = &.{},
 
     pub fn clean(self: Report) bool {
         for (self.backends) |b| {
@@ -100,6 +114,7 @@ pub fn fromManifest(
     try validate_mod.all(arena, m, registry, diag);
 
     var notes: std.ArrayList([]const u8) = .empty;
+    var broken: std.ArrayList(Broken) = .empty;
     var active: std.ArrayList([]const u8) = .empty;
     var usable: std.ArrayList(Backend) = .empty;
     var assumed: std.ArrayList(Backend) = .empty;
@@ -110,6 +125,16 @@ pub fn fromManifest(
             continue;
         }
         const avail = b.available(arena) catch |e| {
+            // A backend no row names has nothing to judge, so its probe
+            // failing must not take every other backend's report with it.
+            if (!named(m, b.name)) {
+                try notes.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "{s}: available failed: {s}; treated as absent",
+                    .{ b.name, @errorName(e) },
+                ));
+                continue;
+            }
             if (diag) |d| d.set("{s}: available failed: {s}", .{ b.name, @errorName(e) });
             return e;
         };
@@ -120,11 +145,7 @@ pub fn fromManifest(
                 continue;
             },
             .absent => {},
-            .broken => |why| try notes.append(arena, try std.fmt.allocPrint(
-                arena,
-                "{s}: `{s} --version` exited {d}; treated as absent",
-                .{ b.name, why.argv0, why.code },
-            )),
+            .broken => |why| try broken.append(arena, .{ .backend = b.name, .argv0 = why.argv0, .code = why.code }),
         }
         if (b.inert) continue;
         if (try willBootstrap(arena, m, b.name, r)) {
@@ -174,7 +195,20 @@ pub fn fromManifest(
         });
     }
 
-    return .{ .in_use = true, .backends = try out.toOwnedSlice(arena), .notes = try notes.toOwnedSlice(arena) };
+    return .{
+        .in_use = true,
+        .backends = try out.toOwnedSlice(arena),
+        .notes = try notes.toOwnedSlice(arena),
+        .broken = try broken.toOwnedSlice(arena),
+    };
+}
+
+/// Whether any package, blacklist, or bootstrap row names `backend`.
+fn named(m: manifest_mod.Manifest, backend: []const u8) bool {
+    for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
+    for (m.blacklist) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
+    for (m.bootstrap) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
+    return false;
 }
 
 /// Whether `apply` would bootstrap `backend` here: a `[[bootstrap]]` row
@@ -437,7 +471,7 @@ test "fromManifest: an inert backend is not assumed for its bootstrap row" {
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
-test "fromManifest: a broken backend is treated as absent and named in a note" {
+test "fromManifest: a broken backend is treated as absent and listed as broken" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -459,10 +493,67 @@ test "fromManifest: a broken backend is treated as absent and named in a note" {
     const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
-    try testing.expectEqual(@as(usize, 2), rep.notes.len);
-    try testing.expectEqualStrings("brew: `brew --version` exited 1; treated as absent", rep.notes[0]);
-    try testing.expectEqualStrings("no package manager is usable on this machine", rep.notes[1]);
+    try testing.expectEqual(@as(usize, 1), rep.broken.len);
+    try testing.expectEqualStrings("brew", rep.broken[0].backend);
+    try testing.expectEqualStrings("brew", rep.broken[0].argv0);
+    try testing.expectEqual(@as(u8, 1), rep.broken[0].code);
+    const line = try std.fmt.allocPrint(a, "{f}", .{rep.broken[0]});
+    try testing.expectEqualStrings("brew: `brew --version` exited 1; treated as absent", line);
+    try testing.expectEqual(@as(usize, 1), rep.notes.len);
+    try testing.expectEqualStrings("no package manager is usable on this machine", rep.notes[0]);
     try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+}
+
+test "fromManifest: a probe error on a backend no row names is a note, and the report still comes back" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
+        .{ .argv = "brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "brew list --cask --full-name", .stdout = "" },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    // test_backend's `available` errors; nothing names dnf.
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{rowOf("ripgrep", "brew")},
+        .files = 1,
+    };
+    const rep = try fromManifest(a, m, .{ .backends = &.{ b.backend(), test_backend.make("dnf") } }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 1), rep.backends.len);
+    try testing.expectEqualStrings("brew", rep.backends[0].backend);
+    try testing.expect(rep.clean());
+    try testing.expectEqual(@as(usize, 1), rep.notes.len);
+    try testing.expectEqualStrings("dnf: available failed: Unreached; treated as absent", rep.notes[0]);
+}
+
+test "fromManifest: a probe error on a backend a blacklist or bootstrap row names still aborts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const bl: manifest_mod.BlacklistRow = .{
+        .name = "usage",
+        .backend = "dnf",
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+    const by_blacklist: manifest_mod.Manifest = .{ .blacklist = &.{bl}, .files = 1 };
+    var d: Diag = .{};
+    try testing.expectError(error.Unreached, fromManifest(a, by_blacklist, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, &d));
+    try testing.expectEqualStrings("dnf: available failed: Unreached", d.capture().?);
+
+    const by_bootstrap: manifest_mod.Manifest = .{ .bootstrap = &.{bootstrapRowOf("dnf", null)}, .files = 1 };
+    try testing.expectError(error.Unreached, fromManifest(a, by_bootstrap, .{ .backends = &.{test_backend.makeBootstrappable("dnf")} }, &r, &.{}, null));
 }
 
 test "fromManifest: a usable backend leaves no note about usability" {

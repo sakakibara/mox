@@ -344,9 +344,10 @@ const Packages = struct {
     report: mox.packages.report.Report = .{},
     broken: bool = false,
 
-    /// Every package the report counts against the exit code.
+    /// Every package the report counts against the exit code, and every
+    /// manager that is there but broken.
     fn problems(self: Packages) usize {
-        return self.report.missingCount() + self.report.untrackedCount() + @intFromBool(self.broken);
+        return self.report.missingCount() + self.report.untrackedCount() + self.report.broken.len + @intFromBool(self.broken);
     }
 };
 
@@ -469,9 +470,11 @@ fn printPackages(
 
     const pkgs = try reportPackages(ctx, prep, bindings);
     const rep = pkgs.report;
-    // What no one backend's rows can say: a manager that is there but
-    // broken, or no usable manager at all.
+    // What no one backend's rows can say: no usable manager at all, or a
+    // manager that is there but broken -- drift, since the machine is not
+    // in the state the manifest describes.
     for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} --version exited {d})\n", .{ "BROKEN", b.backend, b.argv0, b.code });
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
@@ -495,7 +498,8 @@ fn printPackages(
 /// [name]}`, `state` being `missing` or `untracked` and `id` the identity its
 /// backend compares by (a brew cask carries its `cask:` prefix, so it can
 /// never be confused with the formula of the same name). `name` is what the
-/// manifest row spells, present only for a missing package.
+/// manifest row spells, present only for a missing package. A manager that
+/// is there but broken is `{backend, state: "broken", exit}`.
 /// `kind` is a stable tag (`whole_file`, `owned_key`, `symlink_target`,
 /// `generated_set`, `vanished`); `key` appears only for `owned_key` (its owned
 /// key path, or null for a secret whole-scope record). The schema is locked by
@@ -536,6 +540,13 @@ fn emitJsonFiles(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void
 fn emitJsonPackages(out: *std.Io.Writer, rep: mox.packages.report.Report) !void {
     try out.writeByte('[');
     var first = true;
+    for (rep.broken) |b| {
+        if (!first) try out.writeByte(',');
+        first = false;
+        try out.writeAll("{\"backend\":");
+        try writeJsonString(out, b.backend);
+        try out.print(",\"state\":\"broken\",\"exit\":{d}}}", .{b.code});
+    }
     for (rep.backends) |b| {
         for (b.drift.missing) |m| {
             if (!first) try out.writeByte(',');
@@ -581,6 +592,8 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// `\` -> `\\`, tab -> `\t`, newline -> `\n`, CR -> `\r`. `kind` and the flag
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
+/// A package record is `package_missing` / `package_untracked` \t backend \t
+/// id, or `package_broken` \t backend \t exit code.
 fn emitPorcelain(
     out: *std.Io.Writer,
     units: []const mox.apply.drift.Unit,
@@ -596,6 +609,11 @@ fn emitPorcelain(
         try out.print("\t{s}\t", .{if (u.first_contact) "1" else "0"});
         try writePorcelainField(out, u.path);
         try out.writeByte('\n');
+    }
+    for (rep.broken) |b| {
+        try out.writeAll("package_broken\t");
+        try writePorcelainField(out, b.backend);
+        try out.print("\t{d}\n", .{b.code});
     }
     for (rep.backends) |b| {
         for (b.drift.missing) |m| {
@@ -747,7 +765,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked records.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, and each manager that is BROKEN, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -868,6 +886,26 @@ test "emitPorcelain / emitJson: packages ride the same records, keyed by state" 
         "{\"files\":[],\"packages\":[" ++
             "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"cask:ghostty\",\"name\":\"ghostty\"}," ++
             "{\"backend\":\"brew\",\"state\":\"untracked\",\"id\":\"htop\"}]}\n",
+        jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: a broken manager is a record of its own" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const broken = [_]mox.packages.report.Broken{.{ .backend = "brew", .argv0 = "brew", .code = 1 }};
+    const rep: mox.packages.report.Report = .{ .in_use = true, .broken = &broken };
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, rep);
+    try testing.expectEqualStrings("package_broken\tbrew\t1\n", pw.written());
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, rep);
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}]}\n",
         jw.written(),
     );
 }

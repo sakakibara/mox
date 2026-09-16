@@ -853,7 +853,10 @@ fn bootstrapBackends(
         // A probe that fails is reported once, by the report that follows;
         // nothing is bootstrapped on a manager mox could not ask about.
         const present = backend.available(ctx.alloc) catch continue;
-        if (present == .present) continue;
+        // Only a manager that is not there is installed; one that is there
+        // but cannot answer is a broken install to repair, which the report
+        // says by name, not something to install over.
+        if (present != .absent) continue;
         if (!backend.canBootstrap()) {
             try ctx.err.print(
                 "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
@@ -1055,7 +1058,7 @@ fn applyPackages(
                 bootstrap_failed += 1;
                 continue;
             };
-            if (present == .present) continue;
+            if (present != .absent) continue;
             if (!backend.canBootstrap()) {
                 try ctx.err.print(
                     "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",

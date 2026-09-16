@@ -734,7 +734,7 @@ test "status: an absent manager apply would bootstrap is not a clean machine" {
     try std.testing.expectEqual(@as(u8, 1), j.rc);
 }
 
-test "status: no usable manager is said, and a broken one is named rather than read as absent" {
+test "status: a broken manager is BROKEN drift in every format, and no usable manager is said" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -754,17 +754,26 @@ test "status: no usable manager is said, and a broken one is named rather than r
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
+    // A broken manager is not a clean machine: a row, and the exit code.
     const r = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      brew: `brew --version` exited 1; treated as absent\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  BROKEN    brew (brew --version exited 1)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no package manager is usable on this machine\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "treated as absent") == null);
     try std.testing.expect(!fake.called("brew list --full-name --installed-on-request"));
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 
-    // Machine formats keep stdout pure and put the notes on stderr.
+    // Machine formats carry it as a record, keep stdout pure, and put the
+    // notes on stderr.
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try expectPorcelain(p.out);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, p.out, "note") == null);
-    try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: brew: `brew --version` exited 1; treated as absent\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: no package manager is usable on this machine\n") != null);
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}") != null);
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
 }
 
 test "bootstrap: a manager already present is left alone" {
@@ -1469,7 +1478,10 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     defer herm.deinit();
     const io = herm.io;
     const h = try setup(a, io, &tmp, .{
-        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "200" } },
+        // Generous next to the sleep below: the bound must outlast a cold
+        // machine's first spawn of the plugin (`id` runs before the probe),
+        // and still end the hang long before it would finish on its own.
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "1000" } },
     });
 
     // Named `brew` so it shadows the built-in: the first backend probed is
@@ -1478,12 +1490,17 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     try writePlugin(io, h, a, "brew",
         \\#!/bin/sh
         \\case "${1:-}" in
-        \\available) exec sleep 3 ;;
+        \\available) exec sleep 20 ;;
+        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+        \\list) ;;
+        \\*) exit 64 ;;
         \\esac
         \\exit 0
         \\
     );
-    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
+    // A row names the backend, so a probe that cannot answer is the run's
+    // error: the rows it governs can be neither judged nor installed.
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
 
     const started = Io.Timestamp.now(io, .awake);
     const r = try h.run(&.{ "mox", "status" });
@@ -1492,88 +1509,9 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: available failed: PluginTimedOut") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     // Killed at the bound, not waited out.
-    try std.testing.expect(elapsed_ms < 3000);
+    try std.testing.expect(elapsed_ms < 10_000);
 }
 
-test "commit: a row recorded into the private layer is data there, never a managed file" {
-    const io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
-
-    // The repo opted in but declares no brew file; the private layer does,
-    // so that is where commit records the row.
-    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.repo, "data", "packages" }));
-    const private_pkgs = try std.fs.path.join(a, &.{ h.state, "private", "data", "packages" });
-    try Io.Dir.cwd().createDirPath(io, private_pkgs);
-    const private_manifest = try std.fs.path.join(a, &.{ private_pkgs, "local.toml" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = private_manifest, .data = "backend = \"brew\"\n" });
-
-    const fake = try brewWith(a, "htop\n", "", &.{});
-    useFake(fake);
-    defer mox.cli.app.package_runner_override = null;
-
-    const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
-    try std.testing.expect(std.mem.indexOf(u8, c.out, "(private layer)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, c.out, "1 recorded") != null);
-    const after = try Io.Dir.cwd().readFileAlloc(io, private_manifest, a, .limited(1 << 20));
-    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\n"));
-
-    // The private root's data/ is not source: nothing under ~/data is
-    // planned, and the manifest reads as clean.
-    const fake2 = try brewWith(a, "htop\n", "", &.{});
-    useFake(fake2);
-    const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, s.out, "data/packages") == null);
-    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING") == null);
-    try std.testing.expect(std.mem.indexOf(u8, s.out, "clean     brew") != null);
-    try std.testing.expectEqual(@as(u8, 0), s.rc);
-
-    const fake3 = try brewWith(a, "htop\n", "", &.{});
-    useFake(fake3);
-    const d = try h.run(&.{ "mox", "apply", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, d.out, "data/packages") == null);
-    try std.testing.expect(std.mem.indexOf(u8, d.out, "would write") == null);
-    try std.testing.expectEqual(@as(u8, 0), d.rc);
-
-    // A symlinked private manifest is read as a manifest, not refused as a
-    // symlink in the source tree.
-    if (@import("builtin").os.tag == .windows) return;
-    const elsewhere = try std.fs.path.join(a, &.{ h.state, "elsewhere.toml" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = elsewhere, .data = after });
-    try Io.Dir.cwd().deleteFile(io, private_manifest);
-    try Io.Dir.cwd().symLink(io, elsewhere, private_manifest, .{});
-    const fake4 = try brewWith(a, "htop\n", "", &.{});
-    useFake(fake4);
-    const l = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, l.err, "SymlinkInSource") == null);
-    try std.testing.expect(std.mem.indexOf(u8, l.out, "clean     brew") != null);
-    try std.testing.expectEqual(@as(u8, 0), l.rc);
-}
-test "status: a manifest with [[package]] is refused rather than read as an empty one" {
-    const io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
-
-    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[package]]\nname = \"ripgrep\"\n");
-
-    const fake = try a.create(mox.packages.exec.Fake);
-    fake.* = .{ .arena = a, .entries = &.{} };
-    useFake(fake);
-    defer mox.cli.app.package_runner_override = null;
-
-    const r = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: unknown top-level key \"package\"") != null);
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
-}
 test "commit: a malformed manifest is named, and no manager is asked anything" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1608,8 +1546,9 @@ fn noManagers(a: std.mem.Allocator) !*mox.packages.exec.Fake {
 }
 
 /// Every line of a porcelain report is one record -- a kind token and its
-/// tab-separated fields, four for a file and three for a package -- so a
-/// note or heading on stdout would break a consumer's split.
+/// tab-separated fields, four for a file and three for a package or a
+/// broken manager -- so a note or heading on stdout would break a
+/// consumer's split.
 fn expectPorcelain(out: []const u8) !void {
     try std.testing.expect(out.len > 0);
     try std.testing.expect(out[out.len - 1] == '\n');
@@ -1621,7 +1560,7 @@ fn expectPorcelain(out: []const u8) !void {
         while (fields.next()) |_| n += 1;
         const known = for ([_][]const u8{
             "whole_file",      "owned_key",         "symlink_target", "generated_set", "vanished",
-            "package_missing", "package_untracked",
+            "package_missing", "package_untracked", "package_broken",
         }) |k| {
             if (std.mem.eql(u8, k, kind)) break true;
         } else false;
@@ -2245,8 +2184,114 @@ test "status: a plugin's note reaches the terminal before the plugin runs" {
     var err_aw: Io.Writer.Allocating = .init(a);
     const rc = try runWith(h, &.{ "mox", "status" }, &out_w.interface, &err_aw.writer);
     try out_w.interface.flush();
-    try std.testing.expectEqual(@as(u8, 0), rc);
+    // The hermetic stubs are managers whose `--version` exits 1: BROKEN,
+    // which is drift, so the run exits 1 with the report intact.
+    try std.testing.expectEqual(@as(u8, 1), rc);
 
     const seen = try Io.Dir.cwd().readFileAlloc(io, copy_path, a, .limited(1 << 20));
     try std.testing.expect(std.mem.indexOf(u8, seen, "note      backend copier: scripts/backends/copier\n") != null);
+}
+
+test "commit: a row recorded into the private layer is data there, never a managed file" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The repo opted in but declares no brew file; the private layer does,
+    // so that is where commit records the row.
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.repo, "data", "packages" }));
+    const private_pkgs = try std.fs.path.join(a, &.{ h.state, "private", "data", "packages" });
+    try Io.Dir.cwd().createDirPath(io, private_pkgs);
+    const private_manifest = try std.fs.path.join(a, &.{ private_pkgs, "local.toml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = private_manifest, .data = "backend = \"brew\"\n" });
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "(private layer)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "1 recorded") != null);
+    const after = try Io.Dir.cwd().readFileAlloc(io, private_manifest, a, .limited(1 << 20));
+    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\n"));
+
+    // The private root's data/ is not source: nothing under ~/data is
+    // planned, and the manifest reads as clean.
+    const fake2 = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake2);
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "data/packages") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "clean     brew") != null);
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+
+    const fake3 = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake3);
+    const d = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "data/packages") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "would write") == null);
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+
+    // A symlinked private manifest is read as a manifest, not refused as a
+    // symlink in the source tree.
+    if (@import("builtin").os.tag == .windows) return;
+    const elsewhere = try std.fs.path.join(a, &.{ h.state, "elsewhere.toml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = elsewhere, .data = after });
+    try Io.Dir.cwd().deleteFile(io, private_manifest);
+    try Io.Dir.cwd().symLink(io, elsewhere, private_manifest, .{});
+    const fake4 = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake4);
+    const l = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, l.err, "SymlinkInSource") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.out, "clean     brew") != null);
+    try std.testing.expectEqual(@as(u8, 0), l.rc);
+}
+
+test "status: a plugin no row names failing its probe is a note, and the rest still reports" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+    try installPlugin(io, h, a);
+
+    // `available` exits 3: a broken plugin, which no manifest row names.
+    try writePlugin(io, h, a, "crashy", "#!/bin/sh\ncase \"${1:-}\" in\navailable) exit 3 ;;\nesac\nexit 64\n");
+    try writeManifest(io, h, a, "ports.toml", "backend = \"fakeports\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      crashy: available failed: PluginFailed; treated as absent\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "crashy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   fakeports ripgrep") != null);
+}
+
+test "status: a manifest with [[package]] is refused rather than read as an empty one" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[package]]\nname = \"ripgrep\"\n");
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: unknown top-level key \"package\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
