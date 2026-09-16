@@ -116,10 +116,10 @@ distinction is what lets one manifest carry every machine's packages.
 Usable is decided by a probe (`<manager> --version`; `apt-get` for
 apt). A manager that is not
 there is absent and its rows are inert. One that is there but exits nonzero
-is *broken*: it is treated as absent, and `status` says so under `packages:`
-(`note      brew: `brew --version` exited 1; treated as absent`) rather
-than reporting a clean machine. When no package manager at all is usable
-here, `status` notes `no package manager is usable on this machine`.
+is *broken*: `status` reports it as drift of its own (below) rather than as
+a clean machine, and its rows are neither judged nor installed. When no
+package manager at all is usable here, `status` notes
+`no package manager is usable on this machine`.
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
@@ -131,10 +131,14 @@ here, `status` notes `no package manager is usable on this machine`.
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
 | `winget` | `PackageIdentifier` | `winget export` | `source`, `scope` (`user`/`machine`), `override` |
 
+An export reports identifiers alone, so a package is one row: two rows for
+one identifier under different scopes are a duplicate, not two packages.
+
 An install through scoop adds a row's bucket only when `scoop bucket list`
-does not already have it, and winget installs with `--no-upgrade`, counting
-"already installed" as installed: both managers answer a second `apply`
-with an error otherwise. zypper's ledger records what a failed batch still
+does not already have it, and winget installs with `--no-upgrade` and then
+asks `winget list` whether a failed install is nonetheless there: both
+managers answer a second `apply` with an error otherwise, and winget's exit
+codes cannot be told apart once truncated to a byte. zypper's ledger records what a failed batch still
 landed, read back from `rpm`, so a package installed beside one that failed
 is not asked for again.
 
@@ -165,8 +169,11 @@ is reported missing, and is reinstalled rather than assumed to be there. A
 batch that failed part-way is read back the same way, so the rows that did
 land are recorded rather than retried forever.
 
-The cost is that a package installed by hand is invisible to mox on zypper
-and will never be offered for tracking. `mox status` prints that as a note
+Because what is installed is read back from `rpm`, a zypper row names a
+package: a `pattern:`, `patch:`, `product:`, `srcpackage:` or
+`application:` selector is refused, since it would install and then read as
+missing on every status. The cost is that a package installed by hand is
+invisible to mox on zypper and will never be offered for tracking. `mox status` prints that as a note
 under the backend rather than leaving it to be discovered.
 
 ## Drift
@@ -318,26 +325,29 @@ backend.
 - Every captured call is time-bounded like a setup script
   (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the
-  backend, not a hung `mox status`. The bound covers the whole call. A
-  captured call (`available`, `id`, `list`, `declare`, `limitation`) runs in
-  its own process group and the kill takes the group, so a helper it left
-  holding the pipe (`port ... | awk`) cannot outlive it; a streamed call
-  (`install`, `bootstrap`) stays in mox's group so it can use the terminal
-  and Ctrl-C reaches it. Every child leads its own process group, and a
-  streamed one is handed the terminal for its run the way a shell hands it
-  to a job, so `sudo` can prompt and Ctrl-C goes to the manager; a manager
-  killed that way ends mox the same way. Its bound is
+  backend, not a hung `mox status`. The bound covers the whole call, and
+  every child leads its own process group, so the kill takes whatever the
+  call left behind -- a helper holding the pipe (`port ... | awk`), a
+  manager behind a `sudo`. Interrupting mox takes them with it too: a
+  Ctrl-C during a query kills the query's group before mox dies of the
+  interrupt itself, so no manager is left holding a lock.
+- A streamed call (`install`, `bootstrap`) is handed the terminal for its
+  run, the way a shell hands it to a job. `sudo` can prompt, Ctrl-C goes to
+  the manager and ends mox with it, and Ctrl-Z suspends the job and hands
+  the terminal back, so the shell can `fg` it later. Its bound is
   `MOX_INSTALL_TIMEOUT_MS` (none by default: a manager may compile for an
-  hour), and at that bound its whole group is interrupted, then killed ten
-  seconds later, so a shell in front of the manager cannot absorb the
-  interrupt and leave the manager running (on Windows, which has no groups
-  or job control, the direct process is terminated at once).
-  A captured verb must never prompt: in its own group a read from the
-  terminal stops it until the bound. Windows has no process groups, so
-  there the kill always reaches the direct process only. The shipped
-  backends' own manager calls are bounded the same way, and a probe killed
-  at the bound is a named failure, never "manager absent"; a manager whose
-  `--version` exits nonzero is treated as absent and said so in a note.
+  hour), and at that bound its group is interrupted, then killed ten
+  seconds later. A captured verb must never prompt: it is not the
+  foreground job, so a read from the terminal stops it until the bound.
+  Windows has neither process groups nor job control, so there a bound
+  reaches the direct process alone and no terminal changes hands.
+- The shipped backends' own manager calls are bounded the same way, and a
+  probe killed at the bound is a named failure, never read as an absent
+  manager. A manager that answers its probe with anything but "here" or
+  "not here" -- a shipped one whose `--version` fails, a plugin whose
+  `available` neither succeeds nor exits 1 -- is BROKEN (above), unless no
+  row names it, in which case it is a note and its absence changes
+  nothing.
 - Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
   CRLF); an id that is empty, contains whitespace, or exceeds 256 bytes is an
   error naming the plugin. That catches a lost line separator across a large
@@ -347,10 +357,11 @@ backend.
 the backend and `available` says the manager is absent. mox fetches the
 installer and refuses to hand it over unless it hashes to the declared
 sha256; the plugin then runs the verified file however its manager needs.
-Progress goes to stderr; the one line on stdout, if any, is an absolute bin
-dir mox puts on PATH so the same run can use what was just installed. A
-second line, or a relative path, is bad output: progress text must not land
-on PATH.
+The verb is streamed, so its output is the terminal's and it may take as
+long as an install; the bin dir, if there is one, goes into the file the
+second argument names, as a single line holding an absolute path. A second
+line, or a relative path, is bad output: progress text must not land on
+PATH.
 
 ### Environment and which commands run a plugin
 
@@ -412,8 +423,10 @@ answered without the real thing:
 All three run nightly in CI, or on demand. Only the real manager can say
 whether a query's format string still yields one name per line, or whether
 an image without `sudo` installs at all; the hermetic tests cannot. A skip
-is never a pass: under CI a suite that skipped a case fails, because there
-the case is the reason the job exists. The brew checks compare the adapter
+is never a pass: under CI every one of the three fails when a case skipped,
+because there the case is the reason the job exists. The single exception is
+brew's tap check, which needs a formula installed from a third-party tap --
+something no CI runner should do -- so it skips there and says so. The brew checks compare the adapter
 against Homebrew's own install receipts rather than against the command the
 adapter runs, so an adapter asking the wrong question cannot agree with the
 oracle.

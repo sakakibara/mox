@@ -40,19 +40,19 @@ All notable changes to mox are documented here. The format follows
   `data/packages/` queries no manager and reports nothing; one with the
   directory and no file yet is in use and reports everything installed as
   untracked, ready for a first file to record it in.
-  Every captured manager call is bounded by the setup-script timeout: the bound
-  covers reading its output and waiting for it, a captured query runs in
-  its own process group and is killed with it, a streamed install stays in
-  mox's group so `sudo` and Ctrl-C work and only its direct process is
-  killed (Windows has no groups, so the direct process always), and a kill
-  is reported as a timeout naming the backend. Under `--json` and
-  `--porcelain`, plugin notes go to stderr and stdout stays machine-pure.
-  A streamed install is not bounded unless `MOX_INSTALL_TIMEOUT_MS` is set.
-  Every child leads its own process group; a streamed one is handed the
-  terminal for its run, so `sudo` can prompt and Ctrl-C reaches the manager
-  (and ends mox with it), and at the bound its whole group is interrupted
-  and then killed, so no manager outlives the run that started it (on
-  Windows the direct process is terminated at once). `--skip-scripts`
+  Every captured manager call is bounded by the setup-script timeout: the
+  bound covers reading its output and waiting for it, and a kill is reported
+  as a timeout naming the backend. A streamed install is not bounded unless
+  `MOX_INSTALL_TIMEOUT_MS` is set. Every child leads its own process group,
+  and a streamed one is handed the terminal for its run, so `sudo` can
+  prompt and Ctrl-C reaches the manager (and ends mox with it); at a bound
+  the child's whole group is interrupted and then killed, so no manager
+  outlives the run that started it (Windows has neither groups nor job
+  control, so there the direct process is terminated at once). Under
+  `--json` and `--porcelain`, plugin notes go to stderr and stdout stays
+  machine-pure. A Ctrl-C during a query kills the query's group before mox
+  dies of the interrupt; a Ctrl-Z during an install suspends the job and
+  hands the terminal back, so the shell can resume it. `--skip-scripts`
   and a path-scoped `apply`, `commit` or `status` reach no package. `status`
   reports the rows of an absent manager that has a bootstrap row as missing
   and notes that apply will bootstrap it; a manager whose `--version` fails
@@ -62,7 +62,10 @@ All notable changes to mox are documented here. The format follows
   `MOX_INSTALL_TIMEOUT_MS`. A manifest refuses an unknown top-level key, a
   blank or whitespace-bearing `name`, a byte order mark, a second
   `[[bootstrap]]` row for one backend, and two rows naming one package
-  under the same gate.
+  under the same gate, and a zypper row naming a pattern, patch, product,
+  source package or application rather than a package, which `rpm` could
+  never report back. `doctor` notes a file in the private layer's `data/`
+  that is not a data source, since nothing applies it.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;
@@ -89,7 +92,13 @@ All notable changes to mox are documented here. The format follows
 - The timeout watchdog for setup scripts and check hooks runs on its own
   thread. On a host with one CPU it could run inline, sleeping out the
   whole bound before the wait began and then reporting every script as
-  timed out.
+  timed out. Where no thread can be had for it, the wait is unbounded
+  rather than the child unreaped.
+- A private layer's `data/` is data, not source. It was walked as a source
+  tree, so a private data file was planned as a managed file at `~/data/...`
+  and a symlinked one failed the run.
+- `doctor`'s unknown-stage message named only `pre/` and `post/`, though
+  `check/` hooks and `backends/` plugins are run too.
 
 ## [0.11.0] - 2026-09-09
 

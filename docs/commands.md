@@ -381,7 +381,8 @@ machine. Plugin notes go to stderr as `mox status: note: ...` in those modes.
 `--drift` shows only the drift set (the report `mox apply` prints for the
 same tree, from the same classifier -- the two never disagree), dropping
 the clean/gated table and the probe/unbound context. The `packages:`
-section is drift, so `--drift` keeps it. `--json` and
+section is drift, so `--drift` keeps it -- its own clean rows excepted,
+which go the way the clean file table does. `--json` and
 `--porcelain` serialize that set for tooling instead of the human report.
 
 `--json` emits `{"files": [...], "packages": [...]}`. A file is
