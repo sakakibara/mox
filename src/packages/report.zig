@@ -41,7 +41,15 @@ pub const Broken = struct {
     backend: []const u8,
     /// What was asked of it, for the message.
     probe: []const u8,
+    /// The exit code where there was one. A call that did not get far enough
+    /// to have one -- killed at its bound, ended for want of a terminal --
+    /// carries `no_exit`, and `why` is what to read instead.
     code: u8,
+    /// Why it could not answer, in words. Empty where `code` says it.
+    why: []const u8 = "",
+
+    /// The code for a call that never reached an exit of its own.
+    pub const no_exit: u8 = 255;
 };
 
 pub const Report = struct {
@@ -97,6 +105,27 @@ pub fn gather(
 /// must be able to plan the rows of a manager it is not going to bootstrap
 /// for real.
 ///
+/// Record that a backend could not answer, and say so. One backend failing a
+/// verb is that backend's problem: the others were asked and answered, and
+/// throwing their results away would report a machine nobody looked at.
+fn noteBroken(
+    arena: std.mem.Allocator,
+    broken: *std.ArrayList(Broken),
+    diag: ?*Diag,
+    name: []const u8,
+    verb: []const u8,
+    e: anyerror,
+) !void {
+    const why = exec.errorText(e);
+    if (diag) |d| d.set("{s}: {s} failed: {s}", .{ name, verb, why });
+    try broken.append(arena, .{
+        .backend = name,
+        .probe = verb,
+        .code = Broken.no_exit,
+        .why = why,
+    });
+}
+
 /// A backend that is absent but has a `[[bootstrap]]` row whose gate holds
 /// is assumed the same way without being named: `apply` would bootstrap it
 /// and install every row, so a report that called the machine clean would
@@ -183,34 +212,43 @@ pub fn fromManifest(
         try out.append(arena, .{
             .backend = b.name,
             .drift = drift_mod.compute(arena, b, rows, &.{}, m) catch |e| {
-                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, exec.errorText(e) });
-                return e;
+                try noteBroken(arena, &broken, diag, b.name, "id", e);
+                continue;
             },
             .limitation = if (contains(assume_available, b.name)) null else "absent; apply will bootstrap it",
         });
     }
     for (usable.items) |b| {
         const installed = b.installedExplicit(arena) catch |e| {
-            if (diag) |d| d.set("{s}: list failed: {s}", .{ b.name, exec.errorText(e) });
-            return e;
+            try noteBroken(arena, &broken, diag, b.name, "list", e);
+            continue;
         };
+        var shape_ok = true;
         for (installed) |id| {
             if (backend_mod.idShapeOk(id)) continue;
             if (diag) |d| d.set(
                 "{s}: reported an id that is not one id ({d} bytes, or contains whitespace); its list output lost its shape",
                 .{ b.name, id.len },
             );
-            return error.BackendBadOutput;
+            try broken.append(arena, .{
+                .backend = b.name,
+                .probe = "list",
+                .code = Broken.no_exit,
+                .why = "its list output lost its shape",
+            });
+            shape_ok = false;
+            break;
         }
+        if (!shape_ok) continue;
         const limitation = b.limitationOf(arena) catch |e| {
-            if (diag) |d| d.set("{s}: limitation failed: {s}", .{ b.name, exec.errorText(e) });
-            return e;
+            try noteBroken(arena, &broken, diag, b.name, "limitation", e);
+            continue;
         };
         try out.append(arena, .{
             .backend = b.name,
             .drift = drift_mod.compute(arena, b, rows, installed, m) catch |e| {
-                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, exec.errorText(e) });
-                return e;
+                try noteBroken(arena, &broken, diag, b.name, "id", e);
+                continue;
             },
             .limitation = limitation,
         });

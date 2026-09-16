@@ -338,10 +338,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// `data/packages/` manifest -- a repo that has not opted in never queries a
 /// package manager and never reports every installed package as untracked.
 ///
-/// `broken` is a manifest that will not load or check, which is an error
-/// rather than drift and is reported as such -- in every format, since an
-/// empty report reads as a clean machine in exactly the formats that have no
-/// word for the refusal.
+/// `broken` is a package pass that produced nothing to report: a manifest
+/// that would not load or validate, or a plugin set that could not be
+/// discovered. Either is an error rather than drift, and is reported as such
+/// in every format, since an empty report reads as a clean machine in exactly
+/// the formats that have no word for the refusal. A manager that answered its
+/// probe and then failed a verb is NOT this: that is one backend's own BROKEN
+/// row, beside every other backend's results.
 const Packages = struct {
     report: mox.packages.report.Report = .{},
     broken: bool = false,
@@ -500,8 +503,14 @@ fn printPackages(
     }
     // A manifest that failed to load or validate has said why on stderr;
     // without a word here the empty section reads as a clean machine.
-    if (pkgs.broken) try ctx.out.writeAll("  ERROR     the manifest was refused; the reason is the mox status: packages: line\n");
-    for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
+    if (pkgs.broken) try ctx.out.writeAll("  ERROR     the package pass was refused; the reason is the mox status: packages: line\n");
+    for (rep.broken) |b| {
+        if (b.why.len == 0) {
+            try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
+        } else {
+            try ctx.out.print("  {s:<9} {s} ({s}: {s})\n", .{ "BROKEN", b.backend, b.probe, b.why });
+        }
+    }
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
@@ -583,7 +592,13 @@ fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
         first = false;
         try out.writeAll("{\"backend\":");
         try writeJsonString(out, b.backend);
-        try out.print(",\"state\":\"broken\",\"exit\":{d}}}", .{b.code});
+        try out.print(",\"state\":\"broken\",\"exit\":{d},\"probe\":", .{b.code});
+        try writeJsonString(out, b.probe);
+        if (b.why.len > 0) {
+            try out.writeAll(",\"why\":");
+            try writeJsonString(out, b.why);
+        }
+        try out.writeByte('}');
     }
     for (rep.backends) |b| {
         for (b.drift.missing) |m| {
@@ -657,7 +672,9 @@ fn emitPorcelain(
     for (rep.broken) |b| {
         try out.writeAll("package_broken\t");
         try writePorcelainField(out, b.backend);
-        try out.print("\t{d}\n", .{b.code});
+        try out.print("\t{d}\t", .{b.code});
+        try writePorcelainField(out, if (b.why.len > 0) b.why else b.probe);
+        try out.writeByte('\n');
     }
     for (rep.backends) |b| {
         for (b.drift.missing) |m| {
@@ -809,7 +826,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a manifest mox would not read at all, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A manifest mox refuses is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -944,12 +961,12 @@ test "emitPorcelain / emitJson: a broken manager is a record of its own" {
 
     var pw: std.Io.Writer.Allocating = .init(al);
     try emitPorcelain(&pw.writer, &.{}, .{ .report = rep });
-    try testing.expectEqualStrings("package_broken\tbrew\t1\n", pw.written());
+    try testing.expectEqualStrings("package_broken\tbrew\t1\tbrew --version\n", pw.written());
 
     var jw: std.Io.Writer.Allocating = .init(al);
     try emitJson(&jw.writer, &.{}, .{ .report = rep });
     try testing.expectEqualStrings(
-        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}]}\n",
+        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1,\"probe\":\"brew --version\"}]}\n",
         jw.written(),
     );
 }
@@ -983,7 +1000,7 @@ test "emitPorcelain / emitJson: a refused manifest is a record, never an empty p
     try emitJson(&both.writer, &.{}, .{ .broken = true, .report = .{ .in_use = true, .broken = &broken } });
     try testing.expectEqualStrings(
         "{\"files\":[],\"packages\":[{\"state\":\"refused\"}," ++
-            "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}]}\n",
+            "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1,\"probe\":\"brew --version\"}]}\n",
         both.written(),
     );
 }

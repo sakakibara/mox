@@ -738,6 +738,52 @@ test "status: an absent manager apply would bootstrap is not a clean machine" {
     try std.testing.expectEqual(@as(u8, 1), j.rc);
 }
 
+test "status: one backend failing a verb does not throw away what the others answered" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    // brew answers everything; a second manager answers its probe and then
+    // fails the query. One manager that cannot answer is that manager's
+    // problem: reporting it as a refusal of the whole pass would discard
+    // every row brew just computed and describe a machine nobody looked at.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg\n" });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
+    try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
+    try entries.append(a, .{ .argv = "apt-mark showmanual", .code = 7 });
+    try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
+    try entries.append(a, .{ .argv = "pacman --version", .code = 127 });
+    try entries.append(a, .{ .argv = "zypper --version", .code = 127 });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    // brew's own drift survives, and apt says what it could not do.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   brew ripgrep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "UNTRACKED brew agg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    apt (list: DistroQueryFailed)") != null);
+    // Not a refusal: the pass reached every backend and reported each one.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "was refused") == null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+
+    const pw = try h.run(&.{ "mox", "status", "--porcelain" });
+    try expectPorcelain(pw.out);
+    try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_missing\tbrew\tripgrep\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_untracked\tbrew\tagg\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_refused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_broken\tapt\t255\tDistroQueryFailed\n") != null);
+}
+
 test "status: a broken manager is BROKEN drift in every format, and no usable manager is said" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -770,13 +816,13 @@ test "status: a broken manager is BROKEN drift in every format, and no usable ma
     // notes on stderr.
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
     try expectPorcelain(p.out);
-    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t1\tbrew --version\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, p.out, "note") == null);
     try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: no package manager is usable on this machine\n") != null);
     try std.testing.expectEqual(@as(u8, 1), p.rc);
 
     const j = try h.run(&.{ "mox", "status", "--json" });
-    try std.testing.expect(std.mem.indexOf(u8, j.out, "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1,\"probe\":\"brew --version\"}") != null);
     try std.testing.expectEqual(@as(u8, 1), j.rc);
 }
 
@@ -1511,7 +1557,9 @@ test "plugin: a captured verb that stops for a terminal is ended with no bound a
     const r = try h.run(&.{ "mox", "status" });
     const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
 
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: list failed: stopped, and this run has no terminal that could resume it; killed") != null);
+    // The backend that could not answer is BROKEN, with the reason in the row
+    // rather than an error that throws away every other backend's result.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    brew (list: stopped, and this run has no terminal that could resume it; killed)") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     // Ended on the stop itself, with nothing armed that could have ended it
     // otherwise. A regression waits forever here rather than failing, which
@@ -1618,10 +1666,13 @@ fn expectPorcelain(out: []const u8) !void {
             if (std.mem.eql(u8, k, kind)) break true;
         } else false;
         try std.testing.expect(known);
-        // A refused manifest reached no backend and no package, so the kind is
-        // the whole record.
+        // A refused pass reached no backend and no package, so the kind is the
+        // whole record. A broken manager carries a fourth field saying what it
+        // could not answer, which the exit code alone cannot.
         const want: usize = if (std.mem.eql(u8, kind, "package_refused"))
             1
+        else if (std.mem.eql(u8, kind, "package_broken"))
+            4
         else if (std.mem.startsWith(u8, kind, "package_")) 3 else 4;
         try std.testing.expectEqual(want, n);
     }
@@ -2186,7 +2237,7 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
     const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
 
     errdefer std.debug.print("stderr was:\n{s}\n", .{r.err});
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "pipes: list failed: PluginTimedOut") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    pipes (list: PluginTimedOut)") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(elapsed_ms < 60_000);
 }
@@ -2398,7 +2449,7 @@ test "status: a manifest that will not load prints the packages section, not sil
     // repo that never opted in.
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; the reason is the mox status: packages: line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the package pass was refused; the reason is the mox status: packages: line\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
@@ -2406,7 +2457,7 @@ test "status: a manifest that will not load prints the packages section, not sil
     // `--drift` opens the section for it too: the refusal is the problem.
     const d = try h.run(&.{ "mox", "status", "--drift" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "\npackages:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d.out, "  ERROR     the manifest was refused; the reason is the mox status: packages: line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "  ERROR     the package pass was refused; the reason is the mox status: packages: line\n") != null);
     try std.testing.expectEqual(@as(u8, 1), d.rc);
 }
 
@@ -2435,7 +2486,7 @@ test "status: a manifest that will not validate prints the same ERROR row" {
 
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; the reason is the mox status: packages: line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the package pass was refused; the reason is the mox status: packages: line\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: row \"ripgrep\": no backend named \"brw\"") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
