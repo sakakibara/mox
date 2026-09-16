@@ -78,20 +78,33 @@ pub const PackageBackends = struct {
     apt: mox.packages.linux.Distro = undefined,
     dnf: mox.packages.linux.Distro = undefined,
     pacman: mox.packages.linux.Distro = undefined,
-    list: [4]mox.packages.backend.Backend = undefined,
+    scoop: mox.packages.windows.Scoop = undefined,
+    winget: mox.packages.windows.Winget = undefined,
+    list: [6]mox.packages.backend.Backend = undefined,
 
-    pub fn registry(self: *PackageBackends, io: std.Io) mox.packages.backend.Registry {
+    /// `scratch_dir` stages a manager's own export file (winget writes one
+    /// rather than answering on stdout); mox's state directory keeps it off
+    /// a shared temp and inside a directory mox already owns.
+    pub fn registry(
+        self: *PackageBackends,
+        io: std.Io,
+        scratch_dir: []const u8,
+    ) mox.packages.backend.Registry {
         self.proc = .{ .io = io };
         const runner = package_runner_override orelse self.proc.runner();
         self.brew = .{ .runner = runner };
         self.apt = .{ .manager = .apt, .runner = runner };
         self.dnf = .{ .manager = .dnf, .runner = runner };
         self.pacman = .{ .manager = .pacman, .runner = runner };
+        self.scoop = .{ .runner = runner };
+        self.winget = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
         self.list = .{
             self.brew.backend(),
             self.apt.backend(),
             self.dnf.backend(),
             self.pacman.backend(),
+            self.scoop.backend(),
+            self.winget.backend(),
         };
         return .{ .backends = &self.list };
     }

@@ -40,7 +40,13 @@ fn readManifest(io: Io, h: Harness, a: std.mem.Allocator, name: []const u8) ![]c
 /// on every runner these fixtures target. Registered adapters are probed
 /// whether or not a fixture cares about them.
 fn absentLinuxManagers(a: std.mem.Allocator, entries: *std.ArrayList(mox.packages.exec.Fake.Entry)) !void {
-    for ([_][]const u8{ "apt-get --version", "dnf --version", "pacman --version" }) |argv| {
+    for ([_][]const u8{
+        "apt-get --version",
+        "dnf --version",
+        "pacman --version",
+        "scoop --version",
+        "winget --version",
+    }) |argv| {
         try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
     }
 }
@@ -391,6 +397,8 @@ fn dnfWith(
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "apt-get --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "pacman --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "scoop --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "winget --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "dnf --version", .stdout = "dnf 4.18.0\n" });
     try entries.append(a, .{
         .argv = "dnf repoquery --userinstalled --qf %{name}\n",
@@ -495,5 +503,102 @@ test "linux: a row naming no registered backend is still a loud error" {
 
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.err, "no backend named \"dnff\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+/// A Windows machine: scoop and winget usable, the unix managers absent.
+fn windowsWith(
+    a: std.mem.Allocator,
+    scoop_export: []const u8,
+    extra: []const mox.packages.exec.Fake.Entry,
+) !*mox.packages.exec.Fake {
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    for ([_][]const u8{ "brew --version", "apt-get --version", "dnf --version", "pacman --version" }) |argv| {
+        try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
+    }
+    try entries.append(a, .{ .argv = "scoop --version", .stdout = "v0.5.2\n" });
+    try entries.append(a, .{ .argv = "scoop export", .stdout = scoop_export });
+    try entries.append(a, .{ .argv = "winget --version", .fail = error.FileNotFound });
+    for (extra) |e| try entries.append(a, e);
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    return fake;
+}
+
+test "windows: scoop drift and install run through the same core" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "windows.toml",
+        \\backend = "scoop"
+        \\
+        \\[[packages]]
+        \\name = "7zip"
+        \\
+        \\[[packages]]
+        \\name = "firefox"
+        \\bucket = "extras"
+        \\
+    );
+
+    const export_json =
+        \\{ "apps": [ { "Name": "7zip", "Source": "main" }, { "Name": "curl", "Source": "main" } ] }
+    ;
+    const fake = try windowsWith(a, export_json, &.{
+        .{ .argv = "scoop bucket add extras" },
+        .{ .argv = "scoop install extras/firefox" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const s = try h.run(&.{ "mox", "status" });
+    // `7zip` is declared and installed; `firefox` is declared only; `curl` is
+    // installed only.
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING   scoop firefox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "UNTRACKED scoop curl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "scoop 7zip") == null);
+
+    const fake2 = try windowsWith(a, export_json, &.{
+        .{ .argv = "scoop bucket add extras" },
+        .{ .argv = "scoop install extras/firefox" },
+    });
+    useFake(fake2);
+    _ = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(fake2.called("scoop bucket add extras"));
+    try std.testing.expect(fake2.called("scoop install extras/firefox"));
+}
+
+test "windows: a winget row is validated even where winget cannot run" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A shared manifest is read on every machine, so a bad winget row must
+    // fail on a mac too rather than waiting for a Windows box to find it.
+    try writeManifest(io, h, a, "windows.toml",
+        \\backend = "winget"
+        \\
+        \\[[packages]]
+        \\name = "Microsoft.PowerShell"
+        \\scope = "Machine"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not \"user\" or \"machine\"") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }

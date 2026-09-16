@@ -434,7 +434,7 @@ fn reconcilePackages(
     report_only: bool,
 ) !PackageReconcile {
     var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(ctx.io);
+    const registry = pkg_backends.registry(ctx.io, context.paths.state_dir);
 
     var diag: mox.packages.manifest.Diag = .{};
     const m = mox.packages.manifest.load(

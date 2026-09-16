@@ -78,14 +78,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: pwsh -NoProfile -File tests/installer_test.ps1
-      - name: installer parse (windows)
+      - name: powershell parse (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $e = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$e)
-          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
-          Write-Host "install.ps1 parses"
+          $bad = $false
+          foreach ($f in @('install.ps1') + (Get-ChildItem tests -Filter *.ps1 | ForEach-Object { $_.FullName })) {
+            $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$e)
+            if ($e) { Write-Host "$f :"; $e | ForEach-Object { $_.Message }; $bad = $true }
+            else { Write-Host "$f parses" }
+          }
+          if ($bad) { exit 1 }
 
   backends:
     # Nightly only. Runs the backend adapters against the REAL package
@@ -141,6 +145,36 @@ jobs:
           echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: adapters against real managers
         run: sh tests/linux_backends_test.sh
+
+  backends-windows:
+    # Nightly only. The scoop and winget adapters against the REAL managers
+    # (tests/windows_backends_test.ps1), read-only: it queries, it never
+    # installs.
+    #
+    # This is the ONLY place those adapters run at all. They were written from
+    # the dotfiles' PowerShell bootstrap without ever executing against scoop
+    # or winget, so until this job has been green their export-JSON parsing is
+    # unproven. A manager missing from the runner skips loudly rather than
+    # passing.
+    if: github.event_name == 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: pwsh
+        run: |
+          $url = "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $dst = Join-Path $env:USERPROFILE 'zig'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          Expand-Archive -LiteralPath zig.zip -DestinationPath $dst
+          "$dst\zig-x86_64-windows-$env:ZIG_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: build
+        run: zig build
+      - name: adapters against real managers
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/windows_backends_test.ps1
 
   fuzz:
     # Nightly only. Exercises the fuzz targets (tests/fuzz_test.zig) under a
