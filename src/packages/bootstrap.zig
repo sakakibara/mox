@@ -64,7 +64,12 @@ pub fn fetchVerified(
         // where the runner's capture bound stops an endless body on the
         // wire rather than after it has filled the disk.
         error.FileNotFound => blk: {
-            const got = runner.run(arena, &.{ "wget", "-qO-", "--", spec.url }) catch |e2| return e2;
+            const got = runner.runCapped(arena, &.{ "wget", "-qO-", "--", spec.url }, max_installer_bytes + 1) catch |e2| switch (e2) {
+                // The runner's capture bound is this cap: one body too big
+                // for it is the oversize installer, named as such.
+                error.StreamTooLong => return Error.BootstrapInstallerTooLarge,
+                else => return e2,
+            };
             if (got.ok) try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = got.stdout });
             break :blk got;
         },
@@ -97,10 +102,14 @@ const Downloader = struct {
     calls: usize = 0,
 
     fn runner(self: *Downloader) exec.Runner {
-        return .{ .ctx = self, .runFn = run, .streamFn = run };
+        return .{ .ctx = self, .runFn = run, .streamFn = stream };
     }
 
-    fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8) anyerror!exec.Result {
+    fn stream(ctx: *anyopaque, a: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!exec.Result {
+        return run(ctx, a, argv, stdin, exec.max_query_bytes);
+    }
+
+    fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8, _: usize) anyerror!exec.Result {
         const self: *Downloader = @ptrCast(@alignCast(ctx));
         self.calls += 1;
         const out = for (argv, 0..) |a, i| {

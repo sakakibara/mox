@@ -50,7 +50,7 @@ pub const default_install_timeout_ms: i64 = 0;
 pub const default_grace_ms: i64 = 10_000;
 
 /// `MOX_INSTALL_TIMEOUT_MS`, read the way the setup-script bound is: a
-/// present but unparseable value warns on each read and falls back to the default.
+/// present but unparseable value warns where it is read and falls back to the default.
 pub fn installTimeoutMs(env: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
     const m = env orelse return default_install_timeout_ms;
     const v = m.get("MOX_INSTALL_TIMEOUT_MS") orelse return default_install_timeout_ms;
@@ -152,19 +152,25 @@ pub const Result = struct {
 
 pub const Runner = struct {
     ctx: *anyopaque,
-    runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result,
+    runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize) anyerror!Result,
     streamFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result,
 
     /// Run and capture stdout: for a query whose output mox parses. stderr
     /// is the terminal's, so a manager's or plugin's own diagnostics reach
     /// the user as written.
     pub fn run(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
-        return self.runFn(self.ctx, arena, argv, null);
+        return self.runFn(self.ctx, arena, argv, null, max_query_bytes);
+    }
+
+    /// `run` for the one call whose legitimate answer is not a query's: an
+    /// installer fetched through a downloader with no size cap of its own.
+    pub fn runCapped(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, cap: usize) anyerror!Result {
+        return self.runFn(self.ctx, arena, argv, null, cap);
     }
 
     /// `run` with bytes on the child's stdin.
     pub fn runInput(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: []const u8) anyerror!Result {
-        return self.runFn(self.ctx, arena, argv, stdin);
+        return self.runFn(self.ctx, arena, argv, stdin, max_query_bytes);
     }
 
     /// Run with mox's own stdout and stderr: for work the user waits on. An
@@ -190,7 +196,7 @@ pub const Runner = struct {
     }
 
     fn call(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, streamed: bool) anyerror!Result {
-        return if (streamed) self.streamFn(self.ctx, arena, argv, stdin) else self.runFn(self.ctx, arena, argv, stdin);
+        return if (streamed) self.streamFn(self.ctx, arena, argv, stdin) else self.runFn(self.ctx, arena, argv, stdin, max_query_bytes);
     }
 };
 
@@ -239,12 +245,12 @@ pub fn runPowerShell(runner: Runner, arena: std.mem.Allocator, script_args: []co
     };
 }
 
-/// The most stdout a call may answer with. A manager's explicit-install
-/// list is kilobytes; the largest legitimate capture is an installer
-/// fetched through a downloader that has no size cap of its own, which the
-/// bootstrap refuses past 64 MiB. Beyond that is a child that never stops
-/// writing.
-pub const max_capture_bytes: usize = (64 << 20) + 1;
+/// The most stdout a query may answer with. A manager's explicit-install
+/// list is kilobytes; megabytes is a manager that never stops writing. The
+/// one call whose answer is legitimately larger -- an installer fetched
+/// through a downloader with no size cap of its own -- asks for its own cap
+/// through `runCapped`.
+pub const max_query_bytes: usize = 8 << 20;
 
 /// Runs the argv as a real child process. `env` is the environment mox itself
 /// reads through, so a manager invoked here sees the same HOME and PATH mox
@@ -275,14 +281,14 @@ pub const Process = struct {
         return .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(ms), .clock = .awake } };
     }
 
-    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
+    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawn(arena, argv, stdin, .pipe);
+        return self.spawn(arena, argv, stdin, .pipe, cap);
     }
 
     fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawn(arena, argv, stdin, .inherit);
+        return self.spawn(arena, argv, stdin, .inherit, max_query_bytes);
     }
 
     /// Spawn with stdin backed by a scratch file holding `stdin` (closed
@@ -317,7 +323,7 @@ pub const Process = struct {
     /// `SpawnSignals` has the whole rule.
     ///
     /// A streamed child holding the terminal is also the one the terminal
-    /// stops on Ctrl-Z, so that wait is `waitHoldingTerminal` rather than
+    /// stops on Ctrl-Z, so that wait is `waitStreamed` rather than
     /// `Child.wait`: a stop is answered the way a shell answers one.
     fn spawn(
         self: *Process,
@@ -325,6 +331,7 @@ pub const Process = struct {
         argv: []const []const u8,
         stdin: ?[]const u8,
         stdout_io: std.process.SpawnOptions.StdIo,
+        cap: usize,
     ) anyerror!Result {
         const io = self.io;
 
@@ -360,6 +367,10 @@ pub const Process = struct {
             .stderr = .inherit,
             .pgid = own_group,
         });
+        // A signal between the spawn and this line finds no group recorded
+        // and reaches the child not at all. Blocking the three across the
+        // spawn would close that window and leave the child holding the
+        // block, unable to be interrupted at all, which is worse.
         if (child.id) |id| signals.hold(id);
         const deadline = timeoutOf(if (captured) self.timeout_ms else self.install_timeout_ms).toDeadline(io);
         var tty: ?Terminal = null;
@@ -378,7 +389,7 @@ pub const Process = struct {
             // error, never an empty answer: an empty `list` would make every
             // row missing.
             while (mr.fill(4096, deadline)) |_| {
-                if (rd.buffered().len > max_capture_bytes) {
+                if (rd.buffered().len > cap) {
                     killGroup(io, &child);
                     return error.StreamTooLong;
                 }
@@ -430,6 +441,7 @@ pub const Process = struct {
             return e;
         };
         guard.reaped.store(true, .release);
+        signals.release();
         if (killer) |*k| _ = k.cancel(io);
         if (tty) |t| t.takeBack();
         // A shell reaped on the interrupt leaves whatever it backgrounded
@@ -479,6 +491,7 @@ const NoSpawnSignals = struct {
         return .{};
     }
     fn hold(_: NoSpawnSignals, _: std.process.Child.Id) void {}
+    fn release(_: NoSpawnSignals) void {}
     fn restore(_: NoSpawnSignals) void {}
 };
 
@@ -516,6 +529,13 @@ const PosixSpawnSignals = struct {
         group.store(id, .release);
     }
 
+    /// Let the group go the moment it is reaped, so a signal arriving in the
+    /// window before the dispositions are restored cannot reach a pid the
+    /// system has already handed to someone else.
+    fn release(_: PosixSpawnSignals) void {
+        group.store(0, .release);
+    }
+
     fn restore(self: PosixSpawnSignals) void {
         group.store(0, .release);
         std.posix.sigaction(.INT, &self.int, null);
@@ -529,10 +549,18 @@ const PosixSpawnSignals = struct {
         _ = std.c.raise(sig);
     }
 
-    /// The reach of `onSignal`, apart from the death that follows it.
+    /// The reach of `onSignal`, apart from the death that follows it. The
+    /// group is interrupted first, so a manager mid-transaction can unwind,
+    /// and killed a moment later, because mox is about to stop existing and
+    /// nothing would reap what it left. Both calls and the wait between
+    /// them are safe to make from a handler.
     fn killHeldGroup() void {
         const pgid = group.load(.acquire);
-        if (pgid > 0) _ = std.c.kill(-pgid, .KILL);
+        if (pgid <= 0) return;
+        _ = std.c.kill(-pgid, .INT);
+        var pause: std.posix.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&pause, null);
+        _ = std.c.kill(-pgid, .KILL);
     }
 };
 
@@ -614,15 +642,15 @@ fn dieOfInterrupt() noreturn {
 /// shell blocked on a mox that is not itself stopped, so not even `fg`
 /// reaches it. Every other call keeps the ordinary wait.
 fn waitFor(io: Io, child: *std.process.Child, tty: ?Terminal, streamed: bool) anyerror!std.process.Child.Term {
-    if (builtin.os.tag != .windows) {
-        if (streamed) {
-            if (tty) |t| return waitHoldingTerminal(child, t);
-        }
-    }
+    // Every streamed child is waited for by hand, terminal or not: a child
+    // that stops is invisible to a plain wait, which would then never
+    // return. With a terminal the stop is a job control the user asked for;
+    // without one it is a child that wanted a terminal mox cannot give it.
+    if (builtin.os.tag != .windows and streamed) return waitStreamed(child, tty);
     return child.wait(io);
 }
 
-/// Wait for a streamed child that holds the terminal, answering a stop the
+/// Wait for a streamed child, answering a stop the
 /// way a shell answers one: the terminal comes back, mox stops itself so the
 /// shell regains control of its own job, and once mox is continued the
 /// terminal and a SIGCONT go back to the child's group and the wait resumes.
@@ -632,7 +660,7 @@ fn waitFor(io: Io, child: *std.process.Child, tty: ?Terminal, streamed: bool) an
 /// The status is consumed here, so `child.id` is cleared and the term built
 /// from the status: the caller must not wait again. A streamed child has no
 /// pipe of mox's to close, so that is the whole of what reaping owed it.
-fn waitHoldingTerminal(child: *std.process.Child, tty: PosixTerminal) error{Unexpected}!std.process.Child.Term {
+fn waitStreamed(child: *std.process.Child, tty: ?Terminal) error{ Unexpected, StoppedWantingTerminal }!std.process.Child.Term {
     // The child leads its own group, so its pid is that group's id.
     const id = child.id.?;
     while (true) {
@@ -644,7 +672,17 @@ fn waitHoldingTerminal(child: *std.process.Child, tty: PosixTerminal) error{Unex
         }
         const status: u32 = @bitCast(raw);
         if (std.c.W.IFSTOPPED(status)) {
-            tty.takeBack();
+            const t = tty orelse {
+                // No terminal was handed over, so nothing here can answer
+                // what the child is waiting for: a `sudo` prompt in a run
+                // with no terminal of its own, most often `mox apply &`.
+                // Waiting on it would be waiting forever.
+                _ = killGroupOf(id);
+                _ = std.c.waitpid(id, &raw, 0);
+                child.id = null;
+                return error.StoppedWantingTerminal;
+            };
+            t.takeBack();
             stopSelf();
             _ = PosixTerminal.setForeground(std.posix.STDIN_FILENO, id);
             _ = signal(-id, .CONT);
@@ -816,7 +854,7 @@ pub const Fake = struct {
         return null;
     }
 
-    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
+    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, _: usize) anyerror!Result {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         return self.answer(arena, argv, stdin, false);
     }
@@ -1427,7 +1465,31 @@ test "termOfStatus: an exit, a signal, and a stop are each read from a raw wait 
     try testing.expect(stopped == .stopped and stopped.stopped == .TSTP);
 }
 
-test "waitHoldingTerminal: consumes the child's status itself and builds the term from it" {
+test "waitStreamed: a child that stops with no terminal to want is ended, not waited on" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // Stops itself the way a child reading the terminal from a background
+    // group does. Nothing can answer it, so the wait must not be endless.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "kill -STOP $$" },
+        .stdin = .close,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .pgid = own_group,
+    });
+    const started = Io.Clock.awake.now(io);
+    try testing.expectError(error.StoppedWantingTerminal, waitStreamed(&child, null));
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(elapsed_ms < 10_000);
+    try testing.expect(child.id == null);
+    _ = a;
+}
+
+test "waitStreamed: consumes the child's status itself and builds the term from it" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     // Nothing stops these children, so the held terminal is never touched.
@@ -1440,7 +1502,7 @@ test "waitHoldingTerminal: consumes the child's status itself and builds the ter
         .stderr = .ignore,
         .pgid = own_group,
     });
-    const exited = try waitHoldingTerminal(&quits, tty);
+    const exited = try waitStreamed(&quits, tty);
     try testing.expect(exited == .exited and exited.exited == 7);
     try testing.expect(quits.id == null);
 
@@ -1452,7 +1514,7 @@ test "waitHoldingTerminal: consumes the child's status itself and builds the ter
         .pgid = own_group,
     });
     try testing.expect(killGroupOf(killed.id.?));
-    const signalled = try waitHoldingTerminal(&killed, tty);
+    const signalled = try waitStreamed(&killed, tty);
     try testing.expect(signalled == .signal and signalled.signal == .KILL);
     try testing.expect(killed.id == null);
 }

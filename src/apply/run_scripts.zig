@@ -849,6 +849,13 @@ fn checkSpawnOpts(argv: []const []const u8, environ_map: *const EnvironMap, repo
 fn killGroupAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
     timeout.sleep(io) catch return;
     fired.* = true;
+    killGroupOf(id);
+}
+
+/// Kill a child's whole process group. The group outlives its reaped leader
+/// for as long as any member is in it, so this also reaches what the child
+/// left running after mox has reaped the child itself.
+pub fn killGroupOf(id: std.process.Child.Id) void {
     if (builtin.os.tag == .windows) {
         _ = TerminateProcess(id, 1);
     } else {
@@ -936,7 +943,7 @@ fn runOne(
             const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } };
             // No thread for the watchdog: an unbounded wait beats a
             // running child nobody reaps.
-            killer = io.concurrent(killAfter, .{ io, t, id, &timed_out }) catch |e| switch (e) {
+            killer = io.concurrent(killGroupAfter, .{ io, t, id, &timed_out }) catch |e| switch (e) {
                 error.ConcurrencyUnavailable => null,
             };
         } else {
@@ -948,6 +955,8 @@ fn runOne(
         }
     }
 
+    // `wait` clears the id as it reaps, so the group to sweep is remembered.
+    const child_group = child.id;
     const term = child.wait(io) catch |e| {
         if (killer) |*k| _ = k.cancel(io);
         stderr.print("mox apply: {s}: wait failed: {s}\n", .{ path, @errorName(e) }) catch {};
@@ -957,6 +966,9 @@ fn runOne(
     if (killer) |*k| _ = k.cancel(io);
 
     if (timed_out) {
+        // The group outlives the reaped leader for as long as a member
+        // does; whatever the script left running goes with it.
+        if (child_group) |id| killGroupOf(id);
         result.failed += 1;
         stderr.print("mox apply: {s}: timed out after {d}ms, killed\n", .{ path, timeout_ms }) catch {};
         return;
@@ -1048,7 +1060,18 @@ fn spawnScript(arena: std.mem.Allocator, io: Io, path: []const u8, environ_map: 
 }
 
 fn spawnOpts(argv: []const []const u8, environ_map: ?*const EnvironMap) std.process.SpawnOptions {
-    return .{ .argv = argv, .environ_map = environ_map, .stdin = .close, .stdout = .inherit, .stderr = .inherit };
+    var opts: std.process.SpawnOptions = .{
+        .argv = argv,
+        .environ_map = environ_map,
+        .stdin = .close,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    };
+    // Its own group, so the bound reaches what the script started and not
+    // the script alone: an orphan that inherited mox's stdout keeps a
+    // `mox apply | ...` pipeline open long after the run is over.
+    if (builtin.os.tag != .windows) opts.pgid = 0;
+    return opts;
 }
 
 /// PowerShell invocation argv for `path`: `<exe> -NoProfile -File <path>`.
