@@ -113,7 +113,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try privateDataStrays(ctx.alloc, ctx.io, context.paths.private_dir)) |strays| {
         for (strays) |stray| {
             advisories += 1;
-            try ctx.out.print("  private-data {s} (the private layer's data/ holds data sources; this is not one, and nothing applies it)\n", .{stray});
+            try ctx.out.print("  private-data {f} (the private layer's data/ holds data sources; this is not one, and nothing applies it)\n", .{display.of(stray, context.paths.home)});
         }
     }
 
@@ -252,11 +252,23 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return if (problems > 0 or advisories > 0 or skipped > 0) 1 else 0;
 }
 
-/// Source files that compose to null under every configuration in their own
-/// axis space -- gated off on every machine, so they never materialize. Null
-/// means machine state or the source tree could not be read at all (the
-/// check could not run); the caller must not read that the same as "ran and
-/// found nothing". Arena-owned display paths.
+/// Whether a directory under the private `data/` holds a data source at any
+/// depth: one `*.toml` is enough to make it data rather than a stray.
+fn holdsData(io: Io, dir_path: []const u8) !bool {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (junk.isJunk(entry.name)) continue;
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".toml")) return true;
+        if (entry.kind != .directory) continue;
+        const nested = try std.fs.path.join(std.heap.page_allocator, &.{ dir_path, entry.name });
+        defer std.heap.page_allocator.free(nested);
+        if (try holdsData(io, nested)) return true;
+    }
+    return false;
+}
+
 /// Entries of the private layer's `data/` that are not data sources. That
 /// directory is read for `[[rows]]` files alone, and is deliberately not
 /// walked as a source tree, so anything else there is applied by nothing.
@@ -271,15 +283,28 @@ fn privateDataStrays(arena: std.mem.Allocator, io: Io, private_dir: []const u8) 
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (junk.isJunk(entry.name)) continue;
-        // `data/packages/` is the package manifest's own directory.
-        if (entry.kind == .directory and std.mem.eql(u8, entry.name, "packages")) continue;
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".toml")) continue;
-        try out.append(arena, try std.fs.path.join(arena, &.{ data_dir, entry.name }));
+        const path = try std.fs.path.join(arena, &.{ data_dir, entry.name });
+        if (entry.kind == .file) {
+            if (std.mem.endsWith(u8, entry.name, ".toml")) continue;
+            try out.append(arena, path);
+            continue;
+        }
+        if (entry.kind != .directory) continue;
+        // A directory is a data source's home when it holds one: the
+        // package manifest's `packages/`, or any nested `*.toml` that
+        // `mox data <dir>/<file>.toml` can name.
+        if (try holdsData(io, path)) continue;
+        try out.append(arena, path);
     }
     std.mem.sort([]const u8, out.items, {}, lessString);
     return out.items;
 }
 
+/// Source files that compose to null under every configuration in their own
+/// axis space -- gated off on every machine, so they never materialize. Null
+/// means machine state or the source tree could not be read at all (the
+/// check could not run); the caller must not read that the same as "ran and
+/// found nothing". Arena-owned display paths.
 fn neverMaterializing(
     arena: std.mem.Allocator,
     io: Io,

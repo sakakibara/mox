@@ -39,10 +39,13 @@ pub fn all(
 ) !void {
     for (m.packages) |row| {
         const b = registry.find(row.backend) orelse {
-            if (diag) |d| d.set(
-                "{s}: row \"{s}\": no backend named \"{s}\"",
-                .{ row.label, row.name, row.backend },
-            );
+            if (diag) |d| {
+                const at = where(row.label, row.private);
+                d.set(
+                    "{s}{s}: row \"{s}\": no backend named \"{s}\"",
+                    .{ at[0], at[1], row.name, row.backend },
+                );
+            }
             return Error.UnknownBackend;
         };
         try b.validate(row, diag);
@@ -50,10 +53,13 @@ pub fn all(
 
     for (m.blacklist) |bl| {
         const b = registry.find(bl.backend) orelse {
-            if (diag) |d| d.set(
-                "{s}: blacklist row \"{s}\": no backend named \"{s}\"",
-                .{ bl.label, bl.name, bl.backend },
-            );
+            if (diag) |d| {
+                const at = where(bl.label, bl.private);
+                d.set(
+                    "{s}{s}: blacklist row \"{s}\": no backend named \"{s}\"",
+                    .{ at[0], at[1], bl.name, bl.backend },
+                );
+            }
             return Error.UnknownBackend;
         };
         try b.validate(bl.asRow(), diag);
