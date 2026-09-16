@@ -429,10 +429,12 @@ fn reconcilePackages(
     ctx: *app.Ctx,
     context: app.Context,
     bindings: *const mox.dsl.resolver.Resolver,
+    m_state: mox.machine.state.MachineState,
     ask_mode: prompt.Mode,
     input: *Io.Reader,
     report_only: bool,
 ) !PackageReconcile {
+    const env = try app.packageEnv(ctx, context, m_state);
     var diag: mox.packages.manifest.Diag = .{};
     var pkg_backends: app.PackageBackends = .{};
     const registry = pkg_backends.registry(
@@ -440,7 +442,7 @@ fn reconcilePackages(
         ctx.io,
         context.paths.state_dir,
         context.paths.home,
-        null,
+        env,
         context.paths.repo_dir,
         &diag,
     ) catch |e| switch (e) {
@@ -730,7 +732,7 @@ pub fn commitImpl(
     // commit: `mox commit <path>` names files, and reaching past them to the
     // package manifest would be scope the user did not ask for.
     const pkgs = if (paths.len == 0)
-        try reconcilePackages(ctx, context, &axis_resolver, ask_mode, input, report_mode)
+        try reconcilePackages(ctx, context, &axis_resolver, m_state, ask_mode, input, report_mode)
     else
         PackageReconcile{};
 

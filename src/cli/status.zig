@@ -288,7 +288,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // machine output is stable across runs, OSes, and pipes.
     mox.apply.drift.sortByPath(units.items);
 
-    const pkgs = try gatherPackages(ctx, context, &bindings);
+    const pkgs = try gatherPackages(ctx, context, &bindings, m_state);
     problems += pkgs.problems();
 
     if (machine) {
@@ -342,7 +342,9 @@ fn gatherPackages(
     ctx: *app.Ctx,
     context: app.Context,
     bindings: *const mox.dsl.resolver.Resolver,
+    m_state: mox.machine.state.MachineState,
 ) !Packages {
+    const env = try app.packageEnv(ctx, context, m_state);
     var diag: mox.packages.manifest.Diag = .{};
     var pkg_backends: app.PackageBackends = .{};
     const registry = pkg_backends.registry(
@@ -350,7 +352,7 @@ fn gatherPackages(
         ctx.io,
         context.paths.state_dir,
         context.paths.home,
-        null,
+        env,
         context.paths.repo_dir,
         &diag,
     ) catch |e| switch (e) {

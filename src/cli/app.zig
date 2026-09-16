@@ -148,6 +148,10 @@ pub const PackageBackends = struct {
             self.plugins[n] = .{ .name = f.name, .argv0 = f.argv0, .runner = r };
             const pl = &self.plugins[n];
             n += 1;
+            // Every plugin that will run is named by path before it runs:
+            // `status` and `commit` executing repo code is new, and what
+            // executes must be visible rather than inferred.
+            try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}", .{ f.name, f.path }));
             try pl.queryLimitation(arena);
 
             var replaced = false;
@@ -379,4 +383,31 @@ test "MoxCli wiring: a needs_context command loads Context via loadContext" {
     try std.testing.expectEqual(@as(u8, 0), code);
     try std.testing.expect(std.mem.startsWith(u8, out_w.buffered(), "state_dir="));
     try std.testing.expect(out_w.buffered().len > "state_dir=\n".len);
+}
+
+/// The environment every package backend and plugin runs under, for a
+/// command that has captured the machine: the setup-script environment
+/// (MOX_REPO, MOX_STATE_DIR, MOX_HOME, a PATH, every fact as MOX_FACT_*),
+/// built without refreshing the state bin dir -- that is apply's job, and a
+/// read-only command must not rewrite state on the way to a report.
+pub fn packageEnv(
+    ctx: *Ctx,
+    context: Context,
+    m_state: mox.machine.state.MachineState,
+) !*std.process.Environ.Map {
+    const facts = try ctx.alloc.alloc(mox.apply.run_scripts.Fact, m_state.custom_facts.len);
+    for (m_state.custom_facts, 0..) |f, i| facts[i] = .{ .name = f.name, .value = f.value };
+    const built = try mox.apply.run_scripts.buildScriptEnv(
+        ctx.alloc,
+        ctx.io,
+        context.env,
+        context.paths.repo_dir,
+        context.paths.state_dir,
+        context.paths.home,
+        facts,
+        false,
+    );
+    const map = try ctx.alloc.create(std.process.Environ.Map);
+    map.* = built.map;
+    return map;
 }

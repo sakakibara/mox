@@ -226,10 +226,12 @@ puts on PATH so the same run can use what was just installed.
 
 ### Environment and which commands run a plugin
 
-A plugin runs as you, at the trust `scripts/pre` already has, with
-`MOX_REPO`, `MOX_STATE_DIR`, `MOX_HOME`, `PATH` and the `MOX_FACT_*` values
-under `apply`; `status` and `commit` run it under the process environment.
-This is a capability `status` and `commit` did not have before backends:
+A plugin runs as you, at the trust `scripts/pre` already has, under the
+same environment a setup script gets: `MOX_REPO`, `MOX_STATE_DIR`,
+`MOX_HOME`, `PATH` and every fact as `MOX_FACT_*`. That holds for `status`
+and `commit` as much as for `apply`; only `apply` refreshes the state bin dir
+on the way. This is a capability `status` and `commit` did not have before
+backends:
 `status` runs `available`, `list`, `id` and `limitation`; `commit` adds
 `declare`; `apply` adds `install` and `bootstrap`; `--dry-run` runs the
 read-only set. `status` lists every discovered plugin by path before it runs
