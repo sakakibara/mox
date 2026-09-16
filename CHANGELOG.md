@@ -6,12 +6,6 @@ All notable changes to mox are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-- The timeout watchdog for setup scripts and check hooks runs on its own
-  thread. On a host with one CPU it could run inline, sleeping out the
-  whole bound before the wait began and then reporting every script as
-  timed out.
-
 ### Added
 - Packages. A `data/packages/*.toml` manifest of `[[packages]]` rows (core
   keys `name`, `backend`, `when`; every other key belongs to the backend,
@@ -35,7 +29,7 @@ All notable changes to mox are documented here. The format follows
   Ids are opaque, calls are time-bounded, and an id that is empty, contains
   whitespace, or exceeds 256 bytes is refused as a lost line separator.
 - `status` reports each backend's MISSING and UNTRACKED packages, `apply`
-  installs the missing (after the pre stage and before its re-capture, and
+  installs the missing (after the pre stage and its re-capture, and
   first installing a declared manager that is absent from its verified
   installer, then using it in the same run -- brew and scoop by the path it
   landed at, a plugin by the bin dir it reports; `--dry-run` plans as though
@@ -46,7 +40,7 @@ All notable changes to mox are documented here. The format follows
   `data/packages/` queries no manager and reports nothing; one with the
   directory and no file yet is in use and reports everything installed as
   untracked, ready for a first file to record it in.
-  Every manager call is bounded by the setup-script timeout: the bound
+  Every captured manager call is bounded by the setup-script timeout: the bound
   covers reading its output and waiting for it, a captured query runs in
   its own process group and is killed with it, a streamed install stays in
   mox's group so `sudo` and Ctrl-C work and only its direct process is
@@ -54,20 +48,20 @@ All notable changes to mox are documented here. The format follows
   is reported as a timeout naming the backend. Under `--json` and
   `--porcelain`, plugin notes go to stderr and stdout stays machine-pure.
   A streamed install is not bounded unless `MOX_INSTALL_TIMEOUT_MS` is set;
-  at that bound the manager gets SIGINT before SIGKILL. `--skip-scripts`
+  at that bound the manager gets SIGINT before SIGKILL (on Windows it is
+  terminated at once). `--skip-scripts`
   and a path-scoped `apply`, `commit` or `status` reach no package. `status`
   reports the rows of an absent manager that has a bootstrap row as missing
   and notes that apply will bootstrap it; a manager whose `--version` fails
   is treated as absent and noted. `mox --help` names `MOX_SCRIPT_TIMEOUT_MS`
-  and `MOX_INSTALL_TIMEOUT_MS`; a bad value warns as `mox: ...` rather than
-  `mox apply: ...`, since every command reads it. Diagnostics hold 1 KiB
-  instead of 200 bytes and end a message that still does not fit with `...`
-  instead of cutting it silently.
+  and `MOX_INSTALL_TIMEOUT_MS`.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;
-  `tests/windows_backends_test.ps1` probes scoop and winget read-only. All
-  three run nightly.
+  `tests/windows_backends_test.ps1` probes scoop and winget read-only where
+  present and, on a runner without scoop, bootstraps it from the pinned
+  installer and installs one app; the Linux suite also bootstraps Homebrew
+  in a Debian container. All three run nightly, or on demand.
 
 ### Changed
 - BREAKING: `status --json` emits `{"files":[...],"packages":[...]}` rather
@@ -78,6 +72,16 @@ All notable changes to mox are documented here. The format follows
   plugin's `available`, `list`, `id`, `limitation` and (for `commit`)
   `declare`; each plugin is named by path in the report first. `doctor` no
   longer reports `scripts/backends/` as an unknown stage.
+- A bad `MOX_SCRIPT_TIMEOUT_MS` value warns as `mox: ...` rather than
+  `mox apply: ...`, since every command now reads it. Diagnostics hold
+  1 KiB instead of 200 bytes and end a message that still does not fit with
+  `...` instead of cutting it silently.
+
+### Fixed
+- The timeout watchdog for setup scripts and check hooks runs on its own
+  thread. On a host with one CPU it could run inline, sleeping out the
+  whole bound before the wait began and then reporting every script as
+  timed out.
 
 ## [0.11.0] - 2026-09-09
 

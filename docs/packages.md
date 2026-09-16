@@ -87,8 +87,11 @@ absent: the file is fetched, refused unless it hashes to the declared
 sha256, handed to the backend, and deleted afterwards whether the bootstrap
 succeeded or not. brew and scoop know how to run their installers and where
 the result lands, so the same apply installs packages through the manager
-it just put in place; a plugin runs `bootstrap <path>` itself and reports
-the directory to put on PATH, which must be one absolute existing directory.
+it just put in place; a plugin runs `bootstrap <path> <out>` itself, streamed
+like an install, and writes the directory to put on PATH -- one absolute
+existing directory -- as one line into `<out>`, if there is one. If a
+bootstrap fails, the rows of that manager are not attempted and the run
+fails.
 An installer over 64 MiB is refused. `--dry-run` fetches nothing and plans
 as though the bootstrap had happened, so what it lists is what the real run
 would install, and `status` reports the rows of an absent manager that has
@@ -102,12 +105,12 @@ this machine can run it. A `dnf` row on a mac names a registered adapter that
 is inert here; a row naming `dnff` is a typo and is an error. That
 distinction is what lets one manifest carry every machine's packages.
 
-Usable is decided by a probe (`<manager> --version`). A manager that is not
+Usable is decided by a probe (`<manager> --version`; `apt-get` for apt). A manager that is not
 there is absent and its rows are inert. One that is there but exits nonzero
 is *broken*: it is treated as absent, and `status` says so under `packages:`
 (`note      brew: `brew --version` exited 1; treated as absent`) rather
-than reporting a clean machine. When no declared manager is usable at all,
-`status` notes `no declared manager is usable on this machine`.
+than reporting a clean machine. When no package manager at all is usable
+here, `status` notes `no package manager is usable on this machine`.
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
@@ -260,7 +263,7 @@ built-in keeps its place, so the rows it validates stay validated.
 | `list` | -- | one id per line: what was explicitly installed | 64: not implemented; other nonzero: failed |
 | `install` | rows, one per line | streamed to the terminal | 64: not implemented; other nonzero: failed |
 | `declare <id>` | -- | a TOML row body: `name = "..."` plus adapter fields | 64: not implemented; other nonzero: failed |
-| `bootstrap <path>` | -- | optionally one line: an absolute path to a directory to put on PATH; a second line, or a relative path, is bad output | 64: not implemented; other nonzero: failed |
+| `bootstrap <path> <out>` | -- | streamed to the terminal; the bin dir to put on PATH, if any, is written to the file `<out>` as one line, an absolute path (a second line, or a relative path, is bad output) | 64: not implemented; other nonzero: failed |
 | `limitation` | -- | one line on what it cannot see | 64: none; other nonzero: failed |
 
 Rows arrive as TOML inline tables carrying `name` and the row's adapter
@@ -290,7 +293,7 @@ backend.
   one meaning.
 - **Exit 64 means "this verb is not implemented"**, reported by plugin and
   verb where it was needed. Nothing is substituted for a missing verb.
-- Every call is time-bounded like a setup script (`MOX_SCRIPT_TIMEOUT_MS`);
+- Every captured call is time-bounded like a setup script (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the
   backend, not a hung `mox status`. The bound covers the whole call. A
   captured call (`available`, `id`, `list`, `declare`, `limitation`) runs in
@@ -298,7 +301,8 @@ backend.
   holding the pipe (`port ... | awk`) cannot outlive it; a streamed call
   (`install`, `bootstrap`) stays in mox's group so it can use the terminal
   and Ctrl-C reaches it; its bound is `MOX_INSTALL_TIMEOUT_MS` (none by
-  default), and at that bound the direct process gets SIGINT, then SIGKILL.
+  default), and at that bound the direct process gets SIGINT, then SIGKILL
+  (on Windows it is terminated at once).
   A captured verb must never prompt: in its own group a read from the
   terminal stops it until the bound. Windows has no process groups, so
   there the kill always reaches the direct process only. The shipped
@@ -373,8 +377,8 @@ answered without the real thing:
 | Gate | Covers |
 |---|---|
 | `zig build test-backends` | brew, read-only, differential against brew's own output |
-| `sh tests/linux_backends_test.sh` | apt, dnf, zypper, pacman -- a full install round trip per distro, in containers |
-| `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget, read-only |
+| `sh tests/linux_backends_test.sh` | apt, dnf, zypper, pacman -- a full install round trip per distro, in containers; and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply |
+| `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget: read-only where present; on a runner without scoop, a bootstrap from the pinned installer plus one install |
 
 All three run nightly in CI. Only the real manager can say whether a query's
 format string still yields one name per line, or whether an image without

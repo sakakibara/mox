@@ -146,8 +146,9 @@ jobs:
 
   backends-windows:
     # Nightly, or dispatched by hand. The scoop and winget adapters against the REAL managers
-    # (tests/windows_backends_test.ps1), read-only: it queries, it never
-    # installs.
+    # (tests/windows_backends_test.ps1): read-only where a manager is present,
+    # and on a runner without scoop the fresh-machine case, bootstrapping it
+    # from the pinned installer and installing one app through it.
     #
     # This is the only place those adapters meet the real managers. A manager
     # missing from the runner skips loudly rather than passing.

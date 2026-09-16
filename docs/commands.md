@@ -172,10 +172,12 @@ There is no global refusal for an unresolved fact -- that is a
 per-script concern (below), not this pass's to fail wholesale.
 
 A repo carrying a `data/packages/` manifest also installs what that
-manifest declares and the machine lacks, after the pre stage and before
-its re-capture, so a package installed here is a tool the re-capture sees.
-A manager the manifest declares a `[[bootstrap]]` row for is installed
-first when absent, from its verified installer, and used by this same run.
+manifest declares and the machine lacks, after the pre stage and its
+re-capture; the machine is re-read again after any install or bootstrap,
+so a package installed here is a tool the post scripts see. A manager the
+manifest declares a `[[bootstrap]]` row for is installed first when absent,
+from its verified installer, and used by this same run; if that bootstrap
+fails, its rows are not attempted.
 apt, dnf, pacman, zypper and plugins get their whole set in one invocation;
 brew, scoop and winget install row by row, and a failed row leaves the rest
 to proceed. Any failure is an error class (rc 2), and a failed batch or a
