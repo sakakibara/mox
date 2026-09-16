@@ -66,15 +66,33 @@ pub const Row = struct {
     }
 };
 
-/// Installed but never offered for tracking. Separate from `Row` because
-/// desired-state and never-offer are different sets: a blacklist row takes
-/// `name` and `backend` and nothing else.
+/// Installed but never offered for tracking. A separate array from
+/// `[[packages]]` because desired-state and never-offer are different sets,
+/// but the same identity: an entry carries whichever adapter fields it takes
+/// to name one package (a brew cask and the formula of the same name are not
+/// the same entry). A gate is refused -- a blacklist holds regardless of
+/// which machine is asking, so a `when` here would read as meaningful and do
+/// nothing.
 pub const BlacklistRow = struct {
     name: []const u8,
     backend: []const u8,
+    fields: []const Pair = &.{},
     origin: []const u8,
     label: []const u8,
     index: usize,
+
+    /// The same package, shaped for the adapter's `idOf`.
+    pub fn asRow(self: BlacklistRow) Row {
+        return .{
+            .name = self.name,
+            .backend = self.backend,
+            .when = null,
+            .fields = self.fields,
+            .origin = self.origin,
+            .label = self.label,
+            .index = self.index,
+        };
+    }
 };
 
 pub const Manifest = struct {
@@ -291,7 +309,6 @@ fn parseBlacklistRow(
     index: usize,
     diag: ?*Diag,
 ) !BlacklistRow {
-    _ = arena;
     const name = blk: {
         const v = t.get("name") orelse {
             if (diag) |d| d.set("{s}: blacklist row {d} has no \"name\"", .{ f.label, index });
@@ -321,18 +338,30 @@ fn parseBlacklistRow(
         };
     };
 
-    for (t.keys()) |k| {
+    var fields: std.ArrayList(Pair) = .empty;
+    for (t.keys(), t.values()) |k, v| {
         if (std.mem.eql(u8, k, "name") or std.mem.eql(u8, k, "backend")) continue;
-        if (diag) |d| d.set(
-            "{s}: blacklist row \"{s}\": unknown key \"{s}\" (a blacklist row takes \"name\" and \"backend\")",
-            .{ f.label, name, k },
-        );
-        return Error.MalformedPackageRow;
+        if (std.mem.eql(u8, k, "when")) {
+            if (diag) |d| d.set(
+                "{s}: blacklist row \"{s}\": a blacklist row takes no \"when\"",
+                .{ f.label, name },
+            );
+            return Error.MalformedPackageRow;
+        }
+        const fv = try fieldOf(arena, v) orelse {
+            if (diag) |d| d.set(
+                "{s}: blacklist row \"{s}\": \"{s}\" must be a string, integer, boolean, or array of strings",
+                .{ f.label, name, k },
+            );
+            return Error.MalformedPackageRow;
+        };
+        try fields.append(arena, .{ .key = k, .value = fv });
     }
 
     return .{
         .name = name,
         .backend = backend,
+        .fields = try fields.toOwnedSlice(arena),
         .origin = f.path,
         .label = f.label,
         .index = index,
@@ -652,7 +681,7 @@ test "load: blacklist rows carry name and backend only" {
     try testing.expectEqualStrings("brew", m.blacklist[0].backend);
 }
 
-test "load: an extra key on a blacklist row is an error" {
+test "load: a gate on a blacklist row is an error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -662,7 +691,7 @@ test "load: an extra key on a blacklist row is an error" {
         \\
         \\[[blacklist]]
         \\name = "usage"
-        \\kind = "cask"
+        \\when = "profile=personal"
         \\
     });
 
@@ -673,7 +702,7 @@ test "load: an extra key on a blacklist row is an error" {
 
     var d: Diag = .{};
     try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
-    try testing.expect(std.mem.indexOf(u8, d.capture().?, "unknown key \"kind\"") != null);
+    try testing.expect(std.mem.indexOf(u8, d.capture().?, "no \"when\"") != null);
 }
 
 test "load: a missing packages directory yields an empty manifest" {

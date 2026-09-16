@@ -57,7 +57,7 @@ pub fn compute(
     }
     for (m.blacklist) |bl| {
         if (!std.mem.eql(u8, bl.backend, backend)) continue;
-        try declared.put(bl.name, {});
+        try declared.put(try b.idOf(arena, bl.asRow()), {});
     }
 
     var untracked: std.ArrayList([]const u8) = .empty;
@@ -141,6 +141,17 @@ fn blacklistOf(name: []const u8, backend: []const u8) manifest_mod.BlacklistRow 
     return .{
         .name = name,
         .backend = backend,
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+}
+
+fn caskBlacklistOf(name: []const u8, backend: []const u8) manifest_mod.BlacklistRow {
+    return .{
+        .name = name,
+        .backend = backend,
+        .fields = &.{.{ .key = "kind", .value = .{ .string = "cask" } }},
         .origin = "/tmp/x.toml",
         .label = "data/packages/a.toml",
         .index = 0,
@@ -255,4 +266,15 @@ test "compute: clean reports no drift either way" {
 
     const d = try compute(a, TestBackend.make("brew"), &desired, &.{"ripgrep"}, m);
     try testing.expect(d.clean());
+}
+
+test "compute: a blacklisted cask is never untracked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const m: Manifest = .{ .blacklist = &.{caskBlacklistOf("ghostty", "brew")} };
+
+    const d = try compute(a, TestBackend.make("brew"), &.{}, &.{"cask:ghostty"}, m);
+    try testing.expectEqual(@as(usize, 0), d.untracked.len);
 }
