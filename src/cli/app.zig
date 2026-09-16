@@ -66,22 +66,36 @@ pub var cwd_override: ?[]const u8 = null;
 /// running the suite. Null means spawn for real.
 pub var package_runner_override: ?mox.packages.exec.Runner = null;
 
-/// The backend registry every package-aware command works from, built once
-/// so `status`, `apply` and `commit` can never disagree about which managers
-/// exist or how they are reached.
-pub fn packageRegistry(
-    arena: std.mem.Allocator,
-    io: std.Io,
-    backends: *[1]mox.packages.backend.Backend,
-    proc: *mox.packages.exec.Process,
-    brew: *mox.packages.brew.Brew,
-) mox.packages.backend.Registry {
-    _ = arena;
-    proc.* = .{ .io = io };
-    brew.* = .{ .runner = package_runner_override orelse proc.runner() };
-    backends[0] = brew.backend();
-    return .{ .backends = backends };
-}
+/// Every package manager mox knows, built once so `status`, `apply` and
+/// `commit` can never disagree about which exist or how they are reached.
+///
+/// Registered is not the same as usable: a dnf row on a mac names a real
+/// adapter that this machine simply cannot run, which is inert. A row naming
+/// nothing here is a typo, and says so.
+pub const PackageBackends = struct {
+    proc: mox.packages.exec.Process = undefined,
+    brew: mox.packages.brew.Brew = undefined,
+    apt: mox.packages.linux.Distro = undefined,
+    dnf: mox.packages.linux.Distro = undefined,
+    pacman: mox.packages.linux.Distro = undefined,
+    list: [4]mox.packages.backend.Backend = undefined,
+
+    pub fn registry(self: *PackageBackends, io: std.Io) mox.packages.backend.Registry {
+        self.proc = .{ .io = io };
+        const runner = package_runner_override orelse self.proc.runner();
+        self.brew = .{ .runner = runner };
+        self.apt = .{ .manager = .apt, .runner = runner };
+        self.dnf = .{ .manager = .dnf, .runner = runner };
+        self.pacman = .{ .manager = .pacman, .runner = runner };
+        self.list = .{
+            self.brew.backend(),
+            self.apt.backend(),
+            self.dnf.backend(),
+            self.pacman.backend(),
+        };
+        return .{ .backends = &self.list };
+    }
+};
 
 /// Ports `context.zig`'s `init` into cli-zig's context-loader shape.
 /// `loadContext` is a plain function pointer with no access to

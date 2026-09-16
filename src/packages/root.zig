@@ -8,6 +8,7 @@ pub const exec = @import("exec.zig");
 pub const backend = @import("backend.zig");
 pub const validate = @import("validate.zig");
 pub const brew = @import("brew.zig");
+pub const linux = @import("linux.zig");
 pub const report = @import("report.zig");
 pub const write = @import("write.zig");
 
@@ -21,6 +22,7 @@ test {
     _ = backend;
     _ = validate;
     _ = brew;
+    _ = linux;
     _ = report;
     _ = write;
 }

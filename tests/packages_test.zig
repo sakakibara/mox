@@ -36,7 +36,17 @@ fn readManifest(io: Io, h: Harness, a: std.mem.Allocator, name: []const u8) ![]c
     return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
 }
 
-/// brew with `ripgrep` and the `ghostty` cask installed, and nothing else.
+/// The Linux managers reporting themselves absent, as they are on a mac and
+/// on every runner these fixtures target. Registered adapters are probed
+/// whether or not a fixture cares about them.
+fn absentLinuxManagers(a: std.mem.Allocator, entries: *std.ArrayList(mox.packages.exec.Fake.Entry)) !void {
+    for ([_][]const u8{ "apt-get --version", "dnf --version", "pacman --version" }) |argv| {
+        try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
+    }
+}
+
+/// A machine whose only usable manager is brew, carrying `formulae` and
+/// `casks` and answering `extra` for anything else.
 fn brewWith(
     a: std.mem.Allocator,
     formulae: []const u8,
@@ -47,6 +57,7 @@ fn brewWith(
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew leaves --installed-on-request", .stdout = formulae });
     try entries.append(a, .{ .argv = "brew list --cask", .stdout = casks });
+    try absentLinuxManagers(a, &entries);
     for (extra) |e| try entries.append(a, e);
 
     const fake = try a.create(mox.packages.exec.Fake);
@@ -368,4 +379,118 @@ test "commit: a path-scoped commit never reaches the package manifest" {
     const live = try h.liveOf("nothing-here.conf");
     _ = try h.run(&.{ "mox", "commit", live });
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+/// A Fedora machine: dnf usable, brew and the other managers absent.
+fn dnfWith(
+    a: std.mem.Allocator,
+    installed: []const u8,
+    extra: []const mox.packages.exec.Fake.Entry,
+) !*mox.packages.exec.Fake {
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "apt-get --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "pacman --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "dnf --version", .stdout = "dnf 4.18.0\n" });
+    try entries.append(a, .{
+        .argv = "dnf repoquery --userinstalled --qf %{name}",
+        .stdout = installed,
+    });
+    for (extra) |e| try entries.append(a, e);
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    return fake;
+}
+
+test "linux: a dnf machine reports and installs through the same core" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "fedora.toml",
+        \\backend = "dnf"
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    const fake = try dnfWith(a, "bat\nhtop\n", &.{
+        .{ .argv = "sudo dnf install -y ripgrep" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING   dnf ripgrep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "UNTRACKED dnf htop") != null);
+
+    const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
+        .{ .argv = "sudo dnf install -y ripgrep" },
+    });
+    useFake(fake2);
+    _ = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(fake2.called("sudo dnf install -y ripgrep"));
+}
+
+test "linux: a manifest for a manager this machine lacks is inert, not an error" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A shared manifest carries every machine's rows; a mac reading the
+    // fedora file must neither install nor complain.
+    try writeManifest(io, h, a, "fedora.toml",
+        \\backend = "dnf"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "dnf ripgrep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
+}
+
+test "linux: a row naming no registered backend is still a loud error" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "typo.toml",
+        \\backend = "dnff"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no backend named \"dnff\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 }

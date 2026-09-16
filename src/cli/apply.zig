@@ -799,10 +799,8 @@ fn applyPackages(
     bindings: *const mox.dsl.resolver.Resolver,
     dry_run: bool,
 ) !PackageCounts {
-    var proc: mox.packages.exec.Process = undefined;
-    var brew: mox.packages.brew.Brew = undefined;
-    var backends: [1]mox.packages.backend.Backend = undefined;
-    const registry = app.packageRegistry(ctx.alloc, ctx.io, &backends, &proc, &brew);
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(ctx.io);
 
     var diag: mox.packages.manifest.Diag = .{};
     const rep = mox.packages.report.gather(
@@ -828,27 +826,34 @@ fn applyPackages(
 
     var counts: PackageCounts = .{ .in_use = true };
     for (rep.backends) |b| {
+        if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
+
+        var rows: std.ArrayList(mox.packages.manifest.Row) = .empty;
         for (b.drift.missing) |m| {
             if (dry_run) {
                 try ctx.out.print("  would install  {s} {s}\n", .{ b.backend, m.row.name });
                 counts.would += 1;
                 continue;
             }
-            // One row per call so a failure names its own package and leaves
-            // the rest of the list to proceed: a bad formula halfway down
-            // must not strand everything after it.
-            backend.install(ctx.alloc, &.{m.row}) catch |e| {
-                try ctx.err.print(
-                    "mox apply: {s} {s}: install failed: {s}\n",
-                    .{ b.backend, m.row.name, @errorName(e) },
-                );
-                counts.failed += 1;
-                continue;
-            };
-            try ctx.out.print("  installed      {s} {s}\n", .{ b.backend, m.row.name });
-            counts.installed += 1;
+            try ctx.out.print("  installing     {s} {s}\n", .{ b.backend, m.row.name });
+            try rows.append(ctx.alloc, m.row);
         }
+        if (rows.items.len == 0) continue;
+
+        // The whole set goes to the adapter at once: a manager that resolves
+        // a batch in one pass (apt, pacman) must not be driven one package at
+        // a time. The adapter streams its own output, so which package failed
+        // is on the terminal from the manager itself.
+        backend.install(ctx.alloc, rows.items) catch |e| {
+            try ctx.err.print(
+                "mox apply: {s}: install failed: {s}\n",
+                .{ b.backend, @errorName(e) },
+            );
+            counts.failed += 1;
+            continue;
+        };
+        counts.installed += rows.items.len;
     }
     return counts;
 }
