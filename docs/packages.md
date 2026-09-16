@@ -160,7 +160,9 @@ An export reports identifiers alone, so a package is one row: two rows for
 one identifier under different scopes are a duplicate, not two packages.
 
 An install through scoop adds a row's bucket only when `scoop bucket list`
-does not already have it, and winget installs with `--no-upgrade` and then
+does not already have it, and winget installs with `--exact` (`--id`
+restricts the field searched, not the match type, and winget's default is a
+case-insensitive substring match) and `--no-upgrade`, then
 asks `winget list` whether a failed install is nonetheless there: both
 managers answer a second `apply` with an error otherwise, and winget's exit
 codes cannot be told apart once truncated to a byte. zypper's ledger records what a failed batch still
@@ -205,22 +207,39 @@ Before an apt install, mox asks `apt-cache --generate pkgnames` -- apt's one
 literal-matching whole-universe query -- and refuses a row naming anything
 absent from it: `apt-get install` otherwise falls back to reading the operand
 as an unanchored regular expression, so `libz.dev` installs ten packages the
-manifest never declared and `ruby.dev` installs hundreds. That listing holds
-bare names alone, and it omits a package that exists only for a foreign
+manifest never declared and `ruby.dev` installs hundreds. The listing is
+asked for under `APT::Architectures=<native>` and
+`Dir::State::status=/dev/null`, so it holds the native architecture's
+repository packages and nothing else: the plain listing prints most
+foreign-architecture-only names bare, and a bare row naming one would install
+`name:<arch>`, which `apt-mark showmanual` then reports qualified. Such a row
+is refused with the qualified spelling to declare. That listing holds bare
+names alone, and it omits a package that exists only for a foreign
 architecture -- `wine32` is in no listing on an amd64 or arm64 machine, while
 apt installs `wine32:i386` and `apt-mark showmanual` reports exactly that --
 so a row carrying an architecture is asked about as written, with
 `apt-cache madison`, the query verified to match a qualified name literally
 where `apt-cache show` and `apt-cache policy` both fall back to a regex.
+
+A held or pinned package is refused too, and for a different reason: neither
+the index nor the package list knows about either, and `apt-get install`
+answers a batch carrying one by installing nothing at all -- so one such row
+would keep every other package in the manifest off the machine. mox reads
+`apt-mark showhold` and `apt-cache policy` before the install and refuses the
+row. A hold is the user's decision, so it is never overridden.
+
 Before a dnf install, mox asks `dnf repoquery` the same question, and a name
 that is only an rpm capability rather than a package -- `zlib-devel`, which
 `zlib-ng-compat-devel` provides -- is refused with the name to declare in its
 place. Before a pacman install, mox reads `pacman -Slq`, and a name that is a
 package **group** rather than a package -- `xfce4`, which holds fourteen --
 is refused with the members named, since `pacman -S` installs every one of
-them and `pacman -Qeq` reports the members and never the group. That check
-only reads: pacman's database is downloaded only if the listing comes back
-empty, which is a machine that has never synced, and what runs then is the
+them and `pacman -Qeq` reports the members and never the group. Only a group
+is refused there: a name the listing lacks is still handed to pacman, because
+that listing is whatever the machine last synced and the install argv is
+`pacman -Syu`, which syncs before it resolves. That check only reads:
+pacman's database is downloaded only if the listing comes back empty,
+which is a machine that has never synced, and what runs then is the
 full `pacman -Syu` the install itself was about to run, never a bare
 `pacman -Sy` -- which would leave the database ahead of the installed
 packages, a state Arch does not support, on every path that then refuses a
@@ -254,6 +273,14 @@ runs it), a URL, and `owner/tap` alone, which names a tap rather than
 anything `brew list` can report back. Beyond the check, every name mox hands
 brew comes after a `--`.
 
+Before a brew install, mox asks `brew info --json=v2` what each row's name
+stands for, and refuses a row naming an **alias** rather than the package
+brew reports back: `brew install ag` installs `the_silver_searcher`, which is
+the name `brew list --full-name --installed-on-request` answers with, so an
+`ag` row would read as missing and that formula as untracked on every run.
+The refusal names the formula or cask to declare instead. A tap-qualified row
+is not asked about: it names a tap the same install has yet to add.
+
 A scoop `name` is one app: a single token of letters, digits and `.`, `_`,
 `+` or `-`. So a row cannot be a manifest path or a URL (scoop installs
 either), a bucket-qualified name (the bucket is a key of its own), or a
@@ -271,12 +298,17 @@ which is what a path, a URL, a pattern or an option needs.
 
 The field values that reach a manager's argv are checked too, because they
 land where a name lands. scoop's `bucket` and winget's `source` are each one
-token, and are held to the single-token class. winget's `override` is not, and
-cannot be -- it exists to hand a command line on to the package's own
-installer, so a space and a slash are what it is for -- but it may hold no
-`"` and no control byte: those are the bytes no argv carries intact across
-both of Windows' command-line parsers, so a value holding one is not the
-value the installer would receive.
+token, and are held to the single-token class -- which matters most for
+scoop, a PowerShell script whose `-File` parser reads an escaped quote
+differently from the way Zig serializes an argv, so a value carrying
+whitespace and a `"` together could leave its own argument and become several
+operands. winget's `override` is held to neither class, and cannot be: it
+exists to hand a command line on to the package's own installer, so a space,
+a slash and the quotes an installer argument needs (`/DIR="C:\Program
+Files\App"`) are what it is for. winget is spawned directly, so the
+`CommandLineToArgvW` inside `winget.exe` reverses that serialization exactly
+and the value arrives whole; the one byte it may not hold is a control byte,
+which no argv carries intact.
 
 ### brew taps
 

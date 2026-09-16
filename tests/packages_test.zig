@@ -64,6 +64,10 @@ fn brewWith(
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = formulae });
     try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = casks });
+    // What an install asks brew each row's name stands for. Answered with
+    // nothing, so no row is refused as an alias: these fixtures are about the
+    // install, and the alias refusal is exercised on its own elsewhere.
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 });
     try absentLinuxManagers(a, &entries);
     for (extra) |e| try entries.append(a, e);
 
@@ -524,7 +528,7 @@ test "apply --dry-run: says which rows it left unchecked" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         r.out,
-        "note            a dry run leaves these rows unchecked against the packages dnf's repositories carry; a real apply checks them there and refuses a row that names no package\n",
+        "note            a dry run leaves these rows unchecked against the packages dnf's repositories carry; a real apply checks them there and refuses a row it would not install under its own name\n",
     ) != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
@@ -734,6 +738,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew info --json=v2 --formula -- ripgrep", .match = .suffix, .code = 1 });
     try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
@@ -1301,6 +1306,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew info --json=v2 --formula -- ripgrep", .match = .suffix, .code = 1 });
     try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
@@ -2839,6 +2845,11 @@ fn aptWith(
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 3.0.3 (arm64)\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = manual });
+    try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    // A machine with neither a hold nor a pin, which is what these fixtures
+    // are about: the checks are exercised on their own elsewhere.
+    try entries.append(a, .{ .argv = "apt-mark showhold" });
+    try entries.append(a, .{ .argv = "apt-cache policy", .match = .prefix });
     for ([_][]const u8{
         "brew --version",
         "dnf --version",
@@ -2878,7 +2889,8 @@ test "apply: a row no manager has fails alone, and the rows beside it install" {
 
     const fake = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "sl\nbat\n" },
+        .{ .argv = "apt-cache -o APT::Architectures=arm64 -o Dir::State::status=/dev/null --generate pkgnames", .stdout = "sl\nbat\n" },
+        .{ .argv = "apt-cache madison ruby.dev", .stdout = "" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl", .match = .suffix },
     });
     useFake(fake);

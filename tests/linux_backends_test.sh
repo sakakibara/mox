@@ -25,19 +25,26 @@
 # the same fetch, digest check and non-interactive install a fresh machine
 # gets -- before installing the package through it.
 #
-# Six cases run the other way round, because a name a manager resolves to
+# Several cases run the other way round, because a name a manager resolves to
 # something other than itself is a fact about the manager that no fake can
 # establish: `apt-get install -y vim nano-` removes nano; `apt-get install --
 # bsdextrautil.` installs bsdextrautils, apt having matched the operand as a
 # regular expression; `dnf install zlib-devel` installs zlib-ng-compat-devel,
 # `zlib-devel` being a capability rather than a package; `pacman -S xfce4`
 # installs all fourteen members of a group that `pacman -Qeq` never reports;
-# and `apt-get install sl:any` installs sl, which `apt-mark showmanual` then
-# reports bare. The hermetic suite proves the adapter refuses each row; only
-# the real manager proves what the row would have done. A sixth runs the
-# round trip a multiarch machine needs, which is the one place a colon in a
-# name is the name apt itself reports. These six run with the default set,
-# not from the image/backend/package arguments.
+# `apt-get install sl:any` installs sl, which `apt-mark showmanual` then
+# reports bare; and a bare operand naming a package only the foreign
+# architecture has installs `name:<arch>`, which it reports qualified. Two
+# more are about what the manager REFUSES to install: a held package and a
+# pinned one each make `apt-get install` install nothing at all, so a row
+# naming either must go rather than the batch. One runs the round trip a
+# multiarch machine needs, which is the one place a colon in a name is the
+# name apt itself reports; one covers a machine with no package index, where
+# apt's listing must come back empty; and one covers a pacman database that
+# is merely old, where a name it lacks must still reach pacman. The hermetic
+# suite proves what the adapter does; only the real manager proves what the
+# row would have done. These run with the default set, not from the
+# image/backend/package arguments.
 #
 # A manager's IMAGE TAGS are part of what this suite covers. A floating tag
 # is ONE point in a manager's version range, and an adapter can be whole at
@@ -490,6 +497,326 @@ EOF
   fi
 }
 
+# A package that exists only for the foreign architecture and that apt's own
+# listing prints BARE. `run_foreign_only_case` covers the name the listing
+# omits; this covers the 78 of trixie's 90 armhf-only names it prints, where a
+# bare row is kept, apt installs the foreign package, and `apt-mark showmanual`
+# reports it qualified -- missing and untracked for ever. The name is found in
+# the container rather than fixed here, because which names these are differs
+# per release and per architecture pair.
+run_foreign_only_bare_case() {
+  image="$1"
+  foreign="$2"
+  backend="apt foreign-only-bare"
+
+  case_dir="$work/foreign-only-bare"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      foreign='"$foreign"'
+      native="$(dpkg --print-architecture)"
+      dpkg --add-architecture "$foreign"
+      apt-get update >/dev/null
+
+      decode() {
+        case "$1" in
+          *.lz4) /usr/lib/apt/apt-helper cat-file "$1" ;;
+          *.gz) zcat "$1" ;;
+          *.xz) xzcat "$1" ;;
+          *) cat "$1" ;;
+        esac
+      }
+      cd /var/lib/apt/lists
+      for arch in "$native" "$foreign"; do
+        for f in *binary-${arch}_Packages*; do decode "$f"; done |
+          awk "/^Package: /{print \$2}" | sort -u > "/tmp/$arch.txt"
+      done
+      apt-cache --generate pkgnames | sort -u > /tmp/all.txt
+      # In the foreign index, in no native index, and printed bare all the
+      # same: the case the plain listing cannot answer.
+      comm -13 "/tmp/$native.txt" "/tmp/$foreign.txt" | comm -12 - /tmp/all.txt > /tmp/cand.txt
+      pkg="$(head -1 /tmp/cand.txt)"
+      [ -n "$pkg" ] || { echo "no foreign-only name is listed bare here; the case cannot run"; exit 1; }
+      echo "pkg=$pkg"
+      echo "bare-listed=$(grep -cx "$pkg" /tmp/all.txt)"
+      # The harm, without installing it: apt resolves the bare operand to the
+      # foreign package, which is what it would have put on the machine.
+      apt-get install -s -y -- "$pkg" 2>&1 | grep -q "$pkg:$foreign" &&
+        echo "resolves=$pkg:$foreign" || echo "resolves=none"
+
+      cat > /w/repo/data/packages/apt.toml <<TOML
+backend = "apt"
+
+[[packages]]
+name = "$pkg"
+
+[[packages]]
+name = "sl"
+TOML
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- installed ---"
+      dpkg -l "$pkg" 2>/dev/null | grep -c "^ii" || echo 0
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  pkg="$(sed -n 's/^pkg=//p' "$out")"
+
+  if grep -q "^bare-listed=1" "$out"; then
+    ok "$backend ($image): apt's plain listing prints the foreign-only name bare"
+  else
+    no "$backend ($image): the premise does not hold; the name is not listed bare" "$(grep '^bare-listed=' "$out")"
+  fi
+
+  if grep -q "^resolves=$pkg:$foreign" "$out"; then
+    ok "$backend ($image): apt would resolve the bare operand to the foreign package"
+  else
+    no "$backend ($image): apt did not resolve the bare operand to $pkg:$foreign" "$(grep '^resolves=' "$out")"
+  fi
+
+  if grep -q "row \"$pkg\" names an apt package for the architecture \"$foreign\" alone" "$out" &&
+    grep -q "declare \"$pkg:$foreign\" instead" "$out"; then
+    ok "$backend ($image): the row is refused, and told the spelling apt reports back"
+  else
+    no "$backend ($image): the bare foreign-only row was not refused" "$(grep -E '^mox: apt|Packages:' "$out" | tail -3)"
+  fi
+
+  if grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it still installed"
+  else
+    no "$backend ($image): a refused row stopped the row that was fine" "$(grep -E 'Packages:' "$out")"
+  fi
+
+  if [ "$(tail -1 "$out")" = "0" ]; then
+    ok "$backend ($image): nothing the manifest never declared landed"
+  else
+    no "$backend ($image): apt installed the foreign package after all" "$(tail -2 "$out")"
+  fi
+}
+
+# A held package and a pinned one each make apt-get install NOTHING at all, so
+# one of them in a batch keeps every other package in the manifest off the
+# machine. Both must be refused at check time, as rows, and the hold must
+# survive: it is the user's decision, not mox's to override.
+run_apt_hold_pin_case() {
+  image="$1"
+  backend="apt hold-pin"
+
+  case_dir="$work/apt-hold-pin"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "sl"
+
+[[packages]]
+name = "cowsay"
+
+[[packages]]
+name = "bsdextrautils"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      apt-get update >/dev/null
+      apt-get purge -y bsdextrautils >/dev/null 2>&1 || true
+      apt-mark hold sl >/dev/null
+      printf "Package: cowsay\nPin: release *\nPin-Priority: -1\n" > /etc/apt/preferences.d/no-cowsay
+      # The harm, measured here rather than assumed: a batch carrying either
+      # one installs nothing at all.
+      rc=0; apt-get install -y -qq -- sl bsdextrautils >/tmp/h.txt 2>&1 || rc=$?
+      echo "hold-batch-exit=$rc"
+      echo "hold-collateral=$(dpkg -l bsdextrautils 2>/dev/null | grep -c "^ii" || true)"
+      rc=0; apt-get install -y -qq -- cowsay bsdextrautils >/tmp/p.txt 2>&1 || rc=$?
+      echo "pin-batch-exit=$rc"
+      echo "pin-collateral=$(dpkg -l bsdextrautils 2>/dev/null | grep -c "^ii" || true)"
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      echo "installed=$(dpkg -l bsdextrautils 2>/dev/null | grep -c "^ii" || true)"
+      echo "still-held=$(apt-mark showhold | grep -cx sl || true)"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^hold-batch-exit=100" "$out" && grep -q "^hold-collateral=0" "$out" &&
+    grep -q "^pin-batch-exit=100" "$out" && grep -q "^pin-collateral=0" "$out"; then
+    ok "$backend ($image): a held or pinned operand makes apt-get install nothing at all"
+  else
+    no "$backend ($image): the premise does not hold on this apt" "$(grep -E '^(hold|pin)-' "$out")"
+  fi
+
+  if grep -q 'row "sl" names a package apt-mark holds' "$out"; then
+    ok "$backend ($image): the held row is refused by name"
+  else
+    no "$backend ($image): the held row was not refused" "$(grep -E '^mox: apt' "$out" | tail -3)"
+  fi
+
+  if grep -q 'row "cowsay" names a package apt has no installation candidate for' "$out"; then
+    ok "$backend ($image): the pinned row is refused by name"
+  else
+    no "$backend ($image): the pinned row was not refused" "$(grep -E '^mox: apt' "$out" | tail -3)"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 2 failed" "$out"; then
+    ok "$backend ($image): the row beside them installed"
+  else
+    no "$backend ($image): two refused rows kept the third off the machine" \
+      "$(grep -E '^installed=|Packages:' "$out")"
+  fi
+
+  if grep -q "^still-held=1" "$out" && ! grep -q "allow-change-held-packages" "$out"; then
+    ok "$backend ($image): the hold is left as its owner set it"
+  else
+    no "$backend ($image): the run overrode the hold" "$(grep -E '^still-held=' "$out")"
+  fi
+}
+
+# A machine with no package index at all. The plain listing still prints the
+# dpkg status file's own packages there -- 78 lines on trixie, 88 on bookworm
+# -- so it cannot tell that machine apart from a working one; the listing the
+# adapter asks for excludes the status file, and comes back empty.
+run_apt_no_repositories_case() {
+  image="$1"
+  backend="apt no-repositories"
+
+  case_dir="$work/apt-no-repos"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "sl"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      rm -f /etc/apt/sources.list
+      rm -f /etc/apt/sources.list.d/*
+      apt-get update >/dev/null 2>&1 || true
+      native="$(dpkg --print-architecture)"
+      echo "plain=$(apt-cache --generate pkgnames | grep -c . || true)"
+      echo "asked=$(apt-cache -o APT::Architectures=$native -o Dir::State::status=/dev/null --generate pkgnames | grep -c . || true)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^plain=0" "$out"; then
+    no "$backend ($image): the premise does not hold; the plain listing is already empty" "$(grep '^plain=' "$out")"
+  else
+    ok "$backend ($image): the plain listing still prints the status file's packages"
+  fi
+
+  if grep -q "^asked=0" "$out"; then
+    ok "$backend ($image): the listing the adapter asks for is empty, which is the signal"
+  else
+    no "$backend ($image): the listing is not empty on a machine with no index" "$(grep '^asked=' "$out")"
+  fi
+
+  if grep -q "lists no packages at all, which is a machine with no repositories configured" "$out"; then
+    ok "$backend ($image): the run says the machine has no repositories, not that the row names none"
+  else
+    no "$backend ($image): the guard did not fire" "$(grep -E '^mox|Packages:' "$out" | tail -3)"
+  fi
+}
+
+# A pacman database that is merely OLD, which is the normal state of an Arch
+# machine between upgrades. A name it has never heard of must NOT be refused:
+# the install argv is `pacman -Syu`, which syncs before it resolves. Absence
+# is not evidence here, where it is for apt -- mox runs apt's own update
+# immediately before reading apt's listing.
+run_pacman_stale_case() {
+  image="$1"
+  backend="pacman stale"
+
+  case_dir="$work/pacman-stale"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "uv"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      cp /etc/pacman.d/mirrorlist /tmp/mirrorlist
+      echo "Server=https://archive.archlinux.org/repos/2024/01/01/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "archive-sync=failed"; exit 0; }
+      cp /tmp/mirrorlist /etc/pacman.d/mirrorlist
+      echo "archive-sync=ok"
+      echo "stale-names=$(pacman -Slq | grep -c . || true)"
+      echo "stale-has-uv=$(pacman -Slq | grep -cx uv || true)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "installed=$(pacman -Qq uv >/dev/null 2>&1 && echo 1 || echo 0)"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^archive-sync=failed" "$out"; then
+    skip "$backend ($image): the Arch archive did not answer, so no stale database could be built" \
+      "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^stale-has-uv=0" "$out" && ! grep -q "^stale-names=0" "$out"; then
+    ok "$backend ($image): the database is stale, not empty, and does not carry the name"
+  else
+    no "$backend ($image): the premise does not hold" "$(grep -E '^stale-' "$out")"
+  fi
+
+  if grep -q "names no pacman package" "$out"; then
+    no "$backend ($image): an installable row was refused for being absent from a stale database" \
+      "$(grep 'names no pacman package' "$out")"
+  else
+    ok "$backend ($image): a name the stale database lacks is handed to pacman, not refused"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "^apply-exit=0" "$out"; then
+    ok "$backend ($image): the sync the install itself runs resolved it"
+  else
+    no "$backend ($image): the row did not install" "$(grep -E '^installed=|^apply-exit=|Packages:' "$out")"
+  fi
+}
+
 # A foreign-architecture package is the one name apt reports with a colon in
 # it, so declaring it must round-trip: MISSING -> install -> clean.
 run_multiarch_case() {
@@ -844,6 +1171,11 @@ else
   # is the one name that exists for the foreign architecture alone on both
   # kinds of host -- the case apt's own listing cannot answer.
   run_foreign_only_case debian:stable "$foreign_arch"
+  # The other half of that: a foreign-only name apt's plain listing prints
+  # BARE, which is the majority of them.
+  run_foreign_only_bare_case debian:stable "$foreign_arch"
+  run_apt_hold_pin_case debian:stable
+  run_apt_no_repositories_case debian:stable
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
@@ -862,6 +1194,7 @@ else
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
   run_pacman_sync_case archlinux:latest
+  run_pacman_stale_case archlinux:latest
   run_case debian:stable brew hello
 fi
 

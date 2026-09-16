@@ -208,14 +208,20 @@ pub const ValueClass = enum {
 
 /// Why a field value is not one of its class.
 ///
-/// A value is checked because it lands where a name lands. On Windows the
-/// harm is worse than an odd operand: Zig serializes an argv for
-/// `CommandLineToArgvW`, escaping an embedded `"` by doubling backslashes,
-/// while PowerShell's `-File` parser reads `\"` as a backslash and a quote
-/// that ENDS quoting -- so a value carrying whitespace and a `"` together
-/// leaves its own argv element and becomes several operands of the command
-/// it was spliced into. A value with whitespace alone does not: the quoting
-/// PowerShell does honour holds it together.
+/// A value is checked because it lands where a name lands, and on Windows
+/// what the value reaches depends on how its manager is spawned. A `token`
+/// rides a scoop argv, and scoop is a PowerShell script: Zig serializes an
+/// argv for `CommandLineToArgvW`, escaping an embedded `"` by doubling
+/// backslashes, while the `-File` parser that reads the script's arguments
+/// reads `\"` as a backslash and a quote that ENDS quoting -- so a value
+/// carrying whitespace and a `"` together leaves its own argv element and
+/// becomes several operands. A value with whitespace alone does not: the
+/// quoting PowerShell does honour holds it together.
+///
+/// A `command_line` rides a winget argv, and winget is spawned directly, so
+/// the `CommandLineToArgvW` inside winget.exe reverses Zig's escaping
+/// exactly and a `"` arrives as itself -- which an installer argument needs
+/// (`/DIR="C:\Program Files\App"`, `PROPERTY="value"`).
 pub const ValueProblem = enum {
     empty,
     leading,
@@ -233,7 +239,7 @@ pub const ValueProblem = enum {
                 .token => "holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
                 .command_line => "holds only text",
             },
-            .quote => "holds no \" character, which Windows' two command-line parsers disagree about, so a value carrying one can leave its own argument and become several",
+            .quote => "holds no \" character, which PowerShell's -File parser and Windows' argv serializer disagree about, so a value carrying one can leave its own argument and become several",
             .control => "holds no control byte",
         };
     }
@@ -245,12 +251,14 @@ pub fn valueProblem(v: []const u8, class: ValueClass) ?ValueProblem {
     if (!std.unicode.utf8ValidateSlice(v)) return .character;
     for (v) |c| {
         if (std.ascii.isControl(c)) return .control;
-        if (c == '"') return .quote;
+        // Only a token crosses the PowerShell `-File` parser, which is the
+        // one parser that reads an escaped quote differently.
+        if (c == '"' and class == .token) return .quote;
     }
     switch (class) {
-        // An installer's own arguments need the space and the slash that a
-        // token may not have; only the bytes no argv can carry across both
-        // Windows parsers are refused, which is the loop above.
+        // An installer's own arguments need the space, the slash and the
+        // quote a token may not have; a control byte is refused above
+        // because no argv carries one intact.
         .command_line => return null,
         .token => {
             if (!std.ascii.isAlphanumeric(v[0])) return .leading;
@@ -730,7 +738,6 @@ test "valueProblem: a field value spliced into an argv is held to its own class"
     // one value becomes several operands of `scoop bucket add`, whose second
     // operand is the bucket's repository URL.
     try testing.expectEqual(ValueProblem.quote, valueProblem("a\" extras https://evil/x\"b", .token).?);
-    try testing.expectEqual(ValueProblem.quote, valueProblem("a\" extras https://evil/x\"b", .command_line).?);
 
     // Whitespace alone does not break out -- PowerShell honours the quoting
     // Zig added -- but a bucket is still one token.
@@ -745,6 +752,16 @@ test "valueProblem: a field value spliced into an argv is held to its own class"
     // An installer's own arguments need the space, the slash and the dash
     // that a token may not have; only what no argv can carry is refused.
     for ([_][]const u8{ "/SILENT /NORESTART", "-y --quiet", "/DIR=C:\\Program Files\\x" }) |s| {
+        try testing.expectEqual(@as(?ValueProblem, null), valueProblem(s, .command_line));
+    }
+
+    // winget is spawned directly, so `CommandLineToArgvW` inside winget.exe
+    // reverses Zig's escaping and a quoted installer argument arrives whole.
+    for ([_][]const u8{
+        "/DIR=\"C:\\Program Files\\App\"",
+        "INSTALLDIR=\"C:\\App\" ALLUSERS=1",
+        "/v\"/qn REBOOT=ReallySuppress\"",
+    }) |s| {
         try testing.expectEqual(@as(?ValueProblem, null), valueProblem(s, .command_line));
     }
     try testing.expectEqual(ValueProblem.control, valueProblem("/SILENT\r\n/DIR=x", .command_line).?);

@@ -88,9 +88,9 @@ pub const Manager = enum {
     /// dry run to name as what it did not check.
     fn installCheck(self: Manager) []const u8 {
         return switch (self) {
-            .apt => "apt's own package list",
+            .apt => "apt's own package list, its holds and its pins",
             .dnf => "the packages dnf's repositories carry",
-            .pacman => "the packages pacman's repositories carry",
+            .pacman => "the package groups pacman's repositories carry",
         };
     }
 };
@@ -242,7 +242,7 @@ pub const Distro = struct {
             if (!up.ok) return Error.DistroRefreshFailed;
         }
         const keep = switch (self.manager) {
-            .apt => try self.refuseAptNonNames(arena, rows),
+            .apt => try self.refuseAptUninstallable(arena, try self.refuseAptNonNames(arena, rows)),
             .dnf => try self.refuseDnfNonPackages(arena, rows),
             .pacman => try self.refusePacmanNonPackages(arena, rows, elevate),
         };
@@ -284,19 +284,45 @@ pub const Distro = struct {
         w.flush() catch {};
     }
 
-    /// The names apt has, one per line. Verified against apt 3.0.3: this is
-    /// the query that matches an operand LITERALLY -- `apt-cache show` and
-    /// `apt-cache policy` both take a regex -- and it lists the bare name
-    /// alone, never a `:arch` form. About 1.2 MiB on Debian trixie and
-    /// 1.8 MiB on Ubuntu 24.04, well inside a captured call's cap.
+    /// The names a BARE row may resolve to, one per line: every package of
+    /// the native architecture that a configured repository carries.
     ///
-    /// It is the universe for a BARE name only. Measured on Debian trixie
-    /// arm64 with armhf added: of the 90 names the armhf index carries and
-    /// the arm64 index does not, this listing omits 12 -- `wine32` among them
-    /// -- while apt resolves and installs `wine32:armhf` and `apt-mark
-    /// showmanual` then reports exactly that. A qualified name is asked about
-    /// per row instead.
-    const apt_names_argv = [_][]const u8{ "apt-cache", "--generate", "pkgnames" };
+    /// `--generate pkgnames` is the query that matches an operand LITERALLY
+    /// -- `apt-cache show` and `apt-cache policy` both take a regex -- and it
+    /// lists the bare name alone, never a `:arch` form. Both options narrow
+    /// what it lists, and each closes a hole the plain listing has. Verified
+    /// against apt 2.6.1 (bookworm), 2.8.3 (Ubuntu 24.04) and 3.0.3 (trixie),
+    /// each arm64 with armhf added:
+    ///
+    /// - `APT::Architectures=<native>` drops the names only a foreign index
+    ///   carries. The plain listing prints 78 of trixie's 90 armhf-only names
+    ///   BARE (120 of 133 on bookworm, 57 of 73 on Ubuntu), so a row spelling
+    ///   one is kept, apt installs the foreign package, and `apt-mark
+    ///   showmanual` reports it `name:armhf` -- missing and untracked for
+    ///   ever. With the option the listing holds none of them.
+    /// - `Dir::State::status=/dev/null` drops the dpkg status file, which is
+    ///   not a repository: it prints a foreign package already installed
+    ///   under its bare name (the same hole again), and it keeps the listing
+    ///   non-empty -- 78 lines on trixie, 88 on bookworm -- on a machine with
+    ///   no repositories at all, where the emptiness IS the signal. Nothing
+    ///   installable is lost with it: a package installed outside a
+    ///   repository is not marked auto, so `apt-mark showmanual` reports it
+    ///   and no row for it is ever missing.
+    ///
+    /// About 1.2 MiB on Debian trixie and 1.8 MiB on Ubuntu 24.04, well
+    /// inside a captured call's cap. A qualified name is asked about per row
+    /// instead, because the listing holds bare names alone.
+    fn aptNamesArgv(arena: std.mem.Allocator, native: []const u8) ![]const []const u8 {
+        return arena.dupe([]const u8, &.{
+            "apt-cache",
+            "-o",
+            try std.fmt.allocPrint(arena, "APT::Architectures={s}", .{native}),
+            "-o",
+            "Dir::State::status=/dev/null",
+            "--generate",
+            "pkgnames",
+        });
+    }
 
     /// Refuse the rows apt has no package for, and answer with the rest.
     ///
@@ -316,12 +342,18 @@ pub const Distro = struct {
     /// The qualifier is judged before the package list, because a row apt
     /// resolves to the native package is wrong for a reason of its own and
     /// must be told the bare name to declare rather than the regex warning.
+    ///
+    /// A bare row is held to the NATIVE architecture, because that is the one
+    /// apt-mark reports bare. A name apt has only for a foreign architecture
+    /// installs under the qualified name and reads as missing for ever, so it
+    /// is refused and told the qualified spelling -- which the name class
+    /// already accepts.
     fn refuseAptNonNames(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
-        // Each query is made only if a row needs it: the listing costs a
-        // megabyte and a rebuild of apt's cache, and dpkg is asked nothing at
-        // all by a batch that carries no qualifier.
+        // The listing is made only if a row needs it: it costs a megabyte and
+        // a rebuild of apt's cache, and a batch of qualified rows alone never
+        // reads it.
         var known: ?std.StringHashMap(void) = null;
-        var native: ?[]const u8 = null;
+        const native = try self.aptNativeArch(arena);
 
         var keep: std.ArrayList(Row) = .empty;
         for (rows) |row| {
@@ -337,15 +369,14 @@ pub const Distro = struct {
                     );
                     continue;
                 }
-                if (native == null) native = try self.aptNativeArch(arena);
-                if (std.mem.eql(u8, arch, native.?)) {
+                if (std.mem.eql(u8, arch, native)) {
                     self.say(
                         "mox: apt: row \"{s}\" qualifies this machine's own architecture, which apt-mark reports bare, so the row could never read as installed; declare \"{s}\" instead\n",
                         .{ row.name, bare },
                     );
                     continue;
                 }
-                if (try self.aptHasQualified(arena, row.name)) {
+                if ((try self.aptArchesOf(arena, row.name)).len > 0) {
                     try keep.append(arena, row);
                     continue;
                 }
@@ -355,9 +386,22 @@ pub const Distro = struct {
                 );
                 continue;
             }
-            if (known == null) known = try self.universeNames(arena, &apt_names_argv, "apt-cache --generate pkgnames");
+            if (known == null) {
+                const argv = try aptNamesArgv(arena, native);
+                known = try self.universeNames(arena, argv, try std.mem.join(arena, " ", argv));
+            }
             if (known.?.contains(bare)) {
                 try keep.append(arena, row);
+                continue;
+            }
+            // Only a foreign architecture can be suggested: a native one is
+            // what the listing already answered for, and spelling it would
+            // send the user to a row apt-mark reports bare.
+            if (try self.aptForeignArchOf(arena, row.name, native)) |arch| {
+                self.say(
+                    "mox: apt: row \"{s}\" names an apt package for the architecture \"{s}\" alone, which apt-mark reports as \"{s}:{s}\", so the row could never read as installed; declare \"{s}:{s}\" instead\n",
+                    .{ row.name, arch, row.name, arch, row.name, arch },
+                );
                 continue;
             }
             self.say(
@@ -368,32 +412,156 @@ pub const Distro = struct {
         return keep.toOwnedSlice(arena);
     }
 
-    /// Whether apt has a binary package under this exact qualified name.
+    /// The binary architectures apt has this exact name under, in the order
+    /// madison reports them, with no repeats. Empty means apt has no binary
+    /// package by that name at all.
     ///
-    /// `apt-cache madison` is the one query verified to answer LITERALLY for
-    /// a qualified name. Against apt 3.0.3 on Debian trixie: it answers
-    /// `wine32:armhf`, `g++` and `libstdc++6` -- names carrying the regex
-    /// metacharacters the class admits -- with their own line, and answers
-    /// `bsdextrautil.`, `w.ne32:armhf`, `libc.`, `^libc6$`, `libc6.*`, `g..`
-    /// and the prefix `wine3` with nothing at all, while `apt-cache show` and
-    /// `apt-cache policy` resolve those same patterns to a package. A purely
-    /// virtual name (`awk`) also answers with nothing, so a capability cannot
-    /// pass here either.
+    /// `apt-cache madison` is the one query verified to answer LITERALLY.
+    /// Against apt 3.0.3 on Debian trixie: it answers `wine32:armhf`, `g++`
+    /// and `libstdc++6` -- names carrying the regex metacharacters the class
+    /// admits -- with their own line, and answers `bsdextrautil.`,
+    /// `w.ne32:armhf`, `libc.`, `^libc6$`, `libc6.*`, `g..` and the prefix
+    /// `wine3` with nothing at all, while `apt-cache show` and `apt-cache
+    /// policy` resolve those same patterns to a package. A purely virtual
+    /// name (`awk`) also answers with nothing, so a capability cannot pass
+    /// here either.
+    ///
+    /// A line is `<name> | <version> | <url> <suite>/<component> <arch>
+    /// Packages`, so the architecture is the word before the last. Verified
+    /// in that shape on apt 2.6.1, 2.8.3 and 3.0.3, and for a package built
+    /// `Architecture: all`, which madison reports once per enabled
+    /// architecture rather than as `all`.
     ///
     /// Only a line naming a binary index counts: with `deb-src` configured
     /// madison prints a `Sources` line too, and a source package is nothing
     /// `apt-get install` can put on the machine.
-    fn aptHasQualified(self: *Distro, arena: std.mem.Allocator, name: []const u8) anyerror!bool {
+    fn aptArchesOf(self: *Distro, arena: std.mem.Allocator, name: []const u8) anyerror![]const []const u8 {
         const res = try self.runner.run(arena, &.{ "apt-cache", "madison", name });
         try exec.checkTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
 
+        var out: std.ArrayList([]const u8) = .empty;
         var it = std.mem.splitScalar(u8, res.stdout, '\n');
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
-            if (std.mem.endsWith(u8, line, " Packages")) return true;
+            if (!std.mem.endsWith(u8, line, " Packages")) continue;
+            const head = line[0 .. line.len - " Packages".len];
+            const space = std.mem.lastIndexOfScalar(u8, head, ' ') orelse continue;
+            const arch = head[space + 1 ..];
+            if (arch.len == 0) continue;
+            for (out.items) |seen| {
+                if (std.mem.eql(u8, seen, arch)) break;
+            } else try out.append(arena, arch);
         }
-        return false;
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Refuse the rows apt has a package for but would not install, and
+    /// answer with the rest.
+    ///
+    /// A hold and a pin are decisions about the machine that neither the
+    /// index nor the package list knows about, and apt-get answers a batch
+    /// carrying one by installing NOTHING: verified against apt 2.6.1 and
+    /// 3.0.3, `apt-get install -y -qq -- sl bat` exits 100 with "Held
+    /// packages were changed and -y was used without
+    /// --allow-change-held-packages" when `sl` is held, and with "Package
+    /// 'cowsay' has no installation candidate" when a `Pin-Priority: -1`
+    /// rejects every version of it -- and `bat` lands neither time. So one
+    /// such row would keep every other package in the manifest off the
+    /// machine, which is exactly what a row-level refusal exists to prevent.
+    ///
+    /// Not overridden: `--allow-change-held-packages` would install over a
+    /// hold the user put there, and a pin is the same decision written in
+    /// apt's preferences. The row is refused and the machine left as its
+    /// owner set it up.
+    fn refuseAptUninstallable(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
+        if (rows.len == 0) return rows;
+        const held = try self.aptHeld(arena);
+        const candidates = try self.aptCandidates(arena, rows);
+
+        var keep: std.ArrayList(Row) = .empty;
+        for (rows) |row| {
+            if (held.contains(row.name)) {
+                self.say(
+                    "mox: apt: row \"{s}\" names a package apt-mark holds, and an install carrying a held package installs nothing at all, so it was not installed; `apt-mark unhold {s}` to let mox install it\n",
+                    .{ row.name, row.name },
+                );
+                continue;
+            }
+            if (candidates.get(row.name)) |has_candidate| {
+                if (!has_candidate) {
+                    self.say(
+                        "mox: apt: row \"{s}\" names a package apt has no installation candidate for, which a pin in apt's preferences does, and an install carrying it installs nothing at all, so it was not installed\n",
+                        .{row.name},
+                    );
+                    continue;
+                }
+            }
+            try keep.append(arena, row);
+        }
+        return keep.toOwnedSlice(arena);
+    }
+
+    /// The names `apt-mark showhold` reports, one per line. It spells a
+    /// foreign-architecture package `name:arch`, which is how a row spells
+    /// one too, so a row name compares directly.
+    fn aptHeld(self: *Distro, arena: std.mem.Allocator) anyerror!std.StringHashMap(void) {
+        const res = try self.runner.run(arena, &.{ "apt-mark", "showhold" });
+        try exec.checkTimedOut(res);
+        if (!res.ok) return Error.DistroQueryFailed;
+
+        var set = std.StringHashMap(void).init(arena);
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            try set.put(line, {});
+        }
+        return set;
+    }
+
+    /// Whether apt has an installation candidate for each row, asked for the
+    /// whole batch at once.
+    ///
+    /// `apt-cache policy` prints a stanza per package: a header at column
+    /// zero -- the name apt resolves the operand to, then a `:` -- and
+    /// indented lines, of which `Candidate:` is the version apt would
+    /// install or `(none)`. It falls back to a regex only when no package is
+    /// named exactly, and every row reaching here named one, so each answers
+    /// with a single stanza whose header is the row's own name.
+    fn aptCandidates(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!std.StringHashMap(bool) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ "apt-cache", "policy" });
+        for (rows) |row| try argv.append(arena, row.name);
+        const res = try self.runner.run(arena, argv.items);
+        try exec.checkTimedOut(res);
+        if (!res.ok) return Error.DistroQueryFailed;
+
+        var out = std.StringHashMap(bool).init(arena);
+        var name: ?[]const u8 = null;
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (line[0] != ' ' and line[0] != '\t') {
+                name = if (std.mem.endsWith(u8, line, ":")) line[0 .. line.len - 1] else null;
+                continue;
+            }
+            const field = std.mem.trimStart(u8, line, " \t");
+            const value = stringAfter(field, "Candidate:") orelse continue;
+            const key = name orelse continue;
+            try out.put(key, !std.mem.eql(u8, value, "(none)"));
+        }
+        return out;
+    }
+
+    /// The first architecture other than `native` that apt has `name` under,
+    /// or null when apt has it under none.
+    fn aptForeignArchOf(self: *Distro, arena: std.mem.Allocator, name: []const u8, native: []const u8) anyerror!?[]const u8 {
+        for (try self.aptArchesOf(arena, name)) |arch| {
+            if (!std.mem.eql(u8, arch, native)) return arch;
+        }
+        return null;
     }
 
     /// Whether `arch` is one of apt's own names for the native package rather
@@ -565,6 +733,13 @@ pub const Distro = struct {
         return std.mem.order(u8, a, b) == .lt;
     }
 
+    /// What follows `prefix` in `line`, trimmed, or null when `line` does not
+    /// begin with it.
+    fn stringAfter(line: []const u8, prefix: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, line, prefix)) return null;
+        return std.mem.trim(u8, line[prefix.len..], " \t");
+    }
+
     /// Every package pacman's repositories carry, one per line, and the
     /// members of one group. Verified against pacman 7.1.0: `-Slq` lists
     /// package names alone and no group name among them (15263 names,
@@ -572,7 +747,7 @@ pub const Distro = struct {
     /// per member and exits 1 on a name that is not a group.
     const pacman_names_argv = [_][]const u8{ "pacman", "-Slq" };
 
-    /// Refuse the rows pacman would not install under their own name, and
+    /// Refuse the rows `pacman -Sg` positively identifies as a GROUP, and
     /// answer with the rest.
     ///
     /// A group is spelled exactly like a package and passes every shape rule
@@ -587,6 +762,11 @@ pub const Distro = struct {
     /// and not the group's kdevelop-php and kdevelop-python. `base` and
     /// `base-devel` are packages in their own right now, so they pass here
     /// while `pacman -Sg base-devel` says it is no group.
+    ///
+    /// Only a group is refused. A name neither query knows is KEPT: the
+    /// listing is whatever this machine last synced, and refusing what it
+    /// merely failed to find would refuse installable packages on any machine
+    /// whose database is a few days old.
     fn refusePacmanNonPackages(self: *Distro, arena: std.mem.Allocator, rows: []const Row, elevate: bool) anyerror![]const Row {
         // Both queries read the sync database, and a container or a fresh
         // machine has never downloaded one: unsynced, `pacman -Slq` exits 0
@@ -627,10 +807,17 @@ pub const Distro = struct {
             }
             const members = try self.pacmanGroupMembers(arena, row.name);
             if (members.len == 0) {
-                self.say(
-                    "mox: pacman: row \"{s}\" names no pacman package in this machine's repositories\n",
-                    .{row.name},
-                );
+                // Absence from the listing is not evidence against the row
+                // here, where it is for apt: mox runs `apt-get update` itself
+                // immediately before reading apt's listing, so that listing
+                // answers for the index the install will resolve against,
+                // while pacman's sync database is whatever the machine last
+                // downloaded -- the normal state of an Arch machine between
+                // upgrades. The install argv is `pacman -Syu`, which syncs
+                // before it resolves, so a name this database has never heard
+                // of may well be a package once it has; pacman reports a name
+                // that is truly wrong itself.
+                try keep.append(arena, row);
                 continue;
             }
             var list: std.Io.Writer.Allocating = .init(arena);
@@ -687,6 +874,11 @@ pub const Distro = struct {
 };
 
 const testing = std.testing;
+
+/// The bare-name listing argv the apt adapter builds for `native`.
+fn aptNamesCall(comptime native: []const u8) []const u8 {
+    return "apt-cache -o APT::Architectures=" ++ native ++ " -o Dir::State::status=/dev/null --generate pkgnames";
+}
 
 fn rowOf(name: []const u8, fields: []const manifest_mod.Pair) Row {
     return .{
@@ -764,8 +956,10 @@ test "install: apt as root refreshes without sudo too" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\nnano\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nnano\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
@@ -784,8 +978,10 @@ test "install: apt refreshes the index, then installs the whole set at once, deb
     // from the environment along with everything else.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\nfd-find\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nfd-find\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
@@ -1036,8 +1232,10 @@ test "install: the install argv is exactly this, per manager" {
     }) |c| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
-            .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\n" },
             .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+            .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
+            .{ .argv = "apt-mark showhold" },
+            .{ .argv = "apt-cache policy", .match = .prefix },
             .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
             .{ .argv = "sudo pacman -Sy --noconfirm" },
             .{ .argv = "pacman -Slq", .stdout = "bat\n" },
@@ -1089,8 +1287,9 @@ test "install: apt refuses a name it would resolve as a regular expression" {
     // the name class must keep for `python3.11`.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\nbsdextrautils\nnano\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nbsdextrautils\nnano\n" },
+        .{ .argv = "apt-cache madison bsdextrautil.", .stdout = "" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -1113,7 +1312,11 @@ test "install: apt refuses the bad names and installs the rest of the batch" {
     // One row nobody can install must not keep the others off the machine.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "bat\n" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
+        .{ .argv = "apt-cache madison", .match = .prefix, .stdout = "" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1149,6 +1352,8 @@ test "install: a foreign-architecture row is asked about as written, never by it
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
@@ -1198,8 +1403,8 @@ test "install: apt refuses a qualifier naming this machine's own architecture" {
     // the qualified row would read as missing after every install.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "bsdextrautils\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "bsdextrautils\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -1219,7 +1424,8 @@ test "install: a name query that cannot run stops the install, never waves it th
 
     var apt: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .code = 100 },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .code = 100 },
     } };
     var d: Distro = .{ .manager = .apt, .runner = apt.runner(), .force_elevate = false };
     try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -1327,24 +1533,29 @@ test "install: pacman refuses a group, naming the packages to declare instead" {
     }
 }
 
-test "install: pacman refuses a name no repository carries" {
+test "install: pacman installs a name its database has not heard of, rather than refusing it" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Proved with pacman 7.1.0 synced from the 2024-01-01 Arch archive and
+    // then pointed at a current mirror: `pacman -Slq` answers 13801 names and
+    // has none of `ghostty`, `uv`, `zed` or `opencode`, all four of which the
+    // current repositories carry. The install argv is `pacman -Syu`, which
+    // syncs before it resolves, so absence from this database says nothing
+    // about the row and pacman itself answers for a name that is truly wrong.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Slq", .stdout = "bat\nripgrep\n" },
-        .{ .argv = "pacman -Sg ripgrepp", .code = 1 },
+        .{ .argv = "pacman -Sg ghostty", .code = 1 },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- ghostty" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
-    try d.backend().install(a, &.{rowOf("ripgrepp", &.{})});
-    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
-    try testing.expectEqualStrings(
-        "mox: pacman: row \"ripgrepp\" names no pacman package in this machine's repositories\n",
-        w.written(),
-    );
+    try d.backend().install(a, &.{rowOf("ghostty", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- ghostty"));
 }
 
 test "install: pacman takes a name that is a package and a group both" {
@@ -1441,8 +1652,8 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
     }) |c| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-            .{ .argv = "apt-cache --generate pkgnames", .stdout = "bsdextrautils\nbsdmainutils\nsl\n" },
             .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+            .{ .argv = aptNamesCall("arm64"), .stdout = "bsdextrautils\nbsdmainutils\nsl\n" },
         } };
         var w: std.Io.Writer.Allocating = .init(a);
         var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -1467,6 +1678,8 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
             .argv = "apt-cache madison libc6:armhf",
             .stdout = "libc6:armhf | 2.41-12+deb13u4 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- libc6:armhf" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = ok.runner(), .force_elevate = false };
@@ -1483,14 +1696,15 @@ test "install: a listing that answers nothing stops the install, saying which" {
     // machine, and name a cause none of the rows has.
     var apt: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = apt.runner(), .force_elevate = false, .err = &w.writer };
 
     try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expectEqualStrings(
-        "mox: apt: `apt-cache --generate pkgnames` lists no packages at all, which is a machine with no repositories configured rather than a row that names none, so no row could be checked and nothing was installed\n",
+        "mox: apt: `" ++ comptime aptNamesCall("amd64") ++ "` lists no packages at all, which is a machine with no repositories configured rather than a row that names none, so no row could be checked and nothing was installed\n",
         w.written(),
     );
     try testing.expect(!d.backend().installSpawned());
@@ -1521,14 +1735,15 @@ test "install: a listing past the cap stops the install, saying that is what hap
     // that names no package.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .fail = error.StreamTooLong },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .fail = error.StreamTooLong },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
 
     try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expectEqualStrings(
-        "mox: apt: `apt-cache --generate pkgnames` answered with more than the 8 MiB mox reads from one query, so no row could be checked against it and nothing was installed\n",
+        "mox: apt: `" ++ comptime aptNamesCall("amd64") ++ "` answered with more than the 8 MiB mox reads from one query, so no row could be checked against it and nothing was installed\n",
         w.written(),
     );
 }
@@ -1550,7 +1765,8 @@ test "install: whether the manager ran is what says the rows may have landed" {
 
     var timeout: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .timed_out = true },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .timed_out = true },
     } };
     var d2: Distro = .{ .manager = .apt, .runner = timeout.runner(), .force_elevate = false };
     try testing.expectError(error.TimedOut, d2.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -1643,12 +1859,14 @@ test "install: a foreign-architecture row beside a good one installs both" {
     // it, `sl` never lands either.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "apt-cache --generate pkgnames", .stdout = "sl\nbat\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "sl\nbat\n" },
         .{
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf sl" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
@@ -1656,4 +1874,175 @@ test "install: a foreign-architecture row beside a good one installs both" {
     try d.backend().install(a, &.{ rowOf("wine32:armhf", &.{}), rowOf("sl", &.{}) });
     try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
     try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf sl"));
+}
+
+test "install: a bare row apt has only for a foreign architecture is refused, naming the qualified spelling" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved against apt 3.0.3 (trixie), 2.8.3 (Ubuntu 24.04) and 2.6.1
+    // (bookworm), each arm64 with armhf added: the plain listing prints
+    // `armv8-support` BARE even though only the armhf index carries it, and
+    // `apt-get install -y -- armv8-support` exits 0 having installed
+    // `armv8-support:armhf`, which `apt-mark showmanual` reports under that
+    // qualified name -- so the row is missing and the package untracked on
+    // every run after, and every apply installs it again.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nsl\n" },
+        .{
+            .argv = "apt-cache madison armv8-support",
+            .stdout = "armv8-support:armhf |         27 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("armv8-support", &.{}), rowOf("sl", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"armv8-support\" names an apt package for the architecture \"armhf\" alone, which apt-mark reports as \"armv8-support:armhf\", so the row could never read as installed; declare \"armv8-support:armhf\" instead\n",
+        w.written(),
+    );
+    // The refused row never reached apt-get, and the row beside it did.
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl"));
+}
+
+test "install: the bare-name listing asks for the native architecture alone, and for no dpkg status" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Each option closes a hole measured on apt 2.6.1, 2.8.3 and 3.0.3. The
+    // architecture option drops the 78 armhf-only names the plain listing
+    // prints bare on trixie; the status option drops the dpkg status file,
+    // which prints an already-installed foreign package bare and keeps the
+    // listing non-empty (78 lines on trixie, 88 on bookworm) on a machine
+    // with no repositories at all.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(fake.called(
+        "apt-cache -o APT::Architectures=amd64 -o Dir::State::status=/dev/null --generate pkgnames",
+    ));
+}
+
+test "install: apt refuses a held row and installs the rest of the batch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved on apt 3.0.3: with `sl` held, `apt-get install -y -qq -- sl bat`
+    // exits 100 with "Held packages were changed and -y was used without
+    // --allow-change-held-packages" and `bat` does not land either. The hold
+    // is the user's decision, so the row goes rather than the hold.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nsl\n" },
+        .{ .argv = "apt-mark showhold", .stdout = "sl\n" },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = "bat:\n  Installed: (none)\n  Candidate: 0.25.0-2\n" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("sl", &.{}), rowOf("bat", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"sl\" names a package apt-mark holds, and an install carrying a held package installs nothing at all, so it was not installed; `apt-mark unhold sl` to let mox install it\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat"));
+    // The hold is never overridden.
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "allow-change-held-packages") == null);
+}
+
+test "install: apt refuses a row a pin leaves no candidate for, and installs the rest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved on apt 3.0.3: with `Pin-Priority: -1` on cowsay, `apt-cache
+    // policy cowsay` answers `Candidate: (none)` and `apt-get install -y -qq
+    // -- cowsay bat` exits 100 with "Package 'cowsay' has no installation
+    // candidate", leaving `bat` uninstalled too.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = aptNamesCall("amd64"), .stdout = "bat\ncowsay\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{
+            .argv = "apt-cache policy cowsay bat",
+            .stdout =
+            \\cowsay:
+            \\  Installed: (none)
+            \\  Candidate: (none)
+            \\  Version table:
+            \\     3.03+dfsg2-8 -1
+            \\        500 http://deb.debian.org/debian trixie/main amd64 Packages
+            \\bat:
+            \\  Installed: (none)
+            \\  Candidate: 0.25.0-2+b2
+            \\  Version table:
+            \\     0.25.0-2+b2 500
+            \\        500 http://deb.debian.org/debian trixie/main amd64 Packages
+            \\
+            ,
+        },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("cowsay", &.{}), rowOf("bat", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"cowsay\" names a package apt has no installation candidate for, which a pin in apt's preferences does, and an install carrying it installs nothing at all, so it was not installed\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat"));
+}
+
+test "install: a qualified row is judged by its own policy stanza, which carries the architecture" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 3.0.3: `apt-cache policy libc6:armhf` heads its stanza
+    // `libc6:armhf:`, which is how the row spells it, so a pin on the foreign
+    // package is read against the right row.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = "apt-cache madison libc6:armhf",
+            .stdout = "libc6:armhf | 2.41-12+deb13u4 | http://deb.debian.org/debian trixie/main armhf Packages\n",
+        },
+        .{ .argv = "apt-mark showhold" },
+        .{
+            .argv = "apt-cache policy libc6:armhf",
+            .stdout = "libc6:armhf:\n  Installed: (none)\n  Candidate: (none)\n",
+        },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("libc6:armhf", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expect(std.mem.indexOf(u8, w.written(), "row \"libc6:armhf\" names a package apt has no installation candidate for") != null);
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "apt-get install") == null);
 }

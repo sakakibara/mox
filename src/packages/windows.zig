@@ -345,11 +345,10 @@ pub const Winget = struct {
     ///
     /// `source` is a source name, which is one token, so it is held to the
     /// narrow class. `override` is held to neither, and cannot be: it exists
-    /// to hand arguments on to the package's own installer, so the space and
-    /// the slash an installer argument needs are what it is for. What it may
-    /// not hold is a `"` or a control byte -- bytes no argv can carry intact
-    /// across both of Windows' command-line parsers, so a value holding one
-    /// is not the value the installer would receive.
+    /// to hand arguments on to the package's own installer, so the space,
+    /// the slash and the quote an installer argument needs are what it is
+    /// for. winget is spawned directly, so the only byte it may not hold is
+    /// a control byte, which no argv carries intact.
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
         if (backend_mod.nameProblem(row.name, .identifier)) |problem| {
             if (diag) |d| d.set(
@@ -439,7 +438,16 @@ pub const Winget = struct {
         var failed = false;
         for (rows) |row| {
             var argv: std.ArrayList([]const u8) = .empty;
-            try argv.appendSlice(arena, &.{ "winget", "install", "--id", row.name });
+            // `--id` restricts which FIELD is searched, not how it matches:
+            // the default is a case-insensitive substring match, so without
+            // `--exact` the row `microsoft.powershell` installs
+            // `Microsoft.PowerShell` and an id that is a substring of
+            // another package's id installs that other package. Either way
+            // `winget export` reports an identifier no row spells, so the
+            // row is missing and the package untracked on every run after.
+            // It is also what `isInstalled` asks with, which could otherwise
+            // not confirm what the install put there.
+            try argv.appendSlice(arena, &.{ "winget", "install", "--id", row.name, "--exact" });
             if (stringField(row, "source")) |v| try argv.appendSlice(arena, &.{ "--source", v });
             if (stringField(row, "scope")) |v| try argv.appendSlice(arena, &.{ "--scope", v });
             if (stringField(row, "override")) |v| try argv.appendSlice(arena, &.{ "--override", v });
@@ -820,7 +828,7 @@ test "winget: install carries source, scope and override, and both agreements" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "winget install --id Microsoft.PowerShell --source winget --scope machine " ++
+        .{ .argv = "winget install --id Microsoft.PowerShell --exact --source winget --scope machine " ++
             "--override /SILENT --no-upgrade --accept-package-agreements --accept-source-agreements" },
     } };
     var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
@@ -839,13 +847,13 @@ test "winget: a bare row installs with the agreements alone" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements" },
+        .{ .argv = "winget install --id Git.Git --exact --no-upgrade --accept-package-agreements --accept-source-agreements" },
     } };
     var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
 
     try w.backend().install(a, &.{wingetRow("Git.Git", &.{})});
     try testing.expect(fake.called(
-        "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements",
+        "winget install --id Git.Git --exact --no-upgrade --accept-package-agreements --accept-source-agreements",
     ));
 }
 
@@ -857,7 +865,7 @@ test "winget: an install that failed is asked about, not read from its exit code
     // An install that failed is asked about rather than read from its exit
     // code: winget answers that the package is there, so the row landed.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
+        .{ .argv = "winget install --id Git.Git --exact --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
         .{ .argv = "winget list --id Git.Git --exact --accept-source-agreements", .stdout = "Name  Id       Version\nGit   Git.Git  2.46\n" },
     } };
     var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
@@ -867,7 +875,7 @@ test "winget: an install that failed is asked about, not read from its exit code
     // The same exit code, but winget does not have it: a real failure, and
     // no exit code could have told the two apart.
     var other: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
+        .{ .argv = "winget install --id Git.Git --exact --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
         .{ .argv = "winget list --id Git.Git --exact --accept-source-agreements", .stdout = "No installed package found matching input criteria.\n" },
     } };
     var w2: Winget = .{ .runner = other.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
@@ -1106,7 +1114,7 @@ test "validate: the bucket value that would leave its own argv on Windows is ref
         be.validate(scoopRow("ripgrep", &.{.{ .key = "bucket", .value = .{ .string = injection } }}), &d),
     );
     try testing.expectEqualStrings(
-        "data/packages/windows.toml: row \"ripgrep\": \"bucket\" names a bucket, and a bucket name holds no \" character, which Windows' two command-line parsers disagree about, so a value carrying one can leave its own argument and become several",
+        "data/packages/windows.toml: row \"ripgrep\": \"bucket\" names a bucket, and a bucket name holds no \" character, which PowerShell's -File parser and Windows' argv serializer disagree about, so a value carrying one can leave its own argument and become several",
         d.capture().?,
     );
 
@@ -1199,14 +1207,79 @@ test "validate: a winget row names an identifier, and its fields are shaped for 
     ));
     try be.validate(wingetRow("Git.Git", &.{.{ .key = "source", .value = .{ .string = "winget" } }}), null);
 
-    // `override` is the installer's own command line, so the space and the
-    // slash it needs are what it is for; a quote is not, because no argv
-    // carries one intact across both of Windows' parsers.
+    // `override` is the installer's own command line, so the space, the
+    // slash and the quote it needs are what it is for: winget is spawned
+    // directly, so `CommandLineToArgvW` inside winget.exe reverses Zig's
+    // escaping and the quoted argument arrives whole.
     try be.validate(wingetRow("Git.Git", &.{.{ .key = "override", .value = .{ .string = "/SILENT /NORESTART" } }}), null);
+    try be.validate(wingetRow("Git.Git", &.{.{ .key = "override", .value = .{ .string = "/DIR=\"C:\\Program Files\\App\"" } }}), null);
+
+    // A control byte is what no argv carries.
     var d2: Diag = .{};
     try testing.expectError(Error.BadWingetValue, be.validate(
-        wingetRow("Git.Git", &.{.{ .key = "override", .value = .{ .string = "/DIR=\"C:\\x\"" } }}),
+        wingetRow("Git.Git", &.{.{ .key = "override", .value = .{ .string = "/SILENT\r\n/DIR=x" } }}),
         &d2,
     ));
     try testing.expect(std.mem.indexOf(u8, d2.capture().?, "\"override\"") != null);
+}
+
+test "winget: an install matches the identifier exactly, never as a substring" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `--id` restricts the field searched, not the match type: winget's
+    // default is a case-insensitive substring match, so without `--exact` the
+    // row `microsoft.powershell` installs `Microsoft.PowerShell` and an id
+    // that is a substring of another package's id installs that other
+    // package. Either way `winget export` reports an identifier no row
+    // spells. It is also what `list` is asked with, so the two agree.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "winget install --id Microsoft.PowerShell --exact --no-upgrade --accept-package-agreements --accept-source-agreements" },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+
+    try w.backend().install(a, &.{wingetRow("Microsoft.PowerShell", &.{})});
+    for (fake.calls.items) |c| {
+        try testing.expect(std.mem.indexOf(u8, c, " --exact") != null);
+    }
+}
+
+test "winget: a row naming a source installs from that source, exactly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "winget install --id Git.Git --exact --source winget --no-upgrade --accept-package-agreements --accept-source-agreements" },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+
+    try w.backend().install(a, &.{wingetRow("Git.Git", &.{.{ .key = "source", .value = .{ .string = "winget" } }})});
+    try testing.expect(fake.called(
+        "winget install --id Git.Git --exact --source winget --no-upgrade --accept-package-agreements --accept-source-agreements",
+    ));
+}
+
+test "winget: an override carrying a quoted installer argument is accepted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // winget is spawned directly (`argv[0] = "winget"`), so Zig's argv
+    // serializer and the `CommandLineToArgvW` inside winget.exe are the two
+    // halves of one round trip and the quotes an installer argument needs
+    // arrive as themselves.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "winget install --id Some.App --exact --override /DIR=\"C:\\Program Files\\App\" " ++
+                "--no-upgrade --accept-package-agreements --accept-source-agreements",
+        },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+
+    const row = wingetRow("Some.App", &.{.{ .key = "override", .value = .{ .string = "/DIR=\"C:\\Program Files\\App\"" } }});
+    try w.backend().validate(row, null);
+    try w.backend().install(a, &.{row});
+    try testing.expect(fake.calls.items.len == 1);
 }

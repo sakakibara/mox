@@ -115,16 +115,24 @@ All notable changes to mox are documented here. The format follows
 
   Whether a manager HAS a package of that name is asked of the manager
   itself before an install -- apt against `apt-cache --generate pkgnames`,
-  or against `apt-cache madison` for a name carrying an architecture, since
-  the listing omits a package that exists only for a foreign one, dnf
-  against `dnf repoquery`, pacman against `pacman -Slq` -- so a name apt
-  would read as a regular expression, a name that is only an rpm
-  capability, a pacman group, and an apt row carrying the machine's own
-  architecture or apt's `:native`, `:all` or `:any` are each refused with
-  the name to declare instead, having installed nothing. A refused row is
-  its own failure: the rows beside it are installed, since one bad row in a
-  manifest must not keep every other package off the machine. `mox apply
-  --dry-run` runs none of those checks -- they refresh an index and elevate,
+  narrowed to the native architecture and to repository packages so a bare
+  row can only mean the package apt-mark would report bare, or against
+  `apt-cache madison` for a name carrying an architecture, dnf against `dnf
+  repoquery`, pacman against `pacman -Sg`, brew against `brew info
+  --json=v2` -- so a name apt would read as a regular expression, a name apt
+  has only for a foreign architecture, a name that is only an rpm
+  capability, a pacman group, a brew alias, and an apt row carrying the
+  machine's own architecture or apt's `:native`, `:all` or `:any` are each
+  refused with the name to declare instead, having installed nothing. apt is
+  asked two more questions, because a held package and a pinned one each
+  make `apt-get install` install nothing at all: `apt-mark showhold` and
+  `apt-cache policy` name the row to refuse, and a hold is never overridden.
+  A name a manager merely cannot find is not refused where absence is no
+  evidence: pacman's database is whatever the machine last synced, and the
+  install syncs it. A refused row is its own failure: the rows beside it are
+  installed, since one bad row in a manifest must not keep every other
+  package off the machine. `mox apply --dry-run` runs none of those checks --
+  they refresh an index and elevate,
   which a dry run may not do -- and says, beside the rows it would install,
   which manager list it left them unchecked against.
 

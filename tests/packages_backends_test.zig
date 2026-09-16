@@ -401,3 +401,52 @@ test "brew: a name after -- is a name, which is why the install argv carries one
         return error.TestUnexpectedResult;
     }
 }
+
+test "brew: the query that resolves a name answers an alias with the formula it stands for" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // Read-only, and the premise of the alias refusal: `brew install ag`
+    // installs `the_silver_searcher`, which is the name `brew list
+    // --full-name --installed-on-request` reports, so an `ag` row would be
+    // missing and that formula untracked on every run.
+    const res = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--formula", "--", "ag", "ripgrep" });
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("brew info --json=v2 -- ag ripgrep did not answer; the alias refusal has no name to offer\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    // Both operands come back in one answer, so the batch can be asked at
+    // once rather than a formula at a time.
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "\"full_name\": \"the_silver_searcher\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "\"full_name\": \"ripgrep\"") != null);
+    // And the alias is recorded under the formula, which is what maps a row
+    // back to the name to declare.
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "\"ag\"") != null);
+}
+
+test "brew: a cask resolves through the same query, under its own key" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    const tokens = try rawLines(a, io, &.{ "brew", "list", "--cask", "--full-name" });
+    const token = if (tokens.len > 0) tokens[0] else {
+        std.debug.print("brew: no cask installed here; the cask resolution check has nothing to ask about\n", .{});
+        return error.SkipZigTest;
+    };
+
+    const res = try runBrew(a, io, &.{ "brew", "info", "--json=v2", "--cask", "--", token });
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("brew info --json=v2 --cask did not answer; a cask row cannot be resolved\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    const want = try std.fmt.allocPrint(a, "\"full_token\": \"{s}\"", .{token});
+    try testing.expect(std.mem.indexOf(u8, res.stdout, want) != null);
+}

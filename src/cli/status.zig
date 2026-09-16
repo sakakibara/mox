@@ -10,7 +10,8 @@ const drift_report = @import("drift_report.zig");
 const display = @import("display.zig");
 
 /// One status cell: the label to print and whether it counts against the
-/// exit code (the scripting contract: rc 1 when any file needs attention).
+/// exit code (the scripting contract: rc 1 when any file or package needs
+/// attention).
 const Cell = struct { label: []const u8, problem: bool };
 
 /// Map an apply disposition to its status label. `MISSING`/`OUTDATED`/`DRIFT`
