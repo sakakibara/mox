@@ -768,25 +768,41 @@ pub fn runCheck(
 
     if (child.id) |id| signals.hold(id);
 
-    var timed_out = false;
+    var guard: job.Guard = .{};
     var killer: ?Io.Future(void) = null;
     if (timeout_ms > 0) {
         if (child.id) |id| {
             const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } };
             // No thread for the watchdog: an unbounded wait beats a
             // running child nobody reaps.
-            killer = io.concurrent(killGroupAfter, .{ io, t, id, &timed_out }) catch |e| switch (e) {
+            killer = io.concurrent(job.killGroupAfter, .{ io, t, id, &guard }) catch |e| switch (e) {
                 error.ConcurrencyUnavailable => null,
             };
         }
     }
     // `wait` clears the id as it reaps, so the group to sweep is remembered.
     const child_group = child.id;
-    const term = child.wait(io) catch |e| {
+    // Waited on by hand: a checker writes to a file and never holds the
+    // terminal, so one that reads the terminal anyway (anything reaching for
+    // `sudo`) stops where nothing can answer it, and a plain wait would sit
+    // there for the whole bound -- or forever, where the bound is disabled.
+    const term = job.waitFor(io, &child, null) catch |e| {
+        guard.reaped.store(true, .release);
         if (killer) |*k| _ = k.cancel(io);
-        if (child_group) |id| _ = job.killGroupOf(id);
+        if (e != error.StoppedWantingTerminal) {
+            if (child_group) |id| _ = job.killGroupOf(id);
+        }
+        if (e == error.StoppedWantingTerminal) {
+            out_file.close(io);
+            out_open = false;
+            return .{
+                .refusal = "stopped, and this run has no terminal that could resume it; killed",
+                .tail = readTail(arena, io, output_path),
+            };
+        }
         return e;
     };
+    guard.reaped.store(true, .release);
     signals.release();
     if (killer) |*k| _ = k.cancel(io);
 
@@ -794,7 +810,7 @@ pub fn runCheck(
     out_open = false;
     const tail = readTail(arena, io, output_path);
 
-    if (timed_out) {
+    if (guard.fired) {
         // The group outlives the reaped leader for as long as a member does;
         // whatever the checker left running goes with it.
         if (child_group) |id| _ = job.killGroupOf(id);
@@ -827,16 +843,6 @@ fn checkSpawnOpts(argv: []const []const u8, environ_map: *const EnvironMap, repo
     };
     if (builtin.os.tag != .windows) opts.pgid = 0;
     return opts;
-}
-
-/// Bound a child by killing its whole process group (its pgid equals its
-/// pid, set at spawn), so the bound reaches what the script started and not
-/// the script alone. Never reaps: the caller's wait does. A canceled sleep
-/// (the child finished first) returns without killing.
-fn killGroupAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
-    timeout.sleep(io) catch return;
-    fired.* = true;
-    _ = job.killGroupOf(id);
 }
 
 /// The last `check_tail_bytes` of the file at `path`; empty when unreadable.
@@ -927,14 +933,14 @@ fn runOne(
 
     // Bound the wait: a background task terminates the child once the timeout
     // elapses, unblocking the wait; cancel it if the script finishes first.
-    var timed_out = false;
+    var guard: job.Guard = .{};
     var killer: ?Io.Future(void) = null;
     if (timeout_ms > 0) {
         if (child.id) |id| {
             const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } };
             // No thread for the watchdog: an unbounded wait beats a
             // running child nobody reaps.
-            killer = io.concurrent(killGroupAfter, .{ io, t, id, &timed_out }) catch |e| switch (e) {
+            killer = io.concurrent(job.killGroupAfter, .{ io, t, id, &guard }) catch |e| switch (e) {
                 error.ConcurrencyUnavailable => null,
             };
         } else {
@@ -953,23 +959,27 @@ fn runOne(
     // would then never return.
     stdout.flush() catch {};
     stderr.flush() catch {};
-    const term = job.waitFor(io, &child, tty, true) catch |e| {
+    const term = job.waitFor(io, &child, tty) catch |e| {
+        guard.reaped.store(true, .release);
         if (killer) |*k| _ = k.cancel(io);
         if (tty) |t| t.takeBack();
-        if (child_group) |id| _ = job.killGroupOf(id);
         if (e == error.StoppedWantingTerminal) {
-            stderr.print("mox apply: {s}: stopped waiting for a terminal this run does not have; killed\n", .{path}) catch {};
+            // Already killed and reaped by the wait; sweeping again would
+            // signal a pid the system may have handed on.
+            stderr.print("mox apply: {s}: stopped, and this run has no terminal that could resume it; killed\n", .{path}) catch {};
         } else {
+            if (child_group) |id| _ = job.killGroupOf(id);
             stderr.print("mox apply: {s}: wait failed: {s}\n", .{ path, @errorName(e) }) catch {};
         }
         result.failed += 1;
         return;
     };
+    guard.reaped.store(true, .release);
     signals.release();
     if (killer) |*k| _ = k.cancel(io);
     if (tty) |t| t.takeBack();
 
-    if (timed_out) {
+    if (guard.fired) {
         // The group outlives the reaped leader for as long as a member
         // does; whatever the script left running goes with it.
         if (child_group) |id| _ = job.killGroupOf(id);

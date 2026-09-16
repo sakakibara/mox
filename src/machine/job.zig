@@ -55,6 +55,16 @@ pub const own_group: ?std.posix.pid_t = if (builtin.os.tag == .windows) null els
 /// terminal (an explicit `kill`) ends mox inside the handler, before the
 /// wait `dieOfInterrupt` follows can return.
 ///
+/// The four handled are the terminal's own ways of ending a process: INT
+/// (Ctrl-C), QUIT (Ctrl-backslash), HUP (the terminal itself going away) and TERM.
+/// Each is delivered to mox's group alone whenever the child does not hold
+/// the terminal, so each must take the child's group with it.
+///
+/// An instance saves whatever group was held when it was installed and puts
+/// that back, so one live call inside another leaves the outer call's child
+/// still reachable rather than disarmed. Nothing nests today; the saving is
+/// what makes that a property rather than a coincidence.
+///
 /// Windows has neither process groups nor these signals.
 pub const SpawnSignals = if (builtin.os.tag == .windows) NoSpawnSignals else PosixSpawnSignals;
 
@@ -76,8 +86,11 @@ pub const PosixSpawnSignals = struct {
     var default: std.posix.Sigaction = undefined;
 
     int: std.posix.Sigaction,
+    quit: std.posix.Sigaction,
     term: std.posix.Sigaction,
     hup: std.posix.Sigaction,
+    /// The group this instance found held, put back when it is done with it.
+    saved: i32,
 
     pub fn install() PosixSpawnSignals {
         default = .{
@@ -91,7 +104,9 @@ pub const PosixSpawnSignals = struct {
             .flags = 0,
         };
         var self: PosixSpawnSignals = undefined;
+        self.saved = group.load(.acquire);
         std.posix.sigaction(.INT, &act, &self.int);
+        std.posix.sigaction(.QUIT, &act, &self.quit);
         std.posix.sigaction(.TERM, &act, &self.term);
         std.posix.sigaction(.HUP, &act, &self.hup);
         return self;
@@ -104,13 +119,14 @@ pub const PosixSpawnSignals = struct {
     /// Let the group go the moment it is reaped, so a signal arriving in the
     /// window before the dispositions are restored cannot reach a pid the
     /// system has already handed to someone else.
-    pub fn release(_: PosixSpawnSignals) void {
-        group.store(0, .release);
+    pub fn release(self: PosixSpawnSignals) void {
+        group.store(self.saved, .release);
     }
 
     pub fn restore(self: PosixSpawnSignals) void {
-        group.store(0, .release);
+        group.store(self.saved, .release);
         std.posix.sigaction(.INT, &self.int, null);
+        std.posix.sigaction(.QUIT, &self.quit, null);
         std.posix.sigaction(.TERM, &self.term, null);
         std.posix.sigaction(.HUP, &self.hup, null);
     }
@@ -207,19 +223,40 @@ pub fn dieOfInterrupt() noreturn {
     std.process.exit(130);
 }
 
-/// The wait a spawn does. A streamed child holding the terminal is waited on
-/// here rather than by `Child.wait`, which asks only for a child that ended:
-/// the Ctrl-Z the terminal sends that child stops it, `wait4` then never
-/// returns, and mox hangs forever with the terminal still the child's -- the
-/// shell blocked on a mox that is not itself stopped, so not even `fg`
-/// reaches it. Every other call keeps the ordinary wait.
-pub fn waitFor(io: Io, child: *std.process.Child, tty: ?Terminal, streamed: bool) anyerror!std.process.Child.Term {
-    // Every streamed child is waited for by hand, terminal or not: a child
-    // that stops is invisible to a plain wait, which would then never
-    // return. With a terminal the stop is a job control the user asked for;
-    // without one it is a child that wanted a terminal mox cannot give it.
-    if (builtin.os.tag != .windows and streamed) return waitStreamed(child, tty);
-    return child.wait(io);
+/// The wait a spawn does. Every child is waited on here rather than by
+/// `Child.wait`, which asks only for a child that ended: a child that stops
+/// is invisible to it, so the wait never returns. A streamed child holding
+/// the terminal stops on Ctrl-Z, and mox would hang with the terminal still
+/// the child's -- the shell blocked on a mox that is not itself stopped, so
+/// not even `fg` reaches it. A child with no terminal stops the moment it
+/// reads one (a `sudo` behind a query, a check hook in a background group),
+/// and there is nothing to resume it at all.
+pub fn waitFor(io: Io, child: *std.process.Child, tty: ?Terminal) anyerror!std.process.Child.Term {
+    // Every child is waited for by hand, streamed or captured, terminal or
+    // not: a child that stops is invisible to a plain wait, which asks only
+    // for one that ended, and the wait would then never return. With a
+    // terminal the stop is a job control the user asked for; without one it
+    // is a child that wanted a terminal mox cannot give it. A captured child
+    // never has one to be given, so a `sudo` behind a query stops there just
+    // as surely, and a bound the user disabled would leave it stopped
+    // forever.
+    if (builtin.os.tag == .windows) return child.wait(io);
+    // Whatever the caller piped is closed here, since the hand wait consumes
+    // the status itself and never reaches `Child.wait`'s own cleanup.
+    defer closePipes(io, child);
+    return waitStreamed(child, tty);
+}
+
+/// Close what `spawn` opened on mox's side and clear it, the way `Child.wait`
+/// does as it reaps. A stream the caller asked to inherit has no handle here
+/// and is not touched.
+fn closePipes(io: Io, child: *std.process.Child) void {
+    for ([_]*?Io.File{ &child.stdin, &child.stdout, &child.stderr }) |slot| {
+        if (slot.*) |f| {
+            f.close(io);
+            slot.* = null;
+        }
+    }
 }
 
 /// Wait for a streamed child, answering a stop the
@@ -267,6 +304,14 @@ pub fn waitStreamed(child: *std.process.Child, tty: ?Terminal) error{ Unexpected
 
 /// Stop mox itself under SIGTSTP's default disposition, the way a shell's
 /// foreground job stops, and leave the disposition as it was found.
+///
+/// This answers a stop the way the thing above mox expects, which assumes
+/// there is a job-control shell there to notice and to resume it. Under a
+/// terminal with no such shell the stop is discarded (an orphaned group
+/// ignores it) and the wait carries on, which is right. The one shape left
+/// is a supervisor that holds the terminal without job control: there mox
+/// stays stopped, and because it is stopped the bound's watchdog stops with
+/// it -- a stopped process runs nothing, so no bound can outlive one.
 pub fn stopSelf() void {
     const default: std.posix.Sigaction = .{
         .handler = .{ .handler = std.posix.SIG.DFL },
@@ -288,6 +333,31 @@ pub fn termOfStatus(status: u32) std.process.Child.Term {
     return .{ .unknown = status };
 }
 
+/// Shared between the waiter and the deadline task: the waiter marks the
+/// child reaped, and the task marks that it fired so the result is reported
+/// as a timeout. It fires only when its signal reached the child's GROUP, so
+/// a child that exited at the bound is not reported as one -- a pid-directed
+/// kill would not do: a zombie still answers one, and the whole point is to
+/// tell a child that was killed from one that had already finished.
+///
+/// The reaped flag narrows the window in which a kill lands on a pid the
+/// wait has already freed; it does not close it, because reading the flag
+/// and sending the signal are two operations, and the same holds for the
+/// straggler sweep that follows the wait.
+pub const Guard = struct {
+    reaped: std.atomic.Value(bool) = .init(false),
+    fired: bool = false,
+};
+
+/// Bound a child by killing its whole process group once the deadline
+/// passes; never reaps, since the caller's wait does. A canceled sleep (the
+/// child finished first) returns without killing.
+pub fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard: *Guard) void {
+    deadline.sleep(io) catch return;
+    if (guard.reaped.load(.acquire)) return;
+    if (killGroupOf(id)) guard.fired = true;
+}
+
 /// Kill what a timed-out child's group still holds after the child itself
 /// is reaped: a shell's `cmd &` helper ignores the interrupt by POSIX rule,
 /// and the shell exiting on it cancels the watchdog that would have killed
@@ -305,11 +375,18 @@ pub fn killGroup(io: Io, child: *std.process.Child) void {
     child.kill(io);
 }
 
-/// Whether the kill reached the child; a child already gone is not killed.
+/// Whether the kill reached anything still in the child's group. The verdict
+/// comes from the group-directed kill, never the pid-directed one: a reaped
+/// child is a zombie until its parent waits, and a zombie still answers a
+/// pid-directed signal, so that answer cannot tell a child mox killed from
+/// one that had already finished. A group holds its id only while a member
+/// lives, so it can.
 pub fn killGroupOf(id: std.process.Child.Id) bool {
     if (builtin.os.tag == .windows) return killProcess(id);
-    _ = signal(-id, .KILL);
-    return signal(id, .KILL);
+    const reached = signal(-id, .KILL);
+    // The pid too, for a child that somehow leads no group of its own.
+    _ = signal(id, .KILL);
+    return reached;
 }
 
 /// Whether the signal was delivered. A pid nothing answers to (ESRCH) is
@@ -317,4 +394,136 @@ pub fn killGroupOf(id: std.process.Child.Id) bool {
 pub fn signal(pid: std.posix.pid_t, sig: std.posix.SIG) bool {
     std.posix.kill(pid, sig) catch return false;
     return true;
+}
+
+const testing = std.testing;
+
+/// Whether every member of `pgid` is gone within `ms`.
+fn groupGone(io: Io, pgid: std.posix.pid_t, ms: i64) bool {
+    const started = Io.Clock.awake.now(io);
+    while (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < ms) {
+        if (!signal(-pgid, @enumFromInt(0))) return true;
+        const step: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(10), .clock = .awake } };
+        step.sleep(io) catch return false;
+    }
+    return false;
+}
+
+test "SpawnSignals: the terminal's four ways of ending a run are all handled" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var before: [4]std.posix.Sigaction = undefined;
+    const sigs = [_]std.posix.SIG{ .INT, .QUIT, .TERM, .HUP };
+    for (sigs, 0..) |sig, i| std.posix.sigaction(sig, null, &before[i]);
+
+    const signals = SpawnSignals.install();
+    const handler: std.posix.Sigaction.handler_fn = &SpawnSignals.onSignal;
+    for (sigs) |sig| {
+        var during: std.posix.Sigaction = undefined;
+        std.posix.sigaction(sig, null, &during);
+        try testing.expect(during.handler.handler == handler);
+    }
+
+    signals.restore();
+    for (sigs, 0..) |sig, i| {
+        var after: std.posix.Sigaction = undefined;
+        std.posix.sigaction(sig, null, &after);
+        try testing.expect(after.handler.handler == before[i].handler.handler);
+    }
+}
+
+test "SpawnSignals: one call inside another leaves the outer child still reachable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const outer = SpawnSignals.install();
+    defer outer.restore();
+    outer.hold(4242);
+
+    const inner = SpawnSignals.install();
+    inner.hold(4243);
+    try testing.expectEqual(@as(i32, 4243), SpawnSignals.group.load(.acquire));
+    inner.release();
+    // The outer call is still running, so its group must be the one a signal
+    // arriving now would reach.
+    try testing.expectEqual(@as(i32, 4242), SpawnSignals.group.load(.acquire));
+    inner.restore();
+    try testing.expectEqual(@as(i32, 4242), SpawnSignals.group.load(.acquire));
+}
+
+test "killGroupOf: a reaped child that answers a pid signal does not count as reached" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "exit 0" },
+        .stdin = .close,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = own_group,
+    });
+    const id = child.id.?;
+    // Reaped by hand, so the group is empty while the pid is still a zombie
+    // for as long as nothing waits on it: a pid-directed kill succeeds here
+    // and a group-directed one cannot.
+    var raw: c_int = undefined;
+    _ = std.c.waitpid(id, &raw, 0);
+    try testing.expect(!killGroupOf(id));
+    child.id = null;
+    child.stdin = null;
+    child.stdout = null;
+    child.stderr = null;
+}
+
+test "killGroupAfter: a child reaped at the bound is neither killed nor called a timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // The waiter sets this the moment it has the status, before it cancels
+    // the watchdog: a deadline that expires in the window between the two
+    // must not report a run that finished as one that was killed, nor send a
+    // signal to a pid the system may already have handed on.
+    var guard: Guard = .{};
+    guard.reaped.store(true, .release);
+    const deadline: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(5), .clock = .awake } };
+    killGroupAfter(io, deadline.toDeadline(io), std.c.getpid(), &guard);
+    try testing.expect(!guard.fired);
+}
+
+test "killGroupAfter: a child still running at the bound is reached and reported" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "sleep 300 & sleep 300" },
+        .stdin = .close,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = own_group,
+    });
+    const id = child.id.?;
+    var guard: Guard = .{};
+    const deadline: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(20), .clock = .awake } };
+    killGroupAfter(io, deadline.toDeadline(io), id, &guard);
+    try testing.expect(guard.fired);
+    _ = try child.wait(io);
+    try testing.expect(groupGone(io, id, 20_000));
+}
+
+test "waitFor: a captured child that stops is ended, not waited on" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // A captured call never holds the terminal, so a child that reads one
+    // stops with nothing able to answer it.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "kill -STOP $$" },
+        .stdin = .close,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = own_group,
+    });
+    const started = Io.Clock.awake.now(io);
+    try testing.expectError(error.StoppedWantingTerminal, waitFor(io, &child, null));
+    try testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
+    // The pipe mox opened is closed as the wait reaps, exactly as
+    // `Child.wait` would have closed it.
+    try testing.expect(child.stdout == null);
 }

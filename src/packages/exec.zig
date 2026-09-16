@@ -417,7 +417,7 @@ pub const Process = struct {
         // watchdog must really run alongside the wait: `io.async` may run
         // it inline when no thread is spare, which would sleep out the
         // whole bound before the wait even began.
-        var guard: Guard = .{};
+        var guard: job.Guard = .{};
         var killer: ?Io.Future(void) = null;
         if (deadline != .none) {
             if (child.id) |id| {
@@ -435,10 +435,18 @@ pub const Process = struct {
         // `wait` clears `child.id` as it reaps, so the group to sweep must
         // be remembered before it.
         const group = child.id;
-        const term = job.waitFor(io, &child, tty, !captured) catch |e| {
+        const term = job.waitFor(io, &child, tty) catch |e| {
             guard.reaped.store(true, .release);
             if (killer) |*k| _ = k.cancel(io);
             if (tty) |t| t.takeBack();
+            // A wait that failed leaves the child unreaped and its group
+            // live, and `signals.restore` is about to let go of it: nothing
+            // would ever end it. The stop path has already killed and
+            // reaped, so only a pid the system may have handed on is left
+            // there.
+            if (e != error.StoppedWantingTerminal) {
+                if (group) |id| _ = job.killGroupOf(id);
+            }
             return e;
         };
         guard.reaped.store(true, .release);
@@ -464,21 +472,7 @@ pub const Process = struct {
     }
 };
 
-/// Shared between the waiter and the deadline task: the waiter marks the
-/// child reaped, and the task marks that it fired so the result is reported
-/// as a timeout. It fires only when its signal reached a process, so a child
-/// that exited at the bound is not reported as one.
-///
-/// The reaped flag narrows the window in which a kill lands on a pid the
-/// wait has already freed; it does not close it, because reading the flag
-/// and sending the signal are two operations, and the same holds for the
-/// straggler sweep that follows the wait.
-const Guard = struct {
-    reaped: std.atomic.Value(bool) = .init(false),
-    fired: bool = false,
-};
-
-fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard: *Guard) void {
+fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard: *job.Guard) void {
     deadline.sleep(io) catch return;
     if (guard.reaped.load(.acquire)) return;
     if (job.killGroupOf(id)) guard.fired = true;
@@ -489,7 +483,7 @@ fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard:
 /// so only a signal that reaches the manager itself lets `sudo`'s
 /// transaction roll back -- then a kill of the group once the grace has
 /// passed. Windows has neither, so it terminates the direct child.
-fn interruptAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, grace: Io.Timeout, guard: *Guard) void {
+fn interruptAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, grace: Io.Timeout, guard: *job.Guard) void {
     deadline.sleep(io) catch return;
     if (guard.reaped.load(.acquire)) return;
     if (builtin.os.tag == .windows) {
@@ -942,7 +936,7 @@ test "killGroupAfter: a child already gone at the bound is not reported timed ou
 
     // No process has this pid, so the kill reaches nothing and must not
     // count as a timeout.
-    var guard: Guard = .{};
+    var guard: job.Guard = .{};
     const deadline: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(20), .clock = .awake } };
     killGroupAfter(io, deadline.toDeadline(io), 2_147_483_000, &guard);
     try testing.expect(!guard.fired);
@@ -1282,7 +1276,7 @@ test "waitStreamed: consumes the child's status itself and builds the term from 
     try testing.expect(killed.id == null);
 }
 
-test "waitFor: only a streamed call that holds the terminal waits by hand" {
+test "waitFor: every child is waited on by hand, captured or streamed" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
 
@@ -1294,7 +1288,7 @@ test "waitFor: only a streamed call that holds the terminal waits by hand" {
         .stderr = .ignore,
         .pgid = job.own_group,
     });
-    const term = try job.waitFor(io, &child, null, true);
+    const term = try job.waitFor(io, &child, null);
     try testing.expect(term == .exited and term.exited == 5);
     try testing.expect(child.id == null);
 }

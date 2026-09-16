@@ -2635,7 +2635,7 @@ test "run_scripts: a script that stops for a terminal this run cannot give is en
     try std.testing.expect(elapsed_ms < 30_000);
     try std.testing.expectEqual(@as(usize, 0), result.ran);
     try std.testing.expectEqual(@as(usize, 1), result.failed);
-    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "stopped waiting for a terminal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "stopped, and this run has no terminal that could resume it") != null);
 }
 
 test "run_scripts: what a timed-out script left running is killed with it" {
@@ -4907,6 +4907,36 @@ test "apply partial check: a hanging hook is killed within the timeout bound" {
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
     // Killed by the 1500ms bound, not by the checker's 30s sleep ending.
     try std.testing.expect(elapsed < 20);
+}
+
+test "apply partial check: a hook that stops is ended, whatever the bound says" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, check_source);
+    // Stops the way a checker reaching for `sudo` does: it writes to a file,
+    // never the terminal, so it is never the foreground group and the read
+    // stops it. A bound the user disabled leaves nothing to end it.
+    try writeChecker(a, io, &tmp, "#!/bin/sh\nkill -STOP $$\n");
+
+    const c = try testutil.setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MOX_CHECK_TIMEOUT_MS", .value = "0" }},
+    });
+    const started = Io.Clock.real.now(io).toSeconds();
+    const r = try c.run(&.{ "mox", "apply" });
+    const elapsed = Io.Clock.real.now(io).toSeconds() - started;
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no terminal that could resume it") != null);
+    // The stop is answered at once, and never called a timeout: there is no
+    // bound here to time out against.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "timed out") == null);
+    try std.testing.expect(elapsed < 30);
+    try std.testing.expect(!exists(io, try c.homePath("app.toml")));
 }
 
 test "apply partial check: an unparseable MOX_CHECK_TIMEOUT_MS warns exactly once across multiple checked files" {
