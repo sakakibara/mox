@@ -30,6 +30,11 @@ pub const Error = error{
 /// as a failed download.
 pub const max_installer_bytes: usize = 64 << 20;
 
+/// `CURLE_FILESIZE_EXCEEDED`: what curl exits with when `--max-filesize`
+/// refuses the body. wget has no code in this range, so the mapping is only
+/// ever applied to curl's own answer.
+pub const curl_filesize_exceeded: u8 = 63;
+
 /// A declared installer: where to get it and what it must hash to.
 pub const Spec = struct {
     url: []const u8,
@@ -59,23 +64,28 @@ pub fn fetchVerified(
 
     // `--` ends the options: a URL is data even when it starts with `-`.
     const limit = try std.fmt.allocPrint(arena, "{d}", .{max_installer_bytes});
-    const res = runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, "--", spec.url }) catch |e| switch (e) {
+    if (runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, "--", spec.url })) |res| {
+        // curl enforces the cap it was handed and says so with its own exit
+        // code, which is the size refusal by name -- not one more way for a
+        // download to have failed.
+        if (res.code == curl_filesize_exceeded) return Error.BootstrapInstallerTooLarge;
+        if (!res.ok) return Error.BootstrapDownloadFailed;
+    } else |e| switch (e) {
         // wget has no size cap of its own, so it writes to mox's own pipe,
         // where the runner's capture bound stops an endless body on the
         // wire rather than after it has filled the disk.
-        error.FileNotFound => blk: {
+        error.FileNotFound => {
             const got = runner.runCapped(arena, &.{ "wget", "-qO-", "--", spec.url }, max_installer_bytes + 1) catch |e2| switch (e2) {
                 // The runner's capture bound is this cap: one body too big
                 // for it is the oversize installer, named as such.
                 error.StreamTooLong => return Error.BootstrapInstallerTooLarge,
                 else => return e2,
             };
-            if (got.ok) try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = got.stdout });
-            break :blk got;
+            if (!got.ok) return Error.BootstrapDownloadFailed;
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = got.stdout });
         },
         else => return e,
-    };
-    if (!res.ok) return Error.BootstrapDownloadFailed;
+    }
 
     // The read's limit is refused when reached, so one past the cap lets an
     // installer of exactly the cap through, as curl's own cap does.
@@ -95,11 +105,19 @@ fn tmpDir(a: std.mem.Allocator, io: Io, sub: []const u8) ![]const u8 {
     return std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", sub, "scratch" });
 }
 
-/// A runner that "downloads" by writing fixed bytes to the `-o` path.
+/// A runner that "downloads" by writing fixed bytes to the `-o` path, and
+/// that obeys `--max-filesize` the way curl does: a body over the cap is
+/// refused with curl's own exit code and no file is written. A fake that
+/// ignored the flag would let a test assert an outcome production cannot
+/// reach.
 const Downloader = struct {
     io: Io,
     body: []const u8,
     calls: usize = 0,
+    /// A curl that writes the oversize body anyway: what an old curl, or a
+    /// body whose size the server never declared, does. The read-back is then
+    /// the only thing standing between it and the digest check.
+    ignores_cap: bool = false,
 
     fn runner(self: *Downloader) exec.Runner {
         return .{ .ctx = self, .runFn = run, .streamFn = stream };
@@ -109,12 +127,22 @@ const Downloader = struct {
         return run(ctx, a, argv, stdin, exec.max_query_bytes);
     }
 
+    fn valueAfter(argv: []const []const u8, flag: []const u8) ?[]const u8 {
+        for (argv, 0..) |a, i| {
+            if (std.mem.eql(u8, a, flag) and i + 1 < argv.len) return argv[i + 1];
+        }
+        return null;
+    }
+
     fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8, _: usize) anyerror!exec.Result {
         const self: *Downloader = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        const out = for (argv, 0..) |a, i| {
-            if (std.mem.eql(u8, a, "-o")) break argv[i + 1];
-        } else return error.UnexpectedCommand;
+        if (!self.ignores_cap) {
+            const cap = valueAfter(argv, "--max-filesize") orelse return error.UnexpectedCommand;
+            const max = std.fmt.parseInt(usize, cap, 10) catch return error.UnexpectedCommand;
+            if (self.body.len > max) return .{ .code = curl_filesize_exceeded, .ok = false, .stdout = "" };
+        }
+        const out = valueAfter(argv, "-o") orelse return error.UnexpectedCommand;
         try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = out, .data = self.body });
         return .{ .code = 0, .ok = true, .stdout = "" };
     }
@@ -166,7 +194,7 @@ test "fetchVerified: the URL follows an end of options for curl and wget alike" 
     try testing.expect(std.mem.endsWith(u8, fake.calls.items[1], " -- -o/etc/passwd"));
 }
 
-test "fetchVerified: an installer of exactly the cap is accepted, one byte over is refused" {
+test "fetchVerified: an installer of exactly the cap is accepted, one byte over is refused by curl" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -186,6 +214,8 @@ test "fetchVerified: an installer of exactly the cap is accepted, one byte over 
         .sha256 = &hex,
     });
 
+    // curl refuses the body itself and exits 63. Read as a failed download,
+    // that would name the wrong problem: nothing was wrong with the fetch.
     var over: Downloader = .{ .io = io, .body = body };
     try testing.expectError(Error.BootstrapInstallerTooLarge, fetchVerified(a, io, over.runner(), dir, "install.sh", .{
         .url = "https://example.invalid/install.sh",
@@ -193,6 +223,79 @@ test "fetchVerified: an installer of exactly the cap is accepted, one byte over 
     }));
     const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "fetchVerified: an oversize body a curl let through is still refused by name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+
+    const body = try a.alloc(u8, max_installer_bytes + 1);
+    @memset(body, 'x');
+    const hex = applied.contentHashHex(body);
+
+    // The read-back is the second line: a curl that did not enforce the cap
+    // it was handed leaves the oversize file on disk, and it must not reach
+    // the digest check as a normal download.
+    var through: Downloader = .{ .io = io, .body = body, .ignores_cap = true };
+    try testing.expectError(Error.BootstrapInstallerTooLarge, fetchVerified(a, io, through.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = &hex,
+    }));
+    const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "fetchVerified: without curl, an oversize body is refused by name on the wget path too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+
+    // wget takes no size cap, so the runner's capture bound is the cap, and
+    // the body that overruns it is the oversize installer -- the same refusal
+    // curl's exit 63 earns, reached a different way.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .fail = error.FileNotFound },
+        .{ .argv = "wget -qO-", .match = .prefix, .fail = error.StreamTooLong },
+    } };
+    try testing.expectError(Error.BootstrapInstallerTooLarge, fetchVerified(a, io, fake.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+    }));
+    const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "fetchVerified: a wget that succeeds stages the body it captured" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+
+    const body = "#!/bin/sh\necho installed\n";
+    const hex = applied.contentHashHex(body);
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .fail = error.FileNotFound },
+        .{ .argv = "wget -qO-", .match = .prefix, .stdout = body },
+    } };
+
+    const path = try fetchVerified(a, io, fake.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = &hex,
+    });
+    const staged = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    try testing.expectEqualStrings(body, staged);
 }
 
 test "fetchVerified: a matching digest yields the staged file" {

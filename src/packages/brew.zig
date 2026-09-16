@@ -16,6 +16,14 @@
 //! for the same reason, and are a namespace that can collide with a formula of
 //! the same name, so a cask's id carries its kind -- and a cask can come from a
 //! third-party tap just as a formula can.
+//!
+//! The cask half is NOT an explicit-install query, and brew offers none:
+//! `--cask` and `--installed-on-request` are declared as conflicting options
+//! (verified against brew 7.0.1, which answers that argv with its usage and
+//! exit 1). So `brew list --cask --full-name` lists the whole Caskroom,
+//! including a cask pulled in by another cask's `depends_on cask:`, which is
+//! reported untracked for as long as it is installed. That is stated in
+//! `limitation` rather than papered over with a query brew does not have.
 
 const std = @import("std");
 
@@ -43,6 +51,10 @@ pub const cask_prefix = "cask:";
 
 pub const default_prefixes = [_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin" };
 
+/// brew answers "which casks are installed", never "which casks were asked
+/// for": `--cask` conflicts with `--installed-on-request`.
+pub const cask_limitation = "brew has no explicit-install query for casks, so a cask installed as another cask's dependency is reported untracked";
+
 pub const Brew = struct {
     runner: exec.Runner,
     /// Only the bootstrap path needs these: staging a verified installer.
@@ -57,7 +69,12 @@ pub const Brew = struct {
     prefixes: []const []const u8 = &default_prefixes,
 
     pub fn backend(self: *Brew) Backend {
-        return .{ .name = "brew", .ctx = self, .vtable = &vtable };
+        return .{
+            .name = "brew",
+            .ctx = self,
+            .vtable = &vtable,
+            .limitation = cask_limitation,
+        };
     }
 
     const vtable: Backend.VTable = .{
@@ -376,6 +393,33 @@ test "installedExplicit: formulae bare, tapped fully qualified, casks prefixed" 
     try testing.expectEqualStrings("d12frosted/emacs-plus/emacs-plus@30", got[1]);
     try testing.expectEqualStrings("cask:ghostty", got[2]);
     try testing.expectEqualStrings("cask:1password", got[3]);
+}
+
+test "backend: the cask blind spot is declared, not left to be discovered" {
+    var b: Brew = .{ .runner = undefined };
+    // Without this, a cask pulled in by another cask's `depends_on cask:`
+    // is reported untracked forever with nothing saying why.
+    try testing.expectEqualStrings(cask_limitation, b.backend().limitation.?);
+    try testing.expect(std.mem.indexOf(u8, cask_limitation, "cask") != null);
+}
+
+test "installedExplicit: the cask query is the whole Caskroom, which is what the limitation says" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `--installed-on-request` is not on the cask query and must not be: brew
+    // declares the two options as conflicting, so that argv exits 1 with its
+    // usage and every cask row would read as missing.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n" },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    const got = try b.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expect(!fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name --installed-on-request"));
 }
 
 test "installedExplicit: a failed query is an error, never an empty set" {

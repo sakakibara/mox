@@ -27,6 +27,7 @@ const exec = @import("exec.zig");
 const manifest_mod = @import("manifest.zig");
 
 const Io = std.Io;
+const EnvironMap = std.process.Environ.Map;
 
 pub const Row = manifest_mod.Row;
 pub const Diag = manifest_mod.Diag;
@@ -50,9 +51,10 @@ pub const Scoop = struct {
     /// Where scoop lands (`<home>\scoop\shims`), so a bootstrap can name the
     /// bin dir for this same run. Empty means unknown.
     home: []const u8 = "",
-    /// `$env:SCOOP` when set: the installer puts scoop there instead of under
-    /// the profile, so the shims are under it too.
-    scoop_root: ?[]const u8 = null,
+    /// The environment mox itself runs under, read for `$env:SCOOP`: the
+    /// installer puts scoop there instead of under the profile, so the shims
+    /// are under it too. Null falls back to the profile.
+    env: ?*const EnvironMap = null,
     /// How scoop is invoked: `scoop` until a bootstrap installs it, then its
     /// own shim script through pwsh, because a child's PATH is never used to
     /// resolve argv[0] and a freshly installed scoop is on no PATH yet.
@@ -80,14 +82,26 @@ pub const Scoop = struct {
         const res = try exec.runPowerShell(self.runner, arena, &.{ installer_path, "-RunAsAdmin" }, null, true);
         try exec.checkTimedOut(res);
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
-        const root = self.scoop_root orelse blk: {
-            if (self.home.len == 0) return null;
-            break :blk try std.fs.path.join(arena, &.{ self.home, "scoop" });
-        };
+        const root = (try self.rootOf(arena)) orelse return null;
         const shims = try std.fs.path.join(arena, &.{ root, "shims" });
         const shim = try std.fs.path.join(arena, &.{ shims, "scoop.ps1" });
         self.argv0 = try exec.powerShellArgv(arena, exec.powershell_hosts[0], &.{shim});
         return shims;
+    }
+
+    /// Where scoop lives: what `SCOOP` names when it is set -- the installer
+    /// obeys it, so probing the profile instead would miss the shims it just
+    /// wrote -- else `<home>\scoop`. Null when neither is known.
+    fn rootOf(self: *const Scoop, arena: std.mem.Allocator) !?[]const u8 {
+        if (self.env) |m| {
+            if (m.get("SCOOP")) |v| {
+                const root = std.mem.trim(u8, v, " \t\r\n");
+                if (root.len > 0) return root;
+            }
+        }
+        if (self.home.len == 0) return null;
+        const under_profile = try std.fs.path.join(arena, &.{ self.home, "scoop" });
+        return under_profile;
     }
 
     fn argv(self: *const Scoop, arena: std.mem.Allocator, rest: []const []const u8) ![]const []const u8 {
@@ -236,6 +250,12 @@ fn appNames(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(arena);
 }
 
+/// What `winget export` cannot report, and so what mox cannot see: an export
+/// is grouped by source, and a package that belongs to none of them is in no
+/// group. `install` asks `winget list` directly and lands such a row, but
+/// `status` has only the export to read, so the row stays MISSING there.
+pub const export_limitation = "winget export reports only what a source supplied, so a package installed outside one is reported missing on every status";
+
 /// `winget export` writes `{"Sources":[{"Packages":[{"PackageIdentifier":...}]}]}`
 /// to a FILE rather than to stdout, so this adapter needs a path to hand it
 /// and the ability to read one back.
@@ -248,7 +268,12 @@ pub const Winget = struct {
     scratch_dir: []const u8,
 
     pub fn backend(self: *Winget) Backend {
-        return .{ .name = "winget", .ctx = self, .vtable = &vtable };
+        return .{
+            .name = "winget",
+            .ctx = self,
+            .vtable = &vtable,
+            .limitation = export_limitation,
+        };
     }
 
     const vtable: Backend.VTable = .{
@@ -851,6 +876,13 @@ test "scoop: with SCOOP set, the shims after a bootstrap are under it, not the p
     defer arena.deinit();
     const a = arena.allocator();
 
+    // The environment mox runs under is the only place this can come from:
+    // the installer obeys SCOOP, so probing the profile would look for the
+    // shims where the installer did not put them and read scoop as absent.
+    var env: EnvironMap = .init(a);
+    defer env.deinit();
+    try env.put("SCOOP", "D:\\scoop");
+
     const shims = try std.fs.path.join(a, &.{ "D:\\scoop", "shims" });
     const shim = try std.fs.path.join(a, &.{ shims, "scoop.ps1" });
     const shim_export = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} export", .{shim});
@@ -858,12 +890,41 @@ test "scoop: with SCOOP set, the shims after a bootstrap are under it, not the p
         .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin" },
         .{ .argv = shim_export, .stdout = scoop_export },
     } };
-    var s: Scoop = .{ .runner = fake.runner(), .home = "C:\\Users\\x", .scoop_root = "D:\\scoop" };
+    var s: Scoop = .{ .runner = fake.runner(), .home = "C:\\Users\\x", .env = &env };
 
     const got = (try s.backend().bootstrap(a, "C:\\i.ps1")).?;
     try testing.expectEqualStrings(shims, got);
     _ = try s.backend().installedExplicit(a);
     try testing.expect(fake.called(shim_export));
+}
+
+test "scoop: an empty SCOOP is not a root, and the profile answers instead" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An exported-but-empty variable would otherwise make the shims path
+    // `\shims`, which is on no machine.
+    var env: EnvironMap = .init(a);
+    defer env.deinit();
+    try env.put("SCOOP", "");
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin" },
+    } };
+    var s: Scoop = .{ .runner = fake.runner(), .home = "C:\\Users\\x", .env = &env };
+
+    const got = (try s.backend().bootstrap(a, "C:\\i.ps1")).?;
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ "C:\\Users\\x", "scoop", "shims" }), got);
+}
+
+test "winget: the export blind spot is declared, not left to be discovered" {
+    var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+
+    // Without this, a package no source supplied is reported missing on every
+    // status while every apply reports installing it, with nothing saying why.
+    try testing.expectEqualStrings(export_limitation, w.backend().limitation.?);
 }
 
 test "available: present, absent and broken on both managers" {

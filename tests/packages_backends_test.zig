@@ -300,6 +300,29 @@ test "brew: every cask in the caskroom is an id under the cask prefix" {
     }
 }
 
+test "brew: there is no explicit-install query for casks, which is what the limitation says" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // brew declares `--cask` and `--installed-on-request` as conflicting, so
+    // this argv is refused at option parsing and lists nothing. The adapter's
+    // whole-Caskroom query, and the limitation that states its cost, are only
+    // right for as long as that holds.
+    const res = try runBrew(a, io, &.{ "env", "HOMEBREW_NO_AUTO_UPDATE=1", "brew", "list", "--cask", "--full-name", "--installed-on-request" });
+    if (res.term == .exited and res.term.exited == 0) {
+        std.debug.print("brew now accepts --cask with --installed-on-request; the cask query can be made explicit and the limitation dropped\n", .{});
+        return error.TestUnexpectedResult;
+    }
+
+    var p: packages.exec.Process = .{ .io = io };
+    var b: packages.brew.Brew = .{ .runner = p.runner() };
+    try testing.expectEqualStrings(packages.brew.cask_limitation, b.backend().limitation.?);
+}
+
 test "brew: the adapter reports exactly what brew reports, nothing extra" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

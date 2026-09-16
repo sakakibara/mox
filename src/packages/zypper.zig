@@ -172,23 +172,25 @@ pub const Zypper = struct {
         for (rows) |row| try argv.append(arena, row.name);
 
         const res = try self.runner.stream(arena, argv.items);
-        try exec.checkTimedOut(res);
 
         var ids: std.ArrayList([]const u8) = .empty;
         for (rows) |row| try ids.append(arena, row.name);
-        if (installOk(res)) {
+        if (!res.timed_out and installOk(res)) {
             try self.ledger.add(arena, ids.items);
             return;
         }
-        // A failed batch may still have landed some of its rows, and a row
-        // that landed unrecorded is invisible here forever: reported MISSING
-        // on every status, re-attempted beside the same failing sibling on
-        // every apply. Only what rpm confirms is recorded; nothing that never
-        // landed is.
+        // A batch that failed -- or was killed at its bound partway through --
+        // may still have landed some of its rows, and a row that landed
+        // unrecorded is invisible here forever: reported MISSING on every
+        // status, re-attempted beside the same failing sibling on every apply.
+        // Only what rpm confirms is recorded; nothing that never landed is.
+        // A kill is the case the read-back matters most for, so it happens
+        // before the timeout is reported, never instead of it.
         // The install is what failed; a query that also fails must not
         // replace that with its own error.
-        const landed = self.presentOf(arena, ids.items) catch return Error.ZypperInstallFailed;
+        const landed = self.presentOf(arena, ids.items) catch &.{};
         if (landed.len > 0) try self.ledger.add(arena, landed);
+        try exec.checkTimedOut(res);
         return Error.ZypperInstallFailed;
     }
 
@@ -355,6 +357,52 @@ test "install: a failed batch records the rows that landed, and only those" {
     const recorded = try z.ledger.read(a);
     try testing.expectEqual(@as(usize, 1), recorded.len);
     try testing.expectEqualStrings("ripgrep", recorded[0]);
+}
+
+test "install: an install killed at its bound still records what landed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // MOX_INSTALL_TIMEOUT_MS kills zypper partway down the batch. Reporting
+    // the kill without reading rpm back would leave everything zypper had
+    // already committed unrecorded -- the exact loss the read-back exists to
+    // prevent -- so the record happens first and the kill is still reported.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "sudo zypper --non-interactive install ripgrep bat", .timed_out = true },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    try testing.expectError(error.TimedOut, z.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("bat", &.{}) }));
+    const recorded = try z.ledger.read(a);
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expectEqualStrings("ripgrep", recorded[0]);
+}
+
+test "install: a kill whose read-back also fails is still reported as a kill" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The rpm query cannot replace the kill with an error of its own: what
+    // stopped the install is what the caller must be told.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "sudo zypper --non-interactive install ripgrep", .timed_out = true },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .code = 1 },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    try testing.expectError(error.TimedOut, z.backend().install(a, &.{rowOf("ripgrep", &.{})}));
+    try testing.expectEqual(@as(usize, 0), (try z.ledger.read(a)).len);
 }
 
 test "install: a reboot or restart needed after the install is a success" {

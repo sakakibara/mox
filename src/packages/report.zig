@@ -630,5 +630,7 @@ test "fromManifest: a usable backend leaves no note about usability" {
     const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
     const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
     try testing.expectEqual(@as(usize, 0), rep.notes.len);
-    try testing.expect(rep.backends[0].limitation == null);
+    // Whatever limitation rides here is the adapter's own; being usable adds
+    // nothing, and never "absent; apply will bootstrap it".
+    try testing.expectEqual(b.backend().limitation, rep.backends[0].limitation);
 }
