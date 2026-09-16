@@ -128,12 +128,16 @@ pub const Process = struct {
         return self.spawn(arena, argv, stdin, .inherit);
     }
 
-    /// Spawn in its own process group with stdin backed by a scratch file
-    /// holding `stdin` (closed when null), stderr on the terminal, and stdout
-    /// captured or inherited. One deadline bounds the whole call: reading
-    /// what the child writes and waiting for it to exit. Exceeding it kills
-    /// the group, so a manager blocked behind a helper it spawned (`port |
-    /// awk`, `sudo apt-get`) goes with it rather than holding the pipe open.
+    /// Spawn with stdin backed by a scratch file holding `stdin` (closed
+    /// when null), stderr on the terminal, and stdout captured or inherited.
+    /// One deadline bounds the whole call: reading what the child writes and
+    /// waiting for it to exit. A captured call runs in its own process group
+    /// and exceeding the bound kills the group, so a query blocked behind a
+    /// helper it spawned (`port | awk`) goes with it rather than holding the
+    /// pipe open. A streamed call stays in mox's own group: it may talk to
+    /// the terminal (`sudo` asks for a password, and stops on SIGTTOU from a
+    /// background group), and Ctrl-C must reach it; at the bound only the
+    /// direct child is killed.
     fn spawn(
         self: *Process,
         arena: std.mem.Allocator,
@@ -171,7 +175,7 @@ pub const Process = struct {
             .stdin = stdin_io,
             .stdout = stdout_io,
             .stderr = .inherit,
-            .pgid = own_group,
+            .pgid = if (stdout_io == .pipe) own_group else null,
         });
         const deadline = self.timeout().toDeadline(io);
 
@@ -209,11 +213,14 @@ pub const Process = struct {
         }
 
         // The wait is bounded too: a child that closed stdout and lingers
-        // must not hold `mox status` any longer than the read may.
+        // must not hold `mox status` any longer than the read may. The
+        // watchdog must really run alongside the wait: `io.async` may run
+        // it inline when no thread is spare, which would sleep out the
+        // whole bound before the wait even began.
         var guard: Guard = .{};
         var killer: ?Io.Future(void) = null;
         if (deadline != .none) {
-            if (child.id) |id| killer = io.async(killGroupAfter, .{ io, deadline, id, &guard });
+            if (child.id) |id| killer = try io.concurrent(killGroupAfter, .{ io, deadline, id, &guard });
         }
         const term = child.wait(io) catch |e| {
             guard.reaped.store(true, .release);
@@ -232,7 +239,7 @@ pub const Process = struct {
     }
 };
 
-/// A child is the leader of its own process group everywhere that has one;
+/// A captured child leads its own process group everywhere that has one;
 /// Windows has no groups, so its kill reaches the direct child only.
 const own_group: ?std.posix.pid_t = if (builtin.os.tag == .windows) null else 0;
 
@@ -244,9 +251,9 @@ const Guard = struct {
     fired: bool = false,
 };
 
-/// Kill the child's whole process group, then reap it. `Child.kill` alone
-/// sends SIGTERM and waits, which a child that ignores SIGTERM turns into
-/// the hang this exists to end.
+/// Kill the child's whole process group (its own pid when it leads none),
+/// then reap it. `Child.kill` alone sends SIGTERM and waits, which a child
+/// that ignores SIGTERM turns into the hang this exists to end.
 fn killGroup(io: Io, child: *std.process.Child) void {
     if (child.id) |id| killGroupOf(id);
     child.kill(io);
