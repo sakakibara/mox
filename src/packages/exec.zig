@@ -38,7 +38,9 @@ pub fn timeoutFromEnv(env: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
     return run_scripts.scriptTimeoutMs(env, stderr);
 }
 
-fn processId() u32 {
+/// This process's id, for naming a scratch file that a second mox running
+/// beside this one must not share.
+pub fn processId() u32 {
     return switch (builtin.os.tag) {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.c.getpid()),

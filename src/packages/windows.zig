@@ -268,7 +268,10 @@ pub const Winget = struct {
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Winget = @ptrCast(@alignCast(ctx));
 
-        const path = try std.fs.path.join(arena, &.{ self.scratch_dir, "winget-export.json" });
+        // Named per process: a status running beside an apply must not read
+        // the other's half-written export as this machine's state.
+        const name = try std.fmt.allocPrint(arena, "winget-export-{d}.json", .{exec.processId()});
+        const path = try std.fs.path.join(arena, &.{ self.scratch_dir, name });
         try Io.Dir.cwd().createDirPath(self.io, self.scratch_dir);
         // A stale export from an interrupted run would otherwise be read as
         // this machine's current state.
@@ -491,6 +494,30 @@ test "winget: an export yields every PackageIdentifier" {
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualStrings("Microsoft.PowerShell", got[0]);
     try testing.expectEqualStrings("Git.Git", got[1]);
+}
+
+test "winget: the export is staged under a per-process name and removed after" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+    const name = try std.fmt.allocPrint(a, "winget-export-{d}.json", .{exec.processId()});
+    const path = try std.fs.path.join(a, &.{ scratch, name });
+    const argv = try std.fmt.allocPrint(a, "winget export -o {s} --accept-source-agreements", .{path});
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = argv, .stdout = winget_export, .write_after = "-o", .io = io },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = io, .scratch_dir = scratch };
+
+    const got = try w.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expect(fake.called(argv));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
 }
 
 test "winget: an export missing Sources is an error, never an empty set" {

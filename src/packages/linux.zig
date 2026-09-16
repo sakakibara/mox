@@ -143,6 +143,7 @@ pub const Distro = struct {
             // present package into "not found".
             var up_argv: std.ArrayList([]const u8) = .empty;
             if (elevate) try up_argv.append(arena, "sudo");
+            try up_argv.appendSlice(arena, &apt_env);
             try up_argv.appendSlice(arena, &.{ "apt-get", "update" });
             const up = try self.runner.stream(arena, up_argv.items);
             try exec.checkTimedOut(up);
@@ -151,6 +152,7 @@ pub const Distro = struct {
 
         var argv: std.ArrayList([]const u8) = .empty;
         if (elevate) try argv.append(arena, "sudo");
+        if (self.manager == .apt) try argv.appendSlice(arena, &apt_env);
         const head: []const []const u8 = switch (self.manager) {
             .apt => &.{ "apt-get", "install", "-y" },
             .dnf => &.{ "dnf", "install", "-y" },
@@ -163,6 +165,12 @@ pub const Distro = struct {
         try exec.checkTimedOut(res);
         if (!res.ok) return Error.DistroInstallFailed;
     }
+
+    /// `-y` alone answers apt's own questions; debconf asks its own through
+    /// a frontend, and only this setting keeps it from stopping the install.
+    /// Set through `env` rather than mox's environment so it holds after
+    /// `sudo` resets the environment.
+    const apt_env = [_][]const u8{ "env", "DEBIAN_FRONTEND=noninteractive" };
 
     /// Whether an install needs `sudo`. Root already has the privilege, and
     /// a minimal image that runs as root often ships no `sudo` binary.
@@ -245,29 +253,32 @@ test "install: apt as root refreshes without sudo too" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "apt-get update" },
-        .{ .argv = "apt-get install -y bat" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y bat" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expect(fake.called("apt-get update"));
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get update"));
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y bat"));
 }
 
-test "install: apt refreshes the index, then installs the whole set at once" {
+test "install: apt refreshes the index, then installs the whole set at once, debconf silenced" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    // The frontend setting rides after sudo, which would otherwise strip it
+    // from the environment along with everything else.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "sudo apt-get update" },
-        .{ .argv = "sudo apt-get install -y bat fd-find" },
+        .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bat fd-find" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("fd-find", &.{}) });
-    try testing.expect(fake.called("sudo apt-get update"));
-    try testing.expect(fake.called("sudo apt-get install -y bat fd-find"));
+    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[0]);
+    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bat fd-find", fake.calls.items[1]);
 }
 
 test "install: dnf takes one non-interactive command" {

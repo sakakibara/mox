@@ -57,14 +57,17 @@ pub fn fetchVerified(
     // step expects a verified file.
     errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
 
+    // `--` ends the options: a URL is data even when it starts with `-`.
     const limit = try std.fmt.allocPrint(arena, "{d}", .{max_installer_bytes});
-    const res = runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, spec.url }) catch |e| switch (e) {
-        error.FileNotFound => try runner.run(arena, &.{ "wget", "-qO", path, spec.url }),
+    const res = runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, "--", spec.url }) catch |e| switch (e) {
+        error.FileNotFound => try runner.run(arena, &.{ "wget", "-qO", path, "--", spec.url }),
         else => return e,
     };
     if (!res.ok) return Error.BootstrapDownloadFailed;
 
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_installer_bytes)) catch |e| switch (e) {
+    // The read's limit is refused when reached, so one past the cap lets an
+    // installer of exactly the cap through, as curl's own cap does.
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_installer_bytes + 1)) catch |e| switch (e) {
         error.StreamTooLong => return Error.BootstrapInstallerTooLarge,
         else => return Error.BootstrapDownloadFailed,
     };
@@ -120,6 +123,59 @@ test "fetchVerified: curl is told the size cap, and a partial download is not le
         .sha256 = "00",
     }));
     try testing.expect(std.mem.indexOf(u8, fake.calls.items[0], " --max-filesize 67108864 ") != null);
+    try testing.expect(std.mem.endsWith(u8, fake.calls.items[0], " -- https://example.invalid/install.sh"));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "fetchVerified: the URL follows an end of options for curl and wget alike" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+
+    // curl is absent, so wget is tried; both are handed the URL as data.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .fail = error.FileNotFound },
+        .{ .argv = "wget -qO", .match = .prefix, .code = 4 },
+    } };
+    try testing.expectError(Error.BootstrapDownloadFailed, fetchVerified(a, io, fake.runner(), dir, "install.sh", .{
+        .url = "-o/etc/passwd",
+        .sha256 = "00",
+    }));
+    try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+    try testing.expect(std.mem.endsWith(u8, fake.calls.items[0], " -- -o/etc/passwd"));
+    try testing.expect(std.mem.endsWith(u8, fake.calls.items[1], " -- -o/etc/passwd"));
+}
+
+test "fetchVerified: an installer of exactly the cap is accepted, one byte over is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+
+    const body = try a.alloc(u8, max_installer_bytes + 1);
+    @memset(body, 'x');
+
+    const exact = body[0..max_installer_bytes];
+    const hex = applied.contentHashHex(exact);
+    var at_cap: Downloader = .{ .io = io, .body = exact };
+    _ = try fetchVerified(a, io, at_cap.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = &hex,
+    });
+
+    var over: Downloader = .{ .io = io, .body = body };
+    try testing.expectError(Error.BootstrapInstallerTooLarge, fetchVerified(a, io, over.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = &hex,
+    }));
+    const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
 }
 
