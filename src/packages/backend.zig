@@ -27,14 +27,17 @@ fn plainText(s: []const u8) bool {
     return true;
 }
 
-/// Whether an id has the shape of one id. Empty, whitespace inside, or over
-/// 256 bytes says the backend padded its output or lost its line separator
-/// (dnf5 concatenates every name when its format string lacks a newline);
-/// this catches that for a large set, and the fixture tests catch the rest.
-/// The class is `nameShapeOk`'s, because `declare` may answer `name = <id>`:
-/// an id outside it would become a manifest row the next run refuses to load.
+/// The most an id or a name may be. Longer says the backend padded its output
+/// or lost its line separator (dnf5 concatenates every name when its format
+/// string lacks a newline); this catches that for a large set, and the fixture
+/// tests catch the rest.
+pub const max_shape_bytes: usize = 256;
+
+/// Whether an id has the shape of one id. The class is `nameShapeOk`'s, length
+/// included, because `declare` may answer `name = <id>`: an id outside it would
+/// become a manifest row the next run refuses to load.
 pub fn idShapeOk(id: []const u8) bool {
-    if (id.len == 0 or id.len > 256) return false;
+    if (id.len == 0 or id.len > max_shape_bytes) return false;
     return plainText(id);
 }
 
@@ -42,9 +45,11 @@ pub fn idShapeOk(id: []const u8) bool {
 /// The single authority on that: the manifest loader refuses a row outside
 /// this class, so everything that invents a name -- a plugin's `declare`, an
 /// adapter answering with its id -- is held to the same rule before the row is
-/// written, and nothing can record a row every later run then refuses.
+/// written, and nothing can record a row every later run then refuses. One
+/// class in both directions: a name the loader took that no id may be would
+/// leave `declare` free to write a row `idOf` can never match back.
 pub fn nameShapeOk(name: []const u8) bool {
-    if (name.len == 0) return false;
+    if (name.len == 0 or name.len > max_shape_bytes) return false;
     return plainText(name);
 }
 
@@ -231,8 +236,41 @@ test "nameShapeOk: the class the manifest loader enforces, applied before a row 
     try testing.expect(!nameShapeOk("gnu\x7fmake"));
     try testing.expect(!nameShapeOk("gnu\x01make"));
     try testing.expect(!nameShapeOk("gnu\xffmake"));
+}
 
-    // No id may become a name the manifest would then refuse.
-    const outside = [_][]const u8{ "gnu make", "gnu\x0bmake", "gnu\x7fmake", "gnu\xffmake", "" };
-    for (outside) |s| try testing.expect(!idShapeOk(s));
+test "idShapeOk / nameShapeOk: one class, asserted in both directions" {
+    // A row an adapter may write is a row the loader will read back, so
+    // neither predicate may take what the other refuses -- in either
+    // direction, length included: a 257-byte `declare` answer the loader
+    // accepted would be written once and refused by every run after.
+    const outside = [_][]const u8{
+        "",
+        " ",
+        "gnu make",
+        "gnu\tmake",
+        "gnu\nmake",
+        "gnu\x0bmake",
+        "gnu\x0cmake",
+        "gnu\x01make",
+        "gnu\x7fmake",
+        "gnu\xffmake",
+        "\xed\xa0\x80",
+        "x" ** (max_shape_bytes + 1),
+    };
+    for (outside) |s| {
+        try testing.expect(!idShapeOk(s));
+        try testing.expect(!nameShapeOk(s));
+    }
+
+    const inside = [_][]const u8{
+        "ripgrep",
+        "cask:ghostty",
+        "emacs-plus@30",
+        "日本語",
+        "x" ** max_shape_bytes,
+    };
+    for (inside) |s| {
+        try testing.expect(idShapeOk(s));
+        try testing.expect(nameShapeOk(s));
+    }
 }

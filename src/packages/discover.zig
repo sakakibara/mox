@@ -43,7 +43,7 @@ pub const Found = struct {
 };
 
 /// Every plugin under `<repo>/scripts/backends`, name-ordered. A missing
-/// directory is no plugins, and so is a dotfile inside it (`.gitkeep`, which
+/// directory is no plugins, and so is a `.gitkeep` or `.keep` inside it (which
 /// is how an empty one is version-controlled). A name outside `[A-Za-z0-9_-]`
 /// or, on a permission-bearing filesystem, a file without its executable bit
 /// is an error naming the path: a forgotten `chmod +x` must not read as "no
@@ -66,10 +66,11 @@ pub fn discover(
     for (entries) |e| {
         if (e.kind != .file and e.kind != .sym_link and e.kind != .directory) continue;
         if (junk.isJunk(e.name)) continue;
-        // A backend name never begins with a dot, so a dotfile here is repo
-        // furniture -- a `.gitkeep` that lets an empty scripts/backends be
-        // version-controlled -- and not a plugin spelled wrong.
-        if (e.name[0] == '.') continue;
+        // Only the two placeholders are skipped, never every dotfile: a
+        // `.macports` hidden by an editor or by accident must say what it is,
+        // as a `macports/` directory does below, rather than be dropped here
+        // and reported from the manifest's side as no such backend.
+        if (isKeepFile(e.name)) continue;
         const path = try std.fs.path.join(arena, &.{ dir_path, e.name });
         const kind = kindOf(e.name);
         const name = stemOf(e.name, kind);
@@ -100,6 +101,12 @@ pub fn discover(
         try out.append(arena, found);
     }
     return out.toOwnedSlice(arena);
+}
+
+/// The placeholder names git repositories use to carry an otherwise empty
+/// directory.
+fn isKeepFile(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".gitkeep") or std.mem.eql(u8, name, ".keep");
 }
 
 const Kind = enum { plain, ps1, exe, cmd };
@@ -349,6 +356,30 @@ test "discover: a .gitkeep is ignored, so an empty scripts/backends can be commi
 
     const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
     try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "discover: a hidden plugin is named, not skipped for beginning with a dot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    // Hidden by an editor, or by a stray `mv`: skipping it would be reported
+    // from the manifest's side as "no backend named macports", the failure the
+    // directory case twelve lines below exists to prevent.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.macports", .data = "#!/bin/sh\n" });
+
+    var d: Diag = .{};
+    const repo = try tmpRepo(a, io, &tmp.sub_path);
+    try testing.expectError(Error.BadBackendName, discover(a, io, repo, &d));
+    const want = try std.fmt.allocPrint(
+        a,
+        "{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends",
+        .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", ".macports" })},
+    );
+    try testing.expectEqualStrings(want, d.capture().?);
 }
 
 test "discover: a directory named like a plugin says what it is, not that no such backend exists" {

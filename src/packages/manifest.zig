@@ -240,7 +240,7 @@ pub fn load(
             }
             for (v.array.items, 0..) |el, i| {
                 if (el != .table) {
-                    if (diag) |d| d.set("{s}: packages row {d} is not a table", .{ f.label, i });
+                    if (diag) |d| d.set("{s}: row {d} is not a table", .{ f.label, i });
                     return Error.MalformedPackageRow;
                 }
                 try packages.append(arena, try parseRow(arena, f, el.table, file_backend, file_when, i, diag));
@@ -392,7 +392,7 @@ fn parseRow(
             return Error.MalformedPackageRow;
         }
         if (!nameShapeOk(v.string)) {
-            if (diag) |d| d.set("{s}: row {d}: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8", .{ f.label, index });
+            if (diag) |d| d.set("{s}: row {d}: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8, and must be at most 256 bytes", .{ f.label, index });
             return Error.MalformedPackageRow;
         }
         break :blk v.string;
@@ -573,7 +573,7 @@ fn parseBlacklistRow(
             return Error.MalformedPackageRow;
         }
         if (!nameShapeOk(v.string)) {
-            if (diag) |d| d.set("{s}: blacklist row {d}: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8", .{ f.label, index });
+            if (diag) |d| d.set("{s}: blacklist row {d}: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8, and must be at most 256 bytes", .{ f.label, index });
             return Error.MalformedPackageRow;
         }
         break :blk v.string;
@@ -1238,7 +1238,7 @@ test "load: a fault in a private file names the private layer, not the repo file
         var d: Diag = .{};
         try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, priv, &d));
         try testing.expectEqualStrings(
-            "data/packages/local.toml (private layer): row 0: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8",
+            "data/packages/local.toml (private layer): row 0: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8, and must be at most 256 bytes",
             d.capture().?,
         );
     }
@@ -1359,7 +1359,7 @@ test "load: a blank name, or one with whitespace or a control character, is refu
         var d: Diag = .{};
         try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
         try testing.expectEqualStrings(
-            "data/packages/a.toml: row 1: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8",
+            "data/packages/a.toml: row 1: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8, and must be at most 256 bytes",
             d.capture().?,
         );
     }
@@ -1372,7 +1372,7 @@ test "load: a blank name, or one with whitespace or a control character, is refu
     var d: Diag = .{};
     try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
     try testing.expectEqualStrings(
-        "data/packages/a.toml: blacklist row 0: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8",
+        "data/packages/a.toml: blacklist row 0: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8, and must be at most 256 bytes",
         d.capture().?,
     );
 }
