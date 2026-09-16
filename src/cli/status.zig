@@ -304,13 +304,70 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         .width = tty.terminalWidth(80),
     });
 
-    // The probe log and unbound-facts sections are the full-report context, not
-    // part of the drift set, so `--drift` omits them.
+    // Package drift is drift, so it shows under `--drift` too; the probe log
+    // and unbound-facts sections are full-report context and are not.
+    if (try printPackages(ctx, context, &bindings)) problems += 1;
     if (show_table) {
         try printProbeLog(ctx, m_state);
         try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
     }
     return if (problems > 0) 1 else 0;
+}
+
+/// This run's `packages:` section: per-backend missing and untracked.
+///
+/// Printed only when the repo carries a `data/packages/` manifest, so a repo
+/// that has not opted in never queries a package manager and never reports
+/// every installed package as untracked. Returns true when the manifest
+/// itself is broken, which is this command's problem to report; package drift
+/// does NOT set the exit code, which stays the documented file contract until
+/// packages become first-class drift units.
+fn printPackages(
+    ctx: *app.Ctx,
+    context: app.Context,
+    bindings: *const mox.dsl.resolver.Resolver,
+) !bool {
+    var proc: mox.packages.exec.Process = .{ .io = ctx.io };
+    var brew: mox.packages.brew.Brew = .{ .runner = proc.runner() };
+    var backends = [_]mox.packages.backend.Backend{brew.backend()};
+    const registry: mox.packages.backend.Registry = .{ .backends = &backends };
+
+    var diag: mox.packages.manifest.Diag = .{};
+    const rep = mox.packages.report.gather(
+        ctx.alloc,
+        ctx.io,
+        registry,
+        context.paths.repo_dir,
+        context.paths.private_dir,
+        bindings,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox status: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
+            }
+            return true;
+        },
+    };
+    if (!rep.in_use) return false;
+
+    try ctx.out.writeAll("\npackages:\n");
+    for (rep.backends) |b| {
+        if (b.drift.clean()) {
+            try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
+            continue;
+        }
+        for (b.drift.missing) |row| {
+            try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, row.name });
+        }
+        for (b.drift.untracked) |id| {
+            try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
+        }
+    }
+    return false;
 }
 
 /// Emit the drift set as JSON: an array of `{path, kind, [key], first_contact}`.
@@ -505,7 +562,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift).",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED; --json / --porcelain carry files only.",
     .group = .general,
     .needs_context = true,
 }, run);

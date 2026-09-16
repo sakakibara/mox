@@ -322,13 +322,23 @@ classified on its owned content only, so the program's writes on the
 other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 `MISSING`, `STALE`, or `ERROR`.
 
+A repo carrying a `data/packages/` manifest also gets a `packages:`
+section: per backend, each declared package still `MISSING` and each
+installed package `UNTRACKED` (declared nowhere and not blacklisted).
+A repo without that directory is not using the package subsystem, so no
+section prints and no package manager is queried. Package drift does not
+set the exit code, which stays the file contract above; a manifest that
+is itself malformed does, and says which file and row.
+
 `--drift` shows only the drift set (the report `mox apply` prints for the
 same tree, from the same classifier -- the two never disagree), dropping
-the clean/gated table and the probe/unbound context. `--json` and
+the clean/gated table and the probe/unbound context. The `packages:`
+section is drift, so `--drift` keeps it. `--json` and
 `--porcelain` serialize that set for tooling instead of the human report:
 `--json` as an array of `{path, kind, key?, first_contact}`, `--porcelain`
 as stable tab-separated lines (`kind`, `key`, `first_contact` 0/1,
-`path`). In `--porcelain` the free-form `key` and `path` fields are
+`path`). Both carry files only, never packages. In `--porcelain` the
+free-form `key` and `path` fields are
 C-escaped (`\\`, `\t`, `\n`, `\r`) so a tab or newline in them can never
 break the framing; unescape those four to recover exact bytes. Both imply
 `--drift` and keep the same exit code.
