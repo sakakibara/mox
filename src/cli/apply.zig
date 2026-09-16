@@ -774,6 +774,43 @@ fn applyPass(
     return 0;
 }
 
+/// Install any declared manager this machine does not have. Returns how many
+/// failed: a manager that will not install is a genuine failure, not a reason
+/// to press on quietly installing nothing through it.
+fn bootstrapBackends(
+    ctx: *app.Ctx,
+    registry: mox.packages.backend.Registry,
+    m: mox.packages.manifest.Manifest,
+) !usize {
+    var failed: usize = 0;
+    for (m.bootstrap) |b| {
+        const backend = registry.find(b.backend) orelse {
+            try ctx.err.print(
+                "mox apply: {s}: bootstrap names no backend \"{s}\"\n",
+                .{ b.label, b.backend },
+            );
+            failed += 1;
+            continue;
+        };
+        if (try backend.available(ctx.alloc)) continue;
+        if (!backend.canBootstrap()) {
+            try ctx.err.print(
+                "mox apply: {s}: {s} declares an installer but its adapter cannot bootstrap\n",
+                .{ b.label, b.backend },
+            );
+            failed += 1;
+            continue;
+        }
+
+        try ctx.out.print("  bootstrapping  {s}\n", .{b.backend});
+        backend.bootstrap(ctx.alloc, .{ .url = b.url, .sha256 = b.sha256 }) catch |e| {
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
+            failed += 1;
+        };
+    }
+    return failed;
+}
+
 /// What one apply did to this machine's packages.
 const PackageCounts = struct {
     in_use: bool = false,
@@ -803,12 +840,43 @@ fn applyPackages(
     const registry = pkg_backends.registry(ctx.io, context.paths.state_dir);
 
     var diag: mox.packages.manifest.Diag = .{};
-    const rep = mox.packages.report.gather(
+    const manifest = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,
-        registry,
         context.paths.repo_dir,
         context.paths.private_dir,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .failed = 1 };
+        },
+    };
+
+    // A manager that is not installed makes every row naming it inert, so the
+    // manifest's own declaration cannot come true. Bootstrapping runs BEFORE
+    // availability is probed for the drift report, so a manager installed here
+    // is used by this same apply rather than the next one.
+    var bootstrap_failed: usize = 0;
+    if (manifest.inUse() and !dry_run) {
+        bootstrap_failed = try bootstrapBackends(ctx, registry, manifest);
+    } else if (manifest.inUse()) {
+        for (manifest.bootstrap) |b| {
+            const backend = registry.find(b.backend) orelse continue;
+            if (try backend.available(ctx.alloc)) continue;
+            try ctx.out.print("  would bootstrap {s}\n", .{b.backend});
+        }
+    }
+
+    const rep = mox.packages.report.fromManifest(
+        ctx.alloc,
+        manifest,
+        registry,
         bindings,
         &diag,
     ) catch |e| switch (e) {
@@ -824,7 +892,7 @@ fn applyPackages(
     };
     if (!rep.in_use) return .{};
 
-    var counts: PackageCounts = .{ .in_use = true };
+    var counts: PackageCounts = .{ .in_use = true, .failed = bootstrap_failed };
     for (rep.backends) |b| {
         if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;

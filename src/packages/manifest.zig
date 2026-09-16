@@ -105,9 +105,21 @@ pub const Source = struct {
     private: bool,
 };
 
+/// A declared installer for a manager that does not ship with the OS. The
+/// URL and digest are data so a pin bump is a repo edit, never a mox release.
+pub const BootstrapRow = struct {
+    backend: []const u8,
+    url: []const u8,
+    sha256: []const u8,
+    origin: []const u8,
+    label: []const u8,
+    index: usize,
+};
+
 pub const Manifest = struct {
     packages: []const Row = &.{},
     blacklist: []const BlacklistRow = &.{},
+    bootstrap: []const BootstrapRow = &.{},
     sources: []const Source = &.{},
     /// How many manifest files were read. Zero means the subsystem is not in
     /// use on this repo, which is not the same as a manifest that declares
@@ -141,6 +153,7 @@ pub fn load(
 
     var packages: std.ArrayList(Row) = .empty;
     var blacklist: std.ArrayList(BlacklistRow) = .empty;
+    var bootstrap: std.ArrayList(BootstrapRow) = .empty;
     var sources: std.ArrayList(Source) = .empty;
 
     for (files) |f| {
@@ -187,6 +200,20 @@ pub fn load(
             }
         }
 
+        if (doc.table.get("bootstrap")) |v| {
+            if (v != .array) {
+                if (diag) |d| d.set("{s}: \"bootstrap\" must be a [[bootstrap]] array", .{f.label});
+                return Error.MalformedPackageFile;
+            }
+            for (v.array.items, 0..) |el, i| {
+                if (el != .table) {
+                    if (diag) |d| d.set("{s}: bootstrap row {d} is not a table", .{ f.label, i });
+                    return Error.MalformedPackageRow;
+                }
+                try bootstrap.append(arena, try parseBootstrapRow(arena, f, el.table, file_backend, i, diag));
+            }
+        }
+
         if (doc.table.get("blacklist")) |v| {
             if (v != .array) {
                 if (diag) |d| d.set("{s}: \"blacklist\" must be a [[blacklist]] array", .{f.label});
@@ -205,6 +232,7 @@ pub fn load(
     return .{
         .packages = try packages.toOwnedSlice(arena),
         .blacklist = try blacklist.toOwnedSlice(arena),
+        .bootstrap = try bootstrap.toOwnedSlice(arena),
         .sources = try sources.toOwnedSlice(arena),
         .files = files.len,
     };
@@ -336,6 +364,74 @@ fn parseRow(
         .label = f.label,
         .index = index,
     };
+}
+
+fn parseBootstrapRow(
+    arena: std.mem.Allocator,
+    f: SourceFile,
+    t: toml.Value.Table,
+    file_backend: ?[]const u8,
+    index: usize,
+    diag: ?*Diag,
+) !BootstrapRow {
+    _ = arena;
+    const backend = blk: {
+        if (t.get("backend")) |v| {
+            if (v != .string or v.string.len == 0) {
+                if (diag) |d| d.set("{s}: bootstrap row {d}: \"backend\" must be a non-empty string", .{ f.label, index });
+                return Error.MalformedPackageRow;
+            }
+            break :blk v.string;
+        }
+        break :blk file_backend orelse {
+            if (diag) |d| d.set(
+                "{s}: bootstrap row {d} has no \"backend\" and the file declares no default",
+                .{ f.label, index },
+            );
+            return Error.MalformedPackageRow;
+        };
+    };
+
+    const url = try requiredString(t, "url", f, backend, index, diag);
+    const sha256 = try requiredString(t, "sha256", f, backend, index, diag);
+
+    for (t.keys()) |k| {
+        if (std.mem.eql(u8, k, "backend") or std.mem.eql(u8, k, "url") or std.mem.eql(u8, k, "sha256")) continue;
+        if (diag) |d| d.set(
+            "{s}: bootstrap row for \"{s}\": unknown key \"{s}\" (a bootstrap row takes \"backend\", \"url\", \"sha256\")",
+            .{ f.label, backend, k },
+        );
+        return Error.MalformedPackageRow;
+    }
+
+    return .{
+        .backend = backend,
+        .url = url,
+        .sha256 = sha256,
+        .origin = f.path,
+        .label = f.label,
+        .index = index,
+    };
+}
+
+fn requiredString(
+    t: toml.Value.Table,
+    key: []const u8,
+    f: SourceFile,
+    backend: []const u8,
+    index: usize,
+    diag: ?*Diag,
+) ![]const u8 {
+    _ = index;
+    const v = t.get(key) orelse {
+        if (diag) |d| d.set("{s}: bootstrap row for \"{s}\" has no \"{s}\"", .{ f.label, backend, key });
+        return Error.MalformedPackageRow;
+    };
+    if (v != .string or v.string.len == 0) {
+        if (diag) |d| d.set("{s}: bootstrap row for \"{s}\": \"{s}\" must be a non-empty string", .{ f.label, backend, key });
+        return Error.MalformedPackageRow;
+    }
+    return v.string;
 }
 
 fn parseBlacklistRow(

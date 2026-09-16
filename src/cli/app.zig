@@ -93,11 +93,11 @@ pub const PackageBackends = struct {
     ) mox.packages.backend.Registry {
         self.proc = .{ .io = io };
         const runner = package_runner_override orelse self.proc.runner();
-        self.brew = .{ .runner = runner };
+        self.brew = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
         self.apt = .{ .manager = .apt, .runner = runner };
         self.dnf = .{ .manager = .dnf, .runner = runner };
         self.pacman = .{ .manager = .pacman, .runner = runner };
-        self.scoop = .{ .runner = runner };
+        self.scoop = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
         self.winget = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
         self.zypper = .{
             .runner = runner,

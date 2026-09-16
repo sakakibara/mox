@@ -19,6 +19,7 @@
 const std = @import("std");
 
 const backend_mod = @import("backend.zig");
+const bootstrap_mod = @import("bootstrap.zig");
 const exec = @import("exec.zig");
 const manifest_mod = @import("manifest.zig");
 
@@ -39,6 +40,9 @@ pub const cask_prefix = "cask:";
 
 pub const Brew = struct {
     runner: exec.Runner,
+    /// Only the bootstrap path needs these: staging a verified installer.
+    io: ?std.Io = null,
+    scratch_dir: []const u8 = "",
 
     pub fn backend(self: *Brew) Backend {
         return .{ .name = "brew", .ctx = self, .vtable = &vtable };
@@ -51,7 +55,22 @@ pub const Brew = struct {
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
         .declare = declareImpl,
+        .bootstrap = bootstrapImpl,
     };
+
+    /// Homebrew is not there on a fresh mac, so its own installer puts it
+    /// there -- fetched from the URL the manifest declares and run only once
+    /// its digest matches. `NONINTERACTIVE` because `mox apply` is: the
+    /// installer otherwise stops to ask for a keypress no unattended run can
+    /// give it.
+    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        const io = self.io orelse return error.NoBootstrapForBackend;
+
+        const path = try bootstrap_mod.fetchVerified(arena, io, self.runner, self.scratch_dir, "brew-install.sh", spec);
+        const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", path });
+        if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
+    }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Brew = @ptrCast(@alignCast(ctx));

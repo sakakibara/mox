@@ -24,6 +24,7 @@ const std = @import("std");
 const json = @import("json");
 
 const backend_mod = @import("backend.zig");
+const bootstrap_mod = @import("bootstrap.zig");
 const exec = @import("exec.zig");
 const manifest_mod = @import("manifest.zig");
 
@@ -47,6 +48,9 @@ pub const Error = error{
 /// `scoop export` emits `{"apps":[{"Name":...,"Source":...}],...}`.
 pub const Scoop = struct {
     runner: exec.Runner,
+    /// Only the bootstrap path needs these: staging a verified installer.
+    io: ?Io = null,
+    scratch_dir: []const u8 = "",
 
     pub fn backend(self: *Scoop) Backend {
         return .{ .name = "scoop", .ctx = self, .vtable = &vtable };
@@ -59,7 +63,21 @@ pub const Scoop = struct {
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
         .declare = declareImpl,
+        .bootstrap = bootstrapImpl,
     };
+
+    /// scoop installs itself from a PowerShell script, fetched from the URL
+    /// the manifest declares and run only once its digest matches.
+    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void {
+        const self: *Scoop = @ptrCast(@alignCast(ctx));
+        const io = self.io orelse return error.NoBootstrapForBackend;
+
+        const path = try bootstrap_mod.fetchVerified(arena, io, self.runner, self.scratch_dir, "scoop-install.ps1", spec);
+        const res = try self.runner.stream(arena, &.{
+            "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path,
+        });
+        if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
+    }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Scoop = @ptrCast(@alignCast(ctx));

@@ -610,3 +610,118 @@ test "windows: a winget row is validated even where winget cannot run" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not \"user\" or \"machine\"") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
+
+test "bootstrap: a manager that is absent is installed from the declared installer" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/bash\necho installing brew\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    const body = try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{hex});
+    try writeManifest(io, h, a, "darwin.toml", body);
+
+    // brew is absent, so the run must install it before anything else. The
+    // scripted curl writes the installer that the digest above covers.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    mox.cli.app.package_runner_override = fake.runner();
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    // curl was asked for the declared URL.
+    var fetched = false;
+    for (fake.calls.items) |c| {
+        if (std.mem.indexOf(u8, c, "https://example.invalid/install.sh") != null) fetched = true;
+    }
+    try std.testing.expect(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  brew") != null);
+}
+
+test "bootstrap: a manager already present is left alone" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "00"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    // brew answers, so nothing should be fetched; the Fake has no curl entry,
+    // so an attempt would error rather than pass unnoticed.
+    const fake = try brewWith(a, "ripgrep\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    _ = try h.run(&.{ "mox", "apply" });
+    for (fake.calls.items) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, "example.invalid") == null);
+    }
+}
+
+test "bootstrap: a bad digest refuses and the installer never runs" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The digest names something other than what the fetch produces.
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    mox.cli.app.package_runner_override = fake.runner();
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "bootstrap failed") != null);
+    // Nothing was executed: no interpreter was ever invoked on the staged file.
+    for (fake.calls.items) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, "/bin/bash") == null);
+    }
+}

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const bootstrap_mod = @import("bootstrap.zig");
 const manifest_mod = @import("manifest.zig");
 
 pub const Row = manifest_mod.Row;
@@ -59,6 +60,11 @@ pub const Backend = struct {
         installedExplicit: *const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8,
         /// Install these rows, leaving resolution to the manager.
         install: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void,
+        /// Install the manager itself from a declared, digest-verified
+        /// installer. Null for a manager that ships with the OS, which is
+        /// four of the seven: there is nothing to install and no installer to
+        /// declare.
+        bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void = null,
         /// The row that would name an observed installed id: the inverse of
         /// `idOf`, for writing a hand-installed package back into the
         /// manifest. `idOf` of the result must equal the id given.
@@ -94,5 +100,14 @@ pub const Backend = struct {
 
     pub fn declare(self: Backend, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration {
         return self.vtable.declare(self.ctx, arena, id);
+    }
+
+    pub fn canBootstrap(self: Backend) bool {
+        return self.vtable.bootstrap != null;
+    }
+
+    pub fn bootstrap(self: Backend, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void {
+        const f = self.vtable.bootstrap orelse return error.NoBootstrapForBackend;
+        return f(self.ctx, arena, spec);
     }
 };

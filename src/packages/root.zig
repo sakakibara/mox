@@ -12,6 +12,7 @@ pub const linux = @import("linux.zig");
 pub const windows = @import("windows.zig");
 pub const zypper = @import("zypper.zig");
 pub const ledger = @import("ledger.zig");
+pub const bootstrap = @import("bootstrap.zig");
 pub const report = @import("report.zig");
 pub const write = @import("write.zig");
 
@@ -29,6 +30,7 @@ test {
     _ = windows;
     _ = zypper;
     _ = ledger;
+    _ = bootstrap;
     _ = report;
     _ = write;
 }
