@@ -5,16 +5,19 @@
 //! satisfies exactly the same `Backend` contract, so nothing downstream can
 //! tell them apart. Any manager, any language, no mox release.
 //!
-//!     <plugin> available          exit 0: usable here
-//!     <plugin> id                 stdin: rows, one inline table per line
-//!                                 stdout: one id per line, in order
-//!                                 nonzero: a row is refused; stderr says why
+//!     <plugin> available          exit 0: usable here; 1: not usable here
+//!     <plugin> id                 stdin: one row as an inline table
+//!                                 stdout: exactly one id
+//!                                 exit 1: the row is refused; stderr says why
 //!     <plugin> list               stdout: one id per line, explicitly installed
-//!     <plugin> install            stdin: rows; stdio streamed; nonzero: failed
+//!     <plugin> install            stdin: rows, one per line; stdio streamed
 //!     <plugin> declare <id>       stdout: a TOML row body naming this id
 //!     <plugin> bootstrap <path>   optional: install the manager from the
 //!                                 verified file; stdout: a bin dir, or nothing
 //!     <plugin> limitation         optional: one line on what it cannot see
+//!
+//! Exit 64 from any verb means "not implemented"; any other nonzero exit is
+//! a failed plugin, named as such, except `id`'s 1, which is a refusal.
 //!
 //! `id` is both `idOf` and `validate`: a row the plugin cannot name is refused
 //! with the plugin's own reason, which is stronger than any key list mox could
@@ -261,9 +264,9 @@ pub const Plugin = struct {
     }
 };
 
-/// Split on newline, trim `\r` and spaces (a PowerShell plugin emits CRLF),
-/// drop blanks, and refuse any id whose shape says the plugin lost its line
-/// separator or padded its output.
+/// Split on newline, trim `\r` and surrounding spaces (a PowerShell plugin
+/// emits CRLF), drop blanks, and refuse any id whose shape says the plugin
+/// lost its line separator.
 fn idLines(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, text, '\n');

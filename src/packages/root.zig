@@ -1,5 +1,5 @@
 //! Public API for the mox package subsystem: the `data/packages/*.toml`
-//! manifest, and (as they land) the backend adapters, drift computation, and
+//! manifest, and the backend adapters, drift computation, and
 //! reconcile orchestration built on it.
 pub const manifest = @import("manifest.zig");
 pub const desired = @import("desired.zig");

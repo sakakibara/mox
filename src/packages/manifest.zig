@@ -1,6 +1,7 @@
 //! `data/packages/*.toml`: the package manifest -- `[[packages]]` rows
 //! declaring what belongs on a machine, `[[blacklist]]` rows naming what must
-//! never be offered for tracking.
+//! never be offered for tracking, `[[bootstrap]]` rows naming a manager's
+//! installer.
 //!
 //! A DIRECTORY, not a file, because the private layer shadows per file: a
 //! single private `packages.toml` would replace the whole repo list, while a
@@ -8,7 +9,8 @@
 //! Same-basename files still shadow, matching every other data source.
 //!
 //! The core understands `name`, `backend` and `when`, plus a file-level
-//! `backend` default. Every other key belongs to the backend adapter, which
+//! `backend` default and a file-level `when` that gates every row in the
+//! file. Every other key belongs to the backend adapter, which
 //! declares and validates its own key set; this loader only guarantees each
 //! is a scalar or string array, and refuses anything it cannot hand over --
 //! the template projection silently drops a non-scalar, which would turn a

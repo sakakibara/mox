@@ -29,7 +29,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
