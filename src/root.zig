@@ -19,6 +19,7 @@ pub const secret = @import("secret/root.zig");
 pub const trigger = @import("trigger/root.zig");
 pub const diff = @import("diff/root.zig");
 pub const provenance = @import("provenance/root.zig");
+pub const packages = @import("packages/root.zig");
 pub const cli = @import("cli/root.zig");
 
 /// External: TOML 1.1 parser/encoder. Used by the Cat A composer.
@@ -700,6 +701,10 @@ test "classify module tests are discovered" {
 
 test "coupling module tests are discovered" {
     _ = coupling;
+}
+
+test "packages module tests are discovered" {
+    _ = packages;
 }
 
 test "cli paths module is reachable" {
