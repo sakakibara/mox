@@ -16,6 +16,8 @@
 
 const std = @import("std");
 
+const apply_write = @import("../apply/write.zig");
+
 const Io = std.Io;
 
 pub const Ledger = struct {
@@ -73,7 +75,9 @@ pub const Ledger = struct {
 
         try Io.Dir.cwd().createDirPath(self.io, self.dir);
         const p = try self.path(arena);
-        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = p, .data = buf.items });
+        // Atomic: a record that vanished mid-write would read as nothing ever
+        // installed, and every package would be installed again.
+        try apply_write.writeAtomic(self.io, p, buf.items, 0o644);
     }
 };
 

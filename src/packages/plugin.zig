@@ -53,16 +53,14 @@ pub const Plugin = struct {
     /// How to invoke it: the path alone, or an interpreter and the path.
     argv0: []const []const u8,
     runner: exec.Runner,
-    /// Answered once, by `queryLimitation`, before the backend is built.
-    limitation: ?[]const u8 = null,
+    /// Set when this machine cannot run the file (a `.ps1` on unix, a plain
+    /// script on Windows). The plugin is then registered but never usable:
+    /// its rows are inert here, as a dnf row is inert on a mac, rather than
+    /// refused as naming nothing.
+    not_runnable: ?[]const u8 = null,
 
     pub fn backend(self: *Plugin) Backend {
-        return .{
-            .name = self.name,
-            .ctx = self,
-            .vtable = &vtable,
-            .limitation = self.limitation,
-        };
+        return .{ .name = self.name, .ctx = self, .vtable = &vtable };
     }
 
     const vtable: Backend.VTable = .{
@@ -73,6 +71,7 @@ pub const Plugin = struct {
         .install = installImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
+        .limitation = limitationImpl,
     };
 
     fn argv(self: *const Plugin, arena: std.mem.Allocator, verb: []const u8, extra: []const []const u8) ![]const []const u8 {
@@ -83,15 +82,17 @@ pub const Plugin = struct {
         return out.toOwnedSlice(arena);
     }
 
-    /// Ask the optional `limitation` verb. Exit 64 is "none"; a failure is a
-    /// failure.
-    pub fn queryLimitation(self: *Plugin, arena: std.mem.Allocator) !void {
-        const res = try self.runner.run(arena, try self.argv(arena, "limitation", &.{}));
+    /// The optional `limitation` verb. Exit 64 is "none"; a failure is a
+    /// failure. Asked only of a usable backend, after the report has named
+    /// every plugin, so nothing runs before it is listed.
+    fn limitationImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!?[]const u8 {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        const res = try self.runner.runInput(arena, try self.argv(arena, "limitation", &.{}), "");
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return;
+        if (res.code == exit_not_implemented) return null;
         if (!res.ok) return Error.PluginFailed;
         const line = firstLine(res.stdout);
-        self.limitation = if (line.len == 0) null else line;
+        return if (line.len == 0) null else line;
     }
 
     /// Exit 0 is usable, exit 1 is not usable here, and anything else is a
@@ -103,6 +104,7 @@ pub const Plugin = struct {
     /// argv[0] here is not the manager.
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
+        if (self.not_runnable != null) return false;
         const res = try self.runner.runInput(arena, try self.argv(arena, "available", &.{}), "");
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
@@ -112,6 +114,10 @@ pub const Plugin = struct {
 
     fn validateImpl(ctx: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
+        // A row for a plugin this machine cannot run is checked where the
+        // plugin runs; here it is inert, and refusing it would make one
+        // shared manifest unreadable on every other OS.
+        if (self.not_runnable != null) return;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         _ = self.idOne(arena.allocator(), row) catch |e| switch (e) {
@@ -122,12 +128,19 @@ pub const Plugin = struct {
                 );
                 return e;
             },
-            else => return e,
+            else => {
+                if (diag) |d| d.set(
+                    "{s}: row \"{s}\": plugin {s}: id failed: {s}",
+                    .{ row.label, row.name, self.name, @errorName(e) },
+                );
+                return e;
+            },
         };
     }
 
     fn idOfImpl(ctx: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
+        if (self.not_runnable != null) return row.name;
         return self.idOne(arena, row);
     }
 
@@ -139,7 +152,11 @@ pub const Plugin = struct {
         const res = try self.runner.runInput(arena, try self.argv(arena, "id", &.{}), input);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
-        if (!res.ok) return Error.PluginRefusedRow;
+        // Exit 1 is the plugin declining the row; anything else is the plugin
+        // dying (a shell syntax error exits 2), which must not read as a
+        // considered refusal.
+        if (res.code == 1) return Error.PluginRefusedRow;
+        if (!res.ok) return Error.PluginFailed;
 
         const ids = try idLines(arena, res.stdout);
         if (ids.len != 1) return Error.PluginBadOutput;
@@ -148,7 +165,7 @@ pub const Plugin = struct {
 
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.run(arena, try self.argv(arena, "list", &.{}));
+        const res = try self.runner.runInput(arena, try self.argv(arena, "list", &.{}), "");
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
@@ -175,7 +192,7 @@ pub const Plugin = struct {
     /// never match its own package.
     fn declareImpl(ctx: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.run(arena, try self.argv(arena, "declare", &.{id}));
+        const res = try self.runner.runInput(arena, try self.argv(arena, "declare", &.{id}), "");
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
@@ -223,6 +240,14 @@ fn idLines(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(arena);
 }
 
+fn keyOk(k: []const u8) bool {
+    if (k.len == 0) return false;
+    for (k) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
+}
+
 fn firstLine(text: []const u8) []const u8 {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw| {
@@ -242,6 +267,11 @@ fn parseDeclaration(arena: std.mem.Allocator, text: []const u8) !Backend.Declara
     var fields: std.ArrayList(manifest_mod.Pair) = .empty;
     for (v.table.keys(), v.table.values()) |k, fv| {
         if (std.mem.eql(u8, k, "name")) continue;
+        // A core key is mox's to write, and a key outside the bare charset
+        // would be rendered unquoted into a manifest that then fails to
+        // parse; both are the plugin answering wrong, not a row to record.
+        if (std.mem.eql(u8, k, "backend") or std.mem.eql(u8, k, "when")) return Error.PluginBadOutput;
+        if (!keyOk(k)) return Error.PluginBadOutput;
         const f = (try manifest_mod.fieldOf(arena, fv)) orelse return Error.PluginBadOutput;
         try fields.append(arena, .{ .key = k, .value = f });
     }
@@ -282,6 +312,32 @@ test "id: the row goes to stdin as one inline table and the id comes back" {
         "{ name = \"ghostty\", kind = \"cask\" }\n",
         fake.inputTo("/r/scripts/backends/macports id").?,
     );
+}
+
+test "id: a plugin that dies is a failure, not a considered refusal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports id", .code = 2 },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expectError(Error.PluginFailed, p.backend().idOf(a, rowOf("x", &.{})));
+}
+
+test "declare: a core key or an unquotable key is bad output, never written" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports declare x", .stdout = "name = \"x\"\nbackend = \"other\"\n" },
+        .{ .argv = "/r/scripts/backends/macports declare y", .stdout = "name = \"y\"\n\"my key\" = 1\n" },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expectError(Error.PluginBadOutput, p.backend().declare(a, "x"));
+    try testing.expectError(Error.PluginBadOutput, p.backend().declare(a, "y"));
 }
 
 test "id: a refused row is the plugin's decision, surfaced through validate" {
@@ -375,8 +431,7 @@ test "exit 64: an optional verb the plugin lacks is named, never defaulted" {
 
     try testing.expectError(Error.PluginVerbNotImplemented, p.backend().declare(a, "x"));
     try testing.expectError(Error.PluginVerbNotImplemented, p.backend().bootstrap(a, "/tmp/i"));
-    try p.queryLimitation(a);
-    try testing.expect(p.limitation == null);
+    try testing.expect((try p.backend().limitationOf(a)) == null);
 }
 
 test "bootstrap: the line on stdout is the bin dir to put on PATH" {
@@ -400,8 +455,7 @@ test "limitation: the plugin's one line is carried onto the backend" {
         .{ .argv = "/r/scripts/backends/macports limitation", .stdout = "variants are not tracked\n" },
     } };
     var p = pluginWith(&fake);
-    try p.queryLimitation(a);
-    try testing.expectEqualStrings("variants are not tracked", p.backend().limitation.?);
+    try testing.expectEqualStrings("variants are not tracked", (try p.backend().limitationOf(a)).?);
 }
 
 test "available: a plugin that cannot be spawned is an error, not an absent manager" {

@@ -65,10 +65,16 @@ fn contradictions(
 ) !void {
     for (m.blacklist) |bl| {
         const b = registry.find(bl.backend) orelse continue;
-        const blocked = try b.idOf(arena, bl.asRow());
+        const blocked = b.idOf(arena, bl.asRow()) catch |e| {
+            if (diag) |d| d.set("{s}: blacklist row \"{s}\": id failed: {s}", .{ bl.label, bl.name, @errorName(e) });
+            return e;
+        };
         for (m.packages) |row| {
             if (!std.mem.eql(u8, row.backend, bl.backend)) continue;
-            const id = try b.idOf(arena, row);
+            const id = b.idOf(arena, row) catch |e| {
+                if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, @errorName(e) });
+                return e;
+            };
             if (!std.mem.eql(u8, id, blocked)) continue;
             if (diag) |d| d.set(
                 "{s} declares \"{s}\" for backend \"{s}\", which {s} blacklists",

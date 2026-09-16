@@ -962,6 +962,8 @@ test "plugin: one that crashes on available is a named error, not an inert backe
     try std.testing.expect(std.mem.indexOf(u8, r.err, "broken: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "failed") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
+    // What was about to execute is on the record before it ran and died.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      backend broken: scripts/backends/broken") != null);
 }
 
 test "commit: a plugin without declare is reported by name, and the run does not crash" {
@@ -994,4 +996,255 @@ test "commit: a plugin without declare is reported by name, and the run does not
     try std.testing.expect(std.mem.indexOf(u8, r.err, "nodeclare stray: declare failed: PluginVerbNotImplemented") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "internal error") == null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "commit --abort-on-prompt: an untracked package is a prompt, so rc 2 and the manifest is untouched" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const original = "backend = \"brew\"\n";
+    try writeManifest(io, h, a, "darwin.toml", original);
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "commit", "--abort-on-prompt" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "--abort-on-prompt: a package prompt was required") != null);
+
+    const after = try readManifest(io, h, a, "darwin.toml");
+    try std.testing.expectEqualStrings(original, after);
+}
+
+test "commit: q at a package prompt stops there, keeping the row already recorded and saying so" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
+
+    // Offered in the order the manager lists them: htop first, then fd.
+    const fake = try brewWith(a, "htop\nfd\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\nq\n");
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "aborted; 1 package row(s) already recorded, no file changes written") != null);
+
+    // The first answer was appended the moment it was given; the abort
+    // reached the second before anything was written for it.
+    const after = try readManifest(io, h, a, "darwin.toml");
+    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, after, "[[packages]]"));
+    try std.testing.expect(std.mem.indexOf(u8, after, "fd") == null);
+}
+
+test "plugin: a windows-only kind on unix is an inert backend with a note, not an error" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A shared repo's Windows plugin: present here, runnable only there.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "scoopish.ps1" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "exit 0\n" });
+    try writeManifest(io, h, a, "windows.toml",
+        \\backend = "scoopish"
+        \\
+        \\[[packages]]
+        \\name = "7zip"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "scripts/backends/scoopish.ps1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "not runnable") != null);
+    // Neither a typo nor a refusal: its row is simply not this machine's.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "refused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "scoopish:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "plugin: finder junk beside a plugin is ignored, not read as an unexecutable backend" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try installPlugin(io, h, a);
+
+    const junk = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends", ".DS_Store" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = junk, .data = "\x00\x00\x00\x01Bud1\x00" });
+    try writeManifest(io, h, a, "ports.toml", "backend = \"fakeports\"\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ".DS_Store") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "NotExecutable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "packages:") != null);
+}
+
+test "status: a repo with no manifest never discovers a plugin, let alone runs one" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // Would fail loudly if run; the repo has not adopted packages, so it
+    // must not be.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "broken" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "#!/bin/sh\ncase x in\n" });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+
+    // Any manager call errors the run too.
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "packages:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "broken") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing fetched, staged or installed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    // brew is absent; no curl and no install is scripted, so either errors.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would bootstrap brew") != null);
+    // Planned as though the bootstrap had happened: every row is listed.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install  brew fd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install  brew ripgrep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 would be installed, after bootstrapping 1 manager(s)") != null);
+    for (fake.calls.items) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, "install") == null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "https://example.invalid") == null);
+    }
+    // Nothing was staged where a real bootstrap would put the installer.
+    const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
+}
+
+test "plugin: one that hangs on available is killed at the bound, and the timeout is named" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{
+        .extra_env = &.{.{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "200" }},
+    });
+
+    // Named `brew` so it shadows the built-in: the first backend probed is
+    // this one, and no real manager on the host is asked anything under the
+    // same short bound. `exec` so the sleeping process is the plugin itself,
+    // and the kill ends it rather than orphaning a sleep holding the pipe.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "brew" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exec sleep 3 ;;
+        \\esac
+        \\exit 0
+        \\
+    });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
+
+    const started = Io.Timestamp.now(io, .awake);
+    const r = try h.run(&.{ "mox", "status" });
+    const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
+
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: available failed: PluginTimedOut") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    // Killed at the bound, not waited out.
+    try std.testing.expect(elapsed_ms < 3000);
+}
+
+test "commit: a malformed manifest is named, and no manager is asked anything" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n[[packages]\nname = \"x\"\n");
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "darwin.toml") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }

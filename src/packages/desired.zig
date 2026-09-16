@@ -47,10 +47,11 @@ pub fn select(
         const b = registry.find(row.backend) orelse continue;
         if (!try gateHolds(arena, row, r)) continue;
 
-        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{
-            row.backend,
-            try b.idOf(arena, row),
-        });
+        const id = b.idOf(arena, row) catch |e| {
+            if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, @errorName(e) });
+            return e;
+        };
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ row.backend, id });
         if (seen.get(key)) |first| {
             if (diag) |d| d.set(
                 "{s} and {s} both declare \"{s}\" for backend \"{s}\" on this machine",

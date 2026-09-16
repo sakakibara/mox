@@ -22,8 +22,13 @@ const Io = std.Io;
 pub const Error = error{
     BootstrapDownloadFailed,
     BootstrapDigestMismatch,
+    BootstrapInstallerTooLarge,
     BootstrapFailed,
 };
+
+/// The most an installer may be; larger is refused by name rather than read
+/// as a failed download.
+pub const max_installer_bytes: usize = 64 << 20;
 
 /// A declared installer: where to get it and what it must hash to.
 pub const Spec = struct {
@@ -54,8 +59,13 @@ pub fn fetchVerified(
     };
     if (!res.ok) return Error.BootstrapDownloadFailed;
 
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(8 << 20)) catch
-        return Error.BootstrapDownloadFailed;
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_installer_bytes)) catch |e| switch (e) {
+        error.StreamTooLong => {
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+            return Error.BootstrapInstallerTooLarge;
+        },
+        else => return Error.BootstrapDownloadFailed,
+    };
     const got = applied.contentHashHex(bytes);
     if (!std.ascii.eqlIgnoreCase(&got, spec.sha256)) {
         // Removed, so a failed verification cannot leave something runnable

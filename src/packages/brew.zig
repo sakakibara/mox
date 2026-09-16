@@ -141,6 +141,7 @@ pub const Brew = struct {
         var out: std.ArrayList([]const u8) = .empty;
 
         const formulae = try self.runner.run(arena, &.{ self.exe, "list", "--full-name", "--installed-on-request" });
+        try exec.checkTimedOut(formulae);
         if (!formulae.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, formulae.stdout, "");
 
@@ -151,12 +152,17 @@ pub const Brew = struct {
         return out.toOwnedSlice(arena);
     }
 
+    /// One `brew install` per row, every row attempted: a formula that fails
+    /// halfway down the list must not leave the ones after it uninstalled.
+    /// The batch then fails as a whole if any row did.
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Brew = @ptrCast(@alignCast(ctx));
+        var failed = false;
         for (rows) |row| {
             const kind = try kindOf(row);
             if (tapOf(row.name)) |tap| {
                 const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", tap });
+                try exec.checkTimedOut(tapped);
                 if (!tapped.ok) return error.BrewTapFailed;
                 // Trust the one thing named, never the whole tap: an
                 // untrusted third-party tap is ignored outright since
@@ -175,8 +181,10 @@ pub const Brew = struct {
                 .formula => try self.runner.stream(arena, &.{ self.exe, "install", row.name }),
                 .cask => try self.runner.stream(arena, &.{ self.exe, "install", "--cask", row.name }),
             };
-            if (!res.ok) return error.BrewInstallFailed;
+            try exec.checkTimedOut(res);
+            if (!res.ok) failed = true;
         }
+        if (failed) return error.BrewInstallFailed;
     }
 };
 

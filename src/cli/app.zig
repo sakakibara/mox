@@ -87,9 +87,9 @@ pub const PackageBackends = struct {
     zypper: mox.packages.zypper.Zypper = undefined,
     plugins: []mox.packages.plugin.Plugin = &.{},
     list: []mox.packages.backend.Backend = &.{},
-    /// Override and not-runnable notices, for `status` to print: a plugin
-    /// that will not run here, or one standing in for a shipped backend, must
-    /// be visible rather than inferred from what is missing.
+    /// Every discovered plugin by path, an override of a shipped backend, a
+    /// plugin this machine cannot run: printed before any backend is asked
+    /// anything, so what will execute is visible rather than inferred.
     notes: []const []const u8 = &.{},
 
     pub fn runner(self: *PackageBackends) mox.packages.exec.Runner {
@@ -100,8 +100,11 @@ pub const PackageBackends = struct {
     /// mox's state directory keeps both inside a directory mox already owns.
     /// `env` is what every backend and plugin runs under; apply hands its
     /// script environment so a bootstrap's PATH addition reaches the probes
-    /// that follow in the same run. `diag` names a plugin that cannot be
-    /// discovered (bad name, missing executable bit, two files for one name).
+    /// that follow in the same run. Plugins are discovered only when
+    /// `discover_plugins`: a repo that carries no manifest is not using the
+    /// subsystem, and must not have its executables run by a `status`.
+    /// `diag` names a plugin that cannot be discovered (bad name, missing
+    /// executable bit, two files for one name). Nothing here runs a plugin.
     pub fn registry(
         self: *PackageBackends,
         arena: std.mem.Allocator,
@@ -110,9 +113,16 @@ pub const PackageBackends = struct {
         home: []const u8,
         env: ?*const std.process.Environ.Map,
         repo_dir: []const u8,
+        discover_plugins: bool,
+        err: *std.Io.Writer,
         diag: ?*mox.packages.manifest.Diag,
     ) !mox.packages.backend.Registry {
-        self.proc = .{ .io = io, .env = env, .scratch_dir = scratch_dir };
+        self.proc = .{
+            .io = io,
+            .env = env,
+            .scratch_dir = scratch_dir,
+            .timeout_ms = mox.packages.exec.timeoutFromEnv(env, err),
+        };
         const r = self.runner();
         self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
         self.apt = .{ .manager = .apt, .runner = r };
@@ -137,35 +147,26 @@ pub const PackageBackends = struct {
         });
 
         var notes: std.ArrayList([]const u8) = .empty;
-        const found = try mox.packages.discover.discover(arena, io, repo_dir, diag);
+        const found: []const mox.packages.discover.Found = if (discover_plugins)
+            try mox.packages.discover.discover(arena, io, repo_dir, diag)
+        else
+            &.{};
         self.plugins = try arena.alloc(mox.packages.plugin.Plugin, found.len);
-        var n: usize = 0;
-        for (found) |f| {
+        for (found, 0..) |f, i| {
+            self.plugins[i] = .{ .name = f.name, .argv0 = f.argv0, .runner = r, .not_runnable = f.not_runnable };
+            const pl = &self.plugins[i];
             if (f.not_runnable) |why| {
-                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ f.path, why }));
-                continue;
+                try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}: {s}", .{ f.name, f.label, why }));
+            } else {
+                try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}", .{ f.name, f.label }));
             }
-            self.plugins[n] = .{ .name = f.name, .argv0 = f.argv0, .runner = r };
-            const pl = &self.plugins[n];
-            n += 1;
-            // Every plugin that will run is named by path before it runs:
-            // `status` and `commit` executing repo code is new, and what
-            // executes must be visible rather than inferred.
-            try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}", .{ f.name, f.path }));
-            // The first thing a plugin is ever asked; a crash here is a broken
-            // plugin and is named as such rather than surfacing as a bare
-            // error with three plugins to suspect.
-            pl.queryLimitation(arena) catch |e| {
-                if (diag) |d| d.set("{s}: limitation failed: {s} ({s})", .{ f.name, @errorName(e), f.path });
-                return e;
-            };
 
             var replaced = false;
             for (list.items) |*b| {
                 if (std.mem.eql(u8, b.name, f.name)) {
                     b.* = pl.backend();
                     replaced = true;
-                    try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s} overrides the built-in", .{ f.name, f.path }));
+                    try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s} overrides the built-in", .{ f.name, f.label }));
                     break;
                 }
             }

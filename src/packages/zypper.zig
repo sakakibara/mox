@@ -125,6 +125,7 @@ pub const Zypper = struct {
         for (rows) |row| try argv.append(arena, row.name);
 
         const res = try self.runner.stream(arena, argv.items);
+        try exec.checkTimedOut(res);
         if (!res.ok) return Error.ZypperInstallFailed;
 
         // Recorded only after the install succeeded: a ledger entry for a

@@ -49,6 +49,10 @@ pub const Scoop = struct {
     /// Where scoop lands (`<home>\scoop\shims`), so a bootstrap can name the
     /// bin dir for this same run. Empty means unknown.
     home: []const u8 = "",
+    /// How scoop is invoked: `scoop` until a bootstrap installs it, then its
+    /// own shim script through pwsh, because a child's PATH is never used to
+    /// resolve argv[0] and a freshly installed scoop is on no PATH yet.
+    argv0: []const []const u8 = &.{"scoop"},
 
     pub fn backend(self: *Scoop) Backend {
         return .{ .name = "scoop", .ctx = self, .vtable = &vtable };
@@ -73,12 +77,22 @@ pub const Scoop = struct {
         });
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
         if (self.home.len == 0) return null;
-        return try std.fs.path.join(arena, &.{ self.home, "scoop", "shims" });
+        const shims = try std.fs.path.join(arena, &.{ self.home, "scoop", "shims" });
+        const shim = try std.fs.path.join(arena, &.{ shims, "scoop.ps1" });
+        self.argv0 = try arena.dupe([]const u8, &.{ "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", shim });
+        return shims;
+    }
+
+    fn argv(self: *const Scoop, arena: std.mem.Allocator, rest: []const []const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        try out.appendSlice(arena, self.argv0);
+        try out.appendSlice(arena, rest);
+        return out.toOwnedSlice(arena);
     }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ "scoop", "--version" }) catch |e| switch (e) {
+        const res = self.runner.run(arena, try self.argv(arena, &.{"--version"})) catch |e| switch (e) {
             error.FileNotFound => return false,
             else => return e,
         };
@@ -114,7 +128,8 @@ pub const Scoop = struct {
 
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.run(arena, &.{ "scoop", "export" });
+        const res = try self.runner.run(arena, try self.argv(arena, &.{"export"}));
+        try exec.checkTimedOut(res);
         if (!res.ok) return Error.ScoopQueryFailed;
         return appNames(arena, res.stdout);
     }
@@ -125,14 +140,16 @@ pub const Scoop = struct {
             // A bucket must exist before an app in it can resolve, exactly as
             // a brew tap must. Adding one already present is a no-op.
             if (bucketOf(row)) |bucket| {
-                const added = try self.runner.stream(arena, &.{ "scoop", "bucket", "add", bucket });
+                const added = try self.runner.stream(arena, try self.argv(arena, &.{ "bucket", "add", bucket }));
+                try exec.checkTimedOut(added);
                 if (!added.ok) return Error.ScoopInstallFailed;
             }
             const target = if (bucketOf(row)) |bucket|
                 try std.fmt.allocPrint(arena, "{s}/{s}", .{ bucket, row.name })
             else
                 row.name;
-            const res = try self.runner.stream(arena, &.{ "scoop", "install", target });
+            const res = try self.runner.stream(arena, try self.argv(arena, &.{ "install", target }));
+            try exec.checkTimedOut(res);
             if (!res.ok) return Error.ScoopInstallFailed;
         }
     }
@@ -274,6 +291,7 @@ pub const Winget = struct {
             try argv.appendSlice(arena, &.{ "--accept-package-agreements", "--accept-source-agreements" });
 
             const res = try self.runner.stream(arena, argv.items);
+            try exec.checkTimedOut(res);
             if (!res.ok) return Error.WingetInstallFailed;
         }
     }

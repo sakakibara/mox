@@ -406,14 +406,19 @@ const PackageReconcile = struct {
     added: usize = 0,
     blacklisted: usize = 0,
     skipped: usize = 0,
+    /// The manifest could not be read or checked: an error, counted as
+    /// pending so the run cannot exit clean past it.
+    broken: bool = false,
+    /// `q` at a package prompt, or `--abort-on-prompt` meeting one.
     aborted: bool = false,
+    strict_abort: bool = false,
 
     fn touched(self: PackageReconcile) bool {
         return self.added > 0 or self.blacklisted > 0;
     }
 
     fn pending(self: PackageReconcile) bool {
-        return self.skipped > 0;
+        return self.skipped > 0 or self.broken;
     }
 };
 
@@ -436,27 +441,6 @@ fn reconcilePackages(
 ) !PackageReconcile {
     const env = try app.packageEnv(ctx, context, m_state);
     var diag: mox.packages.manifest.Diag = .{};
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(
-        ctx.alloc,
-        ctx.io,
-        context.paths.state_dir,
-        context.paths.home,
-        env,
-        context.paths.repo_dir,
-        &diag,
-    ) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        else => {
-            if (diag.capture()) |cap| {
-                try ctx.err.print("mox commit: packages: {s}\n", .{cap});
-            } else {
-                try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
-            }
-            return .{};
-        },
-    };
-
     const m = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,
@@ -471,12 +455,23 @@ fn reconcilePackages(
             } else {
                 try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
             }
-            return .{};
+            return .{ .broken = true };
         },
     };
     if (!m.inUse()) return .{};
 
-    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &diag) catch |e| switch (e) {
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(
+        ctx.alloc,
+        ctx.io,
+        context.paths.state_dir,
+        context.paths.home,
+        env,
+        context.paths.repo_dir,
+        true,
+        ctx.err,
+        &diag,
+    ) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             if (diag.capture()) |cap| {
@@ -484,7 +479,20 @@ fn reconcilePackages(
             } else {
                 try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
             }
-            return .{};
+            return .{ .broken = true };
+        },
+    };
+    for (pkg_backends.notes) |note| try ctx.out.print("  note  {s}\n", .{note});
+
+    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox commit: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .broken = true };
         },
     };
 
@@ -498,6 +506,7 @@ fn reconcilePackages(
     for (rep.backends) |b| {
         if (b.drift.untracked.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
+        var no_file_said = false;
 
         for (b.drift.untracked) |id| {
             if (report_only) {
@@ -507,10 +516,15 @@ fn reconcilePackages(
             }
 
             const target = mox.packages.write.targetFor(m, b.backend) orelse {
-                try ctx.err.print(
-                    "mox commit: {s} {s}: no data/packages file declares backend \"{s}\"; add one to record it\n",
-                    .{ b.backend, id, b.backend },
-                );
+                // Said once per backend: every untracked package of that
+                // backend has the same missing file.
+                if (!no_file_said) {
+                    try ctx.err.print(
+                        "mox commit: no data/packages file declares backend \"{s}\"; add one to record its {d} untracked package(s)\n",
+                        .{ b.backend, b.drift.untracked.len },
+                    );
+                    no_file_said = true;
+                }
                 res.skipped += 1;
                 continue;
             };
@@ -526,10 +540,13 @@ fn reconcilePackages(
                 },
                 .abort => {
                     res.aborted = true;
+                    res.skipped += 1;
                     return res;
                 },
                 .abort_strict => {
                     res.aborted = true;
+                    res.strict_abort = true;
+                    res.skipped += 1;
                     return res;
                 },
             };
@@ -561,12 +578,13 @@ fn reconcilePackages(
                 if (needs_backend) b.backend else null,
             );
             try mox.packages.write.append(ctx.alloc, ctx.io, target.path, block);
+            const layer: []const u8 = if (target.private) " (private layer)" else "";
             if (chosen == 0) {
                 res.added += 1;
-                try ctx.out.print("  recorded in {s}\n", .{target.label});
+                try ctx.out.print("  recorded in {s}{s}\n", .{ target.label, layer });
             } else {
                 res.blacklisted += 1;
-                try ctx.out.print("  blacklisted in {s}\n", .{target.label});
+                try ctx.out.print("  blacklisted in {s}{s}\n", .{ target.label, layer });
             }
         }
     }
@@ -745,6 +763,22 @@ pub fn commitImpl(
         try reconcilePackages(ctx, context, &axis_resolver, m_state, ask_mode, input, report_mode)
     else
         PackageReconcile{};
+    // A package row is appended the moment it is chosen, so an abort here
+    // ends the run before the file pass and says exactly what was written.
+    if (pkgs.strict_abort) {
+        try ctx.err.print(
+            "mox commit: --abort-on-prompt: a package prompt was required; {d} row(s) already recorded, no file changes written\n",
+            .{pkgs.added + pkgs.blacklisted},
+        );
+        return 2;
+    }
+    if (pkgs.aborted) {
+        try ctx.out.print(
+            "mox commit: aborted; {d} package row(s) already recorded, no file changes written\n",
+            .{pkgs.added + pkgs.blacklisted},
+        );
+        return 1;
+    }
 
     var claims: Claims = .empty;
 

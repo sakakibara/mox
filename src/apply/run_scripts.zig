@@ -67,7 +67,7 @@ extern "kernel32" fn TerminateProcess(hProcess: windows.HANDLE, uExitCode: windo
 /// Generous wall-clock bound on a single setup script so a hung pre-script
 /// (waiting on stdin, a lock, or a stalled network call) cannot block apply
 /// forever. Override per-run with MOX_SCRIPT_TIMEOUT_MS; <= 0 disables it.
-const default_script_timeout_ms: i64 = 600_000;
+pub const default_script_timeout_ms: i64 = 600_000;
 
 pub const Result = struct {
     ran: usize = 0,
@@ -655,13 +655,13 @@ fn runGatedDir(
 /// Read the per-script timeout (ms) from the child environment, or the
 /// default. A present but unparseable override warns once and falls back to
 /// the default, rather than silently ignoring the typo.
-fn scriptTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
+pub fn scriptTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
     const m = environ_map orelse return default_script_timeout_ms;
     const v = m.get("MOX_SCRIPT_TIMEOUT_MS") orelse return default_script_timeout_ms;
     if (v.len == 0) return default_script_timeout_ms;
     const trimmed = std.mem.trim(u8, v, " \t\r\n");
     return std.fmt.parseInt(i64, trimmed, 10) catch {
-        stderr.print("mox apply: MOX_SCRIPT_TIMEOUT_MS={s}: not an integer; using default ({d}ms)\n", .{ trimmed, default_script_timeout_ms }) catch {};
+        stderr.print("mox: MOX_SCRIPT_TIMEOUT_MS={s}: not an integer; using default ({d}ms)\n", .{ trimmed, default_script_timeout_ms }) catch {};
         return default_script_timeout_ms;
     };
 }
@@ -670,7 +670,7 @@ fn scriptTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) i64 
 /// caller's `child.wait` reaps, so there is no double-wait race. Cross-platform
 /// so a hung script cannot block apply forever on any OS.
 /// A canceled sleep (the script finished first) returns without killing.
-fn killAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
+pub fn killAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
     timeout.sleep(io) catch return;
     fired.* = true;
     // Operates on a COPY of the OS handle/pid, never the shared Child, so it

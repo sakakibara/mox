@@ -13,6 +13,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const run_scripts = @import("../apply/run_scripts.zig");
+
 const Io = std.Io;
 const EnvironMap = std.process.Environ.Map;
 
@@ -27,7 +29,27 @@ pub fn isRoot() bool {
     };
 }
 
-pub const default_timeout_ms: i64 = 600_000;
+/// The bound every backend call runs under: the setup-script one, read the
+/// same way (`MOX_SCRIPT_TIMEOUT_MS`, `<= 0` disables), so one variable governs
+/// everything mox runs on the user's behalf.
+pub const default_timeout_ms: i64 = run_scripts.default_script_timeout_ms;
+
+pub fn timeoutFromEnv(env: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
+    return run_scripts.scriptTimeoutMs(env, stderr);
+}
+
+fn processId() u32 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
+/// A kill for exceeding the bound must be named as such, never read as the
+/// manager's own failure.
+pub fn checkTimedOut(res: Result) error{TimedOut}!void {
+    if (res.timed_out) return error.TimedOut;
+}
 
 pub const Result = struct {
     code: u8,
@@ -132,7 +154,7 @@ pub const Process = struct {
             try Io.Dir.cwd().createDirPath(io, self.scratch_dir);
             // Named per process: two mox runs sharing a state dir (a status
             // beside an apply) must not truncate each other's stdin mid-read.
-            const name = try std.fmt.allocPrint(arena, "stdin-{d}.txt", .{std.c.getpid()});
+            const name = try std.fmt.allocPrint(arena, "stdin-{d}.txt", .{processId()});
             const path = try std.fs.path.join(arena, &.{ self.scratch_dir, name });
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
             stdin_path = path;
@@ -151,7 +173,7 @@ pub const Process = struct {
         var timed_out = false;
         var killer: ?Io.Future(void) = null;
         if (self.timeout_ms > 0) {
-            if (child.id) |id| killer = io.async(killAfter, .{ io, self.timeout(), id, &timed_out });
+            if (child.id) |id| killer = io.async(run_scripts.killAfter, .{ io, self.timeout(), id, &timed_out });
         }
 
         var out: []const u8 = "";
@@ -193,19 +215,6 @@ fn fromTerm(term: std.process.Child.Term, stdout: []const u8, stderr: []const u8
         .stdout = stdout,
         .stderr = stderr,
     };
-}
-
-/// Forcibly terminate the child after the timeout elapses (never reaps): the
-/// caller's `wait` reaps, so there is no double-wait race. A canceled sleep
-/// (the child finished first) returns without killing.
-fn killAfter(io: Io, t: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
-    t.sleep(io) catch return;
-    fired.* = true;
-    if (builtin.os.tag == .windows) {
-        _ = std.os.windows.kernel32.TerminateProcess(id, 1);
-    } else {
-        std.posix.kill(id, .KILL) catch {};
-    }
 }
 
 /// A scripted runner: answers each argv from a table, records every call and

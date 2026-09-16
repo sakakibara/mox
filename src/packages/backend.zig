@@ -1,6 +1,6 @@
 //! The contract every package manager is reached through.
 //!
-//! The core knows only these five operations. Everything a manager needs
+//! The core knows only these operations. Everything a manager needs
 //! beyond them -- which keys its rows accept, which executable proves it is
 //! installed, how a qualified name is spelled -- is the adapter's, so adding
 //! a manager never edits the core and a manager's own churn never leaves its
@@ -77,6 +77,10 @@ pub const Backend = struct {
         /// Absent for a manager that ships with the OS, which is four of the
         /// seven: there is nothing to install.
         bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 = null,
+        /// What this backend structurally cannot see, asked once of a usable
+        /// backend. Absent when `limitation` below states it, or when there is
+        /// nothing to state.
+        limitation: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror!?[]const u8 = null,
         /// The row that would name an observed installed id: the inverse of
         /// `idOf`, for writing a hand-installed package back into the
         /// manifest. `idOf` of the result must equal the id given.
@@ -112,6 +116,13 @@ pub const Backend = struct {
 
     pub fn declare(self: Backend, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration {
         return self.vtable.declare(self.ctx, arena, id);
+    }
+
+    /// The declared limitation, or the answer to the `limitation` verb.
+    pub fn limitationOf(self: Backend, arena: std.mem.Allocator) anyerror!?[]const u8 {
+        if (self.limitation) |l| return l;
+        const f = self.vtable.limitation orelse return null;
+        return f(self.ctx, arena);
     }
 
     pub fn canBootstrap(self: Backend) bool {

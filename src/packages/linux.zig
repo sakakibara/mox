@@ -115,6 +115,7 @@ pub const Distro = struct {
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         const res = try self.runner.run(arena, self.manager.queryArgv());
+        try exec.checkTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
 
         var out: std.ArrayList([]const u8) = .empty;
@@ -157,6 +158,7 @@ pub const Distro = struct {
         for (rows) |row| try argv.append(arena, row.name);
 
         const res = try self.runner.stream(arena, argv.items);
+        try exec.checkTimedOut(res);
         if (!res.ok) return Error.DistroInstallFailed;
     }
 

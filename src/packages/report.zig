@@ -70,16 +70,19 @@ pub fn gather(
     diag: ?*Diag,
 ) !Report {
     const m = try manifest_mod.load(arena, io, repo_dir, private_dir, diag);
-    return fromManifest(arena, m, registry, r, diag);
+    return fromManifest(arena, m, registry, r, &.{}, diag);
 }
 
 /// `gather` for a manifest already loaded, so a caller that reads it for its
-/// own reasons does not read it twice.
+/// own reasons does not read it twice. `assume_available` names backends to
+/// treat as usable with nothing installed, without asking them: a dry run
+/// planning what a bootstrap it will not perform would then let install.
 pub fn fromManifest(
     arena: std.mem.Allocator,
     m: manifest_mod.Manifest,
     registry: Registry,
     r: *const Resolver,
+    assume_available: []const []const u8,
     diag: ?*Diag,
 ) !Report {
     if (!m.inUse()) return .{};
@@ -88,7 +91,13 @@ pub fn fromManifest(
 
     var active: std.ArrayList([]const u8) = .empty;
     var usable: std.ArrayList(Backend) = .empty;
+    var assumed: std.ArrayList(Backend) = .empty;
     for (registry.backends) |b| {
+        if (contains(assume_available, b.name)) {
+            try active.append(arena, b.name);
+            try assumed.append(arena, b);
+            continue;
+        }
         const ok = b.available(arena) catch |e| {
             if (diag) |d| d.set("{s}: available failed: {s}", .{ b.name, @errorName(e) });
             return e;
@@ -101,6 +110,15 @@ pub fn fromManifest(
     const rows = try desired_mod.select(arena, m, r, registry, active.items, diag);
 
     var out: std.ArrayList(BackendDrift) = .empty;
+    for (assumed.items) |b| {
+        try out.append(arena, .{
+            .backend = b.name,
+            .drift = drift_mod.compute(arena, b, rows, &.{}, m) catch |e| {
+                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, @errorName(e) });
+                return e;
+            },
+        });
+    }
     for (usable.items) |b| {
         const installed = b.installedExplicit(arena) catch |e| {
             if (diag) |d| d.set("{s}: list failed: {s}", .{ b.name, @errorName(e) });
@@ -114,14 +132,28 @@ pub fn fromManifest(
             );
             return error.BackendBadOutput;
         }
+        const limitation = b.limitationOf(arena) catch |e| {
+            if (diag) |d| d.set("{s}: limitation failed: {s}", .{ b.name, @errorName(e) });
+            return e;
+        };
         try out.append(arena, .{
             .backend = b.name,
-            .drift = try drift_mod.compute(arena, b, rows, installed, m),
-            .limitation = b.limitation,
+            .drift = drift_mod.compute(arena, b, rows, installed, m) catch |e| {
+                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, @errorName(e) });
+                return e;
+            },
+            .limitation = limitation,
         });
     }
 
     return .{ .in_use = true, .backends = try out.toOwnedSlice(arena) };
+}
+
+fn contains(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |h| {
+        if (std.mem.eql(u8, h, needle)) return true;
+    }
+    return false;
 }
 
 const testing = std.testing;
@@ -152,7 +184,7 @@ test "fromManifest: a repo not using the subsystem reports nothing" {
     // No manifest files: every installed package would otherwise read as
     // untracked on a machine that never opted in.
     const m: manifest_mod.Manifest = .{ .files = 0 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{} }, &r, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{} }, &r, &.{}, null);
     try testing.expect(!rep.in_use);
     try testing.expect(rep.clean());
 }
@@ -170,7 +202,7 @@ test "fromManifest: an unusable backend is never queried" {
         .packages = &.{rowOf("bat", "dnf")},
         .files = 1,
     };
-    try testing.expectError(error.Unreached, fromManifest(a, m, .{ .backends = &.{test_backend.make("dnf")} }, &r, null));
+    try testing.expectError(error.Unreached, fromManifest(a, m, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, null));
 }
 
 test "fromManifest: drift comes back per backend" {
@@ -193,7 +225,7 @@ test "fromManifest: drift comes back per backend" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
     try testing.expect(rep.in_use);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
@@ -234,7 +266,7 @@ test "fromManifest: a manifest matching the machine is clean" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
     try testing.expect(rep.clean());
 }
 
@@ -257,6 +289,6 @@ test "fromManifest: an invalid manifest is refused before anything is queried" {
     var d: Diag = .{};
     try testing.expectError(
         validate_mod.Error.UnknownBackend,
-        fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &d),
+        fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, &d),
     );
 }

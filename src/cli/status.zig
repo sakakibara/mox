@@ -346,14 +346,11 @@ fn gatherPackages(
 ) !Packages {
     const env = try app.packageEnv(ctx, context, m_state);
     var diag: mox.packages.manifest.Diag = .{};
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(
+    const manifest = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,
-        context.paths.state_dir,
-        context.paths.home,
-        env,
         context.paths.repo_dir,
+        context.paths.private_dir,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -366,14 +363,43 @@ fn gatherPackages(
             return .{ .broken = true };
         },
     };
+    if (!manifest.inUse()) return .{};
 
-    const rep = mox.packages.report.gather(
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(
         ctx.alloc,
         ctx.io,
-        registry,
+        context.paths.state_dir,
+        context.paths.home,
+        env,
         context.paths.repo_dir,
-        context.paths.private_dir,
+        true,
+        ctx.err,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox status: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .broken = true };
+        },
+    };
+    // Named before anything is asked of them: what will execute is on the
+    // record even if the first thing it does is fail.
+    if (pkg_backends.notes.len > 0) {
+        try ctx.out.writeAll("\npackages:\n");
+        for (pkg_backends.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    }
+
+    const rep = mox.packages.report.fromManifest(
+        ctx.alloc,
+        manifest,
+        registry,
         bindings,
+        &.{},
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -390,14 +416,13 @@ fn gatherPackages(
 }
 
 /// The human `packages:` section. Silent when the repo does not use the
-/// manifest, so an unadopted repo's report is unchanged.
+/// manifest, so an unadopted repo's report is unchanged. The plugin notes
+/// were printed by `gatherPackages` before any plugin ran.
 fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
     const rep = pkgs.report;
-    if (!rep.in_use and pkgs.notes.len == 0) return;
-
-    try ctx.out.writeAll("\npackages:\n");
-    for (pkgs.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
     if (!rep.in_use) return;
+
+    if (pkgs.notes.len == 0) try ctx.out.writeAll("\npackages:\n");
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.

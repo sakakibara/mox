@@ -333,7 +333,7 @@ fn applyPass(
     const pkg_counts = if (skip_scripts_arg or paths.len > 0)
         PackageCounts{}
     else
-        try applyPackages(ctx, context, &bindings, dry_run, &script_env);
+        try applyPackages(ctx, context, &bindings, dry_run, &script_env, &mox_path_dirs);
 
     // A pre-script may install a tool or create a directory a `data/facts.toml`
     // row derives a fact from. Re-capture so this same apply composes against
@@ -342,7 +342,9 @@ fn applyPass(
     // `contracts` are rebuilt in lockstep: a post-script must see and be
     // judged against exactly the facts this re-capture just bound, not the
     // pre-stage's stale projection.
-    if (pre_result.ran > 0 or pkg_counts.installed > 0) {
+    // A failed batch may have landed some of its rows, so the machine is
+    // re-read after any attempt, not only after a clean success.
+    if (pre_result.ran > 0 or pkg_counts.installed > 0 or pkg_counts.attempted > 0) {
         m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 2;
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
@@ -736,7 +738,14 @@ fn applyPass(
             .{ counts.ok, counts.removed, counts.unchanged, counts.skip, counts.drift, counts.fail },
         );
         if (pkg_counts.in_use) {
-            try ctx.out.print("Packages: {d} would be installed\n", .{pkg_counts.would});
+            if (pkg_counts.would_bootstrap > 0) {
+                try ctx.out.print(
+                    "Packages: {d} would be installed, after bootstrapping {d} manager(s)\n",
+                    .{ pkg_counts.would, pkg_counts.would_bootstrap },
+                );
+            } else {
+                try ctx.out.print("Packages: {d} would be installed\n", .{pkg_counts.would});
+            }
         }
     } else {
         try ctx.out.print(
@@ -793,10 +802,13 @@ fn bootstrapBackends(
     pkg_backends: *app.PackageBackends,
     registry: mox.packages.backend.Registry,
     m: mox.packages.manifest.Manifest,
+    bindings: *const mox.dsl.resolver.Resolver,
     script_env: *std.process.Environ.Map,
+    mox_path_dirs: *std.ArrayList([]const u8),
 ) !usize {
     var failed: usize = 0;
     for (m.bootstrap) |b| {
+        if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
         const backend = registry.find(b.backend) orelse {
             try ctx.err.print(
                 "mox apply: {s}: bootstrap names no backend \"{s}\"\n",
@@ -839,19 +851,42 @@ fn bootstrapBackends(
             failed += 1;
             continue;
         };
+        // The verified installer has done its work; nothing should be left
+        // in state that a later run could mistake for a fresh fetch.
+        std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         if (bin_dir) |dir| {
+            // On PATH for the probes that follow, and registered with the
+            // run's PATH additions so the re-capture that this install
+            // triggers folds it back in for the post scripts and check hooks.
             try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), &.{dir}));
+            try mox_path_dirs.append(ctx.alloc, dir);
             try ctx.out.print("  on PATH        {s}\n", .{dir});
         }
     }
     return failed;
 }
 
+/// A bootstrap row with no gate is unconditional; one gated to another OS
+/// must never run here.
+fn bootstrapGateHolds(
+    arena: std.mem.Allocator,
+    b: mox.packages.manifest.BootstrapRow,
+    bindings: *const mox.dsl.resolver.Resolver,
+) !bool {
+    const src = b.when orelse return true;
+    const expr = try mox.dsl.axis.parseString(arena, src);
+    return mox.dsl.axis.evaluate(expr, bindings);
+}
+
 /// What one apply did to this machine's packages.
 const PackageCounts = struct {
     in_use: bool = false,
     installed: usize = 0,
+    /// Rows handed to a backend whose batch then failed: some may have
+    /// landed, so the machine must be re-read as if they had.
+    attempted: usize = 0,
     would: usize = 0,
+    would_bootstrap: usize = 0,
     failed: usize = 0,
 };
 
@@ -872,30 +907,9 @@ fn applyPackages(
     bindings: *const mox.dsl.resolver.Resolver,
     dry_run: bool,
     script_env: *std.process.Environ.Map,
+    mox_path_dirs: *std.ArrayList([]const u8),
 ) !PackageCounts {
     var diag: mox.packages.manifest.Diag = .{};
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(
-        ctx.alloc,
-        ctx.io,
-        context.paths.state_dir,
-        context.paths.home,
-        script_env,
-        context.paths.repo_dir,
-        &diag,
-    ) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        else => {
-            if (diag.capture()) |cap| {
-                try ctx.err.print("mox apply: packages: {s}\n", .{cap});
-            } else {
-                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
-            }
-            return .{ .failed = 1 };
-        },
-    };
-    for (pkg_backends.notes) |note| try ctx.out.print("  note           {s}\n", .{note});
-
     const manifest = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,
@@ -913,32 +927,18 @@ fn applyPackages(
             return .{ .failed = 1 };
         },
     };
+    if (!manifest.inUse()) return .{};
 
-    // A manager that is not installed makes every row naming it inert, so the
-    // manifest's own declaration cannot come true. Bootstrapping runs BEFORE
-    // availability is probed for the drift report, so a manager installed here
-    // is used by this same apply rather than the next one.
-    var bootstrap_failed: usize = 0;
-    if (manifest.inUse() and !dry_run) {
-        bootstrap_failed = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, script_env);
-    } else if (manifest.inUse()) {
-        for (manifest.bootstrap) |b| {
-            const backend = registry.find(b.backend) orelse continue;
-            const present = backend.available(ctx.alloc) catch |e| {
-                try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
-                bootstrap_failed += 1;
-                continue;
-            };
-            if (present) continue;
-            try ctx.out.print("  would bootstrap {s}\n", .{b.backend});
-        }
-    }
-
-    const rep = mox.packages.report.fromManifest(
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(
         ctx.alloc,
-        manifest,
-        registry,
-        bindings,
+        ctx.io,
+        context.paths.state_dir,
+        context.paths.home,
+        script_env,
+        context.paths.repo_dir,
+        true,
+        ctx.err,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -951,9 +951,56 @@ fn applyPackages(
             return .{ .failed = 1 };
         },
     };
-    if (!rep.in_use) return .{};
+    for (pkg_backends.notes) |note| try ctx.out.print("  note           {s}\n", .{note});
 
-    var counts: PackageCounts = .{ .in_use = true, .failed = bootstrap_failed };
+    // A manager that is not installed makes every row naming it inert, so the
+    // manifest's own declaration cannot come true. Bootstrapping runs BEFORE
+    // availability is probed for the drift report, so a manager installed here
+    // is used by this same apply rather than the next one. A dry run performs
+    // no bootstrap, but plans as though it had, so what it lists is what the
+    // real run would install.
+    var bootstrap_failed: usize = 0;
+    var would_bootstrap: std.ArrayList([]const u8) = .empty;
+    if (!dry_run) {
+        bootstrap_failed = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, mox_path_dirs);
+    } else {
+        for (manifest.bootstrap) |b| {
+            if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
+            const backend = registry.find(b.backend) orelse continue;
+            const present = backend.available(ctx.alloc) catch |e| {
+                try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
+                bootstrap_failed += 1;
+                continue;
+            };
+            if (present) continue;
+            try ctx.out.print("  would bootstrap {s}\n", .{b.backend});
+            try would_bootstrap.append(ctx.alloc, b.backend);
+        }
+    }
+
+    const rep = mox.packages.report.fromManifest(
+        ctx.alloc,
+        manifest,
+        registry,
+        bindings,
+        would_bootstrap.items,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .failed = 1 };
+        },
+    };
+    var counts: PackageCounts = .{
+        .in_use = true,
+        .failed = bootstrap_failed,
+        .would_bootstrap = would_bootstrap.items.len,
+    };
     for (rep.backends) |b| {
         if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
@@ -980,6 +1027,7 @@ fn applyPackages(
                 .{ b.backend, @errorName(e) },
             );
             counts.failed += 1;
+            counts.attempted += rows.items.len;
             continue;
         };
         counts.installed += rows.items.len;

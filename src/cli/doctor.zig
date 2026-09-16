@@ -490,7 +490,7 @@ fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !
         if (std.mem.eql(u8, entry.name, "check") or std.mem.eql(u8, entry.name, "backends")) continue;
         try out.append(arena, try std.fmt.allocPrint(
             arena,
-            "unknown-stage scripts/{s} (only pre/ and post/ run, and check/ and backends/ are read; rename or remove it)",
+            "unknown-stage scripts/{s} (only pre/, post/, check/ and backends/ are run; rename or remove it)",
             .{entry.name},
         ));
     }

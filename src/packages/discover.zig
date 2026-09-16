@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const dirent = @import("../source/dirent.zig");
+const junk = @import("../source/junk.zig");
 const diag_mod = @import("../machine/diag.zig");
 
 const Io = std.Io;
@@ -30,6 +31,8 @@ pub const Found = struct {
     /// The filename stem: `macports` and `macports.ps1` both name `macports`.
     name: []const u8,
     path: []const u8,
+    /// `scripts/backends/<file>`, for reports.
+    label: []const u8,
     /// How to invoke it: the path, or an interpreter and the path.
     argv0: []const []const u8,
     /// Null when this machine can run it. Otherwise why not, printed as a
@@ -59,6 +62,7 @@ pub fn discover(
 
     for (entries) |e| {
         if (e.kind != .file and e.kind != .sym_link) continue;
+        if (junk.isJunk(e.name)) continue;
         const path = try std.fs.path.join(arena, &.{ dir_path, e.name });
         const kind = kindOf(e.name);
         const name = stemOf(e.name, kind);
@@ -68,7 +72,8 @@ pub fn discover(
             return Error.BadBackendName;
         }
 
-        const found = try classify(arena, io, path, name, kind, diag);
+        var found = try classify(arena, io, path, name, kind, diag);
+        found.label = try std.fmt.allocPrint(arena, "scripts/backends/{s}", .{e.name});
 
         if (seen.get(name)) |other| {
             // Two runnable files for one name is ambiguous; a runnable file
@@ -138,12 +143,14 @@ fn classify(
             .ps1 => .{
                 .name = name,
                 .path = path,
+                .label = "",
                 .argv0 = try arena.dupe([]const u8, &.{ ps_pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path }),
             },
-            .exe, .cmd => .{ .name = name, .path = path, .argv0 = try arena.dupe([]const u8, &.{path}) },
+            .exe, .cmd => .{ .name = name, .path = path, .label = "", .argv0 = try arena.dupe([]const u8, &.{path}) },
             .plain => .{
                 .name = name,
                 .path = path,
+                .label = "",
                 .argv0 = &.{},
                 .not_runnable = "not runnable on windows (a backend here is a .ps1, .exe or .cmd)",
             },
@@ -154,6 +161,7 @@ fn classify(
         return .{
             .name = name,
             .path = path,
+            .label = "",
             .argv0 = &.{},
             .not_runnable = "a windows-only kind; not runnable here",
         };
@@ -163,6 +171,10 @@ fn classify(
         if (diag) |d| d.set("{s}: cannot stat: {s}", .{ path, @errorName(e) });
         return e;
     };
+    if (st.kind != .file) {
+        if (diag) |d| d.set("{s}: not a file; a backend is an executable file", .{path});
+        return Error.BackendNotExecutable;
+    }
     if (Io.File.Permissions.has_executable_bit and (st.permissions.toMode() & 0o111) == 0) {
         if (diag) |d| d.set(
             "{s}: not executable; a scripts directory holds executables only (chmod +x it, or move it out)",
@@ -170,7 +182,7 @@ fn classify(
         );
         return Error.BackendNotExecutable;
     }
-    return .{ .name = name, .path = path, .argv0 = try arena.dupe([]const u8, &.{path}) };
+    return .{ .name = name, .path = path, .label = "", .argv0 = try arena.dupe([]const u8, &.{path}) };
 }
 
 const testing = std.testing;
@@ -264,6 +276,37 @@ test "discover: a runnable file beside its not-runnable twin wins the name" {
     const got = try discover(a, io, repo, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expect(got[0].not_runnable == null);
+}
+
+test "discover: finder junk is ignored, not a backend name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.DS_Store", .data = "" });
+
+    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "discover: a symlink to a directory is refused as not a file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.createDirPath(io, "repo/elsewhere");
+    try tmp.dir.symLink(io, "../../elsewhere", "repo/scripts/backends/macports", .{});
+
+    var d: Diag = .{};
+    try testing.expectError(Error.BackendNotExecutable, discover(a, io, try tmpRepo(a, io, &tmp.sub_path), &d));
+    try testing.expect(std.mem.indexOf(u8, d.capture().?, "not a file") != null);
 }
 
 test "discover: a name outside the charset is refused with its path" {

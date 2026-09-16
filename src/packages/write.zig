@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const apply_write = @import("../apply/write.zig");
 const backend_mod = @import("backend.zig");
 const manifest_mod = @import("manifest.zig");
 
@@ -31,13 +32,12 @@ pub const Array = enum {
 
 pub const Error = error{NoManifestFileForBackend};
 
-/// The file a row for `backend` belongs in: one whose own default backend
-/// matches, else one that already carries a row for it. Repo files are
-/// preferred over private ones -- a package belongs in the shared manifest
-/// unless the user says otherwise -- and basename order breaks ties so the
-/// same machine always picks the same file.
+/// The file a row for `backend` belongs in. Every repo file is preferred over
+/// every private one -- a package belongs in the shared manifest unless the
+/// user says otherwise -- and within a layer, one whose own default backend
+/// matches before one that merely carries a row for it. Basename order breaks
+/// ties so the same machine always picks the same file.
 pub fn targetFor(m: Manifest, backend: []const u8) ?Source {
-    var fallback: ?Source = null;
     for ([_]bool{ false, true }) |private| {
         for (m.sources) |src| {
             if (src.private != private) continue;
@@ -47,16 +47,14 @@ pub fn targetFor(m: Manifest, backend: []const u8) ?Source {
         }
         for (m.sources) |src| {
             if (src.private != private) continue;
-            if (fallback != null) continue;
             for (m.packages) |row| {
                 if (!std.mem.eql(u8, row.backend, backend)) continue;
                 if (!std.mem.eql(u8, row.origin, src.path)) continue;
-                fallback = src;
-                break;
+                return src;
             }
         }
     }
-    return fallback;
+    return null;
 }
 
 /// Render the block `append` would write, without touching the filesystem.
@@ -114,11 +112,13 @@ pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const man
     return out.written();
 }
 
-/// Append the block to `path`, creating the file when it does not exist.
+/// Append the block to `path`, creating the file when it does not exist. The
+/// rewrite is atomic: a manifest in the private layer lives in no git repo,
+/// and a crash mid-write must not leave it empty.
 pub fn append(arena: std.mem.Allocator, io: Io, path: []const u8, block: []const u8) !void {
     const existing = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20)) catch |e| switch (e) {
         error.FileNotFound => {
-            try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.trimStart(u8, block, "\n") });
+            try apply_write.writeAtomic(io, path, std.mem.trimStart(u8, block, "\n"), 0o644);
             return;
         },
         else => return e,
@@ -132,7 +132,7 @@ pub fn append(arena: std.mem.Allocator, io: Io, path: []const u8, block: []const
         try buf.append(arena, '\n');
     }
     try buf.appendSlice(arena, block);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+    try apply_write.writeAtomic(io, path, buf.items, 0o644);
 }
 
 /// A TOML basic string. A package name is normally plain, but a manager is
@@ -243,6 +243,26 @@ test "targetFor: prefers the repo layer over the private one" {
         sourceOf("data/packages/darwin.toml", "/r/darwin.toml", "brew", false),
     } };
     try testing.expectEqualStrings("/r/darwin.toml", targetFor(m, "brew").?.path);
+}
+
+test "targetFor: a repo file merely carrying a row beats a private file declaring the default" {
+    const row: manifest_mod.Row = .{
+        .name = "ripgrep",
+        .backend = "brew",
+        .when = null,
+        .fields = &.{},
+        .origin = "/r/mixed.toml",
+        .label = "data/packages/mixed.toml",
+        .index = 0,
+    };
+    const m: Manifest = .{
+        .packages = &.{row},
+        .sources = &.{
+            sourceOf("data/packages/local.toml", "/p/local.toml", "brew", true),
+            sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
+        },
+    };
+    try testing.expectEqualStrings("/r/mixed.toml", targetFor(m, "brew").?.path);
 }
 
 test "targetFor: falls back to a file already carrying a row for the backend" {
