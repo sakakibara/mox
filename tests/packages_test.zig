@@ -53,9 +53,23 @@ fn absentLinuxManagers(a: std.mem.Allocator, entries: *std.ArrayList(mox.package
 }
 
 /// A machine whose only usable manager is brew, carrying `formulae` and
-/// `casks` and answering `extra` for anything else.
+/// `casks` and answering `extra` for anything else. Nothing is installed
+/// that was not asked for by name, which is the ordinary machine.
 fn brewWith(
     a: std.mem.Allocator,
+    formulae: []const u8,
+    casks: []const u8,
+    extra: []const mox.packages.exec.Fake.Entry,
+) !*mox.packages.exec.Fake {
+    return brewWithInstalled(a, formulae, formulae, casks, extra);
+}
+
+/// The same machine, with `installed` the formulae brew has whether or not
+/// they were asked for by name -- a superset of `formulae`, since a formula
+/// asked for is a formula installed.
+fn brewWithInstalled(
+    a: std.mem.Allocator,
+    installed: []const u8,
     formulae: []const u8,
     casks: []const u8,
     extra: []const mox.packages.exec.Fake.Entry,
@@ -64,6 +78,7 @@ fn brewWith(
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = formulae });
     try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = casks });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = installed });
     // What an install asks brew each row's name stands for. Answered with
     // nothing, so no row is refused as an alias: these fixtures are about the
     // install, and the alias refusal is exercised on its own elsewhere.
@@ -261,6 +276,74 @@ test "apply: a tapped formula is tapped and trusted before install" {
     const install = indexOfCall(fake, "brew install -- d12frosted/emacs-plus/emacs-plus@30").?;
     try std.testing.expect(tap < trust);
     try std.testing.expect(trust < install);
+}
+
+test "apply: a formula installed as a dependency is marked on request, not reinstalled" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "brotli"
+        \\
+    );
+
+    // brotli is in the Cellar but nothing asked for it by name, so the row is
+    // missing. `brew install` on it exits 0 having done nothing, which would
+    // leave the row missing after a run that called it installed.
+    const fake = try brewWithInstalled(a, "brotli\n", "", "", &.{
+        .{ .argv = "brew tab --installed-on-request --formula -- brotli" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(fake.called("brew tab --installed-on-request --formula -- brotli"));
+    try std.testing.expect(!fake.called("brew install -- brotli"));
+    // Said as what it was: the package was there before the run.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it as installed on request instead") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+}
+
+test "apply: a formula that cannot be marked on request is a failure, not a clean run" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "brotli"
+        \\
+    );
+
+    // A brew too old to have `brew tab` cannot converge the row at all, so
+    // the run must say so rather than fall back to an install that does
+    // nothing and report it as one that worked.
+    const fake = try brewWithInstalled(a, "brotli\n", "", "", &.{
+        .{ .argv = "brew tab --installed-on-request --formula -- brotli", .code = 1 },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(!fake.called("brew install -- brotli"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be marked as installed on request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
 }
 
 /// The position of the first call matching `argv`, or null.
@@ -738,6 +821,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --formula --full-name", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew info --json=v2 --formula -- ripgrep", .match = .suffix, .code = 1 });
     try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
@@ -1306,6 +1390,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --formula --full-name", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew info --json=v2 --formula -- ripgrep", .match = .suffix, .code = 1 });
     try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);

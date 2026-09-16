@@ -372,6 +372,76 @@ test "brew: a tap-qualified formula is reported the way a row spells it" {
     try testing.expect(parts.next() != null);
 }
 
+/// Whether `lines` -- raw `brew list` output -- reports `name`, bare or
+/// under the tap that qualifies it.
+fn listsFormula(lines: []const []const u8, name: []const u8) bool {
+    for (lines) |l| {
+        if (std.mem.eql(u8, l, name)) return true;
+        if (std.mem.endsWith(u8, l, name) and l.len > name.len and l[l.len - name.len - 1] == '/') return true;
+    }
+    return false;
+}
+
+test "brew: the installed-formulae query answers for a formula the explicit one omits" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // What an install rests on: a formula that is installed but was never
+    // asked for by name is reported by the whole-Cellar query and NOT by the
+    // explicit one, so the two together tell "brew install would do nothing"
+    // from "brew install would install it". Differential against the
+    // receipts, not against another brew query.
+    const inv = try inventory(a, io);
+    const all = try rawLines(a, io, &.{ "brew", "list", "--formula", "--full-name" });
+    const requested = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
+
+    // The explicit set is a subset of the installed set, or a row could be
+    // reported present and still be diverted to the marking path.
+    for (requested) |name| {
+        if (!contains(all, name)) {
+            std.debug.print("'{s}' is installed on request but absent from the installed-formulae query\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    var checked: usize = 0;
+    for (inv.dependencies) |name| {
+        // A Cellar directory brew no longer lists under that name is a
+        // renamed formula, which the query is not being asked about.
+        if (!listsFormula(all, name)) continue;
+        if (listsFormula(requested, name)) {
+            std.debug.print("'{s}' has a receipt saying it was not installed on request, yet the explicit query reports it\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+        checked += 1;
+    }
+    if (checked == 0) return skipUnlessCi("no installed formula's receipt says it was not asked for by name");
+}
+
+test "brew: the command that marks an installed formula on request is brew's own" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // Read-only: `--help` prints and exits, marking nothing. The flags an
+    // install splices in when it takes the marking path are what this
+    // checks -- a brew without them cannot converge such a row at all.
+    const res = try runBrew(a, io, &.{ "brew", "tab", "--help" });
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("brew tab --help did not answer; an already-installed formula cannot be marked on request\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "--installed-on-request") != null);
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "--formula") != null);
+}
+
 test "brew: a name after -- is a name, which is why the install argv carries one" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

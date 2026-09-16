@@ -24,6 +24,16 @@
 //! including a cask pulled in by another cask's `depends_on cask:`, which is
 //! reported untracked for as long as it is installed. That is stated in
 //! `limitation` rather than papered over with a query brew does not have.
+//!
+//! An install asks a second question of the formula half: `brew list
+//! --formula --full-name`, which is every installed formula whether or not
+//! it was asked for by name. A formula brew already has, linked and current,
+//! is dropped from `brew install`'s own work list before an installer is
+//! built for it, so the receipt flag the explicit-install query reads is
+//! never written and the command exits 0 having done nothing. Such a row is
+//! missing on every run and "installed" again on every apply, so the adapter
+//! writes that flag itself with `brew tab` instead of running an install
+//! that cannot converge the row.
 
 const std = @import("std");
 const json = @import("json");
@@ -69,9 +79,10 @@ pub const Brew = struct {
     exe: []const u8 = "brew",
     /// Where the installer leaves `brew`; probed after a bootstrap.
     prefixes: []const []const u8 = &default_prefixes,
-    /// Whether the last `install` ran `brew install`, which `installSpawned`
-    /// answers with: a tap or a trust that fails stops the row before it, and
-    /// a batch of one such row never reaches brew's installer at all.
+    /// Whether the last `install` reached the point of changing the machine
+    /// -- brew's installer, or the receipt `brew tab` writes -- which
+    /// `installSpawned` answers with: a tap or a trust that fails stops the
+    /// row before it, and a batch of one such row never reaches brew at all.
     spawned: bool = false,
     /// How many of the last `install`'s rows brew was never handed, which
     /// `installRefused` answers with.
@@ -232,9 +243,21 @@ pub const Brew = struct {
         self.refused = 0;
         const keep = try self.refuseAliases(arena, rows);
         self.refused = rows.len - keep.len;
+        // Asked once for the batch, and only when a formula row is in it.
+        var installed: ?std.StringHashMap(void) = null;
         var failed = false;
         for (keep) |row| {
             const kind = try kindOf(row);
+            if (kind == .formula) {
+                if (installed == null) installed = try self.installedFormulae(arena);
+                // Already there, so an install is a no-op and the tap and
+                // the trust an install needs are moot: the tap is on this
+                // machine or the formula could not have come from it.
+                if (installed.?.contains(row.name)) {
+                    if (!try self.markOnRequest(arena, row.name)) failed = true;
+                    continue;
+                }
+            }
             if (tapOf(row.name)) |tap| {
                 const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", "--", tap });
                 try exec.checkTimedOut(tapped);
@@ -268,6 +291,80 @@ pub const Brew = struct {
             if (!res.ok) failed = true;
         }
         if (failed) return error.BrewInstallFailed;
+    }
+
+    /// Every formula brew has, asked for by name or pulled in behind one --
+    /// the question `--installed-on-request` deliberately does not answer.
+    /// `--full-name` for the same reason the explicit query carries it: a
+    /// tapped formula must come back spelled the way a row spells it.
+    ///
+    /// A query that cannot be answered yields nothing rather than failing the
+    /// batch, which leaves every row to `brew install` as before; the rows
+    /// that cannot converge that way are said so the run does not look
+    /// clean.
+    fn installedFormulae(self: *Brew, arena: std.mem.Allocator) std.mem.Allocator.Error!std.StringHashMap(void) {
+        var set: std.StringHashMap(void) = .init(arena);
+        const res = self.runner.run(arena, &(query_env ++ .{ self.exe, "list", "--formula", "--full-name" })) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.sayUnlistable();
+                return set;
+            },
+        };
+        if (res.timed_out or !res.ok) {
+            self.sayUnlistable();
+            return set;
+        }
+        var lines = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            try set.put(line, {});
+        }
+        return set;
+    }
+
+    fn sayUnlistable(self: *Brew) void {
+        self.say(
+            "mox: brew: the installed formulae could not be listed, so a row naming one that is installed already may not converge this run\n",
+            .{},
+        );
+    }
+
+    /// Record that the user asked for an already-installed formula by name,
+    /// and answer whether brew accepted it.
+    ///
+    /// `brew install` cannot do this. Homebrew drops a formula it already has,
+    /// linked and current, from the install list before a `FormulaInstaller`
+    /// exists for it, and the receipt's `installed_on_request` is written by
+    /// that installer -- so the command warns, exits 0, and the explicit
+    /// query goes on omitting the name. `brew tab` writes the flag on its
+    /// own, refuses a name that is not installed, and keeps formulae and
+    /// casks apart the way `brew trust` does. brew's own `bundle` reaches
+    /// for it for this same reason.
+    ///
+    /// Marking, not installing: the package was on the machine before this
+    /// run and is untouched: what changes is brew's record of who asked for
+    /// it, which is the row's own claim. mox never uninstalls, and this
+    /// direction only makes `brew autoremove` keep more.
+    ///
+    /// Only the formula half needs it. The cask query lists the whole
+    /// Caskroom, so an installed cask is already reported and its row is
+    /// never missing.
+    fn markOnRequest(self: *Brew, arena: std.mem.Allocator, name: []const u8) anyerror!bool {
+        self.say(
+            "mox: brew: \"{s}\" is installed already but not on request, so \"brew install\" would do nothing and leave the row missing; marking it as installed on request instead\n",
+            .{name},
+        );
+        self.spawned = true;
+        const res = try self.runner.stream(arena, &.{ self.exe, "tab", "--installed-on-request", "--formula", "--", name });
+        try exec.checkTimedOut(res);
+        if (res.ok) return true;
+        self.say(
+            "mox: brew: \"{s}\" could not be marked as installed on request, so the row stays missing; \"brew tab\" is in Homebrew 4.3.6 and newer\n",
+            .{name},
+        );
+        return false;
     }
 
     fn installSpawnedImpl(ctx: *anyopaque) bool {
@@ -543,6 +640,11 @@ fn appendLines(
 
 const testing = std.testing;
 
+/// The answer that leaves every formula row to `brew install`: an install
+/// asks which formulae are installed already, and a machine with none sends
+/// nothing down the marking path.
+const nothing_installed: exec.Fake.Entry = .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name" };
+
 fn rowOf(name: []const u8, fields: []const manifest_mod.Pair) Row {
     return .{
         .name = name,
@@ -797,6 +899,7 @@ test "install: a tapped formula is tapped and trusted narrowly before installing
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- d12frosted/emacs-plus" },
         .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
@@ -816,6 +919,7 @@ test "install: a core formula is neither tapped nor trusted" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep" },
     } };
@@ -890,6 +994,7 @@ test "install: a failed tap fails its row and the rows after it still run" {
     // The tapped row's trust and install are unscripted, so reaching either
     // would fail the test with a different error than the one asserted.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
         .{ .argv = "brew install -- ripgrep" },
@@ -930,6 +1035,7 @@ test "install: a failed install is an error, not a silent skip" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep", .code = 1 },
     } };
@@ -966,6 +1072,7 @@ test "install: every name brew is handed comes after a --" {
     // operand as a formula name and exits 1, where `brew install --help`
     // exits 0. `brew tap` and `brew trust` answer a `--` the same way.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap" },
         .{ .argv = "brew trust --formula -- owner/tap/thing" },
@@ -981,8 +1088,91 @@ test "install: every name brew is handed comes after a --" {
         rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
     });
     for (fake.calls.items) |c| {
+        // The one call that hands brew no name at all: it asks which
+        // formulae are installed, so there is nothing for a `--` to guard.
+        if (std.mem.indexOf(u8, c, "brew list ") != null) continue;
         try testing.expect(std.mem.indexOf(u8, c, " -- ") != null);
     }
+}
+
+test "install: a formula brew already has is marked on request, never handed to the installer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A tapped name goes the same way, and needs neither the tap nor the
+    // trust: the formula could not be installed from a tap the machine does
+    // not have. The Fake errors on any unscripted command, so a stray
+    // install, tap or trust here fails the test.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name",
+            .stdout = "brotli\nd12frosted/emacs-plus/emacs-plus@30\n",
+        },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "brew tab --installed-on-request --formula -- brotli" },
+        .{ .argv = "brew tab --installed-on-request --formula -- d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "brew install --cask -- ghostty" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    // The cask beside them still installs: the cask query lists the whole
+    // Caskroom, so a missing cask row names a cask that is not there.
+    try b.backend().install(a, &.{
+        rowOf("brotli", &.{}),
+        rowOf("d12frosted/emacs-plus/emacs-plus@30", &.{}),
+        rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+    });
+    try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
+    try testing.expect(fake.called("brew tab --installed-on-request --formula -- brotli"));
+    try testing.expect(fake.called("brew install --cask -- ghostty"));
+    // Asked once for the batch, not once per row.
+    var asks: usize = 0;
+    for (fake.calls.items) |c| {
+        if (std.mem.endsWith(u8, c, "brew list --formula --full-name")) asks += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), asks);
+    try testing.expect(std.mem.indexOf(u8, w.written(), "marking it as installed on request instead") != null);
+}
+
+test "install: a formula that cannot be marked on request fails its row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `brew tab` arrived in Homebrew 4.3.6; an older brew answers this argv
+    // with an unknown command, and the row cannot converge at all. Falling
+    // back to `brew install` would report a success that leaves it missing.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = "brotli\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "brew tab --installed-on-request --formula -- brotli", .code = 1 },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{rowOf("brotli", &.{})}));
+    try testing.expect(b.backend().installSpawned());
+    try testing.expect(std.mem.indexOf(u8, w.written(), "could not be marked as installed on request") != null);
+}
+
+test "install: a query that cannot say what is installed leaves the rows to brew, and says so" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .code = 1 },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "brew install -- ripgrep" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{rowOf("ripgrep", &.{})});
+    try testing.expect(fake.called("brew install -- ripgrep"));
+    try testing.expect(std.mem.indexOf(u8, w.written(), "could not be listed") != null);
 }
 
 test "install: whether brew's installer ran is what says the rows may have landed" {
@@ -994,6 +1184,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
     // one row reached brew's installer not at all and nothing can have
     // landed.
     var tap: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
     } };
@@ -1003,6 +1194,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
 
     // An install that ran and failed is the other answer.
     var ran: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep", .code = 1 },
     } };
@@ -1012,6 +1204,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
 
     // And the answer is the last batch's, never the one before it.
     var tap2: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
     } };
@@ -1031,6 +1224,7 @@ test "install: an alias row is refused, naming the formula brew reports" {
     // formula untracked on every run. `brew info --json=v2 ag` answers
     // `"full_name": "the_silver_searcher"`, with `ag` among its aliases.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{
             .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag ripgrep",
             .stdout =
@@ -1087,6 +1281,7 @@ test "install: a name brew resolves to nothing is handed to brew, not refused he
     // Only a name brew POSITIVELY resolves to another package is refused.
     // brew itself is what answers for a name it has never heard of.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- nosuchthing", .code = 1 },
         .{ .argv = "brew install -- nosuchthing", .code = 1 },
     } };
@@ -1109,6 +1304,7 @@ test "install: a row naming a tap the machine lacks is kept, brew answering noth
     // install this same run adds -- declaring it IS the decision to trust
     // that tap.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30", .code = 1 },
         .{ .argv = "brew tap -- d12frosted/emacs-plus" },
         .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
@@ -1131,6 +1327,7 @@ test "install: a row qualifying a tap brew reports bare is refused, naming the b
     // `brew list --full-name --installed-on-request` reports that formula
     // `ripgrep` -- so the qualified row would read as missing for ever.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{
             .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- homebrew/core/ripgrep",
             .stdout =
@@ -1160,6 +1357,7 @@ test "install: a row qualifying a third-party tap is kept, brew reporting it qua
     // answer carries `"full_name": "d12frosted/emacs-plus/emacs-plus@30"`,
     // which is the row's own spelling, so nothing is refused.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{
             .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30",
             .stdout =
@@ -1189,6 +1387,7 @@ test "install: one unresolvable name does not disable alias refusal for the batc
     // brew row is missing, so the whole manifest is one batch and one typo
     // would otherwise turn the check off for all of it.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag zzz-removed-formula", .code = 1 },
         .{
             .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
@@ -1227,6 +1426,7 @@ test "install: a formula row and a cask row of one name each get their own answe
     // row install docker-desktop, which `brew list --cask --full-name`
     // reports under that name alone.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{
             .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- docker",
             .stdout =
@@ -1266,6 +1466,7 @@ test "install: a cask row and a formula row of one name each get their own answe
     // accident: `dash` is a canonical CASK token and an old name of the
     // formula `dash-shell`, both verified read-only against Homebrew 7.0.2.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
         .{
             .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- dash",
             .stdout =
