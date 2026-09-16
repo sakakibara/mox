@@ -4,6 +4,51 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Packages. A `data/packages/*.toml` manifest of `[[packages]]` rows (core
+  keys `name`, `backend`, `when`; every other key belongs to the backend,
+  which refuses an unknown one naming the file and row), `[[blacklist]]`
+  rows for what is installed but never to be offered, and `[[bootstrap]]`
+  rows naming a manager's installer by URL and sha256. Files union across the
+  repo and private layers with per-basename shadowing. Seven backends ship:
+  brew (formulae and casks as distinct namespaces; a tap-qualified name is
+  the tap and the decision to trust that one formula or cask, never the
+  whole tap), apt, dnf, pacman, zypper (no explicitly-installed query, so mox
+  keeps a ledger and intersects it with what rpm reports present), scoop and
+  winget.
+- Any other manager is a plugin: an executable at `scripts/backends/<name>`
+  speaking seven verbs (`available`, `id`, `list`, `install`, `declare`,
+  `bootstrap`, `limitation`) on the same contract as a shipped backend. `id`
+  is both validation and identity; a `declare` answer is handed back to `id`
+  and refused unless it round-trips; exit 64 names a verb the plugin lacks;
+  a plugin named like a shipped backend overrides it and `status` says so.
+  Ids are opaque, calls are time-bounded, and an id that is empty, contains
+  whitespace, or exceeds 256 bytes is refused as a lost line separator.
+- `status` reports each backend's MISSING and UNTRACKED packages, `apply`
+  installs the missing (after the pre stage and before its re-capture, and
+  first installing a declared manager that is absent from its verified
+  installer, then using it by the path it landed at in the same run), and
+  `commit` offers each untracked package to add, blacklist or skip, appending
+  a row and never editing one. Nothing ever uninstalls. A repo without
+  `data/packages/` queries no manager and reports nothing.
+- `zig build test-backends` checks the brew adapter against the real brew,
+  differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
+  pacman through a full install round trip in containers;
+  `tests/windows_backends_test.ps1` probes scoop and winget read-only. All
+  three run nightly.
+
+### Changed
+- BREAKING: `status --json` emits `{"files":[...],"packages":[...]}` rather
+  than an array, and `--porcelain` adds `package_missing` and
+  `package_untracked` records of three fields; field count now varies by the
+  leading kind. Package drift counts toward the exit code as file drift does.
+- `status` and `commit` execute repo code they did not before: a backend
+  plugin's `available`, `list`, `id`, `limitation` and (for `commit`)
+  `declare`; each plugin is named by path in the report first. `doctor` no
+  longer reports `scripts/backends/` as an unknown stage.
+
 ## [0.11.0] - 2026-09-09
 
 ### Added
