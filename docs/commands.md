@@ -337,7 +337,10 @@ A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING` and each
 installed package `UNTRACKED` (declared nowhere and not blacklisted).
 A repo without that directory is not using the package subsystem, so no
-section prints and no package manager is queried. Package drift counts
+section prints and no package manager is queried. A repo with plugins under
+`scripts/backends/` has them executed here (their `available`, `list`, `id`
+and `limitation` verbs), each listed by path first; see
+[packages.md](packages.md#adding-a-backend). Package drift counts
 toward the exit code exactly as file drift does, so `mox status` answers
 one question -- does this machine match what it declares -- over files
 and packages alike. A manifest that is itself malformed is an error, not

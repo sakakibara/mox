@@ -149,20 +149,117 @@ entirely.
 
 ## Adding a backend
 
-One adapter file implementing `available`, `validate`, `idOf`,
-`installedExplicit`, `install` and `declare`, plus a line in the registry.
-The manifest format and the core (loading, gating, drift, reconcile) do not
-change -- adding apt, dnf, pacman, scoop, winget and zypper touched none of
-them.
+Any package manager can be given a backend without rebuilding mox. The seven
+above are compiled in because they are what mox supports out of the box, with
+no shell dependency; everything else is a **plugin**: an executable in the
+repo that speaks the protocol below. A plugin satisfies exactly the same
+contract as a compiled backend, so `status`, `apply` and `commit` cannot tell
+them apart. What stays fixed by mox is the set of things a backend is asked to
+do -- there is no `remove` or `upgrade` verb, and adding one is a mox change.
 
-Two contracts are worth stating for a new adapter:
+### Where
 
-- `idOf` must keep apart anything the manager keeps apart. brew casks carry a
-  prefix for exactly this reason: without it a declared `docker` cask would be
-  satisfied by the `docker` formula.
-- `declare` is the inverse of `idOf`: given an id the manager reported, it
-  returns the row that would name it. `idOf(declare(id))` must equal `id`, or
-  a reconciled row will not match the package it came from.
+`scripts/backends/<name>`, flat, repo only. The name is the filename stem:
+`macports` and `macports.ps1` both name `macports`, so one plugin can ship a
+POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`.
+
+- Unix runs a plain file directly; it must be executable (`chmod +x`), and
+  one that is not is an error naming the file -- never "no such backend".
+- Windows has no executable bit, so kind decides: `.ps1` runs through pwsh,
+  `.exe` and `.cmd` directly. Any other file is *not runnable here*, printed
+  as a note under `packages:`, so a MacPorts script in a shared repo neither
+  breaks nor silently vanishes on a Windows machine.
+
+There is no axis gating (`os=darwin/`) and no private-layer shadowing.
+Whether a backend is usable on this machine is its own `available` verb, and
+nothing else: a plugin hidden under an `os=` directory would be undiscovered
+elsewhere, and every shared-manifest row naming it would read as a typo there.
+
+A plugin named like a shipped backend overrides it, and `status` says
+`note  brew: scripts/backends/brew overrides the built-in` on every run.
+
+### The protocol
+
+| Verb | stdin | stdout | Exit |
+|---|---|---|---|
+| `available` | -- | -- | 0 usable here; nonzero not |
+| `id` | rows, one `{ name = "...", ... }` per line | one id per line, in order | nonzero: a row is refused; say why on stderr |
+| `list` | -- | one id per line: what was explicitly installed | nonzero: failed |
+| `install` | rows, one per line | streamed to the terminal | nonzero: failed |
+| `declare <id>` | -- | a TOML row body: `name = "..."` plus fields | nonzero: failed |
+| `bootstrap <path>` | -- | optionally one line: a directory to put on PATH | 64: not implemented |
+| `limitation` | -- | one line on what it cannot see | 64: none |
+
+Rows arrive as TOML inline tables with exactly the keys the manifest row
+carries. Ids are opaque to mox: it compares them and never parses them, so a
+manager with two namespaces prefixes them itself (`cask:ghostty`) and the
+manifest row still spells `name = "ghostty"`, `kind = "cask"` -- the same
+shape as for a compiled backend.
+
+- **`id` is both validate and idOf.** A row the plugin cannot name is refused
+  with the plugin's own reason, which is stronger than any key list mox could
+  check. A refused row fails on every machine that reads the manifest, not
+  only where the manager runs.
+- **`declare` is checked, not trusted.** The row it returns is handed back to
+  `id`, and refused unless the answer is the id it came from. A plugin whose
+  two halves disagree cannot write a row that will never match its package.
+- **`install` gets the whole set.** A manager that resolves a batch in one
+  pass gets one call; a per-item manager loops over its stdin.
+- **No ledger mode.** A manager with no explicitly-installed query keeps its
+  own record under `$MOX_STATE_DIR` and intersects it in `list`; `list` has
+  one meaning.
+- **Exit 64 means "this verb is not implemented"**, reported by plugin and
+  verb where it was needed. Nothing is substituted for a missing verb.
+- Every call is time-bounded like a setup script; a `list` blocked on a
+  manager's lock is a reported failure, not a hung `mox status`.
+- Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
+  CRLF); an id that is empty, contains whitespace, or exceeds 256 bytes is an
+  error naming the plugin. That catches a lost line separator across a large
+  set; a fixture test in your repo is the real defence.
+
+`bootstrap` runs only when the manifest declares a `[[bootstrap]]` row for
+the backend and `available` says the manager is absent. mox fetches the
+installer and refuses to hand it over unless it hashes to the declared
+sha256; the plugin then runs the verified file however its manager needs.
+Progress goes to stderr; the one line on stdout, if any, is a bin dir mox
+puts on PATH so the same run can use what was just installed.
+
+### Environment and which commands run a plugin
+
+A plugin runs as you, at the trust `scripts/pre` already has, with
+`MOX_REPO`, `MOX_STATE_DIR`, `MOX_HOME`, `PATH` and the `MOX_FACT_*` values
+under `apply`; `status` and `commit` run it under the process environment.
+This is a capability `status` and `commit` did not have before backends:
+`status` runs `available`, `list`, `id` and `limitation`; `commit` adds
+`declare`; `apply` adds `install` and `bootstrap`; `--dry-run` runs the
+read-only set. `status` lists every discovered plugin by path before it runs
+anything.
+
+### A complete plugin
+
+MacPorts, as a POSIX script at `scripts/backends/macports`:
+
+```sh
+#!/bin/sh
+set -eu
+cmd=${1:-}; shift || true
+name() { printf '%s' "$1" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; }
+case "$cmd" in
+available) command -v port >/dev/null 2>&1 ;;
+id)        while IFS= read -r l; do [ -n "$l" ] && name "$l"; done ;;
+list)      port -q echo requested | awk 'NF { print $1 }' ;;
+install)   set --; while IFS= read -r l; do [ -n "$l" ] && set -- "$@" "$(name "$l")"; done
+           sudo port -N install "$@" ;;
+declare)   printf 'name = "%s"\n' "$1" ;;
+limitation) echo "variants are not tracked; a port is matched by name alone" ;;
+*)         exit 64 ;;
+esac
+```
+
+That is longer than a purely declarative form of the same thing would be, and
+that is accepted: a schema rich enough to also express a ledger, a second
+namespace, or running an installer is a scripting language in TOML, and the
+first manager with a quirk it lacks would need a mox release again.
 
 ## Testing
 
