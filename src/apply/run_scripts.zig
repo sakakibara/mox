@@ -814,8 +814,10 @@ pub fn runCheck(
 
     if (guard.fired) {
         // The group outlives the reaped leader for as long as a member does;
-        // whatever the checker left running goes with it.
-        if (child_group) |id| _ = job.killGroupOf(id);
+        // whatever the checker left running goes with it. Only the group is
+        // addressed: the child is reaped, so its pid may already name
+        // something else.
+        if (child_group) |id| job.killStragglersOf(id);
         return .{ .refusal = try std.fmt.allocPrint(arena, "timed out after {d}ms, killed", .{timeout_ms}), .tail = tail };
     }
     return switch (term) {
@@ -985,8 +987,10 @@ fn runOne(
 
     if (guard.fired) {
         // The group outlives the reaped leader for as long as a member
-        // does; whatever the script left running goes with it.
-        if (child_group) |id| _ = job.killGroupOf(id);
+        // does; whatever the script left running goes with it. Only the group
+        // is addressed: the child is reaped, so its pid may already name
+        // something else.
+        if (child_group) |id| job.killStragglersOf(id);
         result.failed += 1;
         stderr.print("mox apply: {s}: timed out after {d}ms, killed\n", .{ path, timeout_ms }) catch {};
         return;

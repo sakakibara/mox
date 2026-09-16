@@ -503,6 +503,32 @@ test "killGroupOf: a pid the system has freed is not reached" {
     child.stderr = null;
 }
 
+test "killStragglersOf: only the group is addressed, never the bare pid" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // Left in the caller's own group, so its pid names no process group: a
+    // kill that reached it could only have been addressed to the pid. Every
+    // caller of this sweeps a group whose leader the wait has already reaped,
+    // and a reaped pid is the system's to hand to something else.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "sleep 300" },
+        .stdin = .close,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const id = child.id.?;
+    killStragglersOf(id);
+
+    const step: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(50), .clock = .awake } };
+    try step.sleep(io);
+    var raw: c_int = undefined;
+    try testing.expectEqual(@as(std.c.pid_t, 0), std.c.waitpid(id, &raw, std.c.W.NOHANG));
+
+    _ = killGroupOf(id);
+    _ = try child.wait(io);
+}
+
 test "killGroupAfter: a child reaped at the bound is neither killed nor called a timeout" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
