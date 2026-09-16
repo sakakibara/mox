@@ -29,6 +29,7 @@ pub const Backend = backend_mod.Backend;
 
 pub const Error = error{
     UnknownZypperKey,
+    ZypperSelectorRow,
     ZypperQueryFailed,
     ZypperInstallFailed,
 };
@@ -64,6 +65,18 @@ pub const Zypper = struct {
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
+        // zypper installs more than packages, but mox reads back what is
+        // installed from `rpm`, which knows package names alone. A row
+        // naming anything else would install and then read as missing on
+        // every status, and be reinstalled on every apply.
+        for ([_][]const u8{ "pattern:", "patch:", "product:", "srcpackage:", "application:" }) |selector| {
+            if (!std.mem.startsWith(u8, row.name, selector)) continue;
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": zypper rows name packages; a \"{s}\" selector cannot be read back from rpm",
+                .{ row.label, row.name, selector[0 .. selector.len - 1] },
+            );
+            return Error.ZypperSelectorRow;
+        }
         if (row.fields.len == 0) return;
         if (diag) |d| d.set(
             "{s}: row \"{s}\": zypper accepts no key \"{s}\"",
@@ -152,7 +165,9 @@ pub const Zypper = struct {
         // on every status, re-attempted beside the same failing sibling on
         // every apply. Only what rpm confirms is recorded; nothing that never
         // landed is.
-        const landed = try self.presentOf(arena, ids.items);
+        // The install is what failed; a query that also fails must not
+        // replace that with its own error.
+        const landed = self.presentOf(arena, ids.items) catch return Error.ZypperInstallFailed;
         if (landed.len > 0) try self.ledger.add(arena, landed);
         return Error.ZypperInstallFailed;
     }
@@ -404,6 +419,22 @@ test "backend: the blind spot is declared, not left to be discovered" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
     try testing.expect(z.backend().limitation != null);
+}
+
+test "validate: a selector row is refused, since rpm cannot read it back" {
+    var d: Diag = .{};
+    const row: Row = .{
+        .name = "pattern:devel_basis",
+        .backend = "zypper",
+        .when = null,
+        .fields = &.{},
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/suse.toml",
+        .index = 0,
+    };
+    var z: Zypper = .{ .runner = undefined, .ledger = undefined };
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(row, &d));
+    try testing.expect(std.mem.indexOf(u8, d.capture().?, "cannot be read back from rpm") != null);
 }
 
 test "validate: a key meant for another manager is refused" {

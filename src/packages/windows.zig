@@ -346,19 +346,31 @@ pub const Winget = struct {
 
             const res = try self.runner.stream(arena, argv.items);
             try exec.checkTimedOut(res);
-            if (!res.ok and !alreadyInstalled(res.code)) failed = true;
+            if (!res.ok and !try self.isInstalled(arena, row.name)) failed = true;
         }
         if (failed) return Error.WingetInstallFailed;
     }
 
-    /// A package `winget export` omits (installed outside any source) is
-    /// declared MISSING, and installing it exits
-    /// APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED (0x8A15002B) or
-    /// APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPGRADE (0x8A15010D): it is
-    /// there, so the row has landed. Only the low byte of the HRESULT
-    /// reaches here, because `Term.exited` is a `u8`.
-    fn alreadyInstalled(code: u8) bool {
-        return code == 0x2B or code == 0x0D;
+    /// Whether winget has this identifier installed, asked directly.
+    ///
+    /// A package `winget export` omits (one installed outside any source) is
+    /// declared MISSING, and installing it fails with "already installed" or
+    /// "no applicable upgrade" forever. The exit code cannot tell that apart
+    /// from a real failure: winget's error space is
+    /// `0x8A15xxxx` and only the low byte of an exit status survives
+    /// `Term.exited`, so more than one error arrives as any given byte.
+    /// Asking is the only answer that means what it says.
+    fn isInstalled(self: *Winget, arena: std.mem.Allocator, id: []const u8) !bool {
+        const res = try self.runner.run(arena, &.{
+            "winget",  "list",
+            "--id",    id,
+            "--exact", "--accept-source-agreements",
+        });
+        try exec.checkTimedOut(res);
+        if (!res.ok) return false;
+        // `list` prints a table; the identifier appears in it only when
+        // something matched.
+        return std.mem.indexOf(u8, res.stdout, id) != null;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
@@ -696,23 +708,26 @@ test "winget: a bare row installs with the agreements alone" {
     ));
 }
 
-test "winget: a package that is there but absent from the export counts as landed" {
+test "winget: an install that failed is asked about, not read from its exit code" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The low bytes of PACKAGE_ALREADY_INSTALLED (0x8A15002B) and
-    // NO_APPLICABLE_UPGRADE (0x8A15010D); any other failure still fails.
+    // An install that failed is asked about rather than read from its exit
+    // code: winget answers that the package is there, so the row landed.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
-        .{ .argv = "winget install --id Microsoft.PowerShell --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x0D },
+        .{ .argv = "winget list --id Git.Git --exact --accept-source-agreements", .stdout = "Name  Id       Version\nGit   Git.Git  2.46\n" },
     } };
     var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
 
-    try w.backend().install(a, &.{ wingetRow("Git.Git", &.{}), wingetRow("Microsoft.PowerShell", &.{}) });
+    try w.backend().install(a, &.{wingetRow("Git.Git", &.{})});
 
+    // The same exit code, but winget does not have it: a real failure, and
+    // no exit code could have told the two apart.
     var other: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 1 },
+        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
+        .{ .argv = "winget list --id Git.Git --exact --accept-source-agreements", .stdout = "No installed package found matching input criteria.\n" },
     } };
     var w2: Winget = .{ .runner = other.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
     try testing.expectError(Error.WingetInstallFailed, w2.backend().install(a, &.{wingetRow("Git.Git", &.{})}));
