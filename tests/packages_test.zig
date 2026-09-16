@@ -861,3 +861,137 @@ test "plugin: a name shadowing a shipped backend is announced, not silent" {
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "overrides the built-in") != null);
 }
+
+test "bootstrap: an absent manager is installed and used by the same apply" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/bash\necho installing brew\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writeManifest(io, h, a, "darwin.toml", try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{hex}));
+
+    // brew is absent exactly once; the fetch writes the installer the digest
+    // covers; the installer runs; then brew answers, by whichever path the
+    // adapter now invokes it, and the run installs the package.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
+    try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
+    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --cask", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew install ripgrep", .match = .suffix });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    mox.cli.app.package_runner_override = fake.runner();
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "apply: --skip-scripts and a path-scoped apply install nothing" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+    );
+
+    // Nothing is scripted: any manager call at all errors the run.
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    _ = try h.run(&.{ "mox", "apply", "--skip-scripts" });
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    const live = try h.liveOf("nothing-here.conf");
+    _ = try h.run(&.{ "mox", "apply", live });
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "plugin: one that crashes on available is a named error, not an inert backend" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A syntax error: sh exits 2 before any verb is handled.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "broken" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "#!/bin/sh\ncase x in\n" });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    try writeManifest(io, h, a, "b.toml", "backend = \"broken\"\n\n[[packages]]\nname = \"x\"\n");
+
+    // Whichever verb it dies on first, the error names the plugin.
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "broken: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "failed") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "commit: a plugin without declare is reported by name, and the run does not crash" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "nodeclare" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) sed -n 's/.*name = "\([^"]*\)".*/\1/p' ;;
+        \\list) echo stray ;;
+        \\*) exit 64 ;;
+        \\esac
+        \\
+    });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    try writeManifest(io, h, a, "n.toml", "backend = \"nodeclare\"\n");
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "nodeclare stray: declare failed: PluginVerbNotImplemented") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "internal error") == null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}

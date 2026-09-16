@@ -20,7 +20,7 @@ const Io = std.Io;
 
 pub const Ledger = struct {
     io: Io,
-    /// `<state_dir>/packages`.
+    /// The directory the record lives in; `<backend>.txt` under it.
     dir: []const u8,
     backend: []const u8,
 

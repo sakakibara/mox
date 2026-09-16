@@ -93,11 +93,14 @@ pub const Process = struct {
         const self: *Process = @ptrCast(@alignCast(ctx));
         if (stdin) |bytes| return self.spawnWithStdin(arena, argv, bytes, .pipe, .inherit);
 
-        const res = try std.process.run(arena, self.io, .{
+        const res = std.process.run(arena, self.io, .{
             .argv = argv,
             .environ_map = self.env,
             .timeout = self.timeout(),
-        });
+        }) catch |e| switch (e) {
+            error.Timeout => return .{ .code = 255, .ok = false, .stdout = "", .stderr = "", .timed_out = true },
+            else => return e,
+        };
         return fromTerm(res.term, res.stdout, res.stderr);
     }
 
@@ -120,11 +123,19 @@ pub const Process = struct {
 
         var stdin_file: ?Io.File = null;
         defer if (stdin_file) |f| f.close(io);
+        var stdin_path: ?[]const u8 = null;
+        // Removed once the child has been reaped, so a row file never lingers
+        // in state and a second mox running beside this one never reads it.
+        defer if (stdin_path) |p| Io.Dir.cwd().deleteFile(io, p) catch {};
         var stdin_io: std.process.SpawnOptions.StdIo = .close;
         if (stdin) |bytes| {
             try Io.Dir.cwd().createDirPath(io, self.scratch_dir);
-            const path = try std.fs.path.join(arena, &.{ self.scratch_dir, "stdin.txt" });
+            // Named per process: two mox runs sharing a state dir (a status
+            // beside an apply) must not truncate each other's stdin mid-read.
+            const name = try std.fmt.allocPrint(arena, "stdin-{d}.txt", .{std.c.getpid()});
+            const path = try std.fs.path.join(arena, &.{ self.scratch_dir, name });
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+            stdin_path = path;
             stdin_file = try Io.Dir.cwd().openFile(io, path, .{});
             stdin_io = .{ .file = stdin_file.? };
         }
@@ -147,7 +158,13 @@ pub const Process = struct {
         if (child.stdout) |f| {
             var buf: [4096]u8 = undefined;
             var r = f.reader(io, &buf);
-            out = r.interface.allocRemaining(arena, .limited(8 << 20)) catch "";
+            // A read that fails or overruns the bound is an error, never an
+            // empty answer: an empty `list` would make every row missing.
+            out = r.interface.allocRemaining(arena, .limited(8 << 20)) catch |e| {
+                if (killer) |*k| _ = k.cancel(io);
+                _ = child.wait(io) catch {};
+                return e;
+            };
         }
 
         const term = child.wait(io) catch |e| {
@@ -196,18 +213,29 @@ fn killAfter(io: Io, t: Io.Timeout, id: std.process.Child.Id, fired: *bool) void
 /// matches, so a test can never pass on a command the adapter was not
 /// supposed to run.
 pub const Fake = struct {
+    pub const Match = enum { exact, prefix, suffix };
+
     pub const Entry = struct {
         /// Matched against the argv joined by spaces.
         argv: []const u8,
+        match: Match = .exact,
         stdout: []const u8 = "",
         stderr: []const u8 = "",
         code: u8 = 0,
         /// Raised instead of answering, for the failures a manager reports by
         /// not being there at all.
         fail: ?anyerror = null,
+        /// Write `stdout` to the file the argument after this flag names,
+        /// instead of returning it: what `curl -o <path>` does.
+        write_after: ?[]const u8 = null,
+        io: ?Io = null,
+        /// Answers the first matching call only, then steps aside for a
+        /// later entry: a manager absent before a bootstrap and present after.
+        once: bool = false,
     };
 
     entries: []const Entry,
+    spent: std.ArrayList(bool) = .empty,
     calls: std.ArrayList([]const u8) = .empty,
     /// The stdin handed to each call, in call order ("" when none).
     inputs: std.ArrayList([]const u8) = .empty,
@@ -237,16 +265,34 @@ pub const Fake = struct {
         const joined = try std.mem.join(self.arena, " ", argv);
         try self.calls.append(self.arena, joined);
         try self.inputs.append(self.arena, try self.arena.dupe(u8, stdin orelse ""));
-        for (self.entries) |e| {
-            if (std.mem.eql(u8, e.argv, joined)) {
-                if (e.fail) |err| return err;
-                return .{
-                    .code = e.code,
-                    .ok = e.code == 0,
-                    .stdout = try arena.dupe(u8, e.stdout),
-                    .stderr = try arena.dupe(u8, e.stderr),
-                };
+        if (self.spent.items.len == 0) {
+            for (self.entries) |_| try self.spent.append(self.arena, false);
+        }
+        for (self.entries, 0..) |e, i| {
+            if (self.spent.items[i]) continue;
+            const hit = switch (e.match) {
+                .exact => std.mem.eql(u8, e.argv, joined),
+                .prefix => std.mem.startsWith(u8, joined, e.argv),
+                .suffix => std.mem.endsWith(u8, joined, e.argv),
+            };
+            if (!hit) continue;
+            if (e.once) self.spent.items[i] = true;
+            if (e.fail) |err| return err;
+            if (e.write_after) |flag| {
+                for (argv, 0..) |a, j| {
+                    if (std.mem.eql(u8, a, flag) and j + 1 < argv.len) {
+                        try Io.Dir.cwd().writeFile(e.io.?, .{ .sub_path = argv[j + 1], .data = e.stdout });
+                        break;
+                    }
+                }
+                return .{ .code = e.code, .ok = e.code == 0, .stdout = "", .stderr = "" };
             }
+            return .{
+                .code = e.code,
+                .ok = e.code == 0,
+                .stdout = try arena.dupe(u8, e.stdout),
+                .stderr = try arena.dupe(u8, e.stderr),
+            };
         }
         return error.UnexpectedCommand;
     }

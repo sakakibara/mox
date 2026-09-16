@@ -383,7 +383,7 @@ fn gatherPackages(
             } else {
                 try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
             }
-            return .{ .broken = true };
+            return .{ .broken = true, .notes = pkg_backends.notes };
         },
     };
     return .{ .report = rep, .notes = pkg_backends.notes };
@@ -393,10 +393,11 @@ fn gatherPackages(
 /// manifest, so an unadopted repo's report is unchanged.
 fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
     const rep = pkgs.report;
-    if (!rep.in_use) return;
+    if (!rep.in_use and pkgs.notes.len == 0) return;
 
     try ctx.out.writeAll("\npackages:\n");
     for (pkgs.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    if (!rep.in_use) return;
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
@@ -671,7 +672,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED; --json / --porcelain carry files only.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked records.",
     .group = .general,
     .needs_context = true,
 }, run);

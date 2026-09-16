@@ -152,7 +152,13 @@ pub const PackageBackends = struct {
             // `status` and `commit` executing repo code is new, and what
             // executes must be visible rather than inferred.
             try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}", .{ f.name, f.path }));
-            try pl.queryLimitation(arena);
+            // The first thing a plugin is ever asked; a crash here is a broken
+            // plugin and is named as such rather than surfacing as a bare
+            // error with three plugins to suspect.
+            pl.queryLimitation(arena) catch |e| {
+                if (diag) |d| d.set("{s}: limitation failed: {s} ({s})", .{ f.name, @errorName(e), f.path });
+                return e;
+            };
 
             var replaced = false;
             for (list.items) |*b| {

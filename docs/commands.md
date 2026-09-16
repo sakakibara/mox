@@ -180,6 +180,8 @@ and leaves the rest of the list to proceed; any failure is an error class
 (rc 2). apply only ever installs -- an untracked package is reported by
 `mox status` and reconciled by `mox commit`, never uninstalled. Under
 `--dry-run` nothing is installed and the run lists what it would install.
+`--skip-scripts` skips packages as it skips scripts (both change the machine
+beyond its files), and a path-scoped apply names files and installs nothing.
 A repo without `data/packages/` never queries a package manager.
 
 apply is non-interactive. It writes every file that is clean or absent
@@ -227,7 +229,7 @@ counted under `failed` too, though none of them is a script.
 | --- | --- |
 | `--dry-run` | report only, write nothing |
 | `--overwrite` | overwrite drifted files |
-| `--skip-scripts` | compose and write files, run no scripts |
+| `--skip-scripts` | compose and write files, run no scripts; also installs no packages |
 | `--defaults` | never prompt: bind each unbound fact's default, decline the rest |
 | `--color <color>` | auto|always|never |
 <!-- /generated -->

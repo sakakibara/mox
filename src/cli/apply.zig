@@ -13,7 +13,7 @@ const display = @import("display.zig");
 pub const Spec = struct {
     dry_run: cli.Flag(.{ .help = "report only, write nothing" }),
     overwrite: cli.Flag(.{ .help = "overwrite drifted files" }),
-    skip_scripts: cli.Flag(.{ .help = "compose and write files, run no scripts" }),
+    skip_scripts: cli.Flag(.{ .help = "compose and write files, run no scripts; also installs no packages" }),
     defaults: cli.Flag(.{ .help = "never prompt: bind each unbound fact's default, decline the rest" }),
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
@@ -327,7 +327,13 @@ fn applyPass(
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, "scripts/pre", &bindings, &script_env, &contracts, ctx.out, ctx.err);
 
-    const pkg_counts = try applyPackages(ctx, context, &bindings, dry_run, &script_env);
+    // Packages ride the same gate as setup scripts: both mutate the machine
+    // beyond its files, and a run that asked for neither (`--skip-scripts`,
+    // or a path-scoped apply that names files) installs nothing.
+    const pkg_counts = if (skip_scripts_arg or paths.len > 0)
+        PackageCounts{}
+    else
+        try applyPackages(ctx, context, &bindings, dry_run, &script_env);
 
     // A pre-script may install a tool or create a directory a `data/facts.toml`
     // row derives a fact from. Re-capture so this same apply composes against
@@ -799,7 +805,12 @@ fn bootstrapBackends(
             failed += 1;
             continue;
         };
-        if (try backend.available(ctx.alloc)) continue;
+        const present = backend.available(ctx.alloc) catch |e| {
+            try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
+            failed += 1;
+            continue;
+        };
+        if (present) continue;
         if (!backend.canBootstrap()) {
             try ctx.err.print(
                 "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
@@ -913,7 +924,12 @@ fn applyPackages(
     } else if (manifest.inUse()) {
         for (manifest.bootstrap) |b| {
             const backend = registry.find(b.backend) orelse continue;
-            if (try backend.available(ctx.alloc)) continue;
+            const present = backend.available(ctx.alloc) catch |e| {
+                try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
+                bootstrap_failed += 1;
+                continue;
+            };
+            if (present) continue;
             try ctx.out.print("  would bootstrap {s}\n", .{b.backend});
         }
     }

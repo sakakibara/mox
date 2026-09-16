@@ -538,7 +538,17 @@ fn reconcilePackages(
                 continue;
             }
 
-            const decl = try backend.declare(ctx.alloc, id);
+            const decl = backend.declare(ctx.alloc, id) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {
+                    try ctx.err.print(
+                        "mox commit: {s} {s}: declare failed: {s}; record the row by hand\n",
+                        .{ b.backend, id, @errorName(e) },
+                    );
+                    res.skipped += 1;
+                    continue;
+                },
+            };
             // The file's own default already names the backend; repeating it
             // on the row would be a second spelling of one fact.
             const needs_backend = target.default_backend == null or

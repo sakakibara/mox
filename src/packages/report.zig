@@ -89,7 +89,11 @@ pub fn fromManifest(
     var active: std.ArrayList([]const u8) = .empty;
     var usable: std.ArrayList(Backend) = .empty;
     for (registry.backends) |b| {
-        if (!try b.available(arena)) continue;
+        const ok = b.available(arena) catch |e| {
+            if (diag) |d| d.set("{s}: available failed: {s}", .{ b.name, @errorName(e) });
+            return e;
+        };
+        if (!ok) continue;
         try active.append(arena, b.name);
         try usable.append(arena, b);
     }
@@ -98,7 +102,10 @@ pub fn fromManifest(
 
     var out: std.ArrayList(BackendDrift) = .empty;
     for (usable.items) |b| {
-        const installed = try b.installedExplicit(arena);
+        const installed = b.installedExplicit(arena) catch |e| {
+            if (diag) |d| d.set("{s}: list failed: {s}", .{ b.name, @errorName(e) });
+            return e;
+        };
         for (installed) |id| {
             if (backend_mod.idShapeOk(id)) continue;
             if (diag) |d| d.set(

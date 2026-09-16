@@ -94,20 +94,27 @@ pub const Plugin = struct {
         self.limitation = if (line.len == 0) null else line;
     }
 
-    /// A spawn failure of the plugin itself is a broken plugin, not an absent
-    /// manager: unlike a compiled adapter, argv[0] here is not the manager.
+    /// Exit 0 is usable, exit 1 is not usable here, and anything else is a
+    /// broken plugin: a script that dies on a syntax error exits 2, and
+    /// reading that as "not usable" would make every row naming it vanish
+    /// from every command without a word. Its stderr goes to the terminal
+    /// for the same reason. A spawn failure of the plugin itself is likewise
+    /// a broken plugin, not an absent manager: unlike a compiled adapter,
+    /// argv[0] here is not the manager.
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.run(arena, try self.argv(arena, "available", &.{}));
+        const res = try self.runner.runInput(arena, try self.argv(arena, "available", &.{}), "");
         if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (res.code > 1) return Error.PluginFailed;
         return res.ok;
     }
 
     fn validateImpl(ctx: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        var buf: [4096]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        _ = self.idOne(fba.allocator(), row) catch |e| switch (e) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        _ = self.idOne(arena.allocator(), row) catch |e| switch (e) {
             Error.PluginRefusedRow => {
                 if (diag) |d| d.set(
                     "{s}: row \"{s}\": refused by plugin {s} (its reason is printed above)",
@@ -124,7 +131,8 @@ pub const Plugin = struct {
         return self.idOne(arena, row);
     }
 
-    /// One row in, exactly one id out.
+    /// One row in, exactly one id out: `id` is called once per row, and an
+    /// answer of any other shape (two lines, none) is bad output.
     fn idOne(self: *Plugin, arena: std.mem.Allocator, row: Row) ![]const u8 {
         const line = try write_mod.inlineRow(arena, row.name, row.fields);
         const input = try std.fmt.allocPrint(arena, "{s}\n", .{line});
