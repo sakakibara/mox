@@ -62,7 +62,7 @@ fn brewWith(
 ) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
-    try entries.append(a, .{ .argv = "brew leaves --installed-on-request", .stdout = formulae });
+    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .stdout = formulae });
     try entries.append(a, .{ .argv = "brew list --cask", .stdout = casks });
     try absentLinuxManagers(a, &entries);
     for (extra) |e| try entries.append(a, e);

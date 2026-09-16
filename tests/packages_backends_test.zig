@@ -77,7 +77,7 @@ test "brew: every formula brew reports is an id, spelled identically" {
     if (!brewPresent(a, io)) return error.SkipZigTest;
 
     const ids = try brewIds(a, io);
-    const raw = try rawLines(a, io, &.{ "brew", "leaves", "--installed-on-request" });
+    const raw = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
     if (raw.len == 0) return error.SkipZigTest;
 
     // Verbatim, both ways: a formula must arrive unprefixed and untranslated,
@@ -127,7 +127,7 @@ test "brew: the adapter reports exactly what brew reports, nothing extra" {
     if (!brewPresent(a, io)) return error.SkipZigTest;
 
     const ids = try brewIds(a, io);
-    const formulae = try rawLines(a, io, &.{ "brew", "leaves", "--installed-on-request" });
+    const formulae = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
     const casks = try rawLines(a, io, &.{ "brew", "list", "--cask" });
     try testing.expectEqual(formulae.len + casks.len, ids.len);
 }
@@ -140,7 +140,7 @@ test "brew: a tap-qualified formula is reported the way a row spells it" {
 
     if (!brewPresent(a, io)) return error.SkipZigTest;
 
-    const raw = try rawLines(a, io, &.{ "brew", "leaves", "--installed-on-request" });
+    const raw = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
     var qualified: ?[]const u8 = null;
     for (raw) |name| {
         if (std.mem.indexOfScalar(u8, name, '/') != null) {

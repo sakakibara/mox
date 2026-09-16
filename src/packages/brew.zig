@@ -6,11 +6,15 @@
 //! decision to trust that tap, which the adapter acts on by tapping and
 //! trusting the single formula rather than the whole tap.
 //!
-//! Names need no translation: `brew leaves --installed-on-request` reports a
-//! core formula bare and a tapped one fully qualified, exactly as a row
-//! spells it. Casks are a separate namespace that can collide with a formula
-//! of the same name, so a cask's id carries its kind -- and a cask can come
-//! from a third-party tap just as a formula can.
+//! The explicit set is `brew list --full-name --installed-on-request`, and
+//! each half of that is load-bearing. `brew leaves` is the wrong question: it
+//! excludes any formula that something else depends on, so a package the user
+//! asked for by name vanishes the moment anything needs it and is reported
+//! missing forever. `--full-name` spells a tapped formula the way a row does
+//! (`owner/tap/name`); without it the same formula comes back bare and never
+//! matches its row. Casks are queried separately and are a namespace that can
+//! collide with a formula of the same name, so a cask's id carries its kind
+//! -- and a cask can come from a third-party tap just as a formula can.
 
 const std = @import("std");
 
@@ -102,7 +106,7 @@ pub const Brew = struct {
 
         var out: std.ArrayList([]const u8) = .empty;
 
-        const formulae = try self.runner.run(arena, &.{ "brew", "leaves", "--installed-on-request" });
+        const formulae = try self.runner.run(arena, &.{ "brew", "list", "--full-name", "--installed-on-request" });
         if (!formulae.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, formulae.stdout, "");
 
@@ -296,7 +300,7 @@ test "installedExplicit: formulae bare, tapped fully qualified, casks prefixed" 
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{
-            .argv = "brew leaves --installed-on-request",
+            .argv = "brew list --full-name --installed-on-request",
             .stdout = "ripgrep\nd12frosted/emacs-plus/emacs-plus@30\n",
         },
         .{ .argv = "brew list --cask", .stdout = "ghostty\n1password\n" },
@@ -320,7 +324,7 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     // An empty list would read as "nothing installed" and make every desired
     // package look missing.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew leaves --installed-on-request", .code = 1, .stderr = "boom" },
+        .{ .argv = "brew list --full-name --installed-on-request", .code = 1, .stderr = "boom" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();

@@ -1,7 +1,8 @@
 //! What mox installed, for a manager that cannot say.
 //!
 //! Most managers answer "what did the user install on purpose" themselves
-//! (`brew leaves`, `apt-mark showmanual`, `dnf repoquery --userinstalled`,
+//! (`brew list --installed-on-request`, `apt-mark showmanual`,
+//! `dnf repoquery --userinstalled`,
 //! `pacman -Qe`). zypper has no such query -- verified against zypper 1.14:
 //! `--userinstalled` is not a flag it knows, and `--installed-only` returns
 //! every dependency too. So for those managers mox records what it installed
