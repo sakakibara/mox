@@ -523,7 +523,7 @@ fn reconcilePackages(
                 continue;
             }
 
-            const target = (try mox.packages.write.targetFor(ctx.alloc, m, b.backend, bindings)) orelse {
+            const target = (try mox.packages.write.targetFor(ctx.alloc, m, b.backend, bindings, .packages)) orelse {
                 // Said once per backend: every untracked package of that
                 // backend has the same missing file.
                 if (!no_file_said) {
@@ -582,25 +582,37 @@ fn reconcilePackages(
                     continue;
                 },
             };
+            const array: mox.packages.write.Array = if (chosen == 0) .packages else .blacklist;
+            // A blacklist holds on every machine, so it may not go in a gated
+            // file: the row would refuse the manifest on the next command.
+            const dest = if (array == .packages) target else (try mox.packages.write.targetFor(ctx.alloc, m, b.backend, bindings, .blacklist)) orelse {
+                try ctx.out.flush();
+                try ctx.err.print(
+                    "mox commit: no ungated data/packages file declares backend \"{s}\"; a blacklist holds on every machine, so it needs a file with no top-level \"when\"\n",
+                    .{b.backend},
+                );
+                try ctx.err.flush();
+                res.skipped += 1;
+                continue;
+            };
             // The file's own default already names the backend; repeating it
             // on the row would be a second spelling of one fact.
-            const needs_backend = target.default_backend == null or
-                !std.mem.eql(u8, target.default_backend.?, b.backend);
-            const array: mox.packages.write.Array = if (chosen == 0) .packages else .blacklist;
+            const needs_backend = dest.default_backend == null or
+                !std.mem.eql(u8, dest.default_backend.?, b.backend);
             const block = try mox.packages.write.render(
                 ctx.alloc,
                 array,
                 decl,
                 if (needs_backend) b.backend else null,
             );
-            try mox.packages.write.append(ctx.alloc, ctx.io, target.path, block);
-            const layer: []const u8 = if (target.private) " (private layer)" else "";
+            try mox.packages.write.append(ctx.alloc, ctx.io, dest.path, block);
+            const layer: []const u8 = if (dest.private) " (private layer)" else "";
             if (chosen == 0) {
                 res.added += 1;
-                try ctx.out.print("  recorded in {s}{s}\n", .{ target.label, layer });
+                try ctx.out.print("  recorded in {s}{s}\n", .{ dest.label, layer });
             } else {
                 res.blacklisted += 1;
-                try ctx.out.print("  blacklisted in {s}{s}\n", .{ target.label, layer });
+                try ctx.out.print("  blacklisted in {s}{s}\n", .{ dest.label, layer });
             }
         }
     }

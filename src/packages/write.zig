@@ -36,29 +36,40 @@ pub const Array = enum {
 
 pub const Error = error{ NoManifestFileForBackend, TooManySymlinkHops };
 
-/// The file a row for `backend` belongs in. Every repo file is preferred over
-/// every private one -- a package belongs in the shared manifest unless the
-/// user says otherwise -- and within a layer, one whose own default backend
-/// matches before one that merely carries a row for it. Basename order breaks
-/// ties so the same machine always picks the same file. A file whose own
-/// `when` does not hold on this machine is never the target: a row recorded
-/// there would not be desired on the machine that just recorded it.
-pub fn targetFor(arena: std.mem.Allocator, m: Manifest, backend: []const u8, r: *const Resolver) !?Source {
+/// The file a row of `array` for `backend` belongs in. Every repo file is
+/// preferred over every private one -- a package belongs in the shared
+/// manifest unless the user says otherwise -- and within a layer, one whose
+/// own default backend matches before one that merely carries a row for it.
+/// Basename order breaks ties so the same machine always picks the same file.
+pub fn targetFor(arena: std.mem.Allocator, m: Manifest, backend: []const u8, r: *const Resolver, array: Array) !?Source {
     for ([_]bool{ false, true }) |private| {
         for (m.sources) |src| {
             if (src.private != private) continue;
-            if (!try gateHolds(arena, src, r)) continue;
+            if (!try eligible(arena, src, r, array)) continue;
             if (src.default_backend) |d| {
                 if (std.mem.eql(u8, d, backend)) return src;
             }
         }
         for (m.sources) |src| {
             if (src.private != private) continue;
-            if (!try gateHolds(arena, src, r)) continue;
+            if (!try eligible(arena, src, r, array)) continue;
             if (carriesRow(m, src, backend)) return src;
         }
     }
     return null;
+}
+
+/// Whether a row of `array` may be written into `src` on this machine. A
+/// package row belongs only in a file whose gate holds here: one recorded
+/// elsewhere would not be wanted on the machine that just recorded it. A
+/// blacklist holds regardless of which machine asks, so its file carries no
+/// gate at all -- `manifest.load` refuses one that does, which would make the
+/// row mox just wrote refuse the whole manifest on the next command.
+fn eligible(arena: std.mem.Allocator, src: Source, r: *const Resolver, array: Array) !bool {
+    return switch (array) {
+        .packages => try gateHolds(arena, src, r),
+        .blacklist => src.when == null,
+    };
 }
 
 /// A file with no `when` is unconditional. `manifest.load` rejected a
@@ -350,7 +361,7 @@ test "targetFor: a file carrying only a blacklist row for the backend speaks it"
             sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
         },
     };
-    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
 }
 
 test "targetFor: prefers a file whose own default names the backend" {
@@ -358,7 +369,7 @@ test "targetFor: prefers a file whose own default names the backend" {
         sourceOf("data/packages/a.toml", "/r/a.toml", "dnf", false),
         sourceOf("data/packages/b.toml", "/r/b.toml", "brew", false),
     } };
-    try testing.expectEqualStrings("/r/b.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
+    try testing.expectEqualStrings("/r/b.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
 }
 
 test "targetFor: prefers the repo layer over the private one" {
@@ -366,7 +377,7 @@ test "targetFor: prefers the repo layer over the private one" {
         sourceOf("data/packages/local.toml", "/p/local.toml", "brew", true),
         sourceOf("data/packages/darwin.toml", "/r/darwin.toml", "brew", false),
     } };
-    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
 }
 
 test "targetFor: a repo file merely carrying a row beats a private file declaring the default" {
@@ -386,7 +397,7 @@ test "targetFor: a repo file merely carrying a row beats a private file declarin
             sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
         },
     };
-    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
 }
 
 test "targetFor: falls back to a file already carrying a row for the backend" {
@@ -403,12 +414,12 @@ test "targetFor: falls back to a file already carrying a row for the backend" {
         .packages = &.{row},
         .sources = &.{sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false)},
     };
-    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound)).?.path);
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
 }
 
 test "targetFor: no file speaks the backend" {
     const m: Manifest = .{ .sources = &.{sourceOf("data/packages/a.toml", "/r/a.toml", "dnf", false)} };
-    try testing.expect((try targetFor(testing.allocator, m, "brew", &unbound)) == null);
+    try testing.expect((try targetFor(testing.allocator, m, "brew", &unbound, .packages)) == null);
 }
 
 test "targetFor: a file whose gate excludes this machine is never the target" {
@@ -422,13 +433,13 @@ test "targetFor: a file whose gate excludes this machine is never the target" {
     const excluded: Manifest = .{ .sources = &.{
         gatedSource("data/packages/linux.toml", "/r/linux.toml", "brew", "os=linux"),
     } };
-    try testing.expect((try targetFor(a, excluded, "brew", &r)) == null);
+    try testing.expect((try targetFor(a, excluded, "brew", &r, .packages)) == null);
 
     // The same file, gated to this machine, is the target as before.
     const included: Manifest = .{ .sources = &.{
         gatedSource("data/packages/darwin.toml", "/r/darwin.toml", "brew", "os=darwin"),
     } };
-    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, included, "brew", &r)).?.path);
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, included, "brew", &r, .packages)).?.path);
 }
 
 test "targetFor: an excluded file is passed over for one that holds here" {
@@ -444,7 +455,33 @@ test "targetFor: an excluded file is passed over for one that holds here" {
         gatedSource("data/packages/a.toml", "/r/a.toml", "brew", "os=linux"),
         sourceOf("data/packages/b.toml", "/r/b.toml", "brew", false),
     } };
-    try testing.expectEqualStrings("/r/b.toml", (try targetFor(a, m, "brew", &r)).?.path);
+    try testing.expectEqualStrings("/r/b.toml", (try targetFor(a, m, "brew", &r, .packages)).?.path);
+}
+
+test "targetFor: a blacklist row never goes in a gated file, which would refuse the manifest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // The gate holds here, so a package row belongs in it; a blacklist row
+    // in the same file is what `manifest.load` refuses.
+    const only_gated: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/darwin.toml", "/r/darwin.toml", "brew", "os=darwin"),
+    } };
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, only_gated, "brew", &r, .packages)).?.path);
+    try testing.expect((try targetFor(a, only_gated, "brew", &r, .blacklist)) == null);
+
+    // With an ungated file beside it, the blacklist row goes there and the
+    // package row still prefers the gated one's own default.
+    const both: Manifest = .{ .sources = &.{
+        gatedSource("data/packages/darwin.toml", "/r/darwin.toml", "brew", "os=darwin"),
+        sourceOf("data/packages/shared.toml", "/r/shared.toml", "brew", false),
+    } };
+    try testing.expectEqualStrings("/r/darwin.toml", (try targetFor(a, both, "brew", &r, .packages)).?.path);
+    try testing.expectEqualStrings("/r/shared.toml", (try targetFor(a, both, "brew", &r, .blacklist)).?.path);
 }
 
 test "render: DEL is escaped, as a TOML basic string requires" {
