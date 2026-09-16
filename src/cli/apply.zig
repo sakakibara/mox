@@ -889,7 +889,7 @@ fn bootstrapBackends(
             installer_name,
             .{ .url = b.url, .sha256 = b.sha256 },
         ) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.captureTimeoutMs(), "MOX_SCRIPT_TIMEOUT_MS") });
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.captureTimeoutMs(), "MOX_SCRIPT_TIMEOUT_MS", pkg_backends.captureTimeoutMs()) });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);
@@ -899,7 +899,7 @@ fn bootstrapBackends(
         // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS") });
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()) });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);
@@ -1147,7 +1147,7 @@ fn applyPackages(
         backend.install(ctx.alloc, rows.items) catch |e| {
             try ctx.err.print(
                 "mox apply: {s}: install failed: {s}\n",
-                .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS") },
+                .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()) },
             );
             try ctx.err.flush();
             counts.failed += 1;

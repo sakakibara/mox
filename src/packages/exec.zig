@@ -145,13 +145,6 @@ pub fn checkTimedOut(res: Result) error{TimedOut}!void {
     if (res.timed_out) return error.TimedOut;
 }
 
-/// What a call's failure is, in words rather than an error name. A stop and
-/// a kill are the two the user can do something about -- give the run a
-/// terminal, or raise the bound -- and both reach here as a bare error that
-/// says neither. `bound_ms` and `bound_var` are the bound that call actually
-/// ran under: a download is captured and bounded like a setup script, while
-/// the installer run it feeds is streamed and bounded as an install.
-/// Anything else keeps its name.
 /// A call's failure in words where words exist, and its error name where they
 /// do not. Reached from every report of a verb that did not answer, so one
 /// failure never reads two ways.
@@ -163,16 +156,33 @@ pub fn errorText(e: anyerror) []const u8 {
 }
 
 /// The same, naming the bound for a reader who may want to change it.
-/// `bound_ms` and `bound_var` are what that call actually ran under: a
-/// download is a captured call bounded like a setup script, while the
-/// installer run it feeds is streamed and bounded as an install. A call with
-/// no bound cannot arrive here timed out, since nothing was armed to kill it.
-pub fn failureText(arena: std.mem.Allocator, e: anyerror, bound_ms: i64, bound_var: []const u8) ![]const u8 {
+///
+/// `bound_ms`/`bound_var` are the bound the call site believes it armed: an
+/// install or an installer run is streamed and bounded as an install, while a
+/// download is captured and bounded like a setup script. The call site can be
+/// wrong about it, because an adapter's streamed verb may make a captured
+/// call of its own -- scoop's `install` asks `scoop bucket list` first -- and
+/// that kill escapes wearing the streamed verb's name. When the believed
+/// bound is not armed at all it cannot be the one that fired, so the captured
+/// bound is named instead, which is the only other one there is. With neither
+/// armed nothing could have killed the call, so no bound is named.
+pub fn failureText(
+    arena: std.mem.Allocator,
+    e: anyerror,
+    bound_ms: i64,
+    bound_var: []const u8,
+    capture_ms: i64,
+) ![]const u8 {
     return switch (e) {
         // A plugin's own name for a kill is the same event, so it reads the
         // same: a shipped backend and a plugin must not describe one bound
         // two ways.
-        error.TimedOut, error.PluginTimedOut => try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var }),
+        error.TimedOut, error.PluginTimedOut => if (bound_ms > 0)
+            try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var })
+        else if (capture_ms > 0)
+            try std.fmt.allocPrint(arena, "timed out after {d}ms (MOX_SCRIPT_TIMEOUT_MS), killed", .{capture_ms})
+        else
+            "timed out, killed",
         else => errorText(e),
     };
 }
@@ -297,7 +307,12 @@ const read_step_ms: i64 = 200;
 /// group, which is what still holds the pipe open.
 fn killWhatIsLeft(io: Io, child: *std.process.Child, group: ?std.process.Child.Id) void {
     if (child.id != null) return job.killGroup(io, child);
-    if (group) |id| _ = job.killGroupOf(id);
+    // The child is already reaped, so its pid is no longer mox's to signal:
+    // only the group is addressed, the way `killStragglersOf` does it. The
+    // pipe it left open is mox's, though, and closing it is what `Child.kill`
+    // would have done on the other branch.
+    if (group) |id| job.killStragglersOf(id);
+    job.closePipes(io, child);
 }
 
 /// Runs the argv as a real child process. `env` is the environment mox itself
@@ -504,7 +519,14 @@ pub const Process = struct {
                 signals.release();
                 return e;
             };
-            out = try mr.toOwnedSlice(0);
+            // The last exit from this function that could leave a child
+            // running: `defer signals.restore()` is about to let the group go,
+            // and nothing else would ever end it.
+            out = mr.toOwnedSlice(0) catch |e| {
+                killWhatIsLeft(io, &child, child_group);
+                signals.release();
+                return e;
+            };
         }
 
         // A child the read already found finished has been reaped by that
@@ -1207,6 +1229,60 @@ test "Process: a bound shorter than one look at the child is still kept" {
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(res.timed_out);
     try testing.expect(elapsed_ms < 10_000);
+}
+
+test "failureText: a kill under a bound nobody armed names the bound that was" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A streamed verb can make a captured call of its own -- scoop's install
+    // asks `scoop bucket list` first -- so a kill escapes wearing the streamed
+    // verb's name while the captured bound is what fired. Naming the install
+    // bound there would report `0ms`, which is how no bound at all is spelled,
+    // and send the reader to a variable that changes nothing.
+    try testing.expectEqualStrings(
+        "timed out after 600000ms (MOX_SCRIPT_TIMEOUT_MS), killed",
+        try failureText(a, error.TimedOut, 0, "MOX_INSTALL_TIMEOUT_MS", 600_000),
+    );
+    try testing.expectEqualStrings(
+        "timed out after 30000ms (MOX_INSTALL_TIMEOUT_MS), killed",
+        try failureText(a, error.TimedOut, 30_000, "MOX_INSTALL_TIMEOUT_MS", 600_000),
+    );
+    // With neither armed nothing could have killed it, so no bound is named.
+    try testing.expectEqualStrings(
+        "timed out, killed",
+        try failureText(a, error.TimedOut, 0, "MOX_INSTALL_TIMEOUT_MS", 0),
+    );
+}
+
+test "Process: a bounded call over a reaped child leaves no descriptor behind" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // The shell is reaped between reads while its straggler holds the pipe,
+    // so the call gives up on a child it no longer owns. Closing that pipe is
+    // what the ordinary kill path does through `Child.kill`; this path has to
+    // do it by hand, and one descriptor per call adds up over a status run.
+    const before = openDescriptors();
+    for (0..5) |_| {
+        var p: Process = .{ .io = io, .timeout_ms = 300 };
+        const res = try p.runner().run(a, &.{ "sh", "-c", "sleep 20 & printf ok\n" });
+        try testing.expect(res.timed_out);
+    }
+    try testing.expectEqual(before, openDescriptors());
+}
+
+/// How many descriptors this process holds: a fresh `dup` lands on the lowest
+/// free one, so its number is the count.
+fn openDescriptors() i32 {
+    const fd = std.c.dup(0);
+    if (fd < 0) return 0;
+    _ = std.c.close(fd);
+    return fd;
 }
 
 test "Process: a straggler holding the pipe after the child is reaped is bounded too" {
