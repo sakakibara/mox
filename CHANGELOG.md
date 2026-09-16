@@ -38,8 +38,12 @@ All notable changes to mox are documented here. The format follows
   200 bytes and may carry no control byte. Plugins are handed
   `MOX_PACKAGES_DEPTH`, and a mox reached from inside one discovers no
   plugin and says so, so a plugin that calls mox cannot multiply itself. A
-  dotfile in `scripts/backends/` is ignored, so an empty directory can be
-  kept in git, and a directory named like a plugin says what it is rather
+  file git keeps in a tracked directory -- `.gitkeep`, `.keep`, `.gitignore`,
+  `.gitattributes`, `.editorconfig` -- is not read as a backend, so an empty
+  directory can be kept in git and shell plugins can carry the eol rule that
+  keeps them LF-clean on Windows. Any other name is a backend, so one hidden
+  by a stray dot is refused by name rather than read as a typo from the
+  manifest's side. A directory named like a plugin says what it is rather
   than that no such backend exists.
 - `status` reports each backend's MISSING and UNTRACKED packages, `apply`
   installs the missing and counts a plan's own failures under `--dry-run`

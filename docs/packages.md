@@ -217,6 +217,10 @@ under the backend rather than leaving it to be discovered.
 - **MISSING** -- declared for this machine, not installed.
 - **UNTRACKED** -- installed, declared nowhere in the manifest, not
   blacklisted.
+- **ERROR** -- the manifest itself was refused, so no backend was reached
+  (`ERROR     the manifest was refused; the reason is the mox status:
+  packages: line`). Counted toward the exit code: an empty section would
+  otherwise read as a clean machine.
 - **BROKEN** -- the manager is installed but cannot answer
   (`BROKEN    brew (brew --version exited 1)`). Its rows are neither judged
   nor installed, and a machine in that state is not a clean one: `status`
@@ -310,10 +314,12 @@ POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`.
   as a note under `packages:`, so a MacPorts script in a shared repo neither
   breaks nor silently vanishes on a Windows machine.
 
-A `.gitkeep` or `.keep` is ignored, so an empty `scripts/backends/` can be
-kept in git; any other name is a backend, so one hidden by an accidental dot
-is named rather than silently skipped and then read as a typo from the
-manifest's side. A directory there is an error naming the
+What git keeps in a directory it tracks is ignored -- `.gitkeep`, `.keep`,
+`.gitignore`, `.gitattributes`, `.editorconfig` -- so an empty
+`scripts/backends/` can be version-controlled and shell plugins can carry the
+eol rule that keeps them LF-clean on Windows. Any other name is a backend, so
+one hidden by an accidental dot is named rather than silently skipped and
+then read as a typo from the manifest's side. A directory there is an error naming the
 path, never "no backend named x".
 
 There is no axis gating (`os=darwin/`) and no private-layer shadowing.

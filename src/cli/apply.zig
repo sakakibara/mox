@@ -990,7 +990,7 @@ fn applyPackages(
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
                 try ctx.err.flush();
             } else {
-                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.print("mox apply: packages: {s}\n", .{mox.packages.exec.errorText(e)});
                 try ctx.err.flush();
             }
             return .{ .in_use = true, .failed = 1 };
@@ -1017,7 +1017,7 @@ fn applyPackages(
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
                 try ctx.err.flush();
             } else {
-                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.print("mox apply: packages: {s}\n", .{mox.packages.exec.errorText(e)});
                 try ctx.err.flush();
             }
             return .{ .in_use = true, .failed = 1 };
@@ -1035,7 +1035,7 @@ fn applyPackages(
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
                 try ctx.err.flush();
             } else {
-                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.print("mox apply: packages: {s}\n", .{mox.packages.exec.errorText(e)});
                 try ctx.err.flush();
             }
             return .{ .in_use = true, .failed = 1 };
@@ -1064,7 +1064,7 @@ fn applyPackages(
             const backend = registry.find(b.backend).?;
             if (backend.inert) continue;
             const present = backend.available(ctx.alloc) catch |e| {
-                try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
+                try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, mox.packages.exec.errorText(e) });
                 try ctx.err.flush();
                 bootstrap_failed += 1;
                 continue;
@@ -1098,7 +1098,7 @@ fn applyPackages(
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
                 try ctx.err.flush();
             } else {
-                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.print("mox apply: packages: {s}\n", .{mox.packages.exec.errorText(e)});
                 try ctx.err.flush();
             }
             return .{ .in_use = true, .failed = 1 };

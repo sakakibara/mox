@@ -43,8 +43,8 @@ pub const Found = struct {
 };
 
 /// Every plugin under `<repo>/scripts/backends`, name-ordered. A missing
-/// directory is no plugins, and so is a `.gitkeep` or `.keep` inside it (which
-/// is how an empty one is version-controlled). A name outside `[A-Za-z0-9_-]`
+/// directory is no plugins, and so is anything git keeps in a directory it
+/// tracks (`isKeepFile`), which is how an empty one is version-controlled. A name outside `[A-Za-z0-9_-]`
 /// or, on a permission-bearing filesystem, a file without its executable bit
 /// is an error naming the path: a forgotten `chmod +x` must not read as "no
 /// such backend" from the manifest's side.
@@ -66,7 +66,8 @@ pub fn discover(
     for (entries) |e| {
         if (e.kind != .file and e.kind != .sym_link and e.kind != .directory) continue;
         if (junk.isJunk(e.name)) continue;
-        // Only the two placeholders are skipped, never every dotfile: a
+        // Only what git keeps in a tracked directory is skipped, never every
+        // dotfile: a
         // `.macports` hidden by an editor or by accident must say what it is,
         // as a `macports/` directory does below, rather than be dropped here
         // and reported from the manifest's side as no such backend.

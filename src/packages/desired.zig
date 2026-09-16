@@ -18,6 +18,7 @@ const axis = @import("../dsl/axis.zig");
 const resolver_mod = @import("../dsl/resolver.zig");
 const backend_mod = @import("backend.zig");
 const manifest_mod = @import("manifest.zig");
+const exec = @import("exec.zig");
 
 pub const Resolver = resolver_mod.Resolver;
 pub const Registry = backend_mod.Registry;
@@ -48,7 +49,7 @@ pub fn select(
         if (!try gateHolds(arena, row, r)) continue;
 
         const id = b.idOf(arena, row) catch |e| {
-            if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, exec.errorText(e) });
             return e;
         };
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ row.backend, id });
