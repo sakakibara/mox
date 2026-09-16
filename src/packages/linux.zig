@@ -84,14 +84,10 @@ pub const Distro = struct {
         .declare = declareImpl,
     };
 
-    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Distro = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ self.manager.exe(), "--version" }) catch |e| switch (e) {
-            error.FileNotFound => return false,
-            else => return e,
-        };
-        try exec.checkTimedOut(res);
-        return res.ok;
+        const exe = self.manager.exe();
+        return Backend.probeAvailability(exe, self.runner.run(arena, &.{ exe, "--version" }));
     }
 
     /// These managers take no row keys of their own. Refusing an unknown
@@ -359,14 +355,31 @@ test "available: absent means not usable, any other failure propagates" {
         .entries = &.{.{ .argv = "dnf --version", .fail = error.FileNotFound }},
     };
     var d1: Distro = .{ .manager = .dnf, .runner = missing.runner() };
-    try testing.expect(!try d1.backend().available(a));
+    try testing.expect((try d1.backend().available(a)) == .absent);
 
-    var broken: exec.Fake = .{
+    var denied: exec.Fake = .{
         .arena = a,
         .entries = &.{.{ .argv = "dnf --version", .fail = error.AccessDenied }},
     };
-    var d2: Distro = .{ .manager = .dnf, .runner = broken.runner() };
+    var d2: Distro = .{ .manager = .dnf, .runner = denied.runner() };
     try testing.expectError(error.AccessDenied, d2.backend().available(a));
+
+    var present: exec.Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "apt-get --version", .stdout = "apt 2.6\n" }},
+    };
+    var d3: Distro = .{ .manager = .apt, .runner = present.runner() };
+    try testing.expect((try d3.backend().available(a)) == .present);
+
+    // There, but its own version query fails: broken, naming the executable.
+    var broken: exec.Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "apt-get --version", .code = 100 }},
+    };
+    var d4: Distro = .{ .manager = .apt, .runner = broken.runner() };
+    const got = try d4.backend().available(a);
+    try testing.expectEqual(@as(u8, 100), got.broken.code);
+    try testing.expectEqualStrings("apt-get", got.broken.argv0);
 }
 
 test "declare: an observed name round-trips to a bare row" {

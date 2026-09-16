@@ -95,17 +95,9 @@ pub const Brew = struct {
         return bootstrap_mod.Error.BootstrapFailed;
     }
 
-    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Brew = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ self.exe, "--version" }) catch |e| switch (e) {
-            // Absent is the one failure that means "not usable here"; an
-            // allocation or spawn failure must not read as a missing brew and
-            // silently make every brew row inert.
-            error.FileNotFound => return false,
-            else => return e,
-        };
-        try exec.checkTimedOut(res);
-        return res.ok;
+        return Backend.probeAvailability(self.exe, self.runner.run(arena, &.{ self.exe, "--version" }));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
@@ -391,7 +383,7 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     try testing.expectError(error.BrewQueryFailed, be.installedExplicit(a));
 }
 
-test "available: true when brew answers, false when it is absent" {
+test "available: present when brew answers, absent when it is not there" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -401,14 +393,31 @@ test "available: true when brew answers, false when it is absent" {
         .entries = &.{.{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" }},
     };
     var ok_brew: Brew = .{ .runner = ok_fake.runner() };
-    try testing.expect(try ok_brew.backend().available(a));
+    try testing.expect((try ok_brew.backend().available(a)) == .present);
 
     var missing: exec.Fake = .{
         .arena = a,
         .entries = &.{.{ .argv = "brew --version", .fail = error.FileNotFound }},
     };
     var missing_brew: Brew = .{ .runner = missing.runner() };
-    try testing.expect(!try missing_brew.backend().available(a));
+    try testing.expect((try missing_brew.backend().available(a)) == .absent);
+}
+
+test "available: a brew that is there but cannot answer is broken, not absent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Reading this as "brew is missing" would make every brew row inert
+    // with no diagnostic anywhere.
+    var fake: exec.Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "/opt/homebrew/bin/brew --version", .code = 1 }},
+    };
+    var b: Brew = .{ .runner = fake.runner(), .exe = "/opt/homebrew/bin/brew" };
+    const got = try b.backend().available(a);
+    try testing.expectEqual(@as(u8, 1), got.broken.code);
+    try testing.expectEqualStrings("/opt/homebrew/bin/brew", got.broken.argv0);
 }
 
 test "available: a failure other than an absent brew is not reported as absent" {
@@ -416,14 +425,19 @@ test "available: a failure other than an absent brew is not reported as absent" 
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Reading this as "brew is missing" would make every brew row inert with
-    // no diagnostic anywhere.
     var broken: exec.Fake = .{
         .arena = a,
         .entries = &.{.{ .argv = "brew --version", .fail = error.AccessDenied }},
     };
     var b: Brew = .{ .runner = broken.runner() };
     try testing.expectError(error.AccessDenied, b.backend().available(a));
+
+    var hung: exec.Fake = .{
+        .arena = a,
+        .entries = &.{.{ .argv = "brew --version", .timed_out = true }},
+    };
+    var h: Brew = .{ .runner = hung.runner() };
+    try testing.expectError(error.TimedOut, h.backend().available(a));
 }
 
 test "kindOf: a value validate would refuse is an error, not a formula" {

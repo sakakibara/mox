@@ -692,6 +692,81 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
+test "status: an absent manager apply would bootstrap is not a clean machine" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    // brew is absent and nothing else is usable; no list is scripted, so a
+    // query of the absent manager would fail the run with a different error.
+    const fake = try noManagers(a);
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      brew: absent; apply will bootstrap it\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   brew ripgrep\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "no declared manager is usable") == null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        j.out,
+        "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"ripgrep\",\"name\":\"ripgrep\"}",
+    ) != null);
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+}
+
+test "status: no usable manager is said, and a broken one is named rather than read as absent" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    // brew is there, but its own version query fails.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .code = 1 });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      brew: `brew --version` exited 1; treated as absent\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no declared manager is usable on this machine\n") != null);
+    try std.testing.expect(!fake.called("brew list --full-name --installed-on-request"));
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // Machine formats keep stdout pure and put the notes on stderr.
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "note") == null);
+    try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: brew: `brew --version` exited 1; treated as absent\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: no declared manager is usable on this machine\n") != null);
+}
+
 test "bootstrap: a manager already present is left alone" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1011,6 +1086,53 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping   brew") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "apply: a gate on a tool a pre-script published holds for the packages of the same run" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+    try installPlugin(io, h, a);
+
+    // The pre stage installs a tool and publishes its directory; a row
+    // gated on that tool must be installed by this same apply, not the next.
+    const pre_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "pre" });
+    try Io.Dir.cwd().createDirPath(io, pre_dir);
+    const pre = try std.fs.path.join(a, &.{ pre_dir, "00-tool.sh" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = pre, .data =
+        \\#!/bin/sh
+        \\set -eu
+        \\mkdir -p "$MOX_STATE_DIR/tools"
+        \\printf '#!/bin/sh\n' > "$MOX_STATE_DIR/tools/zzfoo"
+        \\chmod +x "$MOX_STATE_DIR/tools/zzfoo"
+        \\printf '%s\n' "$MOX_STATE_DIR/tools" >> "$MOX_PATH"
+        \\
+    });
+    try Io.Dir.cwd().setFilePermissions(io, pre, Io.File.Permissions.fromMode(0o755), .{});
+    try writeManifest(io, h, a, "ports.toml",
+        \\backend = "fakeports"
+        \\
+        \\[[packages]]
+        \\name = "plain"
+        \\
+        \\[[packages]]
+        \\name = "needs-foo"
+        \\when = "tool=zzfoo"
+        \\
+    );
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "installing      fakeports needs-foo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 

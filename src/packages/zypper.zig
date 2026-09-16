@@ -58,14 +58,9 @@ pub const Zypper = struct {
         .declare = declareImpl,
     };
 
-    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ "zypper", "--version" }) catch |e| switch (e) {
-            error.FileNotFound => return false,
-            else => return e,
-        };
-        try exec.checkTimedOut(res);
-        return res.ok;
+        return Backend.probeAvailability("zypper", self.runner.run(arena, &.{ "zypper", "--version" }));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {

@@ -40,9 +40,10 @@ no() { printf '  FAIL %s\n      %s\n' "$1" "$2"; fails=$((fails + 1)); }
 # so "this host could not run it" can never read as "this backend is fine".
 skip() { printf '  SKIP %s\n      %s\n' "$1" "$2"; skips=$((skips + 1)); }
 
+# A skip is never a pass: a host without docker has not run the gate.
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker not found; skipping (this suite is the real-manager gate)" >&2
-  exit 0
+  exit 2
 fi
 
 # The container's platform, so the binary that runs inside it is the one the

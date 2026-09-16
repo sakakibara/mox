@@ -78,15 +78,22 @@ when = "os=darwin"
 ```
 
 `backend` may come from the file default and `when` from the file gate, as
-for any row. `mox apply` runs it only when the row's gate holds and the
-backend's `available` says the manager is absent: the file is fetched,
-refused unless it hashes to the declared sha256, handed to the backend, and
-deleted afterwards whether the bootstrap succeeded or not. brew and scoop know how to run their installers and
-where the result lands, so the same apply installs packages through the
-manager it just put in place; a plugin runs `bootstrap <path>` itself and
-reports the directory to put on PATH. An installer over 64 MiB is refused.
-`--dry-run` fetches nothing and plans as though the bootstrap had happened,
-so what it lists is what the real run would install.
+for any row, and is checked the same way: a row for a manager that ships
+with its OS (apt, dnf, pacman, zypper, winget) is refused on every machine,
+since there is no installer to run, and a row for a plugin this machine
+cannot run is left to the machine that can. `mox apply` runs it only when
+the row's gate holds and the backend's `available` says the manager is
+absent: the file is fetched, refused unless it hashes to the declared
+sha256, handed to the backend, and deleted afterwards whether the bootstrap
+succeeded or not. brew and scoop know how to run their installers and where
+the result lands, so the same apply installs packages through the manager
+it just put in place; a plugin runs `bootstrap <path>` itself and reports
+the directory to put on PATH, which must be one absolute existing directory.
+An installer over 64 MiB is refused. `--dry-run` fetches nothing and plans
+as though the bootstrap had happened, so what it lists is what the real run
+would install, and `status` reports the rows of an absent manager that has
+a bootstrap row as MISSING, with a note that apply will bootstrap it, rather
+than as a clean machine.
 
 ## Backends
 
@@ -94,6 +101,13 @@ A backend is **registered** if mox has an adapter for it, and **usable** if
 this machine can run it. A `dnf` row on a mac names a registered adapter that
 is inert here; a row naming `dnff` is a typo and is an error. That
 distinction is what lets one manifest carry every machine's packages.
+
+Usable is decided by a probe (`<manager> --version`). A manager that is not
+there is absent and its rows are inert. One that is there but exits nonzero
+is *broken*: it is treated as absent, and `status` says so under `packages:`
+(`note      brew: `brew --version` exited 1; treated as absent`) rather
+than reporting a clean machine. When no declared manager is usable at all,
+`status` notes `no declared manager is usable on this machine`.
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
@@ -151,9 +165,12 @@ does, and `--json` / `--porcelain` carry both sets (see
 
 ## Installing and reconciling
 
-`mox apply` installs what is missing, after the pre-script stage and before
-its re-capture, so a package installed here is a tool the re-capture sees; a
-declared manager that is absent is bootstrapped first (above). apt, dnf,
+`mox apply` installs what is missing after the pre-script stage, with the
+machine re-read in between when a pre-script ran, so a gate on a tool or
+fact a pre-script provided holds here; the machine is re-read again after
+any install or bootstrap, so a package installed here is a tool the
+post-scripts see. A declared manager that is absent is bootstrapped first
+(above). apt, dnf,
 pacman, zypper and plugins get the whole set for their backend in one
 invocation; brew, scoop and winget install row by row, and a row that fails
 leaves the rest to proceed. The manager's own output is streamed rather
@@ -161,7 +178,12 @@ than captured, so progress and errors reach the terminal as they happen,
 and it may talk to the terminal itself (`sudo` asking for a password; apt
 runs with `DEBIAN_FRONTEND=noninteractive` so debconf does not). A batch
 that failed may have landed some of its rows, so the re-capture runs after
-any attempt, and after a bootstrap alone.
+any attempt, and after a bootstrap alone; the summary then says how many
+rows were in failed batches, since a per-row manager counts only the
+batches it lost. An install is not time-bounded by default -- a manager may
+legitimately compile for an hour -- and `MOX_INSTALL_TIMEOUT_MS` bounds it
+when set: at the bound the manager gets SIGINT first, so it can roll back
+its transaction, and SIGKILL ten seconds later.
 `--dry-run` lists what it would install and installs nothing.
 
 apply **only ever installs**. Removal is never automatic: an untracked
@@ -213,8 +235,9 @@ POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`.
   one that is not is an error naming the file -- never "no such backend". A
   Windows-only kind (`.ps1`, `.exe`, `.cmd`) is *not runnable here*: a note,
   not an error, and a manifest row naming it is inert rather than refused.
-- Windows has no executable bit, so kind decides: `.ps1` runs through pwsh,
-  `.exe` and `.cmd` directly. Any other file is *not runnable here*, printed
+- Windows has no executable bit, so kind decides: `.ps1` runs through
+  `pwsh`, or `powershell` where pwsh is not installed; `.exe` and `.cmd`
+  directly. Any other file is *not runnable here*, printed
   as a note under `packages:`, so a MacPorts script in a shared repo neither
   breaks nor silently vanishes on a Windows machine.
 
@@ -237,7 +260,7 @@ built-in keeps its place, so the rows it validates stay validated.
 | `list` | -- | one id per line: what was explicitly installed | 64: not implemented; other nonzero: failed |
 | `install` | rows, one per line | streamed to the terminal | 64: not implemented; other nonzero: failed |
 | `declare <id>` | -- | a TOML row body: `name = "..."` plus adapter fields | 64: not implemented; other nonzero: failed |
-| `bootstrap <path>` | -- | optionally one line: a directory to put on PATH | 64: not implemented; other nonzero: failed |
+| `bootstrap <path>` | -- | optionally one line: an absolute path to a directory to put on PATH; a second line, or a relative path, is bad output | 64: not implemented; other nonzero: failed |
 | `limitation` | -- | one line on what it cannot see | 64: none; other nonzero: failed |
 
 Rows arrive as TOML inline tables carrying `name` and the row's adapter
@@ -274,11 +297,14 @@ backend.
   its own process group and the kill takes the group, so a helper it left
   holding the pipe (`port ... | awk`) cannot outlive it; a streamed call
   (`install`, `bootstrap`) stays in mox's group so it can use the terminal
-  and Ctrl-C reaches it, and at the bound only the direct process is killed.
-  Windows has no process groups, so there the kill always reaches the direct
-  process only. The shipped backends' own manager calls are bounded the same
-  way, and a probe killed at the bound is a named failure, never "manager
-  absent".
+  and Ctrl-C reaches it; its bound is `MOX_INSTALL_TIMEOUT_MS` (none by
+  default), and at that bound the direct process gets SIGINT, then SIGKILL.
+  A captured verb must never prompt: in its own group a read from the
+  terminal stops it until the bound. Windows has no process groups, so
+  there the kill always reaches the direct process only. The shipped
+  backends' own manager calls are bounded the same way, and a probe killed
+  at the bound is a named failure, never "manager absent"; a manager whose
+  `--version` exits nonzero is treated as absent and said so in a note.
 - Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
   CRLF); an id that is empty, contains whitespace, or exceeds 256 bytes is an
   error naming the plugin. That catches a lost line separator across a large
@@ -288,8 +314,10 @@ backend.
 the backend and `available` says the manager is absent. mox fetches the
 installer and refuses to hand it over unless it hashes to the declared
 sha256; the plugin then runs the verified file however its manager needs.
-Progress goes to stderr; the one line on stdout, if any, is a bin dir mox
-puts on PATH so the same run can use what was just installed.
+Progress goes to stderr; the one line on stdout, if any, is an absolute bin
+dir mox puts on PATH so the same run can use what was just installed. A
+second line, or a relative path, is bad output: progress text must not land
+on PATH.
 
 ### Environment and which commands run a plugin
 
@@ -297,9 +325,10 @@ A plugin runs as you, at the trust `scripts/pre` already has, under the
 same environment a setup script gets: `MOX_REPO`, `MOX_STATE_DIR`,
 `MOX_HOME`, `PATH` and every fact as `MOX_FACT_*`. That holds for `status`
 and `commit` as much as for `apply`; only `apply` refreshes the state bin dir
-on the way. `status` runs `available`, `list`, `id` and `limitation`; `commit` adds
-`declare`; `apply` adds `install` and `bootstrap`; `--dry-run` runs the
-read-only set. `status` lists every discovered plugin by path before it runs
+on the way. `status` runs `available`, `list`, `id` and `limitation`;
+`commit` adds `declare`; `apply` adds `install` and `bootstrap`; `--dry-run`
+runs the read-only set. `status` lists every discovered plugin by path
+before it runs
 anything, as `note` lines in the `packages:` section, or on stderr as
 `mox status: note: ...` under `--json` and `--porcelain`, whose stdout stays
 machine-pure. mox flushes its own output before every call, so those lines

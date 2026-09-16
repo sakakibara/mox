@@ -48,7 +48,7 @@ fn declare(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!backend
     return .{ .name = id };
 }
 
-fn unreachedAvailable(_: *anyopaque, _: std.mem.Allocator) anyerror!bool {
+fn unreachedAvailable(_: *anyopaque, _: std.mem.Allocator) anyerror!Backend.Availability {
     return error.Unreached;
 }
 fn unreachedInstalled(_: *anyopaque, _: std.mem.Allocator) anyerror![]const []const u8 {

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const axis = @import("../dsl/axis.zig");
 const resolver_mod = @import("../dsl/resolver.zig");
 const backend_mod = @import("backend.zig");
 const desired_mod = @import("desired.zig");
@@ -36,6 +37,9 @@ pub const BackendDrift = struct {
 pub const Report = struct {
     in_use: bool = false,
     backends: []const BackendDrift = &.{},
+    /// What the report has to say beyond any one backend's rows: a manager
+    /// that is there but broken, or no usable manager at all.
+    notes: []const []const u8 = &.{},
 
     pub fn clean(self: Report) bool {
         for (self.backends) |b| {
@@ -77,6 +81,12 @@ pub fn gather(
 /// own reasons does not read it twice. `assume_available` names backends to
 /// treat as usable with nothing installed, without asking them: a dry run
 /// planning what a bootstrap it will not perform would then let install.
+///
+/// A backend that is absent but has a `[[bootstrap]]` row whose gate holds
+/// is assumed the same way without being named: `apply` would bootstrap it
+/// and install every row, so a report that called the machine clean would
+/// contradict what apply is about to do. A manager that is there but cannot
+/// answer its probe is treated as absent and said so, never silently.
 pub fn fromManifest(
     arena: std.mem.Allocator,
     m: manifest_mod.Manifest,
@@ -89,6 +99,7 @@ pub fn fromManifest(
 
     try validate_mod.all(arena, m, registry, diag);
 
+    var notes: std.ArrayList([]const u8) = .empty;
     var active: std.ArrayList([]const u8) = .empty;
     var usable: std.ArrayList(Backend) = .empty;
     var assumed: std.ArrayList(Backend) = .empty;
@@ -98,14 +109,30 @@ pub fn fromManifest(
             try assumed.append(arena, b);
             continue;
         }
-        const ok = b.available(arena) catch |e| {
+        const avail = b.available(arena) catch |e| {
             if (diag) |d| d.set("{s}: available failed: {s}", .{ b.name, @errorName(e) });
             return e;
         };
-        if (!ok) continue;
-        try active.append(arena, b.name);
-        try usable.append(arena, b);
+        switch (avail) {
+            .present => {
+                try active.append(arena, b.name);
+                try usable.append(arena, b);
+                continue;
+            },
+            .absent => {},
+            .broken => |why| try notes.append(arena, try std.fmt.allocPrint(
+                arena,
+                "{s}: `{s} --version` exited {d}; treated as absent",
+                .{ b.name, why.argv0, why.code },
+            )),
+        }
+        if (b.inert) continue;
+        if (try willBootstrap(arena, m, b.name, r)) {
+            try active.append(arena, b.name);
+            try assumed.append(arena, b);
+        }
     }
+    if (active.items.len == 0) try notes.append(arena, "no declared manager is usable on this machine");
 
     const rows = try desired_mod.select(arena, m, r, registry, active.items, diag);
 
@@ -117,6 +144,7 @@ pub fn fromManifest(
                 if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, @errorName(e) });
                 return e;
             },
+            .limitation = if (contains(assume_available, b.name)) null else "absent; apply will bootstrap it",
         });
     }
     for (usable.items) |b| {
@@ -146,7 +174,21 @@ pub fn fromManifest(
         });
     }
 
-    return .{ .in_use = true, .backends = try out.toOwnedSlice(arena) };
+    return .{ .in_use = true, .backends = try out.toOwnedSlice(arena), .notes = try notes.toOwnedSlice(arena) };
+}
+
+/// Whether `apply` would bootstrap `backend` here: a `[[bootstrap]]` row
+/// names it and the row's gate holds. A gate that fails to parse is an
+/// error, as it is for a package row: `manifest.load` refused a malformed
+/// one, so what reaches here is an allocation failure.
+fn willBootstrap(arena: std.mem.Allocator, m: manifest_mod.Manifest, backend: []const u8, r: *const Resolver) !bool {
+    for (m.bootstrap) |b| {
+        if (!std.mem.eql(u8, b.backend, backend)) continue;
+        const src = b.when orelse return true;
+        const expr = try axis.parseString(arena, src);
+        if (axis.evaluate(expr, r)) return true;
+    }
+    return false;
 }
 
 fn contains(haystack: []const []const u8, needle: []const u8) bool {
@@ -160,6 +202,7 @@ const testing = std.testing;
 const test_backend = @import("test_backend.zig");
 const exec = @import("exec.zig");
 const brew_mod = @import("brew.zig");
+const plugin_mod = @import("plugin.zig");
 
 fn rowOf(name: []const u8, backend: []const u8) Row {
     return .{
@@ -291,4 +334,153 @@ test "fromManifest: an invalid manifest is refused before anything is queried" {
         validate_mod.Error.UnknownBackend,
         fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, &d),
     );
+}
+
+fn bootstrapRowOf(backend: []const u8, when: ?[]const u8) manifest_mod.BootstrapRow {
+    return .{
+        .backend = backend,
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+        .when = when,
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+}
+
+test "fromManifest: an absent backend apply would bootstrap is assumed, its rows missing, and said so" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // brew is absent and never asked to list anything.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .fail = error.FileNotFound },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{rowOf("ripgrep", "brew")},
+        .bootstrap = &.{bootstrapRowOf("brew", "os=darwin")},
+        .files = 1,
+    };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 1), rep.backends.len);
+    try testing.expectEqualStrings("brew", rep.backends[0].backend);
+    try testing.expectEqualStrings("absent; apply will bootstrap it", rep.backends[0].limitation.?);
+    try testing.expectEqual(@as(usize, 1), rep.missingCount());
+    try testing.expectEqual(@as(usize, 0), rep.untrackedCount());
+    try testing.expect(!rep.clean());
+    try testing.expectEqual(@as(usize, 0), rep.notes.len);
+    try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+}
+
+test "fromManifest: a bootstrap row whose gate excludes this machine assumes nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "linux");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .fail = error.FileNotFound },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{rowOf("ripgrep", "brew")},
+        .bootstrap = &.{bootstrapRowOf("brew", "os=darwin")},
+        .files = 1,
+    };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), rep.backends.len);
+    try testing.expect(rep.clean());
+    try testing.expectEqual(@as(usize, 1), rep.notes.len);
+    try testing.expectEqualStrings("no declared manager is usable on this machine", rep.notes[0]);
+}
+
+test "fromManifest: an inert backend is not assumed for its bootstrap row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var p: plugin_mod.Plugin = .{
+        .name = "scoopish",
+        .argv0 = &.{},
+        .runner = fake.runner(),
+        .alloc = a,
+        .not_runnable = "a windows-only kind; not runnable here",
+    };
+
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{rowOf("7zip", "scoopish")},
+        .bootstrap = &.{bootstrapRowOf("scoopish", null)},
+        .files = 1,
+    };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{p.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), rep.backends.len);
+    try testing.expect(rep.clean());
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "fromManifest: a broken backend is treated as absent and named in a note" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // brew's own version query fails: it is never asked to list.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .code = 1 },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{rowOf("ripgrep", "brew")},
+        .files = 1,
+    };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), rep.backends.len);
+    try testing.expect(rep.clean());
+    try testing.expectEqual(@as(usize, 2), rep.notes.len);
+    try testing.expectEqualStrings("brew: `brew --version` exited 1; treated as absent", rep.notes[0]);
+    try testing.expectEqualStrings("no declared manager is usable on this machine", rep.notes[1]);
+    try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+}
+
+test "fromManifest: a usable backend leaves no note about usability" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
+        .{ .argv = "brew list --full-name --installed-on-request", .stdout = "" },
+        .{ .argv = "brew list --cask --full-name", .stdout = "" },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), rep.notes.len);
+    try testing.expect(rep.backends[0].limitation == null);
 }

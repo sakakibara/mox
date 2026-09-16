@@ -327,6 +327,36 @@ fn applyPass(
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, "scripts/pre", &bindings, &script_env, &contracts, ctx.out, ctx.err);
 
+    // A pre-script may install a tool or create a directory a `data/facts.toml`
+    // row derives a fact from, or publish a directory through $MOX_PATH.
+    // Re-capture so the package gates, the files, and every later script
+    // see the machine as the pre stage left it, not as it began -- the
+    // first-apply staleness the design exists to eliminate. `script_env`/
+    // `contracts` are rebuilt in lockstep: a post-script must see and be
+    // judged against exactly the facts this re-capture just bound, not the
+    // pre-stage's stale projection.
+    var recapture: Recapture = .{
+        .ctx = ctx,
+        .context = context,
+        .discovery = discovery,
+        .derived_rows = derived_rows,
+        .m_state = &m_state,
+        .bindings_map = &bindings_map,
+        .live_ctx = &live_ctx,
+        .script_env = &script_env,
+        .contracts = &contracts,
+        .notified_skipped = &notified_skipped,
+        .notified_mox_bin = &notified_mox_bin,
+        .mox_bin_dir = &mox_bin_dir,
+        .mox_path_file = mox_path_file,
+        .mox_path_reader = &mox_path_reader,
+        .mox_path_dirs = &mox_path_dirs,
+        .refresh_bin = !dry_run,
+    };
+    if (pre_result.ran > 0) {
+        if (!try recapture.run()) return 2;
+    }
+
     // Packages ride the same gate as setup scripts: both mutate the machine
     // beyond its files, and a run that asked for neither (`--skip-scripts`,
     // or a path-scoped apply that names files) installs nothing.
@@ -335,31 +365,14 @@ fn applyPass(
     else
         try applyPackages(ctx, context, &bindings, dry_run, &script_env, &mox_path_dirs);
 
-    // A pre-script may install a tool or create a directory a `data/facts.toml`
-    // row derives a fact from. Re-capture so this same apply composes against
-    // the machine as the bootstrap left it, not as it began -- the
-    // first-apply staleness the design exists to eliminate. `script_env`/
-    // `contracts` are rebuilt in lockstep: a post-script must see and be
-    // judged against exactly the facts this re-capture just bound, not the
-    // pre-stage's stale projection.
     // A failed batch may have landed some of its rows, so the machine is
     // re-read after any attempt, not only after a clean success; a
     // bootstrapped manager changed the machine even with no row to install.
-    if (pre_result.ran > 0 or pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.bootstrapped > 0) {
-        m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 2;
-        // A manager bootstrapped this run lives in a directory the fresh
-        // capture's PATH view does not have: every probe, derived fact and
-        // script after this point must still see it.
-        if (m_state.tool_probe) |tp| tp.extend(mox_path_dirs.items);
-        bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-        live_ctx = m_state.liveResolver(&bindings_map);
-        try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped, &notified_mox_bin, &mox_bin_dir, !dry_run);
-        try script_env.put("MOX_PATH", mox_path_file);
-        try prependPathDirs(ctx, &script_env, mox_path_dirs.items, mox_bin_dir);
+    if (pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.bootstrapped > 0) {
+        if (!try recapture.run()) return 2;
     }
-    // $MOX_PATH additions the pre stage named: fold into this run's probe
-    // search space (on the FRESH state above, if it just recaptured) and
-    // into PATH for every later script and check hook.
+    // $MOX_PATH additions named since the last fold: into this run's probe
+    // search space and into PATH for every later script and check hook.
     try foldMoxPathAdditions(ctx, &mox_path_reader, m_state, &script_env, &mox_path_dirs, mox_bin_dir);
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
@@ -819,9 +832,10 @@ fn bootstrapBackends(
     bindings: *const mox.dsl.resolver.Resolver,
     script_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
-) !struct { bootstrapped: usize, failed: usize } {
+) !struct { bootstrapped: usize, failed: usize, failed_backends: []const []const u8 } {
     var bootstrapped: usize = 0;
     var failed: usize = 0;
+    var failed_names: std.ArrayList([]const u8) = .empty;
     for (m.bootstrap) |b| {
         if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
         const backend = registry.find(b.backend) orelse {
@@ -831,6 +845,7 @@ fn bootstrapBackends(
             );
             try ctx.err.flush();
             failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
         // Not runnable here: the machine that can run it bootstraps it.
@@ -839,9 +854,10 @@ fn bootstrapBackends(
             try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
             try ctx.err.flush();
             failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
-        if (present) continue;
+        if (present == .present) continue;
         if (!backend.canBootstrap()) {
             try ctx.err.print(
                 "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
@@ -849,6 +865,7 @@ fn bootstrapBackends(
             );
             try ctx.err.flush();
             failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
             continue;
         }
 
@@ -865,6 +882,7 @@ fn bootstrapBackends(
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
             try ctx.err.flush();
             failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
         // However the install ends, nothing is left in state that a later
@@ -874,9 +892,17 @@ fn bootstrapBackends(
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
             try ctx.err.flush();
             failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
         if (bin_dir) |dir| {
+            if (!std.fs.path.isAbsolute(dir) or (std.Io.Dir.cwd().access(ctx.io, dir, .{}) catch null) == null) {
+                try ctx.err.print("mox apply: {s}: bootstrap reported a bin dir that is not an absolute existing directory: {s}\n", .{ b.backend, dir });
+                try ctx.err.flush();
+                failed += 1;
+                try failed_names.append(ctx.alloc, b.backend);
+                continue;
+            }
             // On PATH for the probes that follow, and registered with the
             // run's PATH additions so the re-capture that this install
             // triggers folds it back in for the post scripts and check hooks.
@@ -886,7 +912,14 @@ fn bootstrapBackends(
         }
         bootstrapped += 1;
     }
-    return .{ .bootstrapped = bootstrapped, .failed = failed };
+    return .{ .bootstrapped = bootstrapped, .failed = failed, .failed_backends = failed_names.items };
+}
+
+fn bootstrapFailedFor(failed: []const []const u8, backend: []const u8) bool {
+    for (failed) |f| {
+        if (std.mem.eql(u8, f, backend)) return true;
+    }
+    return false;
 }
 
 /// A bootstrap row with no gate is unconditional; one gated to another OS
@@ -1008,11 +1041,13 @@ fn applyPackages(
     // real run would install.
     var bootstrapped: usize = 0;
     var bootstrap_failed: usize = 0;
+    var failed_backends: []const []const u8 = &.{};
     var would_bootstrap: std.ArrayList([]const u8) = .empty;
     if (!dry_run) {
         const done = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, mox_path_dirs);
         bootstrapped = done.bootstrapped;
         bootstrap_failed = done.failed;
+        failed_backends = done.failed_backends;
     } else {
         for (manifest.bootstrap) |b| {
             if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
@@ -1025,7 +1060,7 @@ fn applyPackages(
                 bootstrap_failed += 1;
                 continue;
             };
-            if (present) continue;
+            if (present == .present) continue;
             if (!backend.canBootstrap()) {
                 try ctx.err.print(
                     "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
@@ -1060,6 +1095,7 @@ fn applyPackages(
             return .{ .in_use = true, .failed = 1 };
         },
     };
+    for (rep.notes) |note| try ctx.out.print("  note            {s}\n", .{note});
     var counts: PackageCounts = .{
         .in_use = true,
         .bootstrapped = bootstrapped,
@@ -1069,6 +1105,10 @@ fn applyPackages(
     for (rep.backends) |b| {
         if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
+        // The report assumed this manager would be there; its bootstrap
+        // failed above, which is already the run's failure, and an install
+        // through a manager that is not there would only add noise.
+        if (bootstrapFailedFor(failed_backends, b.backend)) continue;
 
         var rows: std.ArrayList(mox.packages.manifest.Row) = .empty;
         for (b.drift.missing) |m| {
@@ -1172,6 +1212,47 @@ fn refreshScriptStage(
         script_env,
     );
 }
+
+/// Re-read the machine after something changed it mid-run, and rebuild what
+/// depends on that reading: the bindings every gate resolves through, the
+/// scripts' environment and contracts, and the PATH view that carries every
+/// directory published or bootstrapped so far. Returns false when the
+/// capture itself failed (already reported).
+const Recapture = struct {
+    ctx: *app.Ctx,
+    context: app.Context,
+    discovery: mox.machine.dimensions.Discovery,
+    derived_rows: []const mox.machine.derived_facts.DeclaredRow,
+    m_state: *mox.machine.state.MachineState,
+    bindings_map: *std.StringHashMap([]const u8),
+    live_ctx: *mox.dsl.resolver.Resolver.Live,
+    script_env: *std.process.Environ.Map,
+    contracts: *mox.apply.run_scripts.Contracts,
+    notified_skipped: *[]const []const u8,
+    notified_mox_bin: *bool,
+    mox_bin_dir: *?[]const u8,
+    mox_path_file: []const u8,
+    mox_path_reader: *mox.apply.mox_path.Reader,
+    mox_path_dirs: *std.ArrayList([]const u8),
+    refresh_bin: bool,
+
+    fn run(self: *Recapture) !bool {
+        const ctx = self.ctx;
+        self.m_state.* = (try captureOrReport(ctx, self.context.env, self.context.paths.repo_dir, self.context.paths.private_dir)) orelse return false;
+        // Directories published through $MOX_PATH or bootstrapped this run
+        // are on no PATH the fresh capture can see: every probe, derived
+        // fact and script after this point must still see them.
+        const new_dirs = try self.mox_path_reader.readNew(ctx.alloc, ctx.io, ctx.err);
+        try self.mox_path_dirs.appendSlice(ctx.alloc, new_dirs);
+        if (self.m_state.tool_probe) |tp| tp.extend(self.mox_path_dirs.items);
+        self.bindings_map.* = try mox.machine.bindings.fromMachineState(ctx.alloc, self.m_state.*);
+        self.live_ctx.* = self.m_state.liveResolver(self.bindings_map);
+        try refreshScriptStage(ctx, self.context, self.m_state.*, self.discovery, self.derived_rows, self.script_env, self.contracts, self.notified_skipped, self.notified_mox_bin, self.mox_bin_dir, self.refresh_bin);
+        try self.script_env.put("MOX_PATH", self.mox_path_file);
+        try prependPathDirs(ctx, self.script_env, self.mox_path_dirs.items, self.mox_bin_dir.*);
+        return true;
+    }
+};
 
 /// Fold whatever a just-finished stage appended to `$MOX_PATH` into
 /// this run: widen `m_state`'s tool probe so a `tool=` gate sees it for the

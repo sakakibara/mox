@@ -297,7 +297,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const pkgs: Packages = if (a.paths.len == 0) blk: {
             const prep = try preparePackages(ctx, context, m_state);
             for (prep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
-            break :blk try reportPackages(ctx, prep, &bindings);
+            const reported = try reportPackages(ctx, prep, &bindings);
+            for (reported.report.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+            break :blk reported;
         } else .{};
         problems += pkgs.problems();
         if (a.json)
@@ -464,6 +466,9 @@ fn printPackages(
 
     const pkgs = try reportPackages(ctx, prep, bindings);
     const rep = pkgs.report;
+    // What no one backend's rows can say: a manager that is there but
+    // broken, or no usable manager at all.
+    for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.

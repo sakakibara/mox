@@ -6,6 +6,12 @@ All notable changes to mox are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The timeout watchdog for setup scripts and check hooks runs on its own
+  thread. On a host with one CPU it could run inline, sleeping out the
+  whole bound before the wait began and then reporting every script as
+  timed out.
+
 ### Added
 - Packages. A `data/packages/*.toml` manifest of `[[packages]]` rows (core
   keys `name`, `backend`, `when`; every other key belongs to the backend,
@@ -47,9 +53,16 @@ All notable changes to mox are documented here. The format follows
   killed (Windows has no groups, so the direct process always), and a kill
   is reported as a timeout naming the backend. Under `--json` and
   `--porcelain`, plugin notes go to stderr and stdout stays machine-pure.
-  The timeout watchdog for setup scripts and check hooks now runs on its
-  own thread; before, on a host with one CPU it could run inline and hold
-  every script for its whole bound.
+  A streamed install is not bounded unless `MOX_INSTALL_TIMEOUT_MS` is set;
+  at that bound the manager gets SIGINT before SIGKILL. `--skip-scripts`
+  and a path-scoped `apply`, `commit` or `status` reach no package. `status`
+  reports the rows of an absent manager that has a bootstrap row as missing
+  and notes that apply will bootstrap it; a manager whose `--version` fails
+  is treated as absent and noted. `mox --help` names `MOX_SCRIPT_TIMEOUT_MS`
+  and `MOX_INSTALL_TIMEOUT_MS`; a bad value warns as `mox: ...` rather than
+  `mox apply: ...`, since every command reads it. Diagnostics hold 1 KiB
+  instead of 200 bytes and end a message that still does not fit with `...`
+  instead of cutting it silently.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;

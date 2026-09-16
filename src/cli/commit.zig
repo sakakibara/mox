@@ -496,6 +496,7 @@ fn reconcilePackages(
             return .{ .broken = true };
         },
     };
+    for (rep.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
 
     var res: PackageReconcile = .{};
     const choices = [_]prompt.Choice{
@@ -563,10 +564,14 @@ fn reconcilePackages(
             const decl = backend.declare(ctx.alloc, id) catch |e| switch (e) {
                 error.OutOfMemory => return e,
                 else => {
+                    // In program order on the terminal: the reason before
+                    // the summary that counts this as skipped.
+                    try ctx.out.flush();
                     try ctx.err.print(
                         "mox commit: {s} {s}: declare failed: {s}; record the row by hand\n",
                         .{ b.backend, id, @errorName(e) },
                     );
+                    try ctx.err.flush();
                     res.skipped += 1;
                     continue;
                 },

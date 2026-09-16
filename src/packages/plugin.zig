@@ -29,6 +29,7 @@
 //! verb: a `declare` that quietly became `name = <id>` would write wrong rows.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const toml = @import("toml");
 
 const backend_mod = @import("backend.zig");
@@ -112,12 +113,18 @@ pub const Plugin = struct {
         return out.toOwnedSlice(arena);
     }
 
+    /// The one place a verb is spawned. A `.ps1` plugin's argv0 names
+    /// `pwsh`, and `invoke` finds the PowerShell this machine has.
+    fn call(self: *const Plugin, arena: std.mem.Allocator, verb: []const u8, extra: []const []const u8, stdin: []const u8, streamed: bool) anyerror!exec.Result {
+        return self.runner.invoke(arena, try self.argv(arena, verb, extra), stdin, streamed);
+    }
+
     /// The optional `limitation` verb. Exit 64 is "none"; a failure is a
     /// failure. Asked only of a usable backend, after the report has named
     /// every plugin, so nothing runs before it is listed.
     fn limitationImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.runInput(arena, try self.argv(arena, "limitation", &.{}), "");
+        const res = try self.call(arena, "limitation", &.{}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return null;
         if (!res.ok) return Error.PluginFailed;
@@ -132,14 +139,14 @@ pub const Plugin = struct {
     /// for the same reason. A spawn failure of the plugin itself is likewise
     /// a broken plugin, not an absent manager: unlike a compiled adapter,
     /// argv[0] here is not the manager.
-    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        if (self.not_runnable != null) return false;
-        const res = try self.runner.runInput(arena, try self.argv(arena, "available", &.{}), "");
+        if (self.not_runnable != null) return .absent;
+        const res = try self.call(arena, "available", &.{}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (res.code > 1) return Error.PluginFailed;
-        return res.ok;
+        return if (res.ok) .present else .absent;
     }
 
     fn validateImpl(ctx: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
@@ -189,7 +196,7 @@ pub const Plugin = struct {
 
     fn idSpawn(self: *Plugin, arena: std.mem.Allocator, line: []const u8) ![]const u8 {
         const input = try std.fmt.allocPrint(arena, "{s}\n", .{line});
-        const res = try self.runner.runInput(arena, try self.argv(arena, "id", &.{}), input);
+        const res = try self.call(arena, "id", &.{}, input, false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         // Exit 1 is the plugin declining the row; anything else is the plugin
@@ -205,7 +212,7 @@ pub const Plugin = struct {
 
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.runInput(arena, try self.argv(arena, "list", &.{}), "");
+        const res = try self.call(arena, "list", &.{}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
@@ -220,7 +227,7 @@ pub const Plugin = struct {
             try input.appendSlice(arena, try write_mod.inlineRow(arena, row.name, row.fields));
             try input.append(arena, '\n');
         }
-        const res = try self.runner.streamInput(arena, try self.argv(arena, "install", &.{}), input.items);
+        const res = try self.call(arena, "install", &.{}, input.items, true);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
@@ -232,7 +239,7 @@ pub const Plugin = struct {
     /// never match its own package.
     fn declareImpl(ctx: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.runInput(arena, try self.argv(arena, "declare", &.{id}), "");
+        const res = try self.call(arena, "declare", &.{id}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
@@ -254,16 +261,32 @@ pub const Plugin = struct {
 
     /// Progress goes to the terminal; the one line on stdout, if any, is a
     /// directory to put on PATH so this same run can use what it installed.
+    /// It must be one line and an absolute path: progress text that leaked
+    /// onto stdout would otherwise land on PATH.
     fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.runInput(arena, try self.argv(arena, "bootstrap", &.{installer_path}), "");
+        const res = try self.call(arena, "bootstrap", &.{installer_path}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
-        const line = firstLine(res.stdout);
-        return if (line.len == 0) null else line;
+        const line = (try onlyLine(res.stdout)) orelse return null;
+        if (!std.fs.path.isAbsolute(line)) return Error.PluginBadOutput;
+        return line;
     }
 };
+
+/// The one non-empty line of `text`, null for none, and bad output for more.
+fn onlyLine(text: []const u8) !?[]const u8 {
+    var found: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (found != null) return Error.PluginBadOutput;
+        found = line;
+    }
+    return found;
+}
 
 /// Split on newline, trim `\r` and surrounding spaces (a PowerShell plugin
 /// emits CRLF), drop blanks, and refuse any id whose shape says the plugin
@@ -371,8 +394,45 @@ test "not runnable: no bootstrap, no limitation, and nothing is ever spawned" {
     try testing.expectError(error.NoBootstrapForBackend, b.bootstrap(a, "/tmp/i"));
     try testing.expectError(Error.PluginNotRunnable, Plugin.bootstrapImpl(&p, a, "/tmp/i"));
     try testing.expect((try b.limitationOf(a)) == null);
-    try testing.expect(!try b.available(a));
+    try testing.expect((try b.available(a)) == .absent);
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "available: exit 0 is present, exit 1 is absent, and neither is broken" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports available", .code = 0, .once = true },
+        .{ .argv = "/r/scripts/backends/macports available", .code = 1, .once = true },
+        .{ .argv = "/r/scripts/backends/macports available", .code = 2 },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expect((try p.backend().available(a)) == .present);
+    try testing.expect((try p.backend().available(a)) == .absent);
+    try testing.expectError(Error.PluginFailed, p.backend().available(a));
+}
+
+test "a .ps1 plugin runs through powershell when pwsh is not there" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const argv0 = try exec.powerShellArgv(a, "pwsh", &.{"C:\\r\\scripts\\backends\\macports.ps1"});
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 available", .fail = error.FileNotFound },
+        .{ .argv = "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 available" },
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 list", .fail = error.FileNotFound },
+        .{ .argv = "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 list", .stdout = "ripgrep\r\n" },
+    } };
+    var p: Plugin = .{ .name = "macports", .argv0 = argv0, .runner = fake.runner(), .alloc = a };
+
+    try testing.expect((try p.backend().available(a)) == .present);
+    const got = try p.backend().installedExplicit(a);
+    try testing.expectEqualStrings("ripgrep", got[0]);
+    try testing.expectEqual(@as(usize, 4), fake.calls.items.len);
+    try testing.expect(fake.called("powershell -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 list"));
 }
 
 test "id: the row goes to stdin as one inline table and the id comes back" {
@@ -519,10 +579,33 @@ test "bootstrap: the line on stdout is the bin dir to put on PATH" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "/opt/local/bin\n" },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = abs_bin ++ "\n" },
     } };
     var p = pluginWith(&fake);
-    try testing.expectEqualStrings("/opt/local/bin", (try p.backend().bootstrap(a, "/tmp/i")).?);
+    try testing.expectEqualStrings(abs_bin, (try p.backend().bootstrap(a, "/tmp/i")).?);
+}
+
+/// A bin dir that is absolute on the host running the test.
+const abs_bin = if (builtin.os.tag == .windows) "C:\\opt\\local\\bin" else "/opt/local/bin";
+
+test "bootstrap: no line is no bin dir, and progress on stdout is bad output" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "\n  \r\n", .once = true },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "installing...\n" ++ abs_bin ++ "\n", .once = true },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = abs_bin ++ "\ndone\n", .once = true },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "opt/local/bin\n", .once = true },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "installed to " ++ abs_bin ++ "\n" },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expect((try p.backend().bootstrap(a, "/tmp/i")) == null);
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
 }
 
 test "limitation: the plugin's one line is carried onto the backend" {

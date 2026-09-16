@@ -179,13 +179,17 @@ first when absent, from its verified installer, and used by this same run.
 apt, dnf, pacman, zypper and plugins get their whole set in one invocation;
 brew, scoop and winget install row by row, and a failed row leaves the rest
 to proceed. Any failure is an error class (rc 2), and a failed batch or a
-bootstrap alone still triggers the re-capture, since the machine changed. apply only ever installs -- an untracked package is
+bootstrap alone still triggers the re-capture, since the machine changed.
+apply only ever installs -- an untracked package is
 reported by `mox status` and reconciled by `mox commit`, never uninstalled.
 Under `--dry-run` nothing is fetched or installed and the run lists what
 it would install, planned as though any absent manager had been
 bootstrapped.
 `--skip-scripts` skips packages as it skips scripts (both change the machine
 beyond its files), and a path-scoped apply names files and installs nothing.
+When a pre-script ran, the machine is re-read before packages are planned,
+so a `when` gate on a tool or fact the pre stage provided holds in the same
+run. An install is not time-bounded unless `MOX_INSTALL_TIMEOUT_MS` is set.
 A repo without `data/packages/` never queries a package manager.
 
 apply is non-interactive. It writes every file that is clean or absent
@@ -291,7 +295,8 @@ A repo carrying a `data/packages/` manifest is reconciled before the file
 pass: each untracked package (installed, declared nowhere, not
 blacklisted) is offered `[y/b/s]` -- add a row to the file that declares
 its backend, blacklist it, or skip; skip is the default, so `--yes` records
-nothing and exits 1 while anything stays untracked. A row is appended the moment it is
+nothing and exits 1 while anything stays untracked. A row is appended the
+moment it is
 chosen, so `q` here ends the run before the file pass and says how many
 rows were already recorded (rc 1); `--abort-on-prompt` exits 2 at the
 first package prompt the same way. A backend plugin's `declare` verb runs
@@ -353,7 +358,9 @@ other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 
 A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING` and each
-installed package `UNTRACKED` (declared nowhere and not blacklisted).
+installed package `UNTRACKED` (declared nowhere and not blacklisted). A
+path-scoped `mox status <file>` names files and reports no packages, as a
+path-scoped apply or commit reaches none.
 A repo without that directory is not using the package subsystem, so no
 section prints and no package manager is queried. A repo with plugins under
 `scripts/backends/` has them executed here (their `available`, `list`, `id`

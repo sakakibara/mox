@@ -69,17 +69,17 @@ pub const Scoop = struct {
     };
 
     /// scoop installs itself from a PowerShell script mox has already fetched
-    /// and verified.
+    /// and verified. `-RunAsAdmin` because the installer otherwise refuses an
+    /// elevated shell, which a CI runner is; it changes nothing elsewhere.
     fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.stream(arena, &.{
-            "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", installer_path,
-        });
+        const res = try exec.runPowerShell(self.runner, arena, &.{ installer_path, "-RunAsAdmin" }, null, true);
+        try exec.checkTimedOut(res);
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
         if (self.home.len == 0) return null;
         const shims = try std.fs.path.join(arena, &.{ self.home, "scoop", "shims" });
         const shim = try std.fs.path.join(arena, &.{ shims, "scoop.ps1" });
-        self.argv0 = try arena.dupe([]const u8, &.{ "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", shim });
+        self.argv0 = try exec.powerShellArgv(arena, exec.powershell_hosts[0], &.{shim});
         return shims;
     }
 
@@ -90,14 +90,15 @@ pub const Scoop = struct {
         return out.toOwnedSlice(arena);
     }
 
-    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+    /// Every scoop call goes through `invoke`: once a bootstrap has made
+    /// argv0 a PowerShell script, the host is found by trying.
+    fn call(self: *const Scoop, arena: std.mem.Allocator, rest: []const []const u8, streamed: bool) anyerror!exec.Result {
+        return self.runner.invoke(arena, try self.argv(arena, rest), null, streamed);
+    }
+
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, try self.argv(arena, &.{"--version"})) catch |e| switch (e) {
-            error.FileNotFound => return false,
-            else => return e,
-        };
-        try exec.checkTimedOut(res);
-        return res.ok;
+        return Backend.probeAvailability(self.argv0[0], self.call(arena, &.{"--version"}, false));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
@@ -129,7 +130,7 @@ pub const Scoop = struct {
 
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        const res = try self.runner.run(arena, try self.argv(arena, &.{"export"}));
+        const res = try self.call(arena, &.{"export"}, false);
         try exec.checkTimedOut(res);
         if (!res.ok) return Error.ScoopQueryFailed;
         return appNames(arena, res.stdout);
@@ -144,7 +145,7 @@ pub const Scoop = struct {
             // A bucket must exist before an app in it can resolve, exactly as
             // a brew tap must. Adding one already present is a no-op.
             if (bucketOf(row)) |bucket| {
-                const added = try self.runner.stream(arena, try self.argv(arena, &.{ "bucket", "add", bucket }));
+                const added = try self.call(arena, &.{ "bucket", "add", bucket }, true);
                 try exec.checkTimedOut(added);
                 if (!added.ok) {
                     failed = true;
@@ -155,7 +156,7 @@ pub const Scoop = struct {
                 try std.fmt.allocPrint(arena, "{s}/{s}", .{ bucket, row.name })
             else
                 row.name;
-            const res = try self.runner.stream(arena, try self.argv(arena, &.{ "install", target }));
+            const res = try self.call(arena, &.{ "install", target }, true);
             try exec.checkTimedOut(res);
             if (!res.ok) failed = true;
         }
@@ -218,14 +219,9 @@ pub const Winget = struct {
         .declare = declareImpl,
     };
 
-    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Winget = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ "winget", "--version" }) catch |e| switch (e) {
-            error.FileNotFound => return false,
-            else => return e,
-        };
-        try exec.checkTimedOut(res);
-        return res.ok;
+        return Backend.probeAvailability("winget", self.runner.run(arena, &.{ "winget", "--version" }));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
@@ -271,8 +267,9 @@ pub const Winget = struct {
         // Named per process: a status running beside an apply must not read
         // the other's half-written export as this machine's state.
         const name = try std.fmt.allocPrint(arena, "winget-export-{d}.json", .{exec.processId()});
-        const path = try std.fs.path.join(arena, &.{ self.scratch_dir, name });
-        try Io.Dir.cwd().createDirPath(self.io, self.scratch_dir);
+        const tmp_dir = try exec.scratchTmpDir(arena, self.scratch_dir);
+        const path = try std.fs.path.join(arena, &.{ tmp_dir, name });
+        try Io.Dir.cwd().createDirPath(self.io, tmp_dir);
         // A stale export from an interrupted run would otherwise be read as
         // this machine's current state.
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
@@ -506,7 +503,7 @@ test "winget: the export is staged under a per-process name and removed after" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
     const name = try std.fmt.allocPrint(a, "winget-export-{d}.json", .{exec.processId()});
-    const path = try std.fs.path.join(a, &.{ scratch, name });
+    const path = try std.fs.path.join(a, &.{ scratch, exec.tmp_subdir, name });
     const argv = try std.fmt.allocPrint(a, "winget export -o {s} --accept-source-agreements", .{path});
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
@@ -593,6 +590,77 @@ test "winget: a valid row passes every field" {
         .{ .key = "scope", .value = .{ .string = "user" } },
         .{ .key = "override", .value = .{ .string = "/quiet" } },
     }), null);
+}
+
+test "scoop: the installer runs as a PowerShell script with -RunAsAdmin, and the shim is used after" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const shim = try std.fs.path.join(a, &.{ "C:\\Users\\x", "scoop", "shims", "scoop.ps1" });
+    const shim_export = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} export", .{shim});
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin" },
+        .{ .argv = shim_export, .stdout = scoop_export },
+    } };
+    var s: Scoop = .{ .runner = fake.runner(), .home = "C:\\Users\\x" };
+
+    const shims = (try s.backend().bootstrap(a, "C:\\i.ps1")).?;
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ "C:\\Users\\x", "scoop", "shims" }), shims);
+    try testing.expect(fake.called("pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin"));
+
+    const got = try s.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expect(fake.called(shim_export));
+}
+
+test "scoop: without pwsh, the installer and the shim run through powershell" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const shim = try std.fs.path.join(a, &.{ "C:\\Users\\x", "scoop", "shims", "scoop.ps1" });
+    const pwsh_probe = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} --version", .{shim});
+    const ps_probe = try std.fmt.allocPrint(a, "powershell -NoProfile -ExecutionPolicy Bypass -File {s} --version", .{shim});
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin", .fail = error.FileNotFound },
+        .{ .argv = "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin" },
+        .{ .argv = pwsh_probe, .fail = error.FileNotFound },
+        .{ .argv = ps_probe, .stdout = "v0.5.2\n" },
+    } };
+    var s: Scoop = .{ .runner = fake.runner(), .home = "C:\\Users\\x" };
+
+    _ = try s.backend().bootstrap(a, "C:\\i.ps1");
+    try testing.expect((try s.backend().available(a)) == .present);
+    try testing.expectEqual(@as(usize, 4), fake.calls.items.len);
+    try testing.expect(fake.called("powershell -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin"));
+    try testing.expect(fake.called(ps_probe));
+}
+
+test "available: present, absent and broken on both managers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var sf: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop --version", .stdout = "v0.5.2\n", .once = true },
+        .{ .argv = "scoop --version", .code = 1 },
+    } };
+    var s: Scoop = .{ .runner = sf.runner() };
+    try testing.expect((try s.backend().available(a)) == .present);
+    const sb = try s.backend().available(a);
+    try testing.expectEqual(@as(u8, 1), sb.broken.code);
+    try testing.expectEqualStrings("scoop", sb.broken.argv0);
+
+    var wf: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "winget --version", .fail = error.FileNotFound, .once = true },
+        .{ .argv = "winget --version", .code = 255 },
+    } };
+    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    try testing.expect((try w.backend().available(a)) == .absent);
+    const wb = try w.backend().available(a);
+    try testing.expectEqual(@as(u8, 255), wb.broken.code);
+    try testing.expectEqualStrings("winget", wb.broken.argv0);
 }
 
 test "declare: an observed id round-trips on both managers" {
