@@ -636,23 +636,40 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try writeManifest(io, h, a, "darwin.toml", body);
 
     // brew is absent, so the run must install it before anything else. The
-    // scripted curl writes the installer that the digest above covers.
+    // scripted curl writes the installer that the digest above covers, the
+    // scripted interpreter stands in for running it, and brew answers from
+    // then on (by whichever path the adapter now invokes it).
+    const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
+    const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
-    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = interpreter });
+    try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
+    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew install ripgrep", .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     mox.cli.app.package_runner_override = fake.runner();
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
-    // curl was asked for the declared URL.
+    // curl was asked for the declared URL, under the size cap.
     var fetched = false;
     for (fake.calls.items) |c| {
-        if (std.mem.indexOf(u8, c, "https://example.invalid/install.sh") != null) fetched = true;
+        if (std.mem.startsWith(u8, c, "curl ") and
+            std.mem.indexOf(u8, c, " --max-filesize ") != null and
+            std.mem.endsWith(u8, c, " https://example.invalid/install.sh")) fetched = true;
     }
     try std.testing.expect(fetched);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  brew") != null);
+    // The verified file is what the interpreter ran, and it is gone once the
+    // install has ended.
+    try std.testing.expect(fake.called(interpreter));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
 test "bootstrap: a manager already present is left alone" {
@@ -710,20 +727,29 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
         \\
     );
 
+    // The scripted curl delivers something else entirely.
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = "#!/bin/bash\necho substituted\n", .write_after = "-o", .io = io });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     mox.cli.app.package_runner_override = fake.runner();
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "bootstrap failed") != null);
-    // Nothing was executed: no interpreter was ever invoked on the staged file.
+    var fetched = false;
     for (fake.calls.items) |c| {
+        if (std.mem.startsWith(u8, c, "curl ")) fetched = true;
+        // Nothing was executed: no interpreter was ever invoked on the staged file.
         try std.testing.expect(std.mem.indexOf(u8, c, "/bin/bash") == null);
     }
+    try std.testing.expect(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: BootstrapDigestMismatch") != null);
+    // The substituted file is not left where a later run could find it.
+    const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
 }
 
 /// A real plugin, a POSIX sh script, exercised through the real process
@@ -748,23 +774,68 @@ const fakeports_sh =
     \\
 ;
 
-fn installPlugin(io: Io, h: Harness, a: std.mem.Allocator) !void {
+/// An executable `scripts/backends/<name>` holding `body`.
+fn writePlugin(io: Io, h: Harness, a: std.mem.Allocator, name: []const u8, body: []const u8) !void {
     const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
     try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "fakeports" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = fakeports_sh });
+    const path = try std.fs.path.join(a, &.{ dir, name });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
     try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+}
+
+fn installPlugin(io: Io, h: Harness, a: std.mem.Allocator) !void {
+    try writePlugin(io, h, a, "fakeports", fakeports_sh);
+}
+
+/// A run whose plugins really execute, with every shipped manager stubbed
+/// absent: a directory of `brew`, `apt-get`, ... that each exit 1 leads a
+/// PATH holding only the system tools a plugin's `sh` needs beside them. A
+/// child's argv[0] resolves against the environment of the Io that spawns
+/// it, not the environment the child is handed, so the stubs reach mox
+/// through an Io built around that PATH; the same PATH goes to the child, so
+/// a plugin sees the machine mox saw.
+const Hermetic = struct {
+    threaded: *Io.Threaded,
+    io: Io,
+    /// The PATH entry for `SetupOpts.extra_env`.
+    env: []const testutil.EnvPair,
+
+    fn deinit(self: *Hermetic) void {
+        self.threaded.deinit();
+    }
+};
+
+fn hermetic(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !Hermetic {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const bin = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "bin" });
+    try Io.Dir.cwd().createDirPath(io, bin);
+    for ([_][]const u8{ "brew", "apt-get", "dnf", "pacman", "zypper", "scoop", "winget" }) |name| {
+        const path = try std.fs.path.join(a, &.{ bin, name });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "#!/bin/sh\nexit 1\n" });
+        try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    }
+    const path_value = try std.fmt.allocPrint(a, "{s}:/usr/bin:/bin", .{bin});
+    const entry = try std.fmt.allocPrintSentinel(a, "PATH={s}", .{path_value}, 0);
+    const block = try a.allocSentinel(?[*:0]const u8, 1, null);
+    block[0] = entry.ptr;
+    const environ: std.process.Environ = if (@import("builtin").os.tag == .windows) .empty else .{ .block = .{ .slice = block } };
+    const threaded = try a.create(Io.Threaded);
+    threaded.* = .init(std.testing.allocator, .{ .environ = environ });
+    const env = try a.dupe(testutil.EnvPair, &.{.{ .name = "PATH", .value = path_value }});
+    return .{ .threaded = threaded, .io = threaded.io(), .env = env };
 }
 
 test "plugin: a repo executable is a first-class backend through the whole loop" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
     try installPlugin(io, h, a);
 
     // No runner override: the plugin really runs.
@@ -809,21 +880,21 @@ test "plugin: a repo executable is a first-class backend through the whole loop"
     const after = try readManifest(io, h, a, "ports.toml");
     try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"zed\"\nkind = \"cask\"\n"));
 
-    // Only this backend: with no runner override the host's real brew is
-    // probed too, and whatever it has untracked is not this test's business.
     const s4 = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, s4.out, "UNTRACKED fakeports") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s4.out, "UNTRACKED") == null);
 }
 
 test "plugin: a row the plugin refuses is refused on every machine, in its own words" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
     try installPlugin(io, h, a);
 
     try writeManifest(io, h, a, "ports.toml",
@@ -842,20 +913,18 @@ test "plugin: a row the plugin refuses is refused on every machine, in its own w
 
 test "plugin: a name shadowing a shipped backend is announced, not silent" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
 
     // The same script, named `brew`: it now stands in for the built-in.
-    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
-    try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "brew" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = fakeports_sh });
-    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    try writePlugin(io, h, a, "brew", fakeports_sh);
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
 
     const r = try h.run(&.{ "mox", "status" });
@@ -941,20 +1010,18 @@ test "apply: --skip-scripts and a path-scoped apply install nothing" {
 
 test "plugin: one that crashes on available is a named error, not an inert backend" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
 
     // A syntax error: sh exits 2 before any verb is handled.
-    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
-    try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "broken" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "#!/bin/sh\ncase x in\n" });
-    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    try writePlugin(io, h, a, "broken", "#!/bin/sh\ncase x in\n");
     try writeManifest(io, h, a, "b.toml", "backend = \"broken\"\n\n[[packages]]\nname = \"x\"\n");
 
     // Whichever verb it dies on first, the error names the plugin.
@@ -968,18 +1035,17 @@ test "plugin: one that crashes on available is a named error, not an inert backe
 
 test "commit: a plugin without declare is reported by name, and the run does not crash" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
 
-    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
-    try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "nodeclare" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+    try writePlugin(io, h, a, "nodeclare",
         \\#!/bin/sh
         \\case "${1:-}" in
         \\available) exit 0 ;;
@@ -988,8 +1054,7 @@ test "commit: a plugin without declare is reported by name, and the run does not
         \\*) exit 64 ;;
         \\esac
         \\
-    });
-    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    );
     try writeManifest(io, h, a, "n.toml", "backend = \"nodeclare\"\n");
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
@@ -1080,7 +1145,7 @@ test "plugin: a windows-only kind on unix is an inert backend with a note, not a
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "scripts/backends/scoopish.ps1") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "not runnable") != null);
-    // Neither a typo nor a refusal: its row is simply not this machine's.
+    // Neither a typo nor a refusal: its row is not this machine's.
     try std.testing.expect(std.mem.indexOf(u8, r.err, "refused") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "scoopish:") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
@@ -1089,13 +1154,15 @@ test "plugin: a windows-only kind on unix is an inert backend with a note, not a
 
 test "plugin: finder junk beside a plugin is ignored, not read as an unexecutable backend" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const h = try setup(a, io, &tmp, .{});
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
     try installPlugin(io, h, a);
 
     const junk = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends", ".DS_Store" });
@@ -1189,32 +1256,29 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
 
 test "plugin: one that hangs on available is killed at the bound, and the timeout is named" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
     const h = try setup(a, io, &tmp, .{
-        .extra_env = &.{.{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "200" }},
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "200" } },
     });
 
     // Named `brew` so it shadows the built-in: the first backend probed is
-    // this one, and no real manager on the host is asked anything under the
-    // same short bound. `exec` so the sleeping process is the plugin itself,
-    // and the kill ends it rather than orphaning a sleep holding the pipe.
-    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
-    try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, "brew" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+    // this one. `exec` so the sleeping process is the plugin itself, and the
+    // kill ends it rather than orphaning a sleep holding the pipe.
+    try writePlugin(io, h, a, "brew",
         \\#!/bin/sh
         \\case "${1:-}" in
         \\available) exec sleep 3 ;;
         \\esac
         \\exit 0
         \\
-    });
-    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    );
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
 
     const started = Io.Timestamp.now(io, .awake);
@@ -1247,4 +1311,361 @@ test "commit: a malformed manifest is named, and no manager is asked anything" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "darwin.toml") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+/// Every shipped manager absent, and nothing else scripted: any other call
+/// errors the run.
+fn noManagers(a: std.mem.Allocator) !*mox.packages.exec.Fake {
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    return fake;
+}
+
+/// Every line of a porcelain report is one record -- a kind token and its
+/// tab-separated fields, four for a file and three for a package -- so a
+/// note or heading on stdout would break a consumer's split.
+fn expectPorcelain(out: []const u8) !void {
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(out[out.len - 1] == '\n');
+    var lines = std.mem.splitScalar(u8, out[0 .. out.len - 1], '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const kind = fields.first();
+        var n: usize = 1;
+        while (fields.next()) |_| n += 1;
+        const known = for ([_][]const u8{
+            "whole_file",      "owned_key",         "symlink_target", "generated_set", "vanished",
+            "package_missing", "package_untracked",
+        }) |k| {
+            if (std.mem.eql(u8, k, kind)) break true;
+        } else false;
+        try std.testing.expect(known);
+        const want: usize = if (std.mem.startsWith(u8, kind, "package_")) 3 else 4;
+        try std.testing.expectEqual(want, n);
+    }
+}
+
+test "status --json / --porcelain: a plugin's note goes to stderr, and stdout stays machine-readable" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+    try installPlugin(io, h, a);
+    try writeManifest(io, h, a, "ports.toml", "backend = \"fakeports\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    const note = "mox status: note: backend fakeports: scripts/backends/fakeports\n";
+
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    try std.testing.expect(std.mem.startsWith(u8, j.out, "{"));
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "{\"backend\":\"fakeports\",\"state\":\"missing\",\"id\":\"ripgrep\",\"name\":\"ripgrep\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "note") == null);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "variants are not tracked") == null);
+    try std.testing.expect(std.mem.indexOf(u8, j.err, note) != null);
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try expectPorcelain(p.out);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing\tfakeports\tripgrep\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.err, note) != null);
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+}
+
+test "bootstrap: an installer declared for a plugin this machine cannot run is refused, and nothing is fetched" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "scoopish.ps1" }), .data = "exit 0\n" });
+    try writeManifest(io, h, a, "windows.toml",
+        \\backend = "scoopish"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.ps1"
+        \\sha256 = "00"
+        \\
+        \\[[packages]]
+        \\name = "7zip"
+        \\
+    );
+
+    const refused = "windows.toml: scoopish declares an installer but its backend cannot bootstrap\n";
+
+    // No curl is scripted: a fetch would error the run with a different
+    // message than the refusal asserted here.
+    const fake = try noManagers(a);
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would bootstrap") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would install") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.err, refused) != null);
+    try std.testing.expectEqual(@as(u8, 2), dry.rc);
+
+    const real = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, real.out, "bootstrapping") == null);
+    try std.testing.expect(std.mem.indexOf(u8, real.out, "installing") == null);
+    try std.testing.expect(std.mem.indexOf(u8, real.err, refused) != null);
+    try std.testing.expectEqual(@as(u8, 2), real.rc);
+
+    for (fake.calls.items) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, "curl") == null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "example.invalid") == null);
+    }
+}
+
+test "plugin: a not-runnable twin of a built-in is noted, and the built-in stays in use" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "brew.ps1" }), .data = "exit 0\n" });
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n");
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "note      backend brew: scripts/backends/brew.ps1: a windows-only kind; not runnable here; the built-in stays\n",
+    ) != null);
+    // The built-in answered: the row is neither inert nor missing.
+    try std.testing.expect(fake.called("brew list --full-name --installed-on-request"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "status: an empty data/packages directory opts in, so an installed package is untracked" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.repo, "data", "packages" }));
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "UNTRACKED brew htop") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "status: a data/packages that is a file is named as not a directory, and no manager is asked" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.repo, "data" }));
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ h.repo, "data", "packages" }),
+        .data = "backend = \"brew\"\n",
+    });
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "data/packages: not a directory") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "plugin: a row key outside the bare charset reaches the plugin quoted, as TOML reads it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+
+    // `id` keeps a copy of every row it was handed.
+    try writePlugin(io, h, a, "quoted",
+        \\#!/bin/sh
+        \\seen="$(dirname "$0")/../../.seen"
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) tee -a "$seen" | sed -n 's/.*name = "\([^"]*\)".*/\1/p' ;;
+        \\list) ;;
+        \\*) exit 64 ;;
+        \\esac
+        \\
+    );
+    try writeManifest(io, h, a, "q.toml",
+        \\backend = "quoted"
+        \\
+        \\[[packages]]
+        \\name = "x"
+        \\"my key" = "v"
+        \\
+    );
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "id failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "refused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   quoted x") != null);
+
+    const seen = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ h.repo, ".seen" }), a, .limited(1 << 20));
+    try std.testing.expectEqualStrings("{ name = \"x\", \"my key\" = \"v\" }\n", seen);
+}
+
+test "commit: a file whose only row for the backend is a blacklist entry is where its next row goes" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const original = "[[blacklist]]\nname = \"a\"\nbackend = \"brew\"\n";
+    try writeManifest(io, h, a, "x.toml", original);
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "1 recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend") == null);
+
+    // Appended there, naming the backend the file does not declare.
+    const after = try readManifest(io, h, a, "x.toml");
+    try std.testing.expect(std.mem.startsWith(u8, after, original));
+    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\nbackend = \"brew\"\n"));
+}
+
+test "plugin: a helper left holding the pipe dies with the plugin at the bound" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "1000" } },
+    });
+
+    // `sleep` keeps the pipe's write end after `sh` would have exited; a
+    // kill that reached only `sh` would leave the read blocked for 6s. The
+    // bound leaves room for every stub probed before this plugin: the first
+    // run of a freshly written script is slow on some hosts.
+    try writePlugin(io, h, a, "pipes",
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\list) sleep 6 | cat ;;
+        \\esac
+        \\exit 0
+        \\
+    );
+    try writeManifest(io, h, a, "p.toml", "backend = \"pipes\"\n");
+
+    const started = Io.Timestamp.now(io, .awake);
+    const r = try h.run(&.{ "mox", "status" });
+    const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
+
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "pipes: list failed: PluginTimedOut") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(elapsed_ms < 5000);
+}
+
+/// `Harness.run` with the caller's own writers, for a test that needs mox's
+/// stdout somewhere a child process can read it.
+fn runWith(h: Harness, argv: []const []const u8, out: *Io.Writer, err: *Io.Writer) !u8 {
+    const saved = mox.cli.app.environ_override;
+    mox.cli.app.environ_override = h.env;
+    defer mox.cli.app.environ_override = saved;
+
+    const saved_cwd = mox.cli.app.cwd_override;
+    mox.cli.app.cwd_override = h.home;
+    defer mox.cli.app.cwd_override = saved_cwd;
+
+    return mox.cli.app.run(h.a, h.io, argv, &mox.cli.app.command_table, out, err);
+}
+
+test "status: a plugin's note reaches the terminal before the plugin runs" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+
+    // mox's stdout is a file here, and the plugin's first verb copies what
+    // that file holds at the moment the plugin was spawned.
+    const out_path = try std.fs.path.join(a, &.{ h.root, "mox-stdout.txt" });
+    const copy_path = try std.fs.path.join(a, &.{ h.root, "seen-by-plugin.txt" });
+    try writePlugin(io, h, a, "copier", try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\case "${{1:-}}" in
+        \\available) cat "{s}" > "{s}"; exit 0 ;;
+        \\list) exit 0 ;;
+        \\esac
+        \\exit 64
+        \\
+    , .{ out_path, copy_path }));
+    try writeManifest(io, h, a, "c.toml", "backend = \"copier\"\n");
+
+    const out_file = try Io.Dir.cwd().createFile(io, out_path, .{});
+    defer out_file.close(io);
+    // Wide enough that nothing reaches the file by overflow: only a flush
+    // before the spawn can put the note there.
+    var out_buf: [64 * 1024]u8 = undefined;
+    var out_w = out_file.writer(io, &out_buf);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    const rc = try runWith(h, &.{ "mox", "status" }, &out_w.interface, &err_aw.writer);
+    try out_w.interface.flush();
+    try std.testing.expectEqual(@as(u8, 0), rc);
+
+    const seen = try Io.Dir.cwd().readFileAlloc(io, copy_path, a, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, seen, "note      backend copier: scripts/backends/copier\n") != null);
 }
