@@ -889,7 +889,7 @@ fn bootstrapBackends(
             installer_name,
             .{ .url = b.url, .sha256 = b.sha256 },
         ) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try streamedFailure(ctx.alloc, e, pkg_backends.installTimeoutMs()) });
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.captureTimeoutMs(), "MOX_SCRIPT_TIMEOUT_MS") });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);
@@ -899,7 +899,7 @@ fn bootstrapBackends(
         // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try streamedFailure(ctx.alloc, e, pkg_backends.installTimeoutMs()) });
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS") });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);
@@ -968,21 +968,6 @@ const PackageCounts = struct {
 ///
 /// Only ever installs. An untracked package is reported by `mox status` and
 /// reconciled by `mox commit`; nothing here removes one.
-/// What a streamed call's failure is, in words rather than an error name.
-/// A stop and a kill are the two the user can do something about -- give the
-/// run a terminal, or raise the bound -- and both reach here as a bare error
-/// that says neither. Anything else keeps its name.
-fn streamedFailure(arena: std.mem.Allocator, e: anyerror, bound_ms: i64) ![]const u8 {
-    return switch (e) {
-        error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
-        error.TimedOut => if (bound_ms > 0)
-            try std.fmt.allocPrint(arena, "timed out after {d}ms (MOX_INSTALL_TIMEOUT_MS), killed", .{bound_ms})
-        else
-            "timed out, killed",
-        else => @errorName(e),
-    };
-}
-
 fn applyPackages(
     ctx: *app.Ctx,
     context: app.Context,
@@ -1162,7 +1147,7 @@ fn applyPackages(
         backend.install(ctx.alloc, rows.items) catch |e| {
             try ctx.err.print(
                 "mox apply: {s}: install failed: {s}\n",
-                .{ b.backend, try streamedFailure(ctx.alloc, e, pkg_backends.installTimeoutMs()) },
+                .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS") },
             );
             try ctx.err.flush();
             counts.failed += 1;

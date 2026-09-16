@@ -128,6 +128,12 @@ pub const PackageBackends = struct {
         return self.proc.install_timeout_ms;
     }
 
+    /// The same, for a captured call: a query, and the download half of a
+    /// bootstrap, which is captured rather than streamed.
+    pub fn captureTimeoutMs(self: *const PackageBackends) i64 {
+        return self.proc.timeout_ms;
+    }
+
     pub fn runner(self: *PackageBackends) mox.packages.exec.Runner {
         return package_runner_override orelse self.proc.runner();
     }
@@ -269,7 +275,7 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
         \\  MOX_SNAPSHOT_RETENTION  Snapshots to keep (default: 10)
         \\  MOX_CHECK_TIMEOUT_MS  Wall-clock bound on check hooks in ms (default: 30000; <= 0 disables)
         \\  MOX_SCRIPT_TIMEOUT_MS  Wall-clock bound on setup scripts and every captured package-manager call in ms (default: 600000; <= 0 disables)
-        \\  MOX_INSTALL_TIMEOUT_MS  Wall-clock bound on a package install or bootstrap in ms (default: 0, no bound; interrupted, then killed 10s later)
+        \\  MOX_INSTALL_TIMEOUT_MS  Wall-clock bound on a package install, or a bootstrap's installer run, in ms (default: 0, no bound; interrupted, then killed 10s later). A bootstrap's download is a captured call, bounded by MOX_SCRIPT_TIMEOUT_MS
         \\  MOX_PACKAGES_DEPTH  Set in every backend plugin's environment; any value present makes this run discover no plugin, so one that calls mox cannot recurse
         \\  HOME, USER     Standard POSIX env
         \\
