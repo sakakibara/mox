@@ -51,6 +51,7 @@ const path_mod = @import("../source/path.zig");
 const dimensions = @import("../machine/dimensions.zig");
 const derived_facts = @import("../machine/derived_facts.zig");
 const state = @import("../machine/state.zig");
+const job = @import("../machine/job.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
@@ -58,11 +59,6 @@ const EnvironMap = std.process.Environ.Map;
 
 const ps_pwsh = "pwsh";
 const ps_powershell = "powershell.exe";
-
-const windows = std.os.windows;
-// std has no wrapper for TerminateProcess; declare the one we need to bound a
-// hung script on Windows (the timeout killer's Windows half).
-extern "kernel32" fn TerminateProcess(hProcess: windows.HANDLE, uExitCode: windows.UINT) callconv(.winapi) windows.BOOL;
 
 /// Generous wall-clock bound on a single setup script so a hung pre-script
 /// (waiting on stdin, a lock, or a stalled network call) cannot block apply
@@ -666,30 +662,6 @@ pub fn scriptTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) 
     };
 }
 
-/// Forcibly terminate the child after the timeout elapses (never reaps): the
-/// caller's `child.wait` reaps, so there is no double-wait race. Cross-platform
-/// so a hung script cannot block apply forever on any OS.
-/// A canceled sleep (the script finished first) returns without killing.
-pub fn killAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
-    timeout.sleep(io) catch return;
-    fired.* = true;
-    _ = killProcess(id);
-}
-
-/// Forcibly end the process `id` names. Operates on a COPY of the OS
-/// handle/pid, never the shared Child, so it races safely alongside
-/// `child.wait` (which reaps). POSIX sends SIGKILL; Windows forcibly
-/// terminates via TerminateProcess. Returns whether the kill reached a
-/// process: one already gone is not killed.
-pub fn killProcess(id: std.process.Child.Id) bool {
-    if (builtin.os.tag == .windows) {
-        return TerminateProcess(id, 1).toBool();
-    } else {
-        std.posix.kill(id, .KILL) catch return false;
-        return true;
-    }
-}
-
 /// Wall-clock bound on a partial file's `check` hook. Tighter than the setup-
 /// script default: a checker validates one file and runs on every apply.
 /// Override per-run with MOX_CHECK_TIMEOUT_MS; <= 0 disables it.
@@ -771,6 +743,11 @@ pub fn runCheck(
     timeout_ms: i64,
 ) !CheckResult {
     const exe = try std.fs.path.join(arena, &.{ repo_dir, check_argv[0] });
+    // A checker writes to a file, never to the terminal, so it is never the
+    // foreground group: a terminal signal reaches mox alone, and without this
+    // mox would die leaving the checker running with init for a parent.
+    const signals = job.SpawnSignals.install();
+    defer signals.restore();
     const out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
     var out_open = true;
     defer if (out_open) out_file.close(io);
@@ -789,6 +766,8 @@ pub fn runCheck(
         break :blk try std.process.spawn(io, checkSpawnOpts(try checkArgv(arena, &.{exe}, check_argv[1..]), environ_map, repo_dir, out_file));
     };
 
+    if (child.id) |id| signals.hold(id);
+
     var timed_out = false;
     var killer: ?Io.Future(void) = null;
     if (timeout_ms > 0) {
@@ -801,10 +780,14 @@ pub fn runCheck(
             };
         }
     }
+    // `wait` clears the id as it reaps, so the group to sweep is remembered.
+    const child_group = child.id;
     const term = child.wait(io) catch |e| {
         if (killer) |*k| _ = k.cancel(io);
+        if (child_group) |id| _ = job.killGroupOf(id);
         return e;
     };
+    signals.release();
     if (killer) |*k| _ = k.cancel(io);
 
     out_file.close(io);
@@ -812,6 +795,9 @@ pub fn runCheck(
     const tail = readTail(arena, io, output_path);
 
     if (timed_out) {
+        // The group outlives the reaped leader for as long as a member does;
+        // whatever the checker left running goes with it.
+        if (child_group) |id| _ = job.killGroupOf(id);
         return .{ .refusal = try std.fmt.allocPrint(arena, "timed out after {d}ms, killed", .{timeout_ms}), .tail = tail };
     }
     return switch (term) {
@@ -843,24 +829,14 @@ fn checkSpawnOpts(argv: []const []const u8, environ_map: *const EnvironMap, repo
     return opts;
 }
 
-/// The group-kill counterpart of `killAfter`: same never-reaps contract, but
-/// the signal goes to the child's whole process group (its pgid equals its
-/// pid, set at spawn). Windows terminates the direct child; see `runCheck`.
+/// Bound a child by killing its whole process group (its pgid equals its
+/// pid, set at spawn), so the bound reaches what the script started and not
+/// the script alone. Never reaps: the caller's wait does. A canceled sleep
+/// (the child finished first) returns without killing.
 fn killGroupAfter(io: Io, timeout: Io.Timeout, id: std.process.Child.Id, fired: *bool) void {
     timeout.sleep(io) catch return;
     fired.* = true;
-    killGroupOf(id);
-}
-
-/// Kill a child's whole process group. The group outlives its reaped leader
-/// for as long as any member is in it, so this also reaches what the child
-/// left running after mox has reaped the child itself.
-pub fn killGroupOf(id: std.process.Child.Id) void {
-    if (builtin.os.tag == .windows) {
-        _ = TerminateProcess(id, 1);
-    } else {
-        std.posix.kill(-id, .KILL) catch {};
-    }
+    _ = job.killGroupOf(id);
 }
 
 /// The last `check_tail_bytes` of the file at `path`; empty when unreadable.
@@ -921,6 +897,11 @@ fn runOne(
         }
     }
 
+    // For the length of the run mox answers the terminal signals, so a Ctrl-C
+    // that reaches mox rather than the script takes the script's group with
+    // it instead of orphaning it; `job.SpawnSignals` has the whole rule.
+    const signals = job.SpawnSignals.install();
+    defer signals.restore();
     var child = spawnScript(arena, io, path, environ_map) catch |e| {
         // Every regular file in a scripts stage is spawned, so this is what a
         // script that lost its exec bit AND a stray README.md both look like.
@@ -934,8 +915,18 @@ fn runOne(
         return;
     };
 
+    if (child.id) |id| signals.hold(id);
+
+    // The script inherits mox's stdout and stderr, so it is handed the
+    // terminal for its run the way a shell hands it to a foreground job: a
+    // `sudo` in a pre-script has to be able to prompt, and a background
+    // group that reads the terminal stops on SIGTTIN and waits out the whole
+    // bound instead. Ctrl-C then goes to the script, not to mox.
+    var tty: ?job.Terminal = null;
+    if (child.id) |id| tty = job.Terminal.handTo(id);
+
     // Bound the wait: a background task terminates the child once the timeout
-    // elapses, unblocking child.wait; cancel it if the script finishes first.
+    // elapses, unblocking the wait; cancel it if the script finishes first.
     var timed_out = false;
     var killer: ?Io.Future(void) = null;
     if (timeout_ms > 0) {
@@ -957,21 +948,42 @@ fn runOne(
 
     // `wait` clears the id as it reaps, so the group to sweep is remembered.
     const child_group = child.id;
-    const term = child.wait(io) catch |e| {
+    // Waited on by hand: a script that stops -- Ctrl-Z, or a terminal read
+    // mox has no terminal to answer -- is invisible to a plain wait, which
+    // would then never return.
+    stdout.flush() catch {};
+    stderr.flush() catch {};
+    const term = job.waitFor(io, &child, tty, true) catch |e| {
         if (killer) |*k| _ = k.cancel(io);
-        stderr.print("mox apply: {s}: wait failed: {s}\n", .{ path, @errorName(e) }) catch {};
+        if (tty) |t| t.takeBack();
+        if (child_group) |id| _ = job.killGroupOf(id);
+        if (e == error.StoppedWantingTerminal) {
+            stderr.print("mox apply: {s}: stopped waiting for a terminal this run does not have; killed\n", .{path}) catch {};
+        } else {
+            stderr.print("mox apply: {s}: wait failed: {s}\n", .{ path, @errorName(e) }) catch {};
+        }
         result.failed += 1;
         return;
     };
+    signals.release();
     if (killer) |*k| _ = k.cancel(io);
+    if (tty) |t| t.takeBack();
 
     if (timed_out) {
         // The group outlives the reaped leader for as long as a member
         // does; whatever the script left running goes with it.
-        if (child_group) |id| killGroupOf(id);
+        if (child_group) |id| _ = job.killGroupOf(id);
         result.failed += 1;
         stderr.print("mox apply: {s}: timed out after {d}ms, killed\n", .{ path, timeout_ms }) catch {};
         return;
+    }
+    // A script that died of an interrupt mox did not send was interrupted by
+    // the user at the terminal it held, so the run ends as that Ctrl-C would
+    // have ended mox itself.
+    if (tty != null and term == .signal and term.signal == .INT) {
+        stdout.flush() catch {};
+        stderr.flush() catch {};
+        job.dieOfInterrupt();
     }
     switch (term) {
         .exited => |code| {

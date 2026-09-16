@@ -28,6 +28,25 @@ fn gatedScript(a: std.mem.Allocator, log: []const u8, word: []const u8, when_exp
     return std.fmt.allocPrint(a, "#!/bin/sh\n# mox: when {s}\nprintf '{s}\\n' >> \"{s}\"\n", .{ when_expr, word, log });
 }
 
+/// The process group id a script wrote to `path`.
+fn pidIn(a: std.mem.Allocator, io: Io, path: []const u8) !std.posix.pid_t {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64));
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10);
+}
+
+/// Whether every member of `pgid` is gone within `ms`. A reaped leader keeps
+/// the group id alive for as long as a member holds it, so signal 0 to the
+/// group is the question, asked until it is answered.
+fn groupGone(io: Io, pgid: std.posix.pid_t, ms: i64) bool {
+    const started = Io.Clock.awake.now(io);
+    while (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < ms) {
+        std.posix.kill(-pgid, @enumFromInt(0)) catch return true;
+        const step: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(10), .clock = .awake } };
+        step.sleep(io) catch return false;
+    }
+    return false;
+}
+
 fn writeExecScript(io: Io, dir: Io.Dir, sub: []const u8, content: []const u8, abs_path: []const u8) !void {
     if (std.fs.path.dirname(sub)) |parent| try dir.createDirPath(io, parent);
     try dir.writeFile(io, .{ .sub_path = sub, .data = content });
@@ -2577,6 +2596,85 @@ test "run_scripts: a hung script is terminated at the timeout, not left to block
     // RETURNED rather than blocking for the full 30s sleep.
     try std.testing.expectEqual(@as(usize, 1), result.failed);
     try std.testing.expectEqual(@as(usize, 0), result.ran);
+}
+
+test "run_scripts: a script that stops for a terminal this run cannot give is ended, not waited on" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    // Stops itself the way a `sudo` prompt in a background process group
+    // does when it reads the terminal. The suite has no terminal to hand
+    // over, so nothing can answer it: the wait must end it rather than sit
+    // out the whole bound.
+    try writeExecScript(io, tmp.dir, "scripts/00-stop.sh", "#!/bin/sh\nkill -STOP $$\n", try std.fs.path.join(a, &.{ root, "scripts/00-stop.sh" }));
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home", &.{}, true)).map;
+    // The default bound stays in force: a regression waits it out, and this
+    // assertion is what fails instead of the suite hanging.
+    try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "60000");
+
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const started = Io.Clock.awake.now(io);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+
+    try std.testing.expect(elapsed_ms < 30_000);
+    try std.testing.expectEqual(@as(usize, 0), result.ran);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+    try std.testing.expect(std.mem.indexOf(u8, err_aw.written(), "stopped waiting for a terminal") != null);
+}
+
+test "run_scripts: what a timed-out script left running is killed with it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(io, a), ".zig-cache", "tmp", &state_tmp.sub_path, "state" });
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const pid_file = try std.fs.path.join(a, &.{ root, "pgid" });
+    // The backgrounded sleep is a group member the script does not wait on:
+    // only a kill addressed to the group reaches it. Both sleeps outlast the
+    // bound by far, so a survivor is a real leak and not a race.
+    const body = try std.fmt.allocPrint(a, "#!/bin/sh\necho $$ > {s}\nsleep 300 &\nsleep 300\n", .{pid_file});
+    try writeExecScript(io, tmp.dir, "scripts/00-leaky.sh", body, try std.fs.path.join(a, &.{ root, "scripts/00-leaky.sh" }));
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home", &.{}, true)).map;
+    // Long enough that a loaded machine has certainly forked, exec'd and
+    // written the pid before the bound fires, and a hundredth of the sleeps
+    // it interrupts.
+    try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "3000");
+
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+
+    const pgid = try pidIn(a, io, pid_file);
+    try std.testing.expect(groupGone(io, pgid, 30_000));
 }
 
 test "init --clone: refuses a non-empty repo dir before touching git" {

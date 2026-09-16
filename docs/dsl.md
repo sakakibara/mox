@@ -428,6 +428,16 @@ script then lands in one of six outcomes, each its own printed line:
 | blocked | `mox apply: <path>: blocked: <reason>` (stderr, one line per unresolved fact) | a needed fact could not be resolved -- fails the run under its own summary count, distinct from `failed` |
 | failed | `mox apply: <path>: exit <code>` (stderr) | nonzero exit |
 | failed | `mox apply: <path>: timed out after <ms>ms, killed` / `... terminated abnormally` (stderr) | killed after `MOX_SCRIPT_TIMEOUT_MS` (default 600000ms, `<= 0` disables), or exited abnormally |
+| failed | `mox apply: <path>: stopped waiting for a terminal this run does not have; killed` (stderr) | the script asked the terminal something a run with none (`mox apply &`, a CI job) cannot answer |
+
+A script leads its own process group, so the bound reaches what it started
+and not the script alone: an orphan holding mox's stdout would keep a
+`mox apply | ...` pipeline open long after the run. It is handed the
+terminal for its run, the way a shell hands it to a foreground job, so a
+`sudo` in a pre-script can prompt and Ctrl-C goes to the script rather than
+orphaning it; Ctrl-Z suspends it and hands the terminal back. Windows has
+neither process groups nor job control, so there the bound reaches the
+direct process alone.
 
 `<reason>` in the `blocked` line names the fact and the remediation: never
 bound but interviewable (`mox facts set <name> <value>`, or answer the
