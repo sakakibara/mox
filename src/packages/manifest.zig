@@ -107,10 +107,12 @@ pub const Source = struct {
 
 /// A declared installer for a manager that does not ship with the OS. The
 /// URL and digest are data so a pin bump is a repo edit, never a mox release.
+/// Gated like a package row: an installer for one OS must not run on another.
 pub const BootstrapRow = struct {
     backend: []const u8,
     url: []const u8,
     sha256: []const u8,
+    when: ?[]const u8 = null,
     origin: []const u8,
     label: []const u8,
     index: usize,
@@ -178,6 +180,21 @@ pub fn load(
             }
             break :blk v.string;
         };
+        // A file-level gate applies to every row in the file, so a manifest
+        // organised per OS says `when = "os=darwin"` once rather than on each
+        // of a hundred rows. A row's own `when` narrows it further.
+        const file_when: ?[]const u8 = blk: {
+            const v = doc.table.get("when") orelse break :blk null;
+            if (v != .string or v.string.len == 0) {
+                if (diag) |d| d.set("{s}: file-level \"when\" must be a non-empty string", .{f.label});
+                return Error.MalformedPackageFile;
+            }
+            _ = axis.parseString(arena, v.string) catch {
+                if (diag) |d| d.set("{s}: file-level \"when\" is not a valid axis expression: {s}", .{ f.label, v.string });
+                return Error.MalformedPackageFile;
+            };
+            break :blk v.string;
+        };
 
         try sources.append(arena, .{
             .path = f.path,
@@ -196,7 +213,7 @@ pub fn load(
                     if (diag) |d| d.set("{s}: packages row {d} is not a table", .{ f.label, i });
                     return Error.MalformedPackageRow;
                 }
-                try packages.append(arena, try parseRow(arena, f, el.table, file_backend, i, diag));
+                try packages.append(arena, try parseRow(arena, f, el.table, file_backend, file_when, i, diag));
             }
         }
 
@@ -210,7 +227,7 @@ pub fn load(
                     if (diag) |d| d.set("{s}: bootstrap row {d} is not a table", .{ f.label, i });
                     return Error.MalformedPackageRow;
                 }
-                try bootstrap.append(arena, try parseBootstrapRow(arena, f, el.table, file_backend, i, diag));
+                try bootstrap.append(arena, try parseBootstrapRow(arena, f, el.table, file_backend, file_when, i, diag));
             }
         }
 
@@ -294,6 +311,7 @@ fn parseRow(
     f: SourceFile,
     t: toml.Value.Table,
     file_backend: ?[]const u8,
+    file_when: ?[]const u8,
     index: usize,
     diag: ?*Diag,
 ) !Row {
@@ -326,7 +344,7 @@ fn parseRow(
         };
     };
 
-    const when: ?[]const u8 = blk: {
+    const own_when: ?[]const u8 = blk: {
         const v = t.get("when") orelse break :blk null;
         if (v != .string or v.string.len == 0) {
             if (diag) |d| d.set("{s}: row \"{s}\": \"when\" must be a non-empty string", .{ f.label, name });
@@ -341,6 +359,7 @@ fn parseRow(
         };
         break :blk v.string;
     };
+    const when = try combineWhen(arena, file_when, own_when);
 
     var fields: std.ArrayList(Pair) = .empty;
     for (t.keys(), t.values()) |k, v| {
@@ -366,15 +385,22 @@ fn parseRow(
     };
 }
 
+/// A file gate and a row gate both hold: `(file) and (row)`.
+fn combineWhen(arena: std.mem.Allocator, file_when: ?[]const u8, own: ?[]const u8) !?[]const u8 {
+    if (file_when == null) return own;
+    if (own == null) return file_when;
+    return try std.fmt.allocPrint(arena, "({s}) and ({s})", .{ file_when.?, own.? });
+}
+
 fn parseBootstrapRow(
     arena: std.mem.Allocator,
     f: SourceFile,
     t: toml.Value.Table,
     file_backend: ?[]const u8,
+    file_when: ?[]const u8,
     index: usize,
     diag: ?*Diag,
 ) !BootstrapRow {
-    _ = arena;
     const backend = blk: {
         if (t.get("backend")) |v| {
             if (v != .string or v.string.len == 0) {
@@ -394,11 +420,23 @@ fn parseBootstrapRow(
 
     const url = try requiredString(t, "url", f, backend, index, diag);
     const sha256 = try requiredString(t, "sha256", f, backend, index, diag);
+    const own_when: ?[]const u8 = blk: {
+        const v = t.get("when") orelse break :blk null;
+        if (v != .string or v.string.len == 0) {
+            if (diag) |d| d.set("{s}: bootstrap row for \"{s}\": \"when\" must be a non-empty string", .{ f.label, backend });
+            return Error.MalformedPackageRow;
+        }
+        _ = axis.parseString(arena, v.string) catch {
+            if (diag) |d| d.set("{s}: bootstrap row for \"{s}\": \"when\" is not a valid axis expression: {s}", .{ f.label, backend, v.string });
+            return Error.MalformedPackageRow;
+        };
+        break :blk v.string;
+    };
 
     for (t.keys()) |k| {
-        if (std.mem.eql(u8, k, "backend") or std.mem.eql(u8, k, "url") or std.mem.eql(u8, k, "sha256")) continue;
+        if (std.mem.eql(u8, k, "backend") or std.mem.eql(u8, k, "url") or std.mem.eql(u8, k, "sha256") or std.mem.eql(u8, k, "when")) continue;
         if (diag) |d| d.set(
-            "{s}: bootstrap row for \"{s}\": unknown key \"{s}\" (a bootstrap row takes \"backend\", \"url\", \"sha256\")",
+            "{s}: bootstrap row for \"{s}\": unknown key \"{s}\" (a bootstrap row takes \"backend\", \"url\", \"sha256\", \"when\")",
             .{ f.label, backend, k },
         );
         return Error.MalformedPackageRow;
@@ -408,6 +446,7 @@ fn parseBootstrapRow(
         .backend = backend,
         .url = url,
         .sha256 = sha256,
+        .when = try combineWhen(arena, file_when, own_when),
         .origin = f.path,
         .label = f.label,
         .index = index,
@@ -790,7 +829,42 @@ test "load: a private file with its own basename adds rows to the repo's" {
     try testing.expect(std.mem.indexOf(u8, m.packages[1].origin, "private") != null);
 }
 
-test "load: blacklist rows carry name and backend only" {
+test "load: a file-level when gates every row, narrowed by a row's own" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data =
+        \\backend = "brew"
+        \\when = "os=darwin"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "steam"
+        \\when = "profile=personal"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    const m = try load(a, io, repo, "", null);
+    try testing.expectEqualStrings("os=darwin", m.packages[0].when.?);
+    try testing.expectEqualStrings("(os=darwin) and (profile=personal)", m.packages[1].when.?);
+    // The installer inherits the gate too: a mac's Homebrew installer must
+    // never run on a Linux machine reading the same manifest.
+    try testing.expectEqualStrings("os=darwin", m.bootstrap[0].when.?);
+}
+
+test "load: blacklist rows parse with no fields" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
