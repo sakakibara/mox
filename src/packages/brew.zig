@@ -500,10 +500,8 @@ test "bootstrap: after installing, brew is invoked by the path it landed at" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A stand-in for the installer's result: the only known prefix that
-    // exists on this machine is the one the test plants under /usr/local? No
-    // -- the probe list is fixed, so plant nothing and assert the fallback:
-    // with no prefix present the exe stays `brew`.
+    // The probe list is fixed, so nothing is planted; with no prefix
+    // present the exe stays `brew`.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env NONINTERACTIVE=1 /bin/bash /tmp/i" },
     } };

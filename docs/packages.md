@@ -91,7 +91,7 @@ so what it lists is what the real run would install.
 
 A backend is **registered** if mox has an adapter for it, and **usable** if
 this machine can run it. A `dnf` row on a mac names a registered adapter that
-is simply inert here; a row naming `dnff` is a typo and is an error. That
+is inert here; a row naming `dnff` is a typo and is an error. That
 distinction is what lets one manifest carry every machine's packages.
 
 | Backend | Identity | Explicitly installed | Row keys |

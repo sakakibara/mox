@@ -55,7 +55,7 @@ pub const Row = struct {
     origin: []const u8,
     /// `data/packages/<basename>`, for diagnostics.
     label: []const u8,
-    /// 0-based index within this file's array, for an in-place row edit.
+    /// 0-based position within its file's array.
     index: usize,
 
     pub fn field(self: Row, key: []const u8) ?Field {

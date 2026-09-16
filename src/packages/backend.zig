@@ -78,7 +78,7 @@ pub const Backend = struct {
         /// seven: there is nothing to install.
         bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 = null,
         /// What this backend structurally cannot see, asked once of a usable
-        /// backend. Absent when `limitation` below states it, or when there is
+        /// backend. Absent when the `limitation` field states it, or when there is
         /// nothing to state.
         limitation: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror!?[]const u8 = null,
         /// The row that would name an observed installed id: the inverse of

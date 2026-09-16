@@ -94,7 +94,7 @@ pub const Distro = struct {
         return res.ok;
     }
 
-    /// These managers take no row keys of their own yet. Refusing an unknown
+    /// These managers take no row keys of their own. Refusing an unknown
     /// one keeps a key that means something to a different manager (a brew
     /// `kind`, a scoop `bucket`) from sitting in a row that silently ignores
     /// it.

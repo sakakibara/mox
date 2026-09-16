@@ -893,12 +893,11 @@ const PackageCounts = struct {
 
 /// Install every package the manifest declares and this machine lacks.
 ///
-/// Runs AFTER the pre stage and BEFORE its re-capture. After, because a
-/// pre-script is what installs the package manager itself on a fresh machine
-/// -- running first would find no brew, treat every row as inert, and install
-/// nothing at all on the one apply that matters most. Before, because a
-/// package installed here is a tool the re-capture has to see, exactly like
-/// one a script installed.
+/// Runs AFTER the pre stage and BEFORE its re-capture. After, so a
+/// pre-script that prepares the machine (the Xcode Command Line Tools, say)
+/// has run before a manager is bootstrapped or asked to install. Before,
+/// because a package installed here is a tool the re-capture has to see,
+/// exactly like one a script installed.
 ///
 /// Only ever installs. An untracked package is reported by `mox status` and
 /// reconciled by `mox commit`; nothing here removes one.

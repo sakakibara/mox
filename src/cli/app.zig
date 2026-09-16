@@ -67,13 +67,13 @@ pub var cwd_override: ?[]const u8 = null;
 /// running the suite. Null means spawn for real.
 pub var package_runner_override: ?mox.packages.exec.Runner = null;
 
-/// Every package backend this run can use: the seven mox ships, then every
-/// plugin the repo carries under `scripts/backends/`. Built once so `status`,
+/// Every package backend this run can use: the seven mox ships, then, for a
+/// repo with a manifest, every plugin it carries under `scripts/backends/`. Built once so `status`,
 /// `apply` and `commit` can never disagree about which exist or how they are
 /// reached.
 ///
 /// Registered is not the same as usable: a dnf row on a mac names a real
-/// backend that this machine simply cannot run, which is inert. A row naming
+/// backend that this machine cannot run, which is inert. A row naming
 /// nothing here is a typo, and says so. A runnable plugin sharing a shipped
 /// backend's name overrides it -- shadowing, as the private layer shadows the
 /// repo -- and `status` says so on every run. One this machine cannot run

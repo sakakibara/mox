@@ -96,8 +96,7 @@ jobs:
     # managers (`zig build test-backends`), which the hermetic `test` step
     # deliberately excludes. Each check is differential against the manager's
     # own output, so the day brew changes a flag or an output shape under an
-    # adapter, this goes red here rather than on a machine. The Linux and
-    # Windows managers have their own jobs below.
+    # adapter, this goes red here rather than on a machine.
     if: github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 20
