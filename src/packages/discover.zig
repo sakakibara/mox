@@ -82,6 +82,7 @@ pub fn discover(
             const prev = &out.items[indexOf(out.items, name)];
             if (prev.not_runnable != null and found.not_runnable == null) {
                 prev.* = found;
+                try seen.put(name, path);
                 continue;
             }
             if (prev.not_runnable == null and found.not_runnable != null) continue;
@@ -276,6 +277,31 @@ test "discover: a runnable file beside its not-runnable twin wins the name" {
     const got = try discover(a, io, repo, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expect(got[0].not_runnable == null);
+}
+
+test "discover: a third file for a name is reported against the file that holds it" {
+    // Only Windows sees a not-runnable file before a runnable one in name
+    // order: the plain file sorts first and is the not-runnable kind there.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports", .data = "#!/bin/sh\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports.cmd", .data = "exit 0\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports.exe", .data = "" });
+    const repo = try tmpRepo(a, io, &tmp.sub_path);
+    const plain = try std.fmt.allocPrint(a, "{s} and ", .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports" })});
+    const cmd = try std.fmt.allocPrint(a, "{s} and ", .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports.cmd" })});
+
+    var d: Diag = .{};
+    try testing.expectError(Error.DuplicateBackend, discover(a, io, repo, &d));
+    const msg = d.capture().?;
+    try testing.expect(std.mem.indexOf(u8, msg, plain) == null);
+    try testing.expect(std.mem.indexOf(u8, msg, cmd) != null);
 }
 
 test "discover: finder junk is ignored, not a backend name" {

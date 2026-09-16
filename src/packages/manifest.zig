@@ -123,14 +123,16 @@ pub const Manifest = struct {
     blacklist: []const BlacklistRow = &.{},
     bootstrap: []const BootstrapRow = &.{},
     sources: []const Source = &.{},
-    /// How many manifest files were read. Zero means the subsystem is not in
-    /// use on this repo, which is not the same as a manifest that declares
-    /// nothing: without this, a machine that has never opted in would see
-    /// every installed package reported as untracked.
+    /// How many manifest files were read.
     files: usize = 0,
+    /// Whether either layer has a `data/packages` directory at all. Creating
+    /// it is the opt-in: an empty one means every installed package is
+    /// genuinely untracked, while a repo without one has never opted in and
+    /// must not have its managers queried.
+    directory: bool = false,
 
     pub fn inUse(self: Manifest) bool {
-        return self.files > 0;
+        return self.files > 0 or self.directory;
     }
 };
 
@@ -151,7 +153,8 @@ pub fn load(
     private_dir: []const u8,
     diag: ?*Diag,
 ) !Manifest {
-    const files = try discover(arena, io, repo_dir, private_dir);
+    const found = try discover(arena, io, repo_dir, private_dir, diag);
+    const files = found.files;
 
     var packages: std.ArrayList(Row) = .empty;
     var blacklist: std.ArrayList(BlacklistRow) = .empty;
@@ -252,6 +255,7 @@ pub fn load(
         .bootstrap = try bootstrap.toOwnedSlice(arena),
         .sources = try sources.toOwnedSlice(arena),
         .files = files.len,
+        .directory = found.directory,
     };
 }
 
@@ -261,22 +265,41 @@ const SourceFile = struct {
     private: bool,
 };
 
+const Discovered = struct {
+    files: []const SourceFile,
+    directory: bool,
+};
+
 /// Every `data/packages/*.toml` across both layers, basename-ordered, a
-/// private file replacing the repo file of the same basename.
+/// private file replacing the repo file of the same basename. A missing
+/// directory is no files; a `data/packages` that is not a directory is an
+/// error naming it.
 fn discover(
     arena: std.mem.Allocator,
     io: Io,
     repo_dir: []const u8,
     private_dir: []const u8,
-) ![]const SourceFile {
+    diag: ?*Diag,
+) !Discovered {
     const Pick = struct { path: []const u8, private: bool };
     var chosen = std.StringHashMap(Pick).init(arena);
     var names: std.ArrayList([]const u8) = .empty;
+    var directory = false;
 
     for ([_][]const u8{ repo_dir, private_dir }, 0..) |root, layer| {
         if (root.len == 0) continue;
         const dir_path = try std.fs.path.join(arena, &.{ root, "data", "packages" });
-        const entries = try dirent.sortedPath(arena, io, dir_path, .{ .iterate = true });
+        var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            error.NotDir => {
+                if (diag) |d| d.set("data/packages: not a directory: {s}", .{dir_path});
+                return e;
+            },
+            else => return e,
+        };
+        defer dir.close(io);
+        directory = true;
+        const entries = try dirent.sorted(arena, io, dir);
         for (entries) |e| {
             if (e.kind != .file and e.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, e.name, ".toml")) continue;
@@ -299,7 +322,7 @@ fn discover(
             .private = pick.private,
         });
     }
-    return out.toOwnedSlice(arena);
+    return .{ .files = try out.toOwnedSlice(arena), .directory = directory };
 }
 
 fn lessName(_: void, a: []const u8, b: []const u8) bool {
@@ -912,26 +935,57 @@ test "load: a gate on a blacklist row is an error" {
     try testing.expect(std.mem.indexOf(u8, d.capture().?, "no \"when\"") != null);
 }
 
-test "load: an empty manifest directory is in use, an absent one is not" {
+test "load: an empty manifest directory is in use" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "repo/data/packages");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data =
-        \\backend = "brew"
-        \\
-    });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
 
-    // A file that declares nothing still opts in: everything installed is
-    // then genuinely untracked.
+    // Creating the directory is the opt-in, before any file is written:
+    // everything installed is then genuinely untracked.
     const m = try load(a, io, repo, "", null);
     try testing.expect(m.inUse());
+    try testing.expectEqual(@as(usize, 0), m.files);
     try testing.expectEqual(@as(usize, 0), m.packages.len);
+}
+
+test "load: a private-layer directory alone opts in" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.createDirPath(io, "private/data/packages");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+    const priv = try tmpAbs(a, io, &tmp.sub_path, "private");
+
+    const m = try load(a, io, repo, priv, null);
+    try testing.expect(m.inUse());
+}
+
+test "load: a data/packages that is a file is named, not a raw error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(error.NotDir, load(a, io, repo, "", &d));
+    try testing.expect(std.mem.startsWith(u8, d.capture().?, "data/packages: not a directory"));
 }
 
 test "load: a missing packages directory yields an empty manifest" {

@@ -40,6 +40,7 @@ pub const Backend = backend_mod.Backend;
 pub const exit_not_implemented: u8 = 64;
 
 pub const Error = error{
+    PluginNotRunnable,
     PluginRefusedRow,
     PluginVerbNotImplemented,
     PluginFailed,
@@ -53,14 +54,25 @@ pub const Plugin = struct {
     /// How to invoke it: the path alone, or an interpreter and the path.
     argv0: []const []const u8,
     runner: exec.Runner,
+    /// Outlives every per-call arena: what `id` answered is kept here for
+    /// the life of the plugin.
+    alloc: std.mem.Allocator,
     /// Set when this machine cannot run the file (a `.ps1` on unix, a plain
     /// script on Windows). The plugin is then registered but never usable:
     /// its rows are inert here, as a dnf row is inert on a mac, rather than
     /// refused as naming nothing.
     not_runnable: ?[]const u8 = null,
+    /// `id`'s answer per rendered row, refusals included. Validation,
+    /// contradiction checks, selection and drift each ask for the same row
+    /// in one pass, and a plugin is a process spawn per question.
+    ids: std.StringHashMapUnmanaged(anyerror![]const u8) = .empty,
 
     pub fn backend(self: *Plugin) Backend {
-        return .{ .name = self.name, .ctx = self, .vtable = &vtable };
+        return .{
+            .name = self.name,
+            .ctx = self,
+            .vtable = if (self.not_runnable != null) &inert_vtable else &vtable,
+        };
     }
 
     const vtable: Backend.VTable = .{
@@ -74,7 +86,21 @@ pub const Plugin = struct {
         .limitation = limitationImpl,
     };
 
+    /// A plugin this machine cannot run has no optional verbs: nothing may
+    /// plan to bootstrap through it, and nothing asks it what it cannot see.
+    const inert_vtable: Backend.VTable = .{
+        .available = availableImpl,
+        .validate = validateImpl,
+        .idOf = idOfImpl,
+        .installedExplicit = installedExplicitImpl,
+        .install = installImpl,
+        .declare = declareImpl,
+    };
+
+    /// The one place a spawn's argv is built, so a file this machine cannot
+    /// run is refused by name here rather than exec'd as a bare verb.
     fn argv(self: *const Plugin, arena: std.mem.Allocator, verb: []const u8, extra: []const []const u8) ![]const []const u8 {
+        if (self.not_runnable != null) return Error.PluginNotRunnable;
         var out: std.ArrayList([]const u8) = .empty;
         try out.appendSlice(arena, self.argv0);
         try out.append(arena, verb);
@@ -148,6 +174,16 @@ pub const Plugin = struct {
     /// answer of any other shape (two lines, none) is bad output.
     fn idOne(self: *Plugin, arena: std.mem.Allocator, row: Row) ![]const u8 {
         const line = try write_mod.inlineRow(arena, row.name, row.fields);
+        if (self.ids.get(line)) |memo| return memo;
+        const memo: anyerror![]const u8 = if (self.idSpawn(arena, line)) |id|
+            try self.alloc.dupe(u8, id)
+        else |e|
+            e;
+        try self.ids.put(self.alloc, try self.alloc.dupe(u8, line), memo);
+        return memo;
+    }
+
+    fn idSpawn(self: *Plugin, arena: std.mem.Allocator, line: []const u8) ![]const u8 {
         const input = try std.fmt.allocPrint(arena, "{s}\n", .{line});
         const res = try self.runner.runInput(arena, try self.argv(arena, "id", &.{}), input);
         if (res.timed_out) return Error.PluginTimedOut;
@@ -240,14 +276,6 @@ fn idLines(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(arena);
 }
 
-fn keyOk(k: []const u8) bool {
-    if (k.len == 0) return false;
-    for (k) |c| {
-        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
-    }
-    return true;
-}
-
 fn firstLine(text: []const u8) []const u8 {
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw| {
@@ -271,7 +299,7 @@ fn parseDeclaration(arena: std.mem.Allocator, text: []const u8) !Backend.Declara
         // would be rendered unquoted into a manifest that then fails to
         // parse; both are the plugin answering wrong, not a row to record.
         if (std.mem.eql(u8, k, "backend") or std.mem.eql(u8, k, "when")) return Error.PluginBadOutput;
-        if (!keyOk(k)) return Error.PluginBadOutput;
+        if (!write_mod.keyOk(k)) return Error.PluginBadOutput;
         const f = (try manifest_mod.fieldOf(arena, fv)) orelse return Error.PluginBadOutput;
         try fields.append(arena, .{ .key = k, .value = f });
     }
@@ -293,7 +321,54 @@ fn rowOf(name: []const u8, fields: []const manifest_mod.Pair) Row {
 }
 
 fn pluginWith(fake: *exec.Fake) Plugin {
-    return .{ .name = "macports", .argv0 = &.{"/r/scripts/backends/macports"}, .runner = fake.runner() };
+    return .{ .name = "macports", .argv0 = &.{"/r/scripts/backends/macports"}, .runner = fake.runner(), .alloc = fake.arena };
+}
+
+test "id: the same row is asked once, and a refusal is remembered too" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports id", .stdout = "cask:ghostty\n" },
+    } };
+    var p = pluginWith(&fake);
+    const row = rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }});
+
+    try testing.expectEqualStrings("cask:ghostty", try p.backend().idOf(a, row));
+    try testing.expectEqualStrings("cask:ghostty", try p.backend().idOf(a, row));
+    try p.backend().validate(row, null);
+    try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+
+    var refusing: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports id", .code = 1 },
+    } };
+    var rp = pluginWith(&refusing);
+    try testing.expectError(Error.PluginRefusedRow, rp.backend().validate(rowOf("x", &.{}), null));
+    try testing.expectError(Error.PluginRefusedRow, rp.backend().idOf(a, rowOf("x", &.{})));
+    try testing.expectEqual(@as(usize, 1), refusing.calls.items.len);
+}
+
+test "not runnable: no bootstrap, no limitation, and nothing is ever spawned" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var p: Plugin = .{
+        .name = "macports",
+        .argv0 = &.{},
+        .runner = fake.runner(),
+        .alloc = a,
+        .not_runnable = "a windows-only kind; not runnable here",
+    };
+    const b = p.backend();
+    try testing.expect(!b.canBootstrap());
+    try testing.expectError(error.NoBootstrapForBackend, b.bootstrap(a, "/tmp/i"));
+    try testing.expectError(Error.PluginNotRunnable, Plugin.bootstrapImpl(&p, a, "/tmp/i"));
+    try testing.expect((try b.limitationOf(a)) == null);
+    try testing.expect(!try b.available(a));
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
 test "id: the row goes to stdin as one inline table and the id comes back" {

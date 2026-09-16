@@ -791,11 +791,12 @@ fn applyPass(
 
 /// Install any declared manager this machine does not have. mox fetches and
 /// digest-verifies the installer; the backend only runs what mox hands it.
-/// A bin dir the backend reports is put on PATH for the rest of this run --
-/// verified in a container: Homebrew's installer succeeds and then the same
-/// apply installs nothing, because `/home/linuxbrew/.linuxbrew/bin` is on no
-/// PATH yet. Returns how many failed: a manager that will not install is a
-/// genuine failure, not a reason to press on quietly installing nothing.
+/// A bin dir the backend reports goes on mox's own PATH view for the rest of
+/// this run: a child's PATH is never used to resolve its argv[0], so a
+/// freshly installed `/home/linuxbrew/.linuxbrew/bin` reaches the probes and
+/// installs that follow only through it. Returns how many failed: a manager
+/// that will not install is a genuine failure, not a reason to press on
+/// quietly installing nothing.
 fn bootstrapBackends(
     ctx: *app.Ctx,
     context: app.Context,
@@ -846,14 +847,14 @@ fn bootstrapBackends(
             failed += 1;
             continue;
         };
+        // However the install ends, nothing is left in state that a later
+        // run could mistake for a fresh fetch.
+        defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
             failed += 1;
             continue;
         };
-        // The verified installer has done its work; nothing should be left
-        // in state that a later run could mistake for a fresh fetch.
-        std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         if (bin_dir) |dir| {
             // On PATH for the probes that follow, and registered with the
             // run's PATH additions so the re-capture that this install
@@ -974,6 +975,14 @@ fn applyPackages(
                 continue;
             };
             if (present) continue;
+            if (!backend.canBootstrap()) {
+                try ctx.err.print(
+                    "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
+                    .{ b.label, b.backend },
+                );
+                bootstrap_failed += 1;
+                continue;
+            }
             try ctx.out.print("  would bootstrap {s}\n", .{b.backend});
             try would_bootstrap.append(ctx.alloc, b.backend);
         }
@@ -2023,7 +2032,7 @@ fn snapshotContentForSite(io: std.Io, arena: std.mem.Allocator, live_path: []con
 pub const command = app.command(Spec, .{
     .name = "apply",
     .summary = "Compose all managed files and write to live paths",
-    .details = "Never prompts. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
+    .details = "Never prompts. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
     .group = .general,
     .needs_context = true,
 }, run);

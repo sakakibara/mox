@@ -7,6 +7,7 @@
 //! list canonically and drop its comments.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const apply_write = @import("../apply/write.zig");
 const backend_mod = @import("backend.zig");
@@ -47,14 +48,22 @@ pub fn targetFor(m: Manifest, backend: []const u8) ?Source {
         }
         for (m.sources) |src| {
             if (src.private != private) continue;
-            for (m.packages) |row| {
-                if (!std.mem.eql(u8, row.backend, backend)) continue;
-                if (!std.mem.eql(u8, row.origin, src.path)) continue;
-                return src;
-            }
+            if (carriesRow(m, src, backend)) return src;
         }
     }
     return null;
+}
+
+/// Whether `src` already holds a row for `backend`: a package or a blacklist
+/// entry, either one saying the file speaks that backend.
+fn carriesRow(m: Manifest, src: Source, backend: []const u8) bool {
+    for (m.packages) |row| {
+        if (std.mem.eql(u8, row.backend, backend) and std.mem.eql(u8, row.origin, src.path)) return true;
+    }
+    for (m.blacklist) |row| {
+        if (std.mem.eql(u8, row.backend, backend) and std.mem.eql(u8, row.origin, src.path)) return true;
+    }
+    return false;
 }
 
 /// Render the block `append` would write, without touching the filesystem.
@@ -71,12 +80,13 @@ pub fn render(
     try out.writer.print("name = {f}\n", .{Quoted{ .s = decl.name }});
     if (backend) |b| try out.writer.print("backend = {f}\n", .{Quoted{ .s = b }});
     for (decl.fields) |p| {
+        const key = Key{ .s = p.key };
         switch (p.value) {
-            .string => |v| try out.writer.print("{s} = {f}\n", .{ p.key, Quoted{ .s = v } }),
-            .int => |v| try out.writer.print("{s} = {d}\n", .{ p.key, v }),
-            .boolean => |v| try out.writer.print("{s} = {s}\n", .{ p.key, if (v) "true" else "false" }),
+            .string => |v| try out.writer.print("{f} = {f}\n", .{ key, Quoted{ .s = v } }),
+            .int => |v| try out.writer.print("{f} = {d}\n", .{ key, v }),
+            .boolean => |v| try out.writer.print("{f} = {s}\n", .{ key, if (v) "true" else "false" }),
             .strings => |vs| {
-                try out.writer.print("{s} = [", .{p.key});
+                try out.writer.print("{f} = [", .{key});
                 for (vs, 0..) |v, i| {
                     if (i > 0) try out.writer.writeAll(", ");
                     try out.writer.print("{f}", .{Quoted{ .s = v }});
@@ -94,12 +104,13 @@ pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const man
     var out: std.Io.Writer.Allocating = .init(arena);
     try out.writer.print("{{ name = {f}", .{Quoted{ .s = name }});
     for (fields) |p| {
+        const key = Key{ .s = p.key };
         switch (p.value) {
-            .string => |v| try out.writer.print(", {s} = {f}", .{ p.key, Quoted{ .s = v } }),
-            .int => |v| try out.writer.print(", {s} = {d}", .{ p.key, v }),
-            .boolean => |v| try out.writer.print(", {s} = {s}", .{ p.key, if (v) "true" else "false" }),
+            .string => |v| try out.writer.print(", {f} = {f}", .{ key, Quoted{ .s = v } }),
+            .int => |v| try out.writer.print(", {f} = {d}", .{ key, v }),
+            .boolean => |v| try out.writer.print(", {f} = {s}", .{ key, if (v) "true" else "false" }),
             .strings => |vs| {
-                try out.writer.print(", {s} = [", .{p.key});
+                try out.writer.print(", {f} = [", .{key});
                 for (vs, 0..) |v, i| {
                     if (i > 0) try out.writer.writeAll(", ");
                     try out.writer.print("{f}", .{Quoted{ .s = v }});
@@ -132,8 +143,38 @@ pub fn append(arena: std.mem.Allocator, io: Io, path: []const u8, block: []const
         try buf.append(arena, '\n');
     }
     try buf.appendSlice(arena, block);
-    try apply_write.writeAtomic(io, path, buf.items, 0o644);
+    try apply_write.writeAtomic(io, path, buf.items, try modeOf(io, path));
 }
+
+/// The mode the rewrite keeps: a private manifest the user made 0600 must
+/// not come back 0644 for having a row appended.
+fn modeOf(io: Io, path: []const u8) !u32 {
+    if (!Io.File.Permissions.has_executable_bit) return 0o644;
+    const st = try Io.Dir.cwd().statFile(io, path, .{});
+    return st.permissions.toMode();
+}
+
+/// Whether a key can be written bare: `[A-Za-z0-9_-]+`, the TOML bare-key
+/// charset.
+pub fn keyOk(k: []const u8) bool {
+    if (k.len == 0) return false;
+    for (k) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
+}
+
+/// A TOML key: bare when it can be, a basic string otherwise. The manifest
+/// accepts any key, so what is handed to a plugin or written back must spell
+/// it the way TOML reads it, not lose the quotes it needed.
+const Key = struct {
+    s: []const u8,
+
+    pub fn format(self: Key, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (keyOk(self.s)) return w.writeAll(self.s);
+        return (Quoted{ .s = self.s }).format(w);
+    }
+};
 
 /// A TOML basic string. A package name is normally plain, but a manager is
 /// free to use any bytes, and an unescaped quote or backslash would produce a
@@ -227,6 +268,37 @@ test "inlineRow: a row renders as one inline table on one line" {
     const got = try inlineRow(a, "ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }});
     try testing.expectEqualStrings("{ name = \"ghostty\", kind = \"cask\" }", got);
     try testing.expect(std.mem.indexOfScalar(u8, got, '\n') == null);
+}
+
+test "inlineRow: a key outside the bare charset is quoted, never misparsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try inlineRow(a, "x", &.{
+        .{ .key = "my key", .value = .{ .int = 1 } },
+        .{ .key = "a.b", .value = .{ .string = "v" } },
+    });
+    try testing.expectEqualStrings("{ name = \"x\", \"my key\" = 1, \"a.b\" = \"v\" }", got);
+}
+
+test "targetFor: a file carrying only a blacklist row for the backend speaks it" {
+    const row: manifest_mod.BlacklistRow = .{
+        .name = "usage",
+        .backend = "brew",
+        .fields = &.{},
+        .origin = "/r/mixed.toml",
+        .label = "data/packages/mixed.toml",
+        .index = 0,
+    };
+    const m: Manifest = .{
+        .blacklist = &.{row},
+        .sources = &.{
+            sourceOf("data/packages/a.toml", "/r/a.toml", "dnf", false),
+            sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
+        },
+    };
+    try testing.expectEqualStrings("/r/mixed.toml", targetFor(m, "brew").?.path);
 }
 
 test "targetFor: prefers a file whose own default names the backend" {
@@ -333,6 +405,26 @@ test "append: a file not ending in a newline does not glue its last line" {
 
     const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n", after);
+}
+
+test "append: an existing file keeps its mode" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p.toml", .data = "backend = \"brew\"\n" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "p.toml" });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o600), .{});
+
+    try append(a, io, path, "\n[[packages]]\nname = \"htop\"\n");
+
+    const st = try Io.Dir.cwd().statFile(io, path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, st.permissions.toMode() & 0o777));
 }
 
 test "append: a missing file is created without a leading blank line" {

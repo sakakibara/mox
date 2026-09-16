@@ -1,6 +1,6 @@
 //! Installing a package manager that is not there yet.
 //!
-//! Four of the seven managers ship with the OS and need none of this. brew and
+//! Five of the seven managers ship with the OS and need none of this. brew and
 //! scoop do not: on a fresh machine their adapters are inert, every row that
 //! names them is inert with them, and nothing mox declares can come true. So
 //! the package subsystem installs its own prerequisite rather than leaving a
@@ -52,27 +52,24 @@ pub fn fetchVerified(
     // A leftover from an interrupted run would otherwise be re-verified and
     // re-used without ever fetching.
     Io.Dir.cwd().deleteFile(io, path) catch {};
+    // Whatever the failure -- a partial download, an oversize one, a digest
+    // that does not match -- nothing runnable may be left where the next
+    // step expects a verified file.
+    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const res = runner.run(arena, &.{ "curl", "-fsSL", "-o", path, spec.url }) catch |e| switch (e) {
+    const limit = try std.fmt.allocPrint(arena, "{d}", .{max_installer_bytes});
+    const res = runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, spec.url }) catch |e| switch (e) {
         error.FileNotFound => try runner.run(arena, &.{ "wget", "-qO", path, spec.url }),
         else => return e,
     };
     if (!res.ok) return Error.BootstrapDownloadFailed;
 
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_installer_bytes)) catch |e| switch (e) {
-        error.StreamTooLong => {
-            Io.Dir.cwd().deleteFile(io, path) catch {};
-            return Error.BootstrapInstallerTooLarge;
-        },
+        error.StreamTooLong => return Error.BootstrapInstallerTooLarge,
         else => return Error.BootstrapDownloadFailed,
     };
     const got = applied.contentHashHex(bytes);
-    if (!std.ascii.eqlIgnoreCase(&got, spec.sha256)) {
-        // Removed, so a failed verification cannot leave something runnable
-        // where the next step expects a verified file.
-        Io.Dir.cwd().deleteFile(io, path) catch {};
-        return Error.BootstrapDigestMismatch;
-    }
+    if (!std.ascii.eqlIgnoreCase(&got, spec.sha256)) return Error.BootstrapDigestMismatch;
     return path;
 }
 
@@ -96,11 +93,35 @@ const Downloader = struct {
     fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8) anyerror!exec.Result {
         const self: *Downloader = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        // `curl -fsSL -o <path> <url>`
-        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = argv[3], .data = self.body });
+        const out = for (argv, 0..) |a, i| {
+            if (std.mem.eql(u8, a, "-o")) break argv[i + 1];
+        } else return error.UnexpectedCommand;
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = out, .data = self.body });
         return .{ .code = 0, .ok = true, .stdout = "" };
     }
 };
+
+test "fetchVerified: curl is told the size cap, and a partial download is not left behind" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+    const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
+
+    // curl writes part of the file, then reports failure (a cut connection).
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = "#!/bin/sh\necho par", .code = 23, .write_after = "-o", .io = io },
+    } };
+    try testing.expectError(Error.BootstrapDownloadFailed, fetchVerified(a, io, fake.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+    }));
+    try testing.expect(std.mem.indexOf(u8, fake.calls.items[0], " --max-filesize 67108864 ") != null);
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
 
 test "fetchVerified: a matching digest yields the staged file" {
     const io = std.testing.io;

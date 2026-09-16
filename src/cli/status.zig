@@ -288,10 +288,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // machine output is stable across runs, OSes, and pipes.
     mox.apply.drift.sortByPath(units.items);
 
-    const pkgs = try gatherPackages(ctx, context, &bindings, m_state);
-    problems += pkgs.problems();
-
     if (machine) {
+        // stdout is the serialized drift set and nothing else; what the
+        // package pass has to say about plugins goes beside every other
+        // diagnostic, before any plugin runs.
+        const prep = try preparePackages(ctx, context, m_state);
+        for (prep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+        const pkgs = try reportPackages(ctx, prep, &bindings);
+        problems += pkgs.problems();
         if (a.json)
             try emitJson(ctx.out, units.items, pkgs.report)
         else
@@ -312,7 +316,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Package drift is drift, so it shows under `--drift` too; the probe log
     // and unbound-facts sections are full-report context and are not.
-    try printPackages(ctx, pkgs);
+    const pkgs = try printPackages(ctx, context, &bindings, m_state);
+    problems += pkgs.problems();
     if (show_table) {
         try printProbeLog(ctx, m_state);
         try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
@@ -329,8 +334,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 const Packages = struct {
     report: mox.packages.report.Report = .{},
     broken: bool = false,
-    /// Plugin override and not-runnable notices, printed above the table.
-    notes: []const []const u8 = &.{},
 
     /// Every package the report counts against the exit code.
     fn problems(self: Packages) usize {
@@ -338,35 +341,51 @@ const Packages = struct {
     }
 };
 
-fn gatherPackages(
+/// The package pass up to, and not including, the first plugin run: the
+/// manifest loaded and every backend registered. Split from the report so
+/// the caller can put the notes wherever its output format wants them
+/// before anything executes.
+const Prepared = struct {
+    manifest: mox.packages.manifest.Manifest = .{},
+    registry: mox.packages.backend.Registry = .{ .backends = &.{} },
+    /// Every discovered plugin, an override of a shipped backend, a plugin
+    /// this machine cannot run: what will execute, on the record even if
+    /// the first thing it does is fail.
+    notes: []const []const u8 = &.{},
+    broken: bool = false,
+    /// A diagnostic set by a failure the report step may still hit.
+    diag: mox.packages.manifest.Diag = .{},
+
+    fn inUse(self: Prepared) bool {
+        return !self.broken and self.manifest.inUse();
+    }
+};
+
+fn preparePackages(
     ctx: *app.Ctx,
     context: app.Context,
-    bindings: *const mox.dsl.resolver.Resolver,
     m_state: mox.machine.state.MachineState,
-) !Packages {
+) !Prepared {
     const env = try app.packageEnv(ctx, context, m_state);
-    var diag: mox.packages.manifest.Diag = .{};
-    const manifest = mox.packages.manifest.load(
+    var prep: Prepared = .{};
+    prep.manifest = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,
         context.paths.repo_dir,
         context.paths.private_dir,
-        &diag,
+        &prep.diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
-            if (diag.capture()) |cap| {
-                try ctx.err.print("mox status: packages: {s}\n", .{cap});
-            } else {
-                try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
-            }
+            try reportPackageError(ctx, &prep.diag, e);
             return .{ .broken = true };
         },
     };
-    if (!manifest.inUse()) return .{};
+    if (!prep.manifest.inUse()) return prep;
 
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(
+    const pkg_backends = try ctx.alloc.create(app.PackageBackends);
+    pkg_backends.* = .{};
+    prep.registry = pkg_backends.registry(
         ctx.alloc,
         ctx.io,
         context.paths.state_dir,
@@ -376,54 +395,71 @@ fn gatherPackages(
         true,
         ctx.out,
         ctx.err,
-        &diag,
+        &prep.diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
-            if (diag.capture()) |cap| {
-                try ctx.err.print("mox status: packages: {s}\n", .{cap});
-            } else {
-                try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
-            }
+            try reportPackageError(ctx, &prep.diag, e);
             return .{ .broken = true };
         },
     };
-    // Named before anything is asked of them: what will execute is on the
-    // record even if the first thing it does is fail.
-    if (pkg_backends.notes.len > 0) {
-        try ctx.out.writeAll("\npackages:\n");
-        for (pkg_backends.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
-    }
+    prep.notes = pkg_backends.notes;
+    return prep;
+}
 
+/// The step that runs plugins and managers: only after the caller has put
+/// the notes on the record.
+fn reportPackages(
+    ctx: *app.Ctx,
+    prep: Prepared,
+    bindings: *const mox.dsl.resolver.Resolver,
+) !Packages {
+    if (prep.broken) return .{ .broken = true };
+    if (!prep.manifest.inUse()) return .{};
+    var diag = prep.diag;
     const rep = mox.packages.report.fromManifest(
         ctx.alloc,
-        manifest,
-        registry,
+        prep.manifest,
+        prep.registry,
         bindings,
         &.{},
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
-            if (diag.capture()) |cap| {
-                try ctx.err.print("mox status: packages: {s}\n", .{cap});
-            } else {
-                try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
-            }
-            return .{ .broken = true, .notes = pkg_backends.notes };
+            try reportPackageError(ctx, &diag, e);
+            return .{ .broken = true };
         },
     };
-    return .{ .report = rep, .notes = pkg_backends.notes };
+    return .{ .report = rep };
 }
 
-/// The human `packages:` section. Silent when the repo does not use the
-/// manifest, so an unadopted repo's report is unchanged. The plugin notes
-/// were printed by `gatherPackages` before any plugin ran.
-fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
-    const rep = pkgs.report;
-    if (!rep.in_use) return;
+fn reportPackageError(ctx: *app.Ctx, diag: *mox.packages.manifest.Diag, e: anyerror) !void {
+    if (diag.capture()) |cap| {
+        try ctx.err.print("mox status: packages: {s}\n", .{cap});
+    } else {
+        try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
+    }
+}
 
-    if (pkgs.notes.len == 0) try ctx.out.writeAll("\npackages:\n");
+/// The human `packages:` section, printed as one block: header, the plugin
+/// notes, then -- only now running anything -- each backend's rows. Silent
+/// when the repo does not use the manifest, so an unadopted repo's report is
+/// unchanged.
+fn printPackages(
+    ctx: *app.Ctx,
+    context: app.Context,
+    bindings: *const mox.dsl.resolver.Resolver,
+    m_state: mox.machine.state.MachineState,
+) !Packages {
+    const prep = try preparePackages(ctx, context, m_state);
+    if (!prep.inUse()) return reportPackages(ctx, prep, bindings);
+
+    try ctx.out.writeAll("\npackages:\n");
+    for (prep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+
+    const pkgs = try reportPackages(ctx, prep, bindings);
+    const rep = pkgs.report;
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
@@ -439,6 +475,7 @@ fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
             try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
         }
     }
+    return pkgs;
 }
 
 /// Emit the drift set as JSON: `{"files":[...],"packages":[...]}`. A file is

@@ -13,9 +13,6 @@ const manifest_mod = @import("manifest.zig");
 pub const Row = manifest_mod.Row;
 pub const Diag = manifest_mod.Diag;
 
-/// Every adapter mox knows, whether or not this machine can use it. A row
-/// naming something outside it is a typo, not a machine difference, so the
-/// two are never the same branch.
 /// Whether an id has the shape of one id. Empty, whitespace inside, or over
 /// 256 bytes says the backend padded its output or lost its line separator
 /// (dnf5 concatenates every name when its format string lacks a newline);
@@ -28,6 +25,9 @@ pub fn idShapeOk(id: []const u8) bool {
     return true;
 }
 
+/// Every adapter mox knows, whether or not this machine can use it. A row
+/// naming something outside it is a typo, not a machine difference, so the
+/// two are never the same branch.
 pub const Registry = struct {
     backends: []const Backend,
 
@@ -74,7 +74,7 @@ pub const Backend = struct {
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
-        /// Absent for a manager that ships with the OS, which is four of the
+        /// Absent for a manager that ships with the OS, which is five of the
         /// seven: there is nothing to install.
         bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 = null,
         /// What this backend structurally cannot see, asked once of a usable

@@ -5,6 +5,7 @@
 //! through.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const paths_mod = @import("paths.zig");
 const Env = @import("env").Env;
@@ -73,9 +74,11 @@ pub var package_runner_override: ?mox.packages.exec.Runner = null;
 ///
 /// Registered is not the same as usable: a dnf row on a mac names a real
 /// backend that this machine simply cannot run, which is inert. A row naming
-/// nothing here is a typo, and says so. A plugin sharing a shipped backend's
-/// name overrides it -- shadowing, as the private layer shadows the repo --
-/// and `status` says so on every run.
+/// nothing here is a typo, and says so. A runnable plugin sharing a shipped
+/// backend's name overrides it -- shadowing, as the private layer shadows the
+/// repo -- and `status` says so on every run. One this machine cannot run
+/// leaves the built-in in place: a `winget.ps1` in a shared repo must not
+/// make the winget adapter vanish on a mac.
 pub const PackageBackends = struct {
     proc: mox.packages.exec.Process = undefined,
     brew: mox.packages.brew.Brew = undefined,
@@ -157,24 +160,28 @@ pub const PackageBackends = struct {
             &.{};
         self.plugins = try arena.alloc(mox.packages.plugin.Plugin, found.len);
         for (found, 0..) |f, i| {
-            self.plugins[i] = .{ .name = f.name, .argv0 = f.argv0, .runner = r, .not_runnable = f.not_runnable };
+            self.plugins[i] = .{ .name = f.name, .argv0 = f.argv0, .runner = r, .alloc = arena, .not_runnable = f.not_runnable };
             const pl = &self.plugins[i];
+            const shipped: ?*mox.packages.backend.Backend = for (list.items) |*b| {
+                if (std.mem.eql(u8, b.name, f.name)) break b;
+            } else null;
+
             if (f.not_runnable) |why| {
+                if (shipped != null) {
+                    try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}: {s}; the built-in stays", .{ f.name, f.label, why }));
+                    continue;
+                }
                 try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}: {s}", .{ f.name, f.label, why }));
             } else {
                 try notes.append(arena, try std.fmt.allocPrint(arena, "backend {s}: {s}", .{ f.name, f.label }));
             }
 
-            var replaced = false;
-            for (list.items) |*b| {
-                if (std.mem.eql(u8, b.name, f.name)) {
-                    b.* = pl.backend();
-                    replaced = true;
-                    try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s} overrides the built-in", .{ f.name, f.label }));
-                    break;
-                }
+            if (shipped) |b| {
+                b.* = pl.backend();
+                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s} overrides the built-in", .{ f.name, f.label }));
+            } else {
+                try list.append(arena, pl.backend());
             }
-            if (!replaced) try list.append(arena, pl.backend());
         }
         self.list = try list.toOwnedSlice(arena);
         self.notes = try notes.toOwnedSlice(arena);
@@ -201,9 +208,9 @@ pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) 
 }
 
 /// mox's help footer: the Environment section (`MOX_REPO`/`MOX_STATE_DIR`/
-/// `MOX_SNAPSHOT_RETENTION`/`MOX_CHECK_TIMEOUT_MS`/`HOME`/`USER`). These are
-/// env vars, not CLI flags, so cli-zig's generated per-command help has
-/// nowhere else to surface them.
+/// `MOX_SNAPSHOT_RETENTION`/`MOX_CHECK_TIMEOUT_MS`/`MOX_SCRIPT_TIMEOUT_MS`/
+/// `HOME`/`USER`). These are env vars, not CLI flags, so cli-zig's generated
+/// per-command help has nowhere else to surface them.
 pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void {
     _ = prog_name;
     try w.writeAll(
@@ -213,6 +220,7 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
         \\  MOX_STATE_DIR  Path to mox state (default: $XDG_STATE_HOME/mox)
         \\  MOX_SNAPSHOT_RETENTION  Snapshots to keep (default: 10)
         \\  MOX_CHECK_TIMEOUT_MS  Wall-clock bound on check hooks in ms (default: 30000; <= 0 disables)
+        \\  MOX_SCRIPT_TIMEOUT_MS  Wall-clock bound on setup scripts and every package-manager call in ms (default: 600000; <= 0 disables)
         \\  HOME, USER     Standard POSIX env
         \\
         \\See the project README for the full design spec.
@@ -394,6 +402,37 @@ test "MoxCli wiring: a needs_context command loads Context via loadContext" {
     try std.testing.expectEqual(@as(u8, 0), code);
     try std.testing.expect(std.mem.startsWith(u8, out_w.buffered(), "state_dir="));
     try std.testing.expect(out_w.buffered().len > "state_dir=\n".len);
+}
+
+test "PackageBackends.registry: a not-runnable twin of a built-in leaves the built-in in place" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/winget.ps1", .data = "exit 0\n" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const state = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+
+    var out_buf: [64]u8 = undefined;
+    var out_w = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+
+    var pkg: PackageBackends = .{};
+    const reg = try pkg.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    const b = reg.find("winget").?;
+    try std.testing.expect(b.ctx == @as(*anyopaque, @ptrCast(&pkg.winget)));
+    try std.testing.expectEqual(@as(usize, 7), reg.backends.len);
+    try std.testing.expectEqual(@as(usize, 1), pkg.notes.len);
+    try std.testing.expectEqualStrings(
+        "backend winget: scripts/backends/winget.ps1: a windows-only kind; not runnable here; the built-in stays",
+        pkg.notes[0],
+    );
 }
 
 /// The environment every package backend and plugin runs under, for a
