@@ -117,6 +117,31 @@ jobs:
       - name: test-backends
         run: zig build test-backends --summary all
 
+  backends-linux:
+    # Nightly only. The Linux package adapters against the REAL apt, dnf and
+    # pacman, each in its own container (tests/linux_backends_test.sh).
+    #
+    # The hermetic suite can only assert that an adapter emits a given argv.
+    # It cannot know whether that argv is right or whether the manager's
+    # output parses back, and both bugs this job exists to catch were
+    # invisible to it: dnf5 concatenating every name onto one line without a
+    # trailing newline in its format string, and a minimal image having no
+    # `sudo` at all.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: adapters against real managers
+        run: sh tests/linux_backends_test.sh
+
   fuzz:
     # Nightly only. Exercises the fuzz targets (tests/fuzz_test.zig) under a
     # wall-clock bound. Continuous fuzzing (`zig build fuzz --fuzz`) is gated
