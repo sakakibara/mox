@@ -343,13 +343,19 @@ fn applyPass(
     // judged against exactly the facts this re-capture just bound, not the
     // pre-stage's stale projection.
     // A failed batch may have landed some of its rows, so the machine is
-    // re-read after any attempt, not only after a clean success.
-    if (pre_result.ran > 0 or pkg_counts.installed > 0 or pkg_counts.attempted > 0) {
+    // re-read after any attempt, not only after a clean success; a
+    // bootstrapped manager changed the machine even with no row to install.
+    if (pre_result.ran > 0 or pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.bootstrapped > 0) {
         m_state = (try captureOrReport(ctx, context.env, context.paths.repo_dir, context.paths.private_dir)) orelse return 2;
+        // A manager bootstrapped this run lives in a directory the fresh
+        // capture's PATH view does not have: every probe, derived fact and
+        // script after this point must still see it.
+        if (m_state.tool_probe) |tp| tp.extend(mox_path_dirs.items);
         bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
         live_ctx = m_state.liveResolver(&bindings_map);
         try refreshScriptStage(ctx, context, m_state, discovery, derived_rows, &script_env, &contracts, &notified_skipped, &notified_mox_bin, &mox_bin_dir, !dry_run);
         try script_env.put("MOX_PATH", mox_path_file);
+        try prependPathDirs(ctx, &script_env, mox_path_dirs.items, mox_bin_dir);
     }
     // $MOX_PATH additions the pre stage named: fold into this run's probe
     // search space (on the FRESH state above, if it just recaptured) and
@@ -794,9 +800,9 @@ fn applyPass(
 /// A bin dir the backend reports goes on mox's own PATH view for the rest of
 /// this run: a child's PATH is never used to resolve its argv[0], so a
 /// freshly installed `/home/linuxbrew/.linuxbrew/bin` reaches the probes and
-/// installs that follow only through it. Returns how many failed: a manager
-/// that will not install is a genuine failure, not a reason to press on
-/// quietly installing nothing.
+/// installs that follow only through it. Returns how many were installed and
+/// how many failed: a manager that will not install is a genuine failure,
+/// not a reason to press on quietly installing nothing.
 fn bootstrapBackends(
     ctx: *app.Ctx,
     context: app.Context,
@@ -806,7 +812,8 @@ fn bootstrapBackends(
     bindings: *const mox.dsl.resolver.Resolver,
     script_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
-) !usize {
+) !struct { bootstrapped: usize, failed: usize } {
+    var bootstrapped: usize = 0;
     var failed: usize = 0;
     for (m.bootstrap) |b| {
         if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
@@ -863,8 +870,9 @@ fn bootstrapBackends(
             try mox_path_dirs.append(ctx.alloc, dir);
             try ctx.out.print("  on PATH        {s}\n", .{dir});
         }
+        bootstrapped += 1;
     }
-    return failed;
+    return .{ .bootstrapped = bootstrapped, .failed = failed };
 }
 
 /// A bootstrap row with no gate is unconditional; one gated to another OS
@@ -882,6 +890,9 @@ fn bootstrapGateHolds(
 /// What one apply did to this machine's packages.
 const PackageCounts = struct {
     in_use: bool = false,
+    /// Managers installed from their declared installer: the machine changed
+    /// even when no row was left to install.
+    bootstrapped: usize = 0,
     installed: usize = 0,
     /// Rows handed to a backend whose batch then failed: some may have
     /// landed, so the machine must be re-read as if they had.
@@ -975,10 +986,13 @@ fn applyPackages(
     // is used by this same apply rather than the next one. A dry run performs
     // no bootstrap, but plans as though it had, so what it lists is what the
     // real run would install.
+    var bootstrapped: usize = 0;
     var bootstrap_failed: usize = 0;
     var would_bootstrap: std.ArrayList([]const u8) = .empty;
     if (!dry_run) {
-        bootstrap_failed = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, mox_path_dirs);
+        const done = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, mox_path_dirs);
+        bootstrapped = done.bootstrapped;
+        bootstrap_failed = done.failed;
     } else {
         for (manifest.bootstrap) |b| {
             if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
@@ -1023,6 +1037,7 @@ fn applyPackages(
     };
     var counts: PackageCounts = .{
         .in_use = true,
+        .bootstrapped = bootstrapped,
         .failed = bootstrap_failed,
         .would_bootstrap = would_bootstrap.items.len,
     };
@@ -1148,13 +1163,24 @@ fn foldMoxPathAdditions(
     const new_dirs = try reader.readNew(ctx.alloc, ctx.io, ctx.err);
     if (new_dirs.len == 0) return;
     if (m_state.tool_probe) |tp| tp.extend(new_dirs);
-    try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), new_dirs));
-    // The running mox stays ahead of whatever a script published: a `mox`
-    // beside a tool in `$MOX_PATH` must not displace it for later scripts.
+    try prependPathDirs(ctx, script_env, new_dirs, mox_bin_dir);
+    try dirs_so_far.appendSlice(ctx.alloc, new_dirs);
+}
+
+/// Put `dirs` ahead on the scripts' PATH, with the running mox ahead of them
+/// all: a `mox` beside a tool in a published dir must not displace it for
+/// later scripts.
+fn prependPathDirs(
+    ctx: *app.Ctx,
+    script_env: *std.process.Environ.Map,
+    dirs: []const []const u8,
+    mox_bin_dir: ?[]const u8,
+) !void {
+    if (dirs.len == 0) return;
+    try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), dirs));
     if (mox_bin_dir) |dir| {
         try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), &.{dir}));
     }
-    try dirs_so_far.appendSlice(ctx.alloc, new_dirs);
 }
 
 /// A file just skipped as axis-gated off: when its whole-file gate names an
