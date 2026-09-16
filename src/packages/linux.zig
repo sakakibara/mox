@@ -6,13 +6,15 @@
 //! grows a concept of its own -- dnf module streams, apt architectures --
 //! earns its fields here rather than in the core.
 //!
-//! Every install goes through `sudo` and is non-interactive, because
-//! `mox apply` is: a manager that stops to ask a question mox cannot answer
-//! would hang a bootstrap. The argv match what the dotfiles' own shell
-//! bootstrap has been running on these distros.
+//! Every install is non-interactive, because `mox apply` is: a manager that
+//! stops to ask a question mox cannot answer would hang a bootstrap. The
+//! argv match what the dotfiles' own shell bootstrap has been running on
+//! these distros.
 //!
-//! Root is not assumed. A manager reports what is installed without
-//! privilege, so only the install path is elevated.
+//! An install elevates through `sudo` only when the process is not already
+//! root. A container and a root WSL install commonly have no `sudo` at all,
+//! where prepending it unconditionally turns every install into
+//! "sudo: command not found". Queries never elevate.
 
 const std = @import("std");
 
@@ -53,7 +55,12 @@ pub const Manager = enum {
     fn queryArgv(self: Manager) []const []const u8 {
         return switch (self) {
             .apt => &.{ "apt-mark", "showmanual" },
-            .dnf => &.{ "dnf", "repoquery", "--userinstalled", "--qf", "%{name}" },
+            // The trailing newline is load-bearing: without it dnf5 emits
+            // every name concatenated into one line, which reads back as a
+            // single absurd package and makes every declared row look
+            // missing. The default format is full NEVRA
+            // (`bat-0:0.24.0-1.fc44.aarch64`), which matches no row either.
+            .dnf => &.{ "dnf", "repoquery", "--userinstalled", "--qf", "%{name}\n" },
             .pacman => &.{ "pacman", "-Qeq" },
         };
     }
@@ -62,6 +69,9 @@ pub const Manager = enum {
 pub const Distro = struct {
     manager: Manager,
     runner: exec.Runner,
+    /// Overrides the root check, so a test can exercise both paths on a host
+    /// whose own uid it does not control.
+    force_elevate: ?bool = null,
 
     pub fn backend(self: *Distro) Backend {
         return .{ .name = self.manager.name(), .ctx = self, .vtable = &vtable };
@@ -126,18 +136,24 @@ pub const Distro = struct {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         if (rows.len == 0) return;
 
+        const elevate = self.elevates();
+
         if (self.manager == .apt) {
             // An install resolves against the index, so a stale one turns a
             // present package into "not found".
-            const up = try self.runner.stream(arena, &.{ "sudo", "apt-get", "update" });
+            var up_argv: std.ArrayList([]const u8) = .empty;
+            if (elevate) try up_argv.append(arena, "sudo");
+            try up_argv.appendSlice(arena, &.{ "apt-get", "update" });
+            const up = try self.runner.stream(arena, up_argv.items);
             if (!up.ok) return Error.DistroInstallFailed;
         }
 
         var argv: std.ArrayList([]const u8) = .empty;
+        if (elevate) try argv.append(arena, "sudo");
         const head: []const []const u8 = switch (self.manager) {
-            .apt => &.{ "sudo", "apt-get", "install", "-y" },
-            .dnf => &.{ "sudo", "dnf", "install", "-y" },
-            .pacman => &.{ "sudo", "pacman", "-Syu", "--needed", "--noconfirm" },
+            .apt => &.{ "apt-get", "install", "-y" },
+            .dnf => &.{ "dnf", "install", "-y" },
+            .pacman => &.{ "pacman", "-Syu", "--needed", "--noconfirm" },
         };
         try argv.appendSlice(arena, head);
         for (rows) |row| try argv.append(arena, row.name);
@@ -146,10 +162,24 @@ pub const Distro = struct {
         if (!res.ok) return Error.DistroInstallFailed;
     }
 
+    /// Whether an install needs `sudo`. Root already has the privilege, and
+    /// a minimal image that runs as root often ships no `sudo` binary.
+    fn elevates(self: *Distro) bool {
+        if (self.force_elevate) |f| return f;
+        return !isRoot();
+    }
+
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
         return .{ .name = id };
     }
 };
+
+fn isRoot() bool {
+    return switch (@import("builtin").os.tag) {
+        .linux, .macos => std.c.geteuid() == 0,
+        else => false,
+    };
+}
 
 const testing = std.testing;
 
@@ -173,7 +203,7 @@ test "installedExplicit: manual packages come back one per line" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showmanual", .stdout = "bat\nfd-find\n\nripgrep\n" },
     } };
-    var d: Distro = .{ .manager = .apt, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     const got = try d.backend().installedExplicit(a);
     try testing.expectEqual(@as(usize, 3), got.len);
@@ -189,14 +219,44 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qeq", .code = 1 },
     } };
-    var d: Distro = .{ .manager = .pacman, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
     try testing.expectError(Error.DistroQueryFailed, d.backend().installedExplicit(a));
 }
 
-test "dnf: the query asks for bare names, not full NEVRA" {
-    // `repoquery --userinstalled` defaults to name-epoch:version-release.arch,
-    // which would match no manifest row.
-    try testing.expectEqualStrings("%{name}", Manager.dnf.queryArgv()[4]);
+test "dnf: the query asks for newline-separated bare names" {
+    // Verified against dnf5 5.4.3: the default format is full NEVRA, and a
+    // format string without the newline concatenates every name into one.
+    try testing.expectEqualStrings("%{name}\n", Manager.dnf.queryArgv()[4]);
+}
+
+test "install: root installs without sudo, which a minimal image lacks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf install -y bat" },
+    } };
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
+
+    // The Fake errors on anything unscripted, so a stray `sudo` fails here.
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(fake.called("dnf install -y bat"));
+}
+
+test "install: apt as root refreshes without sudo too" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "apt-get update" },
+        .{ .argv = "apt-get install -y bat" },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(fake.called("apt-get update"));
 }
 
 test "install: apt refreshes the index, then installs the whole set at once" {
@@ -208,7 +268,7 @@ test "install: apt refreshes the index, then installs the whole set at once" {
         .{ .argv = "sudo apt-get update" },
         .{ .argv = "sudo apt-get install -y bat fd-find" },
     } };
-    var d: Distro = .{ .manager = .apt, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("fd-find", &.{}) });
     try testing.expect(fake.called("sudo apt-get update"));
@@ -223,7 +283,7 @@ test "install: dnf takes one non-interactive command" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo dnf install -y bat ripgrep" },
     } };
-    var d: Distro = .{ .manager = .dnf, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
 
     // The Fake errors on anything unscripted, so a stray refresh fails here.
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ripgrep", &.{}) });
@@ -238,7 +298,7 @@ test "install: pacman syncs and installs only what is needed" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo pacman -Syu --needed --noconfirm bat" },
     } };
-    var d: Distro = .{ .manager = .pacman, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expect(fake.called("sudo pacman -Syu --needed --noconfirm bat"));
@@ -252,7 +312,7 @@ test "install: a failed install is an error, not a silent skip" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo dnf install -y bat", .code = 1 },
     } };
-    var d: Distro = .{ .manager = .dnf, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
     try testing.expectError(Error.DistroInstallFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
 }
 
@@ -262,7 +322,7 @@ test "install: nothing to install runs no command at all" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
-    var d: Distro = .{ .manager = .apt, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{});
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
@@ -275,7 +335,7 @@ test "validate: a key meant for another manager is refused" {
     _ = a;
 
     var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
-    var d: Distro = .{ .manager = .apt, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     const row = rowOf("bat", &.{.{ .key = "kind", .value = .{ .string = "cask" } }});
     var diag: Diag = .{};
@@ -309,7 +369,7 @@ test "declare: an observed name round-trips to a bare row" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
-    var d: Distro = .{ .manager = .pacman, .runner = fake.runner() };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
     const be = d.backend();
 
     const decl = try be.declare(a, "ripgrep");

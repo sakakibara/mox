@@ -393,7 +393,7 @@ fn dnfWith(
     try entries.append(a, .{ .argv = "pacman --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "dnf --version", .stdout = "dnf 4.18.0\n" });
     try entries.append(a, .{
-        .argv = "dnf repoquery --userinstalled --qf %{name}",
+        .argv = "dnf repoquery --userinstalled --qf %{name}\n",
         .stdout = installed,
     });
     for (extra) |e| try entries.append(a, e);
@@ -423,8 +423,11 @@ test "linux: a dnf machine reports and installs through the same core" {
         \\
     );
 
+    // Both spellings are scripted: whether an install elevates depends on the
+    // uid running this suite, and the fixture must not depend on that.
     const fake = try dnfWith(a, "bat\nhtop\n", &.{
         .{ .argv = "sudo dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
