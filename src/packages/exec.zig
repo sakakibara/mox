@@ -145,6 +145,15 @@ pub fn checkTimedOut(res: Result) error{TimedOut}!void {
     if (res.timed_out) return error.TimedOut;
 }
 
+/// The same for a captured call an adapter makes inside a streamed verb --
+/// scoop's `install` asks `scoop bucket list` first. That call answers to the
+/// capture bound, not to the streamed verb's, so its kill must reach the
+/// report as its own error: the call site knows only which bound it armed,
+/// and would otherwise name a variable that changes nothing.
+pub fn checkCaptureTimedOut(res: Result) error{CaptureTimedOut}!void {
+    if (res.timed_out) return error.CaptureTimedOut;
+}
+
 /// A call's failure in words where words exist, and its error name where they
 /// do not. Reached from every report of a verb that did not answer, so one
 /// failure never reads two ways.
@@ -157,15 +166,14 @@ pub fn errorText(e: anyerror) []const u8 {
 
 /// The same, naming the bound for a reader who may want to change it.
 ///
-/// `bound_ms`/`bound_var` are the bound the call site believes it armed: an
-/// install or an installer run is streamed and bounded as an install, while a
-/// download is captured and bounded like a setup script. The call site can be
-/// wrong about it, because an adapter's streamed verb may make a captured
-/// call of its own -- scoop's `install` asks `scoop bucket list` first -- and
-/// that kill escapes wearing the streamed verb's name. When the believed
-/// bound is not armed at all it cannot be the one that fired, so the captured
-/// bound is named instead, which is the only other one there is. With neither
-/// armed nothing could have killed the call, so no bound is named.
+/// `bound_ms`/`bound_var` are the bound the call site armed: an install or an
+/// installer run is streamed and bounded as an install, while a download is
+/// captured and bounded like a setup script. Which of the two fired is the
+/// error's to say, not the call site's -- an adapter's streamed verb may make
+/// a captured call of its own, which answers to the capture bound while the
+/// call site knows only the streamed one -- so `CaptureTimedOut` names the
+/// capture bound wherever it arrives. A bound of `0` is not armed and so
+/// cannot have fired, and there is then nothing to name.
 pub fn failureText(
     arena: std.mem.Allocator,
     e: anyerror,
@@ -179,7 +187,9 @@ pub fn failureText(
         // two ways.
         error.TimedOut, error.PluginTimedOut => if (bound_ms > 0)
             try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var })
-        else if (capture_ms > 0)
+        else
+            "timed out, killed",
+        error.CaptureTimedOut => if (capture_ms > 0)
             try std.fmt.allocPrint(arena, "timed out after {d}ms (MOX_SCRIPT_TIMEOUT_MS), killed", .{capture_ms})
         else
             "timed out, killed",
@@ -1231,28 +1241,36 @@ test "Process: a bound shorter than one look at the child is still kept" {
     try testing.expect(elapsed_ms < 10_000);
 }
 
-test "failureText: a kill under a bound nobody armed names the bound that was" {
+test "failureText: the bound that fired is named, whichever of the two it was" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     // A streamed verb can make a captured call of its own -- scoop's install
-    // asks `scoop bucket list` first -- so a kill escapes wearing the streamed
-    // verb's name while the captured bound is what fired. Naming the install
-    // bound there would report `0ms`, which is how no bound at all is spelled,
-    // and send the reader to a variable that changes nothing.
+    // asks `scoop bucket list` first -- which answers to the capture bound
+    // even while the install bound is armed. The error says which fired; the
+    // call site only knows which it armed.
     try testing.expectEqualStrings(
         "timed out after 600000ms (MOX_SCRIPT_TIMEOUT_MS), killed",
-        try failureText(a, error.TimedOut, 0, "MOX_INSTALL_TIMEOUT_MS", 600_000),
+        try failureText(a, error.CaptureTimedOut, 1_800_000, "MOX_INSTALL_TIMEOUT_MS", 600_000),
+    );
+    try testing.expectEqualStrings(
+        "timed out after 600000ms (MOX_SCRIPT_TIMEOUT_MS), killed",
+        try failureText(a, error.CaptureTimedOut, 0, "MOX_INSTALL_TIMEOUT_MS", 600_000),
     );
     try testing.expectEqualStrings(
         "timed out after 30000ms (MOX_INSTALL_TIMEOUT_MS), killed",
         try failureText(a, error.TimedOut, 30_000, "MOX_INSTALL_TIMEOUT_MS", 600_000),
     );
-    // With neither armed nothing could have killed it, so no bound is named.
+    // A bound of 0 is not armed, so it cannot have fired and there is nothing
+    // to name.
     try testing.expectEqualStrings(
         "timed out, killed",
-        try failureText(a, error.TimedOut, 0, "MOX_INSTALL_TIMEOUT_MS", 0),
+        try failureText(a, error.TimedOut, 0, "MOX_INSTALL_TIMEOUT_MS", 600_000),
+    );
+    try testing.expectEqualStrings(
+        "timed out, killed",
+        try failureText(a, error.CaptureTimedOut, 1_800_000, "MOX_INSTALL_TIMEOUT_MS", 0),
     );
 }
 
@@ -1276,13 +1294,56 @@ test "Process: a bounded call over a reaped child leaves no descriptor behind" {
     try testing.expectEqual(before, openDescriptors());
 }
 
-/// How many descriptors this process holds: a fresh `dup` lands on the lowest
-/// free one, so its number is the count.
-fn openDescriptors() i32 {
+/// How many descriptors this process holds, counted one by one. A process's
+/// descriptors are not dense from 0 -- a Zig runtime holds 0-5 and 9 -- so the
+/// number a fresh `dup` lands on is the lowest free one, which says nothing
+/// about how many are open: a leak above a hole does not move it at all.
+fn openDescriptors() usize {
+    return switch (builtin.os.tag) {
+        .windows => 0,
+        else => blk: {
+            var n: usize = 0;
+            var fd: c_int = 0;
+            while (fd < 4096) : (fd += 1) {
+                if (std.c.fcntl(fd, std.c.F.GETFD) >= 0) n += 1;
+            }
+            break :blk n;
+        },
+    };
+}
+
+/// The number a fresh `dup` lands on: the lowest free descriptor.
+fn lowestFreeDescriptor() i32 {
     const fd = std.c.dup(0);
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
     _ = std.c.close(fd);
     return fd;
+}
+
+test "openDescriptors: counts a leak that the lowest free descriptor cannot see" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const before = openDescriptors();
+    const lowest_before = lowestFreeDescriptor();
+
+    // Each round takes the lowest free descriptor, leaks one above it, and
+    // gives the low one back, so the hole never moves. This is the shape of a
+    // leak the regression test above must keep catching, and the reason its
+    // oracle counts rather than asking where a `dup` lands.
+    var leaked: [5]i32 = undefined;
+    for (&leaked) |*fd| {
+        const transient = std.c.dup(0);
+        try testing.expect(transient >= 0);
+        fd.* = std.c.dup(0);
+        try testing.expect(fd.* >= 0);
+        _ = std.c.close(transient);
+    }
+    defer for (leaked) |fd| {
+        _ = std.c.close(fd);
+    };
+
+    try testing.expectEqual(lowest_before, lowestFreeDescriptor());
+    try testing.expectEqual(before + leaked.len, openDescriptors());
 }
 
 test "Process: a straggler holding the pipe after the child is reaped is bounded too" {

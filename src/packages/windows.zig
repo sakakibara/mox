@@ -167,7 +167,9 @@ pub const Scoop = struct {
         for (rows) |row| {
             if (bucketOf(row) == null) continue;
             const res = try self.call(arena, &.{ "bucket", "list" }, false);
-            try exec.checkTimedOut(res);
+            // Captured inside a streamed verb, so it answers to the capture
+            // bound; the install's call site knows only the install bound.
+            try exec.checkCaptureTimedOut(res);
             if (!res.ok) return Error.ScoopBucketListFailed;
             listed = try bucketNames(arena, res.stdout);
             break;
@@ -614,6 +616,29 @@ test "scoop: a bucket list that fails is a named failure, and nothing is added b
         scoopRow("firefox", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }}),
     }));
     try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+}
+
+test "scoop: a bucket list killed at its bound is reported under the bound that fired" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop bucket list", .timed_out = true },
+    } };
+    var s: Scoop = .{ .runner = fake.runner() };
+
+    const e: anyerror = if (s.backend().install(a, &.{
+        scoopRow("firefox", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }}),
+    })) |_| return error.TestExpectedError else |err| err;
+    try testing.expectEqual(error.CaptureTimedOut, e);
+    // What `mox apply` prints for it: the install bound is armed and much
+    // larger, and naming it would send the reader to a variable that changes
+    // nothing and a number nothing waited.
+    try testing.expectEqualStrings(
+        "timed out after 600000ms (MOX_SCRIPT_TIMEOUT_MS), killed",
+        try exec.failureText(a, e, 1_800_000, "MOX_INSTALL_TIMEOUT_MS", 600_000),
+    );
 }
 
 test "bucketNames: the table's header and rule are not buckets; the bare form still parses" {
