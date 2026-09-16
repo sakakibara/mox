@@ -98,6 +98,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // Backend adapters against the real package managers, at
+    // tests/packages_backends_test.zig. Deliberately NOT on `test`: the
+    // hermetic suite must pass with no package manager installed and must
+    // never touch the one a machine has. Scheduled CI runs this as the
+    // tripwire for a manager changing under an adapter.
+    const backends_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/packages_backends_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    backends_tests_mod.addImport("mox", lib_mod);
+    const backends_tests = b.addTest(.{ .root_module = backends_tests_mod });
+    const backends_step = b.step("test-backends", "Run adapter tests against the real package managers");
+    backends_step.dependOn(&b.addRunArtifact(backends_tests).step);
+
     // Integration tests at tests/dsl_test.zig.
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/dsl_test.zig"),
