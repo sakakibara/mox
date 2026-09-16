@@ -87,15 +87,24 @@ pub const Zypper = struct {
             );
             return Error.ZypperSelectorRow;
         }
-        if (std.mem.lastIndexOfScalar(u8, row.name, '.')) |dot| {
-            for ([_][]const u8{ "x86_64", "i586", "i686", "aarch64", "armv7hl", "ppc64le", "s390x", "noarch" }) |arch| {
-                if (!std.mem.eql(u8, row.name[dot + 1 ..], arch)) continue;
-                if (diag) |d| d.set(
-                    "{s}: row \"{s}\": zypper rows name a package, with no architecture",
-                    .{ row.label, row.name },
-                );
-                return Error.ZypperSelectorRow;
-            }
+        // Everything else zypper's install grammar accepts, refused by what a
+        // package name IS rather than by a list of the shapes it is not:
+        // `zypper install vim !nano` and `zypper install vim -nano` both
+        // remove nano, and a capability (`pkgconfig(libcrypto)`) installs a
+        // package of an entirely different name.
+        if (backend_mod.plainNameProblem(row.name)) |problem| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": zypper rows name a package: {s}",
+                .{ row.label, row.name, problem.text() },
+            );
+            return Error.ZypperSelectorRow;
+        }
+        if (backend_mod.rpmArchSuffix(row.name)) |_| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": zypper rows name a package, with no architecture",
+                .{ row.label, row.name },
+            );
+            return Error.ZypperSelectorRow;
         }
         if (row.fields.len == 0) return;
         if (diag) |d| d.set(
@@ -168,7 +177,10 @@ pub const Zypper = struct {
 
         var argv: std.ArrayList([]const u8) = .empty;
         if (elevate) try argv.append(arena, "sudo");
-        try argv.appendSlice(arena, &.{ "zypper", "--non-interactive", "install" });
+        // `--` is accepted by zypper 1.14.101 and stops anything after it
+        // being read as an option. `validate` is what refuses a name that is
+        // not a package name; this bounds what a name reaching zypper can do.
+        try argv.appendSlice(arena, &.{ "zypper", "--non-interactive", "install", "--" });
         for (rows) |row| try argv.append(arena, row.name);
 
         const res = try self.runner.stream(arena, argv.items);
@@ -305,7 +317,7 @@ test "install: refreshes, installs the batch, and records what landed" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
-        .{ .argv = "sudo zypper --non-interactive install ripgrep bat" },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
@@ -325,7 +337,7 @@ test "install: a failure that landed nothing records nothing" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
-        .{ .argv = "sudo zypper --non-interactive install ripgrep", .code = 1 },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep", .code = 1 },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nglibc\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -348,7 +360,7 @@ test "install: a failed batch records the rows that landed, and only those" {
     // failing sibling on every apply.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
-        .{ .argv = "sudo zypper --non-interactive install ripgrep nosuch", .code = 104 },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep nosuch", .code = 104 },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -373,7 +385,7 @@ test "install: an install killed at its bound still records what landed" {
     // prevent -- so the record happens first and the kill is still reported.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
-        .{ .argv = "sudo zypper --non-interactive install ripgrep bat", .timed_out = true },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat", .timed_out = true },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -396,7 +408,7 @@ test "install: a kill whose read-back also fails is still reported as a kill" {
     // stopped the install is what the caller must be told.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
-        .{ .argv = "sudo zypper --non-interactive install ripgrep", .timed_out = true },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep", .timed_out = true },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .code = 1 },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -417,8 +429,8 @@ test "install: a reboot or restart needed after the install is a success" {
     // (103) are informational; rpm is not consulted for a success.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
-        .{ .argv = "sudo zypper --non-interactive install kernel-default", .code = 102, .once = true },
-        .{ .argv = "sudo zypper --non-interactive install kernel-default", .code = 103 },
+        .{ .argv = "sudo zypper --non-interactive install -- kernel-default", .code = 102, .once = true },
+        .{ .argv = "sudo zypper --non-interactive install -- kernel-default", .code = 103 },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
@@ -442,11 +454,11 @@ test "install: an informational refresh exit is not a failed install" {
     for (codes) |code| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "sudo zypper --non-interactive refresh", .code = code },
-            .{ .argv = "sudo zypper --non-interactive install bat" },
+            .{ .argv = "sudo zypper --non-interactive install -- bat" },
         } };
         var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
         try z.backend().install(a, &.{rowOf("bat", &.{})});
-        try testing.expect(fake.called("sudo zypper --non-interactive install bat"));
+        try testing.expect(fake.called("sudo zypper --non-interactive install -- bat"));
     }
 
     // 104 (ZYPPER_EXIT_INF_CAP_NOT_FOUND) after a refresh is not among them.
@@ -467,13 +479,13 @@ test "install: root installs without sudo" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "zypper --non-interactive refresh" },
-        .{ .argv = "zypper --non-interactive install bat" },
+        .{ .argv = "zypper --non-interactive install -- bat" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
     z.force_elevate = false;
 
     try z.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expect(fake.called("zypper --non-interactive install bat"));
+    try testing.expect(fake.called("zypper --non-interactive install -- bat"));
 }
 
 test "backend: the blind spot is declared, not left to be discovered" {
@@ -519,4 +531,103 @@ test "validate: a key meant for another manager is refused" {
     var d: Diag = .{};
     const row = rowOf("bat", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }});
     try testing.expectError(Error.UnknownZypperKey, z.backend().validate(row, &d));
+}
+
+test "validate: a name zypper would read as an operation is refused" {
+    // `zypper --non-interactive install vim !nano` and the same with `-nano`
+    // both report "1 to remove". Proved against zypper 1.14 in a tumbleweed
+    // container; the row is refused before any argv is built.
+    var z: Zypper = .{ .runner = undefined, .ledger = undefined };
+
+    var d: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("!nano", &.{}), &d));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"!nano\": zypper rows name a package: a name begins with a letter or a digit",
+        d.capture().?,
+    );
+
+    var minus: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("-nano", &.{}), &minus));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"-nano\": zypper rows name a package: a name begins with a letter or a digit",
+        minus.capture().?,
+    );
+
+    var trailing: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("nano-", &.{}), &trailing));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"nano-\": zypper rows name a package: a name does not end with \"-\", which an install reads as a request to remove the package",
+        trailing.capture().?,
+    );
+}
+
+test "validate: a capability zypper resolves to another package is refused" {
+    // `zypper install pkgconfig(libcrypto)` installs libressl-devel, which
+    // rpm then reports under that name: the row would be MISSING on every
+    // status and reinstalled on every apply.
+    var z: Zypper = .{ .runner = undefined, .ledger = undefined };
+
+    var d: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("pkgconfig(libcrypto)", &.{}), &d));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"pkgconfig(libcrypto)\": zypper rows name a package: a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+        d.capture().?,
+    );
+
+    for ([_][]const u8{ "perl(Foo::Bar)", "repo/pkg", "/usr/bin/vim", "vim,nano", "@group" }) |name| {
+        var dg: Diag = .{};
+        try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf(name, &.{}), &dg));
+    }
+}
+
+test "validate: the more specific selector and relation messages stand" {
+    // The general rule would also refuse these, with a clause that says less
+    // about why rpm cannot read the row back.
+    var z: Zypper = .{ .runner = undefined, .ledger = undefined };
+
+    var sel: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("pattern:devel_basis", &.{}), &sel));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"pattern:devel_basis\": zypper rows name packages; a \"pattern\" selector cannot be read back from rpm",
+        sel.capture().?,
+    );
+
+    var rel: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("vim>=9.0", &.{}), &rel));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"vim>=9.0\": zypper rows name a package, with no version or relation",
+        rel.capture().?,
+    );
+
+    var arch: Diag = .{};
+    try testing.expectError(Error.ZypperSelectorRow, z.backend().validate(rowOf("vim.x86_64", &.{}), &arch));
+    try testing.expectEqualStrings(
+        "data/packages/suse.toml: row \"vim.x86_64\": zypper rows name a package, with no architecture",
+        arch.capture().?,
+    );
+}
+
+test "validate: the names real distributions ship are taken" {
+    var z: Zypper = .{ .runner = undefined, .ledger = undefined };
+    for ([_][]const u8{ "g++", "lib32-glibc", "python3.11", "gcc-c++", "zlib1g-dev", "perl-Foo-Bar", "libstdc++6" }) |name| {
+        try z.backend().validate(rowOf(name, &.{}), null);
+    }
+}
+
+test "install: the operands follow a --, so no name can be read as an option" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "sudo zypper --non-interactive install -- bat" },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    try z.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqualStrings("sudo zypper --non-interactive install -- bat", fake.calls.items[1]);
 }

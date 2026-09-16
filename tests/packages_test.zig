@@ -450,8 +450,8 @@ test "linux: a dnf machine reports and installs through the same core" {
     // Both spellings are scripted: whether an install elevates depends on the
     // uid running this suite, and the fixture must not depend on that.
     const fake = try dnfWith(a, "bat\nhtop\n", &.{
-        .{ .argv = "sudo dnf install -y ripgrep" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "sudo dnf install -y -- ripgrep" },
+        .{ .argv = "dnf install -y -- ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -461,11 +461,11 @@ test "linux: a dnf machine reports and installs through the same core" {
     try std.testing.expect(std.mem.indexOf(u8, s.out, "UNTRACKED dnf htop") != null);
 
     const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
-        .{ .argv = "sudo dnf install -y ripgrep" },
+        .{ .argv = "sudo dnf install -y -- ripgrep" },
     });
     useFake(fake2);
     _ = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(fake2.called("sudo dnf install -y ripgrep"));
+    try std.testing.expect(fake2.called("sudo dnf install -y -- ripgrep"));
 }
 
 test "linux: a manifest for a manager this machine lacks is inert, not an error" {
@@ -736,6 +736,41 @@ test "status: an absent manager apply would bootstrap is not a clean machine" {
         "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"ripgrep\",\"name\":\"ripgrep\"}",
     ) != null);
     try std.testing.expectEqual(@as(u8, 1), j.rc);
+}
+
+test "commit: a declared row its own backend would refuse is not written" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml", "backend = \"apt\"\n");
+
+    // The manager reports an installed package whose name an apt install
+    // would read as a request to remove it. Writing that row would leave a
+    // file every later command refuses, and no mox command could repair it.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
+    try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = "nano-\n" });
+    try entries.append(a, .{ .argv = "brew --version", .code = 127 });
+    try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
+    try entries.append(a, .{ .argv = "pacman --version", .code = 127 });
+    try entries.append(a, .{ .argv = "zypper --version", .code = 127 });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "the row it declares would be refused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "does not end with \"-\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "recorded in") == null);
+    // The file is exactly what it was: no row, and nothing to repair.
+    const after = try readManifest(io, h, a, "debian.toml");
+    try std.testing.expectEqualStrings("backend = \"apt\"\n", after);
 }
 
 test "status: one backend failing a verb does not throw away what the others answered" {

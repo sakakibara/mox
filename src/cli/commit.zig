@@ -595,6 +595,36 @@ fn reconcilePackages(
                 res.skipped += 1;
                 continue;
             };
+            // The row about to be written is put through the same check the
+            // loader applies to one already written: an adapter that answers
+            // with a name its own rules refuse would have mox write a file
+            // every later command rejects, and no mox command could repair
+            // it.
+            {
+                var row_diag: mox.packages.manifest.Diag = .{};
+                const candidate: mox.packages.manifest.Row = .{
+                    .name = decl.name,
+                    .backend = b.backend,
+                    .fields = decl.fields,
+                    .origin = dest.path,
+                    .label = dest.label,
+                    .index = 0,
+                };
+                backend.validate(candidate, &row_diag) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => {
+                        try ctx.out.flush();
+                        const why = row_diag.capture() orelse @errorName(e);
+                        try ctx.err.print(
+                            "mox commit: {s} {s}: the row it declares would be refused: {s}\n",
+                            .{ b.backend, id, why },
+                        );
+                        try ctx.err.flush();
+                        res.skipped += 1;
+                        continue;
+                    },
+                };
+            }
             // The file's own default already names the backend; repeating it
             // on the row would be a second spelling of one fact.
             const needs_backend = dest.default_backend == null or
@@ -5429,6 +5459,7 @@ fn writeGlyph(out: *Io.Writer, c: prompt.Choice, is_default: bool, sty: style.St
 
 pub const command = app.command(Spec, .{
     .name = "commit",
+    .usage = "mox commit [--flags] [<paths...>]",
     .summary = "Route live-file edits back into their sources",
     .details = "Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely. Prompts [y/s] per hunk (--yes: take defaults; --dry-run: report only, exit 1 if edits remain; --abort-on-prompt: strict CI, rc 2 on the first prompt); a structured key change prompts [y/p/s] to accept the winning layer, pick another, or skip. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region); a changed token shared by other sources prompts to update them too.",
     .group = .general,

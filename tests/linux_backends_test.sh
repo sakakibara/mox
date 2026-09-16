@@ -24,6 +24,13 @@
 # starts with `mox apply` bootstrapping Homebrew from the pinned installer --
 # the same fetch, digest check and non-interactive install a fresh machine
 # gets -- before installing the package through it.
+#
+# One case runs the other way round. mox never uninstalls anything, and an
+# install argv accepts more than package names: `apt-get install -y vim nano-`
+# removes nano. The hermetic suite proves the adapter refuses such a row; only
+# a real apt, with a real nano installed beside it, proves that the row would
+# have removed the package and that mox stopped before it could. That case
+# runs with the default set, not from the image/backend/package arguments.
 
 set -eu
 
@@ -261,6 +268,66 @@ EOF
   fi
 }
 
+# A row named `nano-` is apt's remove form, not a package. The row must be
+# refused by `mox status` -- which never runs apt at all -- and the nano the
+# image has installed must still be there afterwards.
+run_remove_suffix_case() {
+  image="$1"
+  backend="apt remove-suffix"
+
+  case_dir="$work/remove-suffix"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "nano-"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  # nano is installed first so its survival is a fact about this run, not
+  # about what the image happened to ship.
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      apt-get update >/dev/null
+      apt-get install -y nano >/dev/null
+      [ -x /bin/nano ] || { echo "nano did not install; the case cannot run"; exit 1; }
+      echo "--- status ---"
+      rc=0
+      /w/mox status || rc=$?
+      echo "status-exit=$rc"
+      echo "--- nano ---"
+      [ -x /bin/nano ] && echo "nano=present" || echo "nano=gone"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  # The message names the file, the row and the rule the name broke.
+  if grep -q 'data/packages/apt.toml: row "nano-": apt rows name a package: a name does not end with "-"' "$out"; then
+    ok "$backend ($image): the row is refused, naming the file, the row and the reason"
+  else
+    no "$backend ($image): status did not refuse the row with the expected message" "$(grep -i 'packages:' "$out" | tail -3)"
+  fi
+
+  if grep -q "status-exit=0" "$out"; then
+    no "$backend ($image): a refused package pass exited 0" "$(grep 'status-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused package pass is counted in the exit code"
+  fi
+
+  if grep -q "nano=present" "$out"; then
+    ok "$backend ($image): nano is still installed; the row never reached apt"
+  else
+    no "$backend ($image): nano was removed" "$(tail -5 "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -268,6 +335,7 @@ if [ "$#" -gt 0 ]; then
   done
 else
   run_case debian:stable apt ripgrep
+  run_remove_suffix_case debian:stable
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.

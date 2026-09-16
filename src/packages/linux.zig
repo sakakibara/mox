@@ -26,6 +26,7 @@ pub const Backend = backend_mod.Backend;
 
 pub const Error = error{
     UnknownDistroKey,
+    DistroSelectorRow,
     DistroQueryFailed,
     DistroInstallFailed,
 };
@@ -93,12 +94,38 @@ pub const Distro = struct {
         return Backend.probeAvailability(try std.fmt.allocPrint(arena, "{s} --version", .{exe}), self.runner.run(arena, &.{ exe, "--version" }));
     }
 
-    /// These managers take no row keys of their own. Refusing an unknown
-    /// one keeps a key that means something to a different manager (a brew
-    /// `kind`, a scoop `bucket`) from sitting in a row that silently ignores
-    /// it.
+    /// A row names one plain package and carries no key.
+    ///
+    /// The name is checked against `plainNameProblem` rather than against a
+    /// list of bad shapes: an install argv accepts more than package names,
+    /// and `apt-get install -y vim nano-` removes nano -- which would make
+    /// `mox apply` uninstall a package on every run.
+    ///
+    /// Refusing an unknown key keeps a key that means something to a
+    /// different manager (a brew `kind`, a scoop `bucket`) from sitting in a
+    /// row that silently ignores it.
     fn validateImpl(ctx: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
         const self: *Distro = @ptrCast(@alignCast(ctx));
+        if (backend_mod.plainNameProblem(row.name)) |problem| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": {s} rows name a package: {s}",
+                .{ row.label, row.name, self.manager.name(), problem.text() },
+            );
+            return Error.DistroSelectorRow;
+        }
+        // dnf also takes a full NEVRA (`bat-0.24.0-1.x86_64`) and a bare
+        // `name.arch`, both of which rpm reports under the bare name: the row
+        // would install and then read as missing on every status after. apt
+        // and pacman have no such spelling within the plain-name class.
+        if (self.manager == .dnf) {
+            if (backend_mod.rpmArchSuffix(row.name)) |_| {
+                if (diag) |d| d.set(
+                    "{s}: row \"{s}\": dnf rows name a package, with no architecture",
+                    .{ row.label, row.name },
+                );
+                return Error.DistroSelectorRow;
+            }
+        }
         if (row.fields.len == 0) return;
         if (diag) |d| d.set(
             "{s}: row \"{s}\": {s} accepts no key \"{s}\"",
@@ -158,6 +185,12 @@ pub const Distro = struct {
             .pacman => &.{ "pacman", "-Syu", "--needed", "--noconfirm" },
         };
         try argv.appendSlice(arena, head);
+        // Accepted by apt-get 3.0.3, dnf5 5.4.3 and pacman 7.1.0, and stops
+        // anything after it being read as an option. It is not the fix --
+        // `validate` refuses a name that is not a package name, and apt reads
+        // its remove suffix after a `--` all the same -- but it bounds what a
+        // name reaching the manager can do.
+        try argv.append(arena, "--");
         for (rows) |row| try argv.append(arena, row.name);
 
         const res = try self.runner.stream(arena, argv.items);
@@ -244,13 +277,13 @@ test "install: root installs without sudo, which a minimal image lacks" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf install -y bat" },
+        .{ .argv = "dnf install -y -- bat" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
 
     // The Fake errors on anything unscripted, so a stray `sudo` fails here.
     try d.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expect(fake.called("dnf install -y bat"));
+    try testing.expect(fake.called("dnf install -y -- bat"));
 }
 
 test "install: apt as root refreshes without sudo too" {
@@ -260,13 +293,13 @@ test "install: apt as root refreshes without sudo too" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y bat" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get update"));
-    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y bat"));
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat"));
 }
 
 test "install: apt refreshes the index, then installs the whole set at once, debconf silenced" {
@@ -278,13 +311,13 @@ test "install: apt refreshes the index, then installs the whole set at once, deb
     // from the environment along with everything else.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bat fd-find" },
+        .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("fd-find", &.{}) });
     try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[0]);
-    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bat fd-find", fake.calls.items[1]);
+    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find", fake.calls.items[1]);
 }
 
 test "install: dnf takes one non-interactive command" {
@@ -293,13 +326,13 @@ test "install: dnf takes one non-interactive command" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "sudo dnf install -y bat ripgrep" },
+        .{ .argv = "sudo dnf install -y -- bat ripgrep" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
 
     // The Fake errors on anything unscripted, so a stray refresh fails here.
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ripgrep", &.{}) });
-    try testing.expect(fake.called("sudo dnf install -y bat ripgrep"));
+    try testing.expect(fake.called("sudo dnf install -y -- bat ripgrep"));
 }
 
 test "install: pacman syncs and installs only what is needed" {
@@ -308,12 +341,12 @@ test "install: pacman syncs and installs only what is needed" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "sudo pacman -Syu --needed --noconfirm bat" },
+        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expect(fake.called("sudo pacman -Syu --needed --noconfirm bat"));
+    try testing.expect(fake.called("sudo pacman -Syu --needed --noconfirm -- bat"));
 }
 
 test "install: a failed install is an error, not a silent skip" {
@@ -322,7 +355,7 @@ test "install: a failed install is an error, not a silent skip" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "sudo dnf install -y bat", .code = 1 },
+        .{ .argv = "sudo dnf install -y -- bat", .code = 1 },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
     try testing.expectError(Error.DistroInstallFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -405,4 +438,96 @@ test "declare: an observed name round-trips to a bare row" {
     try testing.expectEqualStrings("ripgrep", decl.name);
     try testing.expectEqual(@as(usize, 0), decl.fields.len);
     try testing.expectEqualStrings("ripgrep", try be.idOf(a, rowOf(decl.name, decl.fields)));
+}
+
+test "validate: a name the manager would read as an operation is refused" {
+    var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
+
+    // `apt-get install -y vim nano-` removes nano. Proved against apt 3.0.3
+    // in a debian container; the row is refused before any argv is built.
+    var apt: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
+    var d: Diag = .{};
+    try testing.expectError(Error.DistroSelectorRow, apt.backend().validate(rowOf("nano-", &.{}), &d));
+    try testing.expectEqualStrings(
+        "data/packages/debian.toml: row \"nano-\": apt rows name a package: a name does not end with \"-\", which an install reads as a request to remove the package",
+        d.capture().?,
+    );
+
+    // Every manager here, since a manifest row is not the manager's to trust.
+    for ([_]Manager{ .apt, .dnf, .pacman }) |m| {
+        var dd: Distro = .{ .manager = m, .runner = fake.runner(), .force_elevate = true };
+        for ([_][]const u8{ "nano-", "!vim", "-vim", "+pkg", "@group", ".foo", "/usr/bin/x" }) |name| {
+            var diag: Diag = .{};
+            try testing.expectError(Error.DistroSelectorRow, dd.backend().validate(rowOf(name, &.{}), &diag));
+            try testing.expect(std.mem.indexOf(u8, diag.capture().?, "rows name a package: a name") != null);
+        }
+    }
+}
+
+test "validate: a name that resolves to a package of another name is refused" {
+    var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
+
+    var diag: Diag = .{};
+    try testing.expectError(Error.DistroSelectorRow, d.backend().validate(rowOf("pkgconfig(libcrypto)", &.{}), &diag));
+    try testing.expectEqualStrings(
+        "data/packages/debian.toml: row \"pkgconfig(libcrypto)\": apt rows name a package: a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+        diag.capture().?,
+    );
+
+    // apt's own qualified spellings resolve the same package under a name the
+    // query never reports, so the row would be MISSING on every status.
+    for ([_][]const u8{ "pkg:amd64", "pkg=1.2", "repo/pkg", "bat,ripgrep" }) |name| {
+        var dg: Diag = .{};
+        try testing.expectError(Error.DistroSelectorRow, d.backend().validate(rowOf(name, &.{}), &dg));
+    }
+}
+
+test "validate: dnf NEVRA and an arch suffix are refused, which rpm reads back bare" {
+    var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
+
+    var diag: Diag = .{};
+    try testing.expectError(Error.DistroSelectorRow, d.backend().validate(rowOf("foo-1.2-3.x86_64", &.{}), &diag));
+    try testing.expectEqualStrings(
+        "data/packages/debian.toml: row \"foo-1.2-3.x86_64\": dnf rows name a package, with no architecture",
+        diag.capture().?,
+    );
+
+    var bare: Diag = .{};
+    try testing.expectError(Error.DistroSelectorRow, d.backend().validate(rowOf("bat.noarch", &.{}), &bare));
+
+    // apt and pacman have no such spelling; a dot-and-arch name there is a
+    // name like any other, and refusing it would refuse a real package.
+    var apt: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
+    try apt.backend().validate(rowOf("bat.noarch", &.{}), null);
+}
+
+test "validate: the names real distributions ship are taken" {
+    var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
+    const names = [_][]const u8{ "g++", "lib32-glibc", "python3.11", "gcc-c++", "zlib1g-dev", "perl-Foo-Bar", "libstdc++6" };
+    for ([_]Manager{ .apt, .dnf, .pacman }) |m| {
+        var d: Distro = .{ .manager = m, .runner = fake.runner(), .force_elevate = true };
+        for (names) |name| try d.backend().validate(rowOf(name, &.{}), null);
+    }
+}
+
+test "install: the operands follow a --, so no name can be read as an option" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_]struct { m: Manager, argv: []const u8 }{
+        .{ .m = .apt, .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
+        .{ .m = .dnf, .argv = "sudo dnf install -y -- bat" },
+        .{ .m = .pacman, .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
+    }) |c| {
+        var fake: exec.Fake = .{ .arena = a, .entries = &.{
+            .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
+            .{ .argv = c.argv },
+        } };
+        var d: Distro = .{ .manager = c.m, .runner = fake.runner(), .force_elevate = true };
+        try d.backend().install(a, &.{rowOf("bat", &.{})});
+        try testing.expect(fake.called(c.argv));
+    }
 }

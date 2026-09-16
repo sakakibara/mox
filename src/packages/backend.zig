@@ -53,6 +53,69 @@ pub fn nameShapeOk(name: []const u8) bool {
     return plainText(name);
 }
 
+/// Why a name is not a plain package name, for an adapter whose manager
+/// takes package names as bare operands in its install argv.
+pub const NameProblem = enum {
+    empty,
+    leading,
+    character,
+    trailing_hyphen,
+
+    /// The clause a diagnostic states after naming the file and the row.
+    pub fn text(self: NameProblem) []const u8 {
+        return switch (self) {
+            .empty => "a name cannot be empty",
+            .leading => "a name begins with a letter or a digit",
+            .character => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+            // apt-get reads `nano-` as "remove nano" and zypper reads `-nano`
+            // and `!nano` the same way, so a row can otherwise ask mox to
+            // uninstall a package on every apply.
+            .trailing_hyphen => "a name does not end with \"-\", which an install reads as a request to remove the package",
+        };
+    }
+};
+
+/// Whether `name` is a plain package name, and if not, which rule it broke.
+///
+/// An allowlist, because the denylist it replaced could not be finished: an
+/// install argv accepts far more than package names -- remove suffixes,
+/// selectors, capability expressions, version relations, repository
+/// qualifiers -- and the grammar is the manager's to change, not mox's to
+/// enumerate. Two distinct harms sit outside this class. A name the manager
+/// reads as an operation makes `mox apply` uninstall a package, which mox
+/// states it never does; a name the manager resolves to a different package
+/// (`pkgconfig(libcrypto)` installs `libressl-devel`) reads back under a name
+/// no row matches, so it is MISSING on every status and reinstalled on every
+/// apply.
+///
+/// A trailing `+` stays legal: `g++` is a real package.
+pub fn plainNameProblem(name: []const u8) ?NameProblem {
+    if (name.len == 0) return .empty;
+    if (!std.ascii.isAlphanumeric(name[0])) return .leading;
+    for (name) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        switch (c) {
+            '.', '_', '+', '-' => {},
+            else => return .character,
+        }
+    }
+    if (name[name.len - 1] == '-') return .trailing_hyphen;
+    return null;
+}
+
+/// The architecture suffix `name` carries, or null. rpm reports an
+/// arch-qualified spec (`bat.x86_64`, dnf's full NEVRA `bat-0.24.0-1.x86_64`)
+/// under its bare name, so a row spelling one installs and then reads as
+/// missing forever.
+pub fn rpmArchSuffix(name: []const u8) ?[]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    const suffix = name[dot + 1 ..];
+    for ([_][]const u8{ "x86_64", "i586", "i686", "aarch64", "armv7hl", "ppc64le", "s390x", "noarch" }) |arch| {
+        if (std.mem.eql(u8, suffix, arch)) return arch;
+    }
+    return null;
+}
+
 /// Every adapter mox knows, whether or not this machine can use it. A row
 /// naming something outside it is a typo, not a machine difference, so the
 /// two are never the same branch.
@@ -273,4 +336,70 @@ test "idShapeOk / nameShapeOk: one class, asserted in both directions" {
         try testing.expect(idShapeOk(s));
         try testing.expect(nameShapeOk(s));
     }
+}
+
+test "plainNameProblem: the shapes a manager would read as an operation" {
+    // apt's remove form, and the two zypper reads the same way.
+    try testing.expectEqual(NameProblem.trailing_hyphen, plainNameProblem("nano-").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem("!vim").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem("-vim").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem("+pkg").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem("@group").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem(".foo").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem("/usr/bin/x").?);
+    try testing.expectEqual(NameProblem.leading, plainNameProblem("~pkg").?);
+    try testing.expectEqual(NameProblem.empty, plainNameProblem("").?);
+}
+
+test "plainNameProblem: the shapes that resolve to a package of another name" {
+    try testing.expectEqual(NameProblem.character, plainNameProblem("pkgconfig(libcrypto)").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("perl(Foo::Bar)").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("repo/pkg").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("pkg=1.2").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("pkg>=1.2").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("pkg:amd64").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("pattern:devel_basis").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("bat,ripgrep").?);
+    try testing.expectEqual(NameProblem.character, plainNameProblem("gnu make").?);
+}
+
+test "plainNameProblem: the names real distributions ship" {
+    // `g++` is why only a trailing `-` is refused and a trailing `+` is not.
+    const inside = [_][]const u8{
+        "g++",
+        "lib32-glibc",
+        "python3.11",
+        "gcc-c++",
+        "zlib1g-dev",
+        "perl-Foo-Bar",
+        "libstdc++6",
+        "ripgrep",
+        "7zip",
+        "bat",
+    };
+    for (inside) |s| try testing.expectEqual(@as(?NameProblem, null), plainNameProblem(s));
+}
+
+test "plainNameProblem: a plain name is a name the loader already takes" {
+    // The two classes must nest: a name this predicate passes that the
+    // manifest loader would refuse could never reach an adapter, and a rule
+    // no row can reach is a rule that was never tested.
+    const inside = [_][]const u8{ "g++", "lib32-glibc", "python3.11", "libstdc++6" };
+    for (inside) |s| {
+        try testing.expect(nameShapeOk(s));
+        try testing.expect(idShapeOk(s));
+    }
+}
+
+test "rpmArchSuffix: an arch-qualified spec reads back under its bare name" {
+    try testing.expectEqualStrings("x86_64", rpmArchSuffix("bat.x86_64").?);
+    try testing.expectEqualStrings("x86_64", rpmArchSuffix("bat-0.24.0-1.x86_64").?);
+    try testing.expectEqualStrings("noarch", rpmArchSuffix("tzdata.noarch").?);
+    try testing.expectEqualStrings("aarch64", rpmArchSuffix("bat.aarch64").?);
+
+    try testing.expectEqual(@as(?[]const u8, null), rpmArchSuffix("bat"));
+    // A dot is ordinary inside a name; only a known arch after the last one
+    // is a qualifier.
+    try testing.expectEqual(@as(?[]const u8, null), rpmArchSuffix("python3.11"));
+    try testing.expectEqual(@as(?[]const u8, null), rpmArchSuffix("bat.x86"));
 }
