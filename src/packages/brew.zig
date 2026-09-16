@@ -118,7 +118,7 @@ pub const Brew = struct {
         for (rows) |row| {
             const kind = try kindOf(row);
             if (tapOf(row.name)) |tap| {
-                const tapped = try self.runner.run(arena, &.{ "brew", "tap", tap });
+                const tapped = try self.runner.stream(arena, &.{ "brew", "tap", tap });
                 if (!tapped.ok) return error.BrewTapFailed;
                 // Trust the one thing named, never the whole tap: an
                 // untrusted third-party tap is ignored outright since
@@ -130,12 +130,12 @@ pub const Brew = struct {
                     .formula => "--formula",
                     .cask => "--cask",
                 };
-                const trusted = try self.runner.run(arena, &.{ "brew", "trust", flag, row.name });
+                const trusted = try self.runner.stream(arena, &.{ "brew", "trust", flag, row.name });
                 if (!trusted.ok) return error.BrewTrustFailed;
             }
             const res = switch (kind) {
-                .formula => try self.runner.run(arena, &.{ "brew", "install", row.name }),
-                .cask => try self.runner.run(arena, &.{ "brew", "install", "--cask", row.name }),
+                .formula => try self.runner.stream(arena, &.{ "brew", "install", row.name }),
+                .cask => try self.runner.stream(arena, &.{ "brew", "install", "--cask", row.name }),
             };
             if (!res.ok) return error.BrewInstallFailed;
         }

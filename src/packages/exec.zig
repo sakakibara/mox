@@ -21,9 +21,20 @@ pub const Result = struct {
 pub const Runner = struct {
     ctx: *anyopaque,
     runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result,
+    streamFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result,
 
+    /// Run and capture: for a query whose output mox parses.
     pub fn run(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
         return self.runFn(self.ctx, arena, argv);
+    }
+
+    /// Run with mox's own stdout and stderr: for work the user waits on.
+    /// An install compiles, downloads, and asks about disk space; capturing
+    /// that would replace minutes of progress with a silent hang and throw
+    /// the manager's own diagnostics away. The returned `stdout`/`stderr` are
+    /// empty because the output already went to the terminal.
+    pub fn stream(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
+        return self.streamFn(self.ctx, arena, argv);
     }
 };
 
@@ -35,7 +46,7 @@ pub const Process = struct {
     env: ?*const EnvironMap = null,
 
     pub fn runner(self: *Process) Runner {
-        return .{ .ctx = self, .runFn = runImpl };
+        return .{ .ctx = self, .runFn = runImpl, .streamFn = streamImpl };
     }
 
     fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
@@ -55,7 +66,29 @@ pub const Process = struct {
             .stderr = res.stderr,
         };
     }
+
+    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
+        _ = arena;
+        const self: *Process = @ptrCast(@alignCast(ctx));
+        return streamImplFor(self.io, self.env, argv);
+    }
 };
+
+fn streamImplFor(io: Io, env: ?*const EnvironMap, argv: []const []const u8) anyerror!Result {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .environ_map = env,
+        .stdin = .close,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
+    const code: u8 = switch (term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    return .{ .code = code, .ok = term == .exited and code == 0, .stdout = "", .stderr = "" };
+}
 
 /// A scripted runner: answers each argv from a table, records every call, and
 /// fails the call rather than inventing output when no entry matches, so a
@@ -77,7 +110,7 @@ pub const Fake = struct {
     arena: std.mem.Allocator,
 
     pub fn runner(self: *Fake) Runner {
-        return .{ .ctx = self, .runFn = runImpl };
+        return .{ .ctx = self, .runFn = runImpl, .streamFn = runImpl };
     }
 
     pub fn called(self: *const Fake, argv: []const u8) bool {
