@@ -209,6 +209,9 @@ fn bucketNames(arena: std.mem.Allocator, text: []const u8) !std.StringHashMapUnm
     while (it.next()) |raw| {
         var toks = std.mem.tokenizeAny(u8, raw, " \t\r");
         const first = toks.next() orelse continue;
+        // The table's own header, not a bucket. A bucket named `Name`
+        // would be skipped with it; scoop's own output cannot tell them
+        // apart, and re-adding one that exists is what this avoids.
         if (std.mem.eql(u8, first, "Name")) continue;
         if (std.mem.indexOfNone(u8, first, "-") == null) continue;
         try out.put(arena, first, {});
@@ -346,7 +349,10 @@ pub const Winget = struct {
 
             const res = try self.runner.stream(arena, argv.items);
             try exec.checkTimedOut(res);
-            if (!res.ok and !try self.isInstalled(arena, row.name)) failed = true;
+            // A re-query that cannot run is not an answer that the row
+            // landed, and not a reason to abandon the rows after it.
+            const landed = if (res.ok) true else self.isInstalled(arena, row.name) catch false;
+            if (!landed) failed = true;
         }
         if (failed) return Error.WingetInstallFailed;
     }
@@ -368,9 +374,18 @@ pub const Winget = struct {
         });
         try exec.checkTimedOut(res);
         if (!res.ok) return false;
-        // `list` prints a table; the identifier appears in it only when
-        // something matched.
-        return std.mem.indexOf(u8, res.stdout, id) != null;
+        // `list` prints a table whose columns it truncates to the console
+        // width, so a substring search over the whole output can miss a long
+        // identifier and match a short one inside another. Compare whole
+        // fields instead.
+        var lines = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+            while (fields.next()) |field| {
+                if (std.mem.eql(u8, field, id)) return true;
+            }
+        }
+        return false;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {

@@ -77,6 +77,26 @@ pub const Zypper = struct {
             );
             return Error.ZypperSelectorRow;
         }
+        // zypper also takes an arch- or version-qualified spec, which `rpm`
+        // reports under the bare name: the row would install and then read
+        // as missing forever.
+        if (std.mem.indexOfAny(u8, row.name, "=<>")) |_| {
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": zypper rows name a package, with no version or relation",
+                .{ row.label, row.name },
+            );
+            return Error.ZypperSelectorRow;
+        }
+        if (std.mem.lastIndexOfScalar(u8, row.name, '.')) |dot| {
+            for ([_][]const u8{ "x86_64", "i586", "i686", "aarch64", "armv7hl", "ppc64le", "s390x", "noarch" }) |arch| {
+                if (!std.mem.eql(u8, row.name[dot + 1 ..], arch)) continue;
+                if (diag) |d| d.set(
+                    "{s}: row \"{s}\": zypper rows name a package, with no architecture",
+                    .{ row.label, row.name },
+                );
+                return Error.ZypperSelectorRow;
+            }
+        }
         if (row.fields.len == 0) return;
         if (diag) |d| d.set(
             "{s}: row \"{s}\": zypper accepts no key \"{s}\"",

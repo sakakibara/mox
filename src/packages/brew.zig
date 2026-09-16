@@ -105,9 +105,10 @@ pub const Brew = struct {
     }
 
     /// `brew list` refreshes the formula and cask API data when the cached
-    /// copy is older than a week; under this it never does, so a read-only
-    /// `mox status` stays offline. Through `env` because an adapter has no
-    /// environment of its own to set.
+    /// copy is older than a week; under this it never refreshes on that
+    /// timer, so a read-only `mox status` does not go to the network for
+    /// age alone. A cache that does not exist yet is still populated, once.
+    /// Through `env` because an adapter has no environment of its own.
     const query_env = [_][]const u8{ "env", "HOMEBREW_NO_AUTO_UPDATE=1" };
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
