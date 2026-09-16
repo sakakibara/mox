@@ -20,9 +20,17 @@ pub const Row = manifest_mod.Row;
 pub const Manifest = manifest_mod.Manifest;
 pub const Backend = backend_mod.Backend;
 
+/// A desired package that is not installed, carrying both what the manifest
+/// calls it and the id it is compared by, so a consumer can match either
+/// without re-deriving the adapter's namespace.
+pub const Missing = struct {
+    row: Row,
+    id: []const u8,
+};
+
 pub const Drift = struct {
     /// Desired here, not installed.
-    missing: []const Row = &.{},
+    missing: []const Missing = &.{},
     /// Installed, declared nowhere in the manifest, and not blacklisted.
     untracked: []const []const u8 = &.{},
 
@@ -44,10 +52,11 @@ pub fn compute(
     var installed_set = std.StringHashMap(void).init(arena);
     for (installed) |i| try installed_set.put(i, {});
 
-    var missing: std.ArrayList(Row) = .empty;
+    var missing: std.ArrayList(Missing) = .empty;
     for (desired) |row| {
         if (!std.mem.eql(u8, row.backend, backend)) continue;
-        if (!installed_set.contains(try b.idOf(arena, row))) try missing.append(arena, row);
+        const id = try b.idOf(arena, row);
+        if (!installed_set.contains(id)) try missing.append(arena, .{ .row = row, .id = id });
     }
 
     var declared = std.StringHashMap(void).init(arena);
@@ -133,7 +142,7 @@ test "compute: missing is desired minus installed" {
 
     const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, m);
     try testing.expectEqual(@as(usize, 1), d.missing.len);
-    try testing.expectEqualStrings("fd", d.missing[0].name);
+    try testing.expectEqualStrings("fd", d.missing[0].row.name);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
 }
 
@@ -203,7 +212,8 @@ test "compute: a cask is not satisfied by the formula of the same name" {
 
     const d = try compute(a, test_backend.make("brew"), &desired, &.{"docker"}, m);
     try testing.expectEqual(@as(usize, 1), d.missing.len);
-    try testing.expectEqualStrings("docker", d.missing[0].name);
+    try testing.expectEqualStrings("docker", d.missing[0].row.name);
+    try testing.expectEqualStrings("cask:docker", d.missing[0].id);
     // And the installed formula is untracked: nothing declares it.
     try testing.expectEqual(@as(usize, 1), d.untracked.len);
     try testing.expectEqualStrings("docker", d.untracked[0]);

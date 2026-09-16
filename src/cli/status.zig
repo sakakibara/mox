@@ -288,8 +288,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // machine output is stable across runs, OSes, and pipes.
     mox.apply.drift.sortByPath(units.items);
 
+    const pkgs = try gatherPackages(ctx, context, &bindings);
+    problems += pkgs.problems();
+
     if (machine) {
-        if (a.json) try emitJson(ctx.out, units.items) else try emitPorcelain(ctx.out, units.items);
+        if (a.json)
+            try emitJson(ctx.out, units.items, pkgs.report)
+        else
+            try emitPorcelain(ctx.out, units.items, pkgs.report);
         return if (problems > 0) 1 else 0;
     }
 
@@ -306,7 +312,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Package drift is drift, so it shows under `--drift` too; the probe log
     // and unbound-facts sections are full-report context and are not.
-    if (try printPackages(ctx, context, &bindings)) problems += 1;
+    try printPackages(ctx, pkgs);
     if (show_table) {
         try printProbeLog(ctx, m_state);
         try printUnboundFacts(ctx, context.paths.repo_dir, &bindings);
@@ -314,19 +320,27 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     return if (problems > 0) 1 else 0;
 }
 
-/// This run's `packages:` section: per-backend missing and untracked.
+/// This run's package drift, or an empty report when the repo carries no
+/// `data/packages/` manifest -- a repo that has not opted in never queries a
+/// package manager and never reports every installed package as untracked.
 ///
-/// Printed only when the repo carries a `data/packages/` manifest, so a repo
-/// that has not opted in never queries a package manager and never reports
-/// every installed package as untracked. Returns true when the manifest
-/// itself is broken, which is this command's problem to report; package drift
-/// does NOT set the exit code, which stays the documented file contract until
-/// packages become first-class drift units.
-fn printPackages(
+/// `broken` is a manifest that will not load or check, which is an error
+/// rather than drift and is reported as such.
+const Packages = struct {
+    report: mox.packages.report.Report = .{},
+    broken: bool = false,
+
+    /// Every package the report counts against the exit code.
+    fn problems(self: Packages) usize {
+        return self.report.missingCount() + self.report.untrackedCount() + @intFromBool(self.broken);
+    }
+};
+
+fn gatherPackages(
     ctx: *app.Ctx,
     context: app.Context,
     bindings: *const mox.dsl.resolver.Resolver,
-) !bool {
+) !Packages {
     var proc: mox.packages.exec.Process = .{ .io = ctx.io };
     var brew: mox.packages.brew.Brew = .{ .runner = proc.runner() };
     var backends = [_]mox.packages.backend.Backend{brew.backend()};
@@ -349,10 +363,17 @@ fn printPackages(
             } else {
                 try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
             }
-            return true;
+            return .{ .broken = true };
         },
     };
-    if (!rep.in_use) return false;
+    return .{ .report = rep };
+}
+
+/// The human `packages:` section. Silent when the repo does not use the
+/// manifest, so an unadopted repo's report is unchanged.
+fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
+    const rep = pkgs.report;
+    if (!rep.in_use) return;
 
     try ctx.out.writeAll("\npackages:\n");
     for (rep.backends) |b| {
@@ -360,22 +381,38 @@ fn printPackages(
             try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
             continue;
         }
-        for (b.drift.missing) |row| {
-            try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, row.name });
+        for (b.drift.missing) |m| {
+            try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, m.row.name });
         }
         for (b.drift.untracked) |id| {
             try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
         }
     }
-    return false;
 }
 
-/// Emit the drift set as JSON: an array of `{path, kind, [key], first_contact}`.
+/// Emit the drift set as JSON: `{"files":[...],"packages":[...]}`. A file is
+/// `{path, kind, [key], first_contact}`; a package is `{backend, state, id,
+/// [name]}`, `state` being `missing` or `untracked` and `id` the identity its
+/// backend compares by (a brew cask carries its `cask:` prefix, so it can
+/// never be confused with the formula of the same name). `name` is what the
+/// manifest row spells, present only for a missing package.
 /// `kind` is a stable tag (`whole_file`, `owned_key`, `symlink_target`,
 /// `generated_set`, `vanished`); `key` appears only for `owned_key` (its owned
 /// key path, or null for a secret whole-scope record). The schema is locked by
 /// test so tooling consumes this instead of parsing the human report.
-fn emitJson(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
+fn emitJson(
+    out: *std.Io.Writer,
+    units: []const mox.apply.drift.Unit,
+    rep: mox.packages.report.Report,
+) !void {
+    try out.writeAll("{\"files\":");
+    try emitJsonFiles(out, units);
+    try out.writeAll(",\"packages\":");
+    try emitJsonPackages(out, rep);
+    try out.writeAll("}\n");
+}
+
+fn emitJsonFiles(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
     try out.writeByte('[');
     for (units, 0..) |u, i| {
         if (i > 0) try out.writeByte(',');
@@ -393,7 +430,35 @@ fn emitJson(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
         try out.writeAll(if (u.first_contact) "true" else "false");
         try out.writeByte('}');
     }
-    try out.writeAll("]\n");
+    try out.writeAll("]");
+}
+
+fn emitJsonPackages(out: *std.Io.Writer, rep: mox.packages.report.Report) !void {
+    try out.writeByte('[');
+    var first = true;
+    for (rep.backends) |b| {
+        for (b.drift.missing) |m| {
+            if (!first) try out.writeByte(',');
+            first = false;
+            try out.writeAll("{\"backend\":");
+            try writeJsonString(out, b.backend);
+            try out.writeAll(",\"state\":\"missing\",\"id\":");
+            try writeJsonString(out, m.id);
+            try out.writeAll(",\"name\":");
+            try writeJsonString(out, m.row.name);
+            try out.writeByte('}');
+        }
+        for (b.drift.untracked) |id| {
+            if (!first) try out.writeByte(',');
+            first = false;
+            try out.writeAll("{\"backend\":");
+            try writeJsonString(out, b.backend);
+            try out.writeAll(",\"state\":\"untracked\",\"id\":");
+            try writeJsonString(out, id);
+            try out.writeByte('}');
+        }
+    }
+    try out.writeByte(']');
 }
 
 fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
@@ -416,7 +481,11 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// `\` -> `\\`, tab -> `\t`, newline -> `\n`, CR -> `\r`. `kind` and the flag
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
-fn emitPorcelain(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void {
+fn emitPorcelain(
+    out: *std.Io.Writer,
+    units: []const mox.apply.drift.Unit,
+    rep: mox.packages.report.Report,
+) !void {
     for (units) |u| {
         const key: []const u8 = switch (u.kind) {
             .owned_key => |k| k orelse "",
@@ -427,6 +496,22 @@ fn emitPorcelain(out: *std.Io.Writer, units: []const mox.apply.drift.Unit) !void
         try out.print("\t{s}\t", .{if (u.first_contact) "1" else "0"});
         try writePorcelainField(out, u.path);
         try out.writeByte('\n');
+    }
+    for (rep.backends) |b| {
+        for (b.drift.missing) |m| {
+            try out.writeAll("package_missing\t");
+            try writePorcelainField(out, b.backend);
+            try out.writeByte('\t');
+            try writePorcelainField(out, m.id);
+            try out.writeByte('\n');
+        }
+        for (b.drift.untracked) |id| {
+            try out.writeAll("package_untracked\t");
+            try writePorcelainField(out, b.backend);
+            try out.writeByte('\t');
+            try writePorcelainField(out, id);
+            try out.writeByte('\n');
+        }
     }
 }
 
@@ -626,7 +711,7 @@ test "emitPorcelain / emitJson: tab, newline, and backslash in a field cannot br
     // Porcelain: each unit stays one line; the tab/newline/backslash in key and
     // path are C-escaped, so a tab-split parser still sees exactly four fields.
     var pw: std.Io.Writer.Allocating = .init(al);
-    try emitPorcelain(&pw.writer, &units);
+    try emitPorcelain(&pw.writer, &units, .{});
     try testing.expectEqualStrings(
         "owned_key\tk\\tey\t0\t/h/a\\tb\\nc\\\\d\n" ++
             "whole_file\t\t1\t/h/plain\n",
@@ -635,10 +720,54 @@ test "emitPorcelain / emitJson: tab, newline, and backslash in a field cannot br
 
     // JSON: the same bytes escaped per the JSON string grammar.
     var jw: std.Io.Writer.Allocating = .init(al);
-    try emitJson(&jw.writer, &units);
+    try emitJson(&jw.writer, &units, .{});
     try testing.expectEqualStrings(
-        "[{\"path\":\"/h/a\\tb\\nc\\\\d\",\"kind\":\"owned_key\",\"key\":\"k\\tey\",\"first_contact\":false}," ++
-            "{\"path\":\"/h/plain\",\"kind\":\"whole_file\",\"first_contact\":true}]\n",
+        "{\"files\":[{\"path\":\"/h/a\\tb\\nc\\\\d\",\"kind\":\"owned_key\",\"key\":\"k\\tey\",\"first_contact\":false}," ++
+            "{\"path\":\"/h/plain\",\"kind\":\"whole_file\",\"first_contact\":true}],\"packages\":[]}\n",
+        jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: packages ride the same records, keyed by state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const missing = [_]mox.packages.drift.Missing{.{
+        .row = .{
+            .name = "ghostty",
+            .backend = "brew",
+            .when = null,
+            .fields = &.{},
+            .origin = "/tmp/x.toml",
+            .label = "data/packages/a.toml",
+            .index = 0,
+        },
+        .id = "cask:ghostty",
+    }};
+    const untracked = [_][]const u8{"htop"};
+    const backends = [_]mox.packages.report.BackendDrift{.{
+        .backend = "brew",
+        .drift = .{ .missing = &missing, .untracked = &untracked },
+    }};
+    const rep: mox.packages.report.Report = .{ .in_use = true, .backends = &backends };
+
+    // A missing cask carries the prefixed id it is compared by AND the name
+    // the manifest spells, so neither has to be re-derived downstream.
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, rep);
+    try testing.expectEqualStrings(
+        "package_missing\tbrew\tcask:ghostty\n" ++
+            "package_untracked\tbrew\thtop\n",
+        pw.written(),
+    );
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, rep);
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[" ++
+            "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"cask:ghostty\",\"name\":\"ghostty\"}," ++
+            "{\"backend\":\"brew\",\"state\":\"untracked\",\"id\":\"htop\"}]}\n",
         jw.written(),
     );
 }

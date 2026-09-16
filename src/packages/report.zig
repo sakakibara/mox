@@ -180,7 +180,7 @@ test "fromManifest: drift comes back per backend" {
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
     // `fd` is declared but absent; `htop` is installed but declared nowhere.
     try testing.expectEqual(@as(usize, 1), rep.missingCount());
-    try testing.expectEqualStrings("fd", rep.backends[0].drift.missing[0].name);
+    try testing.expectEqualStrings("fd", rep.backends[0].drift.missing[0].row.name);
     try testing.expectEqual(@as(usize, 1), rep.untrackedCount());
     try testing.expectEqualStrings("htop", rep.backends[0].drift.untracked[0]);
     try testing.expect(!rep.clean());

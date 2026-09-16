@@ -326,19 +326,32 @@ A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING` and each
 installed package `UNTRACKED` (declared nowhere and not blacklisted).
 A repo without that directory is not using the package subsystem, so no
-section prints and no package manager is queried. Package drift does not
-set the exit code, which stays the file contract above; a manifest that
-is itself malformed does, and says which file and row.
+section prints and no package manager is queried. Package drift counts
+toward the exit code exactly as file drift does, so `mox status` answers
+one question -- does this machine match what it declares -- over files
+and packages alike. A manifest that is itself malformed is an error, not
+drift, and says which file and row.
 
 `--drift` shows only the drift set (the report `mox apply` prints for the
 same tree, from the same classifier -- the two never disagree), dropping
 the clean/gated table and the probe/unbound context. The `packages:`
 section is drift, so `--drift` keeps it. `--json` and
-`--porcelain` serialize that set for tooling instead of the human report:
-`--json` as an array of `{path, kind, key?, first_contact}`, `--porcelain`
-as stable tab-separated lines (`kind`, `key`, `first_contact` 0/1,
-`path`). Both carry files only, never packages. In `--porcelain` the
-free-form `key` and `path` fields are
+`--porcelain` serialize that set for tooling instead of the human report.
+
+`--json` emits `{"files": [...], "packages": [...]}`. A file is
+`{path, kind, key?, first_contact}`; a package is
+`{backend, state, id, name?}`, where `state` is `missing` or `untracked`
+and `id` is the identity its backend compares by -- a brew cask carries
+its `cask:` prefix, so it can never be read as the formula of the same
+name. `name` is what the manifest row spells, and is present only for a
+missing package.
+
+`--porcelain` emits stable tab-separated lines, one record per line, with
+the record kind as the first field. File records are `kind`, `key`,
+`first_contact` (0/1), `path`. Package records are `package_missing` or
+`package_untracked`, then `backend`, then `id`. Field count varies by
+kind, so switch on the first field before reading the rest. In
+`--porcelain` the free-form fields are
 C-escaped (`\\`, `\t`, `\n`, `\r`) so a tab or newline in them can never
 break the framing; unescape those four to recover exact bytes. Both imply
 `--drift` and keep the same exit code.

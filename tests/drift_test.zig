@@ -168,15 +168,17 @@ test "status --json / --porcelain / --drift: stable machine-readable drift set" 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = ha, .data = "edited\n" }); // whole_file drift
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = happ, .data = "[tui]\nk = 9\n" }); // owned_key drift
 
-    // --json: one sorted array with the three units and their fields. The
-    // exact byte-schema (field order, key/first_contact shape, escaping) is
-    // locked platform-independently by status.zig's own unit test; here the
-    // assertions stay separator-agnostic, since a live path is native (`\` on
-    // Windows, which the emitter correctly escapes -- not this test's concern).
+    // --json: `{"files":[...],"packages":[...]}`, the files array sorted with
+    // the three units and their fields. The exact byte-schema (field order,
+    // key/first_contact shape, escaping) is locked platform-independently by
+    // status.zig's own unit test; here the assertions stay separator-agnostic,
+    // since a live path is native (`\` on Windows, which the emitter correctly
+    // escapes -- not this test's concern). This tree carries no package
+    // manifest, so `packages` is empty and no manager is queried.
     const j = try c.run(&.{ "mox", "status", "--json" });
     try std.testing.expectEqual(@as(u8, 1), j.rc);
-    try std.testing.expect(std.mem.startsWith(u8, j.out, "[{"));
-    try std.testing.expect(std.mem.endsWith(u8, j.out, "}]\n"));
+    try std.testing.expect(std.mem.startsWith(u8, j.out, "{\"files\":[{"));
+    try std.testing.expect(std.mem.endsWith(u8, j.out, "}],\"packages\":[]}\n"));
     try std.testing.expect(std.mem.indexOf(u8, j.out, "\"kind\":\"whole_file\",\"first_contact\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, j.out, "\"kind\":\"owned_key\",\"key\":\"tui\",\"first_contact\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, j.out, "\"kind\":\"whole_file\",\"first_contact\":true") != null);
