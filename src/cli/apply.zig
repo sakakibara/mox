@@ -869,7 +869,10 @@ fn bootstrapBackends(
         }
 
         try ctx.out.print("  bootstrapping   {s}\n", .{b.backend});
-        const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer", .{b.backend});
+        // Per process, like every other staged file: a second mox in the
+        // same state dir must not be able to replace a verified installer
+        // between the digest check and the shell that runs it.
+        const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer-{d}", .{ b.backend, mox.packages.exec.processId() });
         const path = mox.packages.bootstrap.fetchVerified(
             ctx.alloc,
             ctx.io,

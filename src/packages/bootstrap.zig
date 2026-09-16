@@ -60,7 +60,14 @@ pub fn fetchVerified(
     // `--` ends the options: a URL is data even when it starts with `-`.
     const limit = try std.fmt.allocPrint(arena, "{d}", .{max_installer_bytes});
     const res = runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, "--", spec.url }) catch |e| switch (e) {
-        error.FileNotFound => try runner.run(arena, &.{ "wget", "-qO", path, "--", spec.url }),
+        // wget has no size cap of its own, so it writes to mox's own pipe,
+        // where the runner's capture bound stops an endless body on the
+        // wire rather than after it has filled the disk.
+        error.FileNotFound => blk: {
+            const got = runner.run(arena, &.{ "wget", "-qO-", "--", spec.url }) catch |e2| return e2;
+            if (got.ok) try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = got.stdout });
+            break :blk got;
+        },
         else => return e,
     };
     if (!res.ok) return Error.BootstrapDownloadFailed;

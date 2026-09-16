@@ -660,7 +660,10 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
     mox.cli.app.brew_prefixes_override = &.{prefix_bin};
     defer mox.cli.app.brew_prefixes_override = null;
-    const staged = try std.fs.path.join(a, &.{ h.state, "tmp", "brew-installer" });
+    const staged = try std.fs.path.join(a, &.{
+        h.state, "tmp",
+        try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
+    });
     const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
@@ -857,7 +860,10 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
     try std.testing.expect(fetched);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: BootstrapDigestMismatch") != null);
     // The substituted file is not left where a later run could find it.
-    const staged = try std.fs.path.join(a, &.{ h.state, "tmp", "brew-installer" });
+    const staged = try std.fs.path.join(a, &.{
+        h.state, "tmp",
+        try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
+    });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
     try std.testing.expectEqual(@as(u8, 2), r.rc);
 }
@@ -1464,7 +1470,10 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
         try std.testing.expect(std.mem.indexOf(u8, c, "https://example.invalid") == null);
     }
     // Nothing was staged where a real bootstrap would put the installer.
-    const staged = try std.fs.path.join(a, &.{ h.state, "tmp", "brew-installer" });
+    const staged = try std.fs.path.join(a, &.{
+        h.state, "tmp",
+        try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
+    });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
 }
 
