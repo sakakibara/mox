@@ -92,12 +92,12 @@ jobs:
           if ($bad) { exit 1 }
 
   backends:
-    # Nightly only. Runs the backend adapters against the REAL package
+    # Nightly, or dispatched by hand. Runs the backend adapters against the REAL package
     # managers (`zig build test-backends`), which the hermetic `test` step
     # deliberately excludes. Each check is differential against the manager's
     # own output, so the day brew changes a flag or an output shape under an
     # adapter, this goes red here rather than on a machine.
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -123,13 +123,13 @@ jobs:
         run: zig build test-backends --summary all
 
   backends-linux:
-    # Nightly only. The Linux package adapters against the REAL apt, dnf and
-    # pacman, each in its own container (tests/linux_backends_test.sh).
+    # Nightly, or dispatched by hand. The Linux package adapters against the REAL apt, dnf,
+    # zypper and pacman, each in its own container (tests/linux_backends_test.sh).
     #
     # The hermetic suite can only assert that an adapter emits a given argv;
     # whether that argv is right, and whether the manager's output parses
     # back, only the real manager can say.
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -145,13 +145,13 @@ jobs:
         run: sh tests/linux_backends_test.sh
 
   backends-windows:
-    # Nightly only. The scoop and winget adapters against the REAL managers
+    # Nightly, or dispatched by hand. The scoop and winget adapters against the REAL managers
     # (tests/windows_backends_test.ps1), read-only: it queries, it never
     # installs.
     #
     # This is the only place those adapters meet the real managers. A manager
     # missing from the runner skips loudly rather than passing.
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -172,12 +172,12 @@ jobs:
         run: pwsh -NoProfile -File tests/windows_backends_test.ps1
 
   fuzz:
-    # Nightly only. Exercises the fuzz targets (tests/fuzz_test.zig) under a
+    # Nightly, or dispatched by hand. Exercises the fuzz targets (tests/fuzz_test.zig) under a
     # wall-clock bound. Continuous fuzzing (`zig build fuzz --fuzz`) is gated
     # on an upstream Zig 0.16.0 test-runner fix; until then this runs the
     # targets as bounded smoke checks so a regression that crashes them fails
     # the nightly rather than hanging.
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
