@@ -65,6 +65,9 @@ pub fn fetchVerified(
     // `--` ends the options: a URL is data even when it starts with `-`.
     const limit = try std.fmt.allocPrint(arena, "{d}", .{max_installer_bytes});
     if (runner.run(arena, &.{ "curl", "-fsSL", "-o", path, "--max-filesize", limit, "--", spec.url })) |res| {
+        // A download killed at its bound left no code worth reading, so a kill
+        // is named before any code is.
+        try exec.checkTimedOut(res);
         // curl enforces the cap it was handed and says so with its own exit
         // code, which is the size refusal by name -- not one more way for a
         // download to have failed.
@@ -81,6 +84,7 @@ pub fn fetchVerified(
                 error.StreamTooLong => return Error.BootstrapInstallerTooLarge,
                 else => return e2,
             };
+            try exec.checkTimedOut(got);
             if (!got.ok) return Error.BootstrapDownloadFailed;
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = got.stdout });
         },
@@ -271,6 +275,40 @@ test "fetchVerified: without curl, an oversize body is refused by name on the wg
         .sha256 = "00",
     }));
     const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+}
+
+test "fetchVerified: a download killed at its bound is a timeout, not a failed download" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmpDir(a, io, &tmp.sub_path);
+    const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
+
+    // A killed curl comes back `code = 255, ok = false`: read by the code
+    // alone, a bound mox itself imposed would be reported as the server's or
+    // the network's failure.
+    var curl: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .timed_out = true },
+    } };
+    try testing.expectError(error.TimedOut, fetchVerified(a, io, curl.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+    }));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+
+    // The same on the wget path, which mox reaches with no curl installed.
+    var wget: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .fail = error.FileNotFound },
+        .{ .argv = "wget -qO-", .match = .prefix, .timed_out = true },
+    } };
+    try testing.expectError(error.TimedOut, fetchVerified(a, io, wget.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+    }));
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
 }
 

@@ -757,13 +757,21 @@ fn applyPass(
             .{ counts.ok, counts.removed, counts.unchanged, counts.skip, counts.drift, counts.fail },
         );
         if (pkg_counts.in_use) {
+            // The failures a plan can already have -- a probe that did not
+            // answer, a row whose absent manager cannot be bootstrapped -- are
+            // the plan's own, so they are counted here as the real run counts
+            // its own. A plan that says only what it would install reads clean
+            // to anyone not watching stderr.
             if (pkg_counts.would_bootstrap > 0) {
                 try ctx.out.print(
-                    "Packages: {d} would be installed, after bootstrapping {d} manager(s)\n",
-                    .{ pkg_counts.would, pkg_counts.would_bootstrap },
+                    "Packages: {d} would be installed, {d} failed, after bootstrapping {d} manager(s)\n",
+                    .{ pkg_counts.would, pkg_counts.failed, pkg_counts.would_bootstrap },
                 );
             } else {
-                try ctx.out.print("Packages: {d} would be installed\n", .{pkg_counts.would});
+                try ctx.out.print(
+                    "Packages: {d} would be installed, {d} failed\n",
+                    .{ pkg_counts.would, pkg_counts.failed },
+                );
             }
         }
     } else {
@@ -881,7 +889,7 @@ fn bootstrapBackends(
             installer_name,
             .{ .url = b.url, .sha256 = b.sha256 },
         ) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try streamedFailure(ctx.alloc, e, pkg_backends.installTimeoutMs()) });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);
@@ -891,7 +899,7 @@ fn bootstrapBackends(
         // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try streamedFailure(ctx.alloc, e, pkg_backends.installTimeoutMs()) });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);
@@ -960,6 +968,21 @@ const PackageCounts = struct {
 ///
 /// Only ever installs. An untracked package is reported by `mox status` and
 /// reconciled by `mox commit`; nothing here removes one.
+/// What a streamed call's failure is, in words rather than an error name.
+/// A stop and a kill are the two the user can do something about -- give the
+/// run a terminal, or raise the bound -- and both reach here as a bare error
+/// that says neither. Anything else keeps its name.
+fn streamedFailure(arena: std.mem.Allocator, e: anyerror, bound_ms: i64) ![]const u8 {
+    return switch (e) {
+        error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
+        error.TimedOut => if (bound_ms > 0)
+            try std.fmt.allocPrint(arena, "timed out after {d}ms (MOX_INSTALL_TIMEOUT_MS), killed", .{bound_ms})
+        else
+            "timed out, killed",
+        else => @errorName(e),
+    };
+}
+
 fn applyPackages(
     ctx: *app.Ctx,
     context: app.Context,
@@ -1139,7 +1162,7 @@ fn applyPackages(
         backend.install(ctx.alloc, rows.items) catch |e| {
             try ctx.err.print(
                 "mox apply: {s}: install failed: {s}\n",
-                .{ b.backend, @errorName(e) },
+                .{ b.backend, try streamedFailure(ctx.alloc, e, pkg_backends.installTimeoutMs()) },
             );
             try ctx.err.flush();
             counts.failed += 1;

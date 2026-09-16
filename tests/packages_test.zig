@@ -220,7 +220,7 @@ test "apply --dry-run: reports what it would install and installs nothing" {
 
     const r = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew fd") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 would be installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 would be installed, 0 failed") != null);
     try std.testing.expect(!fake.called("brew install fd"));
 }
 
@@ -1464,7 +1464,7 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     // Planned as though the bootstrap had happened: every row is listed.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew fd") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew ripgrep") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 would be installed, after bootstrapping 1 manager(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 would be installed, 0 failed, after bootstrapping 1 manager(s)") != null);
     for (fake.calls.items) |c| {
         try std.testing.expect(std.mem.indexOf(u8, c, "install") == null);
         try std.testing.expect(std.mem.indexOf(u8, c, "https://example.invalid") == null);

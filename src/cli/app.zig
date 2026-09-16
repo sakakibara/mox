@@ -115,6 +115,12 @@ pub const PackageBackends = struct {
     /// anything, so what will execute is visible rather than inferred.
     notes: []const []const u8 = &.{},
 
+    /// The bound every streamed call of this registry runs under, so a
+    /// diagnostic about one killed at it can say what killed it.
+    pub fn installTimeoutMs(self: *const PackageBackends) i64 {
+        return self.proc.install_timeout_ms;
+    }
+
     pub fn runner(self: *PackageBackends) mox.packages.exec.Runner {
         return package_runner_override orelse self.proc.runner();
     }
