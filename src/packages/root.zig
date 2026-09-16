@@ -3,10 +3,12 @@
 //! reconcile orchestration built on it.
 pub const manifest = @import("manifest.zig");
 pub const desired = @import("desired.zig");
+pub const drift = @import("drift.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
     // doesn't get walked at comptime by `zig build test` alone.
     _ = manifest;
     _ = desired;
+    _ = drift;
 }
