@@ -111,11 +111,13 @@ jobs:
           echo "$HOME/zig/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: seed one formula and one cask
         shell: bash
-        # The checks skip when a manager reports nothing, which is right on a
-        # developer machine and useless here: without a datum the tripwire
-        # would report green having compared nothing. The cask is a font, so
-        # it needs no GUI. The tap check runs only where a tapped formula is
-        # installed; no third-party tap is installed here, so it skips.
+        # A check with nothing to compare skips on a developer machine and
+        # FAILS here, so the seed is what the job needs to have anything to be
+        # differential about: one formula installed on request feeds the
+        # receipt oracle, one cask feeds the cask-prefix check. The cask is a
+        # font, so it needs no GUI. The tap check is the one exception that
+        # skips even here: covering it would mean installing from a
+        # third-party tap, which this runner deliberately does not do.
         run: |
           brew install --formula tree
           brew install --cask font-fira-code
@@ -123,15 +125,24 @@ jobs:
         run: zig build test-backends --summary all
 
   backends-linux:
-    # Nightly, or dispatched by hand. The Linux package adapters against the REAL apt, dnf,
-    # zypper and pacman, each in its own container (tests/linux_backends_test.sh).
+    # Nightly, or dispatched by hand. The Linux package adapters against the REAL apt, dnf
+    # (both generations), zypper, pacman and brew, each in its own container
+    # (tests/linux_backends_test.sh).
     #
     # The hermetic suite can only assert that an adapter emits a given argv;
     # whether that argv is right, and whether the manager's output parses
     # back, only the real manager can say.
+    #
+    # The script fails the run on a SKIP, which here means a case the runner
+    # could not execute at all. N/A is separate and does not fail it: the
+    # name-shape check needs an explicitly-installed package the manifest does
+    # not declare, which zypper (its explicit set is a mox-kept ledger) and a
+    # stock Debian (it marks nothing manual) can never supply.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Six containers, one of which bootstraps Homebrew from its own installer
+    # and clones homebrew-core before it can install anything.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - name: install zig

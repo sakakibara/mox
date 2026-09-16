@@ -56,8 +56,26 @@ const Inventory = struct {
     casks: []const []const u8,
 };
 
+/// Every production call in the subsystem runs under a deadline; so must
+/// these, or a brew blocked on its lock hangs the gate until the job's own
+/// timeout kills it with nothing to show.
+const brew_timeout_s = 120;
+
+fn runBrew(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !std.process.RunResult {
+    const timeout: std.Io.Timeout = .{
+        .duration = .{ .raw = std.Io.Duration.fromSeconds(brew_timeout_s), .clock = .awake },
+    };
+    return std.process.run(arena, io, .{ .argv = argv, .timeout = timeout }) catch |err| {
+        if (err == error.Timeout) {
+            const cmd = std.mem.join(arena, " ", argv) catch "brew";
+            std.debug.print("'{s}' did not answer within {d}s; brew is wedged, most likely on a held lock\n", .{ cmd, brew_timeout_s });
+        }
+        return err;
+    };
+}
+
 fn brewPath(arena: std.mem.Allocator, io: std.Io, which: []const u8) ![]const u8 {
-    const res = try std.process.run(arena, io, .{ .argv = &.{ "brew", which } });
+    const res = try runBrew(arena, io, &.{ "brew", which });
     if (res.term != .exited or res.term.exited != 0) return error.CommandFailed;
     return std.mem.trim(u8, res.stdout, " \t\r\n");
 }
@@ -78,14 +96,20 @@ fn inventory(arena: std.mem.Allocator, io: std.Io) !Inventory {
         var versions = kegs.iterate();
         var on_request = false;
         var seen_keg = false;
+        // Homebrew answers for the latest keg, so two kegs whose receipts
+        // disagree must not make the oracle answer for the other one. The
+        // receipt's mtime is when brew last wrote that keg's request flag.
+        var newest: i96 = std.math.minInt(i96);
         while (try versions.next(io)) |keg| {
             if (keg.kind != .directory) continue;
             const receipt = try std.fs.path.join(arena, &.{ cellar, name, keg.name, "INSTALL_RECEIPT.json" });
             const text = std.Io.Dir.cwd().readFileAlloc(io, receipt, arena, .limited(4 << 20)) catch continue;
             const parsed = std.json.parseFromSlice(std.json.Value, arena, text, .{}) catch continue;
+            const stat = std.Io.Dir.cwd().statFile(io, receipt, .{}) catch continue;
+            if (seen_keg and stat.mtime.nanoseconds <= newest) continue;
             seen_keg = true;
-            const f = parsed.value.object.get("installed_on_request") orelse continue;
-            if (f == .bool and f.bool) on_request = true;
+            newest = stat.mtime.nanoseconds;
+            on_request = if (parsed.value.object.get("installed_on_request")) |f| f == .bool and f.bool else false;
         }
         if (!seen_keg) continue;
         if (on_request) try requested.append(arena, name) else try dependencies.append(arena, name);
@@ -122,6 +146,16 @@ fn holdsFormula(ids: []const []const u8, name: []const u8) bool {
     return false;
 }
 
+/// `name` itself and nothing else: a tap-qualified id sharing this leaf names
+/// a different formula, so the suffix match above would report the wrong one.
+fn holdsFormulaExactly(ids: []const []const u8, name: []const u8) bool {
+    for (ids) |id| {
+        if (std.mem.startsWith(u8, id, packages.brew.cask_prefix)) continue;
+        if (std.mem.eql(u8, id, name)) return true;
+    }
+    return false;
+}
+
 fn holdsCask(ids: []const []const u8, token: []const u8) bool {
     for (ids) |id| {
         if (!std.mem.startsWith(u8, id, packages.brew.cask_prefix)) continue;
@@ -132,6 +166,17 @@ fn holdsCask(ids: []const []const u8, token: []const u8) bool {
     return false;
 }
 
+/// A check with no data to compare skips rather than passing on nothing --
+/// but under CI it fails: the runner is seeded so that the data is there,
+/// and a skip means the job proved nothing it exists to prove.
+fn skipUnlessCi(why: []const u8) anyerror {
+    if (onCi()) {
+        std.debug.print("CI: {s}; the adapter gate cannot run on nothing\n", .{why});
+        return error.TestUnexpectedResult;
+    }
+    return error.SkipZigTest;
+}
+
 fn brewIds(arena: std.mem.Allocator, io: std.Io) ![]const []const u8 {
     var p: packages.exec.Process = .{ .io = io };
     var b: packages.brew.Brew = .{ .runner = p.runner() };
@@ -140,7 +185,7 @@ fn brewIds(arena: std.mem.Allocator, io: std.Io) ![]const []const u8 {
 
 /// The raw tool's own answer, read without going through the adapter.
 fn rawLines(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]const []const u8 {
-    const res = try std.process.run(arena, io, .{ .argv = argv });
+    const res = try runBrew(arena, io, argv);
     if (res.term != .exited or res.term.exited != 0) return error.CommandFailed;
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, res.stdout, '\n');
@@ -184,10 +229,7 @@ test "brew: the receipts' requested formulae are ids, and their dependencies are
 
     try needBrew(a, io);
     const inv = try inventory(a, io);
-    if (inv.requested.len == 0) {
-        std.debug.print("no formula installed on request; nothing to compare\n", .{});
-        return error.SkipZigTest;
-    }
+    if (inv.requested.len == 0) return skipUnlessCi("no formula is installed on request");
     const ids = try brewIds(a, io);
 
     for (inv.requested) |name| {
@@ -199,7 +241,7 @@ test "brew: the receipts' requested formulae are ids, and their dependencies are
     // The other direction is what catches a query that lists everything: a
     // formula pulled in as a dependency is not tracked and must not appear.
     for (inv.dependencies) |name| {
-        if (holdsFormula(ids, name)) {
+        if (holdsFormulaExactly(ids, name)) {
             std.debug.print("'{s}' is an unrequested dependency but appears as an adapter id\n", .{name});
             return error.TestUnexpectedResult;
         }
@@ -215,7 +257,7 @@ test "brew: the spelling is brew's own, verbatim" {
     try needBrew(a, io);
     const ids = try brewIds(a, io);
     const raw = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
-    if (raw.len == 0) return error.SkipZigTest;
+    if (raw.len == 0) return skipUnlessCi("brew lists no requested formula");
 
     // Verbatim: a formula must arrive unprefixed and untranslated, because
     // ids are compared against manifest names by exact match.
@@ -235,10 +277,7 @@ test "brew: every cask in the caskroom is an id under the cask prefix" {
 
     try needBrew(a, io);
     const inv = try inventory(a, io);
-    if (inv.casks.len == 0) {
-        std.debug.print("no cask installed; nothing to compare\n", .{});
-        return error.SkipZigTest;
-    }
+    if (inv.casks.len == 0) return skipUnlessCi("no cask is installed");
     const ids = try brewIds(a, io);
 
     // Drops the prefix and this fails, which is the point: a cask sharing a
@@ -248,7 +287,7 @@ test "brew: every cask in the caskroom is an id under the cask prefix" {
             std.debug.print("cask '{s}' missing from adapter ids under the cask prefix\n", .{token});
             return error.TestUnexpectedResult;
         }
-        if (holdsFormula(ids, token)) {
+        if (holdsFormulaExactly(ids, token)) {
             std.debug.print("cask '{s}' also present as a formula id\n", .{token});
             return error.TestUnexpectedResult;
         }
@@ -261,7 +300,7 @@ test "brew: the adapter reports exactly what brew reports, nothing extra" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    if (!brewPresent(a, io)) return error.SkipZigTest;
+    try needBrew(a, io);
 
     const ids = try brewIds(a, io);
     const formulae = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
@@ -275,7 +314,7 @@ test "brew: a tap-qualified formula is reported the way a row spells it" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    if (!brewPresent(a, io)) return error.SkipZigTest;
+    try needBrew(a, io);
 
     const raw = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
     var qualified: ?[]const u8 = null;
@@ -285,8 +324,9 @@ test "brew: a tap-qualified formula is reported the way a row spells it" {
             break;
         }
     }
-    // Nothing tapped here: skip rather than pass on an empty search, so this
-    // never reads as green coverage on a runner with no tapped formula.
+    // The one case that skips even under CI: covering it means installing
+    // from a third-party tap, which no CI runner should do. It skips rather
+    // than passing on an empty search, so it never reads as coverage.
     const name = qualified orelse {
         std.debug.print("brew: no tapped formula installed here; the tap check has nothing to compare\n", .{});
         return error.SkipZigTest;

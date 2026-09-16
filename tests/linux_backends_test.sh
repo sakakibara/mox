@@ -34,11 +34,16 @@ trap 'rm -rf "$work"' EXIT INT TERM
 passes=0
 fails=0
 skips=0
+nas=0
 ok() { printf '  ok   %s\n' "$1"; passes=$((passes + 1)); }
 no() { printf '  FAIL %s\n      %s\n' "$1" "$2"; fails=$((fails + 1)); }
 # A skip is never a pass. It is printed, counted, and named in the summary,
 # so "this host could not run it" can never read as "this backend is fine".
 skip() { printf '  SKIP %s\n      %s\n' "$1" "$2"; skips=$((skips + 1)); }
+# Not a skip: the check does not apply to this backend at all, so no host and
+# no runner could ever run it. Counted apart from skips, which fail CI --
+# a check that was never going to run must not fail a green nightly.
+na() { printf '  N/A  %s\n      %s\n' "$1" "$2"; nas=$((nas + 1)); }
 
 # A skip is never a pass: a host without docker has not run the gate.
 if ! command -v docker >/dev/null 2>&1; then
@@ -62,7 +67,9 @@ mox_bin="$work/out/bin/mox"
 # Arch publishes no arm64 image, so an Apple-silicon workstation cannot run
 # that case at all. Pull first to tell "this host has no such image" apart
 # from "the adapter is broken": only the second is a failure. Returns 1 when
-# the case cannot run, having already reported why.
+# the case cannot run, having already reported why -- which a caller must
+# swallow with `|| return 0`, or `set -e` ends the run before the summary and
+# the remaining cases never happen.
 pull_image() {
   image="$1"
   backend="$2"
@@ -102,7 +109,7 @@ name = "$pkg"
 EOF
 
   out="$case_dir/out.txt"
-  pull_image "$image" "$backend" "$case_dir" || return
+  pull_image "$image" "$backend" "$case_dir" || return 0
 
   # `sh -c` rather than separate runs: the container is torn down each time,
   # so the install and the status that must see it have to share one.
@@ -145,13 +152,17 @@ EOF
   # trailing newline) runs every name together, which shows up as one absurd
   # untracked entry rather than many.
   longest="$(echo "$after" | grep "UNTRACKED $backend " | sed "s/.*UNTRACKED $backend //" | awk '{ print length }' | sort -rn | head -1)"
+  # No UNTRACKED name is N/A, never a skip: the explicit set drives MISSING as
+  # well as UNTRACKED, so a query that came back empty or garbled has already
+  # failed the check above. Nothing untracked can only mean the set holds
+  # exactly what mox declared, which no runner can change.
   if [ -z "$longest" ]; then
     if [ "$backend" = zypper ]; then
-      skip "$backend ($image): installed names come back one per line" \
-        "zypper never reports UNTRACKED by design (mox tracks only what it installed), so there is no name to measure"
+      na "$backend ($image): installed names come back one per line" \
+        "zypper never reports UNTRACKED by design (its explicit set is the ledger intersected with rpm, so it holds only what mox declared), leaving no name to measure"
     else
-      skip "$backend ($image): installed names come back one per line" \
-        "no UNTRACKED $backend entry after apply, so there is no name to measure"
+      na "$backend ($image): installed names come back one per line" \
+        "$image marks nothing else as explicitly installed, so $backend's explicit set is the declared package alone and there is no other name to measure"
     fi
   elif [ "$longest" -lt 80 ]; then
     ok "$backend ($image): installed names come back one per line"
@@ -214,7 +225,7 @@ exec su tester -c "sh /w/user.sh"
 EOF
 
   out="$case_dir/out.txt"
-  pull_image "$image" "$backend" "$case_dir" || return
+  pull_image "$image" "$backend" "$case_dir" || return 0
 
   if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/root.sh >"$out" 2>&1; then
     no "$backend ($image): container run failed" "$(tail -3 "$out")"
@@ -260,21 +271,27 @@ else
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
   run_case fedora:latest dnf ripgrep
-  run_case rockylinux:9 dnf ripgrep
+  # jq, not ripgrep: Rocky 9's default repos carry no ripgrep -- it lives in
+  # EPEL, which the stock image does not enable, so that case could only fail.
+  run_case rockylinux:9 dnf jq
   run_case opensuse/tumbleweed zypper ripgrep
   # Arch publishes no arm64 image, so this case skips on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_case debian:stable brew hello
 fi
 
+summary="$passes passed, $fails failed"
 if [ "$skips" -gt 0 ]; then
-  printf '\n%d passed, %d failed, %d skipped\n' "$passes" "$fails" "$skips"
-else
-  printf '\n%d passed, %d failed\n' "$passes" "$fails"
+  summary="$summary, $skips skipped"
 fi
+if [ "$nas" -gt 0 ]; then
+  summary="$summary, $nas n/a"
+fi
+printf '\n%s\n' "$summary"
 # A skip is never a pass. On a developer machine an unavailable image or
 # architecture is a fact of life; on CI it means the gate tested nothing it
-# was added to test, so it fails the run.
+# was added to test, so it fails the run. N/A is not counted here: it says
+# the check does not apply to that backend, which no runner can change.
 if [ -n "${CI:-}" ] && [ "$skips" -gt 0 ]; then
   printf 'CI: %d case(s) skipped; this gate must run them all\n' "$skips" >&2
   exit 1

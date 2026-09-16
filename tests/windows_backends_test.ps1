@@ -204,6 +204,13 @@ name = "7zip"
         Write-Host "$passes passed, $fails failed"
     }
     if ($fails -gt 0) { exit 1 }
+    # A skip is never a pass. On a developer machine an absent manager is a
+    # fact of life; on CI it means this gate proved nothing it exists to
+    # prove, so it fails the run.
+    if ($env:CI -and $skips -gt 0) {
+        Write-Host "CI: $skips case(s) skipped; this gate must run them all"
+        exit 1
+    }
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
