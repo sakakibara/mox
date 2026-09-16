@@ -98,7 +98,7 @@ pub const Scoop = struct {
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        return Backend.probeAvailability(self.argv0[0], self.call(arena, &.{"--version"}, false));
+        return Backend.probeAvailability("scoop", self.call(arena, &.{"--version"}, false));
     }
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {

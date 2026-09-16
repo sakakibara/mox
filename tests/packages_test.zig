@@ -659,7 +659,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
     mox.cli.app.brew_prefixes_override = &.{prefix_bin};
     defer mox.cli.app.brew_prefixes_override = null;
-    const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
+    const staged = try std.fs.path.join(a, &.{ h.state, "tmp", "brew-installer" });
     const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
@@ -722,7 +722,7 @@ test "status: an absent manager apply would bootstrap is not a clean machine" {
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      brew: absent; apply will bootstrap it\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   brew ripgrep\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "no declared manager is usable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "no package manager is usable") == null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 
     const j = try h.run(&.{ "mox", "status", "--json" });
@@ -756,7 +756,7 @@ test "status: no usable manager is said, and a broken one is named rather than r
 
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      brew: `brew --version` exited 1; treated as absent\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no declared manager is usable on this machine\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no package manager is usable on this machine\n") != null);
     try std.testing.expect(!fake.called("brew list --full-name --installed-on-request"));
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
@@ -764,7 +764,7 @@ test "status: no usable manager is said, and a broken one is named rather than r
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
     try std.testing.expect(std.mem.indexOf(u8, p.out, "note") == null);
     try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: brew: `brew --version` exited 1; treated as absent\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: no declared manager is usable on this machine\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: no package manager is usable on this machine\n") != null);
 }
 
 test "bootstrap: a manager already present is left alone" {
@@ -847,7 +847,7 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
     try std.testing.expect(fetched);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: BootstrapDigestMismatch") != null);
     // The substituted file is not left where a later run could find it.
-    const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
+    const staged = try std.fs.path.join(a, &.{ h.state, "tmp", "brew-installer" });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
     try std.testing.expectEqual(@as(u8, 2), r.rc);
 }
@@ -1136,6 +1136,51 @@ test "apply: a gate on a tool a pre-script published holds for the packages of t
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
+test "apply: a batch that failed after landing a row says so, and the landed row is seen after" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+
+    // `install` lands the first row as a tool on PATH and then fails, so the
+    // batch is a failure that changed the machine.
+    try writePlugin(io, h, a, "halfway",
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+        \\list) ;;
+        \\install) mkdir -p "$MOX_STATE_DIR/tools"; printf '#!/bin/sh\n' > "$MOX_STATE_DIR/tools/zzlanded"; chmod +x "$MOX_STATE_DIR/tools/zzlanded"; printf '%s\n' "$MOX_STATE_DIR/tools" >> "$MOX_PATH"; exit 1 ;;
+        \\*) exit 64 ;;
+        \\esac
+        \\
+    );
+    try writeManifest(io, h, a, "h.toml", "backend = \"halfway\"\n\n[[packages]]\nname = \"one\"\n\n[[packages]]\nname = \"two\"\n");
+    const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
+    try Io.Dir.cwd().createDirPath(io, post_dir);
+    const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = post, .data = try std.fmt.allocPrint(
+        a,
+        "#!/bin/sh\ncommand -v zzlanded > \"{s}\" || echo missing > \"{s}\"\n",
+        .{ seen, seen },
+    ) });
+    try Io.Dir.cwd().setFilePermissions(io, post, Io.File.Permissions.fromMode(0o755), .{});
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed (2 row(s) in failed batches may have landed)") != null);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    const got = try Io.Dir.cwd().readFileAlloc(io, seen, a, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, got, "zzlanded") != null);
+}
+
 test "apply: --skip-scripts and a path-scoped apply install nothing" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1409,7 +1454,7 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
         try std.testing.expect(std.mem.indexOf(u8, c, "https://example.invalid") == null);
     }
     // Nothing was staged where a real bootstrap would put the installer.
-    const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
+    const staged = try std.fs.path.join(a, &.{ h.state, "tmp", "brew-installer" });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
 }
 
@@ -1919,7 +1964,7 @@ const bootstrappable_sh =
     \\cmd=${1:-}; shift || true
     \\case "$cmd" in
     \\available) [ -d "$home" ] ;;
-    \\bootstrap) mkdir -p "$home/bin"; (cd "$home/bin" && pwd) ;;
+    \\bootstrap) mkdir -p "$home/bin"; (cd "$home/bin" && pwd) > "$2" ;;
     \\list) ;;
     \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
     \\declare) printf 'name = "%s"\n' "$1" ;;

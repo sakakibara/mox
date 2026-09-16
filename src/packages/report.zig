@@ -132,7 +132,7 @@ pub fn fromManifest(
             try assumed.append(arena, b);
         }
     }
-    if (active.items.len == 0) try notes.append(arena, "no declared manager is usable on this machine");
+    if (active.items.len == 0) try notes.append(arena, "no package manager is usable on this machine");
 
     const rows = try desired_mod.select(arena, m, r, registry, active.items, diag);
 
@@ -404,7 +404,7 @@ test "fromManifest: a bootstrap row whose gate excludes this machine assumes not
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
-    try testing.expectEqualStrings("no declared manager is usable on this machine", rep.notes[0]);
+    try testing.expectEqualStrings("no package manager is usable on this machine", rep.notes[0]);
 }
 
 test "fromManifest: an inert backend is not assumed for its bootstrap row" {
@@ -417,6 +417,7 @@ test "fromManifest: an inert backend is not assumed for its bootstrap row" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
     var p: plugin_mod.Plugin = .{
+        .io = std.testing.io,
         .name = "scoopish",
         .argv0 = &.{},
         .runner = fake.runner(),
@@ -460,7 +461,7 @@ test "fromManifest: a broken backend is treated as absent and named in a note" {
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 2), rep.notes.len);
     try testing.expectEqualStrings("brew: `brew --version` exited 1; treated as absent", rep.notes[0]);
-    try testing.expectEqualStrings("no declared manager is usable on this machine", rep.notes[1]);
+    try testing.expectEqualStrings("no package manager is usable on this machine", rep.notes[1]);
     try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
 }
 

@@ -12,8 +12,9 @@
 //!     <plugin> list               stdout: one id per line, explicitly installed
 //!     <plugin> install            stdin: rows, one per line; stdio streamed
 //!     <plugin> declare <id>       stdout: a TOML row body naming this id
-//!     <plugin> bootstrap <path>   optional: install the manager from the
-//!                                 verified file; stdout: a bin dir, or nothing
+//!     <plugin> bootstrap <path> <out>  optional: install the manager from the
+//!                                 verified file, streamed; write the bin
+//!                                 dir, if any, as one line into <out>
 //!     <plugin> limitation         optional: one line on what it cannot see
 //!
 //! Exit 64 from any verb means "not implemented"; any other nonzero exit is
@@ -58,6 +59,7 @@ pub const Plugin = struct {
     /// How to invoke it: the path alone, or an interpreter and the path.
     argv0: []const []const u8,
     runner: exec.Runner,
+    io: std.Io,
     /// Outlives every per-call arena: what `id` answered is kept here for
     /// the life of the plugin.
     alloc: std.mem.Allocator,
@@ -263,13 +265,23 @@ pub const Plugin = struct {
     /// directory to put on PATH so this same run can use what it installed.
     /// It must be one line and an absolute path: progress text that leaked
     /// onto stdout would otherwise land on PATH.
+    /// Streamed like an install: an installer talks to the terminal and may
+    /// take as long as one. The bin dir therefore cannot come back on
+    /// stdout; the plugin writes it to the file named by the second argument.
     fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
-        const res = try self.call(arena, "bootstrap", &.{installer_path}, "", false);
+        const out_path = try std.fmt.allocPrint(arena, "{s}.bindir", .{installer_path});
+        std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
+        defer std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
+        const res = try self.call(arena, "bootstrap", &.{ installer_path, out_path }, "", true);
         if (res.timed_out) return Error.PluginTimedOut;
         if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
-        const line = (try onlyLine(res.stdout)) orelse return null;
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, out_path, arena, .limited(64 * 1024)) catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
+        const line = (try onlyLine(text)) orelse return null;
         if (!std.fs.path.isAbsolute(line)) return Error.PluginBadOutput;
         return line;
     }
@@ -348,7 +360,7 @@ fn rowOf(name: []const u8, fields: []const manifest_mod.Pair) Row {
 }
 
 fn pluginWith(fake: *exec.Fake) Plugin {
-    return .{ .name = "macports", .argv0 = &.{"/r/scripts/backends/macports"}, .runner = fake.runner(), .alloc = fake.arena };
+    return .{ .name = "macports", .argv0 = &.{"/r/scripts/backends/macports"}, .runner = fake.runner(), .alloc = fake.arena, .io = std.testing.io };
 }
 
 test "id: the same row is asked once, and a refusal is remembered too" {
@@ -383,6 +395,7 @@ test "not runnable: no bootstrap, no limitation, and nothing is ever spawned" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
     var p: Plugin = .{
+        .io = std.testing.io,
         .name = "macports",
         .argv0 = &.{},
         .runner = fake.runner(),
@@ -426,7 +439,7 @@ test "a .ps1 plugin runs through powershell when pwsh is not there" {
         .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 list", .fail = error.FileNotFound },
         .{ .argv = "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\r\\scripts\\backends\\macports.ps1 list", .stdout = "ripgrep\r\n" },
     } };
-    var p: Plugin = .{ .name = "macports", .argv0 = argv0, .runner = fake.runner(), .alloc = a };
+    var p: Plugin = .{ .io = std.testing.io, .name = "macports", .argv0 = argv0, .runner = fake.runner(), .alloc = a };
 
     try testing.expect((try p.backend().available(a)) == .present);
     const got = try p.backend().installedExplicit(a);
@@ -563,7 +576,7 @@ test "exit 64: an optional verb the plugin lacks is named, never defaulted" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "/r/scripts/backends/macports declare x", .code = exit_not_implemented },
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .code = exit_not_implemented },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .match = .prefix, .code = exit_not_implemented },
         .{ .argv = "/r/scripts/backends/macports limitation", .code = exit_not_implemented },
     } };
     var p = pluginWith(&fake);
@@ -573,39 +586,40 @@ test "exit 64: an optional verb the plugin lacks is named, never defaulted" {
     try testing.expect((try p.backend().limitationOf(a)) == null);
 }
 
-test "bootstrap: the line on stdout is the bin dir to put on PATH" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = abs_bin ++ "\n" },
-    } };
-    var p = pluginWith(&fake);
-    try testing.expectEqualStrings(abs_bin, (try p.backend().bootstrap(a, "/tmp/i")).?);
-}
-
 /// A bin dir that is absolute on the host running the test.
 const abs_bin = if (builtin.os.tag == .windows) "C:\\opt\\local\\bin" else "/opt/local/bin";
 
-test "bootstrap: no line is no bin dir, and progress on stdout is bad output" {
+test "bootstrap: no line is no bin dir, and anything but one absolute path in the out file is bad output" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const installer = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "i" });
+    const call = try std.fmt.allocPrint(a, "/r/scripts/backends/macports bootstrap {s}", .{installer});
 
+    // Each scripted run writes its "answer" into the out file the plugin
+    // was handed, as a real plugin would; stdout is the terminal's.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "\n  \r\n", .once = true },
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "installing...\n" ++ abs_bin ++ "\n", .once = true },
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = abs_bin ++ "\ndone\n", .once = true },
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "opt/local/bin\n", .once = true },
-        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "installed to " ++ abs_bin ++ "\n" },
+        .{ .argv = call, .match = .prefix, .once = true },
+        .{ .argv = call, .match = .prefix, .write_after = installer, .io = io, .stdout = "\n  \r\n", .once = true },
+        .{ .argv = call, .match = .prefix, .write_after = installer, .io = io, .stdout = "installing...\n" ++ abs_bin ++ "\n", .once = true },
+        .{ .argv = call, .match = .prefix, .write_after = installer, .io = io, .stdout = "opt/local/bin\n", .once = true },
+        .{ .argv = call, .match = .prefix, .write_after = installer, .io = io, .stdout = abs_bin ++ "\n" },
     } };
     var p = pluginWith(&fake);
-    try testing.expect((try p.backend().bootstrap(a, "/tmp/i")) == null);
-    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
-    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
-    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
-    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, "/tmp/i"));
+    try testing.expect((try p.backend().bootstrap(a, installer)) == null);
+    try testing.expect((try p.backend().bootstrap(a, installer)) == null);
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, installer));
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, installer));
+    try testing.expectEqualStrings(abs_bin, (try p.backend().bootstrap(a, installer)).?);
+    // The out file never outlives the call.
+    const out = try std.fmt.allocPrint(a, "{s}.bindir", .{installer});
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out, .{}));
+    // The call itself is streamed: it carries the installer and the out file.
+    try testing.expect(std.mem.endsWith(u8, fake.calls.items[0], out));
 }
 
 test "limitation: the plugin's one line is carried onto the backend" {

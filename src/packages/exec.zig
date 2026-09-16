@@ -50,7 +50,7 @@ pub const default_install_timeout_ms: i64 = 0;
 pub const default_grace_ms: i64 = 10_000;
 
 /// `MOX_INSTALL_TIMEOUT_MS`, read the way the setup-script bound is: a
-/// present but unparseable value warns once and falls back to the default.
+/// present but unparseable value warns on each read and falls back to the default.
 pub fn installTimeoutMs(env: ?*const EnvironMap, stderr: *std.Io.Writer) i64 {
     const m = env orelse return default_install_timeout_ms;
     const v = m.get("MOX_INSTALL_TIMEOUT_MS") orelse return default_install_timeout_ms;
@@ -748,7 +748,7 @@ test "sweepScratch: a dead process's files go, this process's and a live one's s
     try Io.Dir.cwd().createDirPath(io, tmp_dir);
 
     const mine = try std.fmt.allocPrint(a, "stdin-{d}.txt", .{processId()});
-    const files = [_][]const u8{ "stdin-2147483000.txt", "winget-export-2147483000.json", mine, "stdin-1.txt", "brew-installer" };
+    const files = [_][]const u8{ "stdin-2147483000.txt", "winget-export-2147483000.json", mine, "stdin-1.txt", "notes.txt" };
     for (files) |f| {
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ tmp_dir, f }), .data = "x" });
     }

@@ -167,7 +167,7 @@ pub const PackageBackends = struct {
             &.{};
         self.plugins = try arena.alloc(mox.packages.plugin.Plugin, found.len);
         for (found, 0..) |f, i| {
-            self.plugins[i] = .{ .name = f.name, .argv0 = f.argv0, .runner = r, .alloc = arena, .not_runnable = f.not_runnable };
+            self.plugins[i] = .{ .name = f.name, .argv0 = f.argv0, .runner = r, .alloc = arena, .io = io, .not_runnable = f.not_runnable };
             const pl = &self.plugins[i];
             const shipped: ?*mox.packages.backend.Backend = for (list.items) |*b| {
                 if (std.mem.eql(u8, b.name, f.name)) break b;

@@ -850,13 +850,9 @@ fn bootstrapBackends(
         };
         // Not runnable here: the machine that can run it bootstraps it.
         if (backend.inert) continue;
-        const present = backend.available(ctx.alloc) catch |e| {
-            try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
-            try ctx.err.flush();
-            failed += 1;
-            try failed_names.append(ctx.alloc, b.backend);
-            continue;
-        };
+        // A probe that fails is reported once, by the report that follows;
+        // nothing is bootstrapped on a manager mox could not ask about.
+        const present = backend.available(ctx.alloc) catch continue;
         if (present == .present) continue;
         if (!backend.canBootstrap()) {
             try ctx.err.print(
@@ -875,7 +871,7 @@ fn bootstrapBackends(
             ctx.alloc,
             ctx.io,
             pkg_backends.runner(),
-            context.paths.state_dir,
+            try mox.packages.exec.scratchTmpDir(ctx.alloc, context.paths.state_dir),
             installer_name,
             .{ .url = b.url, .sha256 = b.sha256 },
         ) catch |e| {
@@ -951,11 +947,10 @@ const PackageCounts = struct {
 
 /// Install every package the manifest declares and this machine lacks.
 ///
-/// Runs AFTER the pre stage and BEFORE its re-capture. After, so a
-/// pre-script that prepares the machine (the Xcode Command Line Tools, say)
-/// has run before a manager is bootstrapped or asked to install. Before,
-/// because a package installed here is a tool the re-capture has to see,
-/// exactly like one a script installed.
+/// Runs after the pre stage and its re-capture, so a gate on a tool or
+/// fact a pre-script provided holds here; what it installs or bootstraps
+/// triggers a re-capture of its own, so a package installed here is a tool
+/// the post scripts see, exactly like one a script installed.
 ///
 /// Only ever installs. An untracked package is reported by `mox status` and
 /// reconciled by `mox commit`; nothing here removes one.

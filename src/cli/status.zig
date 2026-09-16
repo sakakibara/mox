@@ -299,6 +299,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             for (prep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
             const reported = try reportPackages(ctx, prep, &bindings);
             for (reported.report.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+            for (reported.report.backends) |b| {
+                if (b.limitation) |note| try ctx.err.print("mox status: note: {s}: {s}\n", .{ b.backend, note });
+            }
             break :blk reported;
         } else .{};
         problems += pkgs.problems();

@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
     // Backend adapters against the real package managers, at
     // tests/packages_backends_test.zig. Deliberately NOT on `test`: the
     // hermetic suite must pass with no package manager installed and must
-    // never touch the one a machine has. Each check is differential against
+    // never touch the one a machine has. The brew check is differential against
     // the manager's own output, so it trips when a manager changes under an
     // adapter.
     const backends_tests_mod = b.createModule(.{
