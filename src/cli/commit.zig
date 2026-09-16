@@ -606,13 +606,14 @@ fn reconcilePackages(
                 if (needs_backend) b.backend else null,
             );
             try mox.packages.write.append(ctx.alloc, ctx.io, dest.path, block);
-            const layer: []const u8 = if (dest.private) " (private layer)" else "";
+            // The label already names the layer; saying it twice reads as a
+            // stutter rather than as emphasis.
             if (chosen == 0) {
                 res.added += 1;
-                try ctx.out.print("  recorded in {s}{s}\n", .{ dest.label, layer });
+                try ctx.out.print("  recorded in {s}\n", .{dest.label});
             } else {
                 res.blacklisted += 1;
-                try ctx.out.print("  blacklisted in {s}{s}\n", .{ dest.label, layer });
+                try ctx.out.print("  blacklisted in {s}\n", .{dest.label});
             }
         }
     }

@@ -103,10 +103,15 @@ pub fn discover(
     return out.toOwnedSlice(arena);
 }
 
-/// The placeholder names git repositories use to carry an otherwise empty
-/// directory.
+/// A file git or an editor keeps in a directory it tracks, rather than a
+/// backend. Named one by one: any other dotfile is a backend whose name
+/// happens to start with a dot, and must be refused by name rather than
+/// silently skipped and then read as a typo from the manifest's side.
 fn isKeepFile(name: []const u8) bool {
-    return std.mem.eql(u8, name, ".gitkeep") or std.mem.eql(u8, name, ".keep");
+    for ([_][]const u8{ ".gitkeep", ".keep", ".gitignore", ".gitattributes", ".editorconfig" }) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    return false;
 }
 
 const Kind = enum { plain, ps1, exe, cmd };
@@ -343,7 +348,7 @@ test "discover: finder junk is ignored, not a backend name" {
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
-test "discover: a .gitkeep is ignored, so an empty scripts/backends can be committed" {
+test "discover: what git keeps in a tracked directory is not read as a backend" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -351,8 +356,13 @@ test "discover: a .gitkeep is ignored, so an empty scripts/backends can be commi
     defer arena.deinit();
     const a = arena.allocator();
     try tmp.dir.createDirPath(io, "repo/scripts/backends");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.gitkeep", .data = "" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.keep", .data = "" });
+    // An empty directory is kept with a placeholder, and a directory of shell
+    // plugins needs the eol rule that keeps them LF-clean on Windows: all of
+    // it is git's, none of it a backend.
+    for ([_][]const u8{ ".gitkeep", ".keep", ".gitignore", ".gitattributes", ".editorconfig" }) |name| {
+        const sub = try std.fs.path.join(a, &.{ "repo/scripts/backends", name });
+        try tmp.dir.writeFile(io, .{ .sub_path = sub, .data = "" });
+    }
 
     const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
     try testing.expectEqual(@as(usize, 0), got.len);

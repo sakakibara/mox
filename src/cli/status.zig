@@ -809,7 +809,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
 pub const command = app.command(Spec, .{
     .name = "status",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, and each manager that is BROKEN, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A manifest mox refuses is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a manifest mox would not read at all, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A manifest mox refuses is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
     .group = .general,
     .needs_context = true,
 }, run);
