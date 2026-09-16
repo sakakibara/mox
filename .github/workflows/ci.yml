@@ -96,10 +96,8 @@ jobs:
     # managers (`zig build test-backends`), which the hermetic `test` step
     # deliberately excludes. Each check is differential against the manager's
     # own output, so the day brew changes a flag or an output shape under an
-    # adapter, this goes red here rather than on a machine.
-    #
-    # macOS only while brew is the only adapter; the matrix grows with the
-    # linux and windows adapters.
+    # adapter, this goes red here rather than on a machine. The Linux and
+    # Windows managers have their own jobs below.
     if: github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 20
@@ -125,12 +123,9 @@ jobs:
     # Nightly only. The Linux package adapters against the REAL apt, dnf and
     # pacman, each in its own container (tests/linux_backends_test.sh).
     #
-    # The hermetic suite can only assert that an adapter emits a given argv.
-    # It cannot know whether that argv is right or whether the manager's
-    # output parses back, and both bugs this job exists to catch were
-    # invisible to it: dnf5 concatenating every name onto one line without a
-    # trailing newline in its format string, and a minimal image having no
-    # `sudo` at all.
+    # The hermetic suite can only assert that an adapter emits a given argv;
+    # whether that argv is right, and whether the manager's output parses
+    # back, only the real manager can say.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -151,11 +146,8 @@ jobs:
     # (tests/windows_backends_test.ps1), read-only: it queries, it never
     # installs.
     #
-    # This is the ONLY place those adapters run at all. They were written from
-    # the dotfiles' PowerShell bootstrap without ever executing against scoop
-    # or winget, so until this job has been green their export-JSON parsing is
-    # unproven. A manager missing from the runner skips loudly rather than
-    # passing.
+    # This is the only place those adapters meet the real managers. A manager
+    # missing from the runner skips loudly rather than passing.
     if: github.event_name == 'schedule'
     runs-on: windows-latest
     timeout-minutes: 30

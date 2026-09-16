@@ -182,8 +182,8 @@ A plugin named like a shipped backend overrides it, and `status` says
 
 | Verb | stdin | stdout | Exit |
 |---|---|---|---|
-| `available` | -- | -- | 0 usable here; nonzero not |
-| `id` | rows, one `{ name = "...", ... }` per line | one id per line, in order | nonzero: a row is refused; say why on stderr |
+| `available` | -- | -- | 0 usable here; 1 not usable here; anything else is a broken plugin |
+| `id` | one row, `{ name = "...", ... }` | exactly one id | nonzero: the row is refused; say why on stderr |
 | `list` | -- | one id per line: what was explicitly installed | nonzero: failed |
 | `install` | rows, one per line | streamed to the terminal | nonzero: failed |
 | `declare <id>` | -- | a TOML row body: `name = "..."` plus fields | nonzero: failed |
@@ -191,7 +191,10 @@ A plugin named like a shipped backend overrides it, and `status` says
 | `limitation` | -- | one line on what it cannot see | 64: none |
 
 Rows arrive as TOML inline tables with exactly the keys the manifest row
-carries. Ids are opaque to mox: it compares them and never parses them, so a
+carries. `id` is asked one row at a time and must answer exactly one line;
+`install` gets every row of the batch, one per line. A plugin's stderr is
+the terminal's for `available` and `id`, so a refusal reason or a crash is
+seen as written. Ids are opaque to mox: it compares them and never parses them, so a
 manager with two namespaces prefixes them itself (`cask:ghostty`) and the
 manifest row still spells `name = "ghostty"`, `kind = "cask"` -- the same
 shape as for a compiled backend.
@@ -245,12 +248,12 @@ MacPorts, as a POSIX script at `scripts/backends/macports`:
 #!/bin/sh
 set -eu
 cmd=${1:-}; shift || true
-name() { printf '%s' "$1" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; }
+name() { printf '%s\n' "$1" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; }
 case "$cmd" in
 available) command -v port >/dev/null 2>&1 ;;
-id)        while IFS= read -r l; do [ -n "$l" ] && name "$l"; done ;;
+id)        while IFS= read -r l; do [ -n "$l" ] || continue; name "$l"; done ;;
 list)      port -q echo requested | awk 'NF { print $1 }' ;;
-install)   set --; while IFS= read -r l; do [ -n "$l" ] && set -- "$@" "$(name "$l")"; done
+install)   set --; while IFS= read -r l; do [ -n "$l" ] || continue; set -- "$@" "$(name "$l")"; done
            sudo port -N install "$@" ;;
 declare)   printf 'name = "%s"\n' "$1" ;;
 limitation) echo "variants are not tracked; a port is matched by name alone" ;;
@@ -279,7 +282,6 @@ answered without the real thing:
 | `sh tests/linux_backends_test.sh` | apt, dnf, zypper, pacman -- a full install round trip per distro, in containers |
 | `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget, read-only |
 
-All three run nightly in CI. Both bugs the container suite was written after
-were invisible to the hermetic tests: dnf5 concatenating every name onto one
-line when its format string lacks a trailing newline, and a minimal image
-having no `sudo`, which made elevating unconditionally fail every install.
+All three run nightly in CI. Only the real manager can say whether a query's
+format string still yields one name per line, or whether an image without
+`sudo` installs at all; the hermetic tests cannot.

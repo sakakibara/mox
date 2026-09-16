@@ -4,11 +4,8 @@
 #
 # READ-ONLY: nothing is installed, and no manifest declares a package this
 # machine lacks that the run would then try to fetch. What is exercised is the
-# QUERY path, which is the part that cannot be verified anywhere else: the
-# adapters were written from the dotfiles' PowerShell bootstrap without ever
-# running against these managers, and the export JSON shapes
-# (`apps[].Name`, `Sources[].Packages[].PackageIdentifier`) are the riskiest
-# assumption in them.
+# QUERY path: whether each manager's export still has the JSON shape the
+# adapter reads (`apps[].Name`, `Sources[].Packages[].PackageIdentifier`).
 #
 # A manager that is absent SKIPS, loudly and counted. A skip is never a pass:
 # "this runner had no winget" must never read as "the winget adapter works".

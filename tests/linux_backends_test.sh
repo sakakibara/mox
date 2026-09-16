@@ -7,10 +7,9 @@
 #
 # The hermetic suite asserts that an adapter EMITS a given argv; it cannot
 # know whether that argv is right, or whether the manager's output parses
-# back. Both bugs this file exists to catch were invisible to it: dnf5's
-# `--qf '%{name}'` concatenates every name onto one line without the trailing
-# newline, and a minimal image has no `sudo`, so elevating unconditionally
-# turns every install into "sudo: command not found".
+# back. Only the real manager can answer that: whether a query's format
+# string still yields one name per line, whether an image without `sudo`
+# installs at all.
 #
 # Each run is a full round trip against a real manager: declare a package the
 # machine lacks, see it reported MISSING, install it for real, see the drift

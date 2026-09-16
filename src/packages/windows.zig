@@ -15,10 +15,8 @@
 //!   which is what a row spells and what an export reports. Its display name
 //!   is not unique and is never used here.
 //!
-//! NOT verified against the real managers. Every argv and JSON shape here is
-//! taken from the dotfiles' own PowerShell bootstrap, which has run on the
-//! user's Windows machines; the parsing is exercised only against fixtures.
-//! Until a Windows runner executes these, treat them as unproven.
+//! Exercised against the real managers only by the Windows integration job;
+//! the unit tests cover the parsing against fixtures.
 
 const std = @import("std");
 const json = @import("json");

@@ -7,9 +7,7 @@
 //! earns its fields here rather than in the core.
 //!
 //! Every install is non-interactive, because `mox apply` is: a manager that
-//! stops to ask a question mox cannot answer would hang a bootstrap. The
-//! argv match what the dotfiles' own shell bootstrap has been running on
-//! these distros.
+//! stops to ask a question mox cannot answer would hang a bootstrap.
 //!
 //! An install elevates through `sudo` only when the process is not already
 //! root. A container and a root WSL install commonly have no `sudo` at all,
