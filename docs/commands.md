@@ -187,8 +187,9 @@ reported by `mox status` and reconciled by `mox commit`, never uninstalled.
 Under `--dry-run` nothing is fetched or installed and the run lists what
 it would install, planned as though any absent manager had been
 bootstrapped. The failures a plan can have on its own -- a probe that did not
-answer, a row whose absent manager cannot be bootstrapped -- are counted on
-the same line, so a plan that could not be made is not read as a clean one.
+answer, a row whose absent manager cannot be bootstrapped -- are counted
+beside them (`Packages: N would be installed, N failed`), so a plan that
+could not be made is not read as a clean one.
 `--skip-scripts` skips packages as it skips scripts (both change the machine
 beyond its files), and a path-scoped apply names files and installs nothing.
 When a pre-script ran, the machine is re-read before packages are planned,
@@ -225,7 +226,7 @@ stale copy -- snapshot-first, so `mox rollback` recovers it. One edited
 since mox wrote it is not deleted silently: it is reported as drift and
 kept until resolved. See `docs/dsl.md` (Empty output) and `keep-empty`.
 
-Every `scripts/pre/`/`scripts/post/` script lands in one of seven outcomes,
+Every `scripts/pre/`/`scripts/post/` script lands under one of five labels,
 summarized on the closing line (`scripts: N ran, N skipped, N failed, N
 blocked, N declined`): `ran` (exit 0); `skipped` (its directory tuple or
 `# mox: when` gate did not match); `declined` (every fact it needs is

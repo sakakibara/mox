@@ -314,12 +314,13 @@ POSIX script and a PowerShell twin. Names are `[A-Za-z0-9_-]`.
   as a note under `packages:`, so a MacPorts script in a shared repo neither
   breaks nor silently vanishes on a Windows machine.
 
-What git keeps in a directory it tracks is ignored -- `.gitkeep`, `.keep`,
-`.gitignore`, `.gitattributes`, `.editorconfig` -- so an empty
-`scripts/backends/` can be version-controlled and shell plugins can carry the
-eol rule that keeps them LF-clean on Windows. Any other name is a backend, so
-one hidden by an accidental dot is named rather than silently skipped and
-then read as a typo from the manifest's side. A directory there is an error naming the
+A backend name never begins with a dot, so nothing there that does is one:
+an empty `scripts/backends/` can be version-controlled, and shell plugins can
+carry the eol rule that keeps them LF-clean on Windows. What git and an
+editor keep in a tracked directory (`.gitkeep`, `.keep`, `.gitignore`,
+`.gitattributes`, `.editorconfig`) passes without remark; any other dotfile
+is ignored and said as a note, since that is also how a backend ends up
+hidden by accident, and it must not read as a typo from the manifest's side. A directory there is an error naming the
 path, never "no backend named x".
 
 There is no axis gating (`os=darwin/`) and no private-layer shadowing.

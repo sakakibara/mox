@@ -207,10 +207,13 @@ pub const PackageBackends = struct {
             try notes.append(arena, "no plugin is discovered: this mox runs under one (" ++
                 packages_depth_var ++ " is set); the built-in backends stay");
         }
+        var skipped: std.ArrayList([]const u8) = .empty;
         const found: []const mox.packages.discover.Found = if (discover_plugins and !nested)
-            try mox.packages.discover.discover(arena, io, repo_dir, diag)
+            try mox.packages.discover.discover(arena, io, repo_dir, diag, &skipped)
         else
             &.{};
+        // Said before any plugin runs, like every other note about the set.
+        for (skipped.items) |why| try notes.append(arena, why);
         self.plugins = try arena.alloc(mox.packages.plugin.Plugin, found.len);
         for (found, 0..) |f, i| {
             self.plugins[i] = .{ .name = f.name, .argv0 = f.argv0, .runner = r, .alloc = arena, .io = io, .not_runnable = f.not_runnable };

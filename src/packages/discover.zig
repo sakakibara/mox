@@ -53,6 +53,9 @@ pub fn discover(
     io: Io,
     repo_dir: []const u8,
     diag: ?*Diag,
+    /// What was in the directory but is not a backend, for the caller to
+    /// print as notes. Null when the caller does not want them.
+    skipped_out: ?*std.ArrayList([]const u8),
 ) ![]const Found {
     const dir_path = try std.fs.path.join(arena, &.{ repo_dir, "scripts", "backends" });
     const entries = dirent.sortedPath(arena, io, dir_path, .{ .iterate = true }) catch |e| {
@@ -61,18 +64,30 @@ pub fn discover(
     };
 
     var out: std.ArrayList(Found) = .empty;
+    var ignored: std.ArrayList([]const u8) = .empty;
+    const skipped = skipped_out orelse &ignored;
     var seen = std.StringHashMap([]const u8).init(arena);
 
     for (entries) |e| {
         if (e.kind != .file and e.kind != .sym_link and e.kind != .directory) continue;
         if (junk.isJunk(e.name)) continue;
-        // Only what git keeps in a tracked directory is skipped, never every
-        // dotfile: a
-        // `.macports` hidden by an editor or by accident must say what it is,
-        // as a `macports/` directory does below, rather than be dropped here
-        // and reported from the manifest's side as no such backend.
-        if (isKeepFile(e.name)) continue;
         const path = try std.fs.path.join(arena, &.{ dir_path, e.name });
+        // A backend name never begins with a dot, so nothing here can be one:
+        // a directory that holds plugins also holds git's and an editor's own
+        // config, and refusing the lot would break every package command over
+        // a `.gitattributes`. It is said rather than silently dropped, since
+        // the other way a file ends up hidden is a slip -- a `.macports` -- and
+        // that must not read as "no such backend" from the manifest's side.
+        if (e.name.len > 0 and e.name[0] == '.') {
+            if (!isKeepFile(e.name)) {
+                try skipped.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "{s}: ignored; a backend name never begins with a dot",
+                    .{path},
+                ));
+            }
+            continue;
+        }
         const kind = kindOf(e.name);
         const name = stemOf(e.name, kind);
 
@@ -104,10 +119,10 @@ pub fn discover(
     return out.toOwnedSlice(arena);
 }
 
-/// A file git or an editor keeps in a directory it tracks, rather than a
-/// backend. Named one by one: any other dotfile is a backend whose name
-/// happens to start with a dot, and must be refused by name rather than
-/// silently skipped and then read as a typo from the manifest's side.
+/// A file whose presence needs no remark: git's own placeholders and the
+/// rules a directory of shell plugins carries. Anything else beginning with a
+/// dot is still skipped, but said, since that is also how a backend ends up
+/// hidden by accident.
 fn isKeepFile(name: []const u8) bool {
     for ([_][]const u8{ ".gitkeep", ".keep", ".gitignore", ".gitattributes", ".editorconfig" }) |k| {
         if (std.mem.eql(u8, name, k)) return true;
@@ -233,7 +248,7 @@ test "discover: a missing directory is no plugins" {
     const a = arena.allocator();
     try tmp.dir.createDirPath(io, "repo");
 
-    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
+    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null, null);
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
@@ -251,7 +266,7 @@ test "discover: an executable plain file is a plugin named by its stem" {
     const p = try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports" });
     try Io.Dir.cwd().setFilePermissions(io, p, Io.File.Permissions.fromMode(0o755), .{});
 
-    const got = try discover(a, io, repo, null);
+    const got = try discover(a, io, repo, null, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings("macports", got[0].name);
     try testing.expect(got[0].not_runnable == null);
@@ -270,7 +285,7 @@ test "discover: a file without its executable bit is a named error, not an absen
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports", .data = "#!/bin/sh\n" });
 
     var d: Diag = .{};
-    try testing.expectError(Error.BackendNotExecutable, discover(a, io, try tmpRepo(a, io, &tmp.sub_path), &d));
+    try testing.expectError(Error.BackendNotExecutable, discover(a, io, try tmpRepo(a, io, &tmp.sub_path), &d, null));
     try testing.expect(std.mem.indexOf(u8, d.capture().?, "chmod +x") != null);
 }
 
@@ -285,7 +300,7 @@ test "discover: a .ps1 on unix is not runnable here, and says so rather than van
     try tmp.dir.createDirPath(io, "repo/scripts/backends");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/scoopish.ps1", .data = "exit 0\n" });
 
-    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
+    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings("scoopish", got[0].name);
     try testing.expect(got[0].not_runnable != null);
@@ -305,7 +320,7 @@ test "discover: a runnable file beside its not-runnable twin wins the name" {
     const repo = try tmpRepo(a, io, &tmp.sub_path);
     try Io.Dir.cwd().setFilePermissions(io, try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports" }), Io.File.Permissions.fromMode(0o755), .{});
 
-    const got = try discover(a, io, repo, null);
+    const got = try discover(a, io, repo, null, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expect(got[0].not_runnable == null);
 }
@@ -329,7 +344,7 @@ test "discover: a third file for a name is reported against the file that holds 
     const cmd = try std.fmt.allocPrint(a, "{s} and ", .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports.cmd" })});
 
     var d: Diag = .{};
-    try testing.expectError(Error.DuplicateBackend, discover(a, io, repo, &d));
+    try testing.expectError(Error.DuplicateBackend, discover(a, io, repo, &d, null));
     const msg = d.capture().?;
     try testing.expect(std.mem.indexOf(u8, msg, plain) == null);
     try testing.expect(std.mem.indexOf(u8, msg, cmd) != null);
@@ -345,7 +360,7 @@ test "discover: finder junk is ignored, not a backend name" {
     try tmp.dir.createDirPath(io, "repo/scripts/backends");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.DS_Store", .data = "" });
 
-    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
+    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null, null);
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
@@ -365,11 +380,11 @@ test "discover: what git keeps in a tracked directory is not read as a backend" 
         try tmp.dir.writeFile(io, .{ .sub_path = sub, .data = "" });
     }
 
-    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
+    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null, null);
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
-test "discover: a hidden plugin is named, not skipped for beginning with a dot" {
+test "discover: a hidden plugin is said, not silently dropped" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -377,20 +392,25 @@ test "discover: a hidden plugin is named, not skipped for beginning with a dot" 
     defer arena.deinit();
     const a = arena.allocator();
     try tmp.dir.createDirPath(io, "repo/scripts/backends");
-    // Hidden by an editor, or by a stray `mv`: skipping it would be reported
-    // from the manifest's side as "no backend named macports", the failure the
-    // directory case twelve lines below exists to prevent.
+    // Hidden by an editor, or by a stray `mv`. Dropping it in silence would
+    // be reported from the manifest's side as "no backend named macports",
+    // the failure the directory case exists to prevent -- but refusing the
+    // whole subsystem over it would take a `.gitattributes` with it.
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.macports", .data = "#!/bin/sh\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.gitattributes", .data = "* text=auto eol=lf\n" });
 
-    var d: Diag = .{};
     const repo = try tmpRepo(a, io, &tmp.sub_path);
-    try testing.expectError(Error.BadBackendName, discover(a, io, repo, &d));
+    var skipped: std.ArrayList([]const u8) = .empty;
+    const got = try discover(a, io, repo, null, &skipped);
+    try testing.expectEqual(@as(usize, 0), got.len);
+    // The slip is named; what git keeps there is not worth remarking on.
+    try testing.expectEqual(@as(usize, 1), skipped.items.len);
     const want = try std.fmt.allocPrint(
         a,
-        "{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends",
+        "{s}: ignored; a backend name never begins with a dot",
         .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", ".macports" })},
     );
-    try testing.expectEqualStrings(want, d.capture().?);
+    try testing.expectEqualStrings(want, skipped.items[0]);
 }
 
 test "discover: a directory named like a plugin says what it is, not that no such backend exists" {
@@ -404,7 +424,7 @@ test "discover: a directory named like a plugin says what it is, not that no suc
 
     var d: Diag = .{};
     const repo = try tmpRepo(a, io, &tmp.sub_path);
-    try testing.expectError(Error.BackendNotExecutable, discover(a, io, repo, &d));
+    try testing.expectError(Error.BackendNotExecutable, discover(a, io, repo, &d, null));
     const want = try std.fmt.allocPrint(
         a,
         "{s}: not a file; a backend is an executable file",
@@ -426,7 +446,7 @@ test "discover: a symlink to a directory is refused as not a file" {
     try tmp.dir.symLink(io, "../../elsewhere", "repo/scripts/backends/macports", .{});
 
     var d: Diag = .{};
-    try testing.expectError(Error.BackendNotExecutable, discover(a, io, try tmpRepo(a, io, &tmp.sub_path), &d));
+    try testing.expectError(Error.BackendNotExecutable, discover(a, io, try tmpRepo(a, io, &tmp.sub_path), &d, null));
     try testing.expect(std.mem.indexOf(u8, d.capture().?, "not a file") != null);
 }
 
@@ -442,7 +462,7 @@ test "discover: a name outside the charset is refused with its path" {
 
     var d: Diag = .{};
     const repo = try tmpRepo(a, io, &tmp.sub_path);
-    try testing.expectError(Error.BadBackendName, discover(a, io, repo, &d));
+    try testing.expectError(Error.BadBackendName, discover(a, io, repo, &d, null));
     const want = try std.fmt.allocPrint(
         a,
         "{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends",
@@ -466,7 +486,7 @@ test "discover: an unreadable scripts/backends directory is named" {
     defer Io.Dir.cwd().setFilePermissions(io, dir_path, Io.File.Permissions.fromMode(0o755), .{}) catch {};
 
     var d: Diag = .{};
-    const got = discover(a, io, repo, &d);
+    const got = discover(a, io, repo, &d, null);
     // root opens anything; the check is about the wording when the open fails.
     if (got) |_| return error.SkipZigTest else |e| {
         try testing.expectEqual(error.AccessDenied, e);

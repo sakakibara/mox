@@ -167,7 +167,10 @@ pub fn errorText(e: anyerror) []const u8 {
 /// no bound cannot arrive here timed out, since nothing was armed to kill it.
 pub fn failureText(arena: std.mem.Allocator, e: anyerror, bound_ms: i64, bound_var: []const u8) ![]const u8 {
     return switch (e) {
-        error.TimedOut => try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var }),
+        // A plugin's own name for a kill is the same event, so it reads the
+        // same: a shipped backend and a plugin must not describe one bound
+        // two ways.
+        error.TimedOut, error.PluginTimedOut => try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var }),
         else => errorText(e),
     };
 }
