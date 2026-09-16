@@ -290,7 +290,8 @@ is a hash -- edit the source directly).
 A repo carrying a `data/packages/` manifest is reconciled before the file
 pass: each untracked package (installed, declared nowhere, not
 blacklisted) is offered `[y/b/s]` -- add a row to the file that declares
-its backend, blacklist it, or skip. A row is appended the moment it is
+its backend, blacklist it, or skip; skip is the default, so `--yes` records
+nothing and exits 1 while anything stays untracked. A row is appended the moment it is
 chosen, so `q` here ends the run before the file pass and says how many
 rows were already recorded (rc 1); `--abort-on-prompt` exits 2 at the
 first package prompt the same way. A backend plugin's `declare` verb runs
@@ -360,8 +361,12 @@ and `limitation` verbs), each listed by path first; see
 [packages.md](packages.md#adding-a-backend). Package drift counts
 toward the exit code exactly as file drift does, so `mox status` answers
 one question -- does this machine match what it declares -- over files
-and packages alike. A manifest that is itself malformed is an error, not
-drift, and says which file and row.
+and packages alike. A manifest that is itself malformed, a plugin that
+fails, or a manager query that fails is an error, not drift: the run exits
+1 with `mox status: packages: ...` on stderr, and under `--json` or
+`--porcelain` the package set on stdout is empty or partial, so tooling must
+treat rc 1 together with that stderr line as an error, not as a clean
+machine. Plugin notes go to stderr as `mox status: note: ...` in those modes.
 
 `--drift` shows only the drift set (the report `mox apply` prints for the
 same tree, from the same classifier -- the two never disagree), dropping

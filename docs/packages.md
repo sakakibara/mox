@@ -6,7 +6,9 @@ declares what belongs on a machine, `mox status` reports the difference,
 
 A repo with no `data/packages/` directory is not using any of this. No
 section prints, no package manager is queried, and no exit code changes.
-Creating that directory is what opts in.
+Creating that directory is what opts in, even before it holds a file: every
+manager is then queried and what it has installed is reported UNTRACKED,
+which is how a manifest is first written by `mox commit`.
 
 ## The manifest
 
@@ -78,7 +80,7 @@ when = "os=darwin"
 for any row. `mox apply` runs it only when the row's gate holds and the
 backend's `available` says the manager is absent: the file is fetched,
 refused unless it hashes to the declared sha256, handed to the backend, and
-deleted afterwards. brew and scoop know how to run their installers and
+deleted afterwards whether the bootstrap succeeded or not. brew and scoop know how to run their installers and
 where the result lands, so the same apply installs packages through the
 manager it just put in place; a plugin runs `bootstrap <path>` itself and
 reports the directory to put on PATH. An installer over 64 MiB is refused.
@@ -97,7 +99,7 @@ distinction is what lets one manifest carry every machine's packages.
 | `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name` | `kind` (`formula`, `cask`) |
 | `apt` | name | `apt-mark showmanual` | -- |
 | `dnf` | name | `dnf repoquery --userinstalled` | -- |
-| `pacman` | name | `pacman -Qeq` | -- |
+| `pacman` | name | `pacman -Qeq`; an install is `pacman -Syu --needed`, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
 | `winget` | `PackageIdentifier` | `winget export` | `source`, `scope` (`user`/`machine`), `override` |
@@ -159,14 +161,23 @@ may have landed some of its rows, so the re-capture runs after any attempt.
 `--dry-run` lists what it would install and installs nothing.
 
 apply **only ever installs**. Removal is never automatic: an untracked
-package is reported and reconciled, never uninstalled behind you.
+package is reported and reconciled, never uninstalled behind you. (What a
+manager does on the way -- pacman's full upgrade, a dependency brew drops --
+is the manager's own behavior, not a mox decision.)
 
-`mox commit` offers each untracked package:
+`mox commit` offers each untracked package `[y/b/s]`:
 
 - **add** -- append a row to the manifest file that already speaks that
-  backend, with whichever adapter fields identify it
+  backend, with whichever adapter fields identify it. The file chosen is
+  the first of: a repo file whose default `backend` is it, a repo file
+  carrying a row for it, then the same two in the private layer. When no
+  file declares the backend at all, commit says so once per backend
+  (`no data/packages file declares backend "x"; add one to record its N
+  untracked package(s)`) and counts those packages as skipped: creating a
+  file is a decision about where the rows live, not one to make silently.
 - **blacklist** -- append a `[[blacklist]]` row so it is never offered again
-- **skip** -- leave it untracked
+- **skip** -- leave it untracked; the default, so `--yes` records nothing
+  and the run still exits 1 while anything is untracked
 
 A row is always **appended**, never edited in place, so every existing byte
 of that file -- comments, ordering, a row you were mid-thought on -- survives
@@ -206,8 +217,10 @@ Whether a backend is usable on this machine is its own `available` verb, and
 nothing else: a plugin hidden under an `os=` directory would be undiscovered
 elsewhere, and every shared-manifest row naming it would read as a typo there.
 
-A plugin named like a shipped backend overrides it, and `status` says
-`note  brew: scripts/backends/brew overrides the built-in` on every run.
+A runnable plugin named like a shipped backend overrides it, and `status`
+says `note      brew: scripts/backends/brew overrides the built-in` on every
+run. One that is not runnable here (`brew.ps1` on macOS) is noted and the
+built-in keeps its place, so the rows it validates stay validated.
 
 ### The protocol
 
@@ -215,11 +228,11 @@ A plugin named like a shipped backend overrides it, and `status` says
 |---|---|---|---|
 | `available` | -- | -- | 0 usable here; 1 not usable here; anything else is a broken plugin |
 | `id` | one row, `{ name = "...", ... }` | exactly one id | 1: the row is refused, say why on stderr; 64: not implemented; anything else is a broken plugin |
-| `list` | -- | one id per line: what was explicitly installed | nonzero: failed |
-| `install` | rows, one per line | streamed to the terminal | nonzero: failed |
+| `list` | -- | one id per line: what was explicitly installed | 64: not implemented; other nonzero: failed |
+| `install` | rows, one per line | streamed to the terminal | 64: not implemented; other nonzero: failed |
 | `declare <id>` | -- | a TOML row body: `name = "..."` plus adapter fields | 64: not implemented; other nonzero: failed |
-| `bootstrap <path>` | -- | optionally one line: a directory to put on PATH | 64: not implemented |
-| `limitation` | -- | one line on what it cannot see | 64: none |
+| `bootstrap <path>` | -- | optionally one line: a directory to put on PATH | 64: not implemented; other nonzero: failed |
+| `limitation` | -- | one line on what it cannot see | 64: none; other nonzero: failed |
 
 Rows arrive as TOML inline tables carrying `name` and the row's adapter
 keys -- never `backend` or `when`, which are mox's. `id` is asked one row at
@@ -233,8 +246,9 @@ backend.
 
 - **`id` is both validate and idOf.** A row the plugin cannot name is refused
   with the plugin's own reason, which is stronger than any key list mox could
-  check. A refused row fails on every machine that reads the manifest, not
-  only where the manager runs.
+  check. A refused row fails on every machine that can run the plugin, not
+  only where the manager is installed; where the plugin itself cannot run
+  (a POSIX script on Windows) its rows are inert, not checked.
 - **`declare` is checked, not trusted.** The row it returns is handed back to
   `id`, and refused unless the answer is the id it came from. A plugin whose
   two halves disagree cannot write a row that will never match its package.
@@ -249,8 +263,11 @@ backend.
   verb where it was needed. Nothing is substituted for a missing verb.
 - Every call is time-bounded like a setup script (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the
-  backend, not a hung `mox status`. The shipped backends' own manager calls
-  are bounded the same way.
+  backend, not a hung `mox status`. The bound covers the whole call and the
+  kill takes the plugin's process group with it, so a helper it left holding
+  the pipe (`port ... | awk`) cannot outlive it. The shipped backends' own
+  manager calls are bounded the same way, and a probe killed at the bound is
+  a named failure, never "manager absent".
 - Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
   CRLF); an id that is empty, contains whitespace, or exceeds 256 bytes is an
   error naming the plugin. That catches a lost line separator across a large
@@ -272,7 +289,10 @@ and `commit` as much as for `apply`; only `apply` refreshes the state bin dir
 on the way. `status` runs `available`, `list`, `id` and `limitation`; `commit` adds
 `declare`; `apply` adds `install` and `bootstrap`; `--dry-run` runs the
 read-only set. `status` lists every discovered plugin by path before it runs
-anything.
+anything, as `note` lines in the `packages:` section, or on stderr as
+`mox status: note: ...` under `--json` and `--porcelain`, whose stdout stays
+machine-pure. mox flushes its own output before every call, so those lines
+reach the terminal before the plugin's do.
 
 ### A complete plugin
 
