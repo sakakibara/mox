@@ -782,7 +782,10 @@ test "status: one backend failing a verb does not throw away what the others ans
     defer tmp.cleanup();
     const h = try setup(a, io, &tmp, .{});
 
+    // Both backends are named, so both are this repo's business: a manager no
+    // row asks anything of is a note, not drift, and would prove nothing here.
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+    try writeManifest(io, h, a, "debian.toml", "backend = \"apt\"\n\n[[packages]]\nname = \"ripgrep\"\n");
 
     // brew answers everything; a second manager answers its probe and then
     // fails the query. One manager that cannot answer is that manager's
@@ -2238,6 +2241,43 @@ test "commit: a file whose only row for the backend is a blacklist entry is wher
     try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\nbackend = \"brew\"\n"));
 }
 
+test "plugin: a failed limitation costs its remark, not the manager's whole report" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{herm.env[0]} });
+
+    // `limitation` says what a manager cannot see and nothing is judged by
+    // it, so a plugin that gets its exit code wrong there must not cost the
+    // reader what is missing -- which is already computable.
+    try writePlugin(io, h, a, "good",
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+        \\list) printf 'stray\n' ;;
+        \\limitation) exit 7 ;;
+        \\esac
+        \\exit 0
+        \\
+    );
+    try writeManifest(io, h, a, "g.toml", "backend = \"good\"\n\n[[packages]]\nname = \"wanted\"\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    // Judged as usual, and the failed remark is said rather than swallowed.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   good wanted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "UNTRACKED good stray") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "good: limitation failed") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
 test "plugin: a helper left holding the pipe dies with the plugin at the bound" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2260,12 +2300,15 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
         \\#!/bin/sh
         \\case "${1:-}" in
         \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
         \\list) sleep 300 | cat ;;
         \\esac
         \\exit 0
         \\
     );
-    try writeManifest(io, h, a, "p.toml", "backend = \"pipes\"\n");
+    // A row names it, so what it cannot do is this repo's business: a backend
+    // nothing asks anything of is a note instead.
+    try writeManifest(io, h, a, "p.toml", "backend = \"pipes\"\n\n[[packages]]\nname = \"anything\"\n");
 
     const started = Io.Timestamp.now(io, .awake);
     const r = try h.run(&.{ "mox", "status" });

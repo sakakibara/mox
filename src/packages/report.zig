@@ -99,24 +99,33 @@ pub fn gather(
     return fromManifest(arena, m, registry, r, &.{}, diag);
 }
 
-/// `gather` for a manifest already loaded, so a caller that reads it for its
-/// own reasons does not read it twice. `assume_available` names backends to
-/// treat as usable with nothing installed, without asking them: a dry run
-/// must be able to plan the rows of a manager it is not going to bootstrap
-/// for real.
-///
 /// Record that a backend could not answer, and say so. One backend failing a
 /// verb is that backend's problem: the others were asked and answered, and
 /// throwing their results away would report a machine nobody looked at.
+///
+/// A backend no row names is a note instead, exactly as a failed probe is: a
+/// manager nothing here asks anything of cannot make this machine's report
+/// wrong, and failing the run over it would fail an apply that had no work
+/// for it either way.
 fn noteBroken(
     arena: std.mem.Allocator,
     broken: *std.ArrayList(Broken),
+    notes: *std.ArrayList([]const u8),
     diag: ?*Diag,
+    m: manifest_mod.Manifest,
     name: []const u8,
     verb: []const u8,
     e: anyerror,
 ) !void {
     const why = exec.errorText(e);
+    if (!actedOn(m, name)) {
+        try notes.append(arena, try std.fmt.allocPrint(
+            arena,
+            "{s}: {s} failed: {s}; no row asks it to install anything, so nothing here needs it",
+            .{ name, verb, why },
+        ));
+        return;
+    }
     if (diag) |d| d.set("{s}: {s} failed: {s}", .{ name, verb, why });
     try broken.append(arena, .{
         .backend = name,
@@ -126,6 +135,12 @@ fn noteBroken(
     });
 }
 
+/// `gather` for a manifest already loaded, so a caller that reads it for its
+/// own reasons does not read it twice. `assume_available` names backends to
+/// treat as usable with nothing installed, without asking them: a dry run
+/// must be able to plan the rows of a manager it is not going to bootstrap
+/// for real.
+///
 /// A backend that is absent but has a `[[bootstrap]]` row whose gate holds
 /// is assumed the same way without being named: `apply` would bootstrap it
 /// and install every row, so a report that called the machine clean would
@@ -212,7 +227,7 @@ pub fn fromManifest(
         try out.append(arena, .{
             .backend = b.name,
             .drift = drift_mod.compute(arena, b, rows, &.{}, m) catch |e| {
-                try noteBroken(arena, &broken, diag, b.name, "id", e);
+                try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
             .limitation = if (contains(assume_available, b.name)) null else "absent; apply will bootstrap it",
@@ -220,7 +235,7 @@ pub fn fromManifest(
     }
     for (usable.items) |b| {
         const installed = b.installedExplicit(arena) catch |e| {
-            try noteBroken(arena, &broken, diag, b.name, "list", e);
+            try noteBroken(arena, &broken, &notes, diag, m, b.name, "list", e);
             continue;
         };
         var shape_ok = true;
@@ -240,14 +255,23 @@ pub fn fromManifest(
             break;
         }
         if (!shape_ok) continue;
-        const limitation = b.limitationOf(arena) catch |e| {
-            try noteBroken(arena, &broken, diag, b.name, "limitation", e);
-            continue;
+        // A limitation is a remark about what this manager cannot see, and
+        // nothing is judged by it. One that fails costs the reader that
+        // remark and nothing else: the drift below is already computable, and
+        // calling the manager broken over it would hide what is missing and
+        // stop apply installing it.
+        const limitation = b.limitationOf(arena) catch |e| blk: {
+            try notes.append(arena, try std.fmt.allocPrint(
+                arena,
+                "{s}: limitation failed: {s}; its packages are judged as usual",
+                .{ b.name, exec.errorText(e) },
+            ));
+            break :blk null;
         };
         try out.append(arena, .{
             .backend = b.name,
             .drift = drift_mod.compute(arena, b, rows, installed, m) catch |e| {
-                try noteBroken(arena, &broken, diag, b.name, "id", e);
+                try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
             .limitation = limitation,
@@ -317,6 +341,30 @@ fn rowOf(name: []const u8, backend: []const u8) Row {
         .label = "data/packages/a.toml",
         .index = 0,
     };
+}
+
+test "fromManifest: a manager no row names failing a verb is a note, not this repo's drift" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The same filter a failed probe already gets: a manager nothing here
+    // asks anything of cannot make this machine's report wrong, and failing
+    // the run over it would fail an apply that had no work for it either way.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 3 },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .code = 3 },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io, .scratch_dir = "" };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: resolver_mod.Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), rep.broken.len);
+    try testing.expectEqual(@as(usize, 1), rep.notes.len);
+    try testing.expect(std.mem.indexOf(u8, rep.notes[0], "no row asks it to install anything") != null);
 }
 
 test "fromManifest: a repo not using the subsystem reports nothing" {
