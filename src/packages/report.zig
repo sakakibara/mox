@@ -157,9 +157,11 @@ pub fn fromManifest(
                 if (actedOn(m, b.name)) {
                     try broken.append(arena, .{ .backend = b.name, .probe = why.probe, .code = why.code });
                 } else {
+                    // A blacklist row names a backend without asking it for
+                    // anything, so "no row names it" would be false there.
                     try notes.append(arena, try std.fmt.allocPrint(
                         arena,
-                        "{s}: {s} exited {d}; no row names it, so nothing here needs it",
+                        "{s}: {s} exited {d}; no row asks it to install anything, so nothing here needs it",
                         .{ b.name, why.probe, why.code },
                     ));
                 }
@@ -558,6 +560,40 @@ test "fromManifest: a broken backend is treated as absent and listed as broken" 
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
     try testing.expectEqualStrings("no package manager is usable on this machine", rep.notes[0]);
     try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+}
+
+test "fromManifest: a broken manager only a blacklist row names is a note saying what is true" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .code = 1 },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    // A blacklist row names brew but asks it for nothing, so its being
+    // broken is a note rather than drift no run could ever clear.
+    const bl: manifest_mod.BlacklistRow = .{
+        .name = "usage",
+        .backend = "brew",
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+    const m: manifest_mod.Manifest = .{ .blacklist = &.{bl}, .files = 1 };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), rep.broken.len);
+    try testing.expectEqual(@as(usize, 0), rep.backends.len);
+    try testing.expect(rep.clean());
+    try testing.expectEqualStrings(
+        "brew: brew --version exited 1; no row asks it to install anything, so nothing here needs it",
+        rep.notes[0],
+    );
 }
 
 test "fromManifest: a probe error on a backend no row names is a note, and the report still comes back" {

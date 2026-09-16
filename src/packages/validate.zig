@@ -23,29 +23,36 @@ pub const Error = error{
     DuplicatePackageRow,
 };
 
-/// A file's name plus which layer it is in: two files of one basename are
-/// told apart by nothing else in a message.
-fn where(label: []const u8, private: bool) struct { []const u8, []const u8 } {
-    return .{ label, if (private) " (private layer)" else "" };
-}
-
 /// Check every row against the registry and its adapter. `diag` (when
-/// non-null) names the file and row behind any failure.
+/// non-null) names the file and row behind any failure. A file's label
+/// carries its layer, so every message below tells two files of one basename
+/// apart by naming one of them.
 pub fn all(
     arena: std.mem.Allocator,
     m: Manifest,
     registry: Registry,
     diag: ?*Diag,
 ) !void {
+    // Before any row: a row inheriting a mistyped file default would
+    // otherwise be blamed for a key it does not carry, and a file holding
+    // nothing but `backend = "brw"` -- the file the docs have you create
+    // first -- would pass with no row to blame at all.
+    for (m.sources) |src| {
+        const name = src.default_backend orelse continue;
+        if (registry.find(name) != null) continue;
+        if (diag) |d| d.set(
+            "{s}: file-level \"backend\": no backend named \"{s}\"",
+            .{ src.label, name },
+        );
+        return Error.UnknownBackend;
+    }
+
     for (m.packages) |row| {
         const b = registry.find(row.backend) orelse {
-            if (diag) |d| {
-                const at = where(row.label, row.private);
-                d.set(
-                    "{s}{s}: row \"{s}\": no backend named \"{s}\"",
-                    .{ at[0], at[1], row.name, row.backend },
-                );
-            }
+            if (diag) |d| d.set(
+                "{s}: row \"{s}\": no backend named \"{s}\"",
+                .{ row.label, row.name, row.backend },
+            );
             return Error.UnknownBackend;
         };
         try b.validate(row, diag);
@@ -53,16 +60,13 @@ pub fn all(
 
     for (m.blacklist) |bl| {
         const b = registry.find(bl.backend) orelse {
-            if (diag) |d| {
-                const at = where(bl.label, bl.private);
-                d.set(
-                    "{s}{s}: blacklist row \"{s}\": no backend named \"{s}\"",
-                    .{ at[0], at[1], bl.name, bl.backend },
-                );
-            }
+            if (diag) |d| d.set(
+                "{s}: blacklist row {d} \"{s}\": no backend named \"{s}\"",
+                .{ bl.label, bl.index, bl.name, bl.backend },
+            );
             return Error.UnknownBackend;
         };
-        try b.validate(bl.asRow(), diag);
+        try blacklistValidate(b, bl, diag);
     }
 
     // A bootstrap row names its backend the same way, and a typo there would
@@ -71,21 +75,17 @@ pub fn all(
     defer installers.deinit();
     for (m.bootstrap) |b| {
         if (installers.get(b.backend)) |first| {
-            if (diag) |d| {
-                const a_at = where(b.label, b.private);
-                const b_at = where(first.label, first.private);
-                d.set(
-                    "{s}{s}: bootstrap row {d} declares a second bootstrap row for backend \"{s}\"; one per backend (the first is {s}{s}: bootstrap row {d})",
-                    .{ a_at[0], a_at[1], b.index, b.backend, b_at[0], b_at[1], first.index },
-                );
-            }
+            if (diag) |d| d.set(
+                "{s}: bootstrap row {d} declares a second bootstrap row for backend \"{s}\"; one per backend (the first is {s}: bootstrap row {d})",
+                .{ b.label, b.index, b.backend, first.label, first.index },
+            );
             return Error.DuplicateBootstrapRow;
         }
         try installers.put(b.backend, b);
         const backend = registry.find(b.backend) orelse {
             if (diag) |d| d.set(
-                "{s}: bootstrap row: no backend named \"{s}\"",
-                .{ b.label, b.backend },
+                "{s}: bootstrap row {d}: no backend named \"{s}\"",
+                .{ b.label, b.index, b.backend },
             );
             return Error.UnknownBackend;
         };
@@ -94,8 +94,8 @@ pub fn all(
         // cannot run is judged where it runs.
         if (!backend.inert and !backend.canBootstrap()) {
             if (diag) |d| d.set(
-                "{s}: bootstrap row: backend \"{s}\" cannot be bootstrapped; it ships with the OS",
-                .{ b.label, b.backend },
+                "{s}: bootstrap row {d}: backend \"{s}\" cannot be bootstrapped; it ships with the OS",
+                .{ b.label, b.index, b.backend },
             );
             return Error.BootstrapUnsupported;
         }
@@ -103,6 +103,36 @@ pub fn all(
 
     try contradictions(arena, m, registry, diag);
     try duplicates(arena, m, registry, diag);
+}
+
+/// An adapter is handed a blacklist row shaped as a package row, and titles
+/// its refusal `<label>: row "<name>": <why>` -- which names the
+/// `[[packages]]` row of that name, a different row that may be perfectly
+/// good. Re-title it so the row it refused is the row it names.
+fn blacklistValidate(b: backend_mod.Backend, bl: manifest_mod.BlacklistRow, diag: ?*Diag) !void {
+    var scratch: Diag = .{};
+    b.validate(bl.asRow(), &scratch) catch |e| {
+        if (diag) |d| {
+            if (adapterReason(scratch.capture(), bl)) |why| {
+                d.set("{s}: blacklist row {d} \"{s}\": {s}", .{ bl.label, bl.index, bl.name, why });
+            } else {
+                d.set("{s}: blacklist row {d} \"{s}\": {s}", .{ bl.label, bl.index, bl.name, @errorName(e) });
+            }
+        }
+        return e;
+    };
+}
+
+/// The adapter's own words with the row title it prefixed them with removed.
+/// Null when it said nothing; a message shaped otherwise is kept whole, so a
+/// re-titling never eats what an adapter has to say.
+fn adapterReason(msg: ?[]const u8, bl: manifest_mod.BlacklistRow) ?[]const u8 {
+    var rest = msg orelse return null;
+    for ([_][]const u8{ bl.label, ": row \"", bl.name, "\": " }) |part| {
+        if (!std.mem.startsWith(u8, rest, part)) return msg;
+        rest = rest[part.len..];
+    }
+    return rest;
 }
 
 /// Two `[[packages]]` rows naming one package (by backend id) under the
@@ -127,14 +157,10 @@ fn duplicates(
         };
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{ row.backend, id, row.when orelse "" });
         if (seen.get(key)) |first| {
-            if (diag) |d| {
-                const a_at = where(first.label, first.private);
-                const b_at = where(row.label, row.private);
-                d.set(
-                    "{s}{s}: row {d} and {s}{s}: row {d} both declare \"{s}\" for backend \"{s}\" with the same gate",
-                    .{ a_at[0], a_at[1], first.index, b_at[0], b_at[1], row.index, row.name, row.backend },
-                );
-            }
+            if (diag) |d| d.set(
+                "{s}: row {d} and {s}: row {d} both declare \"{s}\" for backend \"{s}\" with the same gate",
+                .{ first.label, first.index, row.label, row.index, row.name, row.backend },
+            );
             return Error.DuplicatePackageRow;
         }
         try seen.put(key, row);
@@ -158,7 +184,7 @@ fn contradictions(
         // would refuse a shared manifest on exactly the OS that cannot judge it.
         if (b.inert) continue;
         const blocked = b.idOf(arena, bl.asRow()) catch |e| {
-            if (diag) |d| d.set("{s}: blacklist row \"{s}\": id failed: {s}", .{ bl.label, bl.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: blacklist row {d} \"{s}\": id failed: {s}", .{ bl.label, bl.index, bl.name, @errorName(e) });
             return e;
         };
         for (m.packages) |row| {
@@ -168,14 +194,10 @@ fn contradictions(
                 return e;
             };
             if (!std.mem.eql(u8, id, blocked)) continue;
-            if (diag) |d| {
-                const a_at = where(row.label, row.private);
-                const b_at = where(bl.label, bl.private);
-                d.set(
-                    "{s}{s} declares \"{s}\" for backend \"{s}\", which {s}{s} blacklists",
-                    .{ a_at[0], a_at[1], row.name, row.backend, b_at[0], b_at[1] },
-                );
-            }
+            if (diag) |d| d.set(
+                "{s}: row {d} declares \"{s}\" for backend \"{s}\", which {s}: blacklist row {d} blacklists",
+                .{ row.label, row.index, row.name, row.backend, bl.label, bl.index },
+            );
             return Error.BlacklistedPackageDeclared;
         }
     }
@@ -183,6 +205,12 @@ fn contradictions(
 
 const testing = std.testing;
 const test_backend = @import("test_backend.zig");
+const exec = @import("exec.zig");
+const brew_mod = @import("brew.zig");
+
+fn sourceOf(label: []const u8, default_backend: ?[]const u8) manifest_mod.Source {
+    return .{ .path = "/tmp/x.toml", .label = label, .default_backend = default_backend, .private = false };
+}
 
 fn rowOf(name: []const u8, backend: []const u8, when: ?[]const u8) manifest_mod.Row {
     return rowAt(name, backend, when, "data/packages/a.toml", 0);
@@ -269,6 +297,88 @@ test "all: a backend this machine cannot use is still a known backend" {
     try all(a, m, registryOf(&.{ brew, dnf }), null);
 }
 
+test "all: a file-level backend naming no registered backend is refused, naming the file's key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.make("brew");
+    const want = "data/packages/a.toml: file-level \"backend\": no backend named \"brw\"";
+
+    // The file the docs have you write first: a default and not one row yet.
+    const bare: Manifest = .{ .sources = &.{sourceOf("data/packages/a.toml", "brw")} };
+    var d: Diag = .{};
+    try testing.expectError(Error.UnknownBackend, all(a, bare, registryOf(&.{brew}), &d));
+    try testing.expectEqualStrings(want, d.capture().?);
+
+    // A row inheriting that default is not the thing that is wrong.
+    const inherited: Manifest = .{
+        .packages = &.{rowOf("ripgrep", "brw", null)},
+        .sources = &.{sourceOf("data/packages/a.toml", "brw")},
+    };
+    var d2: Diag = .{};
+    try testing.expectError(Error.UnknownBackend, all(a, inherited, registryOf(&.{brew}), &d2));
+    try testing.expectEqualStrings(want, d2.capture().?);
+}
+
+test "all: a file declaring a registered default is fine, and a file with no default is not checked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.make("brew");
+    const m: Manifest = .{ .sources = &.{
+        sourceOf("data/packages/a.toml", "brew"),
+        sourceOf("data/packages/b.toml", null),
+    } };
+    try all(a, m, registryOf(&.{brew}), null);
+}
+
+test "all: an adapter refusing a blacklist row names that row, not the packages row of the same name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var brew: brew_mod.Brew = .{ .runner = fake.runner() };
+
+    // The `[[packages]]` row of this name is good; the blacklist row carries
+    // a key brew does not take.
+    const bl: manifest_mod.BlacklistRow = .{
+        .name = "docker",
+        .backend = "brew",
+        .fields = &.{.{ .key = "flavor", .value = .{ .string = "cask" } }},
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/local.toml (private layer)",
+        .index = 2,
+    };
+    const m: Manifest = .{ .packages = &.{rowOf("docker", "brew", null)}, .blacklist = &.{bl} };
+
+    var d: Diag = .{};
+    try testing.expectError(error.UnknownBrewKey, all(a, m, registryOf(&.{brew.backend()}), &d));
+    const msg = d.capture().?;
+    try testing.expect(std.mem.startsWith(u8, msg, "data/packages/local.toml (private layer): blacklist row 2 \"docker\": "));
+    try testing.expect(std.mem.indexOf(u8, msg, "flavor") != null);
+    // The clean packages row is never the one named.
+    try testing.expect(std.mem.indexOf(u8, msg, ": row \"docker\"") == null);
+}
+
+test "all: a bootstrap row naming no registered backend is refused, naming file and row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const brew = test_backend.makeBootstrappable("brew");
+    const m: Manifest = .{ .bootstrap = &.{bootstrapAt("brw", "data/packages/darwin.toml", 1)} };
+
+    var d: Diag = .{};
+    try testing.expectError(Error.UnknownBackend, all(a, m, registryOf(&.{brew}), &d));
+    try testing.expectEqualStrings(
+        "data/packages/darwin.toml: bootstrap row 1: no backend named \"brw\"",
+        d.capture().?,
+    );
+}
+
 test "all: a blacklist row naming no registered backend is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -294,7 +404,12 @@ test "all: a package both declared and blacklisted is refused" {
 
     var d: Diag = .{};
     try testing.expectError(Error.BlacklistedPackageDeclared, all(a, m, registryOf(&.{brew}), &d));
-    try testing.expect(std.mem.indexOf(u8, d.capture().?, "blacklists") != null);
+    // Both rows by file and index: two rows of one name are told apart by
+    // nothing else.
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: row 0 declares \"usage\" for backend \"brew\", which data/packages/local.toml: blacklist row 0 blacklists",
+        d.capture().?,
+    );
 }
 
 test "all: the contradiction surfaces even where the gate excludes the row" {

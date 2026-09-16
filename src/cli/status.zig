@@ -365,10 +365,6 @@ const Prepared = struct {
     broken: bool = false,
     /// A diagnostic set by a failure the report step may still hit.
     diag: mox.packages.manifest.Diag = .{},
-
-    fn inUse(self: Prepared) bool {
-        return !self.broken and self.manifest.inUse();
-    }
 };
 
 fn preparePackages(
@@ -466,7 +462,11 @@ fn printPackages(
     drift_only: bool,
 ) !Packages {
     const prep = try preparePackages(ctx, context, m_state);
-    if (!prep.inUse()) return reportPackages(ctx, prep, bindings);
+    // A repo that never opted in says nothing at all; a manifest that would
+    // not load is an error with a section of its own, exactly as one that
+    // would not validate -- otherwise a bad TOML file reads on stdout like a
+    // repo that has no manifest.
+    if (!prep.broken and !prep.manifest.inUse()) return reportPackages(ctx, prep, bindings);
 
     // Under `--drift` stdout is the drift set alone, so what is said about
     // the plugins goes where the machine formats put it -- and, as there,
@@ -480,33 +480,31 @@ fn printPackages(
 
     const pkgs = try reportPackages(ctx, prep, bindings);
     const rep = pkgs.report;
+    // What no one backend's rows can say: no usable manager at all, a manager
+    // that is there but broken, or one that cannot see hand-installed
+    // packages -- none of it conditional on there being drift to print, since
+    // under `--drift` the section may never open.
     if (drift_only) {
+        for (rep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+        for (rep.backends) |b| {
+            if (b.limitation) |note| try ctx.err.print("mox status: note: {s}: {s}\n", .{ b.backend, note });
+        }
         // Nothing drifted and nothing broken: no section at all, the way a
         // clean file table is absent from `--drift`.
         if (pkgs.problems() == 0) return pkgs;
         try ctx.out.writeAll("\npackages:\n");
+    } else {
+        for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
     }
     // A manifest that failed to load or validate has said why on stderr;
     // without a word here the empty section reads as a clean machine.
     if (pkgs.broken) try ctx.out.writeAll("  ERROR     the manifest was refused; see the message above\n");
-    // What no one backend's rows can say: no usable manager at all, or a
-    // manager that is there but broken -- drift, since the machine is not
-    // in the state the manifest describes.
-    if (!drift_only) {
-        for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
-    } else {
-        for (rep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
-    }
     for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
-        if (b.limitation) |note| {
-            if (drift_only) {
-                try ctx.err.print("mox status: note: {s}: {s}\n", .{ b.backend, note });
-            } else {
-                try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
-            }
+        if (!drift_only) {
+            if (b.limitation) |note| try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
         }
         if (b.drift.clean()) {
             if (!drift_only) try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });

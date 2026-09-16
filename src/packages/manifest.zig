@@ -9,19 +9,21 @@
 //! Same-basename files still shadow, matching every other data source.
 //!
 //! The core understands `name`, `backend` and `when`, plus a file-level
-//! `backend` default and a file-level `when` that gates every row in the
-//! file. Every other key belongs to the backend adapter, which
-//! declares and validates its own key set; this loader only guarantees each
-//! is a scalar or string array, and refuses anything it cannot hand over --
-//! the template projection silently drops a non-scalar, which would turn a
-//! mistyped field into a missing one.
+//! `backend` default and a file-level `when` that gates every `[[packages]]`
+//! and `[[bootstrap]]` row in the file. Every other key belongs to the
+//! backend adapter, which declares and validates its own key set; this
+//! loader only guarantees each is a scalar or string array, and refuses
+//! anything it cannot hand over -- the template projection silently drops a
+//! non-scalar, which would turn a mistyped field into a missing one.
 
 const std = @import("std");
 const toml = @import("toml");
 
 const dirent = @import("../source/dirent.zig");
+const junk = @import("../source/junk.zig");
 const axis = @import("../dsl/axis.zig");
 const diag_mod = @import("../machine/diag.zig");
+const backend_mod = @import("backend.zig");
 
 const Io = std.Io;
 
@@ -55,13 +57,12 @@ pub const Row = struct {
     /// Absolute path of the file the row came from: a reconciled row is
     /// written back to the layer that owns it.
     origin: []const u8,
-    /// `data/packages/<basename>`, for diagnostics.
+    /// `data/packages/<basename>`, plus ` (private layer)` when the file is
+    /// the private one: two files of one basename are told apart by nothing
+    /// else in a message, and every message carries the label alone.
     label: []const u8,
     /// 0-based position within its file's array.
     index: usize,
-    /// Which layer the file belongs to: two files of one basename are told
-    /// apart by nothing else in a message.
-    private: bool = false,
 
     pub fn field(self: Row, key: []const u8) ?Field {
         for (self.fields) |p| {
@@ -77,7 +78,8 @@ pub const Row = struct {
 /// to name one package (a brew cask and the formula of the same name are not
 /// the same entry). A gate is refused -- a blacklist holds regardless of
 /// which machine is asking, so a `when` here would read as meaningful and do
-/// nothing.
+/// nothing. That holds for the file's gate too: a file carrying a top-level
+/// `when` takes no blacklist row, since the gate would silently narrow it.
 pub const BlacklistRow = struct {
     name: []const u8,
     backend: []const u8,
@@ -85,7 +87,6 @@ pub const BlacklistRow = struct {
     origin: []const u8,
     label: []const u8,
     index: usize,
-    private: bool = false,
 
     /// The same package, shaped for the adapter's `idOf`.
     pub fn asRow(self: BlacklistRow) Row {
@@ -97,7 +98,6 @@ pub const BlacklistRow = struct {
             .origin = self.origin,
             .label = self.label,
             .index = self.index,
-            .private = self.private,
         };
     }
 };
@@ -126,7 +126,6 @@ pub const BootstrapRow = struct {
     origin: []const u8,
     label: []const u8,
     index: usize,
-    private: bool = false,
 };
 
 pub const Manifest = struct {
@@ -209,9 +208,10 @@ pub fn load(
             }
             break :blk v.string;
         };
-        // A file-level gate applies to every row in the file, so a manifest
-        // organised per OS says `when = "os=darwin"` once rather than on each
-        // of a hundred rows. A row's own `when` narrows it further.
+        // A file-level gate applies to every packages and bootstrap row in
+        // the file, so a manifest organised per OS says `when = "os=darwin"`
+        // once rather than on each of a hundred rows. A row's own `when`
+        // narrows it further.
         const file_when: ?[]const u8 = blk: {
             const v = doc.table.get("when") orelse break :blk null;
             if (v != .string or v.string.len == 0) {
@@ -271,7 +271,7 @@ pub fn load(
                     if (diag) |d| d.set("{s}: blacklist row {d} is not a table", .{ f.label, i });
                     return Error.MalformedPackageRow;
                 }
-                try blacklist.append(arena, try parseBlacklistRow(arena, f, el.table, file_backend, i, diag));
+                try blacklist.append(arena, try parseBlacklistRow(arena, f, el.table, file_backend, file_when, i, diag));
             }
         }
     }
@@ -335,6 +335,11 @@ fn discover(
         };
         for (entries) |e| {
             if (e.kind != .file and e.kind != .sym_link) continue;
+            // Editor and OS noise ends in `.toml` too: emacs's `.#darwin.toml`
+            // lock is a dangling symlink, and a copied `._darwin.toml` is not
+            // TOML at all. Either would fail every package command while a
+            // manifest is merely open in an editor.
+            if (junk.isJunk(e.name)) continue;
             if (!std.mem.endsWith(u8, e.name, ".toml")) continue;
             if (!chosen.contains(e.name)) try names.append(arena, e.name);
             try chosen.put(e.name, .{
@@ -351,7 +356,13 @@ fn discover(
         const pick = chosen.get(n).?;
         try out.append(arena, .{
             .path = pick.path,
-            .label = try std.fmt.allocPrint(arena, "data/packages/{s}", .{n}),
+            // The layer is part of the name every message prints: a private
+            // file shadowing a repo file of the same basename would otherwise
+            // report its faults against the repo file, which is intact.
+            .label = if (pick.private)
+                try std.fmt.allocPrint(arena, "data/packages/{s} (private layer)", .{n})
+            else
+                try std.fmt.allocPrint(arena, "data/packages/{s}", .{n}),
             .private = pick.private,
         });
     }
@@ -381,7 +392,7 @@ fn parseRow(
             return Error.MalformedPackageRow;
         }
         if (!nameShapeOk(v.string)) {
-            if (diag) |d| d.set("{s}: row {d}: \"name\" must not be blank or contain whitespace or control characters", .{ f.label, index });
+            if (diag) |d| d.set("{s}: row {d}: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8", .{ f.label, index });
             return Error.MalformedPackageRow;
         }
         break :blk v.string;
@@ -442,7 +453,6 @@ fn parseRow(
         .origin = f.path,
         .label = f.label,
         .index = index,
-        .private = f.private,
     };
 }
 
@@ -484,11 +494,11 @@ fn parseBootstrapRow(
     const own_when: ?[]const u8 = blk: {
         const v = t.get("when") orelse break :blk null;
         if (v != .string or v.string.len == 0) {
-            if (diag) |d| d.set("{s}: bootstrap row for \"{s}\": \"when\" must be a non-empty string", .{ f.label, backend });
+            if (diag) |d| d.set("{s}: bootstrap row {d} for backend \"{s}\": \"when\" must be a non-empty string", .{ f.label, index, backend });
             return Error.MalformedPackageRow;
         }
         _ = axis.parseString(arena, v.string) catch {
-            if (diag) |d| d.set("{s}: bootstrap row for \"{s}\": \"when\" is not a valid axis expression: {s}", .{ f.label, backend, v.string });
+            if (diag) |d| d.set("{s}: bootstrap row {d} for backend \"{s}\": \"when\" is not a valid axis expression: {s}", .{ f.label, index, backend, v.string });
             return Error.MalformedPackageRow;
         };
         break :blk v.string;
@@ -497,8 +507,8 @@ fn parseBootstrapRow(
     for (t.keys()) |k| {
         if (std.mem.eql(u8, k, "backend") or std.mem.eql(u8, k, "url") or std.mem.eql(u8, k, "sha256") or std.mem.eql(u8, k, "when")) continue;
         if (diag) |d| d.set(
-            "{s}: bootstrap row for \"{s}\": unknown key \"{s}\" (a bootstrap row takes \"backend\", \"url\", \"sha256\", \"when\")",
-            .{ f.label, backend, k },
+            "{s}: bootstrap row {d} for backend \"{s}\": unknown key \"{s}\" (a bootstrap row takes \"backend\", \"url\", \"sha256\", \"when\")",
+            .{ f.label, index, backend, k },
         );
         return Error.MalformedPackageRow;
     }
@@ -511,7 +521,6 @@ fn parseBootstrapRow(
         .origin = f.path,
         .label = f.label,
         .index = index,
-        .private = f.private,
     };
 }
 
@@ -523,13 +532,12 @@ fn requiredString(
     index: usize,
     diag: ?*Diag,
 ) ![]const u8 {
-    _ = index;
     const v = t.get(key) orelse {
-        if (diag) |d| d.set("{s}: bootstrap row for \"{s}\" has no \"{s}\"", .{ f.label, backend, key });
+        if (diag) |d| d.set("{s}: bootstrap row {d} for backend \"{s}\" has no \"{s}\"", .{ f.label, index, backend, key });
         return Error.MalformedPackageRow;
     };
     if (v != .string or v.string.len == 0) {
-        if (diag) |d| d.set("{s}: bootstrap row for \"{s}\": \"{s}\" must be a non-empty string", .{ f.label, backend, key });
+        if (diag) |d| d.set("{s}: bootstrap row {d} for backend \"{s}\": \"{s}\" must be a non-empty string", .{ f.label, index, backend, key });
         return Error.MalformedPackageRow;
     }
     return v.string;
@@ -540,9 +548,21 @@ fn parseBlacklistRow(
     f: SourceFile,
     t: toml.Value.Table,
     file_backend: ?[]const u8,
+    file_when: ?[]const u8,
     index: usize,
     diag: ?*Diag,
 ) !BlacklistRow {
+    // A row's own `when` is refused because a blacklist holds regardless of
+    // which machine asks; a file's gate would narrow it the same way, and
+    // silently, so the file cannot hold both.
+    if (file_when != null) {
+        if (diag) |d| d.set(
+            "{s}: blacklist row {d}: this file has a top-level \"when\", which would gate it; a blacklist holds regardless of which machine asks, so it belongs in a file with no \"when\"",
+            .{ f.label, index },
+        );
+        return Error.MalformedPackageRow;
+    }
+
     const name = blk: {
         const v = t.get("name") orelse {
             if (diag) |d| d.set("{s}: blacklist row {d} has no \"name\"", .{ f.label, index });
@@ -553,7 +573,7 @@ fn parseBlacklistRow(
             return Error.MalformedPackageRow;
         }
         if (!nameShapeOk(v.string)) {
-            if (diag) |d| d.set("{s}: blacklist row {d}: \"name\" must not be blank or contain whitespace or control characters", .{ f.label, index });
+            if (diag) |d| d.set("{s}: blacklist row {d}: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8", .{ f.label, index });
             return Error.MalformedPackageRow;
         }
         break :blk v.string;
@@ -603,7 +623,6 @@ fn parseBlacklistRow(
         .origin = f.path,
         .label = f.label,
         .index = index,
-        .private = f.private,
     };
 }
 
@@ -621,15 +640,13 @@ fn isFileKey(k: []const u8) bool {
     return false;
 }
 
-/// A name a manager could be handed: no whitespace or control byte, and
-/// not blank. Checked here so `name = " "` is refused by the file and row
-/// it sits in rather than blamed on the adapter it reaches.
+/// A name a manager could be handed. One rule, in `backend`, shared with the
+/// shape a declared row must have: a row an adapter may write is exactly a row
+/// this loader will read back, so `mox commit` cannot write a manifest the
+/// next command refuses. Checked here so `name = " "` is refused by the file
+/// and row it sits in rather than blamed on the adapter it reaches.
 fn nameShapeOk(name: []const u8) bool {
-    if (std.mem.trim(u8, name, " \t\r\n").len == 0) return false;
-    for (name) |c| {
-        if (std.ascii.isWhitespace(c) or std.ascii.isControl(c)) return false;
-    }
-    return true;
+    return backend_mod.nameShapeOk(name);
 }
 
 pub fn fieldOf(arena: std.mem.Allocator, v: toml.Value) !?Field {
@@ -1119,6 +1136,164 @@ test "load: a non-toml entry in the packages directory is ignored" {
     try testing.expectEqual(@as(usize, 1), m.packages.len);
 }
 
+test "load: editor and OS junk ending in .toml is not read as a manifest" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data =
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+    const dir = try std.fs.path.join(a, &.{ repo, "data", "packages" });
+
+    // An open emacs buffer leaves a dangling lock symlink; a copy off a mac
+    // leaves an AppleDouble. Both end in `.toml` and neither is one.
+    try Io.Dir.cwd().symLink(io, "user@host.4242:1", try std.fs.path.join(a, &.{ dir, ".#darwin.toml" }), .{});
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ dir, "._darwin.toml" }),
+        .data = "\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X",
+    });
+
+    var d: Diag = .{};
+    const m = try load(a, io, repo, "", &d);
+    try testing.expectEqual(@as(usize, 1), m.files);
+    try testing.expectEqual(@as(usize, 1), m.packages.len);
+    try testing.expectEqualStrings("ripgrep", m.packages[0].name);
+    try testing.expect(d.capture() == null);
+}
+
+test "load: a blacklist row in a file carrying a top-level when is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data =
+        \\backend = "brew"
+        \\when = "os=darwin"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(
+        "data/packages/darwin.toml: blacklist row 0: this file has a top-level \"when\", which would gate it; a blacklist holds regardless of which machine asks, so it belongs in a file with no \"when\"",
+        d.capture().?,
+    );
+}
+
+test "load: a fault in a private file names the private layer, not the repo file it shadows" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const good = "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n";
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "repo/data/packages");
+        try tmp.dir.createDirPath(io, "private/data/packages");
+        try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data = good });
+        try tmp.dir.writeFile(io, .{ .sub_path = "private/data/packages/darwin.toml", .data = "[[package]]\nname = \"ripgrep\"\n" });
+        const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+        const priv = try tmpAbs(a, io, &tmp.sub_path, "private");
+
+        var d: Diag = .{};
+        try testing.expectError(Error.MalformedPackageFile, load(a, io, repo, priv, &d));
+        try testing.expectEqualStrings(
+            "data/packages/darwin.toml (private layer): unknown top-level key \"package\" (a manifest file takes \"backend\", \"when\", \"packages\", \"blacklist\", \"bootstrap\")",
+            d.capture().?,
+        );
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "repo/data/packages");
+        try tmp.dir.createDirPath(io, "private/data/packages");
+        try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data = good });
+        try tmp.dir.writeFile(io, .{ .sub_path = "private/data/packages/local.toml", .data = "backend = \"brew\"\n\n[[packages]]\nname = \"rip grep\"\n" });
+        const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+        const priv = try tmpAbs(a, io, &tmp.sub_path, "private");
+
+        var d: Diag = .{};
+        try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, priv, &d));
+        try testing.expectEqualStrings(
+            "data/packages/local.toml (private layer): row 0: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8",
+            d.capture().?,
+        );
+    }
+
+    if (!Io.File.Permissions.has_executable_bit) return; // no symlinks to create
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "repo/data/packages");
+        try tmp.dir.createDirPath(io, "private/data/packages");
+        try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data = good });
+        const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+        const priv = try tmpAbs(a, io, &tmp.sub_path, "private");
+        // The private file shadows an intact repo file of the same basename.
+        try Io.Dir.cwd().symLink(io, "gone.toml", try std.fs.path.join(a, &.{ priv, "data", "packages", "darwin.toml" }), .{});
+
+        var d: Diag = .{};
+        try testing.expectError(Error.MalformedPackageFile, load(a, io, repo, priv, &d));
+        try testing.expectEqualStrings(
+            "data/packages/darwin.toml (private layer): unreadable: FileNotFound",
+            d.capture().?,
+        );
+    }
+}
+
+test "load: a bootstrap row missing a key is named by its index, not by its backend alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data =
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\
+        \\[[bootstrap]]
+        \\sha256 = "00"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: bootstrap row 1 for backend \"brew\" has no \"url\"",
+        d.capture().?,
+    );
+}
+
 test "load: a byte order mark is named as the cause, not a bare parse error" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1184,7 +1359,7 @@ test "load: a blank name, or one with whitespace or a control character, is refu
         var d: Diag = .{};
         try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
         try testing.expectEqualStrings(
-            "data/packages/a.toml: row 1: \"name\" must not be blank or contain whitespace or control characters",
+            "data/packages/a.toml: row 1: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8",
             d.capture().?,
         );
     }
@@ -1197,7 +1372,7 @@ test "load: a blank name, or one with whitespace or a control character, is refu
     var d: Diag = .{};
     try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
     try testing.expectEqualStrings(
-        "data/packages/a.toml: blacklist row 0: \"name\" must not be blank or contain whitespace or control characters",
+        "data/packages/a.toml: blacklist row 0: \"name\" must not be blank or contain whitespace, control characters, or bytes that are not UTF-8",
         d.capture().?,
     );
 }

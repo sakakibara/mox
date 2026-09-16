@@ -1721,7 +1721,7 @@ test "status: a bootstrap row for a manager that ships with its OS is refused on
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "debian.toml: bootstrap row: backend \"apt\" cannot be bootstrapped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "debian.toml: bootstrap row 0: backend \"apt\" cannot be bootstrapped") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
@@ -1856,7 +1856,7 @@ test "status: a bootstrap row naming no registered backend is refused before any
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "darwin.toml: bootstrap row: no backend named \"brw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "darwin.toml: bootstrap row 0: no backend named \"brw\"") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 
@@ -2279,7 +2279,7 @@ test "status: a plugin no row names failing its probe is a note, and the rest st
     try writeManifest(io, h, a, "ports.toml", "backend = \"fakeports\"\n\n[[packages]]\nname = \"ripgrep\"\n");
 
     const r = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      crashy: crashy available exited 3; no row names it, so nothing here needs it\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "note      crashy: crashy available exited 3; no row asks it to install anything, so nothing here needs it\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "crashy") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   fakeports ripgrep") != null);
 }
@@ -2304,4 +2304,180 @@ test "status: a manifest with [[package]] is refused rather than read as an empt
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: unknown top-level key \"package\"") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "status --drift: a backend's limitation reaches stderr even when nothing drifted" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+    try installPlugin(io, h, a);
+
+    // Nothing declared and nothing installed: no package drift at all, so no
+    // section opens -- and what the backend cannot see still has to be said.
+    try writeManifest(io, h, a, "ports.toml", "backend = \"fakeports\"\n");
+
+    const r = try h.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: note: fakeports: variants are not tracked\n") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "status: a manifest that will not load prints the packages section, not silence" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // Unterminated array-of-tables header: the parser cannot read it, so the
+    // load fails before any row exists to blame.
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]\nname = \"ripgrep\"\n");
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    // Without the section, a refused manifest reads on stdout exactly like a
+    // repo that never opted in.
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; see the message above\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    // `--drift` opens the section for it too: the refusal is the problem.
+    const d = try h.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "\npackages:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "  ERROR     the manifest was refused; see the message above\n") != null);
+    try std.testing.expectEqual(@as(u8, 1), d.rc);
+}
+
+test "status: a manifest that will not validate prints the same ERROR row" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\backend = "brw"
+        \\
+    );
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  ERROR     the manifest was refused; see the message above\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: row \"ripgrep\": no backend named \"brw\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "status: a file-level backend naming no adapter is refused, and the file is what it names" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The onboarding file the docs describe, with the backend misspelled: no
+    // row to blame, and nothing that would ever install.
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brw\"\n");
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: file-level \"backend\": no backend named \"brw\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "status: a blacklist row in a file with a top-level when is refused, naming the file" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\when = "os=darwin"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+    );
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: packages: data/packages/darwin.toml: blacklist row 0: this file has a top-level \"when\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "status: an editor lock beside a manifest does not break every package command" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+    // The manifest is open in an editor while status runs.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "data", "packages" });
+    try Io.Dir.cwd().symLink(io, "user@host.4242:1", try std.fs.path.join(a, &.{ dir, ".#darwin.toml" }), .{});
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ dir, "._darwin.toml" }),
+        .data = "\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X",
+    });
+
+    const fake = try brewWith(a, "ripgrep\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unreadable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "TOML parse failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
