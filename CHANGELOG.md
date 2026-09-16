@@ -12,7 +12,9 @@ All notable changes to mox are documented here. The format follows
   which refuses an unknown one naming the file and row), `[[blacklist]]`
   rows for what is installed but never to be offered, and `[[bootstrap]]`
   rows naming a manager's installer by URL and sha256. Files union across the
-  repo and private layers with per-basename shadowing. Seven backends ship:
+  repo and private layers with per-basename shadowing, and a file-level
+  `when` gates every row in the file, narrowed by a row's own. Seven
+  backends ship:
   brew (formulae and casks as distinct namespaces; a tap-qualified name is
   the tap and the decision to trust that one formula or cask, never the
   whole tap), apt, dnf, pacman, zypper (no explicitly-installed query, so mox
@@ -29,10 +31,15 @@ All notable changes to mox are documented here. The format follows
 - `status` reports each backend's MISSING and UNTRACKED packages, `apply`
   installs the missing (after the pre stage and before its re-capture, and
   first installing a declared manager that is absent from its verified
-  installer, then using it by the path it landed at in the same run), and
-  `commit` offers each untracked package to add, blacklist or skip, appending
-  a row and never editing one. Nothing ever uninstalls. A repo without
-  `data/packages/` queries no manager and reports nothing.
+  installer, then using it in the same run -- brew and scoop by the path it
+  landed at, a plugin by the bin dir it reports; `--dry-run` plans as though
+  that had happened), and `commit` offers each untracked package to add,
+  blacklist or skip, appending a row the moment it is chosen and never
+  editing one (`q` ends the run before the file pass, saying how many rows
+  were already recorded). Nothing ever uninstalls. A repo without
+  `data/packages/` queries no manager and reports nothing. Every manager
+  call is bounded by the setup-script timeout and a call that exceeds it is
+  a timeout failure naming the backend.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;

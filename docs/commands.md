@@ -173,13 +173,17 @@ per-script concern (below), not this pass's to fail wholesale.
 
 A repo carrying a `data/packages/` manifest also installs what that
 manifest declares and the machine lacks, after the pre stage and before
-its re-capture: a pre-script is what installs the package manager itself
-on a fresh machine, and a package installed here is a tool the re-capture
-must see. Each is installed on its own, so a failure names its package
-and leaves the rest of the list to proceed; any failure is an error class
-(rc 2). apply only ever installs -- an untracked package is reported by
-`mox status` and reconciled by `mox commit`, never uninstalled. Under
-`--dry-run` nothing is installed and the run lists what it would install.
+its re-capture, so a package installed here is a tool the re-capture sees.
+A manager the manifest declares a `[[bootstrap]]` row for is installed
+first when absent, from its verified installer, and used by this same run.
+Each backend gets its whole set in one invocation (brew installs row by
+row, so one failure leaves the rest to proceed); any failure is an error
+class (rc 2), and a failed batch still triggers the re-capture, since some
+of it may have landed. apply only ever installs -- an untracked package is
+reported by `mox status` and reconciled by `mox commit`, never uninstalled.
+Under `--dry-run` nothing is fetched or installed and the run lists what
+it would install, planned as though any absent manager had been
+bootstrapped.
 `--skip-scripts` skips packages as it skips scripts (both change the machine
 beyond its files), and a path-scoped apply names files and installs nothing.
 A repo without `data/packages/` never queries a package manager.
@@ -282,6 +286,17 @@ pass.
 A partially owned file always routes per key, over its owned content
 only; one whose owned content resolved a secret is skipped (its record
 is a hash -- edit the source directly).
+
+A repo carrying a `data/packages/` manifest is reconciled before the file
+pass: each untracked package (installed, declared nowhere, not
+blacklisted) is offered `[y/b/s]` -- add a row to the file that declares
+its backend, blacklist it, or skip. A row is appended the moment it is
+chosen, so `q` here ends the run before the file pass and says how many
+rows were already recorded (rc 1); `--abort-on-prompt` exits 2 at the
+first package prompt the same way. A backend plugin's `declare` verb runs
+here (see [packages.md](packages.md#the-protocol)). `--dry-run` lists the
+untracked packages and writes nothing; a path-scoped `mox commit <file>`
+skips packages entirely.
 
 <!-- generated: flags commit -->
 | Flag | Description |
