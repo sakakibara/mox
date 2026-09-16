@@ -1326,7 +1326,8 @@ fn watchGroupOf(io: Io, path: []const u8, seen: *std.atomic.Value(i32)) void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const started = Io.Clock.awake.now(io);
-    while (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 60_000) {
+    var last_pid: std.posix.pid_t = 0;
+    while (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 30_000) {
         // The child writes its pid before mox records the group, so both
         // have to be there before the snapshot means anything. A group that
         // never arrives leaves `seen` at 0 and fails the test, which is the
@@ -1335,6 +1336,7 @@ fn watchGroupOf(io: Io, path: []const u8, seen: *std.atomic.Value(i32)) void {
             Process.timeoutOf(10).sleep(io) catch return;
             continue;
         };
+        last_pid = pid;
         const held = job.SpawnSignals.group.load(.acquire);
         if (held == 0) {
             Process.timeoutOf(10).sleep(io) catch return;
@@ -1344,6 +1346,10 @@ fn watchGroupOf(io: Io, path: []const u8, seen: *std.atomic.Value(i32)) void {
         _ = job.signal(-pid, .KILL);
         return;
     }
+    // Giving up still ends the child, so the call returns and the assertion
+    // that fails is the one about what was held -- not a timeout standing in
+    // for it, which would say nothing about the group at all.
+    if (last_pid != 0) _ = job.signal(-last_pid, .KILL);
 }
 
 test "Process: a captured call holds the child's group for the handler, and lets it go after" {
@@ -1361,9 +1367,10 @@ test "Process: a captured call holds the child's group for the handler, and lets
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
 
-    // The bound is far longer than the call takes: the child ends when the
-    // watcher kills the group it read, never at the bound.
-    var p: Process = .{ .io = io, .timeout_ms = 60_000 };
+    // Far longer than the watcher's own budget, so a loaded machine that is
+    // merely slow never turns this into a timeout: the child ends when the
+    // watcher kills the group it read, and the watcher ends it either way.
+    var p: Process = .{ .io = io, .timeout_ms = 180_000 };
     const res = try p.runner().run(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300", pid_file });
     watcher.await(io);
     try testing.expect(!res.timed_out);
