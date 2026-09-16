@@ -137,6 +137,15 @@ pub fn render(
     return out.written();
 }
 
+/// The file-level lines `src` declares, for `append` to write should it have
+/// to recreate the file. Empty when the file declares neither.
+pub fn renderHeader(arena: std.mem.Allocator, src: Source) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    if (src.default_backend) |b| try out.writer.print("backend = {f}\n", .{Quoted{ .s = b }});
+    if (src.when) |w| try out.writer.print("when = {f}\n", .{Quoted{ .s = w }});
+    return out.written();
+}
+
 /// One row as a single-line TOML inline table, the form a plugin reads from
 /// its stdin one row per line: `{ name = "ghostty", kind = "cask" }`.
 pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const manifest_mod.Pair) ![]const u8 {
@@ -162,15 +171,23 @@ pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const man
     return out.written();
 }
 
-/// Append the block to `path`, creating the file when it does not exist. The
-/// rewrite is atomic: a manifest in the private layer lives in no git repo,
-/// and a crash mid-write must not leave it empty. A manifest that is a
-/// symlink is rewritten where the link points, so the link survives.
-pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, block: []const u8) !void {
+/// Append the block to `path`, creating the file when it does not exist.
+/// `header` is what the file declared when `block` was rendered against it --
+/// the block omits whatever the file already says -- so a file that vanished
+/// between the two comes back declaring it, rather than as a file `commit`
+/// wrote and `load` refuses. The rewrite is atomic: a manifest in the private
+/// layer lives in no git repo, and a crash mid-write must not leave it empty.
+/// A manifest that is a symlink is rewritten where the link points, so the
+/// link survives.
+pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, header: []const u8, block: []const u8) !void {
     const path = try resolveLinks(arena, io, link_path);
     const existing = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20)) catch |e| switch (e) {
         error.FileNotFound => {
-            try apply_write.writeAtomic(io, path, std.mem.trimStart(u8, block, "\n"), 0o644);
+            const body = if (header.len == 0)
+                std.mem.trimStart(u8, block, "\n")
+            else
+                try std.fmt.allocPrint(arena, "{s}{s}", .{ header, block });
+            try apply_write.writeAtomic(io, path, body, 0o644);
             return;
         },
         else => return e,
@@ -553,7 +570,7 @@ test "append: adds a block and leaves every existing byte alone" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "p.toml" });
 
-    try append(a, io, path, "\n[[packages]]\nname = \"htop\"\n");
+    try append(a, io, path, "", "\n[[packages]]\nname = \"htop\"\n");
 
     const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     try testing.expect(std.mem.startsWith(u8, after, original));
@@ -574,7 +591,7 @@ test "append: a file not ending in a newline does not glue its last line" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "p.toml" });
 
-    try append(a, io, path, "\n[[packages]]\nname = \"htop\"\n");
+    try append(a, io, path, "", "\n[[packages]]\nname = \"htop\"\n");
 
     const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n", after);
@@ -594,7 +611,7 @@ test "append: an existing file keeps its mode" {
     const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "p.toml" });
     try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o600), .{});
 
-    try append(a, io, path, "\n[[packages]]\nname = \"htop\"\n");
+    try append(a, io, path, "", "\n[[packages]]\nname = \"htop\"\n");
 
     const st = try Io.Dir.cwd().statFile(io, path, .{});
     try testing.expectEqual(@as(u32, 0o600), @as(u32, st.permissions.toMode() & 0o777));
@@ -621,7 +638,7 @@ test "append: a symlinked manifest is rewritten through the link, which survives
     const link = try std.fs.path.join(a, &.{ root, "repo", "p.toml" });
     const real = try std.fs.path.join(a, &.{ root, "real", "p.toml" });
 
-    try append(a, io, link, "\n[[packages]]\nname = \"htop\"\n");
+    try append(a, io, link, "", "\n[[packages]]\nname = \"htop\"\n");
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     try testing.expectEqualStrings("mid.toml", buf[0..try Io.Dir.cwd().readLink(io, link, &buf)]);
@@ -642,7 +659,7 @@ test "append: a symlink chain past the hop bound is refused by name" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "l0" });
 
-    try testing.expectError(Error.TooManySymlinkHops, append(a, io, link, "\n[[packages]]\nname = \"htop\"\n"));
+    try testing.expectError(Error.TooManySymlinkHops, append(a, io, link, "", "\n[[packages]]\nname = \"htop\"\n"));
 }
 
 test "append: a missing file is created without a leading blank line" {
@@ -656,10 +673,48 @@ test "append: a missing file is created without a leading blank line" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "new.toml" });
 
-    try append(a, io, path, "\n[[packages]]\nname = \"htop\"\n");
+    try append(a, io, path, "", "\n[[packages]]\nname = \"htop\"\n");
 
     const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     try testing.expectEqualStrings("[[packages]]\nname = \"htop\"\n", after);
+}
+
+test "append: a file that vanished comes back declaring what the block left out" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const path = try std.fs.path.join(a, &.{ repo, "data", "packages", "darwin.toml" });
+
+    // The file `load` saw declared the backend and a gate, so the block omits
+    // both; it is gone by the time the row is written. Recreating it without
+    // them would be a file `commit` wrote and `load` refuses.
+    const src: Source = .{
+        .path = path,
+        .label = "data/packages/darwin.toml",
+        .default_backend = "brew",
+        .when = "os=darwin",
+        .private = false,
+    };
+    const block = try render(a, .packages, .{ .name = "ghostty" }, null);
+    try append(a, io, path, try renderHeader(a, src), block);
+
+    const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    try testing.expectEqualStrings(
+        "backend = \"brew\"\nwhen = \"os=darwin\"\n\n[[packages]]\nname = \"ghostty\"\n",
+        after,
+    );
+
+    const m = try manifest_mod.load(a, io, repo, "", null);
+    try testing.expectEqual(@as(usize, 1), m.packages.len);
+    try testing.expectEqualStrings("brew", m.packages[0].backend);
+    try testing.expectEqualStrings("os=darwin", m.packages[0].when.?);
 }
 
 test "append then load: the appended row parses back as written" {
@@ -683,7 +738,7 @@ test "append then load: the appended row parses back as written" {
         .name = "ghostty",
         .fields = &.{.{ .key = "kind", .value = .{ .string = "cask" } }},
     }, null);
-    try append(a, io, path, block);
+    try append(a, io, path, "", block);
 
     // The round trip that matters: what was written is what loads.
     const m = try manifest_mod.load(a, io, repo, "", null);

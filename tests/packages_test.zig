@@ -875,7 +875,7 @@ test "bootstrap: a manager already present is left alone" {
         \\
         \\[[bootstrap]]
         \\url = "https://example.invalid/install.sh"
-        \\sha256 = "00"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
         \\
         \\[[packages]]
         \\name = "ripgrep"
@@ -1334,7 +1334,7 @@ test "plugin: one that crashes on available is a named error, not an inert backe
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      backend broken: scripts/backends/broken") != null);
 }
 
-test "commit: a plugin without declare is reported by name, and the run does not crash" {
+test "commit: a plugin whose declare exits 64 is reported by name, and the run does not crash" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1359,7 +1359,7 @@ test "commit: a plugin without declare is reported by name, and the run does not
     try writeManifest(io, h, a, "n.toml", "backend = \"nodeclare\"\n");
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "nodeclare stray: declare failed: PluginVerbNotImplemented") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "nodeclare stray: declare failed: PluginFailed") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "internal error") == null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
@@ -1762,7 +1762,7 @@ test "bootstrap: an installer declared for a plugin this machine cannot run is l
         \\
         \\[[bootstrap]]
         \\url = "https://example.invalid/install.ps1"
-        \\sha256 = "00"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
         \\
         \\[[packages]]
         \\name = "7zip"

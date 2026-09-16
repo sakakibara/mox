@@ -635,7 +635,13 @@ fn reconcilePackages(
                 decl,
                 if (needs_backend) b.backend else null,
             );
-            try mox.packages.write.append(ctx.alloc, ctx.io, dest.path, block);
+            try mox.packages.write.append(
+                ctx.alloc,
+                ctx.io,
+                dest.path,
+                try mox.packages.write.renderHeader(ctx.alloc, dest),
+                block,
+            );
             // The label already names the layer; saying it twice reads as a
             // stutter rather than as emphasis.
             if (chosen == 0) {

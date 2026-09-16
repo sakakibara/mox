@@ -18,11 +18,13 @@
 //!                                 on a line of its own into <out>
 //!     <plugin> limitation         optional: one line on what it cannot see
 //!
-//! Exit 64 from an optional verb means "not implemented"; any other nonzero
-//! exit is a failed plugin, named as such, except the two exits the table
-//! above gives a meaning: `id`'s 1, a refusal, and `available`'s 1, not usable
-//! here. `available` is not optional, so its 64 is just another exit it cannot
-//! answer with: a broken backend, never a run-ending error.
+//! Exit 64 from an optional verb -- `bootstrap`, `limitation` -- means "not
+//! implemented"; any other nonzero exit is a failed plugin, named as such,
+//! except the two exits the table above gives a meaning: `id`'s 1, a refusal,
+//! and `available`'s 1, not usable here. From a verb that is not optional 64
+//! carries no meaning either, so it is a failed plugin like any other exit:
+//! naming a verb the protocol requires as one the plugin may lack would send
+//! its author looking for a carve-out that is not there.
 //!
 //! `id` is both `idOf` and `validate`: a row the plugin cannot name is refused
 //! with the plugin's own reason, which is stronger than any key list mox could
@@ -31,7 +33,7 @@
 //!
 //! An optional verb signals its absence with exit 64 (EX_USAGE), reported at
 //! the call site by plugin and verb. Nothing is substituted for a missing
-//! verb: a `declare` that quietly became `name = <id>` would write wrong rows.
+//! verb: a `bootstrap` mox quietly skipped would leave the manager absent.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -215,7 +217,6 @@ pub const Plugin = struct {
         const input = try std.fmt.allocPrint(arena, "{s}\n", .{line});
         const res = try self.call(arena, "id", &.{}, input, false);
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         // Exit 1 is the plugin declining the row; anything else is the plugin
         // dying (a shell syntax error exits 2), which must not read as a
         // considered refusal.
@@ -231,7 +232,6 @@ pub const Plugin = struct {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
         const res = try self.call(arena, "list", &.{}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
         return idLines(arena, res.stdout);
     }
@@ -246,7 +246,6 @@ pub const Plugin = struct {
         }
         const res = try self.call(arena, "install", &.{}, input.items, true);
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
     }
 
@@ -258,7 +257,6 @@ pub const Plugin = struct {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
         const res = try self.call(arena, "declare", &.{id}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         if (!res.ok) return Error.PluginFailed;
 
         const decl = try parseDeclaration(arena, res.stdout);
@@ -615,15 +613,34 @@ test "exit 64: an optional verb the plugin lacks is named, never defaulted" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "/r/scripts/backends/macports declare x", .code = exit_not_implemented },
         .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .match = .prefix, .code = exit_not_implemented },
         .{ .argv = "/r/scripts/backends/macports limitation", .code = exit_not_implemented },
     } };
     var p = pluginWith(&fake);
 
-    try testing.expectError(Error.PluginVerbNotImplemented, p.backend().declare(a, "x"));
     try testing.expectError(Error.PluginVerbNotImplemented, p.backend().bootstrap(a, "/tmp/i"));
     try testing.expect((try p.backend().limitationOf(a)) == null);
+}
+
+test "exit 64: from a verb the protocol requires it is a failed plugin, not a missing verb" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Only `bootstrap` and `limitation` are optional, so 64 from any of these
+    // carries no meaning the protocol gives it.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports id", .code = exit_not_implemented },
+        .{ .argv = "/r/scripts/backends/macports list", .code = exit_not_implemented },
+        .{ .argv = "/r/scripts/backends/macports install", .code = exit_not_implemented },
+        .{ .argv = "/r/scripts/backends/macports declare x", .code = exit_not_implemented },
+    } };
+    var p = pluginWith(&fake);
+
+    try testing.expectError(Error.PluginFailed, p.backend().idOf(a, rowOf("ghostty", &.{})));
+    try testing.expectError(Error.PluginFailed, p.backend().installedExplicit(a));
+    try testing.expectError(Error.PluginFailed, p.backend().install(a, &.{rowOf("ghostty", &.{})}));
+    try testing.expectError(Error.PluginFailed, p.backend().declare(a, "x"));
 }
 
 /// A bin dir that is absolute on the host running the test.
