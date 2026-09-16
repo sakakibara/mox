@@ -508,7 +508,7 @@ fn isCoreKey(k: []const u8) bool {
     return false;
 }
 
-fn fieldOf(arena: std.mem.Allocator, v: toml.Value) !?Field {
+pub fn fieldOf(arena: std.mem.Allocator, v: toml.Value) !?Field {
     return switch (v) {
         .string => |s| .{ .string = s },
         .integer => |i| .{ .int = i },

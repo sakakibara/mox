@@ -327,7 +327,7 @@ fn applyPass(
     else
         try mox.apply.run_scripts.runStage(ctx.alloc, ctx.io, pre_dir, "scripts/pre", &bindings, &script_env, &contracts, ctx.out, ctx.err);
 
-    const pkg_counts = try applyPackages(ctx, context, &bindings, dry_run);
+    const pkg_counts = try applyPackages(ctx, context, &bindings, dry_run, &script_env);
 
     // A pre-script may install a tool or create a directory a `data/facts.toml`
     // row derives a fact from. Re-capture so this same apply composes against
@@ -774,13 +774,20 @@ fn applyPass(
     return 0;
 }
 
-/// Install any declared manager this machine does not have. Returns how many
-/// failed: a manager that will not install is a genuine failure, not a reason
-/// to press on quietly installing nothing through it.
+/// Install any declared manager this machine does not have. mox fetches and
+/// digest-verifies the installer; the backend only runs what mox hands it.
+/// A bin dir the backend reports is put on PATH for the rest of this run --
+/// verified in a container: Homebrew's installer succeeds and then the same
+/// apply installs nothing, because `/home/linuxbrew/.linuxbrew/bin` is on no
+/// PATH yet. Returns how many failed: a manager that will not install is a
+/// genuine failure, not a reason to press on quietly installing nothing.
 fn bootstrapBackends(
     ctx: *app.Ctx,
+    context: app.Context,
+    pkg_backends: *app.PackageBackends,
     registry: mox.packages.backend.Registry,
     m: mox.packages.manifest.Manifest,
+    script_env: *std.process.Environ.Map,
 ) !usize {
     var failed: usize = 0;
     for (m.bootstrap) |b| {
@@ -795,7 +802,7 @@ fn bootstrapBackends(
         if (try backend.available(ctx.alloc)) continue;
         if (!backend.canBootstrap()) {
             try ctx.err.print(
-                "mox apply: {s}: {s} declares an installer but its adapter cannot bootstrap\n",
+                "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
                 .{ b.label, b.backend },
             );
             failed += 1;
@@ -803,10 +810,28 @@ fn bootstrapBackends(
         }
 
         try ctx.out.print("  bootstrapping  {s}\n", .{b.backend});
-        backend.bootstrap(ctx.alloc, .{ .url = b.url, .sha256 = b.sha256 }) catch |e| {
+        const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer", .{b.backend});
+        const path = mox.packages.bootstrap.fetchVerified(
+            ctx.alloc,
+            ctx.io,
+            pkg_backends.runner(),
+            context.paths.state_dir,
+            installer_name,
+            .{ .url = b.url, .sha256 = b.sha256 },
+        ) catch |e| {
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
             failed += 1;
+            continue;
         };
+        const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
+            failed += 1;
+            continue;
+        };
+        if (bin_dir) |dir| {
+            try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), &.{dir}));
+            try ctx.out.print("  on PATH        {s}\n", .{dir});
+        }
     }
     return failed;
 }
@@ -835,11 +860,31 @@ fn applyPackages(
     context: app.Context,
     bindings: *const mox.dsl.resolver.Resolver,
     dry_run: bool,
+    script_env: *std.process.Environ.Map,
 ) !PackageCounts {
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(ctx.io, context.paths.state_dir);
-
     var diag: mox.packages.manifest.Diag = .{};
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(
+        ctx.alloc,
+        ctx.io,
+        context.paths.state_dir,
+        context.paths.home,
+        script_env,
+        context.paths.repo_dir,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .failed = 1 };
+        },
+    };
+    for (pkg_backends.notes) |note| try ctx.out.print("  note           {s}\n", .{note});
+
     const manifest = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,
@@ -864,7 +909,7 @@ fn applyPackages(
     // is used by this same apply rather than the next one.
     var bootstrap_failed: usize = 0;
     if (manifest.inUse() and !dry_run) {
-        bootstrap_failed = try bootstrapBackends(ctx, registry, manifest);
+        bootstrap_failed = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, script_env);
     } else if (manifest.inUse()) {
         for (manifest.bootstrap) |b| {
             const backend = registry.find(b.backend) orelse continue;

@@ -48,9 +48,9 @@ pub const Error = error{
 /// `scoop export` emits `{"apps":[{"Name":...,"Source":...}],...}`.
 pub const Scoop = struct {
     runner: exec.Runner,
-    /// Only the bootstrap path needs these: staging a verified installer.
-    io: ?Io = null,
-    scratch_dir: []const u8 = "",
+    /// Where scoop lands (`<home>\scoop\shims`), so a bootstrap can name the
+    /// bin dir for this same run. Empty means unknown.
+    home: []const u8 = "",
 
     pub fn backend(self: *Scoop) Backend {
         return .{ .name = "scoop", .ctx = self, .vtable = &vtable };
@@ -66,17 +66,16 @@ pub const Scoop = struct {
         .bootstrap = bootstrapImpl,
     };
 
-    /// scoop installs itself from a PowerShell script, fetched from the URL
-    /// the manifest declares and run only once its digest matches.
-    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void {
+    /// scoop installs itself from a PowerShell script mox has already fetched
+    /// and verified.
+    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
-        const io = self.io orelse return error.NoBootstrapForBackend;
-
-        const path = try bootstrap_mod.fetchVerified(arena, io, self.runner, self.scratch_dir, "scoop-install.ps1", spec);
         const res = try self.runner.stream(arena, &.{
-            "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path,
+            "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", installer_path,
         });
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
+        if (self.home.len == 0) return null;
+        return try std.fs.path.join(arena, &.{ self.home, "scoop", "shims" });
     }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {

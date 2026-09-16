@@ -329,6 +329,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 const Packages = struct {
     report: mox.packages.report.Report = .{},
     broken: bool = false,
+    /// Plugin override and not-runnable notices, printed above the table.
+    notes: []const []const u8 = &.{},
 
     /// Every package the report counts against the exit code.
     fn problems(self: Packages) usize {
@@ -341,10 +343,28 @@ fn gatherPackages(
     context: app.Context,
     bindings: *const mox.dsl.resolver.Resolver,
 ) !Packages {
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(ctx.io, context.paths.state_dir);
-
     var diag: mox.packages.manifest.Diag = .{};
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(
+        ctx.alloc,
+        ctx.io,
+        context.paths.state_dir,
+        context.paths.home,
+        null,
+        context.paths.repo_dir,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox status: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox status: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .broken = true };
+        },
+    };
+
     const rep = mox.packages.report.gather(
         ctx.alloc,
         ctx.io,
@@ -364,7 +384,7 @@ fn gatherPackages(
             return .{ .broken = true };
         },
     };
-    return .{ .report = rep };
+    return .{ .report = rep, .notes = pkg_backends.notes };
 }
 
 /// The human `packages:` section. Silent when the repo does not use the
@@ -374,6 +394,7 @@ fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
     if (!rep.in_use) return;
 
     try ctx.out.writeAll("\npackages:\n");
+    for (pkgs.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.

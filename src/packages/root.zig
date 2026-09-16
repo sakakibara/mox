@@ -13,6 +13,8 @@ pub const windows = @import("windows.zig");
 pub const zypper = @import("zypper.zig");
 pub const ledger = @import("ledger.zig");
 pub const bootstrap = @import("bootstrap.zig");
+pub const plugin = @import("plugin.zig");
+pub const discover = @import("discover.zig");
 pub const report = @import("report.zig");
 pub const write = @import("write.zig");
 
@@ -31,6 +33,8 @@ test {
     _ = zypper;
     _ = ledger;
     _ = bootstrap;
+    _ = plugin;
+    _ = discover;
     _ = report;
     _ = write;
 }

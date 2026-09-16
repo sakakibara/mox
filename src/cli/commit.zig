@@ -433,10 +433,28 @@ fn reconcilePackages(
     input: *Io.Reader,
     report_only: bool,
 ) !PackageReconcile {
-    var pkg_backends: app.PackageBackends = .{};
-    const registry = pkg_backends.registry(ctx.io, context.paths.state_dir);
-
     var diag: mox.packages.manifest.Diag = .{};
+    var pkg_backends: app.PackageBackends = .{};
+    const registry = pkg_backends.registry(
+        ctx.alloc,
+        ctx.io,
+        context.paths.state_dir,
+        context.paths.home,
+        null,
+        context.paths.repo_dir,
+        &diag,
+    ) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox commit: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox commit: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{};
+        },
+    };
+
     const m = mox.packages.manifest.load(
         ctx.alloc,
         ctx.io,

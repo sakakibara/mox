@@ -23,6 +23,8 @@ const bootstrap_mod = @import("bootstrap.zig");
 const exec = @import("exec.zig");
 const manifest_mod = @import("manifest.zig");
 
+const Io = std.Io;
+
 pub const Row = manifest_mod.Row;
 pub const Diag = manifest_mod.Diag;
 pub const Backend = backend_mod.Backend;
@@ -59,17 +61,24 @@ pub const Brew = struct {
     };
 
     /// Homebrew is not there on a fresh mac, so its own installer puts it
-    /// there -- fetched from the URL the manifest declares and run only once
-    /// its digest matches. `NONINTERACTIVE` because `mox apply` is: the
-    /// installer otherwise stops to ask for a keypress no unattended run can
-    /// give it.
-    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void {
+    /// there, from a file mox has already fetched and verified.
+    /// `NONINTERACTIVE` because `mox apply` is: the installer otherwise stops
+    /// to ask for a keypress no unattended run can give it. The bin dir it
+    /// installed into comes back so this same run can use it: on a fresh
+    /// machine it is on no PATH yet.
+    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         const io = self.io orelse return error.NoBootstrapForBackend;
 
-        const path = try bootstrap_mod.fetchVerified(arena, io, self.runner, self.scratch_dir, "brew-install.sh", spec);
-        const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", path });
+        const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", installer_path });
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
+
+        for ([_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin" }) |dir| {
+            const exe = try std.fs.path.join(arena, &.{ dir, "brew" });
+            Io.Dir.cwd().access(io, exe, .{}) catch continue;
+            return dir;
+        }
+        return null;
     }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {

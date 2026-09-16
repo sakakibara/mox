@@ -99,6 +99,14 @@ pub fn fromManifest(
     var out: std.ArrayList(BackendDrift) = .empty;
     for (usable.items) |b| {
         const installed = try b.installedExplicit(arena);
+        for (installed) |id| {
+            if (backend_mod.idShapeOk(id)) continue;
+            if (diag) |d| d.set(
+                "{s}: reported an id that is not one id ({d} bytes, or contains whitespace); its list output lost its shape",
+                .{ b.name, id.len },
+            );
+            return error.BackendBadOutput;
+        }
         try out.append(arena, .{
             .backend = b.name,
             .drift = try drift_mod.compute(arena, b, rows, installed, m),

@@ -725,3 +725,139 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
         try std.testing.expect(std.mem.indexOf(u8, c, "/bin/bash") == null);
     }
 }
+
+/// A real plugin, a POSIX sh script, exercised through the real process
+/// runner: discovery, the protocol, drift, install and reconcile, with no
+/// scripted stand-in anywhere. Its "manager" is a file beside it, so the
+/// round trip is observable and nothing on the host is touched.
+const fakeports_sh =
+    \\#!/bin/sh
+    \\set -eu
+    \\state="$(dirname "$0")/../../.fakeports-state"
+    \\cmd=${1:-}; shift || true
+    \\idof() { n=$(printf '%s' "$1" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'); case "$1" in *'kind = "cask"'*) echo "cask:$n";; *) echo "$n";; esac; }
+    \\case "$cmd" in
+    \\available) exit 0 ;;
+    \\id) while IFS= read -r l; do [ -n "$l" ] || continue; case "$l" in *'kind = "keg"'*) echo "fakeports: kind keg is not a thing" >&2; exit 1;; esac; idof "$l"; done ;;
+    \\list) [ -f "$state" ] && cat "$state" || true ;;
+    \\install) while IFS= read -r l; do [ -n "$l" ] || continue; idof "$l" >> "$state"; done ;;
+    \\declare) case "$1" in cask:*) printf 'name = "%s"\nkind = "cask"\n' "${1#cask:}";; *) printf 'name = "%s"\n' "$1";; esac ;;
+    \\limitation) echo "variants are not tracked" ;;
+    \\*) exit 64 ;;
+    \\esac
+    \\
+;
+
+fn installPlugin(io: Io, h: Harness, a: std.mem.Allocator) !void {
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "fakeports" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = fakeports_sh });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+}
+
+test "plugin: a repo executable is a first-class backend through the whole loop" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try installPlugin(io, h, a);
+
+    // No runner override: the plugin really runs.
+    try writeManifest(io, h, a, "ports.toml",
+        \\backend = "fakeports"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "ghostty"
+        \\kind = "cask"
+        \\
+    );
+
+    // Declared, nothing installed: both MISSING, the limitation printed.
+    const s1 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s1.out, "MISSING   fakeports ripgrep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1.out, "MISSING   fakeports ghostty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1.out, "variants are not tracked") != null);
+
+    // apply hands both rows to `install`; the cask reaches it as a cask.
+    const ap = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, ap.out, "Packages: 2 installed, 0 failed") != null);
+    const state_path = try std.fs.path.join(a, &.{ h.repo, ".fakeports-state" });
+    const state = try Io.Dir.cwd().readFileAlloc(io, state_path, a, .limited(1 << 20));
+    try std.testing.expectEqualStrings("ripgrep\ncask:ghostty\n", state);
+
+    // The loop closes: what install recorded is what list reports, and that
+    // matches the rows through `id`.
+    const s2 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s2.out, "clean     fakeports") != null);
+
+    // Something installed by hand shows as untracked; commit records it
+    // through `declare`, and the round trip must hold for a cask.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = "ripgrep\ncask:ghostty\ncask:zed\n" });
+    const s3 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s3.out, "UNTRACKED fakeports cask:zed") != null);
+
+    const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "1 recorded") != null);
+    const after = try readManifest(io, h, a, "ports.toml");
+    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"zed\"\nkind = \"cask\"\n"));
+
+    // Only this backend: with no runner override the host's real brew is
+    // probed too, and whatever it has untracked is not this test's business.
+    const s4 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s4.out, "UNTRACKED fakeports") == null);
+}
+
+test "plugin: a row the plugin refuses is refused on every machine, in its own words" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try installPlugin(io, h, a);
+
+    try writeManifest(io, h, a, "ports.toml",
+        \\backend = "fakeports"
+        \\
+        \\[[packages]]
+        \\name = "ghostty"
+        \\kind = "keg"
+        \\
+    );
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "refused by plugin fakeports") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "plugin: a name shadowing a shipped backend is announced, not silent" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The same script, named `brew`: it now stands in for the built-in.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "brew" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = fakeports_sh });
+    try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "overrides the built-in") != null);
+}

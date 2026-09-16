@@ -8,7 +8,6 @@
 
 const std = @import("std");
 
-const bootstrap_mod = @import("bootstrap.zig");
 const manifest_mod = @import("manifest.zig");
 
 pub const Row = manifest_mod.Row;
@@ -17,6 +16,18 @@ pub const Diag = manifest_mod.Diag;
 /// Every adapter mox knows, whether or not this machine can use it. A row
 /// naming something outside it is a typo, not a machine difference, so the
 /// two are never the same branch.
+/// Whether an id has the shape of one id. Empty, whitespace inside, or over
+/// 256 bytes says the backend padded its output or lost its line separator
+/// (dnf5 concatenates every name when its format string lacks a newline);
+/// this catches that for a large set, and the fixture tests catch the rest.
+pub fn idShapeOk(id: []const u8) bool {
+    if (id.len == 0 or id.len > 256) return false;
+    for (id) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') return false;
+    }
+    return true;
+}
+
 pub const Registry = struct {
     backends: []const Backend,
 
@@ -60,11 +71,12 @@ pub const Backend = struct {
         installedExplicit: *const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8,
         /// Install these rows, leaving resolution to the manager.
         install: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void,
-        /// Install the manager itself from a declared, digest-verified
-        /// installer. Null for a manager that ships with the OS, which is
-        /// four of the seven: there is nothing to install and no installer to
-        /// declare.
-        bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void = null,
+        /// Install the manager itself from an installer mox has already
+        /// fetched and digest-verified at `installer_path`. Returns a directory
+        /// to put on PATH so this same run can use what it installed, or null.
+        /// Absent for a manager that ships with the OS, which is four of the
+        /// seven: there is nothing to install.
+        bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 = null,
         /// The row that would name an observed installed id: the inverse of
         /// `idOf`, for writing a hand-installed package back into the
         /// manifest. `idOf` of the result must equal the id given.
@@ -106,8 +118,8 @@ pub const Backend = struct {
         return self.vtable.bootstrap != null;
     }
 
-    pub fn bootstrap(self: Backend, arena: std.mem.Allocator, spec: bootstrap_mod.Spec) anyerror!void {
+    pub fn bootstrap(self: Backend, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const f = self.vtable.bootstrap orelse return error.NoBootstrapForBackend;
-        return f(self.ctx, arena, spec);
+        return f(self.ctx, arena, installer_path);
     }
 };

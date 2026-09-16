@@ -1,0 +1,409 @@
+//! A package backend that lives in the repo as an executable.
+//!
+//! The one extension point. A shipped backend is compiled; a plugin is any
+//! executable under `scripts/backends/` that speaks this protocol, and it
+//! satisfies exactly the same `Backend` contract, so nothing downstream can
+//! tell them apart. Any manager, any language, no mox release.
+//!
+//!     <plugin> available          exit 0: usable here
+//!     <plugin> id                 stdin: rows, one inline table per line
+//!                                 stdout: one id per line, in order
+//!                                 nonzero: a row is refused; stderr says why
+//!     <plugin> list               stdout: one id per line, explicitly installed
+//!     <plugin> install            stdin: rows; stdio streamed; nonzero: failed
+//!     <plugin> declare <id>       stdout: a TOML row body naming this id
+//!     <plugin> bootstrap <path>   optional: install the manager from the
+//!                                 verified file; stdout: a bin dir, or nothing
+//!     <plugin> limitation         optional: one line on what it cannot see
+//!
+//! `id` is both `idOf` and `validate`: a row the plugin cannot name is refused
+//! with the plugin's own reason, which is stronger than any key list mox could
+//! check against. Ids are opaque; a plugin with two namespaces prefixes them
+//! itself, and mox compares strings.
+//!
+//! An optional verb signals its absence with exit 64 (EX_USAGE), reported at
+//! the call site by plugin and verb. Nothing is substituted for a missing
+//! verb: a `declare` that quietly became `name = <id>` would write wrong rows.
+
+const std = @import("std");
+const toml = @import("toml");
+
+const backend_mod = @import("backend.zig");
+const exec = @import("exec.zig");
+const manifest_mod = @import("manifest.zig");
+const write_mod = @import("write.zig");
+
+pub const Row = manifest_mod.Row;
+pub const Diag = manifest_mod.Diag;
+pub const Backend = backend_mod.Backend;
+
+pub const exit_not_implemented: u8 = 64;
+
+pub const Error = error{
+    PluginRefusedRow,
+    PluginVerbNotImplemented,
+    PluginFailed,
+    PluginTimedOut,
+    PluginBadOutput,
+    PluginRoundTripMismatch,
+};
+
+pub const Plugin = struct {
+    name: []const u8,
+    /// How to invoke it: the path alone, or an interpreter and the path.
+    argv0: []const []const u8,
+    runner: exec.Runner,
+    /// Answered once, by `queryLimitation`, before the backend is built.
+    limitation: ?[]const u8 = null,
+
+    pub fn backend(self: *Plugin) Backend {
+        return .{
+            .name = self.name,
+            .ctx = self,
+            .vtable = &vtable,
+            .limitation = self.limitation,
+        };
+    }
+
+    const vtable: Backend.VTable = .{
+        .available = availableImpl,
+        .validate = validateImpl,
+        .idOf = idOfImpl,
+        .installedExplicit = installedExplicitImpl,
+        .install = installImpl,
+        .declare = declareImpl,
+        .bootstrap = bootstrapImpl,
+    };
+
+    fn argv(self: *const Plugin, arena: std.mem.Allocator, verb: []const u8, extra: []const []const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        try out.appendSlice(arena, self.argv0);
+        try out.append(arena, verb);
+        try out.appendSlice(arena, extra);
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Ask the optional `limitation` verb. Exit 64 is "none"; a failure is a
+    /// failure.
+    pub fn queryLimitation(self: *Plugin, arena: std.mem.Allocator) !void {
+        const res = try self.runner.run(arena, try self.argv(arena, "limitation", &.{}));
+        if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return;
+        if (!res.ok) return Error.PluginFailed;
+        const line = firstLine(res.stdout);
+        self.limitation = if (line.len == 0) null else line;
+    }
+
+    /// A spawn failure of the plugin itself is a broken plugin, not an absent
+    /// manager: unlike a compiled adapter, argv[0] here is not the manager.
+    fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        const res = try self.runner.run(arena, try self.argv(arena, "available", &.{}));
+        if (res.timed_out) return Error.PluginTimedOut;
+        return res.ok;
+    }
+
+    fn validateImpl(ctx: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        var buf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        _ = self.idOne(fba.allocator(), row) catch |e| switch (e) {
+            Error.PluginRefusedRow => {
+                if (diag) |d| d.set(
+                    "{s}: row \"{s}\": refused by plugin {s} (its reason is printed above)",
+                    .{ row.label, row.name, self.name },
+                );
+                return e;
+            },
+            else => return e,
+        };
+    }
+
+    fn idOfImpl(ctx: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        return self.idOne(arena, row);
+    }
+
+    /// One row in, exactly one id out.
+    fn idOne(self: *Plugin, arena: std.mem.Allocator, row: Row) ![]const u8 {
+        const line = try write_mod.inlineRow(arena, row.name, row.fields);
+        const input = try std.fmt.allocPrint(arena, "{s}\n", .{line});
+        const res = try self.runner.runInput(arena, try self.argv(arena, "id", &.{}), input);
+        if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (!res.ok) return Error.PluginRefusedRow;
+
+        const ids = try idLines(arena, res.stdout);
+        if (ids.len != 1) return Error.PluginBadOutput;
+        return ids[0];
+    }
+
+    fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        const res = try self.runner.run(arena, try self.argv(arena, "list", &.{}));
+        if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (!res.ok) return Error.PluginFailed;
+        return idLines(arena, res.stdout);
+    }
+
+    fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        if (rows.len == 0) return;
+        var input: std.ArrayList(u8) = .empty;
+        for (rows) |row| {
+            try input.appendSlice(arena, try write_mod.inlineRow(arena, row.name, row.fields));
+            try input.append(arena, '\n');
+        }
+        const res = try self.runner.streamInput(arena, try self.argv(arena, "install", &.{}), input.items);
+        if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (!res.ok) return Error.PluginFailed;
+    }
+
+    /// The round trip is enforced, not assumed: the row the plugin returns is
+    /// handed back to `id`, and refused unless the answer is the id it came
+    /// from. A plugin whose two halves disagree cannot write a row that will
+    /// never match its own package.
+    fn declareImpl(ctx: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        const res = try self.runner.run(arena, try self.argv(arena, "declare", &.{id}));
+        if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (!res.ok) return Error.PluginFailed;
+
+        const decl = try parseDeclaration(arena, res.stdout);
+        const check: Row = .{
+            .name = decl.name,
+            .backend = self.name,
+            .when = null,
+            .fields = decl.fields,
+            .origin = "",
+            .label = self.name,
+            .index = 0,
+        };
+        const back = try self.idOne(arena, check);
+        if (!std.mem.eql(u8, back, id)) return Error.PluginRoundTripMismatch;
+        return decl;
+    }
+
+    /// Progress goes to the terminal; the one line on stdout, if any, is a
+    /// directory to put on PATH so this same run can use what it installed.
+    fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        const res = try self.runner.runInput(arena, try self.argv(arena, "bootstrap", &.{installer_path}), "");
+        if (res.timed_out) return Error.PluginTimedOut;
+        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (!res.ok) return Error.PluginFailed;
+        const line = firstLine(res.stdout);
+        return if (line.len == 0) null else line;
+    }
+};
+
+/// Split on newline, trim `\r` and spaces (a PowerShell plugin emits CRLF),
+/// drop blanks, and refuse any id whose shape says the plugin lost its line
+/// separator or padded its output.
+fn idLines(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (!backend_mod.idShapeOk(line)) return Error.PluginBadOutput;
+        try out.append(arena, line);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len > 0) return line;
+    }
+    return "";
+}
+
+/// A `declare` answer: a TOML body with a string `name` and flat fields.
+fn parseDeclaration(arena: std.mem.Allocator, text: []const u8) !Backend.Declaration {
+    const v = toml.parse(arena, text, .{}) catch return Error.PluginBadOutput;
+    if (v != .table) return Error.PluginBadOutput;
+    const name_v = v.table.get("name") orelse return Error.PluginBadOutput;
+    if (name_v != .string or name_v.string.len == 0) return Error.PluginBadOutput;
+
+    var fields: std.ArrayList(manifest_mod.Pair) = .empty;
+    for (v.table.keys(), v.table.values()) |k, fv| {
+        if (std.mem.eql(u8, k, "name")) continue;
+        const f = (try manifest_mod.fieldOf(arena, fv)) orelse return Error.PluginBadOutput;
+        try fields.append(arena, .{ .key = k, .value = f });
+    }
+    return .{ .name = name_v.string, .fields = try fields.toOwnedSlice(arena) };
+}
+
+const testing = std.testing;
+
+fn rowOf(name: []const u8, fields: []const manifest_mod.Pair) Row {
+    return .{
+        .name = name,
+        .backend = "macports",
+        .when = null,
+        .fields = fields,
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/darwin.toml",
+        .index = 0,
+    };
+}
+
+fn pluginWith(fake: *exec.Fake) Plugin {
+    return .{ .name = "macports", .argv0 = &.{"/r/scripts/backends/macports"}, .runner = fake.runner() };
+}
+
+test "id: the row goes to stdin as one inline table and the id comes back" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports id", .stdout = "cask:ghostty\n" },
+    } };
+    var p = pluginWith(&fake);
+
+    const id = try p.backend().idOf(a, rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}));
+    try testing.expectEqualStrings("cask:ghostty", id);
+    try testing.expectEqualStrings(
+        "{ name = \"ghostty\", kind = \"cask\" }\n",
+        fake.inputTo("/r/scripts/backends/macports id").?,
+    );
+}
+
+test "id: a refused row is the plugin's decision, surfaced through validate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports id", .code = 1 },
+    } };
+    var p = pluginWith(&fake);
+
+    var d: Diag = .{};
+    try testing.expectError(Error.PluginRefusedRow, p.backend().validate(rowOf("x", &.{}), &d));
+    try testing.expect(std.mem.indexOf(u8, d.capture().?, "refused by plugin macports") != null);
+}
+
+test "list: CRLF is trimmed and a lost separator is refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var ok_fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports list", .stdout = "ripgrep\r\nbat\r\n\r\n" },
+    } };
+    var ok_p = pluginWith(&ok_fake);
+    const got = try ok_p.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("bat", got[1]);
+
+    var bad_fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports list", .stdout = "ripgrep bat\n" },
+    } };
+    var bad_p = pluginWith(&bad_fake);
+    try testing.expectError(Error.PluginBadOutput, bad_p.backend().installedExplicit(a));
+}
+
+test "install: every row reaches stdin, one per line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports install" },
+    } };
+    var p = pluginWith(&fake);
+
+    try p.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("bat", &.{}) });
+    try testing.expectEqualStrings(
+        "{ name = \"ripgrep\" }\n{ name = \"bat\" }\n",
+        fake.inputTo("/r/scripts/backends/macports install").?,
+    );
+}
+
+test "declare: the row is handed back to id and refused on mismatch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A plugin whose declare and id agree.
+    var good: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports declare cask:ghostty", .stdout = "name = \"ghostty\"\nkind = \"cask\"\n" },
+        .{ .argv = "/r/scripts/backends/macports id", .stdout = "cask:ghostty\n" },
+    } };
+    var gp = pluginWith(&good);
+    const decl = try gp.backend().declare(a, "cask:ghostty");
+    try testing.expectEqualStrings("ghostty", decl.name);
+    try testing.expectEqualStrings("cask", decl.fields[0].value.string);
+
+    // One whose declare drops the kind: id then answers `ghostty`, not the
+    // id it came from. Writing that row would never match the package.
+    var bad: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports declare cask:ghostty", .stdout = "name = \"ghostty\"\n" },
+        .{ .argv = "/r/scripts/backends/macports id", .stdout = "ghostty\n" },
+    } };
+    var bp = pluginWith(&bad);
+    try testing.expectError(Error.PluginRoundTripMismatch, bp.backend().declare(a, "cask:ghostty"));
+}
+
+test "exit 64: an optional verb the plugin lacks is named, never defaulted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports declare x", .code = exit_not_implemented },
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .code = exit_not_implemented },
+        .{ .argv = "/r/scripts/backends/macports limitation", .code = exit_not_implemented },
+    } };
+    var p = pluginWith(&fake);
+
+    try testing.expectError(Error.PluginVerbNotImplemented, p.backend().declare(a, "x"));
+    try testing.expectError(Error.PluginVerbNotImplemented, p.backend().bootstrap(a, "/tmp/i"));
+    try p.queryLimitation(a);
+    try testing.expect(p.limitation == null);
+}
+
+test "bootstrap: the line on stdout is the bin dir to put on PATH" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports bootstrap /tmp/i", .stdout = "/opt/local/bin\n" },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expectEqualStrings("/opt/local/bin", (try p.backend().bootstrap(a, "/tmp/i")).?);
+}
+
+test "limitation: the plugin's one line is carried onto the backend" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports limitation", .stdout = "variants are not tracked\n" },
+    } };
+    var p = pluginWith(&fake);
+    try p.queryLimitation(a);
+    try testing.expectEqualStrings("variants are not tracked", p.backend().limitation.?);
+}
+
+test "available: a plugin that cannot be spawned is an error, not an absent manager" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports available", .fail = error.FileNotFound },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expectError(error.FileNotFound, p.backend().available(a));
+}

@@ -66,12 +66,16 @@ pub var cwd_override: ?[]const u8 = null;
 /// running the suite. Null means spawn for real.
 pub var package_runner_override: ?mox.packages.exec.Runner = null;
 
-/// Every package manager mox knows, built once so `status`, `apply` and
-/// `commit` can never disagree about which exist or how they are reached.
+/// Every package backend this run can use: the seven mox ships, then every
+/// plugin the repo carries under `scripts/backends/`. Built once so `status`,
+/// `apply` and `commit` can never disagree about which exist or how they are
+/// reached.
 ///
 /// Registered is not the same as usable: a dnf row on a mac names a real
-/// adapter that this machine simply cannot run, which is inert. A row naming
-/// nothing here is a typo, and says so.
+/// backend that this machine simply cannot run, which is inert. A row naming
+/// nothing here is a typo, and says so. A plugin sharing a shipped backend's
+/// name overrides it -- shadowing, as the private layer shadows the repo --
+/// and `status` says so on every run.
 pub const PackageBackends = struct {
     proc: mox.packages.exec.Process = undefined,
     brew: mox.packages.brew.Brew = undefined,
@@ -81,29 +85,48 @@ pub const PackageBackends = struct {
     scoop: mox.packages.windows.Scoop = undefined,
     winget: mox.packages.windows.Winget = undefined,
     zypper: mox.packages.zypper.Zypper = undefined,
-    list: [7]mox.packages.backend.Backend = undefined,
+    plugins: []mox.packages.plugin.Plugin = &.{},
+    list: []mox.packages.backend.Backend = &.{},
+    /// Override and not-runnable notices, for `status` to print: a plugin
+    /// that will not run here, or one standing in for a shipped backend, must
+    /// be visible rather than inferred from what is missing.
+    notes: []const []const u8 = &.{},
 
-    /// `scratch_dir` stages a manager's own export file (winget writes one
-    /// rather than answering on stdout); mox's state directory keeps it off
-    /// a shared temp and inside a directory mox already owns.
+    pub fn runner(self: *PackageBackends) mox.packages.exec.Runner {
+        return package_runner_override orelse self.proc.runner();
+    }
+
+    /// `scratch_dir` stages a manager's own export file and a plugin's stdin;
+    /// mox's state directory keeps both inside a directory mox already owns.
+    /// `env` is what every backend and plugin runs under; apply hands its
+    /// script environment so a bootstrap's PATH addition reaches the probes
+    /// that follow in the same run. `diag` names a plugin that cannot be
+    /// discovered (bad name, missing executable bit, two files for one name).
     pub fn registry(
         self: *PackageBackends,
+        arena: std.mem.Allocator,
         io: std.Io,
         scratch_dir: []const u8,
-    ) mox.packages.backend.Registry {
-        self.proc = .{ .io = io };
-        const runner = package_runner_override orelse self.proc.runner();
-        self.brew = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
-        self.apt = .{ .manager = .apt, .runner = runner };
-        self.dnf = .{ .manager = .dnf, .runner = runner };
-        self.pacman = .{ .manager = .pacman, .runner = runner };
-        self.scoop = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
-        self.winget = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
+        home: []const u8,
+        env: ?*const std.process.Environ.Map,
+        repo_dir: []const u8,
+        diag: ?*mox.packages.manifest.Diag,
+    ) !mox.packages.backend.Registry {
+        self.proc = .{ .io = io, .env = env, .scratch_dir = scratch_dir };
+        const r = self.runner();
+        self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
+        self.apt = .{ .manager = .apt, .runner = r };
+        self.dnf = .{ .manager = .dnf, .runner = r };
+        self.pacman = .{ .manager = .pacman, .runner = r };
+        self.scoop = .{ .runner = r, .home = home };
+        self.winget = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
         self.zypper = .{
-            .runner = runner,
+            .runner = r,
             .ledger = .{ .io = io, .dir = scratch_dir, .backend = "zypper" },
         };
-        self.list = .{
+
+        var list: std.ArrayList(mox.packages.backend.Backend) = .empty;
+        try list.appendSlice(arena, &.{
             self.brew.backend(),
             self.apt.backend(),
             self.dnf.backend(),
@@ -111,8 +134,36 @@ pub const PackageBackends = struct {
             self.scoop.backend(),
             self.winget.backend(),
             self.zypper.backend(),
-        };
-        return .{ .backends = &self.list };
+        });
+
+        var notes: std.ArrayList([]const u8) = .empty;
+        const found = try mox.packages.discover.discover(arena, io, repo_dir, diag);
+        self.plugins = try arena.alloc(mox.packages.plugin.Plugin, found.len);
+        var n: usize = 0;
+        for (found) |f| {
+            if (f.not_runnable) |why| {
+                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ f.path, why }));
+                continue;
+            }
+            self.plugins[n] = .{ .name = f.name, .argv0 = f.argv0, .runner = r };
+            const pl = &self.plugins[n];
+            n += 1;
+            try pl.queryLimitation(arena);
+
+            var replaced = false;
+            for (list.items) |*b| {
+                if (std.mem.eql(u8, b.name, f.name)) {
+                    b.* = pl.backend();
+                    replaced = true;
+                    try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: {s} overrides the built-in", .{ f.name, f.path }));
+                    break;
+                }
+            }
+            if (!replaced) try list.append(arena, pl.backend());
+        }
+        self.list = try list.toOwnedSlice(arena);
+        self.notes = try notes.toOwnedSlice(arena);
+        return .{ .backends = self.list };
     }
 };
 

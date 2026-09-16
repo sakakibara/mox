@@ -83,7 +83,7 @@ const Downloader = struct {
         return .{ .ctx = self, .runFn = run, .streamFn = run };
     }
 
-    fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8) anyerror!exec.Result {
+    fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8) anyerror!exec.Result {
         const self: *Downloader = @ptrCast(@alignCast(ctx));
         self.calls += 1;
         // `curl -fsSL -o <path> <url>`

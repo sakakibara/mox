@@ -90,6 +90,30 @@ pub fn render(
     return out.written();
 }
 
+/// One row as a single-line TOML inline table, the form a plugin reads from
+/// its stdin one row per line: `{ name = "ghostty", kind = "cask" }`.
+pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const manifest_mod.Pair) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.print("{{ name = {f}", .{Quoted{ .s = name }});
+    for (fields) |p| {
+        switch (p.value) {
+            .string => |v| try out.writer.print(", {s} = {f}", .{ p.key, Quoted{ .s = v } }),
+            .int => |v| try out.writer.print(", {s} = {d}", .{ p.key, v }),
+            .boolean => |v| try out.writer.print(", {s} = {s}", .{ p.key, if (v) "true" else "false" }),
+            .strings => |vs| {
+                try out.writer.print(", {s} = [", .{p.key});
+                for (vs, 0..) |v, i| {
+                    if (i > 0) try out.writer.writeAll(", ");
+                    try out.writer.print("{f}", .{Quoted{ .s = v }});
+                }
+                try out.writer.writeAll("]");
+            },
+        }
+    }
+    try out.writer.writeAll(" }");
+    return out.written();
+}
+
 /// Append the block to `path`, creating the file when it does not exist.
 pub fn append(arena: std.mem.Allocator, io: Io, path: []const u8, block: []const u8) !void {
     const existing = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20)) catch |e| switch (e) {
@@ -193,6 +217,16 @@ test "render: int, bool and string-array fields" {
         "\n[[packages]]\nname = \"Xcode\"\nid = 497799835\npin = true\nargs = [\"--a\", \"--b\"]\n",
         got,
     );
+}
+
+test "inlineRow: a row renders as one inline table on one line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try inlineRow(a, "ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }});
+    try testing.expectEqualStrings("{ name = \"ghostty\", kind = \"cask\" }", got);
+    try testing.expect(std.mem.indexOfScalar(u8, got, '\n') == null);
 }
 
 test "targetFor: prefers a file whose own default names the backend" {
