@@ -468,20 +468,46 @@ fn printPackages(
     const prep = try preparePackages(ctx, context, m_state);
     if (!prep.inUse()) return reportPackages(ctx, prep, bindings);
 
-    try ctx.out.writeAll("\npackages:\n");
-    for (prep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    // Under `--drift` stdout is the drift set alone, so what is said about
+    // the plugins goes where the machine formats put it -- and, as there,
+    // before any of them runs.
+    if (drift_only) {
+        for (prep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+    } else {
+        try ctx.out.writeAll("\npackages:\n");
+        for (prep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    }
 
     const pkgs = try reportPackages(ctx, prep, bindings);
     const rep = pkgs.report;
+    if (drift_only) {
+        // Nothing drifted and nothing broken: no section at all, the way a
+        // clean file table is absent from `--drift`.
+        if (pkgs.problems() == 0) return pkgs;
+        try ctx.out.writeAll("\npackages:\n");
+    }
+    // A manifest that failed to load or validate has said why on stderr;
+    // without a word here the empty section reads as a clean machine.
+    if (pkgs.broken) try ctx.out.writeAll("  ERROR     the manifest was refused; see the message above\n");
     // What no one backend's rows can say: no usable manager at all, or a
     // manager that is there but broken -- drift, since the machine is not
     // in the state the manifest describes.
-    for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    if (!drift_only) {
+        for (rep.notes) |note| try ctx.out.print("  note      {s}\n", .{note});
+    } else {
+        for (rep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+    }
     for (rep.broken) |b| try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
     for (rep.backends) |b| {
         // A manager that cannot see hand-installed packages reports none, and
         // "none" is indistinguishable from "none exist" unless it says so.
-        if (b.limitation) |note| try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
+        if (b.limitation) |note| {
+            if (drift_only) {
+                try ctx.err.print("mox status: note: {s}: {s}\n", .{ b.backend, note });
+            } else {
+                try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
+            }
+        }
         if (b.drift.clean()) {
             if (!drift_only) try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
             continue;

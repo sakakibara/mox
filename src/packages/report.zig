@@ -94,7 +94,8 @@ pub fn gather(
 /// `gather` for a manifest already loaded, so a caller that reads it for its
 /// own reasons does not read it twice. `assume_available` names backends to
 /// treat as usable with nothing installed, without asking them: a dry run
-/// planning what a bootstrap it will not perform would then let install.
+/// must be able to plan the rows of a manager it is not going to bootstrap
+/// for real.
 ///
 /// A backend that is absent but has a `[[bootstrap]]` row whose gate holds
 /// is assumed the same way without being named: `apply` would bootstrap it
@@ -149,14 +150,20 @@ pub fn fromManifest(
             // Broken is drift only for a manager the manifest asks about:
             // one no row names has nothing here to go wrong, and a machine
             // whose unrelated manager is damaged is not this repo's drift.
-            .broken => |why| if (named(m, b.name)) {
-                try broken.append(arena, .{ .backend = b.name, .probe = why.probe, .code = why.code });
-            } else {
-                try notes.append(arena, try std.fmt.allocPrint(
-                    arena,
-                    "{s}: {s} exited {d}; no row names it, so nothing here needs it",
-                    .{ b.name, why.probe, why.code },
-                ));
+            // A manager that is there but cannot answer is a broken install
+            // to repair, never one to install over: it is not absent, so no
+            // bootstrap row applies to it and none of its rows can be judged.
+            .broken => |why| {
+                if (actedOn(m, b.name)) {
+                    try broken.append(arena, .{ .backend = b.name, .probe = why.probe, .code = why.code });
+                } else {
+                    try notes.append(arena, try std.fmt.allocPrint(
+                        arena,
+                        "{s}: {s} exited {d}; no row names it, so nothing here needs it",
+                        .{ b.name, why.probe, why.code },
+                    ));
+                }
+                continue;
             },
         }
         if (b.inert) continue;
@@ -219,6 +226,16 @@ pub fn fromManifest(
 fn named(m: manifest_mod.Manifest, backend: []const u8) bool {
     for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
     for (m.blacklist) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
+    for (m.bootstrap) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
+    return false;
+}
+
+/// Whether the manifest asks this backend to do anything. A blacklist row
+/// asks for nothing to happen, so a manager named by one alone has nothing
+/// to install and nothing to judge: its being broken is worth a note, not
+/// drift the run can never clear.
+fn actedOn(m: manifest_mod.Manifest, backend: []const u8) bool {
+    for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
     for (m.bootstrap) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
     return false;
 }
@@ -481,6 +498,34 @@ test "fromManifest: an inert backend is not assumed for its bootstrap row" {
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "fromManifest: a broken backend is not bootstrapped over, whatever the manifest declares" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // brew answers its probe with an error and the manifest declares an
+    // installer for it. Installing over a broken manager would be judged
+    // against a manager that cannot answer, so neither happens.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .code = 1 },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{rowOf("ripgrep", "brew")},
+        .bootstrap = &.{bootstrapRowOf("brew", null)},
+        .files = 1,
+    };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    try testing.expectEqual(@as(usize, 1), rep.broken.len);
+    // No backend drift at all: its rows were not judged.
+    try testing.expectEqual(@as(usize, 0), rep.backends.len);
+    try testing.expect(!rep.clean());
 }
 
 test "fromManifest: a broken backend is treated as absent and listed as broken" {
