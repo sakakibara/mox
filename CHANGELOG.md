@@ -81,12 +81,15 @@ All notable changes to mox are documented here. The format follows
   leading kind. Package drift counts toward the exit code as file drift does.
 - `status` and `commit` execute repo code they did not before: a backend
   plugin's `available`, `list`, `id`, `limitation` and (for `commit`)
-  `declare`; each plugin is named by path in the report first. `doctor` no
-  longer reports `scripts/backends/` as an unknown stage.
+  `declare`; each plugin is named by path in the report first.
 - A bad `MOX_SCRIPT_TIMEOUT_MS` value warns as `mox: ...` rather than
   `mox apply: ...`, since every command now reads it. Diagnostics hold
   1 KiB instead of 200 bytes and end a message that still does not fit with
   `...` instead of cutting it silently.
+- `mox commit` skips a manifest file whose own `when` excludes this machine
+  when it looks for somewhere to record a row: a row appended there would
+  never be desired on the machine that recorded it. A diagnostic that names
+  two files says which layer each is in.
 
 ### Fixed
 - The timeout watchdog for setup scripts and check hooks runs on its own

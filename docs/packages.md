@@ -123,10 +123,10 @@ package manager at all is usable here, `status` notes
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
-| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1` so a read-only `status` stays offline | `kind` (`formula`, `cask`) |
-| `apt` | name | `apt-mark showmanual` | -- |
-| `dnf` | name | `dnf -q repoquery --userinstalled` (`-q` because dnf4 writes its metadata line to stdout) | -- |
-| `pacman` | name | `pacman -Qeq`; an install is `pacman -Syu --needed`, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
+| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1`, so a read-only `status` never refreshes brew's cached API data on a timer (a cache that does not exist yet is still populated once) | `kind` (`formula`, `cask`) |
+| `apt` | name | `apt-mark showmanual`; an install runs `apt-get update` first, so the index it resolves against is current | -- |
+| `dnf` | name | `dnf -q repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; the format string because its default packs several to a line) | -- |
+| `pacman` | name | `pacman -Qeq`; an install is `pacman -Syu --needed --noconfirm`, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
 | `winget` | `PackageIdentifier` | `winget export` | `source`, `scope` (`user`/`machine`), `override` |
@@ -170,9 +170,10 @@ batch that failed part-way is read back the same way, so the rows that did
 land are recorded rather than retried forever.
 
 Because what is installed is read back from `rpm`, a zypper row names a
-package: a `pattern:`, `patch:`, `product:`, `srcpackage:` or
-`application:` selector is refused, since it would install and then read as
-missing on every status. The cost is that a package installed by hand is
+package, plainly: a `pattern:`, `patch:`, `product:`, `srcpackage:` or
+`application:` selector is refused, and so is a version relation
+(`vim=9.0`) or an architecture suffix (`vim.x86_64`), since each would
+install and then read as missing on every status. The cost is that a package installed by hand is
 invisible to mox on zypper and will never be offered for tracking. `mox status` prints that as a note
 under the backend rather than leaving it to be discovered.
 
@@ -183,8 +184,9 @@ under the backend rather than leaving it to be discovered.
   blacklisted.
 - **BROKEN** -- the manager is installed but cannot answer
   (`BROKEN    brew (brew --version exited 1)`). Its rows are neither judged
-  nor installed, and a machine in that state is not a clean one: it counts
-  toward the exit code like any other drift.
+  nor installed, and a machine in that state is not a clean one: `status`
+  counts it toward the exit code and `apply` fails on it. `commit` only
+  notes it, since a manager that cannot list has nothing to reconcile.
 
 Untracked is measured against every row the manifest declares, not only the
 ones desired here: a package gated to another profile is already tracked, and
@@ -334,7 +336,10 @@ backend.
 - A streamed call (`install`, `bootstrap`) is handed the terminal for its
   run, the way a shell hands it to a job. `sudo` can prompt, Ctrl-C goes to
   the manager and ends mox with it, and Ctrl-Z suspends the job and hands
-  the terminal back, so the shell can `fg` it later. Its bound is
+  the terminal back, so the shell can `fg` it later. A run with no terminal
+  to hand over (`mox apply &`, a CI job) cannot answer a prompt, so an
+  install that stops waiting for one is ended and named rather than waited
+  on forever. Its bound is
   `MOX_INSTALL_TIMEOUT_MS` (none by default: a manager may compile for an
   hour), and at that bound its group is interrupted, then killed ten
   seconds later. A captured verb must never prompt: it is not the
@@ -417,16 +422,20 @@ answered without the real thing:
 | Gate | Covers |
 |---|---|
 | `zig build test-backends` | brew, read-only, differential against brew's own output |
-| `sh tests/linux_backends_test.sh` | apt, dnf, zypper, pacman -- a full install round trip per distro, in containers; and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply |
+| `sh tests/linux_backends_test.sh` | apt, dnf (both generations), zypper, pacman -- a full install round trip per image, in containers; and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply |
 | `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget: read-only where present; on a runner without scoop, a bootstrap from the pinned installer plus one install |
 
 All three run nightly in CI, or on demand. Only the real manager can say
 whether a query's format string still yields one name per line, or whether
 an image without `sudo` installs at all; the hermetic tests cannot. A skip
 is never a pass: under CI every one of the three fails when a case skipped,
-because there the case is the reason the job exists. The single exception is
-brew's tap check, which needs a formula installed from a third-party tap --
-something no CI runner should do -- so it skips there and says so. The brew checks compare the adapter
+because there the case is the reason the job exists. A check that cannot
+apply to a backend at all is reported N/A instead, and does not fail
+anything: zypper's ledger reports nothing untracked by construction, so the
+check that measures untracked names has nothing to measure there. The one
+real exception is brew's tap check, which needs a formula installed from a
+third-party tap -- something no CI runner should do -- so it skips there and
+says so. The brew checks compare the adapter
 against Homebrew's own install receipts rather than against the command the
 adapter runs, so an adapter asking the wrong question cannot agree with the
 oracle.
