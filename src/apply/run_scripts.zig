@@ -794,7 +794,11 @@ pub fn runCheck(
     if (timeout_ms > 0) {
         if (child.id) |id| {
             const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } };
-            killer = try io.concurrent(killGroupAfter, .{ io, t, id, &timed_out });
+            // No thread for the watchdog: an unbounded wait beats a
+            // running child nobody reaps.
+            killer = io.concurrent(killGroupAfter, .{ io, t, id, &timed_out }) catch |e| switch (e) {
+                error.ConcurrencyUnavailable => null,
+            };
         }
     }
     const term = child.wait(io) catch |e| {
@@ -930,7 +934,11 @@ fn runOne(
     if (timeout_ms > 0) {
         if (child.id) |id| {
             const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } };
-            killer = try io.concurrent(killAfter, .{ io, t, id, &timed_out });
+            // No thread for the watchdog: an unbounded wait beats a
+            // running child nobody reaps.
+            killer = io.concurrent(killAfter, .{ io, t, id, &timed_out }) catch |e| switch (e) {
+                error.ConcurrencyUnavailable => null,
+            };
         } else {
             // No process id to signal: the timeout cannot be armed, so the wait
             // below would be unbounded. Spawn always yields an id on the

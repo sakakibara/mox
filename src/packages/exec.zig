@@ -276,13 +276,27 @@ pub const Process = struct {
     /// Spawn with stdin backed by a scratch file holding `stdin` (closed
     /// when null), stderr on the terminal, and stdout captured or inherited.
     /// One deadline bounds the whole call: reading what the child writes and
-    /// waiting for it to exit. A captured call runs in its own process group
-    /// and exceeding the bound kills the group, so a query blocked behind a
-    /// helper it spawned (`port | awk`) goes with it rather than holding the
-    /// pipe open. A streamed call stays in mox's own group: it may talk to
-    /// the terminal (`sudo` asks for a password, and stops on SIGTTOU from a
-    /// background group), and Ctrl-C must reach it; at its own bound the
-    /// direct child is interrupted, then killed after the grace.
+    /// waiting for it to exit.
+    ///
+    /// Every child leads its own process group, so a bound reaches the whole
+    /// tree: a query blocked behind a helper it spawned (`port | awk`) and an
+    /// install behind a shell (`sh -c 'sudo port install ...'`) go together,
+    /// never the shell alone with the manager left running. A captured call
+    /// exceeding its bound has the group killed. A streamed call has the
+    /// group interrupted, then killed after the grace, and whatever survived
+    /// the child's own exit is killed once the child is reaped.
+    ///
+    /// A streamed child is handed the terminal for its run, the way a shell
+    /// hands it to a foreground job: `sudo` may prompt (a background group
+    /// stops on SIGTTOU the moment it touches the terminal), and Ctrl-C goes
+    /// to the child's group, not to mox. A streamed child that dies of a
+    /// SIGINT mox did not send was interrupted by the user, so once mox has
+    /// the terminal back it dies of SIGINT itself: the run ends exactly as
+    /// a Ctrl-C delivered to mox would have ended it. A SIGINT the bound
+    /// sent is a timeout, reported as one. Without a terminal on stdin
+    /// (CI, a pipe) there is no handover: nothing can prompt there. Windows
+    /// has neither groups nor an interrupt: a bound terminates the direct
+    /// child.
     fn spawn(
         self: *Process,
         arena: std.mem.Allocator,
@@ -320,9 +334,13 @@ pub const Process = struct {
             .stdin = stdin_io,
             .stdout = stdout_io,
             .stderr = .inherit,
-            .pgid = if (captured) own_group else null,
+            .pgid = own_group,
         });
         const deadline = timeoutOf(if (captured) self.timeout_ms else self.install_timeout_ms).toDeadline(io);
+        var tty: ?Terminal = null;
+        if (!captured) {
+            if (child.id) |id| tty = Terminal.handTo(id);
+        }
 
         var out: []const u8 = "";
         if (child.stdout) |f| {
@@ -366,32 +384,132 @@ pub const Process = struct {
         var killer: ?Io.Future(void) = null;
         if (deadline != .none) {
             if (child.id) |id| {
-                killer = if (captured)
-                    try io.concurrent(killGroupAfter, .{ io, deadline, id, &guard })
+                const spawned = if (captured)
+                    io.concurrent(killGroupAfter, .{ io, deadline, id, &guard })
                 else
-                    try io.concurrent(interruptAfter, .{ io, deadline, id, timeoutOf(self.grace_ms), &guard });
+                    io.concurrent(interruptAfter, .{ io, deadline, id, timeoutOf(self.grace_ms), &guard });
+                // No thread for the watchdog: an unbounded wait beats a
+                // running child nobody reaps.
+                killer = spawned catch |e| switch (e) {
+                    error.ConcurrencyUnavailable => null,
+                };
             }
         }
+        // `wait` clears `child.id` as it reaps, so the group to sweep must
+        // be remembered before it.
+        const group = child.id;
         const term = child.wait(io) catch |e| {
             guard.reaped.store(true, .release);
             if (killer) |*k| _ = k.cancel(io);
+            if (tty) |t| t.takeBack();
             return e;
         };
         guard.reaped.store(true, .release);
         if (killer) |*k| _ = k.cancel(io);
+        if (tty) |t| t.takeBack();
+        // A shell reaped on the interrupt leaves whatever it backgrounded
+        // in its group; the call is over, so nothing there may outlive it.
+        if (guard.fired) {
+            if (group) |id| killStragglersOf(id);
+        }
 
         var res = fromTerm(term, out);
         if (guard.fired) {
             res.ok = false;
             res.timed_out = true;
+        } else if (tty != null and term == .signal and term.signal == .INT) {
+            if (self.out) |w| w.flush() catch {};
+            if (self.err) |w| w.flush() catch {};
+            dieOfInterrupt();
         }
         return res;
     }
 };
 
-/// A captured child leads its own process group everywhere that has one;
+/// Every child leads its own process group everywhere that has one;
 /// Windows has no groups, so its kill reaches the direct child only.
 const own_group: ?std.posix.pid_t = if (builtin.os.tag == .windows) null else 0;
+
+/// The controlling terminal, handed to a streamed child for its run and
+/// taken back once it is reaped. Handed over only when stdin is a terminal
+/// that mox's own group holds: a mox run in the background must not take
+/// it from the job that has it, and a mox without one has nothing to hand.
+/// Windows has no job control, so there it is nothing at all.
+const Terminal = if (builtin.os.tag == .windows) NoTerminal else PosixTerminal;
+
+const NoTerminal = struct {
+    fn handTo(_: std.process.Child.Id) ?NoTerminal {
+        return null;
+    }
+    fn takeBack(_: NoTerminal) void {}
+};
+
+const PosixTerminal = struct {
+    owner: std.posix.pid_t,
+
+    fn handTo(pgid: std.posix.pid_t) ?PosixTerminal {
+        const fd = std.posix.STDIN_FILENO;
+        if (std.c.isatty(fd) == 0) return null;
+        const owner = libc.tcgetpgrp(fd);
+        if (owner < 0 or owner != libc.getpgrp()) return null;
+        if (!setForeground(fd, pgid)) return null;
+        return .{ .owner = owner };
+    }
+
+    fn takeBack(self: PosixTerminal) void {
+        _ = setForeground(std.posix.STDIN_FILENO, self.owner);
+    }
+
+    /// `tcsetpgrp` with SIGTTOU ignored for its duration: the call from a
+    /// background group -- which mox is in while the child has the
+    /// terminal -- stops the caller otherwise.
+    fn setForeground(fd: std.posix.fd_t, pgid: std.posix.pid_t) bool {
+        const ignore: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var previous: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.TTOU, &ignore, &previous);
+        defer std.posix.sigaction(.TTOU, &previous, null);
+        return libc.tcsetpgrp(fd, pgid) == 0;
+    }
+};
+
+/// What `std.c` leaves undeclared of the job-control calls.
+const libc = struct {
+    extern "c" fn getpgrp() std.c.pid_t;
+    extern "c" fn tcgetpgrp(fd: std.c.fd_t) std.c.pid_t;
+    extern "c" fn tcsetpgrp(fd: std.c.fd_t, pgrp: std.c.pid_t) c_int;
+};
+
+/// End this process the way the Ctrl-C the user pressed would have, had
+/// the terminal delivered it here: by SIGINT under its default disposition,
+/// so the shell reports an interrupt and a caller's own SIGINT handling
+/// sees one. Reached only where a terminal was handed over, which is never
+/// on Windows.
+fn dieOfInterrupt() noreturn {
+    if (builtin.os.tag != .windows) {
+        const default: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &default, null);
+        std.posix.raise(.INT) catch {};
+    }
+    std.process.exit(130);
+}
+
+/// Kill what a timed-out child's group still holds after the child itself
+/// is reaped: a shell's `cmd &` helper ignores the interrupt by POSIX rule,
+/// and the shell exiting on it cancels the watchdog that would have killed
+/// the group after the grace. The group id outlives the reaped leader for
+/// as long as any member does, so the kill lands on those members alone.
+fn killStragglersOf(id: std.process.Child.Id) void {
+    if (builtin.os.tag == .windows) return;
+    _ = signal(-id, .KILL);
+}
 
 /// Shared between the waiter and the deadline task: the waiter marks the
 /// child reaped so a kill never lands on a recycled pid, and the task marks
@@ -431,9 +549,11 @@ fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard:
     if (killGroupOf(id)) guard.fired = true;
 }
 
-/// The streamed counterpart: an interrupt first, which `sudo` relays to the
-/// manager it started so a transaction can roll back, then a kill once the
-/// grace has passed. Windows has no interrupt to send, so it terminates.
+/// The streamed counterpart: an interrupt to the whole group first -- the
+/// shell in front of a manager defers it until its foreground child exits,
+/// so only a signal that reaches the manager itself lets `sudo`'s
+/// transaction roll back -- then a kill of the group once the grace has
+/// passed. Windows has neither, so it terminates the direct child.
 fn interruptAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, grace: Io.Timeout, guard: *Guard) void {
     deadline.sleep(io) catch return;
     if (guard.reaped.load(.acquire)) return;
@@ -441,11 +561,11 @@ fn interruptAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, grace:
         if (run_scripts.killProcess(id)) guard.fired = true;
         return;
     }
-    if (!signal(id, .INT)) return;
+    if (!signal(-id, .INT)) return;
     guard.fired = true;
     if (grace != .none) grace.sleep(io) catch return;
     if (guard.reaped.load(.acquire)) return;
-    _ = signal(id, .KILL);
+    _ = signal(-id, .KILL);
 }
 
 fn fromTerm(term: std.process.Child.Term, stdout: []const u8) Result {
@@ -492,10 +612,12 @@ pub const Fake = struct {
     calls: std.ArrayList([]const u8) = .empty,
     /// The stdin handed to each call, in call order ("" when none).
     inputs: std.ArrayList([]const u8) = .empty,
+    /// Whether each call was streamed rather than captured, in call order.
+    streamed: std.ArrayList(bool) = .empty,
     arena: std.mem.Allocator,
 
     pub fn runner(self: *Fake) Runner {
-        return .{ .ctx = self, .runFn = runImpl, .streamFn = runImpl };
+        return .{ .ctx = self, .runFn = runImpl, .streamFn = streamImpl };
     }
 
     pub fn called(self: *const Fake, argv: []const u8) bool {
@@ -515,9 +637,19 @@ pub const Fake = struct {
 
     fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
         const self: *Fake = @ptrCast(@alignCast(ctx));
+        return self.answer(arena, argv, stdin, false);
+    }
+
+    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
+        return self.answer(arena, argv, stdin, true);
+    }
+
+    fn answer(self: *Fake, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, is_streamed: bool) anyerror!Result {
         const joined = try std.mem.join(self.arena, " ", argv);
         try self.calls.append(self.arena, joined);
         try self.inputs.append(self.arena, try self.arena.dupe(u8, stdin orelse ""));
+        try self.streamed.append(self.arena, is_streamed);
         if (self.spent.items.len == 0) {
             for (self.entries) |_| try self.spent.append(self.arena, false);
         }
@@ -623,6 +755,26 @@ test "Fake: stdin handed to a call is recorded against it" {
     try testing.expectEqualStrings("{ name = \"x\" }\n", fake.inputTo("plugin id").?);
 }
 
+test "Fake: records whether each call was captured or streamed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew list", .stdout = "x\n" },
+        .{ .argv = "brew install x" },
+        .{ .argv = "plugin bootstrap" },
+    } };
+    const r = fake.runner();
+
+    _ = try r.run(a, &.{ "brew", "list" });
+    _ = try r.stream(a, &.{ "brew", "install", "x" });
+    _ = try r.streamInput(a, &.{ "plugin", "bootstrap" }, "y\n");
+    _ = try r.invoke(a, &.{ "brew", "list" }, null, false);
+    try testing.expectEqualSlices(bool, &.{ false, true, true, false }, fake.streamed.items);
+    try testing.expectEqual(@as(usize, 4), fake.calls.items.len);
+}
+
 test "Process: a real command that exceeds its bound is killed and reported" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -684,6 +836,113 @@ test "Process: a streamed child that ignores the interrupt is killed after the g
     // Ended by the kill: after the grace, and well before the child's own 30s.
     try testing.expect(elapsed_ms >= 700);
     try testing.expect(elapsed_ms < 5000);
+}
+
+/// A scratch path for a child to write its own pid (`$$`) to, so a test can
+/// ask afterwards whether that child's group still has a member.
+fn pidFilePath(a: std.mem.Allocator, io: Io, tmp: *const std.testing.TmpDir) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    return std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "pid" });
+}
+
+fn pidIn(a: std.mem.Allocator, io: Io, path: []const u8) !std.posix.pid_t {
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64));
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \t\r\n"), 10);
+}
+
+/// Whether nothing answers to the process group `pgid` within `ms`. Polled:
+/// a member the child left behind is reaped by init a moment after it dies,
+/// and until then a zombie may still answer to signal 0 on some systems.
+fn groupGone(io: Io, pgid: std.posix.pid_t, ms: i64) bool {
+    if (builtin.os.tag == .windows) return true;
+    const started = Io.Clock.awake.now(io);
+    while (true) {
+        if (!signal(-pgid, @enumFromInt(0))) return true;
+        if (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() > ms) return false;
+        Process.timeoutOf(20).sleep(io) catch return false;
+    }
+}
+
+test "Process: a streamed shell's foreground child dies with it at the bound" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const pid_file = try pidFilePath(a, io, &tmp);
+
+    // The shell defers the interrupt until `sleep` exits; only a signal to
+    // the whole group reaches the sleep. With the shell alone signaled, the
+    // grace passes, the shell is killed, and the sleep runs on for 30s.
+    var p: Process = .{ .io = io, .install_timeout_ms = 300, .grace_ms = 500 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 30", pid_file });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(!res.ok);
+    try testing.expect(elapsed_ms < 3000);
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 2000));
+}
+
+test "Process: a streamed shell's background helper is killed once the shell is reaped" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const pid_file = try pidFilePath(a, io, &tmp);
+
+    // A `cmd &` child of a non-interactive shell ignores SIGINT, so the
+    // group interrupt ends only the shell's `wait`; the shell exiting on it
+    // cancels the grace kill, and the helper would outlive the call.
+    var p: Process = .{ .io = io, .install_timeout_ms = 300, .grace_ms = 20_000 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 30 & wait", pid_file });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(!res.ok);
+    try testing.expect(elapsed_ms < 5000);
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 2000));
+}
+
+test "Process: a streamed shell that traps the interrupt ends before the grace, and is a timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const pid_file = try pidFilePath(a, io, &tmp);
+
+    // `wait` is interruptible where a foreground `sleep` is not: the trap
+    // runs as soon as the interrupt lands, and the shell exits 3 on its
+    // own -- reported as the timeout it is, not as exit 3.
+    var p: Process = .{ .io = io, .install_timeout_ms = 300, .grace_ms = 20_000 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "trap 'exit 3' INT; echo $$ > \"$0\"; sleep 30 & wait", pid_file });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(res.timed_out);
+    try testing.expect(!res.ok);
+    try testing.expect(elapsed_ms < 5000);
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 2000));
+}
+
+test "Process: a streamed child that exits in time is neither a timeout nor an interrupt" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var p: Process = .{ .io = std.testing.io, .install_timeout_ms = 10_000, .grace_ms = 500 };
+    const res = try p.runner().stream(a, &.{ "sh", "-c", "exit 4" });
+    try testing.expect(!res.timed_out);
+    try testing.expect(!res.ok);
+    try testing.expectEqual(@as(u8, 4), res.code);
 }
 
 test "installTimeoutMs: unset is unbounded, and a non-integer warns and falls back" {
