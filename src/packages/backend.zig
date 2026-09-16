@@ -14,16 +14,38 @@ const manifest_mod = @import("manifest.zig");
 pub const Row = manifest_mod.Row;
 pub const Diag = manifest_mod.Diag;
 
+/// The one character class an id or a name may use: no whitespace, no control
+/// byte (0x7f included), valid UTF-8. UTF-8 because both are re-emitted into
+/// documents that must parse -- a TOML manifest row, a `--json` report -- and
+/// one byte no encoder can represent turns an odd package into a file no
+/// reader will take.
+fn plainText(s: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(s)) return false;
+    for (s) |c| {
+        if (std.ascii.isWhitespace(c) or std.ascii.isControl(c)) return false;
+    }
+    return true;
+}
+
 /// Whether an id has the shape of one id. Empty, whitespace inside, or over
 /// 256 bytes says the backend padded its output or lost its line separator
 /// (dnf5 concatenates every name when its format string lacks a newline);
 /// this catches that for a large set, and the fixture tests catch the rest.
+/// The class is `nameShapeOk`'s, because `declare` may answer `name = <id>`:
+/// an id outside it would become a manifest row the next run refuses to load.
 pub fn idShapeOk(id: []const u8) bool {
     if (id.len == 0 or id.len > 256) return false;
-    for (id) |c| {
-        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') return false;
-    }
-    return true;
+    return plainText(id);
+}
+
+/// Whether a `name` is one a manifest can carry and a manager can be handed.
+/// The single authority on that: the manifest loader refuses a row outside
+/// this class, so everything that invents a name -- a plugin's `declare`, an
+/// adapter answering with its id -- is held to the same rule before the row is
+/// written, and nothing can record a row every later run then refuses.
+pub fn nameShapeOk(name: []const u8) bool {
+    if (name.len == 0) return false;
+    return plainText(name);
 }
 
 /// Every adapter mox knows, whether or not this machine can use it. A row
@@ -170,3 +192,47 @@ pub const Backend = struct {
         return f(self.ctx, arena, installer_path);
     }
 };
+
+const testing = std.testing;
+
+test "idShapeOk: an id that could not be written back as a name is refused" {
+    try testing.expect(idShapeOk("ripgrep"));
+    try testing.expect(idShapeOk("cask:ghostty"));
+    try testing.expect(idShapeOk("d12frosted/emacs-plus/emacs-plus@30"));
+    // A name is spelled in the user's language; only the bytes below 0x80
+    // decide the shape.
+    try testing.expect(idShapeOk("日本語"));
+
+    try testing.expect(!idShapeOk(""));
+    try testing.expect(!idShapeOk("ripgrep bat"));
+    try testing.expect(!idShapeOk("ripgrep\tbat"));
+    try testing.expect(!idShapeOk("rip\ngrep"));
+    try testing.expect(!idShapeOk("x" ** 257));
+    // The bytes an id shares with a name: the whole whitespace class, every
+    // control byte, and anything that is not UTF-8.
+    try testing.expect(!idShapeOk("rip\x0bgrep"));
+    try testing.expect(!idShapeOk("rip\x0cgrep"));
+    try testing.expect(!idShapeOk("rip\x1bgrep"));
+    try testing.expect(!idShapeOk("rip\x7fgrep"));
+    try testing.expect(!idShapeOk("rip\x00grep"));
+    try testing.expect(!idShapeOk("rip\xffgrep"));
+    try testing.expect(!idShapeOk("\xed\xa0\x80"));
+}
+
+test "nameShapeOk: the class the manifest loader enforces, applied before a row is written" {
+    try testing.expect(nameShapeOk("ripgrep"));
+    try testing.expect(nameShapeOk("emacs-plus@30"));
+
+    try testing.expect(!nameShapeOk(""));
+    try testing.expect(!nameShapeOk(" "));
+    try testing.expect(!nameShapeOk("gnu make"));
+    try testing.expect(!nameShapeOk("gnu\x0bmake"));
+    try testing.expect(!nameShapeOk("gnu\x0cmake"));
+    try testing.expect(!nameShapeOk("gnu\x7fmake"));
+    try testing.expect(!nameShapeOk("gnu\x01make"));
+    try testing.expect(!nameShapeOk("gnu\xffmake"));
+
+    // No id may become a name the manifest would then refuse.
+    const outside = [_][]const u8{ "gnu make", "gnu\x0bmake", "gnu\x7fmake", "gnu\xffmake", "" };
+    for (outside) |s| try testing.expect(!idShapeOk(s));
+}

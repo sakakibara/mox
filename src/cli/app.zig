@@ -70,6 +70,23 @@ pub var package_runner_override: ?mox.packages.exec.Runner = null;
 /// prefixes, so a scripted bootstrap can plant its result under a temp dir.
 pub var brew_prefixes_override: ?[]const []const u8 = null;
 
+/// The marker mox exports into every plugin's environment, carrying how many
+/// mox runs already sit above it. A plugin may legitimately call `mox` -- it
+/// runs at the trust of a setup script -- but a plugin reached by a `status`
+/// that itself reaches mox would have that mox discover the same plugins and
+/// run each of them again, once per verb, multiplying with every level. A run
+/// that finds this set discovers no plugin at all, so a nested mox still works
+/// on the shipped backends and cannot recurse.
+pub const packages_depth_var = "MOX_PACKAGES_DEPTH";
+
+/// How many mox runs `env` already sits under. A value mox did not write
+/// (a hand-set marker) still says "a mox is above this one", which is the
+/// only thing the depth is read for.
+fn packagesDepth(arena: std.mem.Allocator, env: Env) u32 {
+    const v = env.get(arena, packages_depth_var) orelse return 0;
+    return std.fmt.parseInt(u32, v, 10) catch 1;
+}
+
 /// Every package backend this run can use: the seven mox ships, then, for a
 /// repo with a manifest, every plugin it carries under `scripts/backends/`. Built once so `status`,
 /// `apply` and `commit` can never disagree about which exist or how they are
@@ -108,7 +125,9 @@ pub const PackageBackends = struct {
     /// script environment so a bootstrap's PATH addition reaches the probes
     /// that follow in the same run. Plugins are discovered only when
     /// `discover_plugins`: a repo that carries no manifest is not using the
-    /// subsystem, and must not have its executables run by a `status`.
+    /// subsystem, and must not have its executables run by a `status`. Nor are
+    /// they discovered when this mox is itself running under a plugin
+    /// (`packages_depth_var`), which is a note rather than silence.
     /// `out`/`err` are flushed before every spawn, so what mox printed about a
     /// call precedes the call's own output. `diag` names a plugin that cannot be discovered (bad name, missing
     /// executable bit, two files for one name). Nothing here runs a plugin.
@@ -142,7 +161,7 @@ pub const PackageBackends = struct {
         self.apt = .{ .manager = .apt, .runner = r };
         self.dnf = .{ .manager = .dnf, .runner = r };
         self.pacman = .{ .manager = .pacman, .runner = r };
-        self.scoop = .{ .runner = r, .home = home };
+        self.scoop = .{ .runner = r, .home = home, .env = env };
         self.winget = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
         self.zypper = .{
             .runner = r,
@@ -161,7 +180,15 @@ pub const PackageBackends = struct {
         });
 
         var notes: std.ArrayList([]const u8) = .empty;
-        const found: []const mox.packages.discover.Found = if (discover_plugins)
+        // Read from the environment mox itself inherited, not from `env`:
+        // `env` is what children get, and `packageEnv` has already put this
+        // run's own marker in it.
+        const nested = packagesDepth(arena, environ_override orelse Env.current()) > 0;
+        if (discover_plugins and nested) {
+            try notes.append(arena, "no plugin is discovered: this mox runs under one (" ++
+                packages_depth_var ++ " is set); the built-in backends stay");
+        }
+        const found: []const mox.packages.discover.Found = if (discover_plugins and !nested)
             try mox.packages.discover.discover(arena, io, repo_dir, diag)
         else
             &.{};
@@ -444,11 +471,74 @@ test "PackageBackends.registry: a not-runnable twin of a built-in leaves the bui
     );
 }
 
+test "packagesDepth: absent is none, and any value set is a mox above this one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var map = std.process.Environ.Map.init(a);
+    const env: Env = .{ .map = &map };
+    try std.testing.expectEqual(@as(u32, 0), packagesDepth(a, env));
+    try map.put(packages_depth_var, "");
+    try std.testing.expectEqual(@as(u32, 0), packagesDepth(a, env));
+    try map.put(packages_depth_var, "1");
+    try std.testing.expectEqual(@as(u32, 1), packagesDepth(a, env));
+    try map.put(packages_depth_var, "3");
+    try std.testing.expectEqual(@as(u32, 3), packagesDepth(a, env));
+    try map.put(packages_depth_var, "yes");
+    try std.testing.expectEqual(@as(u32, 1), packagesDepth(a, env));
+}
+
+test "PackageBackends.registry: a mox running under a plugin discovers none, and says so" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports", .data = "#!/bin/sh\n" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const state = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports" }),
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+
+    var out_buf: [64]u8 = undefined;
+    var out_w = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+
+    var map = std.process.Environ.Map.init(a);
+    try map.put(packages_depth_var, "1");
+    const saved = environ_override;
+    environ_override = .{ .map = &map };
+    defer environ_override = saved;
+
+    var pkg: PackageBackends = .{};
+    const reg = try pkg.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    try std.testing.expectEqual(@as(usize, 7), reg.backends.len);
+    try std.testing.expectEqual(@as(usize, 0), pkg.plugins.len);
+    try std.testing.expect(reg.find("macports") == null);
+    try std.testing.expectEqual(@as(usize, 1), pkg.notes.len);
+    try std.testing.expectEqualStrings(
+        "no plugin is discovered: this mox runs under one (MOX_PACKAGES_DEPTH is set); the built-in backends stay",
+        pkg.notes[0],
+    );
+}
+
 /// The environment every package backend and plugin runs under, for a
 /// command that has captured the machine: the setup-script environment
 /// (MOX_REPO, MOX_STATE_DIR, MOX_HOME, a PATH, every fact as MOX_FACT_*),
 /// built without refreshing the state bin dir -- that is apply's job, and a
-/// read-only command must not rewrite state on the way to a report.
+/// read-only command must not rewrite state on the way to a report. Plus
+/// `packages_depth_var`, counting this run, so a plugin that reaches `mox`
+/// cannot have it discover and run the same plugins again.
 pub fn packageEnv(
     ctx: *Ctx,
     context: Context,
@@ -468,5 +558,7 @@ pub fn packageEnv(
     );
     const map = try ctx.alloc.create(std.process.Environ.Map);
     map.* = built.map;
+    const depth = packagesDepth(ctx.alloc, context.env) + 1;
+    try map.put(packages_depth_var, try std.fmt.allocPrint(ctx.alloc, "{d}", .{depth}));
     return map;
 }

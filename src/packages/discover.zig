@@ -43,10 +43,11 @@ pub const Found = struct {
 };
 
 /// Every plugin under `<repo>/scripts/backends`, name-ordered. A missing
-/// directory is no plugins. A name outside `[A-Za-z0-9_-]` or, on a
-/// permission-bearing filesystem, a file without its executable bit is an
-/// error naming the path: a forgotten `chmod +x` must not read as "no such
-/// backend" from the manifest's side.
+/// directory is no plugins, and so is a dotfile inside it (`.gitkeep`, which
+/// is how an empty one is version-controlled). A name outside `[A-Za-z0-9_-]`
+/// or, on a permission-bearing filesystem, a file without its executable bit
+/// is an error naming the path: a forgotten `chmod +x` must not read as "no
+/// such backend" from the manifest's side.
 pub fn discover(
     arena: std.mem.Allocator,
     io: Io,
@@ -63,8 +64,12 @@ pub fn discover(
     var seen = std.StringHashMap([]const u8).init(arena);
 
     for (entries) |e| {
-        if (e.kind != .file and e.kind != .sym_link) continue;
+        if (e.kind != .file and e.kind != .sym_link and e.kind != .directory) continue;
         if (junk.isJunk(e.name)) continue;
+        // A backend name never begins with a dot, so a dotfile here is repo
+        // furniture -- a `.gitkeep` that lets an empty scripts/backends be
+        // version-controlled -- and not a plugin spelled wrong.
+        if (e.name[0] == '.') continue;
         const path = try std.fs.path.join(arena, &.{ dir_path, e.name });
         const kind = kindOf(e.name);
         const name = stemOf(e.name, kind);
@@ -74,7 +79,7 @@ pub fn discover(
             return Error.BadBackendName;
         }
 
-        var found = try classify(arena, io, path, name, kind, diag);
+        var found = try classify(arena, io, path, name, kind, e.kind, diag);
         found.label = try std.fmt.allocPrint(arena, "scripts/backends/{s}", .{e.name});
 
         if (seen.get(name)) |other| {
@@ -140,8 +145,18 @@ fn classify(
     path: []const u8,
     name: []const u8,
     kind: Kind,
+    entry_kind: Io.File.Kind,
     diag: ?*Diag,
 ) !Found {
+    // A directory reaches here rather than being dropped from the scan: a
+    // `macports/` directory left where the plugin belongs must say what it is,
+    // not read as "no backend named macports" from the manifest's side. The
+    // kind decides it on every OS, since Windows classifies by extension and
+    // would otherwise take `macports.exe/` for an executable.
+    if (entry_kind == .directory) {
+        if (diag) |d| d.set("{s}: not a file; a backend is an executable file", .{path});
+        return Error.BackendNotExecutable;
+    }
     if (builtin.os.tag == .windows) {
         return switch (kind) {
             .ps1 => .{
@@ -319,6 +334,41 @@ test "discover: finder junk is ignored, not a backend name" {
 
     const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
     try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "discover: a .gitkeep is ignored, so an empty scripts/backends can be committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.gitkeep", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/.keep", .data = "" });
+
+    const got = try discover(a, io, try tmpRepo(a, io, &tmp.sub_path), null);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "discover: a directory named like a plugin says what it is, not that no such backend exists" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends/macports");
+
+    var d: Diag = .{};
+    const repo = try tmpRepo(a, io, &tmp.sub_path);
+    try testing.expectError(Error.BackendNotExecutable, discover(a, io, repo, &d));
+    const want = try std.fmt.allocPrint(
+        a,
+        "{s}: not a file; a backend is an executable file",
+        .{try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports" })},
+    );
+    try testing.expectEqualStrings(want, d.capture().?);
 }
 
 test "discover: a symlink to a directory is refused as not a file" {

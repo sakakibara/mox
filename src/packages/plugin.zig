@@ -18,8 +18,11 @@
 //!                                 on a line of its own into <out>
 //!     <plugin> limitation         optional: one line on what it cannot see
 //!
-//! Exit 64 from any verb means "not implemented"; any other nonzero exit is
-//! a failed plugin, named as such, except `id`'s 1, which is a refusal.
+//! Exit 64 from an optional verb means "not implemented"; any other nonzero
+//! exit is a failed plugin, named as such, except the two exits the table
+//! above gives a meaning: `id`'s 1, a refusal, and `available`'s 1, not usable
+//! here. `available` is not optional, so its 64 is just another exit it cannot
+//! answer with: a broken backend, never a run-ending error.
 //!
 //! `id` is both `idOf` and `validate`: a row the plugin cannot name is refused
 //! with the plugin's own reason, which is stronger than any key list mox could
@@ -132,7 +135,9 @@ pub const Plugin = struct {
         if (res.code == exit_not_implemented) return null;
         if (!res.ok) return Error.PluginFailed;
         const line = firstLine(res.stdout);
-        return if (line.len == 0) null else line;
+        if (line.len == 0) return null;
+        if (!limitationShapeOk(line)) return Error.PluginBadOutput;
+        return line;
     }
 
     /// Exit 0 is usable, exit 1 is not usable here, and anything else is a
@@ -147,10 +152,13 @@ pub const Plugin = struct {
         if (self.not_runnable != null) return .absent;
         const res = try self.call(arena, "available", &.{}, "", false);
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
         // Anything but the two answers the protocol defines is a plugin
         // that cannot say whether its manager is here: broken, the same as
-        // a shipped adapter whose probe cannot answer.
+        // a shipped adapter whose probe cannot answer. 64 included: it is
+        // the likeliest exit of a half-written plugin whose case statement
+        // has no `available` arm, and `available` is not optional, so
+        // reading it as "verb missing" would end the whole run over one
+        // backend the manifest may not even name.
         if (res.code > 1) return .{ .broken = .{
             .code = res.code,
             .probe = try std.fmt.allocPrint(arena, "{s} available", .{self.name}),
@@ -284,6 +292,10 @@ pub const Plugin = struct {
         if (!res.ok) return Error.PluginFailed;
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, out_path, arena, .limited(64 * 1024)) catch |e| switch (e) {
             error.FileNotFound => return null,
+            // A file too large to hold one path is the plugin writing its
+            // progress where the bin dir goes: the same deviation as a second
+            // line, and reported as the same thing.
+            error.StreamTooLong => return Error.PluginBadOutput,
             else => return e,
         };
         const line = (try onlyLine(text)) orelse return null;
@@ -329,12 +341,32 @@ fn firstLine(text: []const u8) []const u8 {
     return "";
 }
 
+/// A limitation is one sentence, printed unescaped as a `status` note beside
+/// the backend's name. 200 bytes is a sentence and still fits a terminal line
+/// under the report's own prefix; a plugin that emits more, or emits a control
+/// byte, is writing to the terminal through mox rather than stating a gap.
+const limitation_max = 200;
+
+fn limitationShapeOk(line: []const u8) bool {
+    if (line.len > limitation_max) return false;
+    if (!std.unicode.utf8ValidateSlice(line)) return false;
+    for (line) |c| {
+        if (std.ascii.isControl(c)) return false;
+    }
+    return true;
+}
+
 /// A `declare` answer: a TOML body with a string `name` and flat fields.
 fn parseDeclaration(arena: std.mem.Allocator, text: []const u8) !Backend.Declaration {
     const v = toml.parse(arena, text, .{}) catch return Error.PluginBadOutput;
     if (v != .table) return Error.PluginBadOutput;
     const name_v = v.table.get("name") orelse return Error.PluginBadOutput;
-    if (name_v != .string or name_v.string.len == 0) return Error.PluginBadOutput;
+    // The manifest's own rule, applied before the row is written rather than
+    // on the way back in: the round trip below constrains the id, not the
+    // name, so a plugin mapping `gnu make` to `gnu@make` could otherwise have
+    // commit record a name every later run refuses, with no mox command left
+    // that can repair the file.
+    if (name_v != .string or !backend_mod.nameShapeOk(name_v.string)) return Error.PluginBadOutput;
 
     var fields: std.ArrayList(manifest_mod.Pair) = .empty;
     for (v.table.keys(), v.table.values()) |k, fv| {
@@ -640,6 +672,85 @@ test "limitation: the plugin's one line is carried onto the backend" {
     } };
     var p = pluginWith(&fake);
     try testing.expectEqualStrings("variants are not tracked", (try p.backend().limitationOf(a)).?);
+}
+
+test "available: exit 64 is a broken backend, not a run-ending missing verb" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports available", .code = exit_not_implemented },
+    } };
+    var p = pluginWith(&fake);
+    const got = try p.backend().available(a);
+    try testing.expect(got == .broken);
+    try testing.expectEqual(exit_not_implemented, got.broken.code);
+    try testing.expectEqualStrings("macports available", got.broken.probe);
+}
+
+test "declare: a name the manifest would refuse is bad output, not a row commit writes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A plugin whose id maps `gnu make` onto `gnu@make`: the round trip
+    // agrees, since it constrains the id and not the name, so only the name
+    // rule stands between `declare` and a manifest row that never loads again.
+    var spaced: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports declare gnu@make", .stdout = "name = \"gnu make\"\n" },
+        .{ .argv = "/r/scripts/backends/macports id", .stdout = "gnu@make\n" },
+    } };
+    var sp = pluginWith(&spaced);
+    try testing.expectError(Error.PluginBadOutput, sp.backend().declare(a, "gnu@make"));
+    // Refused where the answer is read, before the row is handed back to `id`.
+    try testing.expectEqual(@as(usize, 1), spaced.calls.items.len);
+
+    var controlled: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports declare x", .stdout = "name = \"gnu\\u000bmake\"\n" },
+        .{ .argv = "/r/scripts/backends/macports declare y", .stdout = "name = \"gnu\\u007fmake\"\n" },
+    } };
+    var cp = pluginWith(&controlled);
+    try testing.expectError(Error.PluginBadOutput, cp.backend().declare(a, "x"));
+    try testing.expectError(Error.PluginBadOutput, cp.backend().declare(a, "y"));
+}
+
+test "limitation: an oversize or control-carrying line is bad output, not a note" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const long = try std.fmt.allocPrint(a, "{s}\n", .{"x" ** (limitation_max + 1)});
+    const at_cap = try std.fmt.allocPrint(a, "{s}\n", .{"x" ** limitation_max});
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "/r/scripts/backends/macports limitation", .stdout = long, .once = true },
+        .{ .argv = "/r/scripts/backends/macports limitation", .stdout = "variants \x1b[31mare not\x1b[0m tracked\n", .once = true },
+        .{ .argv = "/r/scripts/backends/macports limitation", .stdout = at_cap },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expectError(Error.PluginBadOutput, p.backend().limitationOf(a));
+    try testing.expectError(Error.PluginBadOutput, p.backend().limitationOf(a));
+    try testing.expectEqual(@as(usize, limitation_max), (try p.backend().limitationOf(a)).?.len);
+}
+
+test "bootstrap: an out file too large to hold one path is bad output, not a leaked read error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const installer = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "i" });
+    const call = try std.fmt.allocPrint(a, "/r/scripts/backends/macports bootstrap {s}", .{installer});
+
+    const flood = try a.alloc(u8, 64 * 1024 + 1);
+    @memset(flood, 'x');
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = call, .match = .prefix, .write_after = installer, .io = io, .stdout = flood },
+    } };
+    var p = pluginWith(&fake);
+    try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, installer));
 }
 
 test "available: a plugin that cannot be spawned is an error, not an absent manager" {
