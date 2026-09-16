@@ -661,7 +661,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     mox.cli.app.brew_prefixes_override = &.{prefix_bin};
     defer mox.cli.app.brew_prefixes_override = null;
     const staged = try std.fs.path.join(a, &.{
-        h.state, "tmp",
+        h.state,                                                                           "tmp",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
@@ -861,7 +861,7 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: BootstrapDigestMismatch") != null);
     // The substituted file is not left where a later run could find it.
     const staged = try std.fs.path.join(a, &.{
-        h.state, "tmp",
+        h.state,                                                                           "tmp",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
@@ -1471,7 +1471,7 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     }
     // Nothing was staged where a real bootstrap would put the installer.
     const staged = try std.fs.path.join(a, &.{
-        h.state, "tmp",
+        h.state,                                                                           "tmp",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
@@ -1501,7 +1501,7 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
         \\#!/bin/sh
         \\case "${1:-}" in
         \\available) exec sleep 20 ;;
-        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+        \\id) while IFS= read -r l; do case "$l" in *'name = "'*) n=${l#*name = \"}; printf '%s\n' "${n%%\"*}" ;; esac; done ;;
         \\list) ;;
         \\*) exit 64 ;;
         \\esac
