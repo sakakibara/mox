@@ -75,6 +75,7 @@ pub const Plugin = struct {
             .name = self.name,
             .ctx = self,
             .vtable = if (self.not_runnable != null) &inert_vtable else &vtable,
+            .inert = self.not_runnable != null,
         };
     }
 

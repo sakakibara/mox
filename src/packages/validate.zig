@@ -18,6 +18,7 @@ pub const Diag = manifest_mod.Diag;
 pub const Error = error{
     UnknownBackend,
     BlacklistedPackageDeclared,
+    BootstrapUnsupported,
 };
 
 /// Check every row against the registry and its adapter. `diag` (when
@@ -53,12 +54,23 @@ pub fn all(
     // A bootstrap row names its backend the same way, and a typo there would
     // otherwise surface only on the one apply that needs the installer.
     for (m.bootstrap) |b| {
-        if (registry.find(b.backend) != null) continue;
-        if (diag) |d| d.set(
-            "{s}: bootstrap row: no backend named \"{s}\"",
-            .{ b.label, b.backend },
-        );
-        return Error.UnknownBackend;
+        const backend = registry.find(b.backend) orelse {
+            if (diag) |d| d.set(
+                "{s}: bootstrap row: no backend named \"{s}\"",
+                .{ b.label, b.backend },
+            );
+            return Error.UnknownBackend;
+        };
+        // A manager that ships with its OS has no installer to run; a row
+        // declaring one is wrong on every machine. A plugin this machine
+        // cannot run is judged where it runs.
+        if (!backend.inert and !backend.canBootstrap()) {
+            if (diag) |d| d.set(
+                "{s}: bootstrap row: backend \"{s}\" cannot be bootstrapped; it ships with the OS",
+                .{ b.label, b.backend },
+            );
+            return Error.BootstrapUnsupported;
+        }
     }
 
     try contradictions(arena, m, registry, diag);
@@ -76,6 +88,10 @@ fn contradictions(
 ) !void {
     for (m.blacklist) |bl| {
         const b = registry.find(bl.backend) orelse continue;
+        // Only the machine that can run the backend can name its packages;
+        // elsewhere the rows are inert, and comparing them by bare name here
+        // would refuse a shared manifest on exactly the OS that cannot judge it.
+        if (b.inert) continue;
         const blocked = b.idOf(arena, bl.asRow()) catch |e| {
             if (diag) |d| d.set("{s}: blacklist row \"{s}\": id failed: {s}", .{ bl.label, bl.name, @errorName(e) });
             return e;

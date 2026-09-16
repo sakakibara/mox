@@ -764,10 +764,17 @@ fn applyPass(
             },
         );
         if (pkg_counts.in_use) {
-            try ctx.out.print(
-                "Packages: {d} installed, {d} failed\n",
-                .{ pkg_counts.installed, pkg_counts.failed },
-            );
+            if (pkg_counts.attempted > 0) {
+                try ctx.out.print(
+                    "Packages: {d} installed, {d} failed ({d} row(s) in failed batches may have landed)\n",
+                    .{ pkg_counts.installed, pkg_counts.failed, pkg_counts.attempted },
+                );
+            } else {
+                try ctx.out.print(
+                    "Packages: {d} installed, {d} failed\n",
+                    .{ pkg_counts.installed, pkg_counts.failed },
+                );
+            }
         }
     }
 
@@ -822,11 +829,15 @@ fn bootstrapBackends(
                 "mox apply: {s}: bootstrap names no backend \"{s}\"\n",
                 .{ b.label, b.backend },
             );
+            try ctx.err.flush();
             failed += 1;
             continue;
         };
+        // Not runnable here: the machine that can run it bootstraps it.
+        if (backend.inert) continue;
         const present = backend.available(ctx.alloc) catch |e| {
             try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
+            try ctx.err.flush();
             failed += 1;
             continue;
         };
@@ -836,11 +847,12 @@ fn bootstrapBackends(
                 "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
                 .{ b.label, b.backend },
             );
+            try ctx.err.flush();
             failed += 1;
             continue;
         }
 
-        try ctx.out.print("  bootstrapping  {s}\n", .{b.backend});
+        try ctx.out.print("  bootstrapping   {s}\n", .{b.backend});
         const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer", .{b.backend});
         const path = mox.packages.bootstrap.fetchVerified(
             ctx.alloc,
@@ -851,6 +863,7 @@ fn bootstrapBackends(
             .{ .url = b.url, .sha256 = b.sha256 },
         ) catch |e| {
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
+            try ctx.err.flush();
             failed += 1;
             continue;
         };
@@ -859,6 +872,7 @@ fn bootstrapBackends(
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, @errorName(e) });
+            try ctx.err.flush();
             failed += 1;
             continue;
         };
@@ -868,7 +882,7 @@ fn bootstrapBackends(
             // triggers folds it back in for the post scripts and check hooks.
             try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), &.{dir}));
             try mox_path_dirs.append(ctx.alloc, dir);
-            try ctx.out.print("  on PATH        {s}\n", .{dir});
+            try ctx.out.print("  on PATH         {s}\n", .{dir});
         }
         bootstrapped += 1;
     }
@@ -932,10 +946,12 @@ fn applyPackages(
         else => {
             if (diag.capture()) |cap| {
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+                try ctx.err.flush();
             } else {
                 try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.flush();
             }
-            return .{ .failed = 1 };
+            return .{ .in_use = true, .failed = 1 };
         },
     };
     if (!manifest.inUse()) return .{};
@@ -957,13 +973,15 @@ fn applyPackages(
         else => {
             if (diag.capture()) |cap| {
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+                try ctx.err.flush();
             } else {
                 try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.flush();
             }
-            return .{ .failed = 1 };
+            return .{ .in_use = true, .failed = 1 };
         },
     };
-    for (pkg_backends.notes) |note| try ctx.out.print("  note           {s}\n", .{note});
+    for (pkg_backends.notes) |note| try ctx.out.print("  note            {s}\n", .{note});
 
     // Checked before any bootstrap runs: a manifest that every other
     // command refuses must not get an installer downloaded and executed
@@ -973,10 +991,12 @@ fn applyPackages(
         else => {
             if (diag.capture()) |cap| {
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+                try ctx.err.flush();
             } else {
                 try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.flush();
             }
-            return .{ .failed = 1 };
+            return .{ .in_use = true, .failed = 1 };
         },
     };
 
@@ -998,8 +1018,10 @@ fn applyPackages(
             if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
             // Validated against the registry when the manifest was read.
             const backend = registry.find(b.backend).?;
+            if (backend.inert) continue;
             const present = backend.available(ctx.alloc) catch |e| {
                 try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
+                try ctx.err.flush();
                 bootstrap_failed += 1;
                 continue;
             };
@@ -1009,6 +1031,7 @@ fn applyPackages(
                     "mox apply: {s}: {s} declares an installer but its backend cannot bootstrap\n",
                     .{ b.label, b.backend },
                 );
+                try ctx.err.flush();
                 bootstrap_failed += 1;
                 continue;
             }
@@ -1029,10 +1052,12 @@ fn applyPackages(
         else => {
             if (diag.capture()) |cap| {
                 try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+                try ctx.err.flush();
             } else {
                 try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+                try ctx.err.flush();
             }
-            return .{ .failed = 1 };
+            return .{ .in_use = true, .failed = 1 };
         },
     };
     var counts: PackageCounts = .{
@@ -1048,11 +1073,11 @@ fn applyPackages(
         var rows: std.ArrayList(mox.packages.manifest.Row) = .empty;
         for (b.drift.missing) |m| {
             if (dry_run) {
-                try ctx.out.print("  would install  {s} {s}\n", .{ b.backend, m.row.name });
+                try ctx.out.print("  would install   {s} {s}\n", .{ b.backend, m.row.name });
                 counts.would += 1;
                 continue;
             }
-            try ctx.out.print("  installing     {s} {s}\n", .{ b.backend, m.row.name });
+            try ctx.out.print("  installing      {s} {s}\n", .{ b.backend, m.row.name });
             try rows.append(ctx.alloc, m.row);
         }
         if (rows.items.len == 0) continue;
@@ -1066,6 +1091,7 @@ fn applyPackages(
                 "mox apply: {s}: install failed: {s}\n",
                 .{ b.backend, @errorName(e) },
             );
+            try ctx.err.flush();
             counts.failed += 1;
             counts.attempted += rows.items.len;
             continue;
@@ -1124,11 +1150,13 @@ fn refreshScriptStage(
     if (script_env_result.mox_bin_unavailable) |why| {
         if (!notified_mox_bin.*) {
             try ctx.err.print("mox apply: warning: the running mox is not on the scripts' PATH: {s}\n", .{why});
+            try ctx.err.flush();
             notified_mox_bin.* = true;
         }
     }
     if (script_env_result.skipped.len > 0 and !sameSkippedNames(script_env_result.skipped, notified_skipped.*)) {
         try ctx.err.print("mox apply: fact name(s) not representable as MOX_FACT_*, skipped from script env:", .{});
+        try ctx.err.flush();
         for (script_env_result.skipped) |name| try ctx.err.print(" {s}", .{name});
         try ctx.err.writeAll("\n");
         notified_skipped.* = script_env_result.skipped;
@@ -1311,6 +1339,7 @@ fn omitFile(
     const snap_content = try redactedPriorContent(ctx, live_path, live.?);
     mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, live_path, snap_content) catch |e| {
         try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ shown, @errorName(e) });
+        try ctx.err.flush();
         counts.fail += 1;
         return;
     };
@@ -1326,6 +1355,7 @@ fn omitFile(
     }
     std.Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
         try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ shown, @errorName(e) });
+        try ctx.err.flush();
         counts.fail += 1;
         return;
     };
@@ -1388,6 +1418,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
         error.FileNotFound => null,
         else => {
             try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ shown, @errorName(e) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1423,6 +1454,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
                 if ((in.mode_explicit or in.manager_secret) and !liveIsSymlink(ctx.io, in.live_path)) {
                     mox.apply.write.setMode(in.live_path, eff_mode) catch |e| {
                         try ctx.err.print("mox apply: {s}: could not enforce mode: {s}\n", .{ shown, @errorName(e) });
+                        try ctx.err.flush();
                     };
                 }
                 // A stale owned record from a formerly partial path would make
@@ -1451,6 +1483,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
         const snap_content = try redactedPriorContent(ctx, in.live_path, live.?);
         mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, in.live_path, snap_content) catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         };
@@ -1465,6 +1498,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     }
     mox.apply.write.writeAtomic(ctx.io, in.live_path, in.bytes, eff_mode) catch |e| {
         try ctx.err.print("mox apply: {s}: write failed: {s}\n", .{ shown, @errorName(e) });
+        try ctx.err.flush();
         counts.fail += 1;
         return;
     };
@@ -1539,6 +1573,7 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     defer std.Io.Dir.cwd().deleteFile(ctx.io, out_path) catch {};
     if (!materialized) {
         try ctx.err.print("  ERROR   {s} (check {s} could not run: candidate not materialized)\n", .{ shown, check_argv[0] });
+        try ctx.err.flush();
         fail_count.* += 1;
         return false;
     }
@@ -1557,14 +1592,17 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (check {s} could not run: {s})\n", .{ shown, check_argv[0], @errorName(e) });
+            try ctx.err.flush();
             fail_count.* += 1;
             return false;
         },
     };
     const why = res.refusal orelse return true;
     try ctx.err.print("  ERROR   {s} (check {s} refused the candidate: {s})\n", .{ shown, check_argv[0], why });
+    try ctx.err.flush();
     if (res.tail.len > 0) {
         try ctx.err.print("mox apply:   check output:\n{s}", .{res.tail});
+        try ctx.err.flush();
         if (res.tail[res.tail.len - 1] != '\n') try ctx.err.writeAll("\n");
     }
     fail_count.* += 1;
@@ -1594,6 +1632,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
             try ctx.err.print("  ERROR   {s} (composed source does not parse as {s})\n", .{ shown, @tagName(format) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1605,11 +1644,13 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     switch (mode) {
         .own => if (try partial_mod.undeclaredLeaf(ctx.alloc, &owned, own_paths)) |leaf| {
             try ctx.err.print("  ERROR   {s} (composed leaf {s} is outside the declared own paths)\n", .{ shown, leaf });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
         .disown => if (try partial_mod.populatedDisownPath(ctx.alloc, &owned, own_paths)) |spelled| {
             try ctx.err.print("  ERROR   {s} (composed source defines content under disowned path {s})\n", .{ shown, spelled });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1625,6 +1666,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (composed source: {s})\n", .{ shown, pdiag.text() });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1656,6 +1698,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         .readable, .absent => {},
         .special => |k| {
             try ctx.err.print("  ERROR   {s} (not a regular file: {s})\n", .{ shown, @tagName(k) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1668,6 +1711,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         error.FileNotFound => null,
         else => {
             try ctx.err.print("mox apply: {s}: read failed: {s}\n", .{ shown, @errorName(e) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1761,6 +1805,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, pdiag.text() });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1772,6 +1817,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try ctx.err.print("  ERROR   {s} (invariant check failed: {s})\n", .{ shown, pdiag.text() });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1794,12 +1840,14 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
             error.OutOfMemory => return error.OutOfMemory,
             error.MaskFailed => {
                 try ctx.err.print("mox apply: {s}: snapshot masking failed, not overwriting\n", .{shown});
+                try ctx.err.flush();
                 counts.fail += 1;
                 return;
             },
         };
         mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, live_path, snap_content) catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         };
@@ -1815,6 +1863,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
         else => {
             try ctx.err.print("mox apply: {s}: write failed: {s}\n", .{ shown, @errorName(e) });
+            try ctx.err.flush();
             counts.fail += 1;
             return;
         },
@@ -1884,8 +1933,10 @@ fn applyGenerator(
     var diag: mox.compose.interp.Diag = .{};
     const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, m_state, secrets, &diag) catch |e| {
         try ctx.err.print("mox apply: {s}: generator failed: {s}\n", .{ shown, @errorName(e) });
+        try ctx.err.flush();
         if (diag.capture()) |cap|
             try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
+        try ctx.err.flush();
         counts.fail += 1;
         // It IS a generator (compose recognized and then failed): consume it so
         // the caller does not also try to compose it as a normal file. Record it
@@ -1905,12 +1956,14 @@ fn applyGenerator(
         const collides_regular = regular_live.contains(o.live_path) and !std.mem.eql(u8, o.live_path, file.live_path);
         if (collides_regular or produced.contains(o.live_path)) {
             try ctx.err.print("mox apply: {s}: generated path collides with another managed file: {f}\n", .{ shown, display.of(o.live_path, home) });
+            try ctx.err.flush();
             counts.fail += 1;
             try recordFailedGenerator(ctx, file, gen_states);
             return true;
         }
         if (generatedParentEscapes(ctx.io, base_dir, o.live_path)) {
             try ctx.err.print("mox apply: {s}: generated path escapes the target dir through a symlink: {f}\n", .{ shown, display.of(o.live_path, home) });
+            try ctx.err.flush();
             counts.fail += 1;
             try recordFailedGenerator(ctx, file, gen_states);
             return true;

@@ -1743,7 +1743,9 @@ pub fn commitImpl(
             .{ committed_count, coupled_count, manual_count },
         );
     }
-    if (pkgs.touched() or pkgs.pending()) {
+    // A manifest that never loaded has nothing to summarize; the failure
+    // was printed where it happened.
+    if (!pkgs.broken and (pkgs.touched() or pkgs.pending())) {
         try ctx.out.print(
             "mox commit: packages: {d} recorded, {d} blacklisted, {d} still untracked\n",
             .{ pkgs.added, pkgs.blacklisted, pkgs.skipped },

@@ -292,9 +292,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // stdout is the serialized drift set and nothing else; what the
         // package pass has to say about plugins goes beside every other
         // diagnostic, before any plugin runs.
-        const prep = try preparePackages(ctx, context, m_state);
-        for (prep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
-        const pkgs = try reportPackages(ctx, prep, &bindings);
+        // A path-scoped status names files, as a path-scoped apply or
+        // commit does, and reaches no package.
+        const pkgs: Packages = if (a.paths.len == 0) blk: {
+            const prep = try preparePackages(ctx, context, m_state);
+            for (prep.notes) |note| try ctx.err.print("mox status: note: {s}\n", .{note});
+            break :blk try reportPackages(ctx, prep, &bindings);
+        } else .{};
         problems += pkgs.problems();
         if (a.json)
             try emitJson(ctx.out, units.items, pkgs.report)
@@ -316,7 +320,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Package drift is drift, so it shows under `--drift` too; the probe log
     // and unbound-facts sections are full-report context and are not.
-    const pkgs = try printPackages(ctx, context, &bindings, m_state);
+    const pkgs: Packages = if (a.paths.len == 0) try printPackages(ctx, context, &bindings, m_state) else .{};
     problems += pkgs.problems();
     if (show_table) {
         try printProbeLog(ctx, m_state);

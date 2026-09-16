@@ -48,6 +48,10 @@ pub const Backend = struct {
     name: []const u8,
     ctx: *anyopaque,
     vtable: *const VTable,
+    /// Registered but not runnable on this machine (a plugin of a kind this
+    /// OS cannot execute): its rows are neither desired nor judged here, and
+    /// a bootstrap row for it is left for the machine that can run it.
+    inert: bool = false,
     /// What this adapter structurally cannot see, in one line, or null when
     /// it can answer everything asked of it. A manager with no
     /// explicitly-installed query cannot report a package the user installed

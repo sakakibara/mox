@@ -219,7 +219,7 @@ test "apply --dry-run: reports what it would install and installs nothing" {
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install  brew fd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew fd") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 would be installed") != null);
     try std.testing.expect(!fake.called("brew install fd"));
 }
@@ -684,7 +684,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
             std.mem.endsWith(u8, c, " https://example.invalid/install.sh")) fetched = true;
     }
     try std.testing.expect(fetched);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping   brew") != null);
     // The verified file is what the interpreter ran, and it is gone once the
     // install has ended.
     try std.testing.expect(fake.called(interpreter));
@@ -1009,7 +1009,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  brew") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping   brew") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
@@ -1279,8 +1279,8 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     const r = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "would bootstrap brew") != null);
     // Planned as though the bootstrap had happened: every row is listed.
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install  brew fd") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install  brew ripgrep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew fd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew ripgrep") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 would be installed, after bootstrapping 1 manager(s)") != null);
     for (fake.calls.items) |c| {
         try std.testing.expect(std.mem.indexOf(u8, c, "install") == null);
@@ -1416,7 +1416,7 @@ test "status --json / --porcelain: a plugin's note goes to stderr, and stdout st
     try std.testing.expectEqual(@as(u8, 1), p.rc);
 }
 
-test "bootstrap: an installer declared for a plugin this machine cannot run is refused, and nothing is fetched" {
+test "bootstrap: an installer declared for a plugin this machine cannot run is left to the machine that can" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1441,8 +1441,6 @@ test "bootstrap: an installer declared for a plugin this machine cannot run is r
         \\
     );
 
-    const refused = "windows.toml: scoopish declares an installer but its backend cannot bootstrap\n";
-
     // No curl is scripted: a fetch would error the run with a different
     // message than the refusal asserted here.
     const fake = try noManagers(a);
@@ -1452,19 +1450,109 @@ test "bootstrap: an installer declared for a plugin this machine cannot run is r
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would bootstrap") == null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would install") == null);
-    try std.testing.expect(std.mem.indexOf(u8, dry.err, refused) != null);
-    try std.testing.expectEqual(@as(u8, 2), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.err, "cannot bootstrap") == null);
+    try std.testing.expectEqual(@as(u8, 0), dry.rc);
 
     const real = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, real.out, "bootstrapping") == null);
     try std.testing.expect(std.mem.indexOf(u8, real.out, "installing") == null);
-    try std.testing.expect(std.mem.indexOf(u8, real.err, refused) != null);
-    try std.testing.expectEqual(@as(u8, 2), real.rc);
+    try std.testing.expect(std.mem.indexOf(u8, real.err, "cannot bootstrap") == null);
+    try std.testing.expectEqual(@as(u8, 0), real.rc);
 
     for (fake.calls.items) |c| {
         try std.testing.expect(std.mem.indexOf(u8, c, "curl") == null);
         try std.testing.expect(std.mem.indexOf(u8, c, "example.invalid") == null);
     }
+}
+
+test "plugin: a not-runnable plugin's declared and blacklisted rows are not judged here" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // On the OS that can run it, the formula `x` and the cask `x` are two
+    // packages; here nothing can say so, and the shared manifest must load.
+    const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "fakeports.ps1" }), .data = "exit 0\n" });
+    try writeManifest(io, h, a, "fake.toml",
+        \\backend = "fakeports"
+        \\
+        \\[[packages]]
+        \\name = "x"
+        \\
+        \\[[blacklist]]
+        \\name = "x"
+        \\kind = "cask"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blacklists") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "not runnable") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "status: a bootstrap row for a manager that ships with its OS is refused on every machine" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml",
+        \\backend = "apt"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/apt.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+    );
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "debian.toml: bootstrap row: backend \"apt\" cannot be bootstrapped") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "status: a path-scoped status names files and reaches no package" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const live = try h.liveOf("nothing-here.conf");
+    const r = try h.run(&.{ "mox", "status", live });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "packages:") == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+    const p = try h.run(&.{ "mox", "status", "--porcelain", live });
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_") == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
 test "plugin: a not-runnable twin of a built-in is noted, and the built-in stays in use" {
@@ -1783,7 +1871,7 @@ test "bootstrap: a manager installed with no row to install still re-captures th
     try Io.Dir.cwd().setFilePermissions(io, post, Io.File.Permissions.fromMode(0o755), .{});
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  fakemgr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping   fakemgr") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     const got = try Io.Dir.cwd().readFileAlloc(io, seen, a, .limited(1 << 20));
