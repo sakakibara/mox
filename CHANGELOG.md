@@ -38,12 +38,18 @@ All notable changes to mox are documented here. The format follows
   editing one (`q` ends the run before the file pass, saying how many rows
   were already recorded). Nothing ever uninstalls. A repo without
   `data/packages/` queries no manager and reports nothing; one with the
-  directory and no file yet is in use, so `commit` can write the first rows.
-  Every manager call is bounded by the setup-script timeout: the child runs
-  in its own process group, the bound covers reading its output and waiting
-  for it, and exceeding it kills the group and is reported as a timeout
-  naming the backend. Under `--json` and `--porcelain`, plugin notes go to
-  stderr and stdout stays machine-pure.
+  directory and no file yet is in use and reports everything installed as
+  untracked, ready for a first file to record it in.
+  Every manager call is bounded by the setup-script timeout: the bound
+  covers reading its output and waiting for it, a captured query runs in
+  its own process group and is killed with it, a streamed install stays in
+  mox's group so `sudo` and Ctrl-C work and only its direct process is
+  killed (Windows has no groups, so the direct process always), and a kill
+  is reported as a timeout naming the backend. Under `--json` and
+  `--porcelain`, plugin notes go to stderr and stdout stays machine-pure.
+  The timeout watchdog for setup scripts and check hooks now runs on its
+  own thread; before, on a host with one CPU it could run inline and hold
+  every script for its whole bound.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;

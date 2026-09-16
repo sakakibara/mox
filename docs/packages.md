@@ -7,8 +7,9 @@ declares what belongs on a machine, `mox status` reports the difference,
 A repo with no `data/packages/` directory is not using any of this. No
 section prints, no package manager is queried, and no exit code changes.
 Creating that directory is what opts in, even before it holds a file: every
-manager is then queried and what it has installed is reported UNTRACKED,
-which is how a manifest is first written by `mox commit`.
+manager is then queried and what it has installed is reported UNTRACKED.
+The first file is yours to create (`backend = "brew"` on its own is enough);
+from then on `mox commit` fills it.
 
 ## The manifest
 
@@ -152,12 +153,15 @@ does, and `--json` / `--porcelain` carry both sets (see
 
 `mox apply` installs what is missing, after the pre-script stage and before
 its re-capture, so a package installed here is a tool the re-capture sees; a
-declared manager that is absent is bootstrapped first (above). The whole set
-for a backend goes to its manager in one invocation -- brew is the
-exception, installing row by row so one failure leaves the rest to proceed
--- and the manager's own output is streamed rather than captured, so
-progress and errors reach the terminal as they happen. A batch that failed
-may have landed some of its rows, so the re-capture runs after any attempt.
+declared manager that is absent is bootstrapped first (above). apt, dnf,
+pacman, zypper and plugins get the whole set for their backend in one
+invocation; brew, scoop and winget install row by row, and a row that fails
+leaves the rest to proceed. The manager's own output is streamed rather
+than captured, so progress and errors reach the terminal as they happen,
+and it may talk to the terminal itself (`sudo` asking for a password; apt
+runs with `DEBIAN_FRONTEND=noninteractive` so debconf does not). A batch
+that failed may have landed some of its rows, so the re-capture runs after
+any attempt, and after a bootstrap alone.
 `--dry-run` lists what it would install and installs nothing.
 
 apply **only ever installs**. Removal is never automatic: an untracked
@@ -170,8 +174,10 @@ is the manager's own behavior, not a mox decision.)
 - **add** -- append a row to the manifest file that already speaks that
   backend, with whichever adapter fields identify it. The file chosen is
   the first of: a repo file whose default `backend` is it, a repo file
-  carrying a row for it, then the same two in the private layer. When no
-  file declares the backend at all, commit says so once per backend
+  carrying a row for it, then the same two in the private layer -- skipping
+  any file whose own `when` excludes this machine, since a row appended
+  there would never be desired here. When no
+  file remains, commit says so once per backend
   (`no data/packages file declares backend "x"; add one to record its N
   untracked package(s)`) and counts those packages as skipped: creating a
   file is a decision about where the rows live, not one to make silently.
@@ -263,11 +269,16 @@ backend.
   verb where it was needed. Nothing is substituted for a missing verb.
 - Every call is time-bounded like a setup script (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the
-  backend, not a hung `mox status`. The bound covers the whole call and the
-  kill takes the plugin's process group with it, so a helper it left holding
-  the pipe (`port ... | awk`) cannot outlive it. The shipped backends' own
-  manager calls are bounded the same way, and a probe killed at the bound is
-  a named failure, never "manager absent".
+  backend, not a hung `mox status`. The bound covers the whole call. A
+  captured call (`available`, `id`, `list`, `declare`, `limitation`) runs in
+  its own process group and the kill takes the group, so a helper it left
+  holding the pipe (`port ... | awk`) cannot outlive it; a streamed call
+  (`install`, `bootstrap`) stays in mox's group so it can use the terminal
+  and Ctrl-C reaches it, and at the bound only the direct process is killed.
+  Windows has no process groups, so there the kill always reaches the direct
+  process only. The shipped backends' own manager calls are bounded the same
+  way, and a probe killed at the bound is a named failure, never "manager
+  absent".
 - Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
   CRLF); an id that is empty, contains whitespace, or exceeds 256 bytes is an
   error naming the plugin. That catches a lost line separator across a large

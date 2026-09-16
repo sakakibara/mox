@@ -176,10 +176,10 @@ manifest declares and the machine lacks, after the pre stage and before
 its re-capture, so a package installed here is a tool the re-capture sees.
 A manager the manifest declares a `[[bootstrap]]` row for is installed
 first when absent, from its verified installer, and used by this same run.
-Each backend gets its whole set in one invocation (brew installs row by
-row, so one failure leaves the rest to proceed); any failure is an error
-class (rc 2), and a failed batch still triggers the re-capture, since some
-of it may have landed. apply only ever installs -- an untracked package is
+apt, dnf, pacman, zypper and plugins get their whole set in one invocation;
+brew, scoop and winget install row by row, and a failed row leaves the rest
+to proceed. Any failure is an error class (rc 2), and a failed batch or a
+bootstrap alone still triggers the re-capture, since the machine changed. apply only ever installs -- an untracked package is
 reported by `mox status` and reconciled by `mox commit`, never uninstalled.
 Under `--dry-run` nothing is fetched or installed and the run lists what
 it would install, planned as though any absent manager had been
