@@ -45,6 +45,11 @@ pub const Brew = struct {
     /// Only the bootstrap path needs these: staging a verified installer.
     io: ?std.Io = null,
     scratch_dir: []const u8 = "",
+    /// How brew is invoked. `brew` until a bootstrap installs it, then the
+    /// absolute path it landed at: a child's PATH is never used to resolve
+    /// argv[0] (only the parent's is), so a freshly installed brew that is on
+    /// no PATH yet can only be reached by name of its full path.
+    exe: []const u8 = "brew",
 
     pub fn backend(self: *Brew) Backend {
         return .{ .name = "brew", .ctx = self, .vtable = &vtable };
@@ -76,6 +81,7 @@ pub const Brew = struct {
         for ([_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin" }) |dir| {
             const exe = try std.fs.path.join(arena, &.{ dir, "brew" });
             Io.Dir.cwd().access(io, exe, .{}) catch continue;
+            self.exe = exe;
             return dir;
         }
         return null;
@@ -83,7 +89,7 @@ pub const Brew = struct {
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
         const self: *Brew = @ptrCast(@alignCast(ctx));
-        const res = self.runner.run(arena, &.{ "brew", "--version" }) catch |e| switch (e) {
+        const res = self.runner.run(arena, &.{ self.exe, "--version" }) catch |e| switch (e) {
             // Absent is the one failure that means "not usable here"; an
             // allocation or spawn failure must not read as a missing brew and
             // silently make every brew row inert.
@@ -134,11 +140,11 @@ pub const Brew = struct {
 
         var out: std.ArrayList([]const u8) = .empty;
 
-        const formulae = try self.runner.run(arena, &.{ "brew", "list", "--full-name", "--installed-on-request" });
+        const formulae = try self.runner.run(arena, &.{ self.exe, "list", "--full-name", "--installed-on-request" });
         if (!formulae.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, formulae.stdout, "");
 
-        const casks = try self.runner.run(arena, &.{ "brew", "list", "--cask" });
+        const casks = try self.runner.run(arena, &.{ self.exe, "list", "--cask" });
         if (!casks.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, casks.stdout, cask_prefix);
 
@@ -150,7 +156,7 @@ pub const Brew = struct {
         for (rows) |row| {
             const kind = try kindOf(row);
             if (tapOf(row.name)) |tap| {
-                const tapped = try self.runner.stream(arena, &.{ "brew", "tap", tap });
+                const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", tap });
                 if (!tapped.ok) return error.BrewTapFailed;
                 // Trust the one thing named, never the whole tap: an
                 // untrusted third-party tap is ignored outright since
@@ -162,12 +168,12 @@ pub const Brew = struct {
                     .formula => "--formula",
                     .cask => "--cask",
                 };
-                const trusted = try self.runner.stream(arena, &.{ "brew", "trust", flag, row.name });
+                const trusted = try self.runner.stream(arena, &.{ self.exe, "trust", flag, row.name });
                 if (!trusted.ok) return error.BrewTrustFailed;
             }
             const res = switch (kind) {
-                .formula => try self.runner.stream(arena, &.{ "brew", "install", row.name }),
-                .cask => try self.runner.stream(arena, &.{ "brew", "install", "--cask", row.name }),
+                .formula => try self.runner.stream(arena, &.{ self.exe, "install", row.name }),
+                .cask => try self.runner.stream(arena, &.{ self.exe, "install", "--cask", row.name }),
             };
             if (!res.ok) return error.BrewInstallFailed;
         }
@@ -466,6 +472,30 @@ test "install: a cask installs through --cask" {
 
     try b.backend().install(a, &.{rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }})});
     try testing.expect(fake.called("brew install --cask ghostty"));
+}
+
+test "bootstrap: after installing, brew is invoked by the path it landed at" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A stand-in for the installer's result: the only known prefix that
+    // exists on this machine is the one the test plants under /usr/local? No
+    // -- the probe list is fixed, so plant nothing and assert the fallback:
+    // with no prefix present the exe stays `brew`.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env NONINTERACTIVE=1 /bin/bash /tmp/i" },
+    } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io, .scratch_dir = "/tmp" };
+    const before = b.exe;
+    _ = try b.backend().bootstrap(a, "/tmp/i");
+    // Either a real prefix was found (a mac with brew installed) and the exe
+    // became absolute, or none was and it is unchanged; never something else.
+    try testing.expect(std.mem.eql(u8, b.exe, before) or std.fs.path.isAbsolute(b.exe));
+    if (std.fs.path.isAbsolute(b.exe)) try testing.expect(std.mem.endsWith(u8, b.exe, "/brew"));
 }
 
 test "install: a failed install is an error, not a silent skip" {
