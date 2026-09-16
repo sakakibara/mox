@@ -80,7 +80,8 @@ pub const PackageBackends = struct {
     pacman: mox.packages.linux.Distro = undefined,
     scoop: mox.packages.windows.Scoop = undefined,
     winget: mox.packages.windows.Winget = undefined,
-    list: [6]mox.packages.backend.Backend = undefined,
+    zypper: mox.packages.zypper.Zypper = undefined,
+    list: [7]mox.packages.backend.Backend = undefined,
 
     /// `scratch_dir` stages a manager's own export file (winget writes one
     /// rather than answering on stdout); mox's state directory keeps it off
@@ -98,6 +99,10 @@ pub const PackageBackends = struct {
         self.pacman = .{ .manager = .pacman, .runner = runner };
         self.scoop = .{ .runner = runner };
         self.winget = .{ .runner = runner, .io = io, .scratch_dir = scratch_dir };
+        self.zypper = .{
+            .runner = runner,
+            .ledger = .{ .io = io, .dir = scratch_dir, .backend = "zypper" },
+        };
         self.list = .{
             self.brew.backend(),
             self.apt.backend(),
@@ -105,6 +110,7 @@ pub const PackageBackends = struct {
             self.pacman.backend(),
             self.scoop.backend(),
             self.winget.backend(),
+            self.zypper.backend(),
         };
         return .{ .backends = &self.list };
     }

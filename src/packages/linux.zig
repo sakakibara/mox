@@ -166,20 +166,13 @@ pub const Distro = struct {
     /// a minimal image that runs as root often ships no `sudo` binary.
     fn elevates(self: *Distro) bool {
         if (self.force_elevate) |f| return f;
-        return !isRoot();
+        return !exec.isRoot();
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
         return .{ .name = id };
     }
 };
-
-fn isRoot() bool {
-    return switch (@import("builtin").os.tag) {
-        .linux, .macos => std.c.geteuid() == 0,
-        else => false,
-    };
-}
 
 const testing = std.testing;
 

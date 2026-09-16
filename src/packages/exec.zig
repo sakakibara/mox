@@ -11,6 +11,17 @@ const std = @import("std");
 const Io = std.Io;
 const EnvironMap = std.process.Environ.Map;
 
+/// Whether this process already has the privilege an install needs. A
+/// container and a root WSL install commonly ship no `sudo` at all, where
+/// elevating unconditionally turns every install into
+/// "sudo: command not found".
+pub fn isRoot() bool {
+    return switch (@import("builtin").os.tag) {
+        .linux, .macos => std.c.geteuid() == 0,
+        else => false,
+    };
+}
+
 pub const Result = struct {
     code: u8,
     ok: bool,

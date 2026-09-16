@@ -16,6 +16,10 @@
 # machine lacks, see it reported MISSING, install it for real, see the drift
 # go clean. A mox built for the container's own platform runs inside it; the
 # host needs only docker and zig.
+#
+# zypper is here for a second reason: it is the one manager with no
+# explicitly-installed query, so its explicit set is a mox-kept ledger. This
+# exercises that ledger against the real thing.
 
 set -eu
 
@@ -139,6 +143,7 @@ if [ "$#" -gt 0 ]; then
 else
   run_case debian:stable apt ripgrep
   run_case fedora:latest dnf ripgrep
+  run_case opensuse/tumbleweed zypper ripgrep
   # Arch publishes no arm64 image, so this case skips on an arm64 host.
   run_case archlinux:latest pacman ripgrep
 fi

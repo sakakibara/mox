@@ -36,6 +36,13 @@ pub const Backend = struct {
     name: []const u8,
     ctx: *anyopaque,
     vtable: *const VTable,
+    /// What this adapter structurally cannot see, in one line, or null when
+    /// it can answer everything asked of it. A manager with no
+    /// explicitly-installed query cannot report a package the user installed
+    /// by hand, and reporting nothing is indistinguishable from reporting
+    /// that there is nothing -- so the gap is stated rather than left to be
+    /// discovered.
+    limitation: ?[]const u8 = null,
 
     pub const VTable = struct {
         /// Whether this manager is usable on this machine.

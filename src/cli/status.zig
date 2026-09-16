@@ -375,6 +375,9 @@ fn printPackages(ctx: *app.Ctx, pkgs: Packages) !void {
 
     try ctx.out.writeAll("\npackages:\n");
     for (rep.backends) |b| {
+        // A manager that cannot see hand-installed packages reports none, and
+        // "none" is indistinguishable from "none exist" unless it says so.
+        if (b.limitation) |note| try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
         if (b.drift.clean()) {
             try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
             continue;

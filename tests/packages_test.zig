@@ -46,6 +46,7 @@ fn absentLinuxManagers(a: std.mem.Allocator, entries: *std.ArrayList(mox.package
         "pacman --version",
         "scoop --version",
         "winget --version",
+        "zypper --version",
     }) |argv| {
         try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
     }
@@ -399,6 +400,7 @@ fn dnfWith(
     try entries.append(a, .{ .argv = "pacman --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "scoop --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "winget --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = "zypper --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "dnf --version", .stdout = "dnf 4.18.0\n" });
     try entries.append(a, .{
         .argv = "dnf repoquery --userinstalled --qf %{name}\n",
@@ -513,7 +515,13 @@ fn windowsWith(
     extra: []const mox.packages.exec.Fake.Entry,
 ) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
-    for ([_][]const u8{ "brew --version", "apt-get --version", "dnf --version", "pacman --version" }) |argv| {
+    for ([_][]const u8{
+        "brew --version",
+        "apt-get --version",
+        "dnf --version",
+        "pacman --version",
+        "zypper --version",
+    }) |argv| {
         try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
     }
     try entries.append(a, .{ .argv = "scoop --version", .stdout = "v0.5.2\n" });

@@ -10,6 +10,8 @@ pub const validate = @import("validate.zig");
 pub const brew = @import("brew.zig");
 pub const linux = @import("linux.zig");
 pub const windows = @import("windows.zig");
+pub const zypper = @import("zypper.zig");
+pub const ledger = @import("ledger.zig");
 pub const report = @import("report.zig");
 pub const write = @import("write.zig");
 
@@ -25,6 +27,8 @@ test {
     _ = brew;
     _ = linux;
     _ = windows;
+    _ = zypper;
+    _ = ledger;
     _ = report;
     _ = write;
 }

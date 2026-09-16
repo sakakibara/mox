@@ -28,6 +28,9 @@ pub const Drift = drift_mod.Drift;
 pub const BackendDrift = struct {
     backend: []const u8,
     drift: Drift,
+    /// Carried from the adapter so a caller can state what this backend
+    /// cannot see without knowing which manager it is.
+    limitation: ?[]const u8 = null,
 };
 
 pub const Report = struct {
@@ -99,6 +102,7 @@ pub fn fromManifest(
         try out.append(arena, .{
             .backend = b.name,
             .drift = try drift_mod.compute(arena, b, rows, installed, m),
+            .limitation = b.limitation,
         });
     }
 
