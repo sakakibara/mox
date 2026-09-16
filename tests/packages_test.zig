@@ -1477,7 +1477,7 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
 }
 
-test "plugin: a captured verb that stops for a terminal is ended, bound or no bound" {
+test "plugin: a captured verb that stops for a terminal is ended with no bound armed" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1513,8 +1513,10 @@ test "plugin: a captured verb that stops for a terminal is ended, bound or no bo
 
     try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: list failed: stopped, and this run has no terminal that could resume it; killed") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    // Ended on the stop itself. A regression waits forever, so this
-    // assertion is what fails rather than the suite hanging.
+    // Ended on the stop itself, with nothing armed that could have ended it
+    // otherwise. A regression waits forever here rather than failing, which
+    // is the one case the suite cannot bound: a stop is not a resource the
+    // child will ever give back.
     try std.testing.expect(elapsed_ms < 60_000);
 }
 
@@ -2020,7 +2022,7 @@ test "commit: a file whose gate holds here takes the row" {
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
     try std.testing.expect(std.mem.indexOf(u8, r.out, "1 recorded") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "declares backend") == null);
     const after = try readManifest(io, h, a, "a.toml");
     try std.testing.expect(std.mem.startsWith(u8, after, original));
     try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\n"));
@@ -2142,7 +2144,7 @@ test "commit: a file whose only row for the backend is a blacklist entry is wher
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
     try std.testing.expect(std.mem.indexOf(u8, r.out, "1 recorded") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "declares backend") == null);
 
     // Appended there, naming the backend the file does not declare.
     const after = try readManifest(io, h, a, "x.toml");

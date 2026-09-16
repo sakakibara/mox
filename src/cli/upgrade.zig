@@ -1,5 +1,5 @@
 //! `mox upgrade [<version>] [--yes]`: compares the running build against a
-//! GitHub release of sakakibara/mox (the latest, or an explicit tag),
+//! published GitHub release (the latest, or an explicit tag),
 //! downloads that release's platform archive, verifies it against the
 //! release's published `SHA256SUMS`, and atomically replaces the running
 //! binary with the `mox` it contains. A fetched `latest` only installs when it
@@ -37,7 +37,7 @@ pub const command = app.command(Spec, .{
     .name = "upgrade",
     .summary = "Download and install a newer mox release",
     .usage = "mox upgrade [<version>] [--yes]",
-    .details = "Fetches the latest sakakibara/mox release (or the given <version>), verifies it against the release's SHA256SUMS, and replaces the running binary. --yes skips the confirmation prompt.",
+    .details = "Fetches the latest published release (or the given <version>), verifies it against the release's SHA256SUMS, and replaces the running binary. --yes skips the confirmation prompt.",
     .group = .general,
     .needs_context = false,
 }, run);

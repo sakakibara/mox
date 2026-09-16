@@ -8,9 +8,11 @@
 //!
 //! Every captured call is time-bounded, with the same default and kill a
 //! setup script gets: a query blocked on a manager's lock is a reported
-//! failure, never a hung `mox status`. A streamed call -- an install, a
-//! bootstrap -- has its own bound, unbounded by default, and is interrupted
-//! before it is killed so the manager behind `sudo` can roll back.
+//! failure, never a hung `mox status`. A streamed call -- an install, or the
+//! installer run a bootstrap ends in -- has its own bound, unbounded by
+//! default, and is interrupted before it is killed so the manager behind
+//! `sudo` can roll back. A bootstrap's download is a captured call like any
+//! other, and answers to the captured bound.
 
 const std = @import("std");
 const builtin = @import("builtin");

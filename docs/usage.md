@@ -53,7 +53,7 @@ mox add -r ~/.config/nvim             # every file under a directory
 The file is now managed. Check state any time:
 
 ```sh
-mox status        # clean / OUTDATED / DRIFT / MISSING / STALE / GATED per file
+mox status        # clean / OUTDATED / DRIFT / MISSING / STALE / GATED / ERROR per file
 mox diff          # the actual composed-vs-live diff
 ```
 
