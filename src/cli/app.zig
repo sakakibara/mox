@@ -185,6 +185,7 @@ pub const PackageBackends = struct {
         self.zypper = .{
             .runner = r,
             .ledger = .{ .io = io, .dir = scratch_dir, .backend = "zypper" },
+            .err = err,
         };
 
         var list: std.ArrayList(mox.packages.backend.Backend) = .empty;

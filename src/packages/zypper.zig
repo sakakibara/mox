@@ -37,6 +37,10 @@ pub const Error = error{
 pub const Zypper = struct {
     runner: exec.Runner,
     ledger: ledger_mod.Ledger,
+    /// Where a read-back failure after a failed install is said. The install's
+    /// own error is what the call site reports, so this one has nowhere else
+    /// to go and would otherwise be lost.
+    err: ?*std.Io.Writer = null,
     /// Overrides the root check, so a test can exercise both paths on a host
     /// whose own uid it does not control.
     force_elevate: ?bool = null,
@@ -198,9 +202,26 @@ pub const Zypper = struct {
         // Only what rpm confirms is recorded; nothing that never landed is.
         // A kill is the case the read-back matters most for, so it happens
         // before the timeout is reported, never instead of it.
-        // The install is what failed; a query that also fails must not
-        // replace that with its own error.
-        const landed = self.presentOf(arena, ids.items) catch &.{};
+        //
+        // When rpm itself cannot answer, the whole batch is recorded: the
+        // ledger is a candidate set that every read intersects with rpm, so
+        // an id that never landed drops straight back out, while one that did
+        // land and went unrecorded never comes back. The install is what
+        // failed, so the read-back's own failure is said here rather than
+        // returned in place of it.
+        const landed = self.presentOf(arena, ids.items) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => blk: {
+                if (self.err) |w| {
+                    w.print(
+                        "mox: zypper: rpm could not say which of the batch landed ({s}); all {d} are recorded, and every read narrows them to what rpm reports\n",
+                        .{ exec.errorText(e), ids.items.len },
+                    ) catch {};
+                    w.flush() catch {};
+                }
+                break :blk ids.items;
+            },
+        };
         if (landed.len > 0) try self.ledger.add(arena, landed);
         try exec.checkTimedOut(res);
         return Error.ZypperInstallFailed;
@@ -414,7 +435,47 @@ test "install: a kill whose read-back also fails is still reported as a kill" {
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
     try testing.expectError(error.TimedOut, z.backend().install(a, &.{rowOf("ripgrep", &.{})}));
-    try testing.expectEqual(@as(usize, 0), (try z.ledger.read(a)).len);
+    try testing.expectEqual(@as(usize, 1), (try z.ledger.read(a)).len);
+}
+
+test "install: a failed batch whose read-back cannot run records the batch, and says so" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `ripgrep` landed before the batch failed, and rpm cannot say so.
+    // Recording nothing would lose it forever -- MISSING on every status,
+    // re-attempted on every apply -- while recording the batch costs only an
+    // id that every read drops again.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep nosuch", .code = 4 },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .code = 1 },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    z.err = &w.writer;
+
+    try testing.expectError(Error.ZypperInstallFailed, z.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("nosuch", &.{}) }));
+    const recorded = try z.ledger.read(a);
+    try testing.expectEqual(@as(usize, 2), recorded.len);
+    try testing.expectEqualStrings(
+        "mox: zypper: rpm could not say which of the batch landed (ZypperQueryFailed); all 2 are recorded, and every read narrows them to what rpm reports\n",
+        w.written(),
+    );
+
+    // The record is a candidate set, not a claim: with rpm answering again,
+    // the id that never landed is not in the explicit set.
+    var after: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
+    } };
+    z.runner = after.runner();
+    const explicit = try z.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 1), explicit.len);
+    try testing.expectEqualStrings("ripgrep", explicit[0]);
 }
 
 test "install: a reboot or restart needed after the install is a success" {
