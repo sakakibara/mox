@@ -87,6 +87,36 @@ jobs:
           if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
           Write-Host "install.ps1 parses"
 
+  backends:
+    # Nightly only. Runs the backend adapters against the REAL package
+    # managers (`zig build test-backends`), which the hermetic `test` step
+    # deliberately excludes. Each check is differential against the manager's
+    # own output, so the day brew changes a flag or an output shape under an
+    # adapter, this goes red here rather than on a machine.
+    #
+    # macOS only while brew is the only adapter; the matrix grows with the
+    # linux and windows adapters.
+    if: github.event_name == 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: seed one formula
+        shell: bash
+        # The checks skip when a manager reports nothing, which is right on a
+        # developer machine and useless here: without a datum the tripwire
+        # would report green having compared nothing.
+        run: brew install --formula tree
+      - name: test-backends
+        run: zig build test-backends --summary all
+
   fuzz:
     # Nightly only. Exercises the fuzz targets (tests/fuzz_test.zig) under a
     # wall-clock bound. Continuous fuzzing (`zig build fuzz --fuzz`) is gated
