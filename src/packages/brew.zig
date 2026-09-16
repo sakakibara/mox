@@ -41,6 +41,8 @@ pub const Kind = enum { formula, cask };
 /// same name. Opaque to the core, which only compares ids.
 pub const cask_prefix = "cask:";
 
+pub const default_prefixes = [_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin" };
+
 pub const Brew = struct {
     runner: exec.Runner,
     /// Only the bootstrap path needs these: staging a verified installer.
@@ -51,6 +53,8 @@ pub const Brew = struct {
     /// argv[0] (only the parent's is), so a freshly installed brew that is on
     /// no PATH yet can only be reached by name of its full path.
     exe: []const u8 = "brew",
+    /// Where the installer leaves `brew`; probed after a bootstrap.
+    prefixes: []const []const u8 = &default_prefixes,
 
     pub fn backend(self: *Brew) Backend {
         return .{ .name = "brew", .ctx = self, .vtable = &vtable };
@@ -79,7 +83,7 @@ pub const Brew = struct {
         const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", installer_path });
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
 
-        for ([_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin" }) |dir| {
+        for (self.prefixes) |dir| {
             const exe = try std.fs.path.join(arena, &.{ dir, "brew" });
             Io.Dir.cwd().access(io, exe, .{}) catch continue;
             self.exe = exe;

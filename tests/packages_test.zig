@@ -249,8 +249,22 @@ test "apply: a tapped formula is tapped and trusted before install" {
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
-    _ = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(fake.called("brew trust --formula d12frosted/emacs-plus/emacs-plus@30"));
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Tap, then trust, then install: each step needs the one before it.
+    const tap = indexOfCall(fake, "brew tap d12frosted/emacs-plus").?;
+    const trust = indexOfCall(fake, "brew trust --formula d12frosted/emacs-plus/emacs-plus@30").?;
+    const install = indexOfCall(fake, "brew install d12frosted/emacs-plus/emacs-plus@30").?;
+    try std.testing.expect(tap < trust);
+    try std.testing.expect(trust < install);
+}
+
+/// The position of the first call matching `argv`, or null.
+fn indexOfCall(fake: *const mox.packages.exec.Fake, argv: []const u8) ?usize {
+    for (fake.calls.items, 0..) |c, i| {
+        if (std.mem.eql(u8, c, argv)) return i;
+    }
+    return null;
 }
 
 test "commit: recording an untracked package appends a row and clears the drift" {
@@ -639,6 +653,12 @@ test "bootstrap: a manager that is absent is installed from the declared install
     // scripted curl writes the installer that the digest above covers, the
     // scripted interpreter stands in for running it, and brew answers from
     // then on (by whichever path the adapter now invokes it).
+    // The scripted installer leaves `brew` where the adapter looks for it.
+    const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    mox.cli.app.brew_prefixes_override = &.{prefix_bin};
+    defer mox.cli.app.brew_prefixes_override = null;
     const staged = try std.fs.path.join(a, &.{ h.state, "brew-installer" });
     const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
@@ -699,10 +719,15 @@ test "bootstrap: a manager already present is left alone" {
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
-    _ = try h.run(&.{ "mox", "apply" });
+    const r = try h.run(&.{ "mox", "apply" });
     for (fake.calls.items) |c| {
         try std.testing.expect(std.mem.indexOf(u8, c, "example.invalid") == null);
     }
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping") == null);
+    // The package pass still ran over the manager that was already there.
+    try std.testing.expect(fake.called("brew list --full-name --installed-on-request"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
 test "bootstrap: a bad digest refuses and the installer never runs" {
@@ -926,9 +951,15 @@ test "plugin: a name shadowing a shipped backend is announced, not silent" {
     // The same script, named `brew`: it now stands in for the built-in.
     try writePlugin(io, h, a, "brew", fakeports_sh);
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
+    // Its "manager" already holds something, so the override answering is
+    // visible as an untracked row the stubbed built-in could never report.
+    const state = try std.fs.path.join(a, &.{ h.repo, ".fakeports-state" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = state, .data = "sbcl\n" });
 
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "overrides the built-in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "UNTRACKED brew sbcl") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
 
 test "bootstrap: an absent manager is installed and used by the same apply" {
@@ -954,6 +985,12 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
         \\
     , .{hex}));
 
+    // The scripted installer leaves `brew` where the adapter looks for it.
+    const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    mox.cli.app.brew_prefixes_override = &.{prefix_bin};
+    defer mox.cli.app.brew_prefixes_override = null;
     // brew is absent exactly once; the fetch writes the installer the digest
     // covers; the installer runs; then brew answers, by whichever path the
     // adapter now invokes it, and the run installs the package.
@@ -1611,6 +1648,152 @@ test "plugin: a row key outside the bare charset reaches the plugin quoted, as T
 
     const seen = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ h.repo, ".seen" }), a, .limited(1 << 20));
     try std.testing.expectEqualStrings("{ name = \"x\", \"my key\" = \"v\" }\n", seen);
+}
+
+test "commit: a file whose gate excludes this machine is never appended to" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The only brew file is for another OS: a row appended there would be
+    // inert on the very machine that recorded it.
+    const original = "backend = \"brew\"\nwhen = \"os=linux\"\n";
+    try writeManifest(io, h, a, "a.toml", original);
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend \"brew\"; add one to record its 1 untracked package(s)") != null);
+    try std.testing.expectEqualStrings(original, try readManifest(io, h, a, "a.toml"));
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "commit: a file whose gate holds here takes the row" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const original = "backend = \"brew\"\nwhen = \"os=darwin\"\n";
+    try writeManifest(io, h, a, "a.toml", original);
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "1 recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend") == null);
+    const after = try readManifest(io, h, a, "a.toml");
+    try std.testing.expect(std.mem.startsWith(u8, after, original));
+    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\n"));
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+/// A plugin whose manager exists once its home directory does: absent until
+/// `bootstrap` creates it, present from then on. Nothing is ever installed
+/// through it here.
+const bootstrappable_sh =
+    \\#!/bin/sh
+    \\set -eu
+    \\home="$(dirname "$0")/../../.fakemgr-home"
+    \\cmd=${1:-}; shift || true
+    \\case "$cmd" in
+    \\available) [ -d "$home" ] ;;
+    \\bootstrap) mkdir -p "$home/bin"; (cd "$home/bin" && pwd) ;;
+    \\list) ;;
+    \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+    \\declare) printf 'name = "%s"\n' "$1" ;;
+    \\*) exit 64 ;;
+    \\esac
+    \\
+;
+
+test "bootstrap: a manager installed with no row to install still re-captures the machine" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+
+    try writePlugin(io, h, a, "fakemgr", bootstrappable_sh);
+
+    // The "download" is a curl on the hermetic PATH that writes the installer
+    // the digest below covers to the `-o` path it is handed.
+    const installer = "#!/bin/sh\necho installed\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const curl = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "bin", "curl" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = curl, .data =
+        \\#!/bin/sh
+        \\out=
+        \\while [ $# -gt 0 ]; do
+        \\  if [ "$1" = "-o" ]; then out=$2; shift; fi
+        \\  shift
+        \\done
+        \\printf '#!/bin/sh\necho installed\n' > "$out"
+        \\
+    });
+    try Io.Dir.cwd().setFilePermissions(io, curl, Io.File.Permissions.fromMode(0o755), .{});
+
+    try writeManifest(io, h, a, "fakemgr.toml", try std.fmt.allocPrint(a,
+        \\backend = "fakemgr"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+    , .{hex}));
+
+    // A fact bound by the directory the bootstrap creates, and a post script
+    // that records what it was handed: only a re-capture after the bootstrap
+    // can put the fresh value in the script's environment. The script's
+    // reference to the fact is a contract mox checks, so a stale environment
+    // blocks the script (rc 2) rather than running it with the old value.
+    const home = try std.fs.path.join(a, &.{ h.repo, ".fakemgr-home" });
+    const facts = try std.fs.path.join(a, &.{ h.repo, "data", "facts.toml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts, .data = try std.fmt.allocPrint(
+        a,
+        "[[facts]]\nname = \"fakemgrhome\"\ncandidates = [\"{s}\"]\n",
+        .{home},
+    ) });
+    const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
+    try Io.Dir.cwd().createDirPath(io, post_dir);
+    const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = post, .data = try std.fmt.allocPrint(
+        a,
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"${{MOX_FACT_FAKEMGRHOME:-unset}}\" \"$PATH\" > \"{s}\"\n",
+        .{seen},
+    ) });
+    try Io.Dir.cwd().setFilePermissions(io, post, Io.File.Permissions.fromMode(0o755), .{});
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping  fakemgr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const got = try Io.Dir.cwd().readFileAlloc(io, seen, a, .limited(1 << 20));
+    var lines = std.mem.splitScalar(u8, got, '\n');
+    try std.testing.expectEqualStrings(home, lines.next().?);
+    // The bin dir the bootstrap reported is still on the post script's PATH
+    // after the re-capture rebuilt the script environment.
+    const path_line = lines.next().?;
+    const bin = try std.fs.path.join(a, &.{ home, "bin" });
+    try std.testing.expect(std.mem.indexOf(u8, path_line, bin) != null);
 }
 
 test "commit: a file whose only row for the backend is a blacklist entry is where its next row goes" {

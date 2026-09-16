@@ -66,6 +66,9 @@ pub var cwd_override: ?[]const u8 = null;
 /// exercised without a manager installed and without touching the machine
 /// running the suite. Null means spawn for real.
 pub var package_runner_override: ?mox.packages.exec.Runner = null;
+/// Test seam: where a bootstrapped brew is looked for, instead of the real
+/// prefixes, so a scripted bootstrap can plant its result under a temp dir.
+pub var brew_prefixes_override: ?[]const []const u8 = null;
 
 /// Every package backend this run can use: the seven mox ships, then, for a
 /// repo with a manifest, every plugin it carries under `scripts/backends/`. Built once so `status`,
@@ -132,6 +135,7 @@ pub const PackageBackends = struct {
         };
         const r = self.runner();
         self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
+        if (brew_prefixes_override) |p| self.brew.prefixes = p;
         self.apt = .{ .manager = .apt, .runner = r };
         self.dnf = .{ .manager = .dnf, .runner = r };
         self.pacman = .{ .manager = .pacman, .runner = r };
