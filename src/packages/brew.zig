@@ -85,7 +85,10 @@ pub const Brew = struct {
             self.exe = exe;
             return dir;
         }
-        return null;
+        // An installer that reported success but left `brew` in none of its
+        // prefixes is a failed bootstrap, not a manager that then reads as
+        // absent for the rest of the run.
+        return bootstrap_mod.Error.BootstrapFailed;
     }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!bool {
@@ -500,18 +503,22 @@ test "bootstrap: after installing, brew is invoked by the path it landed at" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The probe list is fixed, so nothing is planted; with no prefix
-    // present the exe stays `brew`.
+    // The probe list is fixed, so nothing is planted: on a machine with brew
+    // in one of the prefixes the exe becomes absolute, on any other the
+    // bootstrap is a named failure rather than a manager that reads as absent.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env NONINTERACTIVE=1 /bin/bash /tmp/i" },
     } };
     var b: Brew = .{ .runner = fake.runner(), .io = io, .scratch_dir = "/tmp" };
     const before = b.exe;
-    _ = try b.backend().bootstrap(a, "/tmp/i");
-    // Either a real prefix was found (a mac with brew installed) and the exe
-    // became absolute, or none was and it is unchanged; never something else.
-    try testing.expect(std.mem.eql(u8, b.exe, before) or std.fs.path.isAbsolute(b.exe));
-    if (std.fs.path.isAbsolute(b.exe)) try testing.expect(std.mem.endsWith(u8, b.exe, "/brew"));
+    if (b.backend().bootstrap(a, "/tmp/i")) |dir| {
+        try testing.expect(dir != null);
+        try testing.expect(std.fs.path.isAbsolute(b.exe));
+        try testing.expect(std.mem.endsWith(u8, b.exe, "/brew"));
+    } else |e| {
+        try testing.expectEqual(bootstrap_mod.Error.BootstrapFailed, e);
+        try testing.expectEqualStrings(before, b.exe);
+    }
 }
 
 test "install: a failed tap fails its row and the rows after it still run" {

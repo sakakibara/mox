@@ -50,6 +50,17 @@ pub fn all(
         try b.validate(bl.asRow(), diag);
     }
 
+    // A bootstrap row names its backend the same way, and a typo there would
+    // otherwise surface only on the one apply that needs the installer.
+    for (m.bootstrap) |b| {
+        if (registry.find(b.backend) != null) continue;
+        if (diag) |d| d.set(
+            "{s}: bootstrap row: no backend named \"{s}\"",
+            .{ b.label, b.backend },
+        );
+        return Error.UnknownBackend;
+    }
+
     try contradictions(arena, m, registry, diag);
 }
 

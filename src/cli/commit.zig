@@ -483,7 +483,7 @@ fn reconcilePackages(
             return .{ .broken = true };
         },
     };
-    for (pkg_backends.notes) |note| try ctx.out.print("  note  {s}\n", .{note});
+    for (pkg_backends.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
 
     const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -520,10 +520,14 @@ fn reconcilePackages(
                 // Said once per backend: every untracked package of that
                 // backend has the same missing file.
                 if (!no_file_said) {
+                    // In program order on the terminal: the reason before
+                    // the summary that counts these as skipped.
+                    try ctx.out.flush();
                     try ctx.err.print(
                         "mox commit: no data/packages file declares backend \"{s}\"; add one to record its {d} untracked package(s)\n",
                         .{ b.backend, b.drift.untracked.len },
                     );
+                    try ctx.err.flush();
                     no_file_said = true;
                 }
                 res.skipped += 1;

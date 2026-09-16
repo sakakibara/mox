@@ -1482,6 +1482,69 @@ test "status: an empty data/packages directory opts in, so an installed package 
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
 
+test "commit: an empty data/packages directory records nothing until a file declares the backend" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const dir = try std.fs.path.join(a, &.{ h.repo, "data", "packages" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no data/packages file declares backend \"brew\"; add one to record its 1 untracked package(s)") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    // Nothing was created on the user's behalf.
+    var d = try Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    try std.testing.expect((try it.next(io)) == null);
+}
+
+test "status: a bootstrap row naming no registered backend is refused before any manager is asked" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\backend = "brw"
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+    );
+
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "darwin.toml: bootstrap row: no backend named \"brw\"") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    const d = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, d.err, "no backend named \"brw\"") != null);
+    try std.testing.expectEqual(@as(u8, 2), d.rc);
+}
+
 test "status: a data/packages that is a file is named as not a directory, and no manager is asked" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1587,18 +1650,18 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
     defer herm.deinit();
     const io = herm.io;
     const h = try setup(a, io, &tmp, .{
-        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "1000" } },
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "3000" } },
     });
 
     // `sleep` keeps the pipe's write end after `sh` would have exited; a
-    // kill that reached only `sh` would leave the read blocked for 6s. The
+    // kill that reached only `sh` would leave the read blocked for 12s. The
     // bound leaves room for every stub probed before this plugin: the first
-    // run of a freshly written script is slow on some hosts.
+    // run of a freshly written script is slow on a loaded host.
     try writePlugin(io, h, a, "pipes",
         \\#!/bin/sh
         \\case "${1:-}" in
         \\available) exit 0 ;;
-        \\list) sleep 6 | cat ;;
+        \\list) sleep 12 | cat ;;
         \\esac
         \\exit 0
         \\
@@ -1609,9 +1672,10 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
     const r = try h.run(&.{ "mox", "status" });
     const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
 
+    errdefer std.debug.print("stderr was:\n{s}\n", .{r.err});
     try std.testing.expect(std.mem.indexOf(u8, r.err, "pipes: list failed: PluginTimedOut") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(elapsed_ms < 5000);
+    try std.testing.expect(elapsed_ms < 10_000);
 }
 
 /// `Harness.run` with the caller's own writers, for a test that needs mox's

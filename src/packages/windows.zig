@@ -137,13 +137,19 @@ pub const Scoop = struct {
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
+        // One row at a time, and every row is attempted: one app that fails
+        // to resolve must not stop the rest of the set.
+        var failed = false;
         for (rows) |row| {
             // A bucket must exist before an app in it can resolve, exactly as
             // a brew tap must. Adding one already present is a no-op.
             if (bucketOf(row)) |bucket| {
                 const added = try self.runner.stream(arena, try self.argv(arena, &.{ "bucket", "add", bucket }));
                 try exec.checkTimedOut(added);
-                if (!added.ok) return Error.ScoopInstallFailed;
+                if (!added.ok) {
+                    failed = true;
+                    continue;
+                }
             }
             const target = if (bucketOf(row)) |bucket|
                 try std.fmt.allocPrint(arena, "{s}/{s}", .{ bucket, row.name })
@@ -151,8 +157,9 @@ pub const Scoop = struct {
                 row.name;
             const res = try self.runner.stream(arena, try self.argv(arena, &.{ "install", target }));
             try exec.checkTimedOut(res);
-            if (!res.ok) return Error.ScoopInstallFailed;
+            if (!res.ok) failed = true;
         }
+        if (failed) return Error.ScoopInstallFailed;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
@@ -283,6 +290,7 @@ pub const Winget = struct {
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Winget = @ptrCast(@alignCast(ctx));
+        var failed = false;
         for (rows) |row| {
             var argv: std.ArrayList([]const u8) = .empty;
             try argv.appendSlice(arena, &.{ "winget", "install", "--id", row.name });
@@ -295,8 +303,9 @@ pub const Winget = struct {
 
             const res = try self.runner.stream(arena, argv.items);
             try exec.checkTimedOut(res);
-            if (!res.ok) return Error.WingetInstallFailed;
+            if (!res.ok) failed = true;
         }
+        if (failed) return Error.WingetInstallFailed;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {

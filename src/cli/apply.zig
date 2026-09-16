@@ -954,6 +954,21 @@ fn applyPackages(
     };
     for (pkg_backends.notes) |note| try ctx.out.print("  note           {s}\n", .{note});
 
+    // Checked before any bootstrap runs: a manifest that every other
+    // command refuses must not get an installer downloaded and executed
+    // on its behalf first.
+    mox.packages.validate.all(ctx.alloc, manifest, registry, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (diag.capture()) |cap| {
+                try ctx.err.print("mox apply: packages: {s}\n", .{cap});
+            } else {
+                try ctx.err.print("mox apply: packages: {s}\n", .{@errorName(e)});
+            }
+            return .{ .failed = 1 };
+        },
+    };
+
     // A manager that is not installed makes every row naming it inert, so the
     // manifest's own declaration cannot come true. Bootstrapping runs BEFORE
     // availability is probed for the drift report, so a manager installed here
@@ -967,7 +982,8 @@ fn applyPackages(
     } else {
         for (manifest.bootstrap) |b| {
             if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
-            const backend = registry.find(b.backend) orelse continue;
+            // Validated against the registry when the manifest was read.
+            const backend = registry.find(b.backend).?;
             const present = backend.available(ctx.alloc) catch |e| {
                 try ctx.err.print("mox apply: {s}: available failed: {s}\n", .{ b.backend, @errorName(e) });
                 bootstrap_failed += 1;
