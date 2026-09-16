@@ -223,6 +223,35 @@ pub fn dieOfInterrupt() noreturn {
     std.process.exit(130);
 }
 
+/// What a child is doing at this instant, without blocking.
+///
+/// A child mox reads from is not a child mox is waiting on, so the wait that
+/// answers a stop is not reached until the read is over -- and a stopped
+/// child writes nothing, so the read is never over. Asking here, between
+/// reads, is what lets that child be answered at all.
+///
+/// A stop is consumed by the asking, which costs nothing: the only answer to
+/// a captured child that stopped is to end it. An exit is consumed too, so it
+/// is returned rather than discarded -- the caller must use this term instead
+/// of waiting again.
+pub const Peek = union(enum) {
+    running,
+    stopped,
+    done: std.process.Child.Term,
+};
+
+pub fn peek(child: *std.process.Child) Peek {
+    if (builtin.os.tag == .windows) return .running;
+    const id = child.id orelse return .running;
+    var raw: c_int = undefined;
+    const rc = std.c.waitpid(id, &raw, std.c.W.UNTRACED | std.c.W.NOHANG);
+    if (rc <= 0) return .running;
+    const status: u32 = @bitCast(raw);
+    if (std.c.W.IFSTOPPED(status)) return .stopped;
+    child.id = null;
+    return .{ .done = termOfStatus(status) };
+}
+
 /// The wait a spawn does. Every child is waited on here rather than by
 /// `Child.wait`, which asks only for a child that ended: a child that stops
 /// is invisible to it, so the wait never returns. A streamed child holding
@@ -250,7 +279,7 @@ pub fn waitFor(io: Io, child: *std.process.Child, tty: ?Terminal) anyerror!std.p
 /// Close what `spawn` opened on mox's side and clear it, the way `Child.wait`
 /// does as it reaps. A stream the caller asked to inherit has no handle here
 /// and is not touched.
-fn closePipes(io: Io, child: *std.process.Child) void {
+pub fn closePipes(io: Io, child: *std.process.Child) void {
     for ([_]*?Io.File{ &child.stdin, &child.stdout, &child.stderr }) |slot| {
         if (slot.*) |f| {
             f.close(io);
@@ -335,14 +364,11 @@ pub fn termOfStatus(status: u32) std.process.Child.Term {
 
 /// Shared between the waiter and the deadline task: the waiter marks the
 /// child reaped, and the task marks that it fired so the result is reported
-/// as a timeout. It fires only when its signal reached the child's GROUP, so
-/// a child that exited at the bound is not reported as one -- a pid-directed
-/// kill would not do: a zombie still answers one, and the whole point is to
-/// tell a child that was killed from one that had already finished.
-///
-/// The reaped flag narrows the window in which a kill lands on a pid the
-/// wait has already freed; it does not close it, because reading the flag
-/// and sending the signal are two operations, and the same holds for the
+/// as a timeout. The reaped flag is what tells a child the bound killed from
+/// one that had already finished: the waiter sets it before it cancels this
+/// task, so a deadline that passes after the child was reaped reports
+/// nothing. It narrows rather than closes the window -- reading the flag and
+/// sending the signal are two operations -- and the same holds for the
 /// straggler sweep that follows the wait.
 pub const Guard = struct {
     reaped: std.atomic.Value(bool) = .init(false),
@@ -375,12 +401,15 @@ pub fn killGroup(io: Io, child: *std.process.Child) void {
     child.kill(io);
 }
 
-/// Whether the kill reached anything still in the child's group. The verdict
-/// comes from the group-directed kill, never the pid-directed one: a reaped
-/// child is a zombie until its parent waits, and a zombie still answers a
-/// pid-directed signal, so that answer cannot tell a child mox killed from
-/// one that had already finished. A group holds its id only while a member
-/// lives, so it can.
+/// Whether the kill reached anything in the child's group. The verdict comes
+/// from the group-directed kill rather than the pid-directed one, which
+/// cannot discriminate at all: a child stays a zombie until its parent waits
+/// for it, and a zombie answers a signal addressed to its pid. Addressing the
+/// group is better but not decisive either, and differs by system -- Darwin
+/// refuses a group whose only member is a zombie, Linux accepts it -- so this
+/// narrows the window in which a finished child reads as a killed one without
+/// closing it. What actually discriminates is `Guard.reaped`, which the
+/// waiter sets before it cancels the watchdog.
 pub fn killGroupOf(id: std.process.Child.Id) bool {
     if (builtin.os.tag == .windows) return killProcess(id);
     const reached = signal(-id, .KILL);
@@ -448,7 +477,7 @@ test "SpawnSignals: one call inside another leaves the outer child still reachab
     try testing.expectEqual(@as(i32, 4242), SpawnSignals.group.load(.acquire));
 }
 
-test "killGroupOf: a reaped child that answers a pid signal does not count as reached" {
+test "killGroupOf: a pid the system has freed is not reached" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
 
@@ -460,11 +489,13 @@ test "killGroupOf: a reaped child that answers a pid signal does not count as re
         .pgid = own_group,
     });
     const id = child.id.?;
-    // Reaped by hand, so the group is empty while the pid is still a zombie
-    // for as long as nothing waits on it: a pid-directed kill succeeds here
-    // and a group-directed one cannot.
     var raw: c_int = undefined;
     _ = std.c.waitpid(id, &raw, 0);
+    // Freed, not merely finished: nothing answers either address. A child
+    // that has finished but not yet been waited for is a different case, and
+    // one systems do not agree on -- Darwin refuses its group, Linux accepts
+    // it -- which is why `Guard.reaped`, and not this, is what tells a
+    // killed child from a finished one.
     try testing.expect(!killGroupOf(id));
     child.id = null;
     child.stdin = null;

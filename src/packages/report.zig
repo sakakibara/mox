@@ -133,11 +133,11 @@ pub fn fromManifest(
                 try notes.append(arena, try std.fmt.allocPrint(
                     arena,
                     "{s}: available failed: {s}; treated as absent",
-                    .{ b.name, @errorName(e) },
+                    .{ b.name, exec.errorText(e) },
                 ));
                 continue;
             }
-            if (diag) |d| d.set("{s}: available failed: {s}", .{ b.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: available failed: {s}", .{ b.name, exec.errorText(e) });
             return e;
         };
         switch (avail) {
@@ -183,7 +183,7 @@ pub fn fromManifest(
         try out.append(arena, .{
             .backend = b.name,
             .drift = drift_mod.compute(arena, b, rows, &.{}, m) catch |e| {
-                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, @errorName(e) });
+                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, exec.errorText(e) });
                 return e;
             },
             .limitation = if (contains(assume_available, b.name)) null else "absent; apply will bootstrap it",
@@ -191,7 +191,7 @@ pub fn fromManifest(
     }
     for (usable.items) |b| {
         const installed = b.installedExplicit(arena) catch |e| {
-            if (diag) |d| d.set("{s}: list failed: {s}", .{ b.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: list failed: {s}", .{ b.name, exec.errorText(e) });
             return e;
         };
         for (installed) |id| {
@@ -203,13 +203,13 @@ pub fn fromManifest(
             return error.BackendBadOutput;
         }
         const limitation = b.limitationOf(arena) catch |e| {
-            if (diag) |d| d.set("{s}: limitation failed: {s}", .{ b.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: limitation failed: {s}", .{ b.name, exec.errorText(e) });
             return e;
         };
         try out.append(arena, .{
             .backend = b.name,
             .drift = drift_mod.compute(arena, b, rows, installed, m) catch |e| {
-                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, @errorName(e) });
+                if (diag) |d| d.set("{s}: id failed: {s}", .{ b.name, exec.errorText(e) });
                 return e;
             },
             .limitation = limitation,

@@ -1477,6 +1477,47 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
 }
 
+test "plugin: a captured verb that stops for a terminal is ended, bound or no bound" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    // The bound is off, so nothing but seeing the stop can end this run. mox
+    // reads a captured verb rather than waiting on it, so the stop has to be
+    // noticed between reads or it is never noticed at all.
+    const h = try setup(a, io, &tmp, .{
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "0" } },
+    });
+
+    try writePlugin(io, h, a, "brew",
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do case "$l" in *'name = "'*) n=${l#*name = \"}; printf '%s\n' "${n%%\"*}" ;; esac; done ;;
+        \\list) kill -STOP $$ ;;
+        \\*) exit 64 ;;
+        \\esac
+        \\exit 0
+        \\
+    );
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+
+    const started = Io.Timestamp.now(io, .awake);
+    const r = try h.run(&.{ "mox", "status" });
+    const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
+
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: list failed: stopped, and this run has no terminal that could resume it; killed") != null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    // Ended on the stop itself. A regression waits forever, so this
+    // assertion is what fails rather than the suite hanging.
+    try std.testing.expect(elapsed_ms < 60_000);
+}
+
 test "plugin: one that hangs on available is killed at the bound, and the timeout is named" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

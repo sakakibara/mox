@@ -143,6 +143,34 @@ pub fn checkTimedOut(res: Result) error{TimedOut}!void {
     if (res.timed_out) return error.TimedOut;
 }
 
+/// What a call's failure is, in words rather than an error name. A stop and
+/// a kill are the two the user can do something about -- give the run a
+/// terminal, or raise the bound -- and both reach here as a bare error that
+/// says neither. `bound_ms` and `bound_var` are the bound that call actually
+/// ran under: a download is captured and bounded like a setup script, while
+/// the installer run it feeds is streamed and bounded as an install.
+/// Anything else keeps its name.
+/// A call's failure in words where words exist, and its error name where they
+/// do not. Reached from every report of a verb that did not answer, so one
+/// failure never reads two ways.
+pub fn errorText(e: anyerror) []const u8 {
+    return switch (e) {
+        error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
+        else => @errorName(e),
+    };
+}
+
+pub fn failureText(arena: std.mem.Allocator, e: anyerror, bound_ms: i64, bound_var: []const u8) ![]const u8 {
+    return switch (e) {
+        error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
+        error.TimedOut => if (bound_ms > 0)
+            try std.fmt.allocPrint(arena, "timed out after {d}ms ({s}), killed", .{ bound_ms, bound_var })
+        else
+            try std.fmt.allocPrint(arena, "timed out, killed ({s} is unset)", .{bound_var}),
+        else => errorText(e),
+    };
+}
+
 pub const Result = struct {
     code: u8,
     ok: bool,
@@ -252,6 +280,11 @@ pub fn runPowerShell(runner: Runner, arena: std.mem.Allocator, script_args: []co
 /// through a downloader with no size cap of its own -- asks for its own cap
 /// through `runCapped`.
 pub const max_query_bytes: usize = 8 << 20;
+
+/// How long a captured read waits before looking at the child again. Short
+/// enough that a stopped child is answered promptly, long enough that a
+/// chatty query costs a handful of extra syscalls.
+const read_step_ms: i64 = 200;
 
 /// Runs the argv as a real child process. `env` is the environment mox itself
 /// reads through, so a manager invoked here sees the same HOME and PATH mox
@@ -380,36 +413,82 @@ pub const Process = struct {
         }
 
         var out: []const u8 = "";
+        // Set when the child was found already finished between reads, so the
+        // status is this and there is nothing left to wait for.
+        var read_term: ?std.process.Child.Term = null;
         if (child.stdout) |f| {
             var streams: Io.File.MultiReader.Buffer(1) = undefined;
             var mr: Io.File.MultiReader = undefined;
             mr.init(arena, io, streams.toStreams(), &.{f});
             defer mr.deinit();
             const rd = mr.reader(0);
+            const started = Io.Clock.awake.now(io);
             // A read that fails, overruns the cap, or outlives the bound is an
             // error, never an empty answer: an empty `list` would make every
             // row missing.
-            while (mr.fill(4096, deadline)) |_| {
+            //
+            // Read in steps rather than straight to the bound: this is the
+            // only place a captured child is observed at all, and one that
+            // stopped will never write again. Between steps it is asked what
+            // it is doing, so a child waiting on a terminal it does not have
+            // is ended here instead of holding the read for the whole bound,
+            // or forever where the bound is disabled. The bound is kept by
+            // hand for the same reason.
+            read: while (true) {
+                mr.fill(4096, timeoutOf(read_step_ms).toDeadline(io)) catch |e| switch (e) {
+                    error.EndOfStream => break :read,
+                    error.Timeout => {
+                        const bound = if (captured) self.timeout_ms else self.install_timeout_ms;
+                        if (bound > 0 and started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() >= bound) {
+                            job.killGroup(io, &child);
+                            signals.release();
+                            return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
+                        }
+                        switch (job.peek(&child)) {
+                            .running => continue :read,
+                            .stopped => {
+                                job.killGroup(io, &child);
+                                signals.release();
+                                return error.StoppedWantingTerminal;
+                            },
+                            // Reaped by the asking, so its status is the one
+                            // the caller gets; whatever it wrote is buffered
+                            // and the last read drains it.
+                            .done => |t| {
+                                read_term = t;
+                                mr.fillRemaining(.none) catch {};
+                                break :read;
+                            },
+                        }
+                    },
+                    else => {
+                        job.killGroup(io, &child);
+                        signals.release();
+                        return e;
+                    },
+                };
                 if (rd.buffered().len > cap) {
                     job.killGroup(io, &child);
+                    signals.release();
                     return error.StreamTooLong;
                 }
-            } else |e| switch (e) {
-                error.EndOfStream => {},
-                error.Timeout => {
-                    job.killGroup(io, &child);
-                    return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
-                },
-                else => {
-                    job.killGroup(io, &child);
-                    return e;
-                },
             }
             mr.checkAnyError() catch |e| {
                 job.killGroup(io, &child);
+                signals.release();
                 return e;
             };
             out = try mr.toOwnedSlice(0);
+        }
+
+        // A child the read already found finished has been reaped by that
+        // finding, so there is nothing left to wait for and nothing left to
+        // bound; its own pipe is all that is still open.
+        if (read_term) |t| {
+            signals.release();
+            if (tty) |x| x.takeBack();
+            job.closePipes(io, &child);
+            return fromTerm(t, out);
         }
 
         // The wait is bounded too: a child that closed stdout and lingers
@@ -437,6 +516,7 @@ pub const Process = struct {
         const group = child.id;
         const term = job.waitFor(io, &child, tty) catch |e| {
             guard.reaped.store(true, .release);
+            signals.release();
             if (killer) |*k| _ = k.cancel(io);
             if (tty) |t| t.takeBack();
             // A wait that failed leaves the child unreaped and its group

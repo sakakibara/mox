@@ -116,7 +116,7 @@ fn blacklistValidate(b: backend_mod.Backend, bl: manifest_mod.BlacklistRow, diag
             if (adapterReason(scratch.capture(), bl)) |why| {
                 d.set("{s}: blacklist row {d} \"{s}\": {s}", .{ bl.label, bl.index, bl.name, why });
             } else {
-                d.set("{s}: blacklist row {d} \"{s}\": {s}", .{ bl.label, bl.index, bl.name, @errorName(e) });
+                d.set("{s}: blacklist row {d} \"{s}\": {s}", .{ bl.label, bl.index, bl.name, exec.errorText(e) });
             }
         }
         return e;
@@ -152,7 +152,7 @@ fn duplicates(
         const b = registry.find(row.backend) orelse continue;
         if (b.inert) continue;
         const id = b.idOf(arena, row) catch |e| {
-            if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, exec.errorText(e) });
             return e;
         };
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{ row.backend, id, row.when orelse "" });
@@ -184,13 +184,13 @@ fn contradictions(
         // would refuse a shared manifest on exactly the OS that cannot judge it.
         if (b.inert) continue;
         const blocked = b.idOf(arena, bl.asRow()) catch |e| {
-            if (diag) |d| d.set("{s}: blacklist row {d} \"{s}\": id failed: {s}", .{ bl.label, bl.index, bl.name, @errorName(e) });
+            if (diag) |d| d.set("{s}: blacklist row {d} \"{s}\": id failed: {s}", .{ bl.label, bl.index, bl.name, exec.errorText(e) });
             return e;
         };
         for (m.packages) |row| {
             if (!std.mem.eql(u8, row.backend, bl.backend)) continue;
             const id = b.idOf(arena, row) catch |e| {
-                if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, @errorName(e) });
+                if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, exec.errorText(e) });
                 return e;
             };
             if (!std.mem.eql(u8, id, blocked)) continue;
