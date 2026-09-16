@@ -62,8 +62,8 @@ fn brewWith(
 ) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
-    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .stdout = formulae });
-    try entries.append(a, .{ .argv = "brew list --cask --full-name", .stdout = casks });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = formulae });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = casks });
     try absentLinuxManagers(a, &entries);
     for (extra) |e| try entries.append(a, e);
 
@@ -417,7 +417,7 @@ fn dnfWith(
     try entries.append(a, .{ .argv = "zypper --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "dnf --version", .stdout = "dnf 4.18.0\n" });
     try entries.append(a, .{
-        .argv = "dnf repoquery --userinstalled --qf %{name}\n",
+        .argv = "dnf -q repoquery --userinstalled --qf %{name}\n",
         .stdout = installed,
     });
     for (extra) |e| try entries.append(a, e);
@@ -587,6 +587,7 @@ test "windows: scoop drift and install run through the same core" {
     try std.testing.expect(std.mem.indexOf(u8, s.out, "scoop 7zip") == null);
 
     const fake2 = try windowsWith(a, export_json, &.{
+        .{ .argv = "scoop bucket list", .stdout = "main\n" },
         .{ .argv = "scoop bucket add extras" },
         .{ .argv = "scoop install extras/firefox" },
     });
@@ -759,7 +760,7 @@ test "status: a broken manager is BROKEN drift in every format, and no usable ma
     try std.testing.expect(std.mem.indexOf(u8, r.out, "  BROKEN    brew (brew --version exited 1)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no package manager is usable on this machine\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "treated as absent") == null);
-    try std.testing.expect(!fake.called("brew list --full-name --installed-on-request"));
+    try std.testing.expect(!fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 
     // Machine formats carry it as a record, keep stdout pure, and put the
@@ -809,7 +810,7 @@ test "bootstrap: a manager already present is left alone" {
     }
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping") == null);
     // The package pass still ran over the manager that was already there.
-    try std.testing.expect(fake.called("brew list --full-name --installed-on-request"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
@@ -1766,7 +1767,7 @@ test "plugin: a not-runnable twin of a built-in is noted, and the built-in stays
         "note      backend brew: scripts/backends/brew.ps1: a windows-only kind; not runnable here; the built-in stays\n",
     ) != null);
     // The built-in answered: the row is neither inert nor missing.
-    try std.testing.expect(fake.called("brew list --full-name --installed-on-request"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);

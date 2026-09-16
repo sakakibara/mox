@@ -292,8 +292,8 @@ test "fromManifest: drift comes back per backend" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "brew list --full-name --installed-on-request", .stdout = "ripgrep\nhtop\n" },
-        .{ .argv = "brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\nhtop\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
@@ -324,8 +324,8 @@ test "fromManifest: a manifest matching the machine is clean" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
-        .{ .argv = "brew list --cask --full-name", .stdout = "ghostty\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
@@ -514,8 +514,8 @@ test "fromManifest: a probe error on a backend no row names is a note, and the r
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
-        .{ .argv = "brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
@@ -566,8 +566,8 @@ test "fromManifest: a usable backend leaves no note about usability" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "brew list --full-name --installed-on-request", .stdout = "" },
-        .{ .argv = "brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 

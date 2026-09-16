@@ -37,6 +37,7 @@ pub const Error = error{
     UnknownWingetKey,
     BadWingetValue,
     ScoopQueryFailed,
+    ScoopBucketListFailed,
     ScoopInstallFailed,
     WingetQueryFailed,
     WingetInstallFailed,
@@ -49,6 +50,9 @@ pub const Scoop = struct {
     /// Where scoop lands (`<home>\scoop\shims`), so a bootstrap can name the
     /// bin dir for this same run. Empty means unknown.
     home: []const u8 = "",
+    /// `$env:SCOOP` when set: the installer puts scoop there instead of under
+    /// the profile, so the shims are under it too.
+    scoop_root: ?[]const u8 = null,
     /// How scoop is invoked: `scoop` until a bootstrap installs it, then its
     /// own shim script through pwsh, because a child's PATH is never used to
     /// resolve argv[0] and a freshly installed scoop is on no PATH yet.
@@ -76,8 +80,11 @@ pub const Scoop = struct {
         const res = try exec.runPowerShell(self.runner, arena, &.{ installer_path, "-RunAsAdmin" }, null, true);
         try exec.checkTimedOut(res);
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
-        if (self.home.len == 0) return null;
-        const shims = try std.fs.path.join(arena, &.{ self.home, "scoop", "shims" });
+        const root = self.scoop_root orelse blk: {
+            if (self.home.len == 0) return null;
+            break :blk try std.fs.path.join(arena, &.{ self.home, "scoop" });
+        };
+        const shims = try std.fs.path.join(arena, &.{ root, "shims" });
         const shim = try std.fs.path.join(arena, &.{ shims, "scoop.ps1" });
         self.argv0 = try exec.powerShellArgv(arena, exec.powershell_hosts[0], &.{shim});
         return shims;
@@ -138,18 +145,33 @@ pub const Scoop = struct {
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
+
+        // A bucket must exist before an app in it can resolve, exactly as a
+        // brew tap must, and `scoop bucket add` fails (exit 2) on one already
+        // present, so the ones present are listed once and never re-added.
+        var listed: std.StringHashMapUnmanaged(void) = .empty;
+        for (rows) |row| {
+            if (bucketOf(row) == null) continue;
+            const res = try self.call(arena, &.{ "bucket", "list" }, false);
+            try exec.checkTimedOut(res);
+            if (!res.ok) return Error.ScoopBucketListFailed;
+            listed = try bucketNames(arena, res.stdout);
+            break;
+        }
+
         // One row at a time, and every row is attempted: one app that fails
         // to resolve must not stop the rest of the set.
         var failed = false;
         for (rows) |row| {
-            // A bucket must exist before an app in it can resolve, exactly as
-            // a brew tap must. Adding one already present is a no-op.
             if (bucketOf(row)) |bucket| {
-                const added = try self.call(arena, &.{ "bucket", "add", bucket }, true);
-                try exec.checkTimedOut(added);
-                if (!added.ok) {
-                    failed = true;
-                    continue;
+                if (!listed.contains(bucket)) {
+                    const added = try self.call(arena, &.{ "bucket", "add", bucket }, true);
+                    try exec.checkTimedOut(added);
+                    if (!added.ok) {
+                        failed = true;
+                        continue;
+                    }
+                    try listed.put(arena, bucket, {});
                 }
             }
             const target = if (bucketOf(row)) |bucket|
@@ -176,6 +198,22 @@ fn bucketOf(row: Row) ?[]const u8 {
         .string => |s| if (s.len == 0) null else s,
         else => null,
     };
+}
+
+/// The bucket names of a `scoop bucket list`: one per line, the name first.
+/// Newer versions print a table (`Name Source Updated Manifests`) with a
+/// header and a dashed rule, which are not buckets.
+fn bucketNames(arena: std.mem.Allocator, text: []const u8) !std.StringHashMapUnmanaged(void) {
+    var out: std.StringHashMapUnmanaged(void) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        var toks = std.mem.tokenizeAny(u8, raw, " \t\r");
+        const first = toks.next() orelse continue;
+        if (std.mem.eql(u8, first, "Name")) continue;
+        if (std.mem.indexOfNone(u8, first, "-") == null) continue;
+        try out.put(arena, first, {});
+    }
+    return out;
 }
 
 /// Every `apps[].Name` of a `scoop export` document.
@@ -273,6 +311,9 @@ pub const Winget = struct {
         // A stale export from an interrupted run would otherwise be read as
         // this machine's current state.
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        // And whatever this run leaves, on every path out: a failed export
+        // may still have written part of one.
+        defer Io.Dir.cwd().deleteFile(self.io, path) catch {};
 
         const res = try self.runner.run(arena, &.{
             "winget",                     "export",
@@ -284,7 +325,6 @@ pub const Winget = struct {
 
         const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(8 << 20)) catch
             return Error.UnreadableExport;
-        defer Io.Dir.cwd().deleteFile(self.io, path) catch {};
         return packageIdentifiers(arena, text);
     }
 
@@ -297,15 +337,28 @@ pub const Winget = struct {
             if (stringField(row, "source")) |v| try argv.appendSlice(arena, &.{ "--source", v });
             if (stringField(row, "scope")) |v| try argv.appendSlice(arena, &.{ "--scope", v });
             if (stringField(row, "override")) |v| try argv.appendSlice(arena, &.{ "--override", v });
+            // A row declares presence, not currency: without this an install
+            // of something already there becomes an upgrade.
+            try argv.append(arena, "--no-upgrade");
             // Without both, winget stops on a prompt no unattended apply can
             // answer.
             try argv.appendSlice(arena, &.{ "--accept-package-agreements", "--accept-source-agreements" });
 
             const res = try self.runner.stream(arena, argv.items);
             try exec.checkTimedOut(res);
-            if (!res.ok) failed = true;
+            if (!res.ok and !alreadyInstalled(res.code)) failed = true;
         }
         if (failed) return Error.WingetInstallFailed;
+    }
+
+    /// A package `winget export` omits (installed outside any source) is
+    /// declared MISSING, and installing it exits
+    /// APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED (0x8A15002B) or
+    /// APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPGRADE (0x8A15010D): it is
+    /// there, so the row has landed. Only the low byte of the HRESULT
+    /// reaches here, because `Term.exited` is a `u8`.
+    fn alreadyInstalled(code: u8) bool {
+        return code == 0x2B or code == 0x0D;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
@@ -437,14 +490,95 @@ test "scoop: install adds the bucket first, then installs qualified" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop bucket list", .stdout = "main\n" },
         .{ .argv = "scoop bucket add extras" },
         .{ .argv = "scoop install extras/firefox" },
     } };
     var s: Scoop = .{ .runner = fake.runner() };
 
     try s.backend().install(a, &.{scoopRow("firefox", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }})});
+    try testing.expectEqualStrings("scoop bucket list", fake.calls.items[0]);
     try testing.expect(fake.called("scoop bucket add extras"));
     try testing.expect(fake.called("scoop install extras/firefox"));
+}
+
+const scoop_bucket_table =
+    "\r\n" ++
+    "Name   Source                                  Updated             Manifests\r\n" ++
+    "----   ------                                  -------             ---------\r\n" ++
+    "main   https://github.com/ScoopInstaller/Main  2026-09-13 10:00:00      1400\r\n" ++
+    "extras https://github.com/ScoopInstaller/Extras 2026-09-13 10:00:00     2100\r\n";
+
+test "scoop: a bucket already listed is not added again, a missing one is added once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `scoop bucket add` exits 2 on a bucket that is there, so re-adding
+    // `extras` would fail every row in it. The Fake has no such entry: an
+    // add of a listed bucket fails as an unscripted command.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop bucket list", .stdout = scoop_bucket_table },
+        .{ .argv = "scoop install extras/firefox" },
+        .{ .argv = "scoop install extras/vlc" },
+        .{ .argv = "scoop bucket add nerd-fonts", .once = true },
+        .{ .argv = "scoop install nerd-fonts/FiraCode-NF" },
+        .{ .argv = "scoop install nerd-fonts/Hack-NF" },
+    } };
+    var s: Scoop = .{ .runner = fake.runner() };
+
+    try s.backend().install(a, &.{
+        scoopRow("firefox", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }}),
+        scoopRow("vlc", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }}),
+        scoopRow("FiraCode-NF", &.{.{ .key = "bucket", .value = .{ .string = "nerd-fonts" } }}),
+        scoopRow("Hack-NF", &.{.{ .key = "bucket", .value = .{ .string = "nerd-fonts" } }}),
+    });
+    try testing.expect(!fake.called("scoop bucket add extras"));
+    try testing.expect(!fake.called("scoop bucket add main"));
+    // Listed once per batch, and the bucket just added is not added for the
+    // second row in it (the entry answers once; a second add is unscripted).
+    var lists: usize = 0;
+    var adds: usize = 0;
+    for (fake.calls.items) |c| {
+        if (std.mem.eql(u8, c, "scoop bucket list")) lists += 1;
+        if (std.mem.eql(u8, c, "scoop bucket add nerd-fonts")) adds += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), lists);
+    try testing.expectEqual(@as(usize, 1), adds);
+    try testing.expect(fake.called("scoop install nerd-fonts/Hack-NF"));
+}
+
+test "scoop: a bucket list that fails is a named failure, and nothing is added blind" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop bucket list", .code = 1 },
+    } };
+    var s: Scoop = .{ .runner = fake.runner() };
+
+    try testing.expectError(Error.ScoopBucketListFailed, s.backend().install(a, &.{
+        scoopRow("firefox", &.{.{ .key = "bucket", .value = .{ .string = "extras" } }}),
+    }));
+    try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+}
+
+test "bucketNames: the table's header and rule are not buckets; the bare form still parses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var table = try bucketNames(a, scoop_bucket_table);
+    try testing.expectEqual(@as(usize, 2), table.count());
+    try testing.expect(table.contains("main"));
+    try testing.expect(table.contains("extras"));
+    try testing.expect(!table.contains("Name"));
+    try testing.expect(!table.contains("----"));
+
+    var bare = try bucketNames(a, "main\nextras\n");
+    try testing.expectEqual(@as(usize, 2), bare.count());
+    try testing.expect(bare.contains("extras"));
 }
 
 test "scoop: a bucketless row installs bare and adds no bucket" {
@@ -534,7 +668,7 @@ test "winget: install carries source, scope and override, and both agreements" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "winget install --id Microsoft.PowerShell --source winget --scope machine " ++
-            "--override /SILENT --accept-package-agreements --accept-source-agreements" },
+            "--override /SILENT --no-upgrade --accept-package-agreements --accept-source-agreements" },
     } };
     var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
 
@@ -552,14 +686,59 @@ test "winget: a bare row installs with the agreements alone" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "winget install --id Git.Git --accept-package-agreements --accept-source-agreements" },
+        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements" },
     } };
     var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
 
     try w.backend().install(a, &.{wingetRow("Git.Git", &.{})});
     try testing.expect(fake.called(
-        "winget install --id Git.Git --accept-package-agreements --accept-source-agreements",
+        "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements",
     ));
+}
+
+test "winget: a package that is there but absent from the export counts as landed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The low bytes of PACKAGE_ALREADY_INSTALLED (0x8A15002B) and
+    // NO_APPLICABLE_UPGRADE (0x8A15010D); any other failure still fails.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x2B },
+        .{ .argv = "winget install --id Microsoft.PowerShell --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 0x0D },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+
+    try w.backend().install(a, &.{ wingetRow("Git.Git", &.{}), wingetRow("Microsoft.PowerShell", &.{}) });
+
+    var other: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "winget install --id Git.Git --no-upgrade --accept-package-agreements --accept-source-agreements", .code = 1 },
+    } };
+    var w2: Winget = .{ .runner = other.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    try testing.expectError(Error.WingetInstallFailed, w2.backend().install(a, &.{wingetRow("Git.Git", &.{})}));
+}
+
+test "winget: a failed export leaves no scratch file behind" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+    const name = try std.fmt.allocPrint(a, "winget-export-{d}.json", .{exec.processId()});
+    const path = try std.fs.path.join(a, &.{ scratch, exec.tmp_subdir, name });
+    const argv = try std.fmt.allocPrint(a, "winget export -o {s} --accept-source-agreements", .{path});
+
+    // The export writes a partial file and then fails.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = argv, .stdout = "{\"Sources\":[", .write_after = "-o", .io = io, .code = 1 },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = io, .scratch_dir = scratch };
+
+    try testing.expectError(Error.WingetQueryFailed, w.backend().installedExplicit(a));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
 }
 
 test "winget: validate refuses an unknown key and a scope outside the set" {
@@ -635,6 +814,26 @@ test "scoop: without pwsh, the installer and the shim run through powershell" {
     try testing.expectEqual(@as(usize, 4), fake.calls.items.len);
     try testing.expect(fake.called("powershell -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin"));
     try testing.expect(fake.called(ps_probe));
+}
+
+test "scoop: with SCOOP set, the shims after a bootstrap are under it, not the profile" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const shims = try std.fs.path.join(a, &.{ "D:\\scoop", "shims" });
+    const shim = try std.fs.path.join(a, &.{ shims, "scoop.ps1" });
+    const shim_export = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} export", .{shim});
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1 -RunAsAdmin" },
+        .{ .argv = shim_export, .stdout = scoop_export },
+    } };
+    var s: Scoop = .{ .runner = fake.runner(), .home = "C:\\Users\\x", .scoop_root = "D:\\scoop" };
+
+    const got = (try s.backend().bootstrap(a, "C:\\i.ps1")).?;
+    try testing.expectEqualStrings(shims, got);
+    _ = try s.backend().installedExplicit(a);
+    try testing.expect(fake.called(shim_export));
 }
 
 test "available: present, absent and broken on both managers" {

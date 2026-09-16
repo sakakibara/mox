@@ -76,15 +76,19 @@ pub const Zypper = struct {
         return row.name;
     }
 
-    /// The ledger, narrowed to what is actually installed. rpm is the query
-    /// because it is the stable machine-readable one on this family; zypper's
-    /// own search output is a table meant for a person.
+    /// The ledger, narrowed to what is actually installed.
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
 
         const recorded = try self.ledger.read(arena);
         if (recorded.len == 0) return &.{};
+        return self.presentOf(arena, recorded);
+    }
 
+    /// The names of `ids` that rpm reports installed, in order. rpm is the
+    /// query because it is the stable machine-readable one on this family;
+    /// zypper's own search output is a table meant for a person.
+    fn presentOf(self: *Zypper, arena: std.mem.Allocator, ids: []const []const u8) anyerror![]const []const u8 {
         const res = try self.runner.run(arena, &.{ "rpm", "-qa", "--qf", "%{NAME}\n" });
         try exec.checkTimedOut(res);
         if (!res.ok) return Error.ZypperQueryFailed;
@@ -98,10 +102,22 @@ pub const Zypper = struct {
         }
 
         var out: std.ArrayList([]const u8) = .empty;
-        for (recorded) |id| {
+        for (ids) |id| {
             if (present.contains(id)) try out.append(arena, id);
         }
         return out.toOwnedSlice(arena);
+    }
+
+    /// zypper reports some outcomes that are not failures through its exit
+    /// code: after a refresh, 100-103 (updates, patches, a reboot or a
+    /// restart needed) and 106 (a repository skipped); after an install, 102
+    /// and 103 (a reboot or restart needed for what was installed).
+    fn refreshOk(res: exec.Result) bool {
+        return res.ok or (res.code >= 100 and res.code <= 103) or res.code == 106;
+    }
+
+    fn installOk(res: exec.Result) bool {
+        return res.ok or res.code == 102 or res.code == 103;
     }
 
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
@@ -115,7 +131,7 @@ pub const Zypper = struct {
         try refresh.appendSlice(arena, &.{ "zypper", "--non-interactive", "refresh" });
         const up = try self.runner.stream(arena, refresh.items);
         try exec.checkTimedOut(up);
-        if (!up.ok) return Error.ZypperInstallFailed;
+        if (!refreshOk(up)) return Error.ZypperInstallFailed;
 
         var argv: std.ArrayList([]const u8) = .empty;
         if (elevate) try argv.append(arena, "sudo");
@@ -124,13 +140,21 @@ pub const Zypper = struct {
 
         const res = try self.runner.stream(arena, argv.items);
         try exec.checkTimedOut(res);
-        if (!res.ok) return Error.ZypperInstallFailed;
 
-        // Recorded only after the install succeeded: a ledger entry for a
-        // package that never landed would read as installed forever.
         var ids: std.ArrayList([]const u8) = .empty;
         for (rows) |row| try ids.append(arena, row.name);
-        try self.ledger.add(arena, ids.items);
+        if (installOk(res)) {
+            try self.ledger.add(arena, ids.items);
+            return;
+        }
+        // A failed batch may still have landed some of its rows, and a row
+        // that landed unrecorded is invisible here forever: reported MISSING
+        // on every status, re-attempted beside the same failing sibling on
+        // every apply. Only what rpm confirms is recorded; nothing that never
+        // landed is.
+        const landed = try self.presentOf(arena, ids.items);
+        if (landed.len > 0) try self.ledger.add(arena, landed);
+        return Error.ZypperInstallFailed;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
@@ -254,7 +278,7 @@ test "install: refreshes, installs the batch, and records what landed" {
     try testing.expectEqualStrings("ripgrep", recorded[0]);
 }
 
-test "install: a failure records nothing" {
+test "install: a failure that landed nothing records nothing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -265,12 +289,89 @@ test "install: a failure records nothing" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
         .{ .argv = "sudo zypper --non-interactive install ripgrep", .code = 1 },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nglibc\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
     try testing.expectError(Error.ZypperInstallFailed, z.backend().install(a, &.{rowOf("ripgrep", &.{})}));
     // A record here would claim it is installed forever.
     try testing.expectEqual(@as(usize, 0), (try z.ledger.read(a)).len);
+}
+
+test "install: a failed batch records the rows that landed, and only those" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `ripgrep` landed before `nosuch` failed the batch. Unrecorded, it
+    // would be MISSING on every status and re-attempted beside the same
+    // failing sibling on every apply.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "sudo zypper --non-interactive install ripgrep nosuch", .code = 104 },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    try testing.expectError(Error.ZypperInstallFailed, z.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("nosuch", &.{}) }));
+    const recorded = try z.ledger.read(a);
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expectEqualStrings("ripgrep", recorded[0]);
+}
+
+test "install: a reboot or restart needed after the install is a success" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ZYPPER_EXIT_INF_REBOOT_NEEDED (102) and ZYPPER_EXIT_INF_RESTART_NEEDED
+    // (103) are informational; rpm is not consulted for a success.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "sudo zypper --non-interactive install kernel-default", .code = 102, .once = true },
+        .{ .argv = "sudo zypper --non-interactive install kernel-default", .code = 103 },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    try z.backend().install(a, &.{rowOf("kernel-default", &.{})});
+    try z.backend().install(a, &.{rowOf("kernel-default", &.{})});
+    const recorded = try z.ledger.read(a);
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expectEqualStrings("kernel-default", recorded[0]);
+    try testing.expect(!fake.called("rpm -qa --qf %{NAME}\n"));
+}
+
+test "install: an informational refresh exit is not a failed install" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const codes = [_]u8{ 100, 101, 102, 103, 106 };
+    for (codes) |code| {
+        var fake: exec.Fake = .{ .arena = a, .entries = &.{
+            .{ .argv = "sudo zypper --non-interactive refresh", .code = code },
+            .{ .argv = "sudo zypper --non-interactive install bat" },
+        } };
+        var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+        try z.backend().install(a, &.{rowOf("bat", &.{})});
+        try testing.expect(fake.called("sudo zypper --non-interactive install bat"));
+    }
+
+    // 104 (ZYPPER_EXIT_INF_CAP_NOT_FOUND) after a refresh is not among them.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh", .code = 104 },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    try testing.expectError(Error.ZypperInstallFailed, z.backend().install(a, &.{rowOf("bat", &.{})}));
 }
 
 test "install: root installs without sudo" {

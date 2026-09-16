@@ -81,6 +81,7 @@ pub const Brew = struct {
         const io = self.io orelse return error.NoBootstrapForBackend;
 
         const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", installer_path });
+        try exec.checkTimedOut(res);
         if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
 
         for (self.prefixes) |dir| {
@@ -95,10 +96,19 @@ pub const Brew = struct {
         return bootstrap_mod.Error.BootstrapFailed;
     }
 
+    /// Bare, not under `query_env`: `env` would answer an absent brew with
+    /// exit 127 rather than the spawn failure that means absent, and
+    /// `--version` is answered before brew reaches anything that fetches.
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         return Backend.probeAvailability(self.exe, self.runner.run(arena, &.{ self.exe, "--version" }));
     }
+
+    /// `brew list` refreshes the formula and cask API data when the cached
+    /// copy is older than a week; under this it never does, so a read-only
+    /// `mox status` stays offline. Through `env` because an adapter has no
+    /// environment of its own to set.
+    const query_env = [_][]const u8{ "env", "HOMEBREW_NO_AUTO_UPDATE=1" };
 
     fn validateImpl(_: *anyopaque, row: Row, diag: ?*Diag) anyerror!void {
         for (row.fields) |p| {
@@ -141,12 +151,12 @@ pub const Brew = struct {
 
         var out: std.ArrayList([]const u8) = .empty;
 
-        const formulae = try self.runner.run(arena, &.{ self.exe, "list", "--full-name", "--installed-on-request" });
+        const formulae = try self.runner.run(arena, &(query_env ++ .{ self.exe, "list", "--full-name", "--installed-on-request" }));
         try exec.checkTimedOut(formulae);
         if (!formulae.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, formulae.stdout, "");
 
-        const casks = try self.runner.run(arena, &.{ self.exe, "list", "--cask", "--full-name" });
+        const casks = try self.runner.run(arena, &(query_env ++ .{ self.exe, "list", "--cask", "--full-name" }));
         try exec.checkTimedOut(casks);
         if (!casks.ok) return error.BrewQueryFailed;
         try appendLines(arena, &out, casks.stdout, cask_prefix);
@@ -351,10 +361,10 @@ test "installedExplicit: formulae bare, tapped fully qualified, casks prefixed" 
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{
-            .argv = "brew list --full-name --installed-on-request",
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request",
             .stdout = "ripgrep\nd12frosted/emacs-plus/emacs-plus@30\n",
         },
-        .{ .argv = "brew list --cask --full-name", .stdout = "ghostty\n1password\n" },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n1password\n" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();
@@ -375,7 +385,7 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     // An empty list would read as "nothing installed" and make every desired
     // package look missing.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "brew list --full-name --installed-on-request", .code = 1 },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 1 },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();
@@ -537,6 +547,20 @@ test "bootstrap: after installing, brew is invoked by the path it landed at" {
         try testing.expectEqual(bootstrap_mod.Error.BootstrapFailed, e);
         try testing.expectEqualStrings(before, b.exe);
     }
+}
+
+test "bootstrap: an installer killed at its bound is a timeout, not a failed bootstrap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env NONINTERACTIVE=1 /bin/bash /tmp/i", .timed_out = true },
+    } };
+    var b: Brew = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+
+    try testing.expectError(error.TimedOut, b.backend().bootstrap(a, "/tmp/i"));
+    try testing.expectEqualStrings("brew", b.exe);
 }
 
 test "install: a failed tap fails its row and the rows after it still run" {

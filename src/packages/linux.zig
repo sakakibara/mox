@@ -58,7 +58,10 @@ pub const Manager = enum {
             // single absurd package and makes every declared row look
             // missing. The default format is full NEVRA
             // (`bat-0:0.24.0-1.fc44.aarch64`), which matches no row either.
-            .dnf => &.{ "dnf", "repoquery", "--userinstalled", "--qf", "%{name}\n" },
+            // `-q` because dnf4 (RHEL 8 and 9, Fedora up to 40) prints
+            // "Last metadata expiration check ..." on stdout, where it would
+            // read as a package name.
+            .dnf => &.{ "dnf", "-q", "repoquery", "--userinstalled", "--qf", "%{name}\n" },
             .pacman => &.{ "pacman", "-Qeq" },
         };
     }
@@ -225,7 +228,14 @@ test "installedExplicit: a failed query is an error, never an empty set" {
 test "dnf: the query asks for newline-separated bare names" {
     // Verified against dnf5 5.4.3: the default format is full NEVRA, and a
     // format string without the newline concatenates every name into one.
-    try testing.expectEqualStrings("%{name}\n", Manager.dnf.queryArgv()[4]);
+    try testing.expectEqualStrings("%{name}\n", Manager.dnf.queryArgv()[5]);
+}
+
+test "dnf: the query is quiet, so dnf4's metadata notice cannot read as a package" {
+    // Verified against dnf 4.14 (Rocky 9): without `-q` the first stdout
+    // line is "Last metadata expiration check: ...", which the line split
+    // would report as an installed package.
+    try testing.expectEqualStrings("-q", Manager.dnf.queryArgv()[1]);
 }
 
 test "install: root installs without sudo, which a minimal image lacks" {
