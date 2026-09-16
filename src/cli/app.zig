@@ -177,9 +177,9 @@ pub const PackageBackends = struct {
         const r = self.runner();
         self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
         if (brew_prefixes_override) |p| self.brew.prefixes = p;
-        self.apt = .{ .manager = .apt, .runner = r };
-        self.dnf = .{ .manager = .dnf, .runner = r };
-        self.pacman = .{ .manager = .pacman, .runner = r };
+        self.apt = .{ .manager = .apt, .runner = r, .err = err };
+        self.dnf = .{ .manager = .dnf, .runner = r, .err = err };
+        self.pacman = .{ .manager = .pacman, .runner = r, .err = err };
         self.scoop = .{ .runner = r, .home = home, .env = env };
         self.winget = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
         self.zypper = .{

@@ -1151,7 +1151,9 @@ fn applyPackages(
             );
             try ctx.err.flush();
             counts.failed += 1;
-            counts.attempted += rows.items.len;
+            // A batch refused before it ran landed nothing, so saying its rows
+            // may have is a hedge about work that never happened.
+            if (!mox.packages.backend.refusedBeforeRunning(e)) counts.attempted += rows.items.len;
             continue;
         };
         counts.installed += rows.items.len;

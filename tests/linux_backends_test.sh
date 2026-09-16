@@ -25,12 +25,17 @@
 # the same fetch, digest check and non-interactive install a fresh machine
 # gets -- before installing the package through it.
 #
-# One case runs the other way round. mox never uninstalls anything, and an
-# install argv accepts more than package names: `apt-get install -y vim nano-`
-# removes nano. The hermetic suite proves the adapter refuses such a row; only
-# a real apt, with a real nano installed beside it, proves that the row would
-# have removed the package and that mox stopped before it could. That case
-# runs with the default set, not from the image/backend/package arguments.
+# Four cases run the other way round, because a name a manager resolves to
+# something other than itself is a fact about the manager that no fake can
+# establish: `apt-get install -y vim nano-` removes nano; `apt-get install --
+# bsdextrautil.` installs bsdextrautils, apt having matched the operand as a
+# regular expression; and `dnf install zlib-devel` installs
+# zlib-ng-compat-devel, `zlib-devel` being a capability rather than a package.
+# The hermetic suite proves the adapter refuses each row; only the real
+# manager proves what the row would have done. A fifth runs the round trip a
+# multiarch machine needs, which is the one place a colon in a name is the
+# name apt itself reports. These five run with the default set, not from the
+# image/backend/package arguments.
 
 set -eu
 
@@ -62,8 +67,8 @@ fi
 # host can build. A runner is x86_64; an Apple-silicon workstation is arm64.
 arch="$(uname -m)"
 case "$arch" in
-  arm64 | aarch64) platform=linux/arm64 target=aarch64-linux-musl ;;
-  *) platform=linux/amd64 target=x86_64-linux-musl ;;
+  arm64 | aarch64) platform=linux/arm64 target=aarch64-linux-musl foreign_arch=armhf ;;
+  *) platform=linux/amd64 target=x86_64-linux-musl foreign_arch=i386 ;;
 esac
 
 echo "Building mox for $target"
@@ -328,6 +333,186 @@ EOF
   fi
 }
 
+# A row named `bsdextrautil.` is not a package: apt falls back to matching an
+# install operand as an unanchored regex, and installs bsdextrautils. mox must
+# refuse the batch, naming the row, and leave the collateral uninstalled.
+run_regex_operand_case() {
+  image="$1"
+  backend="apt regex-operand"
+
+  case_dir="$work/regex-operand"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "bsdextrautil."
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      dpkg -s bsdextrautils >/dev/null 2>&1 && { echo "the image ships bsdextrautils; the case cannot run"; exit 1; }
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      dpkg -s bsdextrautils >/dev/null 2>&1 && echo "collateral=present" || echo "collateral=absent"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q 'mox: apt: row "bsdextrautil." names no apt package' "$out"; then
+    ok "$backend ($image): the row is refused, naming it and what apt would have done"
+  else
+    no "$backend ($image): apply did not refuse the row with the expected message" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+
+  if grep -q "collateral=absent" "$out"; then
+    ok "$backend ($image): bsdextrautils was never installed; the manifest declares no such package"
+  else
+    no "$backend ($image): apt installed a package the manifest never declared" "$(tail -5 "$out")"
+  fi
+}
+
+# A foreign-architecture package is the one name apt reports with a colon in
+# it, so declaring it must round-trip: MISSING -> install -> clean.
+run_multiarch_case() {
+  image="$1"
+  foreign="$2"
+  backend="apt multiarch"
+
+  case_dir="$work/multiarch"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<EOF
+backend = "apt"
+
+[[packages]]
+name = "libc6:$foreign"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      dpkg --add-architecture '"$foreign"'
+      apt-get update >/dev/null
+      echo "--- before ---"
+      /w/mox status || true
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      /w/mox status || true
+      echo "--- showmanual ---"
+      apt-mark showmanual | grep ":'"$foreign"'" || echo "not-manual"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- showmanual ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+apt libc6:$foreign"; then
+    ok "$backend ($image): a foreign-architecture package the machine lacks is MISSING"
+  else
+    no "$backend ($image): expected 'libc6:$foreign' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q "Packages: 1 installed, 0 failed" "$out"; then
+    ok "$backend ($image): apply installed it through the real apt"
+  else
+    no "$backend ($image): apply did not report a successful install" "$(grep -i 'packages:\|failed' "$out" | tail -3)"
+  fi
+
+  # apt-mark is what mox reads back, so the qualified name must be in it.
+  if grep -q "^libc6:$foreign" "$out"; then
+    ok "$backend ($image): apt-mark reports the package under the qualified name"
+  else
+    no "$backend ($image): apt-mark did not report libc6:$foreign" "$(sed -n '/--- showmanual ---/,$p' "$out")"
+  fi
+
+  if echo "$after" | grep -qE "(MISSING|UNTRACKED)[[:space:]]+apt libc6:$foreign"; then
+    no "$backend ($image): drift over libc6:$foreign survived apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+}
+
+# `zlib-devel` is not a package in Fedora; it is a capability that
+# zlib-ng-compat-devel provides. The row must be refused with the name to
+# write in its place, and nothing installed behind the user's back.
+run_provide_name_case() {
+  image="$1"
+  backend="dnf provide-name"
+
+  case_dir="$work/provide-name"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/dnf.toml" <<'EOF'
+backend = "dnf"
+
+[[packages]]
+name = "zlib-devel"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      rpm -q zlib-devel >/dev/null 2>&1 && { echo "this image has a real zlib-devel; the case cannot run"; exit 1; }
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      rpm -q zlib-ng-compat-devel >/dev/null 2>&1 && echo "collateral=present" || echo "collateral=absent"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  # The message must carry the name to declare, or the user is left with a
+  # row that fails on every apply and no way to learn what to write.
+  if grep -q 'mox: dnf: row "zlib-devel" names no dnf package; it is a capability provided by "zlib-ng-compat-devel"' "$out"; then
+    ok "$backend ($image): the row is refused, naming the package that provides it"
+  else
+    no "$backend ($image): apply did not name the real package" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+
+  if grep -q "collateral=absent" "$out"; then
+    ok "$backend ($image): zlib-ng-compat-devel was never installed; the manifest declares no such package"
+  else
+    no "$backend ($image): dnf installed a package the manifest never declared" "$(tail -5 "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -336,10 +521,15 @@ if [ "$#" -gt 0 ]; then
 else
   run_case debian:stable apt ripgrep
   run_remove_suffix_case debian:stable
+  run_regex_operand_case debian:stable
+  # The foreign architecture is whichever one the host is not: i386 beside
+  # amd64 (Steam, wine), armhf beside arm64 (cross work).
+  run_multiarch_case debian:stable "$foreign_arch"
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
   run_case fedora:latest dnf ripgrep
+  run_provide_name_case fedora:latest
   # jq, not ripgrep: Rocky 9's default repos carry no ripgrep -- it lives in
   # EPEL, which the stock image does not enable, so that case could only fail.
   run_case rockylinux:9 dnf jq

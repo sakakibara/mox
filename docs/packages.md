@@ -191,6 +191,27 @@ bare name; both are refused for the same reason. Beyond the check, the
 operands are passed after `--`, so nothing a row is named can be read as an
 option.
 
+apt is the one exception to the plain name, because its own
+`apt-mark showmanual` reports a foreign-architecture package qualified: an
+apt row may carry one `:<arch>` suffix, as in `libc6:armhf`, where the
+architecture holds only letters, digits and `-`. The colon stays refused on
+dnf, pacman and zypper, whose queries never answer with one -- zypper reads
+it as a selector separator (`pattern:`, `patch:`) instead.
+
+Whether the manager actually **has** a package of that name is a separate
+question, asked where the install is rather than at load, since only the
+manager can answer it and a manifest must read the same on every machine.
+Before an apt install, mox asks `apt-cache --generate pkgnames` -- apt's one
+literal-matching query -- and refuses a batch naming anything absent from it:
+`apt-get install` otherwise falls back to reading the operand as an unanchored
+regular expression, so `libz.dev` installs ten packages the manifest never
+declared and `ruby.dev` installs hundreds. Before a dnf install, mox asks
+`dnf repoquery` the same question, and a name that is only an rpm capability
+rather than a package -- `zlib-devel`, which `zlib-ng-compat-devel` provides
+-- is refused with the name to declare in its place. Both refusals install
+nothing at all; an apt row qualified with the machine's own architecture is
+refused the same way, since `apt-mark` reports that one bare.
+
 ### brew taps
 
 A tap is not a key. A tap-qualified name names its own tap, and declaring

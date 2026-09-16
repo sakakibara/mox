@@ -460,8 +460,13 @@ test "linux: a dnf machine reports and installs through the same core" {
     try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING   dnf ripgrep") != null);
     try std.testing.expect(std.mem.indexOf(u8, s.out, "UNTRACKED dnf htop") != null);
 
+    // The install first asks dnf whether the name is a package at all: an
+    // rpm virtual provide is spelled like one and would otherwise install a
+    // package of another name.
     const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
+        .{ .argv = "dnf -q repoquery --qf %{name}\n -- ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "sudo dnf install -y -- ripgrep" },
+        .{ .argv = "dnf install -y -- ripgrep" },
     });
     useFake(fake2);
     _ = try h.run(&.{ "mox", "apply" });
@@ -738,6 +743,36 @@ test "status: an absent manager apply would bootstrap is not a clean machine" {
     try std.testing.expectEqual(@as(u8, 1), j.rc);
 }
 
+test "apply: a batch refused before it ran is not reported as maybe landed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // zypper refuses a selector row before asking zypper anything, so nothing
+    // it named can have landed. Saying otherwise hedges about work that never
+    // happened.
+    try writeManifest(io, h, a, "suse.toml", "backend = \"zypper\"\n\n[[packages]]\nname = \"vim\"\nkind = \"nonsense\"\n");
+
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "zypper --version", .stdout = "zypper 1.14.0\n" });
+    try entries.append(a, .{ .argv = "rpm -qa --qf %{NAME}\\n", .stdout = "" });
+    try entries.append(a, .{ .argv = "brew --version", .code = 127 });
+    try entries.append(a, .{ .argv = "apt-get --version", .code = 127 });
+    try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
+    try entries.append(a, .{ .argv = "pacman --version", .code = 127 });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+}
+
 test "commit: a declared row its own backend would refuse is not written" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -771,6 +806,39 @@ test "commit: a declared row its own backend would refuse is not written" {
     // The file is exactly what it was: no row, and nothing to repair.
     const after = try readManifest(io, h, a, "debian.toml");
     try std.testing.expectEqualStrings("backend = \"apt\"\n", after);
+}
+
+test "commit: a foreign-architecture package apt reports is recorded, not refused" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml", "backend = \"apt\"\n");
+
+    // `apt-mark showmanual` is mox's own explicit-install query, and on any
+    // multiarch machine it answers with names like this one. A row it cannot
+    // write is drift no command could ever clear.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
+    try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = "libc6:armhf\n" });
+    try entries.append(a, .{ .argv = "brew --version", .code = 127 });
+    try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
+    try entries.append(a, .{ .argv = "pacman --version", .code = 127 });
+    try entries.append(a, .{ .argv = "zypper --version", .code = 127 });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "would be refused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "recorded in") != null);
+    const after = try readManifest(io, h, a, "debian.toml");
+    try std.testing.expect(std.mem.indexOf(u8, after, "name = \"libc6:armhf\"") != null);
 }
 
 test "status: one backend failing a verb does not throw away what the others answered" {

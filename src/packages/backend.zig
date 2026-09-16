@@ -53,29 +53,45 @@ pub fn nameShapeOk(name: []const u8) bool {
     return plainText(name);
 }
 
-/// Why a name is not a plain package name, for an adapter whose manager
-/// takes package names as bare operands in its install argv.
+/// How wide a manager's package namespace is. One shared class cannot serve
+/// every manager: apt's own explicit-install query reports a
+/// foreign-architecture package as `pkg:arch`, while zypper reads `:` as a
+/// selector separator (`pattern:`, `patch:`), which rpm can never read back.
+pub const NameClass = enum {
+    plain,
+    /// A plain name, optionally carrying one `:<arch>` qualifier.
+    multiarch,
+};
+
+/// Why a name is not a package name, for an adapter whose manager takes
+/// package names as bare operands in its install argv.
 pub const NameProblem = enum {
     empty,
     leading,
     character,
     trailing_hyphen,
+    arch,
 
     /// The clause a diagnostic states after naming the file and the row.
-    pub fn text(self: NameProblem) []const u8 {
+    pub fn text(self: NameProblem, class: NameClass) []const u8 {
         return switch (self) {
             .empty => "a name cannot be empty",
             .leading => "a name begins with a letter or a digit",
-            .character => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+            .character => switch (class) {
+                .plain => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\"",
+                .multiarch => "a name holds only letters, digits and \".\", \"_\", \"+\" or \"-\", optionally followed by \":\" and an architecture",
+            },
             // apt-get reads `nano-` as "remove nano" and zypper reads `-nano`
             // and `!nano` the same way, so a row can otherwise ask mox to
             // uninstall a package on every apply.
             .trailing_hyphen => "a name does not end with \"-\", which an install reads as a request to remove the package",
+            .arch => "a name carries one \":\" at most, and an architecture holds only letters, digits and \"-\"",
         };
     }
 };
 
-/// Whether `name` is a plain package name, and if not, which rule it broke.
+/// Whether `name` is a package name of `class`, and if not, which rule it
+/// broke.
 ///
 /// An allowlist, because the denylist it replaced could not be finished: an
 /// install argv accepts far more than package names -- remove suffixes,
@@ -89,18 +105,66 @@ pub const NameProblem = enum {
 /// apply.
 ///
 /// A trailing `+` stays legal: `g++` is a real package.
-pub fn plainNameProblem(name: []const u8) ?NameProblem {
+/// Whether a failed install refused the batch before running it, so nothing
+/// it named can have landed. An adapter that checks a row against its own
+/// manager before installing raises one of these; a manager that failed
+/// part-way through a batch does not, and what it already did is the
+/// caller's to report.
+pub fn refusedBeforeRunning(e: anyerror) bool {
+    return switch (e) {
+        error.DistroNameNotAPackage, error.ZypperSelectorRow, error.UnknownZypperKey => true,
+        else => false,
+    };
+}
+
+pub fn nameProblem(name: []const u8, class: NameClass) ?NameProblem {
     if (name.len == 0) return .empty;
-    if (!std.ascii.isAlphanumeric(name[0])) return .leading;
-    for (name) |c| {
+    const base = switch (class) {
+        .plain => name,
+        .multiarch => blk: {
+            const colon = std.mem.indexOfScalar(u8, name, ':') orelse break :blk name;
+            if (!isArchitecture(name[colon + 1 ..])) return .arch;
+            break :blk name[0..colon];
+        },
+    };
+    if (base.len == 0) return .leading;
+    if (!std.ascii.isAlphanumeric(base[0])) return .leading;
+    for (base) |c| {
         if (std.ascii.isAlphanumeric(c)) continue;
         switch (c) {
             '.', '_', '+', '-' => {},
             else => return .character,
         }
     }
-    if (name[name.len - 1] == '-') return .trailing_hyphen;
+    if (base[base.len - 1] == '-') return .trailing_hyphen;
     return null;
+}
+
+/// Whether `s` has the shape of a dpkg architecture (`amd64`, `armhf`,
+/// `kfreebsd-amd64`). Neither `.` nor `+` is one, which keeps a regex
+/// metacharacter out of the one part of a name apt does not resolve against
+/// its package list.
+fn isArchitecture(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!std.ascii.isAlphanumeric(s[0])) return false;
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-') continue;
+        return false;
+    }
+    return s[s.len - 1] != '-';
+}
+
+/// `name` without its `:<arch>` qualifier: the name apt resolves against its
+/// package list, and the one `apt-cache pkgnames` lists.
+pub fn bareName(name: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, name, ':') orelse return name;
+    return name[0..colon];
+}
+
+/// The `:<arch>` qualifier `name` carries, or null.
+pub fn archOf(name: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, name, ':') orelse return null;
+    return name[colon + 1 ..];
 }
 
 /// The architecture suffix `name` carries, or null. rpm reports an
@@ -338,32 +402,66 @@ test "idShapeOk / nameShapeOk: one class, asserted in both directions" {
     }
 }
 
-test "plainNameProblem: the shapes a manager would read as an operation" {
+test "nameProblem: the shapes a manager would read as an operation" {
     // apt's remove form, and the two zypper reads the same way.
-    try testing.expectEqual(NameProblem.trailing_hyphen, plainNameProblem("nano-").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem("!vim").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem("-vim").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem("+pkg").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem("@group").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem(".foo").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem("/usr/bin/x").?);
-    try testing.expectEqual(NameProblem.leading, plainNameProblem("~pkg").?);
-    try testing.expectEqual(NameProblem.empty, plainNameProblem("").?);
+    for ([_]NameClass{ .plain, .multiarch }) |class| {
+        try testing.expectEqual(NameProblem.trailing_hyphen, nameProblem("nano-", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem("!vim", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem("-vim", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem("+pkg", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem("@group", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem(".foo", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem("/usr/bin/x", class).?);
+        try testing.expectEqual(NameProblem.leading, nameProblem("~pkg", class).?);
+        try testing.expectEqual(NameProblem.empty, nameProblem("", class).?);
+    }
+    // A qualified name is judged on the name, not on the qualifier.
+    try testing.expectEqual(NameProblem.trailing_hyphen, nameProblem("nano-:armhf", .multiarch).?);
+    try testing.expectEqual(NameProblem.leading, nameProblem(":armhf", .multiarch).?);
 }
 
-test "plainNameProblem: the shapes that resolve to a package of another name" {
-    try testing.expectEqual(NameProblem.character, plainNameProblem("pkgconfig(libcrypto)").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("perl(Foo::Bar)").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("repo/pkg").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("pkg=1.2").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("pkg>=1.2").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("pkg:amd64").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("pattern:devel_basis").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("bat,ripgrep").?);
-    try testing.expectEqual(NameProblem.character, plainNameProblem("gnu make").?);
+test "nameProblem: the shapes that resolve to a package of another name" {
+    for ([_]NameClass{ .plain, .multiarch }) |class| {
+        try testing.expectEqual(NameProblem.character, nameProblem("pkgconfig(libcrypto)", class).?);
+        try testing.expectEqual(NameProblem.character, nameProblem("repo/pkg", class).?);
+        try testing.expectEqual(NameProblem.character, nameProblem("pkg=1.2", class).?);
+        try testing.expectEqual(NameProblem.character, nameProblem("pkg>=1.2", class).?);
+        try testing.expectEqual(NameProblem.character, nameProblem("bat,ripgrep", class).?);
+        try testing.expectEqual(NameProblem.character, nameProblem("gnu make", class).?);
+    }
 }
 
-test "plainNameProblem: the names real distributions ship" {
+test "nameProblem: a colon is apt's architecture qualifier and zypper's selector" {
+    // apt-mark showmanual -- mox's own explicit-install query -- reports a
+    // foreign-architecture package as `pkg:arch`, so refusing it leaves drift
+    // no command can clear on a multiarch machine. zypper's `pattern:` and
+    // `patch:` name things rpm never reports, so a colon stays refused there.
+    try testing.expectEqual(@as(?NameProblem, null), nameProblem("libc6:armhf", .multiarch));
+    try testing.expectEqual(@as(?NameProblem, null), nameProblem("g++:i386", .multiarch));
+    try testing.expectEqual(@as(?NameProblem, null), nameProblem("libc6:kfreebsd-amd64", .multiarch));
+    try testing.expectEqual(NameProblem.character, nameProblem("libc6:armhf", .plain).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("pattern:devel_basis", .plain).?);
+    try testing.expectEqual(NameProblem.character, nameProblem("perl(Foo::Bar)", .plain).?);
+
+    // One qualifier, and nothing in it apt would resolve as a regex or read
+    // as an operation.
+    try testing.expectEqual(NameProblem.arch, nameProblem("pattern:devel_basis", .multiarch).?);
+    try testing.expectEqual(NameProblem.arch, nameProblem("perl(Foo::Bar)", .multiarch).?);
+    try testing.expectEqual(NameProblem.arch, nameProblem("libc6:", .multiarch).?);
+    try testing.expectEqual(NameProblem.arch, nameProblem("libc6:a:b", .multiarch).?);
+    try testing.expectEqual(NameProblem.arch, nameProblem("libc6:arm.f", .multiarch).?);
+    try testing.expectEqual(NameProblem.arch, nameProblem("libc6:armhf-", .multiarch).?);
+    try testing.expectEqual(NameProblem.arch, nameProblem("libc6:-armhf", .multiarch).?);
+}
+
+test "bareName / archOf: the two halves apt keeps apart" {
+    try testing.expectEqualStrings("libc6", bareName("libc6:armhf"));
+    try testing.expectEqualStrings("libc6", bareName("libc6"));
+    try testing.expectEqualStrings("armhf", archOf("libc6:armhf").?);
+    try testing.expectEqual(@as(?[]const u8, null), archOf("libc6"));
+}
+
+test "nameProblem: the names real distributions ship" {
     // `g++` is why only a trailing `-` is refused and a trailing `+` is not.
     const inside = [_][]const u8{
         "g++",
@@ -377,10 +475,12 @@ test "plainNameProblem: the names real distributions ship" {
         "7zip",
         "bat",
     };
-    for (inside) |s| try testing.expectEqual(@as(?NameProblem, null), plainNameProblem(s));
+    for ([_]NameClass{ .plain, .multiarch }) |class| {
+        for (inside) |s| try testing.expectEqual(@as(?NameProblem, null), nameProblem(s, class));
+    }
 }
 
-test "plainNameProblem: a plain name is a name the loader already takes" {
+test "nameProblem: a package name is a name the loader already takes" {
     // The two classes must nest: a name this predicate passes that the
     // manifest loader would refuse could never reach an adapter, and a rule
     // no row can reach is a rule that was never tested.

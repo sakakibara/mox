@@ -96,10 +96,10 @@ pub const Zypper = struct {
         // `zypper install vim !nano` and `zypper install vim -nano` both
         // remove nano, and a capability (`pkgconfig(libcrypto)`) installs a
         // package of an entirely different name.
-        if (backend_mod.plainNameProblem(row.name)) |problem| {
+        if (backend_mod.nameProblem(row.name, .plain)) |problem| {
             if (diag) |d| d.set(
                 "{s}: row \"{s}\": zypper rows name a package: {s}",
-                .{ row.label, row.name, problem.text() },
+                .{ row.label, row.name, problem.text(.plain) },
             );
             return Error.ZypperSelectorRow;
         }
