@@ -359,8 +359,9 @@ other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 `MISSING`, `STALE`, or `ERROR`.
 
 A repo carrying a `data/packages/` manifest also gets a `packages:`
-section: per backend, each declared package still `MISSING` and each
-installed package `UNTRACKED` (declared nowhere and not blacklisted). A
+section: per backend, each declared package still `MISSING`, each installed
+package `UNTRACKED` (declared nowhere and not blacklisted), and each manager
+that is installed but cannot answer `BROKEN`. A
 path-scoped `mox status <file>` names files and reports no packages, as a
 path-scoped apply or commit reaches none.
 A repo without that directory is not using the package subsystem, so no
@@ -384,7 +385,8 @@ section is drift, so `--drift` keeps it. `--json` and
 `--porcelain` serialize that set for tooling instead of the human report.
 
 `--json` emits `{"files": [...], "packages": [...]}`. A file is
-`{path, kind, key?, first_contact}`; a package is
+`{path, kind, key?, first_contact}`; a broken manager is
+`{backend, state: "broken", exit}`; a package is
 `{backend, state, id, name?}`, where `state` is `missing` or `untracked`
 and `id` is the identity its backend compares by -- a brew cask carries
 its `cask:` prefix, so it can never be read as the formula of the same
@@ -394,7 +396,8 @@ missing package.
 `--porcelain` emits stable tab-separated lines, one record per line, with
 the record kind as the first field. File records are `kind`, `key`,
 `first_contact` (0/1), `path`. Package records are `package_missing` or
-`package_untracked`, then `backend`, then `id`. Field count varies by
+`package_untracked`, then `backend`, then `id`; a broken manager is
+`package_broken`, then `backend`, then the exit code. Field count varies by
 kind, so switch on the first field before reading the rest. In
 `--porcelain` the free-form fields are
 C-escaped (`\\`, `\t`, `\n`, `\r`) so a tab or newline in them can never

@@ -47,14 +47,22 @@ All notable changes to mox are documented here. The format follows
   killed (Windows has no groups, so the direct process always), and a kill
   is reported as a timeout naming the backend. Under `--json` and
   `--porcelain`, plugin notes go to stderr and stdout stays machine-pure.
-  A streamed install is not bounded unless `MOX_INSTALL_TIMEOUT_MS` is set;
-  at that bound the manager gets SIGINT before SIGKILL (on Windows it is
-  terminated at once). `--skip-scripts`
+  A streamed install is not bounded unless `MOX_INSTALL_TIMEOUT_MS` is set.
+  Every child leads its own process group; a streamed one is handed the
+  terminal for its run, so `sudo` can prompt and Ctrl-C reaches the manager
+  (and ends mox with it), and at the bound its whole group is interrupted
+  and then killed, so no manager outlives the run that started it (on
+  Windows the direct process is terminated at once). `--skip-scripts`
   and a path-scoped `apply`, `commit` or `status` reach no package. `status`
   reports the rows of an absent manager that has a bootstrap row as missing
   and notes that apply will bootstrap it; a manager whose `--version` fails
-  is treated as absent and noted. `mox --help` names `MOX_SCRIPT_TIMEOUT_MS`
-  and `MOX_INSTALL_TIMEOUT_MS`.
+  is reported `BROKEN` and counted in the exit code, with a
+  `package_broken` porcelain record and a `{backend, state, exit}` JSON
+  entry. `mox --help` names `MOX_SCRIPT_TIMEOUT_MS` and
+  `MOX_INSTALL_TIMEOUT_MS`. A manifest refuses an unknown top-level key, a
+  blank or whitespace-bearing `name`, a byte order mark, a second
+  `[[bootstrap]]` row for one backend, and two rows naming one package
+  under the same gate.
 - `zig build test-backends` checks the brew adapter against the real brew,
   differentially; `tests/linux_backends_test.sh` runs apt, dnf, zypper and
   pacman through a full install round trip in containers;

@@ -52,7 +52,15 @@ beside the shared list without replacing it.
 
 Every other key belongs to the backend adapter (below). An unknown key, a
 missing required one, or a wrong type is an error naming the file and the
-row, checked on every machine rather than only where that manager runs.
+row, checked on every machine rather than only where that manager runs. So
+is a top-level key the format does not define (`[[package]]`, singular,
+would otherwise load as no rows at all and report a clean machine), a `name`
+that is blank or carries whitespace or control characters, a second
+`[[bootstrap]]` row for one backend, and two `[[packages]]` rows that name
+one package under the same gate -- the last checked ungated, so a pair gated
+to another OS is refused here rather than on the machine it breaks. A file
+that begins with a byte order mark is refused by name, since the TOML parser
+cannot read past it.
 
 ### Blacklist
 
@@ -105,7 +113,8 @@ this machine can run it. A `dnf` row on a mac names a registered adapter that
 is inert here; a row naming `dnff` is a typo and is an error. That
 distinction is what lets one manifest carry every machine's packages.
 
-Usable is decided by a probe (`<manager> --version`; `apt-get` for apt). A manager that is not
+Usable is decided by a probe (`<manager> --version`; `apt-get` for
+apt). A manager that is not
 there is absent and its rows are inert. One that is there but exits nonzero
 is *broken*: it is treated as absent, and `status` says so under `packages:`
 (`note      brew: `brew --version` exited 1; treated as absent`) rather
@@ -114,13 +123,20 @@ here, `status` notes `no package manager is usable on this machine`.
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
-| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name` | `kind` (`formula`, `cask`) |
+| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1` so a read-only `status` stays offline | `kind` (`formula`, `cask`) |
 | `apt` | name | `apt-mark showmanual` | -- |
-| `dnf` | name | `dnf repoquery --userinstalled` | -- |
+| `dnf` | name | `dnf -q repoquery --userinstalled` (`-q` because dnf4 writes its metadata line to stdout) | -- |
 | `pacman` | name | `pacman -Qeq`; an install is `pacman -Syu --needed`, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
 | `winget` | `PackageIdentifier` | `winget export` | `source`, `scope` (`user`/`machine`), `override` |
+
+An install through scoop adds a row's bucket only when `scoop bucket list`
+does not already have it, and winget installs with `--no-upgrade`, counting
+"already installed" as installed: both managers answer a second `apply`
+with an error otherwise. zypper's ledger records what a failed batch still
+landed, read back from `rpm`, so a package installed beside one that failed
+is not asked for again.
 
 ### brew taps
 
@@ -145,7 +161,9 @@ it installed in `<state_dir>/zypper.txt` and treats that as the explicit set.
 
 That record is never trusted on its own: it is intersected with what `rpm`
 reports actually present, so a package removed behind mox's back drops out,
-is reported missing, and is reinstalled rather than assumed to be there.
+is reported missing, and is reinstalled rather than assumed to be there. A
+batch that failed part-way is read back the same way, so the rows that did
+land are recorded rather than retried forever.
 
 The cost is that a package installed by hand is invisible to mox on zypper
 and will never be offered for tracking. `mox status` prints that as a note
@@ -156,6 +174,10 @@ under the backend rather than leaving it to be discovered.
 - **MISSING** -- declared for this machine, not installed.
 - **UNTRACKED** -- installed, declared nowhere in the manifest, not
   blacklisted.
+- **BROKEN** -- the manager is installed but cannot answer
+  (`BROKEN    brew (brew --version exited 1)`). Its rows are neither judged
+  nor installed, and a machine in that state is not a clean one: it counts
+  toward the exit code like any other drift.
 
 Untracked is measured against every row the manifest declares, not only the
 ones desired here: a package gated to another profile is already tracked, and
@@ -293,16 +315,23 @@ backend.
   one meaning.
 - **Exit 64 means "this verb is not implemented"**, reported by plugin and
   verb where it was needed. Nothing is substituted for a missing verb.
-- Every captured call is time-bounded like a setup script (`MOX_SCRIPT_TIMEOUT_MS`);
+- Every captured call is time-bounded like a setup script
+  (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the
   backend, not a hung `mox status`. The bound covers the whole call. A
   captured call (`available`, `id`, `list`, `declare`, `limitation`) runs in
   its own process group and the kill takes the group, so a helper it left
   holding the pipe (`port ... | awk`) cannot outlive it; a streamed call
   (`install`, `bootstrap`) stays in mox's group so it can use the terminal
-  and Ctrl-C reaches it; its bound is `MOX_INSTALL_TIMEOUT_MS` (none by
-  default), and at that bound the direct process gets SIGINT, then SIGKILL
-  (on Windows it is terminated at once).
+  and Ctrl-C reaches it. Every child leads its own process group, and a
+  streamed one is handed the terminal for its run the way a shell hands it
+  to a job, so `sudo` can prompt and Ctrl-C goes to the manager; a manager
+  killed that way ends mox the same way. Its bound is
+  `MOX_INSTALL_TIMEOUT_MS` (none by default: a manager may compile for an
+  hour), and at that bound its whole group is interrupted, then killed ten
+  seconds later, so a shell in front of the manager cannot absorb the
+  interrupt and leave the manager running (on Windows, which has no groups
+  or job control, the direct process is terminated at once).
   A captured verb must never prompt: in its own group a read from the
   terminal stops it until the bound. Windows has no process groups, so
   there the kill always reaches the direct process only. The shipped
@@ -380,6 +409,11 @@ answered without the real thing:
 | `sh tests/linux_backends_test.sh` | apt, dnf, zypper, pacman -- a full install round trip per distro, in containers; and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply |
 | `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget: read-only where present; on a runner without scoop, a bootstrap from the pinned installer plus one install |
 
-All three run nightly in CI. Only the real manager can say whether a query's
-format string still yields one name per line, or whether an image without
-`sudo` installs at all; the hermetic tests cannot.
+All three run nightly in CI, or on demand. Only the real manager can say
+whether a query's format string still yields one name per line, or whether
+an image without `sudo` installs at all; the hermetic tests cannot. A skip
+is never a pass: under CI a suite that skipped a case fails, because there
+the case is the reason the job exists. The brew checks compare the adapter
+against Homebrew's own install receipts rather than against the command the
+adapter runs, so an adapter asking the wrong question cannot agree with the
+oracle.
