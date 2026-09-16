@@ -21,7 +21,8 @@ const testing = std.testing;
 fn brewPresent(arena: std.mem.Allocator, io: std.Io) bool {
     var p: packages.exec.Process = .{ .io = io };
     var b: packages.brew.Brew = .{ .runner = p.runner() };
-    return b.backend().available(arena) catch false;
+    const got = b.backend().available(arena) catch return false;
+    return got == .present;
 }
 
 fn brewIds(arena: std.mem.Allocator, io: std.Io) ![]const []const u8 {
@@ -60,7 +61,7 @@ test "brew: available agrees with brew answering for itself" {
     var p: packages.exec.Process = .{ .io = io };
     var b: packages.brew.Brew = .{ .runner = p.runner() };
 
-    const available = b.backend().available(a) catch false;
+    const available = (b.backend().available(a) catch .absent) == .present;
     const answered = blk: {
         const res = std.process.run(a, io, .{ .argv = &.{ "brew", "--version" } }) catch break :blk false;
         break :blk res.term == .exited and res.term.exited == 0;
