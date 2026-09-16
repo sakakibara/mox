@@ -256,7 +256,11 @@ if [ "$#" -gt 0 ]; then
   done
 else
   run_case debian:stable apt ripgrep
+  # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
+  # its metadata line to stdout, which the adapter's query must not read as
+  # a package name.
   run_case fedora:latest dnf ripgrep
+  run_case rockylinux:9 dnf ripgrep
   run_case opensuse/tumbleweed zypper ripgrep
   # Arch publishes no arm64 image, so this case skips on an arm64 host.
   run_case archlinux:latest pacman ripgrep
@@ -267,5 +271,12 @@ if [ "$skips" -gt 0 ]; then
   printf '\n%d passed, %d failed, %d skipped\n' "$passes" "$fails" "$skips"
 else
   printf '\n%d passed, %d failed\n' "$passes" "$fails"
+fi
+# A skip is never a pass. On a developer machine an unavailable image or
+# architecture is a fact of life; on CI it means the gate tested nothing it
+# was added to test, so it fails the run.
+if [ -n "${CI:-}" ] && [ "$skips" -gt 0 ]; then
+  printf 'CI: %d case(s) skipped; this gate must run them all\n' "$skips" >&2
+  exit 1
 fi
 [ "$fails" -eq 0 ]
