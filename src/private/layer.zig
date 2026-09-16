@@ -24,7 +24,9 @@ pub fn merge(
         else => return e,
     };
 
-    const private_tree = try source.tree.walk(arena, io, private_dir, home_dir);
+    // The private root's `data/` is data (`mox data`, loop sources, the
+    // package manifest), never a source: walking it would plan `~/data/...`.
+    const private_tree = try source.tree.walkExcluding(arena, io, private_dir, home_dir, &.{"data"}, null);
 
     var base_map = std.StringHashMap(ManagedFile).init(arena);
     defer base_map.deinit();

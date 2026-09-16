@@ -1495,6 +1495,64 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     try std.testing.expect(elapsed_ms < 3000);
 }
 
+test "commit: a row recorded into the private layer is data there, never a managed file" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The repo opted in but declares no brew file; the private layer does,
+    // so that is where commit records the row.
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.repo, "data", "packages" }));
+    const private_pkgs = try std.fs.path.join(a, &.{ h.state, "private", "data", "packages" });
+    try Io.Dir.cwd().createDirPath(io, private_pkgs);
+    const private_manifest = try std.fs.path.join(a, &.{ private_pkgs, "local.toml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = private_manifest, .data = "backend = \"brew\"\n" });
+
+    const fake = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "(private layer)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "1 recorded") != null);
+    const after = try Io.Dir.cwd().readFileAlloc(io, private_manifest, a, .limited(1 << 20));
+    try std.testing.expect(std.mem.endsWith(u8, after, "[[packages]]\nname = \"htop\"\n"));
+
+    // The private root's data/ is not source: nothing under ~/data is
+    // planned, and the manifest reads as clean.
+    const fake2 = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake2);
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "data/packages") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "clean     brew") != null);
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+
+    const fake3 = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake3);
+    const d = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "data/packages") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "would write") == null);
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+
+    // A symlinked private manifest is read as a manifest, not refused as a
+    // symlink in the source tree.
+    if (@import("builtin").os.tag == .windows) return;
+    const elsewhere = try std.fs.path.join(a, &.{ h.state, "elsewhere.toml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = elsewhere, .data = after });
+    try Io.Dir.cwd().deleteFile(io, private_manifest);
+    try Io.Dir.cwd().symLink(io, elsewhere, private_manifest, .{});
+    const fake4 = try brewWith(a, "htop\n", "", &.{});
+    useFake(fake4);
+    const l = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, l.err, "SymlinkInSource") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.out, "clean     brew") != null);
+    try std.testing.expectEqual(@as(u8, 0), l.rc);
+}
 test "commit: a malformed manifest is named, and no manager is asked anything" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

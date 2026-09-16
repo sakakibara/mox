@@ -290,6 +290,21 @@ pub fn walkDiag(
     home_dir: []const u8,
     diag: ?*Diag,
 ) !ManagedTree {
+    return walkExcluding(arena, io, src_dir, home_dir, &.{}, diag);
+}
+
+/// `walkDiag`, skipping the top-level directories named in `exclude`: they
+/// are never entered, so nothing under them is a managed file or a walk
+/// error. The private root keeps its `data/` beside its sources, where the
+/// repo keeps its own outside `src/`.
+pub fn walkExcluding(
+    arena: std.mem.Allocator,
+    io: Io,
+    src_dir: []const u8,
+    home_dir: []const u8,
+    exclude: []const []const u8,
+    diag: ?*Diag,
+) !ManagedTree {
     var files: std.ArrayList(ManagedFile) = .empty;
     errdefer files.deinit(arena);
     var exact: std.ArrayList([]const u8) = .empty;
@@ -310,7 +325,7 @@ pub fn walkDiag(
         return e;
     };
 
-    try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs, diag);
+    try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs, exclude, diag);
 
     // Stamp every walked file with the repo root (parent of `src/`).
     const out = try files.toOwnedSlice(arena);
@@ -335,6 +350,7 @@ fn walkDir(
     abs_prefix: []const u8,
     home_dir: []const u8,
     attrs: *const attributes.Attributes,
+    exclude: []const []const u8,
     diag: ?*Diag,
 ) !void {
     var file_names: std.ArrayList([]const u8) = .empty;
@@ -423,6 +439,7 @@ fn walkDir(
     // Subdirectories: orphan `.d/` becomes a `has_base=false` managed file;
     // anything else is a plain subdirectory to recurse into.
     for (dir_names.items) |name| {
+        if (excluded(exclude, name)) continue;
         if (!std.mem.endsWith(u8, name, ".d")) {
             const sub_rel = try path_mod.joinKey(arena, &.{ rel_prefix, name });
             const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, name });
@@ -431,7 +448,7 @@ fn walkDir(
                 .follow_symlinks = false,
             });
             defer sub.close(io);
-            try walkDir(arena, io, files, exact, sub, sub_rel, sub_abs, home_dir, attrs, diag);
+            try walkDir(arena, io, files, exact, sub, sub_rel, sub_abs, home_dir, attrs, &.{}, diag);
             continue;
         }
         if (paired.contains(name)) continue;
@@ -458,7 +475,7 @@ fn walkDir(
             // Recurse, then close. We can't use `defer .close()` here because
             // we need to release the handle before the recursive walk also
             // opens the same dir -- Zig's Dir.openDir doesn't reuse handles.
-            try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs, diag);
+            try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs, &.{}, diag);
             dot_d_dir.close(io);
             continue;
         }
@@ -477,6 +494,13 @@ fn walkDir(
             .regions = regions,
         });
     }
+}
+
+fn excluded(exclude: []const []const u8, name: []const u8) bool {
+    for (exclude) |e| {
+        if (std.mem.eql(u8, e, name)) return true;
+    }
+    return false;
 }
 
 const BaseRef = struct { dir: Io.Dir, name: []const u8 };
