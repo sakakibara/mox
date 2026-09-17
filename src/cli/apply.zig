@@ -1150,7 +1150,7 @@ fn applyPackages(
         // rather than left to be discovered by the apply that follows.
         if (dry_run) {
             if (backend.install_check) |what| try ctx.out.print(
-                "  note            a dry run leaves these rows unchecked against {s}; a real apply checks them there and refuses a row it would not install under its own name\n",
+                "  note            a dry run leaves these rows unchecked against {s}; a real apply checks them there, and marks or refuses a row those checks say not to install\n",
                 .{what},
             );
             continue;

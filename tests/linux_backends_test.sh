@@ -706,6 +706,81 @@ EOF
   fi
 }
 
+# The pin refusal under a locale apt translates. `apt-cache policy` is the
+# query that says whether a pin rejects every version of a package, and it
+# prints its `Candidate:` line in the user's language: on apt 3.0.3 under
+# ja_JP.UTF-8 the word is Japanese, so a parser reading the English word finds
+# no line at all, keeps the pinned row, and the install exits 100 having put
+# nothing on the machine -- the very batch failure the refusal exists to
+# prevent. mox pins every captured call to the C locale, and this holds it
+# to that: the locale is generated in the container, the harm measured on
+# the raw query, and the apply run with that locale exported.
+run_apt_pin_locale_case() {
+  image="$1"
+  backend="apt pin-locale"
+
+  case_dir="$work/apt-pin-locale"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF2'
+backend = "apt"
+
+[[packages]]
+name = "cowsay"
+
+[[packages]]
+name = "bsdextrautils"
+EOF2
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      apt-get update >/dev/null
+      apt-get install -y -qq locales >/dev/null 2>&1
+      sed -i "s/^# *ja_JP.UTF-8 UTF-8/ja_JP.UTF-8 UTF-8/" /etc/locale.gen
+      locale-gen >/dev/null
+      apt-get purge -y bsdextrautils >/dev/null 2>&1 || true
+      printf "Package: cowsay\nPin: release *\nPin-Priority: -1\n" > /etc/apt/preferences.d/no-cowsay
+      export LANG=ja_JP.UTF-8
+      unset LC_ALL LANGUAGE
+      # The harm, measured on the raw query: the stanza is there, the
+      # English field name is not.
+      apt-cache policy cowsay >/tmp/policy.txt 2>&1 || true
+      echo "policy-stanza=$(grep -c "^cowsay:" /tmp/policy.txt || true)"
+      echo "policy-candidate-english=$(grep -c "Candidate:" /tmp/policy.txt || true)"
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      echo "installed=$(dpkg -l bsdextrautils 2>/dev/null | grep -c "^ii" || true)"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^policy-stanza=1" "$out" && grep -q "^policy-candidate-english=0" "$out"; then
+    ok "$backend ($image): apt-cache policy translates its Candidate line under ja_JP.UTF-8"
+  else
+    no "$backend ($image): the premise does not hold on this apt" "$(grep -E '^policy-' "$out")"
+  fi
+
+  if grep -q 'row "cowsay" names a package apt has no installation candidate for' "$out"; then
+    ok "$backend ($image): the pinned row is refused by name under ja_JP.UTF-8"
+  else
+    no "$backend ($image): the pinned row was not refused under ja_JP.UTF-8" "$(grep -E '^mox: apt|^E:' "$out" | tail -3)"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed under ja_JP.UTF-8"
+  else
+    no "$backend ($image): the pinned row kept the other off the machine" \
+      "$(grep -E '^installed=|Packages:' "$out")"
+  fi
+}
+
 # A machine with no package index at all. The plain listing still prints the
 # dpkg status file's own packages there -- 78 lines on trixie, 88 on bookworm
 # -- so it cannot tell that machine apart from a working one; the listing the
@@ -1675,6 +1750,78 @@ EOF
   fi
 }
 
+# The name check under a locale zypper translates. `zypper search` types each
+# row in the user's language: with its translations installed (a desktop
+# install ships them; the container image strips them, so they are put back
+# here) the Type column reads a Japanese word under ja_JP.UTF-8 and `Paket`
+# under de_DE.UTF-8 where a parser reading `package` expects English, so
+# every row is refused as naming no package and nothing ever installs. mox
+# pins every captured call to the C locale, and this holds it to that.
+run_zypper_locale_case() {
+  image="$1"
+  pkg="$2"
+  backend="zypper locale"
+
+  case_dir="$work/zypper-locale"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF2
+backend = "zypper"
+
+[[packages]]
+name = "$pkg"
+
+[[packages]]
+name = "mox-no-such-package"
+EOF2
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      rpm -q $pkg >/dev/null 2>&1 && { echo 'the image ships $pkg; the case cannot run'; exit 1; }
+      echo '%_install_langs all' > /etc/rpm/macros.langs
+      zypper --non-interactive --quiet install -y glibc-locale >/dev/null 2>&1
+      zypper --non-interactive --quiet install -y -f zypper libzypp >/dev/null 2>&1
+      export LANG=ja_JP.UTF-8
+      unset LC_ALL LANGUAGE
+      # The harm, measured on the raw query: the row is there, the English
+      # type is not.
+      zypper --non-interactive --quiet search --match-exact --type package -- $pkg >/tmp/search.txt 2>&1 || true
+      echo \"search-row=\$(grep -c '| $pkg ' /tmp/search.txt || true)\"
+      echo \"search-type-english=\$(grep -c '| package' /tmp/search.txt || true)\"
+      echo '--- apply ---'
+      rc=0
+      /w/mox apply || rc=\$?
+      echo \"apply-exit=\$rc\"
+      echo \"installed=\$(rpm -q $pkg >/dev/null 2>&1 && echo 1 || echo 0)\"
+    " >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^search-row=1" "$out" && grep -q "^search-type-english=0" "$out"; then
+    ok "$backend ($image): zypper search translates its Type column under ja_JP.UTF-8"
+  else
+    no "$backend ($image): the premise does not hold on this zypper" "$(grep -E '^search-' "$out")"
+  fi
+
+  if grep -q "^installed=1" "$out" && ! grep -q "row \"$pkg\" names no zypper package" "$out"; then
+    ok "$backend ($image): a real package installs under ja_JP.UTF-8"
+  else
+    no "$backend ($image): the real package was refused under ja_JP.UTF-8" "$(grep -E '^mox: zypper|^installed=' "$out" | tail -3)"
+  fi
+
+  if grep -q 'mox: zypper: row "mox-no-such-package" names no zypper package in this machine.s repositories' "$out" && ! grep -q "apply-exit=0" "$out"; then
+    ok "$backend ($image): the name zypper has nothing for is still refused under ja_JP.UTF-8"
+  else
+    no "$backend ($image): the unknown name was not refused under ja_JP.UTF-8" "$(grep -E '^mox: zypper|^apply-exit=' "$out" | tail -3)"
+  fi
+}
+
 # A row naming a package the manager ALREADY HAS, installed as another
 # package's dependency. The row is missing because the manager's
 # explicit-install query reports what the user asked for, and nothing asked
@@ -2216,6 +2363,7 @@ else
   run_apt_local_deb_case debian:stable "$foreign_arch"
   run_apt_virtual_name_case debian:stable
   run_apt_hold_pin_case debian:stable
+  run_apt_pin_locale_case debian:stable
   run_apt_no_repositories_case debian:stable
   run_dependency_case debian:stable apt
   run_apt_held_dependency_case debian:stable
@@ -2244,6 +2392,7 @@ else
   # negative half every other manager already has.
   run_zypper_provide_name_case opensuse/leap:15.6
   run_zypper_unknown_name_case opensuse/tumbleweed ripgrep
+  run_zypper_locale_case opensuse/tumbleweed ripgrep
   # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest

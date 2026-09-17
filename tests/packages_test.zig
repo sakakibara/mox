@@ -716,7 +716,7 @@ test "apply --dry-run: says which rows it left unchecked" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         r.out,
-        "note            a dry run leaves these rows unchecked against the packages dnf's repositories carry; a real apply checks them there and refuses a row it would not install under its own name\n",
+        "note            a dry run leaves these rows unchecked against what dnf already has installed, and the packages and provisions its repositories carry; a real apply checks them there, and marks or refuses a row those checks say not to install\n",
     ) != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }

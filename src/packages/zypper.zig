@@ -219,6 +219,11 @@ pub const Zypper = struct {
     /// none. A row is a line whose last column is `package`, which the header
     /// (`Type`) and the rule under it are not; the name is the second column,
     /// ahead of the summary, so a summary carrying a `|` cannot move it.
+    ///
+    /// `package` is the C-locale spelling, which the captured call runs
+    /// under: measured on zypper 1.14.101 with its translations installed,
+    /// the column reads `Paket` under `LANG=de_DE.UTF-8` and a Japanese word
+    /// under `ja_JP.UTF-8`, and either would leave every row unmatched.
     fn zypperNameSet(self: *Zypper, arena: std.mem.Allocator, argv: []const []const u8) anyerror!std.StringHashMap(void) {
         var set = std.StringHashMap(void).init(arena);
         const res = try self.runner.run(arena, argv);

@@ -84,13 +84,13 @@ pub const Manager = enum {
         };
     }
 
-    /// What this manager's install asks the manager itself about a row, for a
-    /// dry run to name as what it did not check.
+    /// What this manager's install asks the manager itself about a row, in
+    /// the order it asks, for a dry run to name as what it did not check.
     fn installCheck(self: Manager) []const u8 {
         return switch (self) {
-            .apt => "apt's own package list, what dpkg has installed, its holds and its pins",
-            .dnf => "the packages dnf's repositories carry",
-            .pacman => "the packages, groups and provisions pacman's repositories carry",
+            .apt => "what apt has installed as a dependency, apt's own package list, what dpkg has installed, its holds and its pins",
+            .dnf => "what dnf already has installed, and the packages and provisions its repositories carry",
+            .pacman => "what pacman has installed as a dependency, and the packages, groups and provisions its repositories carry",
         };
     }
 
@@ -887,6 +887,10 @@ pub const Distro = struct {
     /// install or `(none)`. It falls back to a regex only when no package is
     /// named exactly, and every row reaching here named one, so each answers
     /// with a single stanza whose header is the row's own name.
+    ///
+    /// `Candidate:` is the C-locale spelling, which the captured call runs
+    /// under; measured on apt 3.0.3 under `LANG=ja_JP.UTF-8`, the same line
+    /// is printed in Japanese and would match nothing here.
     fn aptCandidates(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!std.StringHashMap(bool) {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &.{ "apt-cache", "policy" });

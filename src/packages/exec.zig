@@ -13,6 +13,10 @@
 //! default, and is interrupted before it is killed so the manager behind
 //! `sudo` can roll back. A bootstrap's download is a captured call like any
 //! other, and answers to the captured bound.
+//!
+//! Every captured call runs under the C locale, because what it prints is
+//! parsed here and the parsers read English; a streamed call keeps the
+//! user's locale, because what it prints goes to the user's terminal.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -364,6 +368,34 @@ pub const Process = struct {
         return self.spawn(arena, argv, stdin, .inherit, max_query_bytes);
     }
 
+    /// The environment a captured child runs under: the call's own, with
+    /// `LC_ALL=C` and no `LANGUAGE`. A captured call's output is parsed by an
+    /// adapter, and the parsers read the manager's English: measured under
+    /// `LANG=ja_JP.UTF-8` with translations installed, zypper 1.14.101 types
+    /// a search row in Japanese where `zypperNameSet` looks for `package`,
+    /// and apt 3.0.3 prints the candidate line `aptCandidates` looks for in
+    /// Japanese; each then answers nothing, silently. `LC_ALL=C` alone puts
+    /// glibc's gettext back to English whatever `LANGUAGE` says (measured on
+    /// those two, dnf5 5.4.3 and dnf 4.14.0); Python's gettext module reads
+    /// `LANGUAGE` first (measured on Debian trixie: `LC_ALL=C LANGUAGE=ja`
+    /// finds the ja catalog), and a plugin may translate through it, so
+    /// `LANGUAGE` goes too. A query never runs under `sudo`, so nothing
+    /// resets either before the manager reads them.
+    ///
+    /// A streamed child keeps the caller's environment: its output goes to
+    /// the user's terminal, in the user's language. A call with no
+    /// environment of its own takes the process's, as a spawn with none
+    /// inherits it.
+    fn capturedEnviron(self: *const Process, arena: std.mem.Allocator) !EnvironMap {
+        var map = if (self.env) |env|
+            try env.clone(arena)
+        else
+            try std.process.Environ.createMap(std.Io.Threaded.global_single_threaded.environ.process_environ, arena);
+        try map.put("LC_ALL", "C");
+        _ = map.swapRemove("LANGUAGE");
+        return map;
+    }
+
     /// Spawn with stdin backed by a scratch file holding `stdin` (closed
     /// when null), stderr on the terminal, and stdout captured or inherited.
     /// One deadline bounds the whole call: reading what the child writes and
@@ -430,11 +462,12 @@ pub const Process = struct {
         if (self.err) |w| w.flush() catch {};
 
         const captured = stdout_io == .pipe;
+        const captured_env: ?EnvironMap = if (captured) try self.capturedEnviron(arena) else null;
         const signals = job.SpawnSignals.install();
         defer signals.restore();
         var child = try std.process.spawn(io, .{
             .argv = argv,
-            .environ_map = self.env,
+            .environ_map = if (captured_env) |*m| m else self.env,
             .stdin = stdin_io,
             .stdout = stdout_io,
             .stderr = .inherit,
@@ -1409,6 +1442,75 @@ test "Process: stdin bytes reach the child and stdout is captured" {
     const res = try p.runner().runInput(a, &.{"cat"}, "hello from stdin\n");
     try testing.expect(res.ok);
     try testing.expectEqualStrings("hello from stdin\n", res.stdout);
+}
+
+/// The locale a child reports, written where the test can read it: a
+/// captured child's stdout, or a file for a streamed one, whose stdout is
+/// the terminal's.
+const locale_probe = "printf '%s|%s|%s' \"${LC_ALL-unset}\" \"${LANGUAGE-unset}\" \"${LANG-unset}\"";
+
+fn japaneseEnviron() !EnvironMap {
+    var map: EnvironMap = .init(testing.allocator);
+    errdefer map.deinit();
+    try map.put("PATH", "/usr/bin:/bin");
+    try map.put("LANG", "ja_JP.UTF-8");
+    try map.put("LC_ALL", "ja_JP.UTF-8");
+    try map.put("LANGUAGE", "ja");
+    return map;
+}
+
+test "Process: a captured child runs under LC_ALL=C with no LANGUAGE, whatever the caller's locale" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = try japaneseEnviron();
+    defer map.deinit();
+
+    var p: Process = .{ .io = std.testing.io, .env = &map };
+    const res = try p.runner().run(a, &.{ "sh", "-c", locale_probe });
+    try testing.expect(res.ok);
+    try testing.expectEqualStrings("C|unset|ja_JP.UTF-8", res.stdout);
+
+    // The caller's own map is the streamed calls' environment, and is not
+    // what was changed.
+    try testing.expectEqualStrings("ja_JP.UTF-8", map.get("LC_ALL").?);
+    try testing.expectEqualStrings("ja", map.get("LANGUAGE").?);
+}
+
+test "Process: a streamed child keeps the caller's locale" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "locale.txt" });
+    var map = try japaneseEnviron();
+    defer map.deinit();
+
+    var p: Process = .{ .io = io, .env = &map, .install_timeout_ms = 10_000 };
+    const script = try std.fmt.allocPrint(a, "{s} > '{s}'", .{ locale_probe, path });
+    const res = try p.runner().stream(a, &.{ "sh", "-c", script });
+    try testing.expect(res.ok);
+    const got = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(256));
+    try testing.expectEqualStrings("ja_JP.UTF-8|ja|ja_JP.UTF-8", got);
+}
+
+test "Process: a captured child with no environment of its own still gets the process's" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // PATH is what a test binary always runs with, so its presence in the
+    // child says the process environment reached it beneath the pin.
+    var p: Process = .{ .io = std.testing.io };
+    const res = try p.runner().run(a, &.{ "sh", "-c", "printf '%s|%s' \"${LC_ALL-unset}\" \"${PATH:+set}\"" });
+    try testing.expect(res.ok);
+    try testing.expectEqualStrings("C|set", res.stdout);
 }
 
 test "SpawnSignals: a call handles the terminal signals, and gives the dispositions back" {

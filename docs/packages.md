@@ -607,6 +607,9 @@ backend.
   required, so 64 from one of them carries no meaning: `available` reads it as
   a broken plugin like any other unexpected exit, and `id`, `list`, `install`
   and `declare` as a failure like any other nonzero exit.
+- Every captured call runs under `LC_ALL=C` with `LANGUAGE` unset, because
+  mox parses what it prints and parses one language; a streamed call keeps
+  your locale, because what it prints reaches your terminal
 - Every captured call is time-bounded like a setup script
   (`MOX_SCRIPT_TIMEOUT_MS`);
   a `list` blocked on a manager's lock is a timeout failure naming the
