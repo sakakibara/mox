@@ -90,7 +90,7 @@ pub const Manager = enum {
         return switch (self) {
             .apt => "apt's own package list, what dpkg has installed, its holds and its pins",
             .dnf => "the packages dnf's repositories carry",
-            .pacman => "the package groups pacman's repositories carry",
+            .pacman => "the packages, groups and provisions pacman's repositories carry",
         };
     }
 };
@@ -111,6 +111,9 @@ pub const Distro = struct {
     /// How many of the last `install`'s rows the manager was never handed,
     /// which `installRefused` answers with.
     refused: usize = 0,
+    /// Whether this install's own check already ran a full `pacman -Syu`, so
+    /// the install that follows does not refresh a second time.
+    synced: bool = false,
 
     pub fn backend(self: *Distro) Backend {
         return .{
@@ -226,6 +229,7 @@ pub const Distro = struct {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         self.spawned = false;
         self.refused = 0;
+        self.synced = false;
         if (rows.len == 0) return;
 
         const elevate = self.elevates();
@@ -252,10 +256,16 @@ pub const Distro = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         if (elevate) try argv.append(arena, "sudo");
         if (self.manager == .apt) try argv.appendSlice(arena, &apt_env);
+        // pacman's install refreshes as it goes, except when the check ahead
+        // of it already ran that same full `-Syu`: repeating it there costs a
+        // second whole-system upgrade for a database that is already current.
         const head: []const []const u8 = switch (self.manager) {
             .apt => &.{ "apt-get", "install", "-y" },
             .dnf => &.{ "dnf", "install", "-y" },
-            .pacman => &.{ "pacman", "-Syu", "--needed", "--noconfirm" },
+            .pacman => if (self.synced)
+                &.{ "pacman", "-S", "--needed", "--noconfirm" }
+            else
+                &.{ "pacman", "-Syu", "--needed", "--noconfirm" },
         };
         try argv.appendSlice(arena, head);
         // `--` stops an operand being read as an option, and apt-get 3.0.3
@@ -871,6 +881,15 @@ pub const Distro = struct {
         return std.mem.order(u8, a, b) == .lt;
     }
 
+    /// Whether any row names something the listing does not carry, which is
+    /// the only row the group and provision questions are asked about.
+    fn anyUnlisted(rows: []const Row, known: std.StringHashMap(void)) bool {
+        for (rows) |row| {
+            if (!known.contains(row.name)) return true;
+        }
+        return false;
+    }
+
     /// What follows `prefix` in `line`, trimmed, or null when `line` does not
     /// begin with it.
     fn stringAfter(line: []const u8, prefix: []const u8) ?[]const u8 {
@@ -953,8 +972,9 @@ pub const Distro = struct {
         return true;
     }
 
-    /// Refuse the rows `pacman -Sg` positively identifies as a GROUP, and
-    /// answer with the rest.
+    /// Refuse the rows pacman positively identifies as something other than a
+    /// package of that name -- a GROUP, or a PROVISION some other package
+    /// satisfies -- and answer with the rest.
     ///
     /// A group is spelled exactly like a package and passes every shape rule
     /// there is. `pacman -S xfce4` installs all 14 of its members -- `gnome`
@@ -963,16 +983,24 @@ pub const Distro = struct {
     /// status while the machine carries packages no manifest declares, and
     /// every apply installs the group again.
     ///
+    /// A PROVISION goes the same way and is spelled the same again: `cron` is
+    /// in no `pacman -Sl` line and `pacman -Sg cron` exits 1, but `pacman -Syu
+    /// --needed --noconfirm -- cron` installs `cronie`, and `pacman -Qeq`
+    /// reports `cronie`. Measured on pacman 7.1.0 against fully synced
+    /// databases, `sh` resolves to `bash`, `java-runtime` to `jdk-openjdk`,
+    /// `ttf-font` to `gnu-free-fonts` and `smtp-forwarder` to `exim` the same
+    /// way.
+    ///
     /// The package universe is asked first because a name that is both is
     /// pacman's package: `pacman -S kdevelop` resolves the package kdevelop
     /// and not the group's kdevelop-php and kdevelop-python. `base` and
     /// `base-devel` are packages in their own right now, so they pass here
     /// while `pacman -Sg base-devel` says it is no group.
     ///
-    /// Only a group is refused. A name neither query knows is KEPT: the
-    /// listing is whatever this machine last synced, and refusing what it
-    /// merely failed to find would refuse installable packages on any machine
-    /// whose database is a few days old.
+    /// Only a POSITIVE answer refuses. A name no query resolves at all is
+    /// KEPT: the listing is whatever this machine last synced, and refusing
+    /// what it merely failed to find would refuse installable packages on any
+    /// machine whose database is a few days old.
     ///
     /// "This is no group", though, is acted on rather than merely believed,
     /// so it is asked of a COMPLETE database. Verified against pacman 7.1.0
@@ -982,31 +1010,42 @@ pub const Distro = struct {
     /// `pacman -Sg xfce4` exits 1 saying the group was not found, which is
     /// what a genuine non-group answers too. Acting on that keeps the row,
     /// and `pacman -Syu -- xfce4` then installs all of the group's members.
+    /// The provision oracle needs no such guarantee of its own -- it refuses
+    /// only on a resolution pacman actually made, which a short database
+    /// cannot manufacture -- but it is asked after the same sync all the same,
+    /// because a database that answered nothing for the row would otherwise
+    /// leave both questions unanswered.
     fn refusePacmanNonPackages(self: *Distro, arena: std.mem.Allocator, rows: []const Row, elevate: bool) anyerror![]const Row {
-        // Both queries read the sync database, and a container or a fresh
-        // machine has never downloaded one: unsynced, `pacman -Sl` exits 0
-        // with nothing at all (verified against pacman 7.1.0) and every row
-        // would be judged against a database that holds nothing.
+        // Every one of these queries reads the sync database, and a container
+        // or a fresh machine has never downloaded one: unsynced, `pacman -Sl`
+        // exits 0 with nothing at all (verified against pacman 7.1.0) and
+        // every row would be judged against a database that holds nothing.
         //
         // So the database is ASKED first and written only when its answer is
-        // unusable -- a check on a machine whose every repository answered
-        // changes nothing -- and what is then run is the full `-Syu` the
-        // install itself was about to run, never a bare `-Sy`. A `-Sy` alone
-        // leaves the database ahead of the installed packages, which Arch
-        // documents as an unsupported partial-upgrade state, and every path
-        // out of here -- a refused row, an empty listing, a kill at the
-        // bound -- would leave the machine in it.
+        // unusable, and what is then run is the full `-Syu` the install itself
+        // was about to run, never a bare `-Sy`. A `-Sy` alone leaves the
+        // database ahead of the installed packages, which Arch documents as an
+        // unsupported partial-upgrade state, and every path out of here -- a
+        // refused row, an empty listing, a kill at the bound -- would leave the
+        // machine in it. The install that follows drops its own `-y` once this
+        // has run, so no apply upgrades the system twice.
         //
-        // A repository that answers with nothing after a sync that succeeded
-        // has a database and no packages in it, which is complete.
+        // Completeness is asked only when some row is absent from the listing,
+        // because that is the only row any of this has a question about. A
+        // repository configured with an EMPTY database contributes no line and
+        // so can never read as complete -- measured on pacman 7.1.0 against a
+        // `repo-add` database with nothing in it, which `pacman -Sl` answers
+        // for exactly as it answers for a database that is missing -- and
+        // asking it on every apply would sync every apply for nothing.
         var universe = try self.pacmanUniverse(arena);
-        if (!try self.pacmanDatabaseComplete(arena, universe)) {
+        if (anyUnlisted(rows, universe.names) and !try self.pacmanDatabaseComplete(arena, universe)) {
             var sync: std.ArrayList([]const u8) = .empty;
             if (elevate) try sync.append(arena, "sudo");
             try sync.appendSlice(arena, &.{ "pacman", "-Syu", "--noconfirm" });
             const up = try self.runner.stream(arena, sync.items);
             try exec.checkTimedOut(up);
             if (!up.ok) return Error.DistroRefreshFailed;
+            self.synced = true;
             universe = try self.pacmanUniverse(arena);
         }
         const known = universe.names;
@@ -1026,16 +1065,23 @@ pub const Distro = struct {
             }
             const members = try self.pacmanGroupMembers(arena, row.name);
             if (members.len == 0) {
+                if (try self.pacmanProvider(arena, row.name)) |provider| {
+                    self.say(
+                        "mox: pacman: row \"{s}\" names no pacman package; it is a provision that \"{s}\" satisfies, and pacman reports only the package name, so declare that instead\n",
+                        .{ row.name, provider },
+                    );
+                    continue;
+                }
                 // Absence from the listing is not evidence against the row
                 // here, where it is for apt: mox runs `apt-get update` itself
                 // immediately before reading apt's listing, so that listing
                 // answers for the index the install will resolve against,
                 // while pacman's sync database is whatever the machine last
                 // downloaded -- the normal state of an Arch machine between
-                // upgrades. The install argv is `pacman -Syu`, which syncs
-                // before it resolves, so a name this database has never heard
-                // of may well be a package once it has; pacman reports a name
-                // that is truly wrong itself.
+                // upgrades. The install argv syncs before it resolves, so a
+                // name this database has never heard of may well be a package
+                // once it has; pacman reports a name that is truly wrong
+                // itself.
                 try keep.append(arena, row);
                 continue;
             }
@@ -1072,6 +1118,44 @@ pub const Distro = struct {
         }
         std.mem.sort([]const u8, out.items, {}, lessThanString);
         return out.toOwnedSlice(arena);
+    }
+
+    /// The package pacman would install for `name` when `name` is not itself
+    /// one; null when pacman resolves `name` to itself, and null again when it
+    /// resolves it to nothing at all.
+    ///
+    /// `pacman -S --print` resolves the operand and prints the transaction it
+    /// would run without committing any of it: measured on pacman 7.1.0,
+    /// nothing under the database path changes across a run of these.
+    /// `--print-format '%n'` reduces each entry to a bare package name.
+    ///
+    /// A name with no target exits 1 saying "target not found", which is why
+    /// this cannot refuse an installable name on a stale database: only an
+    /// exit 0, a resolution pacman actually made, is acted on.
+    ///
+    /// No `--needed`, which the install argv does carry: measured on the same
+    /// pacman, `-S --print --needed` prints NOTHING for a target already
+    /// installed, and an empty transaction is indistinguishable from one that
+    /// resolved elsewhere. Without it an installed target prints its own name.
+    ///
+    /// The transaction carries the target's dependencies too, and the target
+    /// is its LAST entry, because a dependency is installed before the package
+    /// that needs it: `cron` prints `run-parts` then `cronie`, `bat` prints
+    /// three libraries then `bat`, `smtp-forwarder` four then `exim`.
+    fn pacmanProvider(self: *Distro, arena: std.mem.Allocator, name: []const u8) anyerror!?[]const u8 {
+        const res = try self.runner.run(arena, &.{ "pacman", "-S", "--print", "--print-format", "%n", "--", name });
+        try exec.checkTimedOut(res);
+        if (!res.ok) return null;
+
+        var last: ?[]const u8 = null;
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (std.mem.eql(u8, line, name)) return null;
+            last = line;
+        }
+        return last;
     }
 
     /// `-y` alone answers apt's own questions; debconf asks its own through
@@ -1784,6 +1868,7 @@ test "install: pacman installs a name its database has not heard of, rather than
         .{ .argv = "pacman -Sl", .stdout = "core bat 0.25.0-1\nextra ripgrep 14.1.1-1\n" },
         .{ .argv = "pacman-conf --repo-list", .stdout = "core\nextra\n" },
         .{ .argv = "pacman -Sg ghostty", .code = 1 },
+        .{ .argv = "pacman -S --print --print-format %n -- ghostty", .code = 1 },
         .{ .argv = "pacman -Syu --needed --noconfirm -- ghostty" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1866,20 +1951,145 @@ test "install: a configured repository with no packages in it is not a short dat
     // `repo-add` and holding nothing syncs, and `pacman -Sl` then prints no
     // line for it -- the same stdout a missing database gives. A sync that
     // succeeded is what tells the two apart, so one sync is the most this
-    // can cost.
+    // can cost, and the install that follows carries no `-y` of its own.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Sl", .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = "pacman-conf --repo-list", .stdout = "core\nemptyrepo\n" },
         .{ .argv = "sudo pacman -Syu --noconfirm" },
         .{ .argv = "pacman -Sg ghostty", .code = 1 },
-        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- ghostty" },
+        .{ .argv = "pacman -S --print --print-format %n -- ghostty", .code = 1 },
+        .{ .argv = "sudo pacman -S --needed --noconfirm -- ghostty" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{rowOf("ghostty", &.{})});
     try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
     try testing.expectEqual(@as(usize, 1), countCalls(&fake, "sudo pacman -Syu --noconfirm"));
-    try testing.expect(fake.called("sudo pacman -Syu --needed --noconfirm -- ghostty"));
+    try testing.expect(fake.called("sudo pacman -S --needed --noconfirm -- ghostty"));
+}
+
+test "install: a row naming an ALPM provision is refused, naming what provides it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Proved on pacman 7.1.0 against fully synced databases: `cron` is in no
+    // `pacman -Sl` line, `pacman -Sg cron` exits 1, `pacman -Syu --needed
+    // --noconfirm -- cron` installs `cronie`, and `pacman -Qeq` reports
+    // `cronie`. The row would be MISSING for ever while cronie reads
+    // UNTRACKED for ever, and every apply would install it again.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Sl", .stdout = "core bat 0.25.0-1\ncore cronie 1.7.2-1\n" },
+        .{ .argv = "pacman-conf --repo-list", .stdout = "core\n" },
+        .{ .argv = "pacman -Sg cron", .code = 1 },
+        .{ .argv = "pacman -S --print --print-format %n -- cron", .stdout = "run-parts\ncronie\n" },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("cron", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: row \"cron\" names no pacman package; it is a provision that \"cronie\" satisfies, and pacman reports only the package name, so declare that instead\n",
+        w.written(),
+    );
+    // One row nobody can install must not keep the rest off the machine.
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- bat"));
+}
+
+test "install: the provision oracle reads the transaction's last name, never a dependency" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A dependency is installed before the package that needs it, so the
+    // target is the transaction's last entry: measured on pacman 7.1.0,
+    // `smtp-forwarder` prints four libraries and then `exim`, and
+    // `java-runtime` sixteen and then `jdk-openjdk`.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Sl", .stdout = "core bash 5.3-1\n" },
+        .{ .argv = "pacman-conf --repo-list", .stdout = "core\n" },
+        .{ .argv = "pacman -Sg smtp-forwarder", .code = 1 },
+        .{ .argv = "pacman -S --print --print-format %n -- smtp-forwarder", .stdout = "libidn\nlibspf2\ndb5.3\nperl\nexim\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("smtp-forwarder", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expect(!d.backend().installSpawned());
+    try testing.expect(std.mem.indexOf(u8, w.written(), "a provision that \"exim\" satisfies") != null);
+}
+
+test "install: a name pacman resolves to itself is kept, dependencies and all" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The transaction for a real package carries its dependencies too, and
+    // the row's own name among them is what says the row is a package: on
+    // pacman 7.1.0 `bat` prints three libraries and then `bat`. A database
+    // that merely has not heard of the name yet answers exit 1 instead, and
+    // the row stands -- only a POSITIVE resolution refuses.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Sl", .stdout = "core glibc 2.42-1\n" },
+        .{ .argv = "pacman-conf --repo-list", .stdout = "core\n" },
+        .{ .argv = "pacman -Sg bat", .code = 1 },
+        .{ .argv = "pacman -S --print --print-format %n -- bat", .stdout = "llhttp\nlibgit2\noniguruma\nbat\n" },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- bat"));
+}
+
+test "install: a group is named as a group, never as a provision" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `pacman -S --print -- <group>` resolves a group too, so the oracle
+    // would refuse it with a message that names one member as its provider.
+    // The group question is asked first, where the whole membership is what
+    // the user needs to read.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Sl", .stdout = "extra exo 4.20.0-1\nextra garcon 4.20.0-1\n" },
+        .{ .argv = "pacman-conf --repo-list", .stdout = "extra\n" },
+        .{ .argv = "pacman -Sg xfce4", .stdout = "xfce4 exo\nxfce4 garcon\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("xfce4", &.{})});
+    try testing.expect(std.mem.indexOf(u8, w.written(), "it is a group of 2 packages") != null);
+    try testing.expect(!fake.called("pacman -S --print --print-format %n -- xfce4"));
+}
+
+test "install: a row the listing already carries asks the database nothing more" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The empty repository above can never read as complete, so asking
+    // whether the database is whole on every apply would sync on every apply.
+    // Nothing here has a question for it: every row is in the listing, so no
+    // group and no provision is asked about, and the install's own `-Syu` is
+    // the only refresh the machine pays for.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Sl", .stdout = "core bat 0.25.0-1\n" },
+        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+    try testing.expect(!fake.called("pacman-conf --repo-list"));
+    try testing.expect(!fake.called("sudo pacman -Syu --noconfirm"));
 }
 
 test "install: a pacman listing past the cap stops the install, saying that is what happened" {
@@ -1915,14 +2125,18 @@ test "install: a pacman check reads the database and never writes to it" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Sl", .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = "pacman-conf --repo-list", .stdout = "core\n" },
-        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
+        .{ .argv = "pacman -Sg ghostty", .code = 1 },
+        .{ .argv = "pacman -S --print --print-format %n -- ghostty", .code = 1 },
+        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat ghostty" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
-    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ghostty", &.{}) });
     try testing.expectEqualStrings("pacman -Sl", fake.calls.items[0]);
     try testing.expectEqualStrings("pacman-conf --repo-list", fake.calls.items[1]);
-    try testing.expectEqual(@as(usize, 3), fake.calls.items.len);
+    try testing.expectEqual(@as(usize, 5), fake.calls.items.len);
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-Sy") == null or
+        std.mem.indexOf(u8, c, "--needed") != null);
 }
 
 test "install: an unsynced pacman database is brought up by the upgrade the install was about to run" {
@@ -1941,7 +2155,7 @@ test "install: an unsynced pacman database is brought up by the upgrade the inst
         .{ .argv = "pacman-conf --repo-list", .stdout = "core\nextra\n" },
         .{ .argv = "sudo pacman -Syu --noconfirm" },
         .{ .argv = "pacman -Sl", .stdout = "core bat 0.25.0-1\n" },
-        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
+        .{ .argv = "sudo pacman -S --needed --noconfirm -- bat" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
@@ -1950,7 +2164,10 @@ test "install: an unsynced pacman database is brought up by the upgrade the inst
     try testing.expectEqualStrings("pacman-conf --repo-list", fake.calls.items[1]);
     try testing.expectEqualStrings("sudo pacman -Syu --noconfirm", fake.calls.items[2]);
     try testing.expectEqualStrings("pacman -Sl", fake.calls.items[3]);
-    try testing.expectEqualStrings("sudo pacman -Syu --needed --noconfirm -- bat", fake.calls.items[4]);
+    // The check's own upgrade is the run's only one: repeating `-Syu` in the
+    // install would upgrade the whole system a second time.
+    try testing.expectEqualStrings("sudo pacman -S --needed --noconfirm -- bat", fake.calls.items[4]);
+    try testing.expectEqual(@as(usize, 1), countCalls(&fake, "sudo pacman -Syu --noconfirm"));
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-Sy ") == null);
 
     // An upgrade that fails is not an install that failed: no install ran.

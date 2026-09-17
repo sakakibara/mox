@@ -91,6 +91,13 @@ pub const Brew = struct {
     /// is what the call site reports, so the row and the name to write in its
     /// place have nowhere else to go.
     err: ?*Io.Writer = null,
+    /// What the whole per-name fallback in `resolveNames` gets, in
+    /// milliseconds; NEGATIVE leaves it unbounded, and zero spends none of it.
+    /// Each of that fallback's calls answers to the per-call bound alone, so
+    /// without one budget over all of them a batch of 120 names costs 120 of
+    /// those and no setting caps the total. Set from the same bound one call
+    /// runs under, so the check as a whole costs about what one query may.
+    probe_budget_ms: i64 = exec.default_timeout_ms,
 
     pub fn backend(self: *Brew) Backend {
         return .{
@@ -502,19 +509,44 @@ pub const Brew = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &head);
         try argv.appendSlice(arena, names.items);
-        const res = try self.runner.run(arena, argv.items);
-        try exec.checkTimedOut(res);
-        if (res.ok) {
-            try recordAnswers(arena, kind, res.stdout, into);
-            return;
+        if (self.runner.run(arena, argv.items)) |res| {
+            try exec.checkTimedOut(res);
+            if (res.ok) {
+                try recordAnswers(arena, kind, res.stdout, into);
+                return;
+            }
+        } else |e| switch (e) {
+            // A batch answered past the capture cap is one brew answered for,
+            // in more JSON than mox reads at once. Each name on its own is an
+            // answer that fits, which is what the fallback below asks for.
+            error.StreamTooLong => {},
+            else => return e,
         }
         if (names.items.len == 1) return;
 
-        for (names.items) |name| {
+        // A clock this adapter has no `Io` for cannot bound anything, and a
+        // negative budget asks for no bound: both leave the fallback to the
+        // per-call one, which is what it had before.
+        const clock = if (self.probe_budget_ms < 0) null else self.io;
+        const started = if (clock) |io| Io.Timestamp.now(io, .awake) else null;
+        for (names.items, 0..) |name, asked| {
+            if (started) |from| {
+                const elapsed = from.durationTo(Io.Timestamp.now(clock.?, .awake)).toMilliseconds();
+                if (elapsed >= self.probe_budget_ms) {
+                    self.say(
+                        "mox: brew: asking about the {d} {s} names one at a time passed the {d} ms this check gets in total, so {d} of them went unasked; a row naming an alias among those installs under the alias\n",
+                        .{ names.items.len, @tagName(kind), self.probe_budget_ms, names.items.len - asked },
+                    );
+                    return;
+                }
+            }
             var one: std.ArrayList([]const u8) = .empty;
             try one.appendSlice(arena, &head);
             try one.append(arena, name);
-            const got = try self.runner.run(arena, one.items);
+            const got = self.runner.run(arena, one.items) catch |e| switch (e) {
+                error.StreamTooLong => continue,
+                else => return e,
+            };
             try exec.checkTimedOut(got);
             if (!got.ok) continue;
             try recordAnswers(arena, kind, got.stdout, into);
@@ -1413,6 +1445,97 @@ test "install: one unresolvable name does not disable alias refusal for the batc
     // The alias never reached brew; the name brew could not resolve did.
     try testing.expect(!fake.called("brew install -- ag"));
     try testing.expect(fake.called("brew install -- zzz-removed-formula"));
+}
+
+test "install: the per-name fallback stops at its budget, saying what went unasked" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every call of the fallback answers to the per-call bound alone, so a
+    // manifest of 120 formulas and one bad name costs 121 of those and no
+    // setting caps the total. One budget over all of them does.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat zzz-removed-formula", .code = 1 },
+        .{ .argv = "brew install -- ag" },
+        .{ .argv = "brew install -- bat" },
+        .{ .argv = "brew install -- zzz-removed-formula" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .io = io, .err = &w.writer, .probe_budget_ms = 0 };
+
+    try b.backend().install(a, &.{ rowOf("ag", &.{}), rowOf("bat", &.{}), rowOf("zzz-removed-formula", &.{}) });
+    try testing.expectEqualStrings(
+        "mox: brew: asking about the 3 formula names one at a time passed the 0 ms this check gets in total, so 3 of them went unasked; a row naming an alias among those installs under the alias\n",
+        w.written(),
+    );
+    // Unasked is not refused: the rows stand, which is the direction that
+    // installs rather than the one that keeps packages off the machine.
+    try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
+    try testing.expect(!fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag"));
+    try testing.expect(fake.called("brew install -- ag"));
+}
+
+test "install: a budget mox has no clock for leaves the fallback as it was" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every name is still asked about: a bound that cannot be measured must
+    // not silently turn the check off.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat", .code = 1 },
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
+            .stdout =
+            \\{"formulae":[{"full_name":"the_silver_searcher","name":"the_silver_searcher","tap":"homebrew/core","aliases":["ag"],"oldnames":[]}],"casks":[]}
+            ,
+        },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- bat", .code = 1 },
+        .{ .argv = "brew install -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer, .probe_budget_ms = 0 };
+
+    try b.backend().install(a, &.{ rowOf("ag", &.{}), rowOf("bat", &.{}) });
+    try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
+    try testing.expect(fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag"));
+    try testing.expect(std.mem.indexOf(u8, w.written(), "went unasked") == null);
+}
+
+test "install: a batch answered past the capture cap is asked name by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `brew info --json=v2` over a whole manifest is the one answer here that
+    // can outgrow what mox reads from a query. Letting that abort the install
+    // would keep every package off the machine over an answer that is merely
+    // large; each name on its own is an answer that fits.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        nothing_installed,
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat", .fail = error.StreamTooLong },
+        .{
+            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
+            .stdout =
+            \\{"formulae":[{"full_name":"the_silver_searcher","name":"the_silver_searcher","tap":"homebrew/core","aliases":["ag"],"oldnames":[]}],"casks":[]}
+            ,
+        },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- bat", .fail = error.StreamTooLong },
+        .{ .argv = "brew install -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{ rowOf("ag", &.{}), rowOf("bat", &.{}) });
+    // The alias was still caught, and the name that answered with nothing
+    // usable was left to brew.
+    try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
+    try testing.expect(fake.called("brew install -- bat"));
+    try testing.expect(!fake.called("brew install -- ag"));
 }
 
 test "install: a formula row and a cask row of one name each get their own answer" {

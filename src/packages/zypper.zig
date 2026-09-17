@@ -48,6 +48,9 @@ pub const Zypper = struct {
     /// `installSpawned` answers with: a refresh that fails stops the install
     /// before it, and nothing it named can have landed.
     spawned: bool = false,
+    /// How many of the last `install`'s rows zypper was never handed, which
+    /// `installRefused` answers with.
+    refused: usize = 0,
 
     pub fn backend(self: *Zypper) Backend {
         return .{
@@ -55,6 +58,7 @@ pub const Zypper = struct {
             .ctx = self,
             .vtable = &vtable,
             .limitation = "zypper cannot report what was installed by hand, so mox tracks only what it installed itself",
+            .install_check = "the package names zypper's repositories carry",
         };
     }
 
@@ -65,12 +69,25 @@ pub const Zypper = struct {
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
         .installSpawned = installSpawnedImpl,
+        .installRefused = installRefusedImpl,
         .declare = declareImpl,
     };
 
     fn installSpawnedImpl(ctx: *anyopaque) bool {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
         return self.spawned;
+    }
+
+    fn installRefusedImpl(ctx: *anyopaque) usize {
+        const self: *Zypper = @ptrCast(@alignCast(ctx));
+        return self.refused;
+    }
+
+    /// Say `fmt` where a refused row can be read, if anywhere.
+    fn say(self: *Zypper, comptime fmt: []const u8, args: anytype) void {
+        const w = self.err orelse return;
+        w.print(fmt, args) catch {};
+        w.flush() catch {};
     }
 
     fn availableImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Backend.Availability {
@@ -176,9 +193,134 @@ pub const Zypper = struct {
         return res.ok or res.code == 102 or res.code == 103;
     }
 
+    /// The argv that asks zypper which of `names` its repositories carry
+    /// under that exact name. `--match-exact` matches the NAME alone, never a
+    /// capability: measured against zypper 1.14.94, `smtp_daemon` and `java`
+    /// answer nothing here while the same search with `--provides` answers
+    /// with the packages that provide them.
+    ///
+    /// Several operands are one OR search, so a batch is one call, and only
+    /// the names that matched come back. `--quiet` drops the progress lines;
+    /// what is left is zypper's `S | Name | Summary | Type` table, which is
+    /// the only machine query zypper has for what its repositories carry.
+    ///
+    /// The pool includes what is already installed: measured on the same
+    /// zypper, the first five names `rpm -qa` reported each answered here too,
+    /// so a package that came from an rpm file rather than a repository is not
+    /// refused.
+    const search_head = [_][]const u8{ "zypper", "--non-interactive", "--quiet", "search", "--match-exact", "--type", "package" };
+
+    /// zypper answers a search that matched nothing with
+    /// ZYPPER_EXIT_INF_CAP_NOT_FOUND, which is an empty answer rather than a
+    /// query that could not run.
+    const exit_cap_not_found: u8 = 104;
+
+    /// The names in one search table, or nothing when the search matched
+    /// none. A row is a line whose last column is `package`, which the header
+    /// (`Type`) and the rule under it are not; the name is the second column,
+    /// ahead of the summary, so a summary carrying a `|` cannot move it.
+    fn zypperNameSet(self: *Zypper, arena: std.mem.Allocator, argv: []const []const u8) anyerror!std.StringHashMap(void) {
+        var set = std.StringHashMap(void).init(arena);
+        const res = try self.runner.run(arena, argv);
+        try exec.checkTimedOut(res);
+        if (res.code == exit_cap_not_found) return set;
+        if (!res.ok) return Error.ZypperQueryFailed;
+
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            var fields = std.mem.splitScalar(u8, raw, '|');
+            _ = fields.next() orelse continue;
+            const name_field = fields.next() orelse continue;
+            var columns: usize = 2;
+            var last = name_field;
+            while (fields.next()) |f| {
+                last = f;
+                columns += 1;
+            }
+            if (columns < 4) continue;
+            if (!std.mem.eql(u8, std.mem.trim(u8, last, " \t\r"), "package")) continue;
+            const name = std.mem.trim(u8, name_field, " \t\r");
+            if (name.len == 0) continue;
+            try set.put(name, {});
+        }
+        return set;
+    }
+
+    /// The packages that provide `name`, never `name` itself, sorted: a hash
+    /// map's order is not a message's.
+    fn zypperProvidersOf(self: *Zypper, arena: std.mem.Allocator, name: []const u8) anyerror![]const []const u8 {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &search_head);
+        try argv.appendSlice(arena, &.{ "--provides", "--", name });
+        const set = try self.zypperNameSet(arena, argv.items);
+
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = set.keyIterator();
+        while (it.next()) |k| {
+            if (std.mem.eql(u8, k.*, name)) continue;
+            try out.append(arena, k.*);
+        }
+        std.mem.sort([]const u8, out.items, {}, lessThanString);
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Refuse the rows zypper has no package of that name for, and answer
+    /// with the rest.
+    ///
+    /// An rpm virtual provide is spelled exactly like a package name, so it
+    /// passes every shape rule there is: measured on openSUSE Leap 15.6 with
+    /// zypper 1.14.94, `smtp_daemon` is no package, `zypper --non-interactive
+    /// install -- smtp_daemon` exits 0 having installed `postfix`, and `rpm
+    /// -qa` reports `postfix`. The row is missing on every status and
+    /// reinstalled on every apply, and zypper exits 0 each time, so nothing
+    /// ever surfaces it. `java` goes the same way, resolving to an openjdk.
+    ///
+    /// A name zypper has nothing at all for is refused too, rather than
+    /// handed over: measured on the same zypper, `install -- ripgrep
+    /// nosuchpkgxyz` exits 104 having installed NEITHER, so one bad row
+    /// otherwise keeps every package beside it off the machine.
+    ///
+    /// Here rather than in `validate` because only the manager can answer it,
+    /// and after the refresh because the refresh is what makes its answer the
+    /// one the install will resolve against.
+    fn refuseZypperNonPackages(self: *Zypper, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &search_head);
+        try argv.append(arena, "--");
+        for (rows) |row| try argv.append(arena, row.name);
+        const known = try self.zypperNameSet(arena, argv.items);
+
+        var keep: std.ArrayList(Row) = .empty;
+        for (rows) |row| {
+            if (known.contains(row.name)) {
+                try keep.append(arena, row);
+                continue;
+            }
+            const providers = try self.zypperProvidersOf(arena, row.name);
+            if (providers.len == 0) {
+                self.say(
+                    "mox: zypper: row \"{s}\" names no zypper package in this machine's repositories\n",
+                    .{row.name},
+                );
+                continue;
+            }
+            var list: std.Io.Writer.Allocating = .init(arena);
+            for (providers, 0..) |p, i| {
+                if (i > 0) try list.writer.writeAll(", ");
+                try list.writer.print("\"{s}\"", .{p});
+            }
+            self.say(
+                "mox: zypper: row \"{s}\" names no zypper package; it is a capability provided by {s}, and rpm reports only the package name, so declare that instead\n",
+                .{ row.name, list.written() },
+            );
+        }
+        return keep.toOwnedSlice(arena);
+    }
+
     fn installImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!void {
         const self: *Zypper = @ptrCast(@alignCast(ctx));
         self.spawned = false;
+        self.refused = 0;
         if (rows.len == 0) return;
 
         const elevate = if (self.force_elevate) |f| f else !exec.isRoot();
@@ -190,21 +332,39 @@ pub const Zypper = struct {
         try exec.checkTimedOut(up);
         if (!refreshOk(up)) return Error.ZypperInstallFailed;
 
+        // A row the manager has no package for is refused and the rest of the
+        // batch installed: one row nobody can install must not keep every
+        // other package off the machine, and `installRefused` reports how
+        // many so the run counts them and exits non-zero.
+        const keep = try self.refuseZypperNonPackages(arena, rows);
+        self.refused = rows.len - keep.len;
+        if (keep.len == 0) return;
+
         var argv: std.ArrayList([]const u8) = .empty;
         if (elevate) try argv.append(arena, "sudo");
         // `--` is accepted by zypper 1.14.101 and stops anything after it
         // being read as an option. `validate` is what refuses a name that is
         // not a package name; this bounds what a name reaching zypper can do.
         try argv.appendSlice(arena, &.{ "zypper", "--non-interactive", "install", "--" });
-        for (rows) |row| try argv.append(arena, row.name);
+        for (keep) |row| try argv.append(arena, row.name);
 
         self.spawned = true;
         const res = try self.runner.stream(arena, argv.items);
 
         var ids: std.ArrayList([]const u8) = .empty;
-        for (rows) |row| try ids.append(arena, row.name);
+        for (keep) |row| try ids.append(arena, row.name);
         if (!res.timed_out and installOk(res)) {
-            try self.ledger.add(arena, ids.items);
+            // The install landed whatever the record can or cannot say about
+            // it, so a state directory that cannot be written is said and not
+            // reported as an install that failed. What is lost is the record:
+            // these read as missing again on the next apply.
+            self.ledger.add(arena, ids.items) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                self.say(
+                    "mox: zypper: the install landed, but its record could not be written ({s}); these {d} are reported missing again on the next apply\n",
+                    .{ exec.errorText(e), ids.items.len },
+                );
+            };
             return;
         }
         // A batch that failed -- or was killed at its bound partway through --
@@ -224,23 +384,35 @@ pub const Zypper = struct {
         const landed = self.presentOf(arena, ids.items) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => blk: {
-                if (self.err) |w| {
-                    w.print(
-                        "mox: zypper: rpm could not say which of the batch landed ({s}); all {d} are recorded, and every read narrows them to what rpm reports\n",
-                        .{ exec.errorText(e), ids.items.len },
-                    ) catch {};
-                    w.flush() catch {};
-                }
+                self.say(
+                    "mox: zypper: rpm could not say which of the batch landed ({s}); all {d} are recorded, and every read narrows them to what rpm reports\n",
+                    .{ exec.errorText(e), ids.items.len },
+                );
                 break :blk ids.items;
             },
         };
-        if (landed.len > 0) try self.ledger.add(arena, landed);
+        if (landed.len > 0) {
+            // What stopped the install is what the caller must be told, so a
+            // record that cannot be written is said here rather than returned
+            // in place of the install's own failure.
+            self.ledger.add(arena, landed) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                self.say(
+                    "mox: zypper: {d} of the batch landed, but the record could not be written ({s}); they are reported missing again on the next apply\n",
+                    .{ landed.len, exec.errorText(e) },
+                );
+            };
+        }
         try exec.checkTimedOut(res);
         return Error.ZypperInstallFailed;
     }
 
     fn declareImpl(_: *anyopaque, _: std.mem.Allocator, id: []const u8) anyerror!Backend.Declaration {
         return .{ .name = id };
+    }
+
+    fn lessThanString(_: void, a: []const u8, b: []const u8) bool {
+        return std.mem.order(u8, a, b) == .lt;
     }
 };
 
@@ -350,6 +522,7 @@ test "install: refreshes, installs the batch, and records what landed" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | bat | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -370,6 +543,7 @@ test "install: a failure that landed nothing records nothing" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep", .code = 1 },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nglibc\n" },
     } };
@@ -393,6 +567,7 @@ test "install: a failed batch records the rows that landed, and only those" {
     // failing sibling on every apply.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep nosuch", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | nosuch | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep nosuch", .code = 104 },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
     } };
@@ -418,6 +593,7 @@ test "install: an install killed at its bound still records what landed" {
     // prevent -- so the record happens first and the kill is still reported.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | bat | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat", .timed_out = true },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\n" },
     } };
@@ -441,6 +617,7 @@ test "install: a kill whose read-back also fails is still reported as a kill" {
     // stopped the install is what the caller must be told.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep", .timed_out = true },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .code = 1 },
     } };
@@ -464,6 +641,7 @@ test "install: a failed batch whose read-back cannot run records the batch, and 
     // id that every read drops again.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep nosuch", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | nosuch | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep nosuch", .code = 4 },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .code = 1 },
     } };
@@ -502,6 +680,7 @@ test "install: a reboot or restart needed after the install is a success" {
     // (103) are informational; rpm is not consulted for a success.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- kernel-default", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | kernel-default | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- kernel-default", .code = 102, .once = true },
         .{ .argv = "sudo zypper --non-interactive install -- kernel-default", .code = 103 },
     } };
@@ -527,6 +706,7 @@ test "install: an informational refresh exit is not a failed install" {
     for (codes) |code| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "sudo zypper --non-interactive refresh", .code = code },
+            .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
             .{ .argv = "sudo zypper --non-interactive install -- bat" },
         } };
         var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -552,6 +732,7 @@ test "install: root installs without sudo" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
         .{ .argv = "zypper --non-interactive install -- bat" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -697,10 +878,149 @@ test "install: the operands follow a --, so no name can be read as an option" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- bat" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
     try z.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expectEqualStrings("sudo zypper --non-interactive install -- bat", fake.calls.items[1]);
+    try testing.expectEqualStrings("sudo zypper --non-interactive install -- bat", fake.calls.items[2]);
+}
+
+test "install: a row naming an rpm virtual provide is refused, naming what provides it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on openSUSE Leap 15.6 with zypper 1.14.94: `smtp_daemon` is no
+    // package, `zypper --non-interactive install -- smtp_daemon` exits 0
+    // having installed postfix, and rpm reports postfix. The row would be
+    // missing on every status and reinstalled on every apply, silently --
+    // zypper exits 0 each time.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep smtp_daemon", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package --provides -- smtp_daemon", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | postfix | a mailer | package\n   | exim | a mailer | package\n" },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    z.err = &w.writer;
+
+    try z.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("smtp_daemon", &.{}) });
+    try testing.expectEqual(@as(usize, 1), z.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: zypper: row \"smtp_daemon\" names no zypper package; it is a capability provided by \"exim\", \"postfix\", and rpm reports only the package name, so declare that instead\n",
+        w.written(),
+    );
+    // The row beside it was installed, and only it was recorded.
+    try testing.expect(fake.called("sudo zypper --non-interactive install -- ripgrep"));
+    const recorded = try z.ledger.read(a);
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expectEqualStrings("ripgrep", recorded[0]);
+}
+
+test "install: a row zypper has nothing at all for is refused, and the batch beside it installed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on the same zypper: `install -- ripgrep nosuchpkgxyz` exits
+    // 104 having installed NEITHER, so handing the bad name over would keep
+    // the good one off the machine.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- ripgrep nosuchpkgxyz", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package --provides -- nosuchpkgxyz", .code = 104 },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    z.err = &w.writer;
+
+    try z.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("nosuchpkgxyz", &.{}) });
+    try testing.expectEqual(@as(usize, 1), z.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: zypper: row \"nosuchpkgxyz\" names no zypper package in this machine's repositories\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("sudo zypper --non-interactive install -- ripgrep"));
+}
+
+test "install: a batch whose every row is refused never runs zypper" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- java", .code = 104 },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package --provides -- java", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | java-11-openjdk | a runtime | package\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    z.err = &w.writer;
+
+    try z.backend().install(a, &.{rowOf("java", &.{})});
+    try testing.expectEqual(@as(usize, 1), z.backend().installRefused());
+    try testing.expect(!z.backend().installSpawned());
+    try testing.expectEqual(@as(usize, 0), (try z.ledger.read(a)).len);
+}
+
+test "install: a search that cannot run stops the install rather than refusing every row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 104 is "matched nothing"; any other non-zero exit is a query that could
+    // not answer, and reading that as "no row names a package" would refuse
+    // every row on a machine whose zypper is merely unwell.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- bat", .code = 6 },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    try testing.expectError(Error.ZypperQueryFailed, z.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expect(!z.backend().installSpawned());
+}
+
+test "install: a record that cannot be written is said, not reported as a failed install" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A read-only state directory or a full disk. The install landed, so
+    // reporting it as a failure would send the reader looking for a package
+    // that is on the machine; what is lost is the record alone.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = "zypper --non-interactive --quiet search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
+        .{ .argv = "sudo zypper --non-interactive install -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z: Zypper = .{
+        .runner = fake.runner(),
+        // A path no directory can be made at: `ledger.add` fails on it.
+        .ledger = .{ .io = io, .dir = "/dev/null/nowhere/packages", .backend = "zypper" },
+        .force_elevate = true,
+        .err = &w.writer,
+    };
+
+    try z.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(std.mem.startsWith(u8, w.written(), "mox: zypper: the install landed, but its record could not be written ("));
+    try testing.expect(std.mem.endsWith(u8, w.written(), "); these 1 are reported missing again on the next apply\n"));
 }

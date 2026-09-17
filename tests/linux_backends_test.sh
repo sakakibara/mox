@@ -30,7 +30,10 @@
 # establish: `apt-get install -y vim nano-` removes nano; `apt-get install --
 # bsdextrautil.` installs bsdextrautils, apt having matched the operand as a
 # regular expression; `dnf install zlib-devel` installs zlib-ng-compat-devel,
-# `zlib-devel` being a capability rather than a package; `pacman -S xfce4`
+# `zlib-devel` being a capability rather than a package; `zypper install
+# smtp_daemon` installs postfix and exits 0 every time after, `smtp_daemon`
+# being an rpm virtual provide; `pacman -S cron` installs cronie, `cron` being
+# an ALPM provision that is in no listing and no group; `pacman -S xfce4`
 # installs all fourteen members of a group that `pacman -Qeq` never reports;
 # `apt-get install sl:any` installs sl, which `apt-mark showmanual` then
 # reports bare; and a bare operand naming a package only the foreign
@@ -43,9 +46,12 @@
 # apt's listing must come back empty; one covers a pacman database that
 # is merely old, where a name it lacks must still reach pacman; one covers a
 # package no repository carries, installed from a .deb, which apt would
-# install and mox must therefore keep; and one covers a pacman database that
+# install and mox must therefore keep; one covers a pacman database that
 # is SHORT rather than old, where a repository's groups all read as no group
-# at all. The hermetic
+# at all; one covers a name zypper has nothing at all for, which makes
+# `zypper install` install none of the batch it is in; and one covers a
+# configured, synced and EMPTY pacman repository, which contributes no line to
+# the listing and so can never read as complete. The hermetic
 # suite proves what the adapter does; only the real manager proves what the
 # row would have done. These run with the default set, not from the
 # image/backend/package arguments.
@@ -1403,6 +1409,262 @@ EOF
   fi
 }
 
+# `cron` is an ALPM PROVISION: it is in no `pacman -Sl` line and no group
+# either, but `pacman -S cron` installs `cronie`, which `pacman -Qeq` then
+# reports -- so the row is MISSING for ever, cronie UNTRACKED for ever, and
+# every apply installs it again. Only the real pacman can establish that the
+# provision resolves and that the row's own name is absent from what it
+# resolves to.
+run_pacman_provision_case() {
+  image="$1"
+  backend="pacman provision"
+
+  case_dir="$work/pacman-provision"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "cron"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      pacman -Q cronie >/dev/null 2>&1 && { echo "the image ships cronie; the case cannot run"; exit 1; }
+      # The premises: no package of that name, no group of that name, and
+      # pacman resolves it all the same.
+      pacman -Sl 2>/dev/null | awk "\$2 == \"cron\"" | grep -q . && { echo "this image has a real cron package; the case cannot run"; exit 1; }
+      pacman -Sg cron >/dev/null 2>&1 && { echo "cron is a group here; the case cannot run"; exit 1; }
+      pacman -S --print --print-format "%n" -- cron >/dev/null 2>&1 || { echo "cron resolves to nothing here; the case cannot run"; exit 1; }
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      pacman -Q cronie >/dev/null 2>&1 && echo "collateral=cronie" || echo "collateral=absent"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no database could answer" "$(tail -2 "$out")"
+    return
+  fi
+
+  # The message must carry the name to declare, or the user is left with a
+  # row that fails on every apply and no way to learn what to write.
+  if grep -q 'mox: pacman: row "cron" names no pacman package; it is a provision that "cronie" satisfies' "$out"; then
+    ok "$backend ($image): the row is refused, naming the package that satisfies it"
+  else
+    no "$backend ($image): apply did not name the package pacman would install" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "collateral=absent" "$out"; then
+    ok "$backend ($image): cronie was never installed; the manifest declares no such package"
+  else
+    no "$backend ($image): pacman installed a package the manifest never declared" "$(grep '^collateral=' "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# A repository that is configured, synced and EMPTY contributes no line to
+# `pacman -Sl`, which is the same stdout a missing database gives -- so it can
+# never read as complete, and a completeness check on every apply would sync on
+# every apply. A row the listing already carries has no question for the
+# database, so nothing is asked of it and nothing is synced ahead of the
+# install's own refresh.
+run_pacman_empty_repo_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman empty-repo"
+
+  case_dir="$work/pacman-empty-repo"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      mkdir -p /srv/empty
+      repo-add /srv/empty/emptyrepo.db.tar.gz >/tmp/ra.txt 2>&1 || { echo 'repo-add=failed'; exit 0; }
+      printf '\n[emptyrepo]\nSigLevel = Never\nServer = file:///srv/empty\n' >> /etc/pacman.conf
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo 'sync=failed'; exit 0; }
+      # The premises: the repository is configured, its database is present
+      # and synced, and it contributes nothing to the listing.
+      pacman-conf --repo-list | grep -qx emptyrepo || { echo 'the empty repository is not configured; the case cannot run'; exit 1; }
+      [ -f /var/lib/pacman/sync/emptyrepo.db ] || { echo 'the empty database did not sync; the case cannot run'; exit 1; }
+      pacman -Sl 2>/dev/null | awk '\$1 == \"emptyrepo\"' | grep -q . && { echo 'the empty repository carries packages; the case cannot run'; exit 1; }
+      echo '--- apply ---'
+      rc=0
+      /w/mox apply || rc=\$?
+      echo \"apply-exit=\$rc\"
+      echo \"installed=\$(pacman -Qq $pkg >/dev/null 2>&1 && echo 1 || echo 0)\"
+    " >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^repo-add=failed" "$out" || grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): no empty repository could be built and synced here" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^installed=1" "$out"; then
+    ok "$backend ($image): the row installed beside a repository that carries nothing"
+  else
+    no "$backend ($image): the row did not install" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    ok "$backend ($image): an empty repository is not a failure"
+  else
+    no "$backend ($image): apply failed over an empty repository" "$(grep 'apply-exit=' "$out")"
+  fi
+}
+
+# `smtp_daemon` is an rpm VIRTUAL PROVIDE: `zypper install smtp_daemon` exits
+# 0 having installed postfix, `rpm -qa` reports postfix, and a second install
+# says postfix already provides it and exits 0 again -- so the row is MISSING
+# for ever and reinstalled on every apply, silently. Only the real zypper can
+# establish that the name resolves to a package of another name.
+run_zypper_provide_name_case() {
+  image="$1"
+  backend="zypper provide-name"
+
+  case_dir="$work/zypper-provide-name"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/zypper.toml" <<'EOF'
+backend = "zypper"
+
+[[packages]]
+name = "smtp_daemon"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      rpm -q postfix >/dev/null 2>&1 && { echo "the image ships postfix; the case cannot run"; exit 1; }
+      rpm -q smtp_daemon >/dev/null 2>&1 && { echo "this image has a real smtp_daemon; the case cannot run"; exit 1; }
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "--- collateral ---"
+      rpm -q postfix >/dev/null 2>&1 && echo "collateral=postfix" || echo "collateral=absent"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  # The message must carry a name to declare, or the user is left with a row
+  # that reinstalls on every apply and no way to learn what to write.
+  if grep -q 'mox: zypper: row "smtp_daemon" names no zypper package; it is a capability provided by ' "$out" &&
+    grep -q '"postfix"' "$out"; then
+    ok "$backend ($image): the row is refused, naming the packages that provide it"
+  else
+    no "$backend ($image): apply did not name what provides the capability" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "collateral=absent" "$out"; then
+    ok "$backend ($image): postfix was never installed; the manifest declares no such package"
+  else
+    no "$backend ($image): zypper installed a package the manifest never declared" "$(grep '^collateral=' "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# The other half of the zypper check: a name zypper has nothing at all for
+# must go alone, because `zypper install ripgrep nosuchpkgxyz` exits 104
+# having installed NEITHER -- one bad row would keep every package beside it
+# off the machine.
+run_zypper_unknown_name_case() {
+  image="$1"
+  pkg="$2"
+  backend="zypper unknown-name"
+
+  case_dir="$work/zypper-unknown-name"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF
+backend = "zypper"
+
+[[packages]]
+name = "$pkg"
+
+[[packages]]
+name = "mox-no-such-package"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      rpm -q $pkg >/dev/null 2>&1 && { echo 'the image ships $pkg; the case cannot run'; exit 1; }
+      echo '--- apply ---'
+      rc=0
+      /w/mox apply || rc=\$?
+      echo \"apply-exit=\$rc\"
+      echo \"installed=\$(rpm -q $pkg >/dev/null 2>&1 && echo 1 || echo 0)\"
+    " >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q 'mox: zypper: row "mox-no-such-package" names no zypper package in this machine.s repositories' "$out"; then
+    ok "$backend ($image): the name zypper has nothing for is refused"
+  else
+    no "$backend ($image): the unknown name was not refused" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "^installed=1" "$out"; then
+    ok "$backend ($image): the row beside it installed; one bad row kept nothing off the machine"
+  else
+    no "$backend ($image): the good row did not install" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -1443,12 +1705,18 @@ else
   # EPEL, which the stock image does not enable, so that case could only fail.
   run_case rockylinux:9 dnf jq
   run_case opensuse/tumbleweed zypper ripgrep
+  # zypper's only other case installs a real package; these two are the
+  # negative half every other manager already has.
+  run_zypper_provide_name_case opensuse/leap:15.6
+  run_zypper_unknown_name_case opensuse/tumbleweed ripgrep
   # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
   run_pacman_sync_case archlinux:latest
   run_pacman_partial_db_case archlinux:latest
   run_pacman_stale_case archlinux:latest
+  run_pacman_provision_case archlinux:latest
+  run_pacman_empty_repo_case archlinux:latest ripgrep
   run_case debian:stable brew hello
 fi
 

@@ -246,21 +246,46 @@ that is only an rpm capability rather than a package -- `zlib-devel`, which
 place. Before a pacman install, mox reads `pacman -Sl`, and a name that is a
 package **group** rather than a package -- `xfce4`, which holds fourteen --
 is refused with the members named, since `pacman -S` installs every one of
-them and `pacman -Qeq` reports the members and never the group. Only a group
-is refused there: a name the listing lacks is still handed to pacman, because
-that listing is whatever the machine last synced and the install argv is
-`pacman -Syu`, which syncs before it resolves.
+them and `pacman -Qeq` reports the members and never the group. A name that
+is an ALPM **provision** rather than a package goes the same way: `cron` is
+in no `pacman -Sl` line and is no group either, but `pacman -S cron` installs
+`cronie` and `pacman -Qeq` reports `cronie`. mox asks
+`pacman -S --print --print-format '%n'`, which resolves the name and prints
+the transaction without running any of it, and refuses a row whose own name
+is not among what pacman would install -- naming what pacman resolved it to.
+`sh`, `java-runtime`, `ttf-font` and `smtp-forwarder` are all such names.
+
+Only a POSITIVE answer refuses there: a name pacman resolves to nothing
+exits non-zero, and that row is still handed over, because the listing is
+whatever the machine last synced and the install argv syncs before it
+resolves.
 
 "This is no group" is acted on, though, so it is asked of a database every
 configured repository answered for. With one repository's database missing,
 `pacman -Sl` still lists the others and `pacman -Sg` says the missing
 repository's groups are no groups at all -- the same answer a real package
 gives. So mox compares the repositories that answered against
-`pacman-conf --repo-list`, and syncs when one of them did not. That check
-otherwise only reads, and what runs when it does sync is the full
-`pacman -Syu` the install itself was about to run, never a bare `pacman -Sy`
--- which would leave the database ahead of the installed packages, a state
-Arch does not support, on every path that then refuses a row or fails.
+`pacman-conf --repo-list`, and syncs when one of them did not. That comparison
+is made only when some row is absent from the listing, since that is the only
+row either question is asked about; a repository configured with an empty
+database contributes no line and so can never read as complete, and asking on
+every apply would sync on every apply for nothing. The check otherwise only
+reads, and what runs when it does sync is the full `pacman -Syu` the install
+itself was about to run, never a bare `pacman -Sy` -- which would leave the
+database ahead of the installed packages, a state Arch does not support, on
+every path that then refuses a row or fails. Having run it, the install that
+follows drops its own `-y`, so no apply upgrades the system twice.
+
+Before a zypper install, mox asks `zypper search --match-exact --type
+package` which of the row names its repositories carry under exactly that
+name. An rpm **virtual provide** is spelled like a package name and resolves
+like a dnf capability: `zypper install smtp_daemon` exits 0 having installed
+`postfix`, and `rpm -qa` reports `postfix`, so the row reads as missing and
+is reinstalled on every apply -- silently, since zypper exits 0 each time.
+Such a row is refused with its providers named, from
+`zypper search --provides --match-exact`. A name zypper has nothing at all
+for is refused too, because `zypper install` answers a batch carrying one by
+installing none of it.
 
 An apt row qualified with the machine's own architecture is refused the same
 way, as are apt's `:native`, `:all` and `:any`, which apt resolves to the

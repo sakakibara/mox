@@ -175,7 +175,7 @@ pub const PackageBackends = struct {
         // What a mox that died mid-call left staged for a call of its own.
         mox.packages.exec.sweepScratch(io, arena, scratch_dir);
         const r = self.runner();
-        self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir, .err = err };
+        self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir, .err = err, .probe_budget_ms = if (self.proc.timeout_ms <= 0) -1 else self.proc.timeout_ms };
         if (brew_prefixes_override) |p| self.brew.prefixes = p;
         self.apt = .{ .manager = .apt, .runner = r, .err = err };
         self.dnf = .{ .manager = .dnf, .runner = r, .err = err };
