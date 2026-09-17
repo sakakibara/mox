@@ -591,10 +591,10 @@ test "apply: a row the manager already has is counted apart from the one it inst
     // for it and the row is missing; ripgrep is not there at all. Only the
     // second is something mox installs.
     const fake = try dnfWith(a, "bat\n", &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\nripgrep\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\n" },
         .{ .argv = "sudo dnf mark install groff-base" },
         .{ .argv = "dnf mark install groff-base" },
+        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "sudo dnf install -y ripgrep" },
         .{ .argv = "dnf install -y ripgrep" },
     });
@@ -626,6 +626,7 @@ test "apply: a check that could not run reports nothing landed" {
     // built, so the machine is exactly as it was, and a hedge about rows that
     // may have landed would send the user looking for a change nothing made.
     const fake = try dnfWith(a, "bat\n", &.{
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n ripgrep" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .code = 1 },
     });
     useFake(fake);
@@ -635,6 +636,59 @@ test "apply: a check that could not run reports nothing landed" {
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+}
+
+test "apply: a mark that fails is one row's failure, and the rows beside it are reported as they landed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "fedora.toml",
+        \\backend = "dnf"
+        \\
+        \\[[packages]]
+        \\name = "groff-base"
+        \\
+        \\[[packages]]
+        \\name = "less"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    // groff-base and less are on the machine as dependencies; the mark takes
+    // on less and not on groff-base, and ripgrep installs. Two rows converged
+    // for certain, so the summary must say so, and only the failed mark is a
+    // failure -- not the batch, and not "may have landed" over rows that did.
+    const fake = try dnfWith(a, "bat\n", &.{
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base less ripgrep", .stdout = "groff-base\nless\n" },
+        .{ .argv = "sudo dnf mark install groff-base", .code = 1 },
+        .{ .argv = "dnf mark install groff-base", .code = 1 },
+        .{ .argv = "sudo dnf mark install less" },
+        .{ .argv = "dnf mark install less" },
+        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "sudo dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y ripgrep" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "Packages: 1 installed, 1 failed, 1 already on the machine and now recorded as asked for",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "\"groff-base\" could not be marked user installed, so the row stays missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "install failed") == null);
 }
 
 test "apply --dry-run: says which rows it left unchecked" {

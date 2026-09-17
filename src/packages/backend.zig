@@ -400,6 +400,12 @@ pub const Backend = struct {
         /// manager's record of who asked for it. Absent for an adapter with
         /// no such path, where the answer is always zero.
         installMarked: ?*const fn (ctx: *anyopaque) usize = null,
+        /// How many of the last `install`'s rows named a package already on
+        /// the machine whose mark did not take. Each is that row's own
+        /// failure, not the batch's: the rows beside it were marked or
+        /// installed all the same. Absent for an adapter with no mark path,
+        /// where the answer is always zero.
+        installUnmarked: ?*const fn (ctx: *anyopaque) usize = null,
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
@@ -483,6 +489,11 @@ pub const Backend = struct {
 
     pub fn installMarked(self: Backend) usize {
         const f = self.vtable.installMarked orelse return 0;
+        return f(self.ctx);
+    }
+
+    pub fn installUnmarked(self: Backend) usize {
+        const f = self.vtable.installUnmarked orelse return 0;
         return f(self.ctx);
     }
 

@@ -1182,18 +1182,19 @@ fn applyPackages(
             // The adapter is asked whether its manager ran, rather than its
             // error read: a check that runs before the install fails in the
             // same ways the install does.
-            if (spawned) counts.attempted += rows.items.len - backend.installRefused();
+            if (spawned) counts.attempted += rows.items.len - backend.installRefused() - backend.installMarked() - backend.installUnmarked();
         };
-        // A row the adapter refused is a failure of that row alone: the rows
-        // beside it were installed, so counting the batch instead would
-        // report work that happened as work that did not.
+        // A row the adapter refused, or one whose mark did not take, is a
+        // failure of that row alone: the rows beside it were installed, so
+        // counting the batch instead would report work that happened as work
+        // that did not. A marked row converged whatever the batch did after
+        // it: the mark ran to completion before any install was asked for.
         const refused = backend.installRefused();
         const marked = backend.installMarked();
-        counts.failed += refused;
-        if (!batch_failed) {
-            counts.marked += marked;
-            counts.installed += rows.items.len - refused - marked;
-        }
+        const unmarked = backend.installUnmarked();
+        counts.failed += refused + unmarked;
+        counts.marked += marked;
+        if (!batch_failed) counts.installed += rows.items.len - refused - marked - unmarked;
     }
     return counts;
 }

@@ -483,8 +483,14 @@ summary counts those rows apart from the ones mox installed:
 Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for
 ```
 
-A mark that fails is that row's own failure. There is no fallback to an
-install, which would exit 0, change nothing, and leave the row missing.
+What the machine already has is asked before anything else, so such a row is
+marked before the checks an install needs -- the index refresh, the package
+listing, apt's holds and pins, pacman's sync -- and converges where those
+would refuse it: a package no enabled dnf repository carries any more, a held
+apt package, a pacman that cannot sync. A mark that fails is that row's own
+failure, counted as one, and the rows beside it are marked or installed all
+the same. There is no fallback to an install, which would exit 0, change
+nothing, and leave the row missing.
 
 `mox commit` offers each untracked package `[y/b/s]`:
 

@@ -557,7 +557,13 @@ pub const Brew = struct {
             try one.appendSlice(arena, &head);
             try one.append(arena, name);
             const got = self.runner.run(arena, one.items) catch |e| switch (e) {
-                error.StreamTooLong => continue,
+                error.StreamTooLong => {
+                    self.say(
+                        "mox: brew: `brew info --json=v2 {s} -- {s}` answered with more than the {d} MiB mox reads from one query, so \"{s}\" went unchecked; if it is an alias, its row installs under the alias\n",
+                        .{ flag, name, exec.max_query_bytes / (1024 * 1024), name },
+                    );
+                    continue;
+                },
                 else => return e,
             };
             try exec.checkTimedOut(got);
@@ -1549,10 +1555,16 @@ test "install: a batch answered past the capture cap is asked name by name" {
 
     try b.backend().install(a, &.{ rowOf("ag", &.{}), rowOf("bat", &.{}) });
     // The alias was still caught, and the name that answered with nothing
-    // usable was left to brew.
+    // usable was left to brew -- said by name, so a row that then installs
+    // under an alias has its reason on the terminal.
     try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
     try testing.expect(fake.called("brew install -- bat"));
     try testing.expect(!fake.called("brew install -- ag"));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        w.written(),
+        "mox: brew: `brew info --json=v2 --formula -- bat` answered with more than the 8 MiB mox reads from one query, so \"bat\" went unchecked; if it is an alias, its row installs under the alias\n",
+    ));
 }
 
 test "install: a formula row and a cask row of one name each get their own answer" {

@@ -43,7 +43,11 @@
 # naming either must go rather than the batch. Three run the round trip for a
 # package the manager ALREADY HAS, installed as another package's dependency,
 # where an install cannot converge the row at all and only the manager's mark
-# command can. One runs the round trip a
+# command can; three more put that same package where an install-time check
+# would refuse it -- absent from every enabled dnf repository, held by
+# apt-mark, on a pacman that cannot sync -- and require the mark all the
+# same, because a package the machine has needs no install and so no check
+# that serves one. One runs the round trip a
 # multiarch machine needs, which is the one place a colon in a name is the
 # name apt itself reports; one covers a machine with no package index, where
 # apt's listing must come back empty; one covers a pacman database that
@@ -1882,6 +1886,311 @@ CASE
   fi
 }
 
+# The dependency round trip on a machine where the install-time check would
+# refuse the row: the package is on the machine, and no enabled repository
+# carries it. A dropped third-party repository, a release upgrade or a
+# package the distribution retired all leave a machine here, and the check
+# that asks the repositories what an install would land has no business with
+# a package that is not going to be installed. Proved before the fix on
+# Fedora with every repository `enabled=0`: `MISSING dnf groff-base`, then
+# `Packages: 0 installed, 1 failed` with "names no dnf package in this
+# machine's repositories", identically on every apply after -- while `dnf -q
+# repoquery --installed` answered and `dnf mark user -y` exited 0 in that
+# same state.
+run_dnf_no_repository_case() {
+  image="$1"
+  backend="dnf no-repository"
+
+  case_dir="$work/dnf-no-repository"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/dnf.toml" <<'EOF'
+backend = "dnf"
+
+[[packages]]
+name = "groff-base"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      dnf install -y man-db >/dev/null 2>&1 || true
+      sed -i "s/^enabled=1/enabled=0/" /etc/yum.repos.d/*.repo
+      echo "--- premise ---"
+      if dnf -q repoquery --installed --qf "%{name}\n" groff-base 2>/dev/null | grep -qx groff-base; then
+        echo "premise-installed=yes"
+      else
+        echo "premise-installed=no"
+      fi
+      if dnf -q repoquery --userinstalled --qf "%{name}\n" 2>/dev/null | grep -qx groff-base; then
+        echo "premise-asked-for=yes"
+      else
+        echo "premise-asked-for=no"
+      fi
+      rc=0; answer="$(dnf -q repoquery --qf "%{name}\n" groff-base 2>/dev/null)" || rc=$?
+      echo "repositories-exit=$rc"
+      echo "repositories-answer=$answer"
+      echo "--- before ---"
+      /w/mox status || true
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      /w/mox status || true
+      echo "--- record ---"
+      if dnf -q repoquery --userinstalled --qf "%{name}\n" 2>/dev/null | grep -qx groff-base; then
+        echo "record=asked-for"
+      else
+        echo "record=dependency"
+      fi
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "premise-installed=yes" "$out" && grep -q "premise-asked-for=no" "$out" && grep -qx "repositories-answer=" "$out"; then
+    ok "$backend ($image): the machine has groff-base as a dependency, and no enabled repository carries it"
+  else
+    no "$backend ($image): the case could not put groff-base in the state it is about" "$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- record ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+dnf groff-base"; then
+    ok "$backend ($image): the row reads MISSING before the apply"
+  else
+    no "$backend ($image): expected 'groff-base' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q 'names no dnf package' "$out"; then
+    no "$backend ($image): the row was refused for the repositories, which have nothing to say about a package the machine has" "$(grep '^mox: dnf' "$out" | tail -3)"
+  else
+    ok "$backend ($image): the repositories were never asked about a package the machine already has"
+  fi
+
+  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+    ok "$backend ($image): the apply says the row was marked, never that it was installed"
+  else
+    no "$backend ($image): apply did not report the row as marked" "$(grep -i 'packages:' "$out" | tail -3)"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+dnf groff-base"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+
+  if grep -q "record=asked-for" "$out"; then
+    ok "$backend ($image): dnf's own record now reports groff-base as asked for"
+  else
+    no "$backend ($image): dnf still records groff-base as a dependency" "$(sed -n '/--- record ---/,$p' "$out")"
+  fi
+}
+
+# The dependency round trip on an apt where the row's package is HELD. The
+# hold refusal exists because an install carrying a held package installs
+# nothing at all -- and a package the machine already has needs no install:
+# `apt-mark manual` takes a held package, and the hold is left exactly as its
+# owner set it.
+run_apt_held_dependency_case() {
+  image="$1"
+  backend="apt held-dependency"
+
+  case_dir="$work/apt-held-dependency"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "groff-base"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      apt-get update >/dev/null
+      apt-get install -y man-db >/dev/null 2>&1 || true
+      apt-mark hold groff-base >/dev/null
+      echo "--- premise ---"
+      if apt-mark showauto | grep -qx groff-base; then
+        echo "premise-installed=yes"
+      else
+        echo "premise-installed=no"
+      fi
+      if apt-mark showmanual | grep -qx groff-base; then
+        echo "premise-asked-for=yes"
+      else
+        echo "premise-asked-for=no"
+      fi
+      echo "premise-held=$(apt-mark showhold | grep -cx groff-base || true)"
+      echo "--- before ---"
+      /w/mox status || true
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      /w/mox status || true
+      echo "--- record ---"
+      if apt-mark showmanual | grep -qx groff-base; then
+        echo "record=asked-for"
+      else
+        echo "record=dependency"
+      fi
+      echo "still-held=$(apt-mark showhold | grep -cx groff-base || true)"
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "premise-installed=yes" "$out" && grep -q "premise-asked-for=no" "$out" && grep -q "^premise-held=1" "$out"; then
+    ok "$backend ($image): the machine has groff-base as a held dependency that nothing asked for"
+  else
+    no "$backend ($image): the case could not put groff-base in the state it is about" "$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- record ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+apt groff-base"; then
+    ok "$backend ($image): the row reads MISSING before the apply"
+  else
+    no "$backend ($image): expected 'groff-base' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q 'names a package apt-mark holds' "$out"; then
+    no "$backend ($image): the row was refused for a hold that stops an install it does not need" "$(grep '^mox: apt' "$out" | tail -3)"
+  else
+    ok "$backend ($image): the hold was never asked about a package the machine already has"
+  fi
+
+  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+    ok "$backend ($image): the apply says the row was marked, never that it was installed"
+  else
+    no "$backend ($image): apply did not report the row as marked" "$(grep -i 'packages:' "$out" | tail -3)"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+apt groff-base"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+
+  if grep -q "record=asked-for" "$out"; then
+    ok "$backend ($image): apt's own record now reports groff-base as asked for"
+  else
+    no "$backend ($image): apt still records groff-base as a dependency" "$(sed -n '/--- record ---/,$p' "$out")"
+  fi
+
+  if grep -q "^still-held=1" "$out" && ! grep -q "allow-change-held-packages" "$out"; then
+    ok "$backend ($image): the hold is left as its owner set it"
+  else
+    no "$backend ($image): the run touched the hold" "$(grep -E '^still-held=|^mox: apt' "$out")"
+  fi
+}
+
+# The dependency round trip on a pacman that cannot sync: the container has
+# no network, so the full `-Syu` the install-time check runs fails. Marking
+# needs only `pacman -Qdq` and `pacman -D --asexplicit`, both local, so the
+# row the machine has converges; the row beside it, which needs the sync,
+# is the one that fails. Proved before the fix with mox on an Arch machine
+# whose sync fails: `install did not run: DistroRefreshFailed`, record
+# unchanged.
+run_pacman_no_sync_case() {
+  image="$1"
+  backend="pacman no-sync"
+
+  case_dir="$work/pacman-no-sync"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "acl"
+
+[[packages]]
+name = "ripgrep"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --network none --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      echo "--- premise ---"
+      rc=0; pacman -Syu --noconfirm >/dev/null 2>&1 || rc=$?
+      echo "sync-exit=$rc"
+      if pacman -Qdq | grep -qx acl; then
+        echo "premise-installed=yes"
+      else
+        echo "premise-installed=no"
+      fi
+      if pacman -Qeq | grep -qx acl; then
+        echo "premise-asked-for=yes"
+      else
+        echo "premise-asked-for=no"
+      fi
+      echo "--- before ---"
+      /w/mox status || true
+      echo "--- apply ---"
+      /w/mox apply || true
+      echo "--- after ---"
+      /w/mox status || true
+      echo "--- record ---"
+      if pacman -Qeq | grep -qx acl; then
+        echo "record=asked-for"
+      else
+        echo "record=dependency"
+      fi
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "premise-installed=yes" "$out" && grep -q "premise-asked-for=no" "$out" && grep -q "^sync-exit=[1-9]" "$out"; then
+    ok "$backend ($image): the machine has acl as a dependency that nothing asked for, and cannot sync"
+  else
+    no "$backend ($image): the case could not put the machine in the state it is about" "$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- record ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+pacman acl"; then
+    ok "$backend ($image): the row reads MISSING before the apply"
+  else
+    no "$backend ($image): expected 'acl' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q "Packages: 0 installed, 1 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+    ok "$backend ($image): the apply marked the row the machine has, and failed only the one that needed the sync"
+  else
+    no "$backend ($image): apply did not report one row marked and one failed" "$(grep -i 'packages:\|^mox apply' "$out" | tail -3)"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+pacman acl"; then
+    no "$backend ($image): acl is still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift over acl is clean after apply"
+  fi
+
+  if grep -q "record=asked-for" "$out"; then
+    ok "$backend ($image): pacman's own record now reports acl as asked for"
+  else
+    no "$backend ($image): pacman still records acl as a dependency" "$(sed -n '/--- record ---/,$p' "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -1909,6 +2218,7 @@ else
   run_apt_hold_pin_case debian:stable
   run_apt_no_repositories_case debian:stable
   run_dependency_case debian:stable apt
+  run_apt_held_dependency_case debian:stable
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
@@ -1927,6 +2237,8 @@ else
   run_dependency_case rockylinux:9 dnf
   run_dependency_case fedora:42 dnf
   run_dependency_case fedora:latest dnf
+  run_dnf_no_repository_case rockylinux:9
+  run_dnf_no_repository_case fedora:latest
   run_case opensuse/tumbleweed zypper ripgrep
   # zypper's only other case installs a real package; these two are the
   # negative half every other manager already has.
@@ -1941,6 +2253,7 @@ else
   run_pacman_provision_case archlinux:latest
   run_pacman_empty_repo_case archlinux:latest ripgrep
   run_dependency_case archlinux:latest pacman
+  run_pacman_no_sync_case archlinux:latest
   run_case debian:stable brew hello
 fi
 
