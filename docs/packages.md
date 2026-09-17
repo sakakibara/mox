@@ -469,6 +469,23 @@ package is reported and reconciled, never uninstalled behind you. (What a
 manager does on the way -- pacman's full upgrade, a dependency brew drops --
 is the manager's own behavior, not a mox decision.)
 
+A declared package the manager ALREADY HAS, installed as something else's
+dependency, is **marked** rather than installed. A manager writes its
+explicit-install record when it installs something, and installing a package
+it has already is nothing it does: the row would read missing on every status
+and every apply would install nothing at all. So mox runs the manager's own
+mark command instead -- `brew tab --installed-on-request`, `apt-mark manual`,
+`dnf mark install` on dnf4 and `dnf mark user` on dnf5, `pacman -D
+--asexplicit` -- which changes that record and leaves the machine alone. The
+summary counts those rows apart from the ones mox installed:
+
+```
+Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for
+```
+
+A mark that fails is that row's own failure. There is no fallback to an
+install, which would exit 0, change nothing, and leave the row missing.
+
 `mox commit` offers each untracked package `[y/b/s]`:
 
 - **add** -- append a row to the manifest file that already speaks that

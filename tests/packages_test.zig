@@ -308,9 +308,14 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(fake.called("brew tab --installed-on-request --formula -- brotli"));
     try std.testing.expect(!fake.called("brew install -- brotli"));
-    // Said as what it was: the package was there before the run.
+    // Said as what it was: the package was there before the run, so the
+    // summary counts it apart from what mox put on the machine.
     try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it as installed on request instead") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for",
+    ) != null);
 }
 
 test "apply: a formula that cannot be marked on request is a failure, not a clean run" {
@@ -502,7 +507,7 @@ fn dnfWith(
     try entries.append(a, .{ .argv = "scoop --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "winget --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "zypper --version", .fail = error.FileNotFound });
-    try entries.append(a, .{ .argv = "dnf --version", .stdout = "dnf 4.18.0\n" });
+    try entries.append(a, .{ .argv = "dnf --version", .stdout = "4.18.0\n" });
     try entries.append(a, .{
         .argv = "dnf -q repoquery --userinstalled --qf %{name}\n",
         .stdout = installed,
@@ -537,6 +542,7 @@ test "linux: a dnf machine reports and installs through the same core" {
     // Both spellings are scripted: whether an install elevates depends on the
     // uid running this suite, and the fixture must not depend on that.
     const fake = try dnfWith(a, "bat\nhtop\n", &.{
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "sudo dnf install -y ripgrep" },
         .{ .argv = "dnf install -y ripgrep" },
     });
@@ -552,12 +558,57 @@ test "linux: a dnf machine reports and installs through the same core" {
     // package of another name.
     const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "sudo dnf install -y ripgrep" },
         .{ .argv = "dnf install -y ripgrep" },
     });
     useFake(fake2);
     _ = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(fake2.called("sudo dnf install -y ripgrep"));
+}
+
+test "apply: a row the manager already has is counted apart from the one it installed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "fedora.toml",
+        \\backend = "dnf"
+        \\
+        \\[[packages]]
+        \\name = "groff-base"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    // groff-base is on the machine as man-db's dependency, so nothing asked
+    // for it and the row is missing; ripgrep is not there at all. Only the
+    // second is something mox installs.
+    const fake = try dnfWith(a, "bat\n", &.{
+        .{ .argv = "dnf -q repoquery --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\nripgrep\n" },
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\n" },
+        .{ .argv = "sudo dnf mark install groff-base" },
+        .{ .argv = "dnf mark install groff-base" },
+        .{ .argv = "sudo dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y ripgrep" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it user installed") != null);
 }
 
 test "apply: a check that could not run reports nothing landed" {
@@ -2978,6 +3029,7 @@ test "apply: a row no manager has fails alone, and the rows beside it install" {
         .{ .argv = "dpkg-query -W -f ${Package} ${Architecture} ${Status}\\n", .stdout = "sl arm64 install ok installed\n" },
         .{ .argv = "apt-cache madison ruby.dev", .stdout = "" },
         .{ .argv = "apt-cache showpkg ruby.dev", .stdout = "" },
+        .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl", .match = .suffix },
     });
     useFake(fake);
@@ -3021,6 +3073,7 @@ test "apply: a foreign-architecture row apt's listing omits still installs" {
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf", .match = .suffix },
     });
     useFake(fake);
@@ -3096,6 +3149,7 @@ test "commit then apply: a row commit records is a row apply installs, architect
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf", .match = .suffix },
     });
     useFake(fake2);

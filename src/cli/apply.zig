@@ -785,17 +785,19 @@ fn applyPass(
             },
         );
         if (pkg_counts.in_use) {
-            if (pkg_counts.attempted > 0) {
-                try ctx.out.print(
-                    "Packages: {d} installed, {d} failed ({d} row(s) in failed batches may have landed)\n",
-                    .{ pkg_counts.installed, pkg_counts.failed, pkg_counts.attempted },
-                );
-            } else {
-                try ctx.out.print(
-                    "Packages: {d} installed, {d} failed\n",
-                    .{ pkg_counts.installed, pkg_counts.failed },
-                );
-            }
+            try ctx.out.print("Packages: {d} installed, {d} failed", .{ pkg_counts.installed, pkg_counts.failed });
+            // A marked row is neither installed nor failed, and calling it
+            // installed would say mox put a package on a machine that already
+            // had it.
+            if (pkg_counts.marked > 0) try ctx.out.print(
+                ", {d} already on the machine and now recorded as asked for",
+                .{pkg_counts.marked},
+            );
+            if (pkg_counts.attempted > 0) try ctx.out.print(
+                " ({d} row(s) in failed batches may have landed)",
+                .{pkg_counts.attempted},
+            );
+            try ctx.out.writeAll("\n");
         }
     }
 
@@ -951,6 +953,9 @@ const PackageCounts = struct {
     /// even when no row was left to install.
     bootstrapped: usize = 0,
     installed: usize = 0,
+    /// Rows converged without an install: the package was on the machine
+    /// already and only its manager's record of who asked for it changed.
+    marked: usize = 0,
     /// Rows handed to a backend whose batch then failed: some may have
     /// landed, so the machine must be re-read as if they had.
     attempted: usize = 0,
@@ -1183,8 +1188,12 @@ fn applyPackages(
         // beside it were installed, so counting the batch instead would
         // report work that happened as work that did not.
         const refused = backend.installRefused();
+        const marked = backend.installMarked();
         counts.failed += refused;
-        if (!batch_failed) counts.installed += rows.items.len - refused;
+        if (!batch_failed) {
+            counts.marked += marked;
+            counts.installed += rows.items.len - refused - marked;
+        }
     }
     return counts;
 }

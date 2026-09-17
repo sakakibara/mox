@@ -40,7 +40,10 @@
 # architecture has installs `name:<arch>`, which it reports qualified. Two
 # more are about what the manager REFUSES to install: a held package and a
 # pinned one each make `apt-get install` install nothing at all, so a row
-# naming either must go rather than the batch. One runs the round trip a
+# naming either must go rather than the batch. Three run the round trip for a
+# package the manager ALREADY HAS, installed as another package's dependency,
+# where an install cannot converge the row at all and only the manager's mark
+# command can. One runs the round trip a
 # multiarch machine needs, which is the one place a colon in a name is the
 # name apt itself reports; one covers a machine with no package index, where
 # apt's listing must come back empty; one covers a pacman database that
@@ -1167,10 +1170,11 @@ EOF
 # Both halves of the oracle a BARE apt row is judged by, in one container.
 # A package installed from a .deb is in no repository, so the repository
 # listing cannot answer for it: marked auto it is absent from
-# `apt-mark showmanual` too, yet `apt-get install` of its bare name exits 0
-# and marks it manual, so the row converges and must be KEPT. The same query
-# is what still refuses a bare name whose package exists only for a foreign
-# architecture, where the install sets `name:<arch>` to manual instead and
+# `apt-mark showmanual` too, yet dpkg has it under the row's own name and the
+# row converges, so it must be KEPT rather than refused. What converges it is
+# a mark, the package being on the machine already. The same query is what
+# still refuses a bare name whose package exists only for a foreign
+# architecture, where an install sets `name:<arch>` to manual instead and
 # apt-mark reports it qualified.
 run_apt_local_deb_case() {
   image="$1"
@@ -1250,7 +1254,7 @@ EOF
   fi
 
   if grep -qx "moxlocaldemo" "$out"; then
-    ok "$backend ($image): the real apt marked it manually installed, so apt-mark reports it"
+    ok "$backend ($image): the real apt-mark recorded it manually installed, so apt-mark reports it"
   else
     no "$backend ($image): apt-mark does not report moxlocaldemo" "$(sed -n '/--- showmanual ---/,$p' "$out")"
   fi
@@ -1270,10 +1274,12 @@ EOF
     no "$backend ($image): the foreign-architecture row was not refused with the qualified spelling" "$(grep '^mox: apt' "$out" | tail -3)"
   fi
 
-  if grep -q "Packages: 1 installed, 1 failed" "$out"; then
-    ok "$backend ($image): the kept row installed and the refused one is counted as its own failure"
+  # The kept row is MARKED rather than installed, apt having had the package
+  # since the `dpkg -i` above; the refused one is still one row's failure.
+  if grep -q "Packages: 0 installed, 1 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+    ok "$backend ($image): the kept row converged and the refused one is counted as its own failure"
   else
-    no "$backend ($image): apply did not install one row and refuse the other" "$(grep -i 'packages:\|apply-exit=' "$out" | tail -3)"
+    no "$backend ($image): apply did not converge one row and refuse the other" "$(grep -i 'packages:\|apply-exit=' "$out" | tail -3)"
   fi
 }
 
@@ -1665,6 +1671,217 @@ EOF
   fi
 }
 
+# A row naming a package the manager ALREADY HAS, installed as another
+# package's dependency. The row is missing because the manager's
+# explicit-install query reports what the user asked for, and nothing asked
+# for a dependency -- and an install does not change that: measured on dnf
+# 4.14.0, dnf5 5.2.18 and 5.4.3, `dnf install` exits 0 saying the package is
+# installed already and leaves the reason alone; measured on pacman 7.1.0,
+# `pacman -S --needed` skips it and even a full reinstall leaves the reason
+# `dependency`. So the row reads missing on every status and every apply
+# reinstalls nothing, for ever. mox must record the row's own claim with the
+# manager's mark command instead, and say what it did: marked, not installed.
+#
+# apt is here for the other half of the same question. `apt-get install` sets
+# an automatically installed package manual when it has no upgrade to do, but
+# apt 3.0.3 upgrading the package leaves it automatic, so the row converges
+# one apply late. What is asserted for all three is the same: the mark ran,
+# the row went clean, and the manager's own record now reports the package.
+run_dependency_case() {
+  image="$1"
+  manager="$2"
+  backend="$manager dependency"
+
+  case_dir="$work/$manager-dependency"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  case "$manager" in
+    pacman) pkg=acl ;;
+    *) pkg=groff-base ;;
+  esac
+  cat >"$case_dir/repo/data/packages/$manager.toml" <<EOF
+backend = "$manager"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  # Each script leaves the same three things on stdout: whether the premise
+  # held, whether the manager's own install healed the record (asked of dnf
+  # and pacman, whose answer does not move with the version), and what the
+  # record says once mox has run.
+  case "$manager" in
+    dnf)
+      cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+dnf install -y man-db >/dev/null 2>&1 || true
+echo "--- premise ---"
+if dnf -q repoquery --installed --qf '%{name}\n' groff-base | grep -qx groff-base; then
+  echo "premise-installed=yes"
+else
+  echo "premise-installed=no"
+fi
+if dnf -q repoquery --userinstalled --qf '%{name}\n' | grep -qx groff-base; then
+  echo "premise-asked-for=yes"
+else
+  echo "premise-asked-for=no"
+fi
+echo "--- defect ---"
+rc=0
+dnf install -y groff-base >/dev/null 2>&1 || rc=$?
+echo "manager-install-exit=$rc"
+if dnf -q repoquery --userinstalled --qf '%{name}\n' | grep -qx groff-base; then
+  echo "defect=healed"
+else
+  echo "defect=stands"
+fi
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+/w/mox apply || true
+echo "--- after ---"
+/w/mox status || true
+echo "--- record ---"
+if dnf -q repoquery --userinstalled --qf '%{name}\n' | grep -qx groff-base; then
+  echo "record=asked-for"
+else
+  echo "record=dependency"
+fi
+CASE
+      ;;
+    pacman)
+      cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+pacman -Sy --noconfirm >/dev/null 2>&1 || true
+echo "--- premise ---"
+if pacman -Qdq | grep -qx acl; then
+  echo "premise-installed=yes"
+else
+  echo "premise-installed=no"
+fi
+if pacman -Qeq | grep -qx acl; then
+  echo "premise-asked-for=yes"
+else
+  echo "premise-asked-for=no"
+fi
+echo "--- defect ---"
+rc=0
+pacman -S --needed --noconfirm -- acl >/dev/null 2>&1 || rc=$?
+echo "manager-install-exit=$rc"
+if pacman -Qeq | grep -qx acl; then
+  echo "defect=healed"
+else
+  echo "defect=stands"
+fi
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+/w/mox apply || true
+echo "--- after ---"
+/w/mox status || true
+echo "--- record ---"
+if pacman -Qeq | grep -qx acl; then
+  echo "record=asked-for"
+else
+  echo "record=dependency"
+fi
+CASE
+      ;;
+    apt)
+      cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+apt-get update >/dev/null
+apt-get install -y man-db >/dev/null 2>&1 || true
+echo "--- premise ---"
+if apt-mark showauto | grep -qx groff-base; then
+  echo "premise-installed=yes"
+else
+  echo "premise-installed=no"
+fi
+if apt-mark showmanual | grep -qx groff-base; then
+  echo "premise-asked-for=yes"
+else
+  echo "premise-asked-for=no"
+fi
+echo "--- defect ---"
+echo "manager-install-exit=0"
+echo "defect=not-asked"
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+/w/mox apply || true
+echo "--- after ---"
+/w/mox status || true
+echo "--- record ---"
+if apt-mark showmanual | grep -qx groff-base; then
+  echo "record=asked-for"
+else
+  echo "record=dependency"
+fi
+CASE
+      ;;
+  esac
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "premise-installed=yes" "$out" && grep -q "premise-asked-for=no" "$out"; then
+    ok "$backend ($image): the machine has $pkg as a dependency and nothing asked for it"
+  else
+    no "$backend ($image): the case could not put $pkg in the state it is about" "$(sed -n '/--- premise ---/,/--- defect ---/p' "$out")"
+  fi
+
+  case "$manager" in
+    apt)
+      na "$backend ($image): the manager's own install leaves the record alone" \
+        "apt-get install sets an automatically installed package manual when it has no upgrade to do, so what it leaves behind moves with the release and with the index; only what mox does is asserted here"
+      ;;
+    *)
+      if grep -q "defect=stands" "$out"; then
+        ok "$backend ($image): the manager's own install exits 0 and leaves the record alone"
+      else
+        no "$backend ($image): $manager's install healed the record, so this case proves nothing" "$(sed -n '/--- defect ---/,/--- before ---/p' "$out")"
+      fi
+      ;;
+  esac
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- record ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+$manager $pkg"; then
+    ok "$backend ($image): the row reads MISSING before the apply"
+  else
+    no "$backend ($image): expected '$pkg' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+    ok "$backend ($image): the apply says the row was marked, never that it was installed"
+  else
+    no "$backend ($image): apply did not report the row as marked" "$(grep -i 'packages:' "$out" | tail -3)"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+$manager $pkg"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+
+  if grep -q "record=asked-for" "$out"; then
+    ok "$backend ($image): $manager's own record now reports $pkg as asked for"
+  else
+    no "$backend ($image): $manager still records $pkg as a dependency" "$(sed -n '/--- record ---/,$p' "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -1691,6 +1908,7 @@ else
   run_apt_virtual_name_case debian:stable
   run_apt_hold_pin_case debian:stable
   run_apt_no_repositories_case debian:stable
+  run_dependency_case debian:stable apt
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
@@ -1704,6 +1922,11 @@ else
   # jq, not ripgrep: Rocky 9's default repos carry no ripgrep -- it lives in
   # EPEL, which the stock image does not enable, so that case could only fail.
   run_case rockylinux:9 dnf jq
+  # The same row on both dnf generations, whose mark commands are each exit 2
+  # on the other's spelling: dnf4 has `mark install` and dnf5 `mark user`.
+  run_dependency_case rockylinux:9 dnf
+  run_dependency_case fedora:42 dnf
+  run_dependency_case fedora:latest dnf
   run_case opensuse/tumbleweed zypper ripgrep
   # zypper's only other case installs a real package; these two are the
   # negative half every other manager already has.
@@ -1717,6 +1940,7 @@ else
   run_pacman_stale_case archlinux:latest
   run_pacman_provision_case archlinux:latest
   run_pacman_empty_repo_case archlinux:latest ripgrep
+  run_dependency_case archlinux:latest pacman
   run_case debian:stable brew hello
 fi
 

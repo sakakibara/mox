@@ -87,6 +87,9 @@ pub const Brew = struct {
     /// How many of the last `install`'s rows brew was never handed, which
     /// `installRefused` answers with.
     refused: usize = 0,
+    /// How many of the last `install`'s rows were converged by marking a
+    /// formula brew already had, which `installMarked` answers with.
+    marked: usize = 0,
     /// Where a row refused at install time is said. The install's own error
     /// is what the call site reports, so the row and the name to write in its
     /// place have nowhere else to go.
@@ -117,6 +120,7 @@ pub const Brew = struct {
         .install = installImpl,
         .installSpawned = installSpawnedImpl,
         .installRefused = installRefusedImpl,
+        .installMarked = installMarkedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
     };
@@ -248,6 +252,7 @@ pub const Brew = struct {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         self.spawned = false;
         self.refused = 0;
+        self.marked = 0;
         const keep = try self.refuseAliases(arena, rows);
         self.refused = rows.len - keep.len;
         // Asked once for the batch, and only when a formula row is in it.
@@ -366,7 +371,10 @@ pub const Brew = struct {
         self.spawned = true;
         const res = try self.runner.stream(arena, &.{ self.exe, "tab", "--installed-on-request", "--formula", "--", name });
         try exec.checkTimedOut(res);
-        if (res.ok) return true;
+        if (res.ok) {
+            self.marked += 1;
+            return true;
+        }
         self.say(
             "mox: brew: \"{s}\" could not be marked as installed on request, so the row stays missing; \"brew tab\" is in Homebrew 4.3.6 and newer\n",
             .{name},
@@ -382,6 +390,11 @@ pub const Brew = struct {
     fn installRefusedImpl(ctx: *anyopaque) usize {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         return self.refused;
+    }
+
+    fn installMarkedImpl(ctx: *anyopaque) usize {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        return self.marked;
     }
 
     /// Say `fmt` where a refused row can be read, if anywhere.
@@ -1157,6 +1170,9 @@ test "install: a formula brew already has is marked on request, never handed to 
         rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
     });
     try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
+    // Two marked, one installed: a run that called all three installed would
+    // say mox put two packages on a machine that already had them.
+    try testing.expectEqual(@as(usize, 2), b.backend().installMarked());
     try testing.expect(fake.called("brew tab --installed-on-request --formula -- brotli"));
     try testing.expect(fake.called("brew install --cask -- ghostty"));
     // Asked once for the batch, not once per row.
@@ -1185,6 +1201,7 @@ test "install: a formula that cannot be marked on request fails its row" {
     var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
 
     try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{rowOf("brotli", &.{})}));
+    try testing.expectEqual(@as(usize, 0), b.backend().installMarked());
     try testing.expect(b.backend().installSpawned());
     try testing.expect(std.mem.indexOf(u8, w.written(), "could not be marked as installed on request") != null);
 }

@@ -395,6 +395,11 @@ pub const Backend = struct {
         /// handing them to its manager. Absent for an adapter that refuses
         /// none, where the answer is always zero.
         installRefused: ?*const fn (ctx: *anyopaque) usize = null,
+        /// How many of the last `install`'s rows were converged without an
+        /// install: a package already on the machine that needed only its
+        /// manager's record of who asked for it. Absent for an adapter with
+        /// no such path, where the answer is always zero.
+        installMarked: ?*const fn (ctx: *anyopaque) usize = null,
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
@@ -473,6 +478,11 @@ pub const Backend = struct {
     /// returns cleanly.
     pub fn installRefused(self: Backend) usize {
         const f = self.vtable.installRefused orelse return 0;
+        return f(self.ctx);
+    }
+
+    pub fn installMarked(self: Backend) usize {
+        const f = self.vtable.installMarked orelse return 0;
         return f(self.ctx);
     }
 
