@@ -483,7 +483,7 @@ pub const Winget = struct {
             "--id",    id,
             "--exact", "--accept-source-agreements",
         });
-        try exec.checkTimedOut(res);
+        try exec.checkCaptureTimedOut(res);
         if (!res.ok) return false;
         // `list` prints a table whose columns it truncates to the console
         // width, so a substring search over the whole output can miss a long

@@ -523,7 +523,7 @@ pub const Brew = struct {
         try argv.appendSlice(arena, &head);
         try argv.appendSlice(arena, names.items);
         if (self.runner.run(arena, argv.items)) |res| {
-            try exec.checkTimedOut(res);
+            try exec.checkCaptureTimedOut(res);
             if (res.ok) {
                 try recordAnswers(arena, kind, res.stdout, into);
                 return;
@@ -566,7 +566,7 @@ pub const Brew = struct {
                 },
                 else => return e,
             };
-            try exec.checkTimedOut(got);
+            try exec.checkCaptureTimedOut(got);
             if (!got.ok) continue;
             try recordAnswers(arena, kind, got.stdout, into);
         }

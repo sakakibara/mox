@@ -368,7 +368,7 @@ fn applyPass(
     // A failed batch may have landed some of its rows, so the machine is
     // re-read after any attempt, not only after a clean success; a
     // bootstrapped manager changed the machine even with no row to install.
-    if (pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.bootstrapped > 0) {
+    if (pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.landed > 0 or pkg_counts.bootstrapped > 0) {
         if (!try recapture.run()) return 2;
     }
     // $MOX_PATH additions named since the last fold: into this run's probe
@@ -797,6 +797,10 @@ fn applyPass(
                 " ({d} row(s) in failed batches may have landed)",
                 .{pkg_counts.attempted},
             );
+            if (pkg_counts.landed > 0) try ctx.out.print(
+                " ({d} row(s) in failed batches landed)",
+                .{pkg_counts.landed},
+            );
             try ctx.out.writeAll("\n");
         }
     }
@@ -959,6 +963,9 @@ const PackageCounts = struct {
     /// Rows handed to a backend whose batch then failed: some may have
     /// landed, so the machine must be re-read as if they had.
     attempted: usize = 0,
+    /// Rows of a failed batch the adapter found on the machine afterwards:
+    /// known to have landed, so the machine must be re-read.
+    landed: usize = 0,
     would: usize = 0,
     would_bootstrap: usize = 0,
     failed: usize = 0,
@@ -1181,8 +1188,15 @@ fn applyPackages(
             counts.failed += 1;
             // The adapter is asked whether its manager ran, rather than its
             // error read: a check that runs before the install fails in the
-            // same ways the install does.
-            if (spawned) counts.attempted += rows.items.len - backend.installRefused() - backend.installMarked() - backend.installUnmarked();
+            // same ways the install does. One that then read the machine
+            // back says what landed, and there is nothing left to hedge.
+            if (spawned) {
+                if (backend.installLanded()) |landed| {
+                    counts.landed += landed;
+                } else {
+                    counts.attempted += rows.items.len - backend.installRefused() - backend.installMarked() - backend.installUnmarked();
+                }
+            }
         };
         // A row the adapter refused, or one whose mark did not take, is a
         // failure of that row alone: the rows beside it were installed, so

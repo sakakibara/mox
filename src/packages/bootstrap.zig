@@ -131,7 +131,7 @@ const Downloader = struct {
     }
 
     fn stream(ctx: *anyopaque, a: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!exec.Result {
-        return run(ctx, a, argv, stdin, exec.max_query_bytes);
+        return run(ctx, a, argv, stdin, exec.max_query_bytes, .stdout);
     }
 
     fn valueAfter(argv: []const []const u8, flag: []const u8) ?[]const u8 {
@@ -141,7 +141,7 @@ const Downloader = struct {
         return null;
     }
 
-    fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8, _: usize) anyerror!exec.Result {
+    fn run(ctx: *anyopaque, _: std.mem.Allocator, argv: []const []const u8, _: ?[]const u8, _: usize, _: exec.Capture) anyerror!exec.Result {
         const self: *Downloader = @ptrCast(@alignCast(ctx));
         self.calls += 1;
         if (!self.ignores_cap) {

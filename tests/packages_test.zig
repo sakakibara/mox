@@ -3166,8 +3166,173 @@ test "apply: an install that never ran says so, and claims no row may have lande
 
     const r = try h.run(&.{ "mox", "apply" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: apt: install did not run: DistroRefreshFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: apt: install did not run: the index or database refresh the install resolves against did not complete, so nothing was installed") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
+}
+
+test "apply: an install that could not elevate names sudo, and why it was needed" {
+    // The elevated argv is only built for a process that is not root.
+    if (mox.packages.exec.isRoot()) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "debian.toml",
+        \\backend = "apt"
+        \\
+        \\[[packages]]
+        \\name = "sl"
+        \\
+    );
+
+    // Measured on debian:stable as a user with no `sudo` on the machine: the
+    // apply said `install did not run: FileNotFound`, naming neither the
+    // program nor that elevation was what the install lacked.
+    const fake = try aptWith(a, "", &.{
+        .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update", .fail = error.FileNotFound },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: apt: install did not run: sudo was not found; mox is not running as root, so the install needed it to elevate\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "FileNotFound") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
+}
+
+test "apply: a pacman install that fails is reported as the whole-system upgrade it is" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "arch.toml",
+        \\backend = "pacman"
+        \\
+        \\[[packages]]
+        \\name = "foo"
+        \\
+    );
+
+    // A `-Syu` that fails at commit is the install failing, and the install
+    // is the whole-system upgrade, so the words say both and no refresh is
+    // blamed. The elevated calls are matched by suffix, so the test does
+    // not depend on the uid it runs under.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "pacman --version", .stdout = "Pacman v7.1.0 - libalpm v16.0.1\n" });
+    try entries.append(a, .{ .argv = "pacman -Qeq", .stdout = "" });
+    for ([_][]const u8{ "brew --version", "apt-get --version", "dnf --version", "scoop --version", "winget --version", "zypper --version" }) |argv| {
+        try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
+    }
+    try entries.append(a, .{ .argv = "pacman -Qdq", .code = 1 });
+    try entries.append(a, .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" });
+    try entries.append(a, .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 });
+    try entries.append(a, .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db", .match = .suffix });
+    try entries.append(a, .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local", .match = .suffix });
+    try entries.append(a, .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null", .match = .suffix });
+    try entries.append(a, .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core foo 1-1\n" });
+    try entries.append(a, .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix });
+    try entries.append(a, .{ .argv = "pacman -Qi" });
+    try entries.append(a, .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- foo", .stdout = "foo\n" });
+    try entries.append(a, .{ .argv = "pacman -Syu --needed --noconfirm -- foo", .code = 1, .match = .suffix });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: pacman: install failed: the install did not complete, and on pacman an install is the whole-system upgrade pacman requires of one, so pacman's own message above may name a package no row declares\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "DistroUpgradeInstallFailed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "RefreshFailed") == null);
+    // The transaction ran, so its row may have landed: the hedge stands.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed (1 row(s) in failed batches may have landed)") != null);
+}
+
+fn zypperWith(a: std.mem.Allocator, extra: []const mox.packages.exec.Fake.Entry) !*mox.packages.exec.Fake {
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "zypper --version", .stdout = "zypper 1.14.101\n" });
+    for ([_][]const u8{ "brew --version", "apt-get --version", "dnf --version", "pacman --version", "scoop --version", "winget --version" }) |argv| {
+        try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
+    }
+    try entries.append(a, .{ .argv = "zypper --non-interactive refresh", .match = .suffix });
+    try entries.append(a, .{
+        .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep bat",
+        .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | bat | a package | package\n",
+    });
+    try entries.append(a, .{ .argv = "zypper --non-interactive install -- ripgrep bat", .code = 4, .match = .suffix });
+    for (extra) |e| try entries.append(a, e);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    return fake;
+}
+
+const zypper_two_rows =
+    \\backend = "zypper"
+    \\
+    \\[[packages]]
+    \\name = "ripgrep"
+    \\
+    \\[[packages]]
+    \\name = "bat"
+    \\
+;
+
+test "apply: a zypper batch whose read-back found nothing landed is not hedged about" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try writeManifest(io, h, a, "suse.toml", zypper_two_rows);
+
+    // Measured on Tumbleweed with `zypper addlock ripgrep` and the staged
+    // adapter: the batch exited 4, rpm reported neither row, and the apply
+    // still printed "(2 row(s) in failed batches may have landed)" -- a
+    // hedge over a fact the read-back had just established.
+    const fake = try zypperWith(a, &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "landed") == null);
+}
+
+test "apply: a zypper batch whose read-back found a row landed says how many" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try writeManifest(io, h, a, "suse.toml", zypper_two_rows);
+
+    const fake = try zypperWith(a, &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n", .once = true },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nbat\n" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed (1 row(s) in failed batches landed)") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
 }
 

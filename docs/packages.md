@@ -151,7 +151,7 @@ package manager at all is usable here, `status` notes
 | `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1`, so a read-only `status` never refreshes brew's cached API data on a timer (a cache that does not exist yet is still populated once). The cask half is not an explicit-install query (below) | `kind` (`formula`, `cask`) |
 | `apt` | name | `apt-mark showmanual`; an install runs `apt-get update` first, so the index it resolves against is current | -- |
 | `dnf` | name | `dnf -q repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; the format string because its default packs several to a line) | -- |
-| `pacman` | name | `pacman -Qeq`; an install is `pacman -Syu --needed --noconfirm`, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
+| `pacman` | name | `pacman -Qeq`; an install is one `pacman -Syu --needed --noconfirm` transaction with the rows as its targets, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
 | `winget` | `PackageIdentifier` | `winget export`, which reports only what a source supplied (below) | `source`, `scope` (`user`/`machine`), `override` |
@@ -255,26 +255,58 @@ the transaction without running any of it, and refuses a row whose own name
 is not among what pacman would install -- naming what pacman resolved it to.
 `sh`, `java-runtime`, `ttf-font` and `smtp-forwarder` are all such names.
 
-Only a POSITIVE answer refuses there: a name pacman resolves to nothing
-exits non-zero, and that row is still handed over, because the listing is
-whatever the machine last synced and the install argv syncs before it
-resolves.
+A name pacman resolves to nothing at all is refused too, because
+`pacman -S` answers a batch carrying one with "target not found" and installs
+none of it -- and so is a name `pacman -Sl` lists that `pacman -S` still
+answers that way, which is what a repository configured with a `Usage` that
+leaves out `Install` produces. So the listing settles only whether a name is
+a group or a package, and every row to install is then asked of
+`pacman -S --print`: the whole batch in one call, and a row that transaction
+does not carry on its own. That call's stderr is read, because pacman exits
+1 the same way for a name it has nothing for (`error: target not found`) and
+for a package whose dependency no repository satisfies (`could not satisfy
+dependencies`, with the dependency named on stdout); each refusal quotes
+what pacman said.
 
-"This is no group" is acted on, though, so it is asked of a database every
-configured repository answered for. With one repository's database missing,
-`pacman -Sl` still lists the others and `pacman -Sg` says the missing
-repository's groups are no groups at all -- the same answer a real package
-gives. So mox compares the repositories that answered against
-`pacman-conf --repo-list`, and syncs when one of them did not. That comparison
-is made only when some row is absent from the listing, since that is the only
-row either question is asked about; a repository configured with an empty
-database contributes no line and so can never read as complete, and asking on
-every apply would sync on every apply for nothing. The check otherwise only
-reads, and what runs when it does sync is the full `pacman -Syu` the install
-itself was about to run, never a bare `pacman -Sy` -- which would leave the
-database ahead of the installed packages, a state Arch does not support, on
-every path that then refuses a row or fails. Having run it, the install that
-follows drops its own `-y`, so no apply upgrades the system twice.
+A row whose package **conflicts with an installed package** is refused as
+well. `pacman -S --print` does not report that -- the transaction prints and
+exits 0 -- and the install then asks "Remove <package>? [y/N]", which
+`--noconfirm` answers no, so the batch fails as one with "unresolvable
+package conflicts detected" and nothing beside the row lands, on every apply.
+mox never removes a package, so the row goes rather than the batch: its
+`Conflicts With` (from `pacman -Si`) is judged by `pacman -T`, which says
+whether an installed package satisfies each spec, versions included, and the
+installed packages' own `Conflicts With` (from `pacman -Qi`) are read for a
+conflict declared on that side alone, a versioned one judged by whether
+`pacman -S --print` resolves the spec to the row's package. The refusal names
+the installed package pacman would have removed.
+
+Every one of these answers is a sync database's, and the system's is only as
+current as the machine's last sync -- absence from a database synced months
+ago says nothing about a row. A check never mutates the system, and a bare
+`pacman -Sy` that brought the system's database forward would leave it ahead
+of the installed packages, a state Arch does not support, on every path that
+then refuses a row. So mox syncs a copy of its own, the way `checkupdates`
+from pacman-contrib does: `pacman -Sy --dbpath /var/cache/mox/pacman-db
+--logfile /dev/null`, with the copy's `local` a symlink to the system's local
+database, so that `--print` resolves against what the machine has. The copy
+lives under `/var/cache` rather than mox's state directory because pacman 7
+downloads as its `DownloadUser`, which cannot reach into a home directory of
+mode 0700, Arch's default; it is root-owned, kept between applies, and read
+by nothing but these checks. It is made with
+`install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db` and
+`ln -sfn <DBPath>/local /var/cache/mox/pacman-db/local`, both elevated, and
+only when `stat` and `readlink` find it missing, with a mode the download
+user could not traverse, or with `local` pointing elsewhere -- so after the
+first apply an apply elevates `pacman` alone, and a sudoers rule that grants
+nothing else serves it. When those two commands cannot run, the message
+gives them to run once as root. A sync that fails with `db.lck` left in the
+copy -- what a pacman killed outright mid-sync leaves behind -- names the
+file and says it may be removed once no pacman is running. The install that
+follows is the single `pacman -Syu --needed --noconfirm` transaction with
+the rows as its targets, which is what records a row the upgrade would
+otherwise pull in as some other package's dependency as explicitly
+installed.
 
 Before a zypper install, mox asks `zypper search --match-exact --type
 package` which of the row names its repositories carry under exactly that
@@ -285,7 +317,19 @@ is reinstalled on every apply -- silently, since zypper exits 0 each time.
 Such a row is refused with its providers named, from
 `zypper search --provides --match-exact`. A name zypper has nothing at all
 for is refused too, because `zypper install` answers a batch carrying one by
-installing none of it.
+installing none of it. Both searches run with `--no-color`: zypper.conf's
+`useColors = always` colours the table even into a pipe, `NO_COLOR` does not
+undo it, and a coloured table names no package. A package zypper has
+**locked** (`zypper addlock`) and not yet installed is refused the way apt's
+held one is: the search table's status column reads `l` for it,
+`zypper install` answers a batch carrying it by installing nothing at all,
+and the lock is the user's decision, so the row is refused with
+`zypper removelock` named and the lock left in place. One installed and
+locked (`il`) stops the batch the same way only when an update for it is
+pending, which the search table cannot show, so
+`zypper list-updates --all` is asked about such rows: one it lists is
+refused with both versions named, one it does not list is installed with the
+batch, and when it cannot answer the row is refused rather than risked.
 
 An apt row qualified with the machine's own architecture is refused the same
 way, as are apt's `:native`, `:all` and `:any`, which apt resolves to the
@@ -458,7 +502,9 @@ runs with `DEBIAN_FRONTEND=noninteractive` so debconf does not). A batch
 that failed may have landed some of its rows, so the re-capture runs after
 any attempt, and after a bootstrap alone; the summary then says how many
 rows were in failed batches, since a per-row manager counts only the
-batches it lost. An install is not time-bounded by default -- a manager may
+batches it lost -- or, for zypper, which reads the machine back before and
+after a batch, how many of them the failed batch landed, with no hedge when
+none did and no credit for a package the machine had before. An install is not time-bounded by default -- a manager may
 legitimately compile for an hour -- and `MOX_INSTALL_TIMEOUT_MS` bounds it
 when set: at the bound the manager gets SIGINT first, so it can roll back
 its transaction, and SIGKILL ten seconds later.

@@ -164,6 +164,9 @@ pub fn checkCaptureTimedOut(res: Result) error{CaptureTimedOut}!void {
 pub fn errorText(e: anyerror) []const u8 {
     return switch (e) {
         error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
+        Error.SudoNotFound => "sudo was not found; mox is not running as root, so the install needed it to elevate",
+        error.DistroUpgradeInstallFailed => "the install did not complete, and on pacman an install is the whole-system upgrade pacman requires of one, so pacman's own message above may name a package no row declares",
+        error.DistroRefreshFailed => "the index or database refresh the install resolves against did not complete, so nothing was installed",
         else => @errorName(e),
     };
 }
@@ -201,35 +204,65 @@ pub fn failureText(
     };
 }
 
+pub const Error = error{
+    /// An argv beginning with `sudo` could not be spawned because `sudo` is
+    /// not there: the only program a spawn of it can fail to find, since the
+    /// manager behind it is one sudo would have run itself.
+    SudoNotFound,
+};
+
+/// `FileNotFound` from a spawn names no program. For an argv beginning with
+/// `sudo` there is only one it can be, so it is named.
+fn nameNotFound(e: anyerror, argv: []const []const u8) anyerror {
+    if (e == error.FileNotFound and argv.len > 0 and std.mem.eql(u8, argv[0], "sudo")) return Error.SudoNotFound;
+    return e;
+}
+
 pub const Result = struct {
     code: u8,
     ok: bool,
     stdout: []const u8,
+    /// What the child wrote to stderr, for a `runBoth` call alone; every
+    /// other call leaves stderr on the terminal and this empty.
+    stderr: []const u8 = "",
     /// The call was killed for exceeding its bound; `code` is meaningless.
     timed_out: bool = false,
 };
 
+/// Which of a captured child's streams come back in the `Result`.
+pub const Capture = enum { stdout, both };
+
 pub const Runner = struct {
     ctx: *anyopaque,
-    runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize) anyerror!Result,
+    runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize, capture: Capture) anyerror!Result,
     streamFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result,
 
     /// Run and capture stdout: for a query whose output mox parses. stderr
     /// is the terminal's, so a manager's or plugin's own diagnostics reach
     /// the user as written.
     pub fn run(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
-        return self.runFn(self.ctx, arena, argv, null, max_query_bytes);
+        return self.runFn(self.ctx, arena, argv, null, max_query_bytes, .stdout) catch |e| nameNotFound(e, argv);
+    }
+
+    /// `run` with stderr captured too: for a query whose stderr IS part of
+    /// the answer -- the manager says there which of several ways it
+    /// failed, or a probe whose failure is the answer and whose complaint
+    /// is no diagnostic. The caller owes the user what it captured: a
+    /// diagnostic read here reaches the terminal only through the caller's
+    /// own message.
+    pub fn runBoth(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
+        return self.runFn(self.ctx, arena, argv, null, max_query_bytes, .both) catch |e| nameNotFound(e, argv);
     }
 
     /// `run` for the one call whose legitimate answer is not a query's: an
     /// installer fetched through a downloader with no size cap of its own.
     pub fn runCapped(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, cap: usize) anyerror!Result {
-        return self.runFn(self.ctx, arena, argv, null, cap);
+        return self.runFn(self.ctx, arena, argv, null, cap, .stdout) catch |e| nameNotFound(e, argv);
     }
 
     /// `run` with bytes on the child's stdin.
     pub fn runInput(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: []const u8) anyerror!Result {
-        return self.runFn(self.ctx, arena, argv, stdin, max_query_bytes);
+        return self.runFn(self.ctx, arena, argv, stdin, max_query_bytes, .stdout) catch |e| nameNotFound(e, argv);
     }
 
     /// Run with mox's own stdout and stderr: for work the user waits on. An
@@ -237,12 +270,12 @@ pub const Runner = struct {
     /// would replace minutes of progress with a silent hang and throw the
     /// manager's own diagnostics away. `stdout` comes back empty.
     pub fn stream(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, null);
+        return self.streamFn(self.ctx, arena, argv, null) catch |e| nameNotFound(e, argv);
     }
 
     /// `stream` with bytes on the child's stdin.
     pub fn streamInput(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, stdin);
+        return self.streamFn(self.ctx, arena, argv, stdin) catch |e| nameNotFound(e, argv);
     }
 
     /// `run` or `stream` by flag. An argv that is a PowerShell script
@@ -255,7 +288,8 @@ pub const Runner = struct {
     }
 
     fn call(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, streamed: bool) anyerror!Result {
-        return if (streamed) self.streamFn(self.ctx, arena, argv, stdin) else self.runFn(self.ctx, arena, argv, stdin, max_query_bytes);
+        const res = if (streamed) self.streamFn(self.ctx, arena, argv, stdin) else self.runFn(self.ctx, arena, argv, stdin, max_query_bytes, .stdout);
+        return res catch |e| nameNotFound(e, argv);
     }
 };
 
@@ -358,14 +392,14 @@ pub const Process = struct {
         return .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(ms), .clock = .awake } };
     }
 
-    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize) anyerror!Result {
+    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize, capture: Capture) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawn(arena, argv, stdin, .pipe, cap);
+        return self.spawn(arena, argv, stdin, .pipe, if (capture == .both) .pipe else .inherit, cap);
     }
 
     fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawn(arena, argv, stdin, .inherit, max_query_bytes);
+        return self.spawn(arena, argv, stdin, .inherit, .inherit, max_query_bytes);
     }
 
     /// The environment a captured child runs under: the call's own, with
@@ -397,9 +431,9 @@ pub const Process = struct {
     }
 
     /// Spawn with stdin backed by a scratch file holding `stdin` (closed
-    /// when null), stderr on the terminal, and stdout captured or inherited.
-    /// One deadline bounds the whole call: reading what the child writes and
-    /// waiting for it to exit.
+    /// when null), and stdout and stderr each captured or inherited; stderr
+    /// is captured only alongside stdout. One deadline bounds the whole
+    /// call: reading what the child writes and waiting for it to exit.
     ///
     /// Every child leads its own process group, so a bound reaches the whole
     /// tree: a query blocked behind a helper it spawned (`port | awk`) and an
@@ -436,6 +470,7 @@ pub const Process = struct {
         argv: []const []const u8,
         stdin: ?[]const u8,
         stdout_io: std.process.SpawnOptions.StdIo,
+        stderr_io: std.process.SpawnOptions.StdIo,
         cap: usize,
     ) anyerror!Result {
         const io = self.io;
@@ -470,7 +505,7 @@ pub const Process = struct {
             .environ_map = if (captured_env) |*m| m else self.env,
             .stdin = stdin_io,
             .stdout = stdout_io,
-            .stderr = .inherit,
+            .stderr = stderr_io,
             .pgid = job.own_group,
         });
         // A signal between the spawn and this line finds no group recorded
@@ -488,16 +523,25 @@ pub const Process = struct {
         }
 
         var out: []const u8 = "";
+        var err_out: []const u8 = "";
         // Set when the child was found already finished between reads, so the
         // status is this and there is nothing left to wait for. The pipe may
         // still be held by something it left behind, so the read goes on.
         var read_term: ?std.process.Child.Term = null;
         if (child.stdout) |f| {
-            var streams: Io.File.MultiReader.Buffer(1) = undefined;
+            // Both pipes are read by the one reader, so a child that fills
+            // stderr while mox drains stdout never blocks on either.
+            var one: Io.File.MultiReader.Buffer(1) = undefined;
+            var two: Io.File.MultiReader.Buffer(2) = undefined;
             var mr: Io.File.MultiReader = undefined;
-            mr.init(arena, io, streams.toStreams(), &.{f});
+            if (child.stderr) |ef| {
+                mr.init(arena, io, two.toStreams(), &.{ f, ef });
+            } else {
+                mr.init(arena, io, one.toStreams(), &.{f});
+            }
             defer mr.deinit();
             const rd = mr.reader(0);
+            const erd: ?*Io.Reader = if (child.stderr != null) mr.reader(1) else null;
             const started = Io.Clock.awake.now(io);
             const bound = if (captured) self.timeout_ms else self.install_timeout_ms;
             // A read that fails, overruns the cap, or outlives the bound is an
@@ -551,7 +595,8 @@ pub const Process = struct {
                         return e;
                     },
                 };
-                if (rd.buffered().len > cap) {
+                const err_len = if (erd) |r| r.buffered().len else 0;
+                if (rd.buffered().len > cap or err_len > cap) {
                     killWhatIsLeft(io, &child, child_group);
                     signals.release();
                     return error.StreamTooLong;
@@ -570,6 +615,11 @@ pub const Process = struct {
                 signals.release();
                 return e;
             };
+            if (erd != null) err_out = mr.toOwnedSlice(1) catch |e| {
+                killWhatIsLeft(io, &child, child_group);
+                signals.release();
+                return e;
+            };
         }
 
         // A child the read already found finished has been reaped by that
@@ -579,7 +629,7 @@ pub const Process = struct {
             signals.release();
             if (tty) |x| x.takeBack();
             job.closePipes(io, &child);
-            return fromTerm(t, out);
+            return fromTerm(t, out, err_out);
         }
 
         // The wait is bounded too: a child that closed stdout and lingers
@@ -628,7 +678,7 @@ pub const Process = struct {
             if (child_group) |id| job.killStragglersOf(id);
         }
 
-        var res = fromTerm(term, out);
+        var res = fromTerm(term, out, err_out);
         if (guard.fired) {
             res.ok = false;
             res.timed_out = true;
@@ -666,7 +716,7 @@ fn interruptAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, grace:
     _ = job.signal(-id, .KILL);
 }
 
-fn fromTerm(term: std.process.Child.Term, stdout: []const u8) Result {
+fn fromTerm(term: std.process.Child.Term, stdout: []const u8, stderr: []const u8) Result {
     const code: u8 = switch (term) {
         .exited => |c| c,
         else => 255,
@@ -675,6 +725,7 @@ fn fromTerm(term: std.process.Child.Term, stdout: []const u8) Result {
         .code = code,
         .ok = term == .exited and code == 0,
         .stdout = stdout,
+        .stderr = stderr,
     };
 }
 
@@ -690,6 +741,9 @@ pub const Fake = struct {
         argv: []const u8,
         match: Match = .exact,
         stdout: []const u8 = "",
+        /// Answered only to a call that captures stderr, as the real stderr
+        /// reaches a `Result` only then.
+        stderr: []const u8 = "",
         code: u8 = 0,
         /// Raised instead of answering, for the failures a manager reports by
         /// not being there at all.
@@ -733,17 +787,17 @@ pub const Fake = struct {
         return null;
     }
 
-    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize) anyerror!Result {
+    fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize, capture: Capture) anyerror!Result {
         const self: *Fake = @ptrCast(@alignCast(ctx));
-        return self.answer(arena, argv, stdin, false, cap);
+        return self.answer(arena, argv, stdin, false, cap, capture);
     }
 
     fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
         const self: *Fake = @ptrCast(@alignCast(ctx));
-        return self.answer(arena, argv, stdin, true, max_query_bytes);
+        return self.answer(arena, argv, stdin, true, max_query_bytes, .stdout);
     }
 
-    fn answer(self: *Fake, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, is_streamed: bool, cap: usize) anyerror!Result {
+    fn answer(self: *Fake, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, is_streamed: bool, cap: usize, capture: Capture) anyerror!Result {
         const joined = try std.mem.join(self.arena, " ", argv);
         try self.calls.append(self.arena, joined);
         try self.inputs.append(self.arena, try self.arena.dupe(u8, stdin orelse ""));
@@ -781,6 +835,7 @@ pub const Fake = struct {
                 .code = e.code,
                 .ok = e.code == 0,
                 .stdout = try arena.dupe(u8, e.stdout),
+                .stderr = if (capture == .both) try arena.dupe(u8, e.stderr) else "",
             };
         }
         return error.UnexpectedCommand;
@@ -920,6 +975,44 @@ test "Process: a real command that exceeds its bound is killed and reported" {
     const res = try p.runner().run(a, &.{ "sleep", "5" });
     try testing.expect(res.timed_out);
     try testing.expect(!res.ok);
+}
+
+test "Process: runBoth captures stderr beside stdout, and run leaves it on the terminal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var p: Process = .{ .io = std.testing.io, .timeout_ms = 5_000 };
+    const both = try p.runner().runBoth(a, &.{ "sh", "-c", "echo out; echo err >&2; exit 3" });
+    try testing.expectEqual(@as(u8, 3), both.code);
+    try testing.expectEqualStrings("out\n", both.stdout);
+    try testing.expectEqualStrings("err\n", both.stderr);
+
+    // A child that fills stderr past a pipe's buffer while stdout is what
+    // mox waits on must still end: both are drained together.
+    const wide = try p.runner().runBoth(a, &.{ "sh", "-c", "i=0; while [ $i -lt 4000 ]; do echo 'a line of stderr, long enough to fill a pipe when repeated' >&2; i=$((i+1)); done; echo done" });
+    try testing.expect(wide.ok);
+    try testing.expectEqualStrings("done\n", wide.stdout);
+    try testing.expect(wide.stderr.len > 65536);
+
+    const one = try p.runner().run(a, &.{ "sh", "-c", "echo out; echo err >&2" });
+    try testing.expectEqualStrings("out\n", one.stdout);
+    try testing.expectEqualStrings("", one.stderr);
+}
+
+test "Fake: stderr is answered to a runBoth call alone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -S --print -- x", .code = 1, .stderr = "error: target not found: x\n" },
+    } };
+    const both = try fake.runner().runBoth(a, &.{ "pacman", "-S", "--print", "--", "x" });
+    try testing.expectEqualStrings("error: target not found: x\n", both.stderr);
+    const one = try fake.runner().run(a, &.{ "pacman", "-S", "--print", "--", "x" });
+    try testing.expectEqualStrings("", one.stderr);
 }
 
 test "Process: a streamed call is not bounded by the captured bound" {
@@ -1304,6 +1397,30 @@ test "failureText: the bound that fired is named, whichever of the two it was" {
     try testing.expectEqualStrings(
         "timed out, killed",
         try failureText(a, error.CaptureTimedOut, 1_800_000, "MOX_INSTALL_TIMEOUT_MS", 0),
+    );
+}
+
+test "Runner: an elevated argv that cannot be spawned names sudo, and says why it was needed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on debian:stable as a user with no `sudo` on the machine:
+    // the apply reported `install did not run: FileNotFound`, naming neither
+    // the program nor that elevation was what the install lacked.
+    var fake: Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo pacman -Syu --noconfirm", .fail = error.FileNotFound },
+        .{ .argv = "sudo apt-mark manual sl", .fail = error.FileNotFound },
+        .{ .argv = "pacman -Sl", .fail = error.FileNotFound },
+    } };
+    try testing.expectError(Error.SudoNotFound, fake.runner().stream(a, &.{ "sudo", "pacman", "-Syu", "--noconfirm" }));
+    try testing.expectError(Error.SudoNotFound, fake.runner().run(a, &.{ "sudo", "apt-mark", "manual", "sl" }));
+    // A program that is not sudo is not named sudo.
+    try testing.expectError(error.FileNotFound, fake.runner().run(a, &.{ "pacman", "-Sl" }));
+
+    try testing.expectEqualStrings(
+        "sudo was not found; mox is not running as root, so the install needed it to elevate",
+        errorText(Error.SudoNotFound),
     );
 }
 

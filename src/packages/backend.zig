@@ -406,6 +406,12 @@ pub const Backend = struct {
         /// installed all the same. Absent for an adapter with no mark path,
         /// where the answer is always zero.
         installUnmarked: ?*const fn (ctx: *anyopaque) usize = null,
+        /// How many of the last `install`'s rows the adapter found on the
+        /// machine after its batch failed, when it looked. A failed batch may
+        /// have landed some of its rows; an adapter that reads the machine
+        /// back afterwards can say how many, where the caller could only
+        /// hedge. Absent, or null, when it did not look.
+        installLanded: ?*const fn (ctx: *anyopaque) ?usize = null,
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
@@ -494,6 +500,11 @@ pub const Backend = struct {
 
     pub fn installUnmarked(self: Backend) usize {
         const f = self.vtable.installUnmarked orelse return 0;
+        return f(self.ctx);
+    }
+
+    pub fn installLanded(self: Backend) ?usize {
+        const f = self.vtable.installLanded orelse return null;
         return f(self.ctx);
     }
 

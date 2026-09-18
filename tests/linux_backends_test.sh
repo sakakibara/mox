@@ -51,17 +51,31 @@
 # multiarch machine needs, which is the one place a colon in a name is the
 # name apt itself reports; one covers a machine with no package index, where
 # apt's listing must come back empty; one covers a pacman database that
-# is merely old, where a name it lacks must still reach pacman; one covers a
+# is merely old, where a name it lacks must still install; one covers a
 # package no repository carries, installed from a .deb, which apt would
 # install and mox must therefore keep; one covers a pacman database that
 # is SHORT rather than old, where a repository's groups all read as no group
 # at all; one covers a name zypper has nothing at all for, which makes
-# `zypper install` install none of the batch it is in; and one covers a
-# configured, synced and EMPTY pacman repository, which contributes no line to
-# the listing and so can never read as complete. The hermetic
-# suite proves what the adapter does; only the real manager proves what the
-# row would have done. These run with the default set, not from the
-# image/backend/package arguments.
+# `zypper install` install none of the batch it is in; one covers a name
+# pacman has nothing at all for, which makes `pacman -S` install none of the
+# batch it is in the same way; one covers a zypper.conf that colours every
+# table zypper writes, pipe or not; one covers a configured, synced and
+# EMPTY pacman repository, which contributes no line to the listing; one
+# covers a row a pacman upgrade pulls in as another package's dependency,
+# which the install must still record as asked for; one covers a repository
+# pacman lists but will not install from (`Usage = Sync Search`); one
+# covers a zypper lock, which makes `zypper install` install none of the
+# batch it is in; one covers a lock on a package installed with an update
+# pending, which does the same while a lock on one at its newest does
+# nothing; one covers a pacman package whose dependency no repository
+# satisfies, which `pacman -S --print` refuses with the same exit code as a
+# name it has nothing for; one covers a row that conflicts with an installed
+# package, in each direction, which `--print` passes and the install then
+# refuses as a batch; one covers the database copy under a umask of 077,
+# which pacman's download user must still traverse; and one covers a stale
+# lock in that copy. The hermetic suite proves what the adapter does; only
+# the real manager proves what the row would have done. These run with the
+# default set, not from the image/backend/package arguments.
 #
 # A manager's IMAGE TAGS are part of what this suite covers. A floating tag
 # is ONE point in a manager's version range, and an adapter can be whole at
@@ -842,9 +856,9 @@ EOF
 
 # A pacman database that is merely OLD, which is the normal state of an Arch
 # machine between upgrades. A name it has never heard of must NOT be refused:
-# the install argv is `pacman -Syu`, which syncs before it resolves. Absence
-# is not evidence here, where it is for apt -- mox runs apt's own update
-# immediately before reading apt's listing.
+# the check syncs mox's own copy of the database and reads that, so the old
+# database is never what a row is judged by -- and is left as old as it was
+# until the install's own `-Syu` brings it forward.
 run_pacman_stale_case() {
   image="$1"
   backend="pacman stale"
@@ -899,11 +913,11 @@ EOF
     no "$backend ($image): an installable row was refused for being absent from a stale database" \
       "$(grep 'names no pacman package' "$out")"
   else
-    ok "$backend ($image): a name the stale database lacks is handed to pacman, not refused"
+    ok "$backend ($image): a name the stale database lacks is not refused against it"
   fi
 
   if grep -q "^installed=1" "$out" && grep -q "^apply-exit=0" "$out"; then
-    ok "$backend ($image): the sync the install itself runs resolved it"
+    ok "$backend ($image): the check's own copy of the database resolved it, and it installed"
   else
     no "$backend ($image): the row did not install" "$(grep -E '^installed=|^apply-exit=|Packages:' "$out")"
   fi
@@ -1170,13 +1184,33 @@ EOF
   fi
 }
 
-# A pacman CHECK must only read. `pacman -Sy` without `-u` leaves the sync
-# database ahead of the installed packages, which Arch documents as an
-# unsupported partial upgrade -- and a check that runs it leaves the machine
-# in that state on every path out, a refused row included. Two phases: a
-# machine that has never synced, where the database has to be downloaded
-# before anything can be judged, and one that already has it, where nothing
-# may be written at all.
+# A pacman package built by hand, for a repository the case controls:
+# `mkpkg name ver depend outdir [conflict]` writes `outdir/name-ver-any.pkg.tar`,
+# which `repo-add` takes. bsdtar and repo-add both ship with pacman; makepkg
+# would need fakeroot, which a base install does not.
+pacman_mkpkg='mkpkg() {
+  d=/tmp/mkpkg/$1-$2
+  rm -rf "$d"
+  mkdir -p "$d/usr/share/$1"
+  echo "$1 $2" > "$d/usr/share/$1/README"
+  {
+    printf "pkgname = %s\npkgver = %s\npkgdesc = a test package\nurl = http://localhost\nbuilddate = 0\npackager = mox\nsize = 0\narch = any\n" "$1" "$2"
+    if [ -n "$3" ]; then printf "depend = %s\n" "$3"; fi
+    if [ -n "${5:-}" ]; then printf "conflict = %s\n" "$5"; fi
+  } > "$d/.PKGINFO"
+  (cd "$d" && bsdtar -cf "$4/$1-$2-any.pkg.tar" .PKGINFO usr)
+}
+'
+
+# What a pacman apply does to the SYSTEM. A check never mutates it: the
+# check syncs mox's own copy of the sync database and reads that, so an
+# apply whose every row is refused leaves the system's sync database as it
+# was -- absent, on a machine that has never synced -- and pacman's log
+# without a line, however many times it runs. The install is the one write,
+# and it is the single `pacman -Syu --needed` transaction. Three group-only
+# applies first, then one with a real package; the system's database
+# directory, pacman's own log and its pending-upgrade count say what
+# happened.
 run_pacman_sync_case() {
   image="$1"
   backend="pacman sync"
@@ -1185,8 +1219,8 @@ run_pacman_sync_case() {
   rm -rf "$case_dir"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
-  # A group: refused, so every path after the database read is the failing
-  # one this case is about.
+  # A group: refused, so every path after the database read is the one
+  # that must leave the system alone.
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
 backend = "pacman"
 
@@ -1201,48 +1235,70 @@ EOF
       set -e
       export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
       [ -f /var/lib/pacman/sync/core.db ] && { echo "this image ships a synced database; the case cannot run"; exit 1; }
-      echo "--- unsynced ---"
+      pacman -Q ripgrep >/dev/null 2>&1 && { echo "the image ships ripgrep; the case cannot run"; exit 1; }
+      echo "--- three refused applies ---"
+      log_before=$(grep -c "\[PACMAN\] Running" /var/log/pacman.log 2>/dev/null || true)
+      refusals=0
+      for i in 1 2 3; do
+        rc=0
+        /w/mox apply >/tmp/apply-$i.txt 2>&1 || rc=$?
+        echo "apply-$i-exit=$rc"
+        grep -q "names no pacman package" /tmp/apply-$i.txt && refusals=$((refusals + 1))
+      done
+      cat /tmp/apply-1.txt
+      echo "refusals=$refusals"
+      echo "system-dbs-after-refusals=$(ls /var/lib/pacman/sync 2>/dev/null | grep -c "\.db$" || true)"
+      log_after=$(grep -c "\[PACMAN\] Running" /var/log/pacman.log 2>/dev/null || true)
+      echo "pacman-runs-during-refusals=$((log_after - log_before))"
+      echo "private-dbs=$(ls /var/cache/mox/pacman-db/sync 2>/dev/null | grep -c "\.db$" || true)"
+      echo "--- one install ---"
+      printf "backend = \"pacman\"\n\n[[packages]]\nname = \"ripgrep\"\n" > /w/repo/data/packages/pacman.toml
       rc=0
       /w/mox apply || rc=$?
       echo "apply-exit=$rc"
       echo "--- pending upgrades ---"
       pacman -Qu > /tmp/pending.txt 2>&1 || true
       echo "pending=$(grep -c . /tmp/pending.txt)"
-      echo "--- synced ---"
-      touch /tmp/marker
-      sleep 1
-      rc=0
-      /w/mox apply || rc=$?
-      echo "apply-exit=$rc"
-      if [ -n "$(find /var/lib/pacman/sync -newer /tmp/marker)" ]; then
-        echo "database=written"
-      else
-        echo "database=untouched"
-      fi
+      echo "upgrades=$(grep -c "Running .pacman -Syu" /var/log/pacman.log || true)"
+      echo "bare-syncs=$(grep -c "Running .pacman -Sy " /var/log/pacman.log || true)"
     ' >"$out" 2>&1; then
     no "$backend ($image): container run failed" "$(tail -3 "$out")"
     return
   fi
 
+  if grep -q "^refusals=3" "$out"; then
+    ok "$backend ($image): the group is refused on every apply"
+  else
+    no "$backend ($image): the row was not refused each time" "$(grep -E '^refusals=|^apply-[123]-exit=' "$out")"
+  fi
+
+  # A check never mutates the system: after three applies that installed
+  # nothing, the system has no sync database and pacman logged nothing,
+  # while mox's own copy answered.
+  if grep -q "^system-dbs-after-refusals=0" "$out" && grep -q "^pacman-runs-during-refusals=0" "$out"; then
+    ok "$backend ($image): three refused applies left the system's database and log untouched"
+  else
+    no "$backend ($image): a refused apply wrote to the system" "$(grep -E '^system-dbs-|^pacman-runs-' "$out")"
+  fi
+
+  if grep -q "^private-dbs=[1-9]" "$out"; then
+    ok "$backend ($image): the check answered from mox's own copy of the database"
+  else
+    no "$backend ($image): mox's own database copy was not synced" "$(grep -E '^private-dbs=' "$out")"
+  fi
+
+  if grep -q "Packages: 1 installed, 0 failed" "$out" && grep -q "^upgrades=1" "$out" && grep -q "^bare-syncs=0" "$out"; then
+    ok "$backend ($image): the install is the apply's one upgrade, and no bare sync ever runs"
+  else
+    no "$backend ($image): the install's upgrade count is off" "$(grep -E '^upgrades=|^bare-syncs=|Packages:' "$out")"
+  fi
+
   # A machine left with a synced database and un-upgraded packages has
   # pending upgrades against a database it never asked for.
   if grep -q "^pending=0" "$out"; then
-    ok "$backend ($image): an unsynced machine is left upgraded, never half-synced"
+    ok "$backend ($image): the machine is left upgraded, never half-synced"
   else
-    no "$backend ($image): the run left the machine in a partial-upgrade state" \
-      "$(grep -E '^pending=|^apply-exit=' "$out" | head -2)"
-  fi
-
-  if grep -q "database=untouched" "$out"; then
-    ok "$backend ($image): a check against a database that is already there writes nothing"
-  else
-    no "$backend ($image): a check wrote to the sync database" "$(grep -E 'database=' "$out")"
-  fi
-
-  if grep -q "names no pacman package" "$out"; then
-    ok "$backend ($image): the row is still refused, on both runs"
-  else
-    no "$backend ($image): the row was not refused" "$(tail -5 "$out")"
+    no "$backend ($image): the run left the machine in a partial-upgrade state" "$(grep -E '^pending=' "$out")"
   fi
 }
 
@@ -1565,12 +1621,268 @@ EOF
   fi
 }
 
+# A name pacman has NOTHING for, beside a real package. Measured on pacman
+# 7.1.0 against a synced database, `pacman -S --needed --noconfirm -- cowsay
+# mox-no-such-package` exits 1 with "target not found" and installs neither,
+# so the bad row kept the good one off the machine on every apply, and every
+# apply reported the batch failed. The check syncs first, so absence from the
+# database is current and the row is refused on its own; the row beside it
+# installs. The stale case above is the other half: a name only a current
+# database has must not be refused against the old one.
+run_pacman_unknown_name_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman unknown-name"
+
+  case_dir="$work/pacman-unknown-name"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "$pkg"
+
+[[packages]]
+name = "mox-no-such-package"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pacman -Q $pkg >/dev/null 2>&1 && { echo 'the image ships $pkg; the case cannot run'; exit 1; }
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo 'sync=failed'; exit 0; }
+      # The premises: the name is in no listing, no group, and pacman
+      # resolves it to nothing.
+      pacman -Sl 2>/dev/null | awk '\$2 == \"mox-no-such-package\"' | grep -q . && { echo 'the name is a package here; the case cannot run'; exit 1; }
+      pacman -Sg mox-no-such-package >/dev/null 2>&1 && { echo 'the name is a group here; the case cannot run'; exit 1; }
+      rc=0; pacman -S --print --print-format '%n' -- mox-no-such-package >/dev/null 2>&1 || rc=\$?
+      echo \"print-exit=\$rc\"
+      echo '--- apply ---'
+      rc=0
+      /w/mox apply || rc=\$?
+      echo \"apply-exit=\$rc\"
+      echo \"installed=\$(pacman -Qq $pkg >/dev/null 2>&1 && echo 1 || echo 0)\"
+      echo \"upgrades=\$(grep -c 'Running .pacman -Syu' /var/log/pacman.log || true)\"
+    " >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no database could answer" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^print-exit=1" "$out"; then
+    ok "$backend ($image): pacman resolves the name to nothing"
+  else
+    no "$backend ($image): the premise does not hold on this pacman" "$(grep -E '^print-exit=' "$out")"
+  fi
+
+  if grep -q 'mox: pacman: row "mox-no-such-package" names no pacman package in this machine.s repositories' "$out"; then
+    ok "$backend ($image): the name pacman has nothing for is refused, by name"
+  else
+    no "$backend ($image): the unknown name was not refused" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed; one bad row kept nothing off the machine"
+  else
+    no "$backend ($image): the good row did not install" "$(grep -E '^installed=|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "^upgrades=1" "$out"; then
+    ok "$backend ($image): the install's own upgrade is the apply's only one"
+  else
+    no "$backend ($image): the upgrade count is off" "$(grep -E '^upgrades=' "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# A row the install's own upgrade pulls in as another package's dependency.
+# A repository the case controls carries `a` 2-1; once that is installed the
+# repository moves to `a` 3-1, which depends on `foo`, and the manifest
+# declares `foo`. In one `pacman -Syu --needed -- foo` transaction foo is a
+# target and pacman records it "Explicitly installed"; split into a `-Syu`
+# and a `-S --needed -- foo`, the upgrade of `a` lands foo as a dependency
+# and the second step skips it as up to date, so the apply reports it
+# installed while `pacman -Qeq` never does and every status says MISSING.
+run_pacman_upgrade_dependency_case() {
+  image="$1"
+  backend="pacman upgrade-dependency"
+
+  case_dir="$work/pacman-upgrade-dependency"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
+backend = "pacman"
+
+[[packages]]
+name = "foo"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "$pacman_mkpkg"'
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      for p in a foo; do
+        pacman -Q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      mkdir -p /srv/repo
+      mkpkg a 2-1 "" /srv/repo
+      mkpkg a 3-1 foo /srv/repo
+      mkpkg foo 1-1 "" /srv/repo
+      (cd /srv/repo && repo-add -q moxtest.db.tar.gz a-2-1-any.pkg.tar >/dev/null 2>&1)
+      printf "[moxtest]\nSigLevel = Never\nServer = file:///srv/repo\n" >> /etc/pacman.conf
+      pacman -Sy --noconfirm >/dev/null 2>&1
+      pacman -S --noconfirm a >/dev/null 2>&1
+      (cd /srv/repo && repo-add -q -R moxtest.db.tar.gz a-3-1-any.pkg.tar foo-1-1-any.pkg.tar >/dev/null 2>&1)
+      echo "premise-a=$(pacman -Q a | tr " " =)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "a-after=$(pacman -Q a | tr " " =)"
+      echo "reason=$(pacman -Qi foo 2>/dev/null | sed -n "s/^Install Reason *: //p")"
+      echo "--- after ---"
+      /w/mox status || true
+    ' >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no upgrade could be built" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^premise-a=a=2-1" "$out" && grep -q "^a-after=a=3-1" "$out"; then
+    ok "$backend ($image): the install's upgrade moved a from 2-1 to 3-1, which pulls foo in"
+  else
+    no "$backend ($image): the premise does not hold" "$(grep -E '^premise-a=|^a-after=' "$out")"
+  fi
+
+  if grep -q "Packages: 1 installed, 0 failed" "$out" && grep -q "^apply-exit=0" "$out"; then
+    ok "$backend ($image): the apply installed the row"
+  else
+    no "$backend ($image): the apply did not report the row installed" "$(grep -E 'Packages:|^apply-exit=|^mox apply' "$out")"
+  fi
+
+  if grep -q "^reason=Explicitly installed" "$out"; then
+    ok "$backend ($image): pacman records the row as asked for, being a target of the one transaction"
+  else
+    no "$backend ($image): pacman records the row as a dependency, so it reads MISSING for ever" "$(grep -E '^reason=' "$out")"
+  fi
+
+  after="$(sed -n '/--- after ---/,$p' "$out")"
+  if echo "$after" | grep -qE "MISSING[[:space:]]+pacman foo"; then
+    no "$backend ($image): the row is still MISSING after the apply that installed it" "$(echo "$after" | tail -3)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+}
+
+# A repository configured `Usage = Sync Search` puts its packages in
+# `pacman -Sl` while `pacman -S` answers each with "target not found", and a
+# batch carrying one installs nothing. The listing alone would keep the row;
+# only `pacman -S --print`, asked of every row, refuses it.
+run_pacman_sync_search_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman sync-search"
+
+  case_dir="$work/pacman-sync-search"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "sidepkg"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "$pacman_mkpkg"'
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      for p in sidepkg "$pkg"; do
+        pacman -Q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      mkdir -p /srv/side
+      mkpkg sidepkg 1-1 "" /srv/side
+      (cd /srv/side && repo-add -q side.db.tar.gz sidepkg-1-1-any.pkg.tar >/dev/null 2>&1)
+      printf "[side]\nSigLevel = Never\nUsage = Sync Search\nServer = file:///srv/side\n" >> /etc/pacman.conf
+      pacman -Sy --noconfirm >/dev/null 2>&1
+      echo "--- premise ---"
+      echo "listed=$(pacman -Sl side | grep -c " sidepkg " || true)"
+      rc=0; pacman -S --print --print-format "%n" -- sidepkg >/dev/null 2>&1 || rc=$?
+      echo "print-exit=$rc"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no database could answer" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^listed=1" "$out" && grep -q "^print-exit=1" "$out"; then
+    ok "$backend ($image): pacman lists the name and still resolves it to nothing"
+  else
+    no "$backend ($image): the premise does not hold on this pacman" "$(grep -E '^listed=|^print-exit=' "$out")"
+  fi
+
+  if grep -q 'mox: pacman: row "sidepkg" names a package pacman lists and still will not install (error: target not found: sidepkg), which is a repository whose Usage in pacman.conf leaves out Install' "$out"; then
+    ok "$backend ($image): the row is refused, naming the repository setting that answers for it"
+  else
+    no "$backend ($image): the listed-but-uninstallable name was not refused" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed; one bad row kept nothing off the machine"
+  else
+    no "$backend ($image): the good row did not install" "$(grep -E '^installed=|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
 # A repository that is configured, synced and EMPTY contributes no line to
-# `pacman -Sl`, which is the same stdout a missing database gives -- so it can
-# never read as complete, and a completeness check on every apply would sync on
-# every apply. A row the listing already carries has no question for the
-# database, so nothing is asked of it and nothing is synced ahead of the
-# install's own refresh.
+# `pacman -Sl`, which is the same stdout a missing database gives. Nothing may
+# read that as a database still to be repaired: the row beside it installs
+# and the apply exits 0.
 run_pacman_empty_repo_case() {
   image="$1"
   pkg="$2"
@@ -1750,6 +2062,94 @@ EOF
   fi
 }
 
+# A LOCKED package makes `zypper install` install none of the batch it is
+# in: zypper exits 4 asking to choose a solution, on every apply, and the row
+# beside it never lands. The lock is the user's decision, so the row is
+# refused with `zypper removelock` named and the lock left as it was; and
+# the read-back that found nothing landed leaves the summary nothing to
+# hedge about.
+run_zypper_lock_case() {
+  image="$1"
+  pkg="$2"
+  backend="zypper lock"
+
+  case_dir="$work/zypper-lock"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF
+backend = "zypper"
+
+[[packages]]
+name = "ripgrep"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      for p in ripgrep "$pkg"; do
+        rpm -q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      zypper addlock ripgrep >/dev/null
+      echo "--- premise ---"
+      zypper --non-interactive refresh >/dev/null 2>&1 || true
+      echo "locked-rows=$(zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep | grep -c "^ *l *|" || true)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "landed-ripgrep=$(rpm -q ripgrep >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "landed-pkg=$(rpm -q "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "lock-kept=$(zypper ll | grep -c ripgrep || true)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^locked-rows=1" "$out"; then
+    ok "$backend ($image): the search table reads the lock in its status column"
+  else
+    no "$backend ($image): the premise does not hold on this zypper" "$(grep -E '^locked-rows=' "$out")"
+  fi
+
+  if grep -q 'mox: zypper: row "ripgrep" names a package zypper has locked, and an install carrying a locked package installs nothing at all, so it was not installed; `zypper removelock ripgrep` to let mox install it' "$out"; then
+    ok "$backend ($image): the locked row is refused, naming the lock to lift"
+  else
+    no "$backend ($image): the locked row was not refused" "$(tail -5 "$out")"
+  fi
+
+  if grep -q "^landed-pkg=1" "$out" && grep -q "^landed-ripgrep=0" "$out" && grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed; the locked one did not"
+  else
+    no "$backend ($image): the good row did not install, or the locked one did" "$(grep -E '^landed-|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "^lock-kept=1" "$out"; then
+    ok "$backend ($image): the lock survives; it is the user's decision"
+  else
+    no "$backend ($image): the lock was lifted" "$(grep -E '^lock-kept=' "$out")"
+  fi
+
+  if grep -q "may have landed" "$out"; then
+    no "$backend ($image): the summary hedges about rows the read-back found absent" "$(grep 'Packages:' "$out")"
+  else
+    ok "$backend ($image): nothing is hedged about; the read-back said what landed"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
 # The name check under a locale zypper translates. `zypper search` types each
 # row in the user's language: with its translations installed (a desktop
 # install ships them; the container image strips them, so they are put back
@@ -1819,6 +2219,74 @@ EOF2
     ok "$backend ($image): the name zypper has nothing for is still refused under ja_JP.UTF-8"
   else
     no "$backend ($image): the unknown name was not refused under ja_JP.UTF-8" "$(grep -E '^mox: zypper|^apply-exit=' "$out" | tail -3)"
+  fi
+}
+
+# The name check under a zypper.conf that colours every pipe. With
+# `useColors = always` under `[color]`, `zypper search` wraps every cell of
+# its table in SGR sequences even into a pipe, `NO_COLOR=1` does not undo
+# it, and a parser reading the bare word `package` matches nothing: every
+# row is refused and nothing ever installs. mox asks for the plain table
+# with `--no-color`, and this holds it to that.
+run_zypper_color_case() {
+  image="$1"
+  pkg="$2"
+  backend="zypper color"
+
+  case_dir="$work/zypper-color"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF2
+backend = "zypper"
+
+[[packages]]
+name = "$pkg"
+
+[[packages]]
+name = "mox-no-such-package"
+EOF2
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      rpm -q $pkg >/dev/null 2>&1 && { echo 'the image ships $pkg; the case cannot run'; exit 1; }
+      printf '\n[color]\nuseColors = always\n' >> /etc/zypp/zypper.conf
+      # The harm, measured on the raw query: the row is there, wrapped in
+      # escape sequences, and the bare type is not.
+      NO_COLOR=1 zypper --non-interactive --quiet search --match-exact --type package -- $pkg >/tmp/search.txt 2>&1 || true
+      echo \"search-row=\$(grep -c \"$pkg\" /tmp/search.txt || true)\"
+      echo \"search-colored=\$(grep -c \"\$(printf '\033')\\[\" /tmp/search.txt || true)\"
+      echo \"search-type-plain=\$(grep -c '| package' /tmp/search.txt || true)\"
+      echo '--- apply ---'
+      rc=0
+      /w/mox apply || rc=\$?
+      echo \"apply-exit=\$rc\"
+      echo \"installed=\$(rpm -q $pkg >/dev/null 2>&1 && echo 1 || echo 0)\"
+    " >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^search-row=1" "$out" && ! grep -q "^search-colored=0" "$out" && grep -q "^search-type-plain=0" "$out"; then
+    ok "$backend ($image): zypper search colours its table into a pipe under useColors = always, NO_COLOR or not"
+  else
+    no "$backend ($image): the premise does not hold on this zypper" "$(grep -E '^search-' "$out")"
+  fi
+
+  if grep -q "^installed=1" "$out" && ! grep -q "row \"$pkg\" names no zypper package" "$out"; then
+    ok "$backend ($image): a real package installs under useColors = always"
+  else
+    no "$backend ($image): the real package was refused under useColors = always" "$(grep -E '^mox: zypper|^installed=' "$out" | tail -3)"
+  fi
+
+  if grep -q 'mox: zypper: row "mox-no-such-package" names no zypper package in this machine.s repositories' "$out" && ! grep -q "apply-exit=0" "$out"; then
+    ok "$backend ($image): the name zypper has nothing for is still refused under useColors = always"
+  else
+    no "$backend ($image): the unknown name was not refused under useColors = always" "$(grep -E '^mox: zypper|^apply-exit=' "$out" | tail -3)"
   fi
 }
 
@@ -2244,7 +2712,7 @@ EOF
 }
 
 # The dependency round trip on a pacman that cannot sync: the container has
-# no network, so the full `-Syu` the install-time check runs fails. Marking
+# no network, so the sync of mox's own database copy the check runs fails. Marking
 # needs only `pacman -Qdq` and `pacman -D --asexplicit`, both local, so the
 # row the machine has converges; the row beside it, which needs the sync,
 # is the one that fails. Proved before the fix with mox on an Arch machine
@@ -2338,6 +2806,448 @@ EOF
   fi
 }
 
+# A package INSTALLED and locked with an update pending: `zypper install`
+# asks whether to lift the lock or skip the update, exits 4, and installs
+# none of the batch -- while one installed and locked at its newest lets the
+# batch land. The search table reads `il` for both; only `zypper
+# list-updates --all` tells them apart. The image's own pending updates
+# supply the package; a lock on one with none pending (bash) must not be
+# refused.
+run_zypper_installed_lock_case() {
+  image="$1"
+  pkg="$2"
+  backend="zypper installed-lock"
+
+  case_dir="$work/zypper-installed-lock"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      rpm -q "$pkg" >/dev/null 2>&1 && { echo "the image ships $pkg; the case cannot run"; exit 1; }
+      zypper --non-interactive refresh >/dev/null 2>&1 || true
+      LC_ALL=C zypper --non-interactive --quiet --no-color list-updates --all > /tmp/lu.txt 2>/dev/null || true
+      # The image ships no awk: the third row of the table, third column.
+      name=$(sed -n 3p /tmp/lu.txt | cut -d "|" -f 3 | tr -d " ")
+      [ -n "$name" ] || { echo "pending=none"; exit 0; }
+      grep -q "| bash " /tmp/lu.txt && { echo "bash has an update pending here; the case cannot run"; exit 1; }
+      printf "backend = \"zypper\"\n\n[[packages]]\nname = \"%s\"\n\n[[packages]]\nname = \"bash\"\n\n[[packages]]\nname = \"%s\"\n" "$name" "$pkg" > /w/repo/data/packages/zypper.toml
+      zypper addlock "$name" >/dev/null
+      zypper addlock bash >/dev/null
+      echo "--- premise ---"
+      echo "pending=$name"
+      echo "status-rows=$(LC_ALL=C zypper --non-interactive --quiet --no-color search --match-exact --type package -- "$name" bash | grep -c "^il *|" || true)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "landed-pkg=$(rpm -q "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "locks-kept=$(zypper ll | grep -c "$name\|bash" || true)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^pending=none" "$out"; then
+    skip "$backend ($image): this image has no package with an update pending, so no lock could stop a batch" "$(tail -2 "$out")"
+    return
+  fi
+  name="$(sed -n 's/^pending=//p' "$out")"
+
+  if grep -q "^status-rows=2" "$out"; then
+    ok "$backend ($image): both rows read il in the search table; the table cannot tell them apart"
+  else
+    no "$backend ($image): the premise does not hold on this zypper" "$(grep -E '^status-rows=' "$out")"
+  fi
+
+  if grep -q "mox: zypper: row \"$name\" names a package zypper has installed and locked with an update pending (" "$out" && grep -q " available), and an install carrying it asks which to keep and installs nothing at all, so it was not installed; \`zypper removelock $name\` to let mox install it" "$out"; then
+    ok "$backend ($image): the locked row with an update pending is refused, naming both versions"
+  else
+    no "$backend ($image): the locked row with an update pending was not refused" "$(grep '^mox: zypper' "$out" | tail -3)"
+  fi
+
+  if grep -q 'row "bash" names a package zypper has installed and locked' "$out"; then
+    no "$backend ($image): the locked row with no update pending was refused, though it stops nothing" "$(grep 'row "bash"' "$out")"
+  else
+    ok "$backend ($image): the locked row with no update pending goes with the batch"
+  fi
+
+  if grep -q "^landed-pkg=1" "$out" && grep -q "Packages: 2 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the batch beside the refused row landed"
+  else
+    no "$backend ($image): the batch did not land" "$(grep -E '^landed-|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "^locks-kept=2" "$out"; then
+    ok "$backend ($image): both locks survive; they are the user's decision"
+  else
+    no "$backend ($image): a lock was lifted" "$(grep -E '^locks-kept=' "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# A package whose dependency no repository satisfies: `pacman -S --print`
+# exits 1 exactly as for a name pacman has nothing for, and only its stderr
+# (`could not satisfy dependencies`) and stdout (`:: unable to satisfy
+# dependency`) say which. Read by the exit code alone, the refusal told the
+# user their repository's Usage in pacman.conf was wrong, quoting a "target
+# not found" pacman never printed.
+run_pacman_unsatisfiable_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman unsatisfiable"
+
+  case_dir="$work/pacman-unsatisfiable"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "needy"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "$pacman_mkpkg"'
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      for p in needy "$pkg"; do
+        pacman -Q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      mkdir -p /srv/repo
+      mkpkg needy 1-1 mox-no-such-dep /srv/repo
+      (cd /srv/repo && repo-add -q moxtest.db.tar.gz needy-1-1-any.pkg.tar >/dev/null 2>&1)
+      printf "[moxtest]\nSigLevel = Never\nServer = file:///srv/repo\n" >> /etc/pacman.conf
+      pacman -Sy --noconfirm >/dev/null 2>&1
+      echo "--- premise ---"
+      rc=0; pacman -S --print --print-format "%n" -- needy >/tmp/print-out.txt 2>/tmp/print-err.txt || rc=$?
+      echo "print-exit=$rc"
+      echo "print-stderr=$(cat /tmp/print-err.txt)"
+      echo "print-stdout=$(cat /tmp/print-out.txt)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no repository could be built" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^print-exit=1" "$out" && grep -q "^print-stderr=error: failed to prepare transaction (could not satisfy dependencies)" "$out" && grep -q "^print-stdout=:: unable to satisfy dependency 'mox-no-such-dep' required by needy" "$out"; then
+    ok "$backend ($image): pacman exits 1 with the cause on stderr and the dependency on stdout"
+  else
+    no "$backend ($image): the premise does not hold on this pacman" "$(grep -E '^print-' "$out")"
+  fi
+
+  if grep -q "mox: pacman: row \"needy\" names a package pacman cannot install here, a dependency of it being satisfied by nothing in this machine's repositories (unable to satisfy dependency 'mox-no-such-dep' required by needy), so it was not installed; add the repository that carries it, or drop the row" "$out"; then
+    ok "$backend ($image): the row is refused in pacman's own words, naming the dependency"
+  else
+    no "$backend ($image): the row was not refused for its dependency" "$(grep '^mox: pacman' "$out" | tail -3)"
+  fi
+
+  if grep -q "Usage in pacman.conf\|target not found" "$out"; then
+    no "$backend ($image): the refusal blamed a repository setting, or quoted words pacman never printed" "$(grep 'Usage\|target not found' "$out")"
+  else
+    ok "$backend ($image): nothing pacman did not say is quoted, and no repository setting is blamed"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed; one bad row kept nothing off the machine"
+  else
+    no "$backend ($image): the good row did not install" "$(grep -E '^installed=|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# A row that CONFLICTS with an installed package, in either direction:
+# `pacman -S --print` prints the transaction and exits 0, the install asks
+# "Remove <installed>? [y/N]" and `--noconfirm` answers no, so the batch
+# fails as one and nothing beside the row lands, on every apply. mox never
+# removes a package, so the row goes rather than the batch. `newcomer`
+# declares the conflict with the installed `holder`; the installed `guard`
+# declares one with `rowb`, which declares nothing back.
+run_pacman_conflict_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman conflict"
+
+  case_dir="$work/pacman-conflict"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "newcomer"
+
+[[packages]]
+name = "rowb"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "$pacman_mkpkg"'
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      for p in holder guard newcomer rowb "$pkg"; do
+        pacman -Q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
+      done
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      mkdir -p /srv/repo
+      mkpkg holder 1-1 "" /srv/repo
+      mkpkg guard 1-1 "" /srv/repo rowb
+      mkpkg newcomer 1-1 "" /srv/repo holder
+      mkpkg rowb 1-1 "" /srv/repo
+      (cd /srv/repo && repo-add -q moxtest.db.tar.gz holder-1-1-any.pkg.tar guard-1-1-any.pkg.tar newcomer-1-1-any.pkg.tar rowb-1-1-any.pkg.tar >/dev/null 2>&1)
+      printf "[moxtest]\nSigLevel = Never\nServer = file:///srv/repo\n" >> /etc/pacman.conf
+      pacman -Sy --noconfirm >/dev/null 2>&1
+      pacman -S --noconfirm holder guard >/dev/null 2>&1
+      echo "--- premise ---"
+      rc=0; pacman -S --print --print-format "%n" --noconfirm -- newcomer rowb "$pkg" >/tmp/print.txt 2>&1 || rc=$?
+      echo "print-exit=$rc"
+      echo "print-rows=$(grep -c "^newcomer$\|^rowb$" /tmp/print.txt || true)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+      echo "installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "kept=$(pacman -Qq holder guard 2>/dev/null | grep -c . || true)"
+      echo "collateral=$(pacman -Qq newcomer rowb 2>/dev/null | grep -c . || true)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no repository could be built" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^print-exit=0" "$out" && grep -q "^print-rows=2" "$out"; then
+    ok "$backend ($image): --print prints both conflicting rows and exits 0, so it cannot be the check"
+  else
+    no "$backend ($image): the premise does not hold on this pacman" "$(grep -E '^print-' "$out")"
+  fi
+
+  if grep -q 'mox: pacman: row "newcomer" names a package that conflicts with "holder", which this machine has installed; pacman would have to remove holder to install it, and mox never removes a package, so the row was not installed: remove holder yourself, or drop the row' "$out"; then
+    ok "$backend ($image): the row declaring the conflict is refused, naming the installed package"
+  else
+    no "$backend ($image): the row declaring the conflict was not refused" "$(grep 'row "newcomer"' "$out" | tail -2)"
+  fi
+
+  if grep -q 'mox: pacman: row "rowb" names a package that "guard", which this machine has installed, declares a conflict with ("rowb"); pacman would have to remove guard to install it, and mox never removes a package, so the row was not installed: remove guard yourself, or drop the row' "$out"; then
+    ok "$backend ($image): the row an installed package declares a conflict with is refused, naming it"
+  else
+    no "$backend ($image): the row an installed package conflicts with was not refused" "$(grep 'row "rowb"' "$out" | tail -2)"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 2 failed" "$out"; then
+    ok "$backend ($image): the row beside them installed; two bad rows kept nothing off the machine"
+  else
+    no "$backend ($image): the good row did not install" "$(grep -E '^installed=|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "^kept=2" "$out" && grep -q "^collateral=0" "$out"; then
+    ok "$backend ($image): nothing was removed and neither conflicting row landed"
+  else
+    no "$backend ($image): the machine was changed beyond the good row" "$(grep -E '^kept=|^collateral=' "$out")"
+  fi
+
+  if grep -q "apply-exit=0" "$out"; then
+    no "$backend ($image): a refused install exited 0" "$(grep 'apply-exit=' "$out")"
+  else
+    ok "$backend ($image): a refused install is counted in the exit code"
+  fi
+}
+
+# The database copy under a caller's umask of 077: `mkdir -p` made
+# `/var/cache/mox` and the copy 700, pacman's download user could not
+# traverse them, the sync failed with "Permission denied", and a later
+# apply under 022 failed the same way, since `mkdir -p` repairs nothing
+# that exists. Both halves: a fresh copy made under 077 must sync, and a
+# 700 tree left by an earlier run must be repaired.
+run_pacman_umask_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman umask"
+
+  case_dir="$work/pacman-umask"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      pacman -Q "$pkg" >/dev/null 2>&1 && { echo "the image ships $pkg; the case cannot run"; exit 1; }
+      [ -e /var/cache/mox ] && { echo "the image ships /var/cache/mox; the case cannot run"; exit 1; }
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      echo "--- fresh under 077 ---"
+      rc=0
+      (umask 077 && /w/mox apply) || rc=$?
+      echo "fresh-exit=$rc"
+      echo "fresh-modes=$(stat -c %a /var/cache/mox /var/cache/mox/pacman-db | tr "\n" " ")"
+      echo "fresh-installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "--- repair of a 700 tree ---"
+      pacman -Rns --noconfirm "$pkg" >/dev/null 2>&1 || true
+      rm -rf /var/cache/mox /w/state
+      mkdir -p /w/state
+      (umask 077 && mkdir -p /var/cache/mox/pacman-db)
+      echo "before-modes=$(stat -c %a /var/cache/mox /var/cache/mox/pacman-db | tr "\n" " ")"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "repair-exit=$rc"
+      echo "repair-modes=$(stat -c %a /var/cache/mox /var/cache/mox/pacman-db | tr "\n" " ")"
+      echo "repair-installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no copy could be made" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^fresh-exit=0" "$out" && grep -q "^fresh-installed=1" "$out" && grep -q "^fresh-modes=755 755 " "$out"; then
+    ok "$backend ($image): a copy made under umask 077 is 755 on both levels, and the row installed through it"
+  else
+    no "$backend ($image): the copy made under umask 077 did not serve the install" "$(grep -E '^fresh-|Permission denied|^mox' "$out" | tail -4)"
+  fi
+
+  if grep -q "^before-modes=700 700 " "$out"; then
+    ok "$backend ($image): the premise holds: a 700 tree stood where the copy goes"
+  else
+    no "$backend ($image): the premise does not hold" "$(grep -E '^before-modes=' "$out")"
+  fi
+
+  if grep -q "^repair-exit=0" "$out" && grep -q "^repair-installed=1" "$out" && grep -q "^repair-modes=755 755 " "$out"; then
+    ok "$backend ($image): a 700 tree is repaired to 755, and the row installed through it"
+  else
+    no "$backend ($image): the 700 tree was not repaired" "$(grep -E '^repair-|Permission denied|^mox' "$out" | tail -4)"
+  fi
+}
+
+# A stale `db.lck` in the copy, which a pacman killed outright mid-sync
+# leaves behind: pacman says only "unable to lock database" for a sync, and
+# the apply named nothing but an error. It must name the file.
+run_pacman_stale_lock_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman stale-lock"
+
+  case_dir="$work/pacman-stale-lock"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      pacman -Q "$pkg" >/dev/null 2>&1 && { echo "the image ships $pkg; the case cannot run"; exit 1; }
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db
+      ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local
+      # What SIGKILL leaves: measured, pacman removes the lock on an
+      # interrupt and not on a kill.
+      pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null >/dev/null 2>&1 &
+      sleep 0.3
+      kill -KILL $! 2>/dev/null || true
+      wait $! 2>/dev/null || true
+      [ -e /var/cache/mox/pacman-db/db.lck ] || touch /var/cache/mox/pacman-db/db.lck
+      echo "--- premise ---"
+      rc=0; pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null >/tmp/sy2.txt 2>&1 || rc=$?
+      echo "sync-exit=$rc"
+      echo "sync-said=$(grep -c "unable to lock database" /tmp/sy2.txt || true)"
+      echo "--- apply ---"
+      rc=0
+      /w/mox apply || rc=$?
+      echo "apply-exit=$rc"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no lock could be left" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^sync-exit=1" "$out" && grep -q "^sync-said=1" "$out"; then
+    ok "$backend ($image): a stale lock fails the sync with nothing naming the file"
+  else
+    no "$backend ($image): the premise does not hold on this pacman" "$(grep -E '^sync-' "$out")"
+  fi
+
+  if grep -q "mox: pacman: the sync of mox's database copy failed and /var/cache/mox/pacman-db/db.lck exists, which a pacman killed outright mid-sync leaves behind; only this sync ever takes that lock, so once no pacman is running it may be removed, as root" "$out"; then
+    ok "$backend ($image): the apply names the lock file and says it may be removed"
+  else
+    no "$backend ($image): the apply did not name the lock file" "$(grep '^mox' "$out" | tail -3)"
+  fi
+
+  if grep -q "install did not run: the index or database refresh the install resolves against did not complete, so nothing was installed" "$out" && ! grep -q "apply-exit=0" "$out"; then
+    ok "$backend ($image): the failure is worded, and counted in the exit code"
+  else
+    no "$backend ($image): the failure is a bare error name, or exited 0" "$(grep -E 'install did not run|apply-exit=' "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -2393,6 +3303,9 @@ else
   run_zypper_provide_name_case opensuse/leap:15.6
   run_zypper_unknown_name_case opensuse/tumbleweed ripgrep
   run_zypper_locale_case opensuse/tumbleweed ripgrep
+  run_zypper_color_case opensuse/tumbleweed ripgrep
+  run_zypper_lock_case opensuse/tumbleweed bat
+  run_zypper_installed_lock_case opensuse/tumbleweed ripgrep
   # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
@@ -2400,9 +3313,16 @@ else
   run_pacman_partial_db_case archlinux:latest
   run_pacman_stale_case archlinux:latest
   run_pacman_provision_case archlinux:latest
+  run_pacman_unknown_name_case archlinux:latest cowsay
   run_pacman_empty_repo_case archlinux:latest ripgrep
+  run_pacman_upgrade_dependency_case archlinux:latest
+  run_pacman_sync_search_case archlinux:latest bat
   run_dependency_case archlinux:latest pacman
   run_pacman_no_sync_case archlinux:latest
+  run_pacman_unsatisfiable_case archlinux:latest cowsay
+  run_pacman_conflict_case archlinux:latest cowsay
+  run_pacman_umask_case archlinux:latest cowsay
+  run_pacman_stale_lock_case archlinux:latest cowsay
   run_case debian:stable brew hello
 fi
 
