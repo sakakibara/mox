@@ -230,17 +230,30 @@ pub const Distro = struct {
         return row.name;
     }
 
+    /// apt's answer is intersected with what dpkg has installed AND
+    /// configured: `apt-mark showmanual` lists a package an interrupted run
+    /// left `install ok unpacked`, which is on the disk and not set up, and
+    /// a row reading clean over it would never be finished. Measured on apt
+    /// 2.6.1 and 3.0.3 with `sl` unpacked by `dpkg --unpack` over its
+    /// installed self: `apt-mark showmanual` prints `sl`, `dpkg-query`
+    /// answers `sl arm64 install ok unpacked`, and `apt-get install -y --
+    /// sl` exits 0 printing `Setting up sl`, after which dpkg calls it
+    /// `installed`. So the row reads missing, and the install configures it.
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Distro = @ptrCast(@alignCast(ctx));
         const res = try self.runner.run(arena, self.manager.queryArgv());
         try exec.checkTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
+        const machine: ?AptMachine = if (self.manager == .apt) try self.aptMachine(arena) else null;
 
         var out: std.ArrayList([]const u8) = .empty;
         var it = std.mem.splitScalar(u8, res.stdout, '\n');
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0) continue;
+            if (machine) |m| {
+                if (!m.hasConfigured(line)) continue;
+            }
             try out.append(arena, line);
         }
         return out.toOwnedSlice(arena);
@@ -277,7 +290,8 @@ pub const Distro = struct {
 
         const elevate = self.elevates();
 
-        const present = try self.installedAlready(arena, rows);
+        const machine: ?AptMachine = if (self.manager == .apt) try self.aptMachine(arena) else null;
+        const present = try self.installedAlready(arena, rows, machine);
         var to_mark: std.ArrayList(Row) = .empty;
         var to_resolve: std.ArrayList(Row) = .empty;
         for (rows) |row| {
@@ -302,7 +316,7 @@ pub const Distro = struct {
             if (!up.ok) return Error.DistroRefreshFailed;
         }
         const to_install = switch (self.manager) {
-            .apt => try self.refuseAptUninstallable(arena, try self.refuseAptNonNames(arena, to_resolve.items)),
+            .apt => try self.refuseAptUninstallable(arena, try self.refuseAptNonNames(arena, to_resolve.items, machine.?)),
             .dnf => try self.refuseDnfNonPackages(arena, to_resolve.items),
             .pacman => try self.refusePacmanNonPackages(arena, to_resolve.items, elevate),
         };
@@ -320,9 +334,15 @@ pub const Distro = struct {
         // row reads MISSING on every status after, while `-Syu --needed --
         // foo` leaves it "Explicitly installed", being a target of the
         // transaction that installs it.
+        //
+        // dnf carries `--setopt=assumeno=0` because a dnf.conf `assumeno=True`
+        // outranks `-y`: measured on dnf 4.14.0, dnf5 5.2.18 and 5.4.3, `dnf
+        // install -y` under it exits 1 with "Operation aborted." (dnf4) or
+        // "Operation aborted by the user." (dnf5) having installed nothing,
+        // and with the option each installs.
         const head: []const []const u8 = switch (self.manager) {
             .apt => &.{ "apt-get", "install", "-y" },
-            .dnf => &.{ "dnf", "install", "-y" },
+            .dnf => &.{ "dnf", "install", "-y", "--setopt=assumeno=0" },
             .pacman => &.{ "pacman", "-Syu", "--needed", "--noconfirm" },
         };
         try argv.appendSlice(arena, head);
@@ -369,7 +389,13 @@ pub const Distro = struct {
     /// local read of a few hundred names; dnf is asked about the row names
     /// alone, because its query reaches for repository metadata and the rows
     /// are the only names any of this has a question about.
-    fn installedAlready(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!std.StringHashMap(void) {
+    ///
+    /// apt's set is intersected with what dpkg has configured, as the
+    /// explicit query's is: a package left `install ok unpacked` is one
+    /// `apt-mark manual` leaves unpacked (measured on apt 2.6.1 and 3.0.3),
+    /// while `apt-get install -y -- <name>` on it prints "already the newest
+    /// version", sets it manual and configures it.
+    fn installedAlready(self: *Distro, arena: std.mem.Allocator, rows: []const Row, machine: ?AptMachine) anyerror!std.StringHashMap(void) {
         var set: std.StringHashMap(void) = .init(arena);
         var argv: std.ArrayList([]const u8) = .empty;
         switch (self.manager) {
@@ -401,6 +427,9 @@ pub const Distro = struct {
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0) continue;
+            if (machine) |m| {
+                if (!m.hasConfigured(line)) continue;
+            }
             try set.put(line, {});
         }
         return set;
@@ -460,9 +489,9 @@ pub const Distro = struct {
                     },
                 };
                 break :blk if (five)
-                    &[_][]const u8{ "dnf", "mark", "user", "-y" }
+                    &[_][]const u8{ "dnf", "mark", "user", "-y", "--setopt=assumeno=0" }
                 else
-                    &[_][]const u8{ "dnf", "mark", "install" };
+                    &[_][]const u8{ "dnf", "mark", "install", "--setopt=assumeno=0" };
             },
         };
 
@@ -496,7 +525,11 @@ pub const Distro = struct {
     /// `dnf5 version <version>`.
     ///
     /// dnf5 prompts for a mark and aborts unanswered, so it carries the same
-    /// `-y` the install does; dnf4's mark asks nothing.
+    /// `-y` the install does, and the same `--setopt=assumeno=0`: under a
+    /// dnf.conf `assumeno=True`, `dnf mark user -y` exits 1 with "Operation
+    /// aborted by the user." and marks nothing (measured on 5.2.18 and
+    /// 5.4.3), and with the option it marks. dnf4's mark asks nothing and
+    /// takes the option all the same (measured on 4.14.0).
     fn dnfIsFive(self: *Distro, arena: std.mem.Allocator) anyerror!bool {
         const res = try self.runner.run(arena, &.{ "dnf", "--version" });
         try exec.checkCaptureTimedOut(res);
@@ -551,6 +584,12 @@ pub const Distro = struct {
     ///   non-empty -- 78 lines on trixie, 88 on bookworm -- on a machine with
     ///   no repositories at all, where the emptiness IS the signal.
     ///
+    /// - `APT::Cache::AllNames=false` keeps virtual names out whatever
+    ///   apt.conf says. With `APT::Cache::AllNames "true"` configured the
+    ///   listing prints `awk` (119883 lines against 62840 on bookworm), a
+    ///   name `apt-cache policy` answers `Candidate: (none)` for, so the row
+    ///   would be refused as pinned instead of told what provides it.
+    ///
     /// So this answers what the REPOSITORIES carry natively, and nothing
     /// about what is already on the machine. A package installed from a .deb
     /// is in no repository, so it is absent here and its row is judged
@@ -566,6 +605,8 @@ pub const Distro = struct {
             try std.fmt.allocPrint(arena, "APT::Architectures={s}", .{native}),
             "-o",
             "Dir::State::status=/dev/null",
+            "-o",
+            "APT::Cache::AllNames=false",
             "--generate",
             "pkgnames",
         });
@@ -603,13 +644,24 @@ pub const Distro = struct {
     /// `apt-mark showmanual` reports it and the row converges. So the
     /// installed architectures answer for it where the repository listing
     /// cannot.
-    fn refuseAptNonNames(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
+    ///
+    /// A qualified row naming an architecture dpkg has not enabled is kept
+    /// only when dpkg has the package installed under it (`dpkg -i
+    /// --force-architecture` leaves one there, and `apt-get install` on it
+    /// exits 0 and marks it manual, measured on apt 2.6.1 and 3.0.3). A
+    /// repository can still carry the name -- a flat one holds every
+    /// architecture in a single index, and apt 3.0.3 lists such a package
+    /// with a candidate -- but the install then fails at dpkg with "package
+    /// architecture (i386) does not match system (arm64)", taking the batch
+    /// with it.
+    fn refuseAptNonNames(self: *Distro, arena: std.mem.Allocator, rows: []const Row, machine: AptMachine) anyerror![]const Row {
         // The listing is made only if a row needs it: it costs a megabyte and
         // a rebuild of apt's cache, and a batch of qualified rows alone never
         // reads it.
         var known: ?std.StringHashMap(void) = null;
-        var installed: ?Arches = null;
-        const native = try self.aptNativeArch(arena);
+        var foreign: ?std.StringHashMap(void) = null;
+        const native = machine.native;
+        const installed = machine.installed;
 
         var keep: std.ArrayList(Row) = .empty;
         for (rows) |row| {
@@ -632,12 +684,19 @@ pub const Distro = struct {
                     );
                     continue;
                 }
-                if ((try self.aptArchesOf(arena, row.name)).len > 0) {
+                if (hasArch(installed, bare, arch)) {
                     try keep.append(arena, row);
                     continue;
                 }
-                if (installed == null) installed = try self.aptInstalledArches(arena);
-                if (hasArch(installed.?, bare, arch)) {
+                if (foreign == null) foreign = try self.aptForeignArches(arena);
+                if (!foreign.?.contains(arch)) {
+                    self.say(
+                        "mox: apt: row \"{s}\" qualifies the architecture \"{s}\", which this machine's dpkg has not enabled and has no package installed under, so it was not installed; `dpkg --add-architecture {s}` to let mox install it\n",
+                        .{ row.name, arch, arch },
+                    );
+                    continue;
+                }
+                if ((try self.aptArchesOf(arena, row.name, native)).len > 0) {
                     try keep.append(arena, row);
                     continue;
                 }
@@ -655,19 +714,18 @@ pub const Distro = struct {
                 try keep.append(arena, row);
                 continue;
             }
-            if (installed == null) installed = try self.aptInstalledArches(arena);
             // A package installed under the architecture apt-mark reports
             // bare -- this machine's own, or `all` -- is installed under the
             // row's own spelling, and apt-get marks it manual rather than
             // reaching for a regex.
-            if (hasArch(installed.?, bare, native) or hasArch(installed.?, bare, "all")) {
+            if (hasArch(installed, bare, native) or hasArch(installed, bare, "all")) {
                 try keep.append(arena, row);
                 continue;
             }
             // Only a foreign architecture can be suggested: a native one is
             // what the listing already answered for, and spelling it would
             // send the user to a row apt-mark reports bare.
-            if (try self.aptForeignArchOf(arena, row.name, native, installed.?)) |arch| {
+            if (try self.aptForeignArchOf(arena, row.name, native, installed)) |arch| {
                 self.say(
                     "mox: apt: row \"{s}\" names an apt package for the architecture \"{s}\" alone, which apt-mark reports as \"{s}:{s}\", so the row could never read as installed; declare \"{s}:{s}\" instead\n",
                     .{ row.name, arch, row.name, arch, row.name, arch },
@@ -715,10 +773,18 @@ pub const Distro = struct {
     /// `Architecture: all`, which madison reports once per enabled
     /// architecture rather than as `all`.
     ///
+    /// A flat repository (`deb [trusted=yes] file:/repo ./`) has one index
+    /// for every architecture, and its line is `<name> | <version> | <url>
+    /// ./ Packages` -- the word before the last is the suite, which ends in
+    /// `/`, and the architecture is in the name column instead: measured on
+    /// apt 2.6.1 and 3.0.3, `mox-flat-armhf:armhf |        1.0 | file:/repo
+    /// ./ Packages` for an armhf package and `mox-flat-native |        1.0 |
+    /// file:/repo ./ Packages` for a native one.
+    ///
     /// Only a line naming a binary index counts: with `deb-src` configured
     /// madison prints a `Sources` line too, and a source package is nothing
     /// `apt-get install` can put on the machine.
-    fn aptArchesOf(self: *Distro, arena: std.mem.Allocator, name: []const u8) anyerror![]const []const u8 {
+    fn aptArchesOf(self: *Distro, arena: std.mem.Allocator, name: []const u8, native: []const u8) anyerror![]const []const u8 {
         const res = try self.runner.run(arena, &.{ "apt-cache", "madison", name });
         try exec.checkCaptureTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
@@ -730,8 +796,13 @@ pub const Distro = struct {
             if (!std.mem.endsWith(u8, line, " Packages")) continue;
             const head = line[0 .. line.len - " Packages".len];
             const space = std.mem.lastIndexOfScalar(u8, head, ' ') orelse continue;
-            const arch = head[space + 1 ..];
+            var arch = head[space + 1 ..];
             if (arch.len == 0) continue;
+            if (std.mem.endsWith(u8, arch, "/")) {
+                const bar = std.mem.indexOfScalar(u8, line, '|') orelse continue;
+                const spelled = std.mem.trim(u8, line[0..bar], " \t");
+                arch = backend_mod.archOf(spelled) orelse native;
+            }
             for (out.items) |seen| {
                 if (std.mem.eql(u8, seen, arch)) break;
             } else try out.append(arena, arch);
@@ -847,13 +918,39 @@ pub const Distro = struct {
     /// hold the user put there, and a pin is the same decision written in
     /// apt's preferences. The row is refused and the machine left as its
     /// owner set it up.
+    ///
+    /// The same query settles what a bare row from a FLAT repository would
+    /// land, which the package listing cannot: a flat index carries every
+    /// architecture, so the native listing prints its foreign-only names bare
+    /// (measured on apt 2.6.1, 2.8.3 and 3.0.3 with armhf added and an index
+    /// from dpkg-scanpackages holding an armhf and an i386 package: both
+    /// listed). `apt-cache policy` heads the armhf package's stanza
+    /// `mox-flat-armhf:armhf:`, and `apt-get install -y -- mox-flat-armhf`
+    /// installs `mox-flat-armhf:armhf`, which apt-mark reports qualified --
+    /// so the row is refused with that spelling, as a foreign-only name
+    /// from any other index is. The i386 package, whose architecture dpkg
+    /// has not enabled, is refused too: apt 2.6.1 answers no stanza for it
+    /// and its install "Unable to locate package", apt 3.0.3 answers a
+    /// stanza headed `mox-flat-i386:i386:` and its install fails at dpkg
+    /// with "package architecture (i386) does not match system (arm64)" --
+    /// and either way the batch it is in installs nothing.
+    ///
+    /// No stanza at all says only that apt could not resolve the operand,
+    /// which is why the refusal for it names nothing narrower. Measured on
+    /// apt 2.6.1 and 3.0.3: `mox-no-such-package`, `sl:notanarch` and
+    /// `foo:bar:baz` each print zero bytes and exit 0, while the two
+    /// conditions a package can be in and still not install DO print a
+    /// stanza -- a purely virtual name heads `awk:` with `Candidate:
+    /// (none)`, and a package built for an architecture alone heads
+    /// `care:armhf:` -- and are refused on the branches below.
     fn refuseAptUninstallable(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
         if (rows.len == 0) return rows;
         const held = try self.aptHeld(arena);
-        const candidates = try self.aptCandidates(arena, rows);
+        const stanzas = try self.aptStanzas(arena, rows);
+        var foreign: ?std.StringHashMap(void) = null;
 
         var keep: std.ArrayList(Row) = .empty;
-        for (rows) |row| {
+        for (rows, stanzas) |row, answer| {
             if (held.contains(row.name)) {
                 self.say(
                     "mox: apt: row \"{s}\" names a package apt-mark holds, and an install carrying a held package installs nothing at all, so it was not installed; `apt-mark unhold {s}` to let mox install it\n",
@@ -861,14 +958,36 @@ pub const Distro = struct {
                 );
                 continue;
             }
-            if (candidates.get(row.name)) |has_candidate| {
-                if (!has_candidate) {
-                    self.say(
-                        "mox: apt: row \"{s}\" names a package apt has no installation candidate for, which a pin in apt's preferences does, and an install carrying it installs nothing at all, so it was not installed\n",
-                        .{row.name},
-                    );
+            const stanza = answer orelse {
+                self.say(
+                    "mox: apt: row \"{s}\" names a package apt-cache policy prints no stanza for, which is an operand apt cannot locate at all, and an install carrying one installs nothing at all, so it was not installed\n",
+                    .{row.name},
+                );
+                continue;
+            };
+            if (backend_mod.archOf(stanza.header)) |arch| {
+                if (backend_mod.archOf(row.name) == null) {
+                    if (foreign == null) foreign = try self.aptForeignArches(arena);
+                    if (foreign.?.contains(arch)) {
+                        self.say(
+                            "mox: apt: row \"{s}\" names an apt package for the architecture \"{s}\" alone, which apt-mark reports as \"{s}:{s}\", so the row could never read as installed; declare \"{s}:{s}\" instead\n",
+                            .{ row.name, arch, row.name, arch, row.name, arch },
+                        );
+                    } else {
+                        self.say(
+                            "mox: apt: row \"{s}\" names an apt package for the architecture \"{s}\" alone, which this machine's dpkg has not enabled, so an install carrying it fails at dpkg and installs nothing at all, and it was not installed; `dpkg --add-architecture {s}` and declare \"{s}:{s}\" to let mox install it\n",
+                            .{ row.name, arch, arch, row.name, arch },
+                        );
+                    }
                     continue;
                 }
+            }
+            if (!stanza.candidate) {
+                self.say(
+                    "mox: apt: row \"{s}\" names a package apt has no installation candidate for, which a pin in apt's preferences does, and an install carrying it installs nothing at all, so it was not installed\n",
+                    .{row.name},
+                );
+                continue;
             }
             try keep.append(arena, row);
         }
@@ -893,20 +1012,36 @@ pub const Distro = struct {
         return set;
     }
 
-    /// Whether apt has an installation candidate for each row, asked for the
-    /// whole batch at once.
+    /// What `apt-cache policy` says of one package: the name at the head of
+    /// its stanza, which is the name apt resolved the operand to, and
+    /// whether apt has a version to install.
+    const Stanza = struct {
+        header: []const u8,
+        candidate: bool,
+    };
+
+    /// Each row's policy stanza, asked for the whole batch at once, or null
+    /// where apt printed none.
     ///
     /// `apt-cache policy` prints a stanza per package: a header at column
     /// zero -- the name apt resolves the operand to, then a `:` -- and
     /// indented lines, of which `Candidate:` is the version apt would
     /// install or `(none)`. It falls back to a regex only when no package is
-    /// named exactly, and every row reaching here named one, so each answers
-    /// with a single stanza whose header is the row's own name.
+    /// named exactly, and every row reaching here named one.
+    ///
+    /// The stanzas come in operand order, and an operand apt cannot locate
+    /// gets none -- nothing on stdout, nothing on stderr, exit 0 (measured
+    /// on apt 2.6.1 and 3.0.3 with a nonexistent name among real ones) --
+    /// so they are matched to the rows in order, each row taking the next
+    /// stanza that answers it. A stanza answers a row when its header is the
+    /// row's name, or, for a bare row, the row's name qualified: that is
+    /// how apt heads a package a flat index holds for a foreign
+    /// architecture alone.
     ///
     /// `Candidate:` is the C-locale spelling, which the captured call runs
     /// under; measured on apt 3.0.3 under `LANG=ja_JP.UTF-8`, the same line
     /// is printed in Japanese and would match nothing here.
-    fn aptCandidates(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!std.StringHashMap(bool) {
+    fn aptStanzas(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const ?Stanza {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &.{ "apt-cache", "policy" });
         for (rows) |row| try argv.append(arena, row.name);
@@ -914,22 +1049,43 @@ pub const Distro = struct {
         try exec.checkCaptureTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
 
-        var out = std.StringHashMap(bool).init(arena);
-        var name: ?[]const u8 = null;
+        var printed: std.ArrayList(Stanza) = .empty;
         var it = std.mem.splitScalar(u8, res.stdout, '\n');
         while (it.next()) |raw| {
             const line = std.mem.trimEnd(u8, raw, " \t\r");
             if (line.len == 0) continue;
             if (line[0] != ' ' and line[0] != '\t') {
-                name = if (std.mem.endsWith(u8, line, ":")) line[0 .. line.len - 1] else null;
+                if (std.mem.endsWith(u8, line, ":")) {
+                    try printed.append(arena, .{ .header = line[0 .. line.len - 1], .candidate = false });
+                }
                 continue;
             }
             const field = std.mem.trimStart(u8, line, " \t");
             const value = stringAfter(field, "Candidate:") orelse continue;
-            const key = name orelse continue;
-            try out.put(key, !std.mem.eql(u8, value, "(none)"));
+            if (printed.items.len == 0) continue;
+            printed.items[printed.items.len - 1].candidate = !std.mem.eql(u8, value, "(none)");
+        }
+
+        const out = try arena.alloc(?Stanza, rows.len);
+        var next: usize = 0;
+        for (rows, out) |row, *slot| {
+            slot.* = null;
+            var i = next;
+            while (i < printed.items.len) : (i += 1) {
+                if (stanzaAnswers(printed.items[i].header, row.name)) {
+                    slot.* = printed.items[i];
+                    next = i + 1;
+                    break;
+                }
+            }
         }
         return out;
+    }
+
+    fn stanzaAnswers(header: []const u8, name: []const u8) bool {
+        if (std.mem.eql(u8, header, name)) return true;
+        if (backend_mod.archOf(name) != null) return false;
+        return header.len > name.len and std.mem.startsWith(u8, header, name) and header[name.len] == ':';
     }
 
     /// The first architecture other than `native` that apt has `name` under,
@@ -943,7 +1099,7 @@ pub const Distro = struct {
         native: []const u8,
         installed: Arches,
     ) anyerror!?[]const u8 {
-        for (try self.aptArchesOf(arena, name)) |arch| {
+        for (try self.aptArchesOf(arena, name, native)) |arch| {
             if (!std.mem.eql(u8, arch, native)) return arch;
         }
         const list = installed.get(name) orelse return null;
@@ -1028,6 +1184,47 @@ pub const Distro = struct {
         try exec.checkCaptureTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
         return std.mem.trim(u8, res.stdout, " \t\r\n");
+    }
+
+    /// The architectures dpkg has enabled beside the native one, one per
+    /// line. A machine with none prints nothing and exits 0 (measured on
+    /// apt 2.6.1 and 3.0.3).
+    fn aptForeignArches(self: *Distro, arena: std.mem.Allocator) anyerror!std.StringHashMap(void) {
+        const res = try self.runner.run(arena, &.{ "dpkg", "--print-foreign-architectures" });
+        try exec.checkCaptureTimedOut(res);
+        if (!res.ok) return Error.DistroQueryFailed;
+
+        var set = std.StringHashMap(void).init(arena);
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            try set.put(line, {});
+        }
+        return set;
+    }
+
+    /// What dpkg says of this machine: its native architecture, and the
+    /// architectures each installed package is configured under.
+    const AptMachine = struct {
+        native: []const u8,
+        installed: Arches,
+
+        /// Whether the package apt-mark spells `name` -- bare for the native
+        /// architecture and for `all`, `name:<arch>` for a foreign one -- is
+        /// installed and configured here.
+        fn hasConfigured(self: AptMachine, name: []const u8) bool {
+            const bare = backend_mod.bareName(name);
+            if (backend_mod.archOf(name)) |arch| return hasArch(self.installed, bare, arch);
+            return hasArch(self.installed, bare, self.native) or hasArch(self.installed, bare, "all");
+        }
+    };
+
+    fn aptMachine(self: *Distro, arena: std.mem.Allocator) anyerror!AptMachine {
+        return .{
+            .native = try self.aptNativeArch(arena),
+            .installed = try self.aptInstalledArches(arena),
+        };
     }
 
     /// Refuse the rows dnf has no package for, and answer with the rest.
@@ -1179,15 +1376,32 @@ pub const Distro = struct {
     /// The cache directory the copy lives under, made with the copy.
     pub const pacman_cache_dir = "/var/cache/mox";
 
-    /// Makes both levels, and sets 755 on each whether it made them or
-    /// found them: measured with coreutils 9.11 under `umask 077`, `mkdir
-    /// -p` leaves the parent 700 and `mkdir -p -m 755` repairs nothing that
-    /// exists, while this creates and repairs both. 755 because pacman 7
-    /// downloads as `DownloadUser` (`alpm`), which must traverse both to
-    /// reach `sync/`, and the user reads the copy unelevated: measured, a
-    /// 750 copy fails the sync with "Permission denied" on every apply, the
-    /// mode outliving the umask that set it.
-    const pacman_make_argv = [_][]const u8{ "install", "-d", "-m", "755", pacman_cache_dir, pacman_private_db };
+    /// The one call that makes the copy, as root through `sh -c`, so a
+    /// password prompt comes once, on the terminal: `$1` and `$2` are the
+    /// two levels, `$3` the system's `local`, `$4` the copy's.
+    ///
+    /// `install -d -m 755` makes both levels, and sets 755 on each whether
+    /// it made them or found them: measured with coreutils 9.11 under
+    /// `umask 077`, `mkdir -p` leaves the parent 700 and `mkdir -p -m 755`
+    /// repairs nothing that exists, while this creates and repairs both.
+    /// 755 because pacman 7 downloads as `DownloadUser` (`alpm`), which
+    /// must traverse both to reach `sync/`, and the user reads the copy
+    /// unelevated: measured, a 750 copy fails the sync with "Permission
+    /// denied" on every apply, the mode outliving the umask that set it.
+    ///
+    /// `ln -sfnT` replaces whatever stands at the copy's `local`, a
+    /// directory excepted: measured with the same coreutils, `ln -sfn`
+    /// against a real directory there nests the link inside it, so
+    /// `readlink` fails and the make runs on every apply after, and `-T`
+    /// refuses the directory with "cannot overwrite directory". A real
+    /// directory there is what a sync into the copy before the link makes,
+    /// empty; it is removed so the link can go in, and one with entries in
+    /// it is left, with `pacman_local_kept` to say so.
+    const pacman_make_script = "install -d -m 755 \"$1\" \"$2\" && { [ -L \"$4\" ] || [ ! -d \"$4\" ] || rmdir \"$4\" || exit 3; } && ln -sfnT \"$3\" \"$4\"";
+
+    /// What the make exits when the copy's `local` is a directory with
+    /// entries in it, which it leaves alone.
+    const pacman_local_kept: u8 = 3;
 
     /// The lock file a pacman killed outright mid-sync leaves in the copy.
     const pacman_private_lock = pacman_private_db ++ "/db.lck";
@@ -1197,13 +1411,12 @@ pub const Distro = struct {
     /// pacman does not create the dbpath itself ("failed to resolve path",
     /// measured), so it is made first, and the `local` symlink goes in
     /// before the first sync: a sync into a dbpath with no `local` creates
-    /// an empty directory there (measured on pacman 7.1.0), which `ln -sfn`
-    /// could not then replace. With the symlink, `-S --print` resolves
-    /// against what the machine has, as the install will: `bat` prints
-    /// `oniguruma` then `bat` against the real local database and its whole
-    /// dependency closure against an empty one. `pacman-conf DBPath` is
-    /// where the system's `local` is, which `checkupdates` reads the same
-    /// way; it answers with a trailing slash.
+    /// an empty directory there (measured on pacman 7.1.0). With the
+    /// symlink, `-S --print` resolves against what the machine has, as the
+    /// install will: `bat` prints `oniguruma` then `bat` against the real
+    /// local database and its whole dependency closure against an empty
+    /// one. `pacman-conf DBPath` is where the system's `local` is, which
+    /// `checkupdates` reads the same way; it answers with a trailing slash.
     ///
     /// Making the copy is elevated, and only pacman need be: once the tree
     /// is there, an apply elevates `pacman -Sy` alone, so a sudoers rule
@@ -1213,6 +1426,12 @@ pub const Distro = struct {
     /// cannot live somewhere the user owns instead: the sync is root's,
     /// and root writing into a directory another user controls is what a
     /// symlink planted there turns into a write anywhere.
+    ///
+    /// The make is streamed, as the sync and the install are: a captured
+    /// child has no terminal, and sudo asking it for a password stops it,
+    /// which the read loop reports as killed (measured on a user sudoers
+    /// grants with a password: the first apply failed, and no copy was
+    /// made). Only its exit code is read.
     fn pacmanSyncPrivate(self: *Distro, arena: std.mem.Allocator, elevate: bool) anyerror!void {
         const conf = try self.runner.run(arena, &.{ "pacman-conf", "DBPath" });
         try exec.checkCaptureTimedOut(conf);
@@ -1220,23 +1439,38 @@ pub const Distro = struct {
         var db_path = std.mem.trimEnd(u8, std.mem.trim(u8, conf.stdout, " \t\r\n"), "/");
         if (db_path.len == 0) db_path = "/var/lib/pacman";
         const local = try std.fmt.allocPrint(arena, "{s}/local", .{db_path});
+        const link = pacman_private_db ++ "/local";
 
-        if (!try self.pacmanCopyReady(arena, local)) {
-            const link = [_][]const u8{ "ln", "-sfn", local, pacman_private_db ++ "/local" };
-            for ([_][]const []const u8{ &pacman_make_argv, &link }) |step| {
+        switch (try self.pacmanCopyProbe(arena, local)) {
+            .ready => {},
+            .blocked => |found| {
+                self.say(
+                    "mox: pacman: {s} is a {s}, not a directory, so the copy of pacman's databases the check reads at {s} cannot be made; move it aside as root, after which an apply makes the copy\n",
+                    .{ found.path, found.kind, pacman_private_db },
+                );
+                return Error.DistroQueryFailed;
+            },
+            .wanting => {
                 var argv: std.ArrayList([]const u8) = .empty;
                 if (elevate) try argv.append(arena, "sudo");
-                try argv.appendSlice(arena, step);
-                const res = try self.runner.run(arena, argv.items);
-                try exec.checkCaptureTimedOut(res);
+                try argv.appendSlice(arena, &.{ "sh", "-c", pacman_make_script, "sh", pacman_cache_dir, pacman_private_db, local, link });
+                const res = try self.runner.stream(arena, argv.items);
+                try exec.checkTimedOut(res);
                 if (!res.ok) {
-                    self.say(
-                        "mox: pacman: `{s}` exited {d}, so the copy of pacman's databases the check reads at {s} could not be made; make it once as root with `install -d -m 755 {s} {s} && ln -sfn {s} {s}/local`, after which an apply elevates nothing but pacman\n",
-                        .{ try std.mem.join(arena, " ", argv.items), res.code, pacman_private_db, pacman_cache_dir, pacman_private_db, local, pacman_private_db },
-                    );
+                    if (res.code == pacman_local_kept) {
+                        self.say(
+                            "mox: pacman: {s} is a directory with entries in it, where the copy of pacman's databases the check reads keeps a link to {s}; mox removes nothing there, so move it aside as root, after which an apply makes the link\n",
+                            .{ link, local },
+                        );
+                    } else {
+                        self.say(
+                            "mox: pacman: `{s}sh -c` making the copy of pacman's databases the check reads at {s} exited {d}, so the copy could not be made; make it once as root with `install -d -m 755 {s} {s} && {{ [ -L {s} ] || [ ! -d {s} ] || rmdir {s}; }} && ln -sfnT {s} {s}`, after which an apply elevates nothing but pacman\n",
+                            .{ if (elevate) "sudo " else "", pacman_private_db, res.code, pacman_cache_dir, pacman_private_db, link, link, link, local, link },
+                        );
+                    }
                     return Error.DistroQueryFailed;
                 }
-            }
+            },
         }
 
         var sync: std.ArrayList([]const u8) = .empty;
@@ -1257,31 +1491,49 @@ pub const Distro = struct {
         return Error.DistroRefreshFailed;
     }
 
+    const CopyProbe = union(enum) {
+        ready,
+        wanting,
+        /// Something that is not a directory stands at one of the two
+        /// levels: what `stat` calls it, and where.
+        blocked: struct { path: []const u8, kind: []const u8 },
+    };
+
     /// Whether the copy is there to sync into, as an unelevated read sees
-    /// it: both directories readable and traversable by others (`alpm`
-    /// downloads into the copy, and the user reads it), and `local` pointing
-    /// where the system's is. Anything short of that, or a read that cannot
-    /// be made, is left to the elevated steps to make or repair. Both probes
+    /// it: both levels directories readable and traversable by others
+    /// (`alpm` downloads into the copy, and the user reads it), and `local`
+    /// a link to where the system's is. Anything short of that, or a read
+    /// that cannot be made, is left to the elevated make to make or repair,
+    /// except a non-directory at either level: `install -d` fails on one
+    /// with "File exists" (measured, coreutils 9.11), so it is named here
+    /// instead. `stat -L` follows a symlink at either level to what it
+    /// names, and `%n %a %F` reads `<path> <mode> <kind>` per line (measured:
+    /// `/var/cache/mox 755 directory`; `/var/cache/mox 644 regular empty
+    /// file`, and exit 1 with the level under it unreadable). Both probes
     /// capture stderr: a first apply finds nothing there, and `stat` saying
     /// so is the expected answer, not a diagnostic.
-    fn pacmanCopyReady(self: *Distro, arena: std.mem.Allocator, local: []const u8) anyerror!bool {
-        const modes = try self.runner.runBoth(arena, &.{ "stat", "-c", "%a", pacman_cache_dir, pacman_private_db });
+    fn pacmanCopyProbe(self: *Distro, arena: std.mem.Allocator, local: []const u8) anyerror!CopyProbe {
+        const modes = try self.runner.runBoth(arena, &.{ "stat", "-L", "-c", "%n %a %F", pacman_cache_dir, pacman_private_db });
         try exec.checkCaptureTimedOut(modes);
-        if (!modes.ok) return false;
         var seen: usize = 0;
+        var traversable = true;
         var it = std.mem.tokenizeAny(u8, modes.stdout, "\r\n");
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t");
-            if (line.len == 0) continue;
-            const mode = std.fmt.parseInt(u32, line, 8) catch return false;
-            if (mode & 0o005 != 0o005) return false;
+            const after_path = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const rest = line[after_path + 1 ..];
+            const after_mode = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+            const kind = rest[after_mode + 1 ..];
+            if (!std.mem.eql(u8, kind, "directory")) return .{ .blocked = .{ .path = line[0..after_path], .kind = kind } };
+            const mode = std.fmt.parseInt(u32, rest[0..after_mode], 8) catch return .wanting;
+            if (mode & 0o005 != 0o005) traversable = false;
             seen += 1;
         }
-        if (seen != 2) return false;
+        if (!modes.ok or seen != 2 or !traversable) return .wanting;
         const target = try self.runner.runBoth(arena, &.{ "readlink", pacman_private_db ++ "/local" });
         try exec.checkCaptureTimedOut(target);
-        if (!target.ok) return false;
-        return std.mem.eql(u8, std.mem.trim(u8, target.stdout, " \t\r\n"), local);
+        if (!target.ok) return .wanting;
+        return if (std.mem.eql(u8, std.mem.trim(u8, target.stdout, " \t\r\n"), local)) .ready else .wanting;
     }
 
     /// Whether a stale lock sits in the copy.
@@ -1456,8 +1708,13 @@ pub const Distro = struct {
     /// `rows` at once, or null when pacman would run none: measured on
     /// pacman 7.1.0, a batch with one name pacman resolves to nothing exits
     /// 1 having printed only "target not found", whichever rows stand beside
-    /// it. Its stderr is captured and dropped: every row of a batch that
-    /// fails is asked about alone, and that answer relays what pacman said.
+    /// it. Its stderr is captured: on a failure it is dropped, every row of
+    /// a batch that fails being asked about alone, and that answer relays
+    /// what pacman said; beside a transaction pacman does print it is
+    /// written through as it came, since it is a warning `run` would have
+    /// left on the terminal (measured: `warning: config file
+    /// /etc/pacman.conf, line 97: directive 'BogusDirective' in section
+    /// 'options' not recognized.`, and exit 0).
     fn pacmanPrinted(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror!?std.StringHashMap(void) {
         if (rows.len == 0) return null;
         var argv: std.ArrayList([]const u8) = .empty;
@@ -1466,6 +1723,7 @@ pub const Distro = struct {
         const res = try self.runner.runBoth(arena, argv.items);
         try exec.checkCaptureTimedOut(res);
         if (!res.ok) return null;
+        if (res.stderr.len > 0) self.say("{s}", .{res.stderr});
 
         var set = std.StringHashMap(void).init(arena);
         var it = std.mem.splitScalar(u8, res.stdout, '\n');
@@ -1583,13 +1841,14 @@ pub const Distro = struct {
         version: []const u8,
         provides: []const []const u8,
         conflicts: []const []const u8,
+        replaces: []const []const u8,
     };
 
     /// The packages `pacman -Si` or `pacman -Qi` described in `text`, one
     /// block per package (measured on pacman 7.1.0): `Name`, `Version`,
-    /// `Provides` and `Conflicts With` are each one `Key : value` line, a
-    /// list value is space-separated with no space inside a spec, and an
-    /// empty one reads `None`.
+    /// `Provides`, `Conflicts With` and `Replaces` are each one `Key :
+    /// value` line, a list value is space-separated with no space inside a
+    /// spec, and an empty one reads `None`.
     fn pacmanInfoBlocks(arena: std.mem.Allocator, text: []const u8) ![]const PacmanInfo {
         var out: std.ArrayList(PacmanInfo) = .empty;
         var current: ?PacmanInfo = null;
@@ -1601,7 +1860,7 @@ pub const Distro = struct {
             const value = std.mem.trim(u8, line[colon + 3 ..], " \t");
             if (std.mem.eql(u8, key, "Name")) {
                 if (current) |c| try out.append(arena, c);
-                current = .{ .name = value, .version = "", .provides = &.{}, .conflicts = &.{} };
+                current = .{ .name = value, .version = "", .provides = &.{}, .conflicts = &.{}, .replaces = &.{} };
                 continue;
             }
             const c = &(current orelse continue);
@@ -1611,6 +1870,8 @@ pub const Distro = struct {
                 c.provides = try pacmanSpecList(arena, value);
             } else if (std.mem.eql(u8, key, "Conflicts With")) {
                 c.conflicts = try pacmanSpecList(arena, value);
+            } else if (std.mem.eql(u8, key, "Replaces")) {
+                c.replaces = try pacmanSpecList(arena, value);
             }
         }
         if (current) |c| try out.append(arena, c);
@@ -1625,14 +1886,216 @@ pub const Distro = struct {
         return out.toOwnedSlice(arena);
     }
 
-    /// The name a dependency spec names, ahead of any version constraint.
-    fn pacmanSpecName(spec: []const u8) []const u8 {
-        const end = std.mem.indexOfAny(u8, spec, "<>=") orelse spec.len;
-        return spec[0..end];
+    const PacmanSpec = struct {
+        text: []const u8,
+        name: []const u8,
+        /// `<`, `<=`, `=`, `>=` or `>`; empty for a bare name.
+        op: []const u8,
+        version: []const u8,
+    };
+
+    /// A dependency spec split: the name, then an operator and a version
+    /// when it carries them (`xorg-server<21.1.1`, `nvidia-utils<=331.20`,
+    /// `virt=2`; measured on pacman 7.1.0, with no space between).
+    fn pacmanSpecParts(spec: []const u8) PacmanSpec {
+        const start = std.mem.indexOfAny(u8, spec, "<>=") orelse return .{ .text = spec, .name = spec, .op = "", .version = "" };
+        var end = start + 1;
+        if (end < spec.len and spec[end] == '=') end += 1;
+        return .{ .text = spec, .name = spec[0..start], .op = spec[start..end], .version = spec[end..] };
+    }
+
+    /// Whether `version` satisfies `spec`, by pacman's own comparison:
+    /// `vercmp a b` prints -1, 0 or 1 (measured on pacman 7.1.0: `vercmp
+    /// 1:1.6.8-1 2` is 1, the epoch deciding; `vercmp 2-1 2` is 0, a
+    /// release absent from one side being left out). A bare name is
+    /// satisfied by any version, and a versioned spec by no bare
+    /// provision, as alpm has it.
+    fn pacmanSpecHolds(self: *Distro, arena: std.mem.Allocator, spec: PacmanSpec, version: []const u8) anyerror!bool {
+        if (spec.op.len == 0) return true;
+        if (version.len == 0) return false;
+        const res = try self.runner.run(arena, &.{ "vercmp", version, spec.version });
+        try exec.checkCaptureTimedOut(res);
+        const said = std.mem.trim(u8, res.stdout, " \t\r\n");
+        const sign = std.fmt.parseInt(i8, said, 10) catch null;
+        if (!res.ok or sign == null) {
+            self.say(
+                "mox: pacman: `vercmp {s} {s}` exited {d} rather than comparing them, so whether \"{s}\" is a conflict is left to pacman, which then installs none of the batch if it is\n",
+                .{ version, spec.version, res.code, spec.text },
+            );
+            return false;
+        }
+        const c = sign.?;
+        if (std.mem.eql(u8, spec.op, "<")) return c < 0;
+        if (std.mem.eql(u8, spec.op, "<=")) return c <= 0;
+        if (std.mem.eql(u8, spec.op, "=")) return c == 0;
+        if (std.mem.eql(u8, spec.op, ">=")) return c >= 0;
+        return c > 0;
+    }
+
+    /// The version under which `info` answers to `name`: its own when it
+    /// is `name`, the provision's when it provides `name` ("" for a bare
+    /// provision), and null when it does neither.
+    fn pacmanVersionFor(info: PacmanInfo, name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, info.name, name)) return info.version;
+        for (info.provides) |prov| {
+            const parts = pacmanSpecParts(prov);
+            if (std.mem.eql(u8, parts.name, name)) return parts.version;
+        }
+        return null;
+    }
+
+    /// Whether installing `candidate` replaces the installed `pkg`: a
+    /// `Replaces` naming it, at a version the installed one satisfies.
+    /// alpm reads a replacement against the package's own name, never a
+    /// provision of it.
+    fn pacmanReplaces(self: *Distro, arena: std.mem.Allocator, candidate: PacmanInfo, pkg: PacmanInfo) anyerror!bool {
+        for (candidate.replaces) |r| {
+            const parts = pacmanSpecParts(r);
+            if (std.mem.eql(u8, parts.name, pkg.name) and try self.pacmanSpecHolds(arena, parts, pkg.version)) return true;
+        }
+        return false;
+    }
+
+    /// The packages the apply's `-Syu` will bring forward, each with the
+    /// version it will leave: measured on pacman 7.1.0, `pacman -Qu`
+    /// against the copy prints `<name> <installed> -> <new>` per package,
+    /// with ` [ignored]` after one `IgnorePkg` keeps back, and exits 1
+    /// printing nothing when no upgrade is pending.
+    ///
+    /// That empty exit 1 is the only failure that means "nothing pending",
+    /// so every other one is said out loud rather than read as an empty
+    /// answer: measured on the same pacman, a dbpath that is not there
+    /// exits 1 with `error: 'failed to resolve path '/no/such/path' passed
+    /// to '--dbpath': No such file or directory` on stderr, and a dbpath
+    /// whose `local` is not a directory exits 255 with `error: failed to
+    /// initialize alpm library:` and `could not open database`.
+    fn pacmanPending(self: *Distro, arena: std.mem.Allocator) anyerror!std.StringHashMap([]const u8) {
+        var out = std.StringHashMap([]const u8).init(arena);
+        const res = try self.runner.runBoth(arena, &.{ "pacman", "-Qu", "--dbpath", pacman_private_db });
+        try exec.checkCaptureTimedOut(res);
+        if (!res.ok) {
+            if (res.code != 1 or res.stdout.len > 0 or res.stderr.len > 0) self.say(
+                "mox: pacman: what the apply's `-Syu` will bring forward could not be read (`pacman -Qu --dbpath {s}` exited {d}: {s}), so a versioned conflict is judged against the version installed now, and a row the upgrade would have made room for may be refused\n",
+                .{ pacman_private_db, res.code, try oneLine(arena, if (res.stderr.len > 0) res.stderr else res.stdout) },
+            );
+            return out;
+        }
+        var it = std.mem.tokenizeAny(u8, res.stdout, "\r\n");
+        while (it.next()) |line| {
+            var words = std.mem.tokenizeAny(u8, line, " \t");
+            const name = words.next() orelse continue;
+            _ = words.next() orelse continue;
+            const arrow = words.next() orelse continue;
+            const new = words.next() orelse continue;
+            if (!std.mem.eql(u8, arrow, "->") or words.next() != null) continue;
+            try out.put(name, new);
+        }
+        return out;
+    }
+
+    /// The machine the apply's `-Syu` will leave, as far as an installed
+    /// package's own name goes.
+    const PacmanFuture = struct {
+        /// The block of the version the upgrade will leave, for each
+        /// installed package with a pending upgrade.
+        upgraded: std.StringHashMap(PacmanInfo),
+        /// The installed packages the upgrade will remove.
+        removed: std.StringHashMap(void),
+
+        /// What the installed `p` will be once the upgrade has run, or null
+        /// when it will not be on the machine at all.
+        fn after(self: PacmanFuture, p: PacmanInfo) ?PacmanInfo {
+            if (self.removed.contains(p.name)) return null;
+            return self.upgraded.get(p.name) orelse p;
+        }
+    };
+
+    /// What each installed package will be once the apply's `-Syu` has run:
+    /// its block from `pacman -Si` against the copy at the pending version
+    /// where a name is carried by more than one repository, and, for the
+    /// packages the upgrade removes rather than upgrades, nothing.
+    ///
+    /// `pacman -Qu` is blind to a replacement, so it cannot answer the
+    /// second half on its own. Measured on pacman 7.1.0 with `oldname 1-1`
+    /// installed and the repository carrying only `newname 2-1`, whose
+    /// `Replaces` names it: `pacman -Qu --dbpath <copy>` exits 1 printing
+    /// nothing, while `pacman -Su --print --print-format '%n' --dbpath
+    /// <copy>` exits 0 printing `newname`, and the `-Syu` the apply runs
+    /// answers its own ":: Replace oldname with moxtest/newname? [Y/n]" yes
+    /// under `--noconfirm`, removing oldname and installing newname. So the
+    /// upgrade's own targets are asked for, `-Si` read for the ones the
+    /// machine does not already have, and each installed package their
+    /// `Replaces` names at a version it satisfies is gone from the future.
+    /// With nothing pending that print exits 0 having printed nothing.
+    fn pacmanFutureOf(self: *Distro, arena: std.mem.Allocator, installed: []const PacmanInfo, pending: std.StringHashMap([]const u8)) anyerror!PacmanFuture {
+        var out: PacmanFuture = .{
+            .upgraded = std.StringHashMap(PacmanInfo).init(arena),
+            .removed = std.StringHashMap(void).init(arena),
+        };
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ "pacman", "-Si", "--dbpath", pacman_private_db, "--" });
+        for (installed) |p| {
+            if (pending.contains(p.name)) try argv.append(arena, p.name);
+        }
+        if (argv.items.len > 5) {
+            const res = try self.runner.run(arena, argv.items);
+            try exec.checkCaptureTimedOut(res);
+            if (res.ok) {
+                for (try pacmanInfoBlocks(arena, res.stdout)) |block| {
+                    const new = pending.get(block.name) orelse continue;
+                    const have = out.upgraded.get(block.name);
+                    if (have == null or std.mem.eql(u8, block.version, new)) try out.upgraded.put(block.name, block);
+                }
+            }
+        }
+
+        var newcomers: std.ArrayList([]const u8) = .empty;
+        try newcomers.appendSlice(arena, &.{ "pacman", "-Si", "--dbpath", pacman_private_db, "--" });
+        for (try self.pacmanUpgradeTargets(arena)) |name| {
+            for (installed) |p| {
+                if (std.mem.eql(u8, p.name, name)) break;
+            } else try newcomers.append(arena, name);
+        }
+        if (newcomers.items.len == 5) return out;
+        const info = try self.runner.run(arena, newcomers.items);
+        try exec.checkCaptureTimedOut(info);
+        if (!info.ok) return out;
+        for (try pacmanInfoBlocks(arena, info.stdout)) |block| {
+            for (installed) |p| {
+                if (try self.pacmanReplaces(arena, block, p)) try out.removed.put(p.name, {});
+            }
+        }
+        return out;
+    }
+
+    /// The names the apply's `-Syu` would install, whether as an upgrade of
+    /// an installed package, as a new dependency, or in place of one it
+    /// replaces. `--print` resolves and prints without committing and takes
+    /// no lock, as the `-S --print` above does; `--print-format '%n'`
+    /// reduces each entry to a bare name. Measured on pacman 7.1.0, it
+    /// exits 0 with nothing on either stream when there is nothing to do,
+    /// so any other answer is a failure and is said out loud: a dbpath that
+    /// is not there exits 1 with `error: 'failed to resolve path
+    /// '/no/such/path' passed to '--dbpath': No such file or directory`.
+    fn pacmanUpgradeTargets(self: *Distro, arena: std.mem.Allocator) anyerror![]const []const u8 {
+        const res = try self.runner.runBoth(arena, &.{ "pacman", "-Su", "--print", "--print-format", "%n", "--dbpath", pacman_private_db });
+        try exec.checkCaptureTimedOut(res);
+        if (!res.ok) {
+            self.say(
+                "mox: pacman: what the apply's `-Syu` would install could not be read (`pacman -Su --print --print-format %n --dbpath {s}` exited {d}: {s}), so an installed package the upgrade would replace is judged as still installed, and a row that conflicts with it may be refused\n",
+                .{ pacman_private_db, res.code, try oneLine(arena, if (res.stderr.len > 0) res.stderr else res.stdout) },
+            );
+            return &.{};
+        }
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, res.stdout, " \t\r\n");
+        while (it.next()) |name| try out.append(arena, name);
+        return out.toOwnedSlice(arena);
     }
 
     /// Refuse the rows whose package conflicts with one this machine has
-    /// installed, and answer with the rest.
+    /// installed and will still have once the apply's `-Syu` has run, and
+    /// answer with the rest.
     ///
     /// `pacman -S --print` does not report such a conflict -- the
     /// transaction prints and exits 0 (measured on pacman 7.1.0, with
@@ -1643,18 +2106,23 @@ pub const Distro = struct {
     /// the batch, cowsay never lands, on every apply. mox never removes a
     /// package, so the row goes rather than the batch.
     ///
-    /// The row's own `Conflicts With` (from `-Si`, against the copy) is
-    /// judged by `pacman -T`, which answers whether an installed package
-    /// satisfies each spec, versions included, and prints only the ones
-    /// none does (exit 127 then, 0 when every spec is satisfied; measured).
-    /// The other direction -- an installed package whose `Conflicts With`
-    /// names the row or something it provides -- pacman refuses just the
-    /// same, and 42 of the 136 conflict pairs in the current repositories
-    /// are declared on one side only (`exfatprogs` names `exfat-utils`,
-    /// `iptables-legacy` names `iptables`, the `xf86-*` drivers name
-    /// `xorg-server<21.1.1`; none names them back), so `pacman -Qi` is read
-    /// for those. A versioned spec there is judged by whether `pacman -S
-    /// --print` resolves the spec to the row's package, which is pacman's
+    /// The install is one `-Syu`, so a conflict is judged against the
+    /// machine that transaction leaves, not the one it starts from
+    /// (measured on the same pacman): an installed package the row's
+    /// `Replaces` names is answered "Replace <it> with <row>? [Y/n]" yes by
+    /// `--noconfirm`, and is no conflict; an installed package some OTHER
+    /// pending package replaces is gone from that machine too, and is no
+    /// conflict either; and a versioned spec is judged against the version
+    /// the upgrade will leave -- `xf86-*` declares `xorg-server<21.1.1`,
+    /// which the same upgrade moves past. Both directions are read, since 42 of the
+    /// 136 conflict pairs in the current repositories are declared on one
+    /// side only (`exfatprogs` names `exfat-utils`, `iptables-legacy`
+    /// names `iptables`; none names them back): the row's own `Conflicts
+    /// With` (from `-Si`, against the copy) against what `pacman -Qi` says
+    /// is installed, by name or by provision; and each installed package's
+    /// own `Conflicts With` -- of the version the upgrade will leave, from
+    /// `-Si` against the copy when one is pending -- against the row and
+    /// what it provides. A versioned spec is compared by `vercmp`, pacman's
     /// own comparison, epoch and all.
     fn refusePacmanConflicts(self: *Distro, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
         if (rows.len == 0) return rows;
@@ -1666,40 +2134,18 @@ pub const Distro = struct {
         try exec.checkCaptureTimedOut(info);
         const candidates = try pacmanInfoBlocks(arena, info.stdout);
 
-        // Every candidate's conflict specs, asked of the machine in one call.
-        var specs: std.ArrayList([]const u8) = .empty;
-        for (candidates) |c| try specs.appendSlice(arena, c.conflicts);
-        var satisfied = std.StringHashMap(void).init(arena);
-        if (specs.items.len > 0) {
-            var t: std.ArrayList([]const u8) = .empty;
-            try t.appendSlice(arena, &.{ "pacman", "-T", "--" });
-            try t.appendSlice(arena, specs.items);
-            const res = try self.runner.run(arena, t.items);
-            try exec.checkCaptureTimedOut(res);
-            if (res.ok or res.code == 127) {
-                var unsatisfied = std.StringHashMap(void).init(arena);
-                var lines = std.mem.tokenizeAny(u8, res.stdout, "\r\n");
-                while (lines.next()) |l| try unsatisfied.put(std.mem.trim(u8, l, " \t"), {});
-                for (specs.items) |s| {
-                    if (!unsatisfied.contains(s)) try satisfied.put(s, {});
-                }
-            } else {
-                self.say(
-                    "mox: pacman: `pacman -T` could not say which of what these rows conflict with is installed (exit {d}), so a row that conflicts with an installed package is left to pacman, which then installs none of the batch\n",
-                    .{res.code},
-                );
-            }
-        }
-
         const qi = try self.runner.run(arena, &.{ "pacman", "-Qi" });
         try exec.checkCaptureTimedOut(qi);
-        const installed: []const PacmanInfo = if (qi.ok) try pacmanInfoBlocks(arena, qi.stdout) else blk: {
+        if (!qi.ok) {
             self.say(
-                "mox: pacman: what this machine has installed could not be read in full (`pacman -Qi` exited {d}), so a row an installed package declares a conflict with is left to pacman, which then installs none of the batch\n",
+                "mox: pacman: what this machine has installed could not be read in full (`pacman -Qi` exited {d}), so a row that conflicts with an installed package, or that one declares a conflict with, is left to pacman, which then installs none of the batch\n",
                 .{qi.code},
             );
-            break :blk &.{};
-        };
+            return rows;
+        }
+        const installed = try pacmanInfoBlocks(arena, qi.stdout);
+        const pending = try self.pacmanPending(arena);
+        const future = try self.pacmanFutureOf(arena, installed, pending);
 
         var keep: std.ArrayList(Row) = .empty;
         rows: for (rows) |row| {
@@ -1709,33 +2155,37 @@ pub const Distro = struct {
                 try keep.append(arena, row);
                 continue;
             };
-            for (candidate.conflicts) |spec| {
-                if (!satisfied.contains(spec)) continue;
-                const pkg = try self.pacmanInstalledFor(arena, pacmanSpecName(spec));
-                if (std.mem.eql(u8, pkg, spec)) {
-                    self.say(
-                        "mox: pacman: row \"{s}\" names a package that conflicts with \"{s}\", which this machine has installed; pacman would have to remove {s} to install it, and mox never removes a package, so the row was not installed: remove {s} yourself, or drop the row\n",
-                        .{ row.name, spec, pkg, pkg },
-                    );
-                } else {
-                    self.say(
-                        "mox: pacman: row \"{s}\" names a package that conflicts with \"{s}\", which this machine has installed as \"{s}\"; pacman would have to remove {s} to install it, and mox never removes a package, so the row was not installed: remove {s} yourself, or drop the row\n",
-                        .{ row.name, spec, pkg, pkg, pkg },
-                    );
+            for (candidate.conflicts) |text| {
+                const spec = pacmanSpecParts(text);
+                for (installed) |p| {
+                    if (try self.pacmanReplaces(arena, candidate, p)) continue;
+                    const after = future.after(p) orelse continue;
+                    const version = pacmanVersionFor(after, spec.name) orelse continue;
+                    if (!try self.pacmanSpecHolds(arena, spec, version)) continue;
+                    if (std.mem.eql(u8, p.name, text)) {
+                        self.say(
+                            "mox: pacman: row \"{s}\" names a package that conflicts with \"{s}\", which this machine has installed; pacman would have to remove {s} to install it, and mox never removes a package, so the row was not installed: remove {s} yourself, or drop the row\n",
+                            .{ row.name, text, p.name, p.name },
+                        );
+                    } else {
+                        self.say(
+                            "mox: pacman: row \"{s}\" names a package that conflicts with \"{s}\", which this machine has installed as \"{s}\"; pacman would have to remove {s} to install it, and mox never removes a package, so the row was not installed: remove {s} yourself, or drop the row\n",
+                            .{ row.name, text, p.name, p.name, p.name },
+                        );
+                    }
+                    continue :rows;
                 }
-                continue :rows;
             }
             for (installed) |p| {
-                for (p.conflicts) |spec| {
-                    const named = pacmanSpecName(spec);
-                    const hits = std.mem.eql(u8, named, row.name) or for (candidate.provides) |prov| {
-                        if (std.mem.eql(u8, pacmanSpecName(prov), named)) break true;
-                    } else false;
-                    if (!hits) continue;
-                    if (named.len != spec.len and !try self.pacmanSpecResolvesTo(arena, spec, row.name)) continue;
+                if (try self.pacmanReplaces(arena, candidate, p)) continue;
+                const after = future.after(p) orelse continue;
+                for (after.conflicts) |text| {
+                    const spec = pacmanSpecParts(text);
+                    const version = pacmanVersionFor(candidate, spec.name) orelse continue;
+                    if (!try self.pacmanSpecHolds(arena, spec, version)) continue;
                     self.say(
                         "mox: pacman: row \"{s}\" names a package that \"{s}\", which this machine has installed, declares a conflict with (\"{s}\"); pacman would have to remove {s} to install it, and mox never removes a package, so the row was not installed: remove {s} yourself, or drop the row\n",
-                        .{ row.name, p.name, spec, p.name, p.name },
+                        .{ row.name, p.name, text, p.name, p.name },
                     );
                     continue :rows;
                 }
@@ -1743,34 +2193,6 @@ pub const Distro = struct {
             try keep.append(arena, row);
         }
         return keep.toOwnedSlice(arena);
-    }
-
-    /// The installed package that is `name` or provides it: measured on
-    /// pacman 7.1.0, `pacman -Qq -- pulse-native-provider` answers
-    /// `pulseaudio`. `name` itself when pacman cannot say.
-    fn pacmanInstalledFor(self: *Distro, arena: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
-        const res = try self.runner.run(arena, &.{ "pacman", "-Qq", "--", name });
-        try exec.checkCaptureTimedOut(res);
-        if (!res.ok) return name;
-        const first = std.mem.trim(u8, std.mem.sliceTo(res.stdout, '\n'), " \t\r");
-        return if (first.len > 0) first else name;
-    }
-
-    /// Whether pacman resolves the versioned `spec` to `name`'s package:
-    /// measured on pacman 7.1.0, `-S --print -- 'pipewire-pulse<2'` is
-    /// "target not found" against pipewire-pulse 1:1.6.8-1 while
-    /// `'pipewire-pulse>=99'` prints it, the epoch deciding both.
-    fn pacmanSpecResolvesTo(self: *Distro, arena: std.mem.Allocator, spec: []const u8, name: []const u8) anyerror!bool {
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &pacman_print_head);
-        try argv.append(arena, spec);
-        const res = try self.runner.runBoth(arena, argv.items);
-        try exec.checkCaptureTimedOut(res);
-        if (!res.ok) return false;
-        var last: []const u8 = "";
-        var it = std.mem.tokenizeAny(u8, res.stdout, "\r\n");
-        while (it.next()) |l| last = std.mem.trim(u8, l, " \t");
-        return std.mem.eql(u8, last, name);
     }
 
     /// `-y` alone answers apt's own questions; debconf asks its own through
@@ -1795,11 +2217,17 @@ const testing = std.testing;
 
 /// The bare-name listing argv the apt adapter builds for `native`.
 fn aptNamesCall(comptime native: []const u8) []const u8 {
-    return "apt-cache -o APT::Architectures=" ++ native ++ " -o Dir::State::status=/dev/null --generate pkgnames";
+    return "apt-cache -o APT::Architectures=" ++ native ++ " -o Dir::State::status=/dev/null -o APT::Cache::AllNames=false --generate pkgnames";
 }
 
 /// The installed-architecture listing argv the apt adapter builds.
 const apt_installed_call = "dpkg-query -W -f ${Package} ${Architecture} ${Status}\\n";
+
+/// The stanza `apt-cache policy` prints for a package it has a version of,
+/// in the shape apt 2.6.1 and 3.0.3 print it.
+fn aptStanza(comptime name: []const u8) []const u8 {
+    return name ++ ":\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 500\n        500 http://deb.debian.org/debian trixie/main arm64 Packages\n";
+}
 
 fn countCalls(fake: *const exec.Fake, argv: []const u8) usize {
     var n: usize = 0;
@@ -1848,6 +2276,8 @@ test "installedExplicit: manual packages come back one per line" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showmanual", .stdout = "bat\nfd-find\n\nripgrep\n" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\nfd-find arm64 install ok installed\nripgrep arm64 install ok installed\n" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
@@ -1890,13 +2320,13 @@ test "install: root installs without sudo, which a minimal image lacks" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "dnf install -y bat" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
 
     // The Fake errors on anything unscripted, so a stray `sudo` fails here.
     try d.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expect(fake.called("dnf install -y bat"));
+    try testing.expect(fake.called("dnf install -y --setopt=assumeno=0 bat"));
 }
 
 test "install: apt as root refreshes without sudo too" {
@@ -1909,8 +2339,9 @@ test "install: apt as root refreshes without sudo too" {
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nnano\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
@@ -1928,19 +2359,19 @@ test "install: apt refreshes the index, then installs the whole set at once, deb
     // The frontend setting rides after sudo, which would otherwise strip it
     // from the environment along with everything else.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nfd-find\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
-        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = comptime (aptStanza("bat") ++ aptStanza("fd-find")) },
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("fd-find", &.{}) });
-    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[1]);
+    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[3]);
     try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find", fake.calls.items[fake.calls.items.len - 1]);
 }
 
@@ -1952,13 +2383,13 @@ test "install: dnf takes one non-interactive command" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat ripgrep", .stdout = "bat\nripgrep\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "sudo dnf install -y bat ripgrep" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 bat ripgrep" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
 
     // The Fake errors on anything unscripted, so a stray refresh fails here.
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ripgrep", &.{}) });
-    try testing.expect(fake.called("sudo dnf install -y bat ripgrep"));
+    try testing.expect(fake.called("sudo dnf install -y --setopt=assumeno=0 bat ripgrep"));
 }
 
 test "install: pacman checks against its own copy of the database, and installs in one transaction" {
@@ -1969,13 +2400,14 @@ test "install: pacman checks against its own copy of the database, and installs 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq" },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "sudo ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make },
         .{ .argv = "sudo pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra ripgrep 14.1.1-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "oniguruma\nbat\n" },
         .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     } };
@@ -1996,7 +2428,7 @@ test "install: a failed install is an error, not a silent skip" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "sudo dnf install -y bat", .code = 1 },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 bat", .code = 1 },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
     try testing.expectError(Error.DistroInstallFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -2193,24 +2625,27 @@ test "install: the install argv is exactly this, per manager" {
     // `Unknown argument "--"` and installs nothing at all.
     for ([_]struct { m: Manager, argv: []const u8 }{
         .{ .m = .apt, .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
-        .{ .m = .dnf, .argv = "sudo dnf install -y bat" },
+        .{ .m = .dnf, .argv = "sudo dnf install -y --setopt=assumeno=0 bat" },
         .{ .m = .pacman, .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     }) |c| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
             .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+            .{ .argv = apt_installed_call },
+            .{ .argv = "apt-mark showauto" },
             .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
             .{ .argv = "apt-mark showhold" },
-            .{ .argv = "apt-cache policy", .match = .prefix },
+            .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
             .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
             .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-            .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-            .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-            .{ .argv = "sudo ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+            .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+            .{ .argv = "sudo " ++ pacman_make },
             .{ .argv = "sudo pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
             .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\n" },
             .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
             .{ .argv = "pacman -Qi" },
+            .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+            nothing_to_upgrade,
             .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "bat\n" },
             .{ .argv = c.argv },
         } };
@@ -2233,7 +2668,7 @@ test "install: no argv dnf parses carries a --, which dnf5 5.2.x refuses" {
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat zlib-devel", .stdout = "bat\n" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "dnf install -y bat" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -2295,7 +2730,7 @@ test "install: apt refuses the bad names and installs the rest of the batch" {
         .{ .argv = "apt-cache madison", .match = .prefix, .stdout = "" },
         .{ .argv = "apt-cache showpkg", .match = .prefix, .stdout = "" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
@@ -2332,9 +2767,11 @@ test "install: a foreign-architecture row is asked about as written, never by it
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("wine32:armhf") },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
@@ -2362,6 +2799,7 @@ test "install: apt refuses a qualified name madison has no binary package for" {
             .argv = "apt-cache madison wine:armhf",
             .stdout = "      wine | 10.0~repack-6 | http://deb.debian.org/debian trixie/main Sources\n",
         },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -2386,6 +2824,7 @@ test "install: apt refuses a qualifier naming this machine's own architecture" {
     // the qualified row would read as missing after every install.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bsdextrautils\n" },
@@ -2408,6 +2847,7 @@ test "install: a name query that cannot run stops the install, never waves it th
 
     var apt: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .code = 100 },
@@ -2467,7 +2907,7 @@ test "install: a row dnf has as a dependency is marked user installed, never ins
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.2.18.0\ndnf5 plugin API version 2.0\n" },
-        .{ .argv = "sudo dnf mark user -y bat" },
+        .{ .argv = "sudo dnf mark user -y --setopt=assumeno=0 bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true, .err = &w.writer };
@@ -2475,7 +2915,7 @@ test "install: a row dnf has as a dependency is marked user installed, never ins
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expectEqual(@as(usize, 1), d.backend().installMarked());
     try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
-    try testing.expect(fake.called("sudo dnf mark user -y bat"));
+    try testing.expect(fake.called("sudo dnf mark user -y --setopt=assumeno=0 bat"));
     for (fake.calls.items) |c| {
         try testing.expect(std.mem.indexOf(u8, c, "dnf install") == null);
         try testing.expect(std.mem.indexOf(u8, c, "--installed") != null or std.mem.indexOf(u8, c, "repoquery") == null);
@@ -2497,13 +2937,13 @@ test "install: dnf4 takes the other mark spelling, which dnf5 exits 2 on" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "4.14.0\n  Installed: dnf-0:4.14.0-8.el9.noarch\n" },
-        .{ .argv = "dnf mark install bat" },
+        .{ .argv = "dnf mark install --setopt=assumeno=0 bat" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expectEqual(@as(usize, 1), d.backend().installMarked());
-    try testing.expect(fake.called("dnf mark install bat"));
+    try testing.expect(fake.called("dnf mark install --setopt=assumeno=0 bat"));
 }
 
 test "install: a mark that fails is that row's failure, and the rows beside it go on" {
@@ -2518,10 +2958,10 @@ test "install: a mark that fails is that row's failure, and the rows beside it g
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat fd-find ripgrep", .stdout = "bat\nfd-find\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.4.3.0\n" },
-        .{ .argv = "dnf mark user -y bat", .code = 1 },
-        .{ .argv = "dnf mark user -y fd-find" },
+        .{ .argv = "dnf mark user -y --setopt=assumeno=0 bat", .code = 1 },
+        .{ .argv = "dnf mark user -y --setopt=assumeno=0 fd-find" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -2530,8 +2970,8 @@ test "install: a mark that fails is that row's failure, and the rows beside it g
     try testing.expectEqual(@as(usize, 1), d.backend().installUnmarked());
     try testing.expectEqual(@as(usize, 1), d.backend().installMarked());
     try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
-    try testing.expect(fake.called("dnf install -y ripgrep"));
-    try testing.expect(!fake.called("dnf install -y bat"));
+    try testing.expect(fake.called("dnf install -y --setopt=assumeno=0 ripgrep"));
+    try testing.expect(!fake.called("dnf install -y --setopt=assumeno=0 bat"));
     try testing.expect(std.mem.indexOf(u8, w.written(), "\"bat\" could not be marked user installed, so the row stays missing") != null);
 }
 
@@ -2564,9 +3004,9 @@ test "install: the rows a manager already has are counted apart from the ones it
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat ripgrep", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.4.3.0\n" },
-        .{ .argv = "dnf mark user -y bat" },
+        .{ .argv = "dnf mark user -y --setopt=assumeno=0 bat" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
 
@@ -2574,7 +3014,7 @@ test "install: the rows a manager already has are counted apart from the ones it
     try testing.expectEqual(@as(usize, 1), d.backend().installMarked());
     // The install carries the other row alone: handing it the marked one
     // would install nothing and cost a resolution.
-    try testing.expect(fake.called("dnf install -y ripgrep"));
+    try testing.expect(fake.called("dnf install -y --setopt=assumeno=0 ripgrep"));
 }
 
 test "install: a row apt has as a dependency is marked manual, never installed" {
@@ -2590,6 +3030,8 @@ test "install: a row apt has as a dependency is marked manual, never installed" 
     // Nothing is going to be installed, so nothing is resolved either: no
     // index refresh, no listing, no hold or pin check.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\nlibc6 arm64 install ok installed\n" },
         .{ .argv = "apt-mark showauto", .stdout = "bat\nlibc6\n" },
         .{ .argv = "apt-mark manual bat" },
     } };
@@ -2599,7 +3041,7 @@ test "install: a row apt has as a dependency is marked manual, never installed" 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expectEqual(@as(usize, 1), d.backend().installMarked());
     try testing.expect(fake.called("apt-mark manual bat"));
-    try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+    try testing.expectEqual(@as(usize, 4), fake.calls.items.len);
     try testing.expect(std.mem.indexOf(u8, w.written(), "marking it manually installed") != null);
 }
 
@@ -2615,6 +3057,7 @@ test "install: a held package apt already has is marked, never refused for the h
     // resolves and installs as usual.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto", .stdout = "groff-base\n" },
+        .{ .argv = apt_installed_call, .stdout = "groff-base amd64 install ok installed\n" },
         .{ .argv = "apt-mark manual groff-base" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
@@ -2679,9 +3122,8 @@ test "install: a pacman that cannot sync still marks what the machine already ha
         .{ .argv = "pacman -Qdq", .stdout = "acl\n" },
         .{ .argv = "pacman -D --asexplicit acl" },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null", .code = 1 },
         .{ .argv = "test -e /var/cache/mox/pacman-db/db.lck", .code = 1 },
     } };
@@ -2707,13 +3149,14 @@ test "install: a -Qdq that could not answer is said, never read as no dependency
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 255 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "bat\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
     } };
@@ -2740,13 +3183,14 @@ test "install: a machine with no dependency at all is an answer, not a failed qu
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "bat\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
     } };
@@ -2769,7 +3213,8 @@ test "install: a listing that could not be read leaves the rows to the install, 
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
+        .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto", .code = 7 },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
@@ -2838,13 +3283,14 @@ test "install: pacman refuses a group, naming the packages to declare instead" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra fprintd 1.94.9-1\nextra libfprint 1.94.9-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db fprint", .stdout = "fprint libfprint\nfprint fprintd\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -2878,13 +3324,14 @@ test "install: pacman installs a name only a current database has heard of, rath
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq" },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra ghostty 1.2.0-1\nextra ripgrep 14.1.1-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- ghostty", .stdout = "ghostty\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- ghostty" },
     } };
@@ -2894,8 +3341,8 @@ test "install: pacman installs a name only a current database has heard of, rath
     try d.backend().install(a, &.{rowOf("ghostty", &.{})});
     try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
     try testing.expectEqualStrings("", w.written());
-    try testing.expectEqualStrings(pacman_private_sync, fake.calls.items[5]);
-    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[6]);
+    try testing.expectEqualStrings(pacman_private_sync, fake.calls.items[4]);
+    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[5]);
     try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- ghostty"));
     try testing.expectEqual(@as(usize, 1), pacmanSystemWrites(&fake));
 }
@@ -2916,13 +3363,14 @@ test "install: pacman refuses a name its synced database has nothing for, and in
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra cowsay 3.04-6\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db mox-no-such-package", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- cowsay mox-no-such-package", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- cowsay", .stdout = "cowsay\n" },
@@ -2955,13 +3403,14 @@ test "install: a name pacman lists and still will not install is refused, naming
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nside sidepkg 1-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- sidepkg bat", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- sidepkg", .code = 1, .stderr = "error: target not found: sidepkg\n" },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "oniguruma\nbat\n" },
@@ -2989,13 +3438,14 @@ test "install: a batch that fails names the rows that were in it" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra cowsay 3.04-6\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat cowsay", .stdout = "bat\ncowsay\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- bat cowsay", .code = 1 },
     } };
@@ -3020,7 +3470,7 @@ test "install: a batch that fails names the rows that were in it" {
     var dnf: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
-        .{ .argv = "dnf install -y bat", .code = 1 },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 bat", .code = 1 },
     } };
     var d2: Distro = .{ .manager = .dnf, .runner = dnf.runner(), .force_elevate = false };
     try testing.expectError(Error.DistroInstallFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -3037,8 +3487,8 @@ test "install: an elevated install with no sudo on the machine says so" {
     var pac: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db", .fail = error.FileNotFound },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make, .fail = error.FileNotFound },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = pac.runner(), .force_elevate = true };
     try testing.expectError(exec.Error.SudoNotFound, d.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -3046,6 +3496,8 @@ test "install: an elevated install with no sudo on the machine says so" {
 
     var apt: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update", .fail = error.FileNotFound },
     } };
     var d2: Distro = .{ .manager = .apt, .runner = apt.runner(), .force_elevate = true };
@@ -3074,13 +3526,14 @@ test "install: pacman takes a name that is a package and a group both" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq" },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core base 3-2\ncore base-devel 1-2\nextra kdevelop 25.08.1-1\nextra kdevelop-php 25.08.1-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- kdevelop base-devel base", .stdout = "kdevelop\nbase-devel\nbase\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- kdevelop base-devel base" },
     } };
@@ -3091,7 +3544,7 @@ test "install: pacman takes a name that is a package and a group both" {
     // Asked about no name it already found, so no group query ran at all,
     // and the three were resolved in one `--print`.
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-Sg") == null);
-    try testing.expectEqual(@as(usize, 11), fake.calls.items.len);
+    try testing.expectEqual(@as(usize, 12), fake.calls.items.len);
 }
 
 test "install: a group in a repository this machine never synced is still refused" {
@@ -3113,13 +3566,14 @@ test "install: a group in a repository this machine never synced is still refuse
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "sudo ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make },
         .{ .argv = "sudo pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra exo 4.20.0-1\nextra garcon 4.20.0-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db xfce4", .stdout = "xfce4 exo\nxfce4 garcon\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -3133,9 +3587,9 @@ test "install: a group in a repository this machine never synced is still refuse
     );
     // The listing and the group question both came after the private sync,
     // never against the short database.
-    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[5]);
-    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[6]);
-    try testing.expectEqualStrings("pacman -Sg --dbpath /var/cache/mox/pacman-db xfce4", fake.calls.items[7]);
+    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[4]);
+    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[5]);
+    try testing.expectEqualStrings("pacman -Sg --dbpath /var/cache/mox/pacman-db xfce4", fake.calls.items[6]);
     try testing.expect(!d.backend().installSpawned());
     try testing.expectEqual(@as(usize, 0), pacmanSystemWrites(&fake));
 }
@@ -3155,13 +3609,14 @@ test "install: a row naming an ALPM provision is refused, naming what provides i
         .entries = &.{
             .{ .argv = "pacman -Qdq" },
             .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-            .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-            .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-            .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+            .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+            .{ .argv = pacman_make },
             .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
             .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\ncore cronie 1.7.2-1\n" },
             .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
             .{ .argv = "pacman -Qi" },
+            .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+            nothing_to_upgrade,
             .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db cron", .code = 1 },
             // The batch resolves, and carries bat but not cron: measured, `--
             // bat cron` prints bat's libraries, bat, run-parts and cronie.
@@ -3195,13 +3650,14 @@ test "install: the provision oracle reads the transaction's last name, never a d
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bash 5.3-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db smtp-forwarder", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- smtp-forwarder", .stdout = "libidn\nlibspf2\ndb5.3\nperl\nexim\n" },
     } };
@@ -3225,13 +3681,14 @@ test "install: a name pacman resolves to itself is kept, dependencies and all" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq" },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core glibc 2.42-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db bat", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "llhttp\nlibgit2\noniguruma\nbat\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
@@ -3257,13 +3714,14 @@ test "install: a group is named as a group, never as a provision" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "extra exo 4.20.0-1\nextra garcon 4.20.0-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db xfce4", .stdout = "xfce4 exo\nxfce4 garcon\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -3284,24 +3742,25 @@ test "install: a row the listing already carries is asked of --print, and of not
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq" },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "sudo ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make },
         .{ .argv = "sudo pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\nextra ripgrep 14.1.1-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat ripgrep", .stdout = "oniguruma\nbat\nripgrep\n" },
         .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat ripgrep" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ripgrep", &.{}) });
-    try testing.expectEqual(@as(usize, 11), fake.calls.items.len);
+    try testing.expectEqual(@as(usize, 12), fake.calls.items.len);
     var prints: usize = 0;
     for (fake.calls.items) |c| {
         try testing.expect(std.mem.indexOf(u8, c, "-Sg") == null);
-        if (std.mem.indexOf(u8, c, "--print") != null) prints += 1;
+        if (std.mem.indexOf(u8, c, "-S --print") != null) prints += 1;
     }
     try testing.expectEqual(@as(usize, 1), prints);
 }
@@ -3316,9 +3775,8 @@ test "install: a pacman listing past the cap stops the install, saying that is w
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .fail = error.StreamTooLong },
     } };
@@ -3347,13 +3805,14 @@ test "install: the pacman check syncs its own copy, and the install is the only 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "sudo ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make },
         .{ .argv = "sudo pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Sg --dbpath /var/cache/mox/pacman-db ghostty", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat ghostty", .code = 1 },
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "bat\n" },
@@ -3366,14 +3825,14 @@ test "install: the pacman check syncs its own copy, and the install is the only 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ghostty", &.{}) });
     try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
     try testing.expectEqualStrings("pacman-conf DBPath", fake.calls.items[1]);
-    try testing.expectEqualStrings("stat -c %a " ++ pacman_cache ++ " " ++ pdb, fake.calls.items[2]);
-    try testing.expectEqualStrings("sudo ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local", fake.calls.items[4]);
-    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[5]);
-    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[6]);
-    try testing.expectEqualStrings("sudo pacman -Syu --needed --noconfirm -- bat", fake.calls.items[13]);
-    try testing.expectEqual(@as(usize, 14), fake.calls.items.len);
+    try testing.expectEqualStrings(pacman_probe, fake.calls.items[2]);
+    try testing.expectEqualStrings("sudo " ++ pacman_make, fake.calls.items[3]);
+    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[4]);
+    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[5]);
+    try testing.expectEqualStrings("sudo pacman -Syu --needed --noconfirm -- bat", fake.calls.items[14]);
+    try testing.expectEqual(@as(usize, 15), fake.calls.items.len);
     try testing.expectEqual(@as(usize, 1), pacmanSystemWrites(&fake));
-    for (fake.calls.items[0..10]) |c| try testing.expect(!touchesPacmanSystem(c));
+    for (fake.calls.items[0..11]) |c| try testing.expect(!touchesPacmanSystem(c));
     try testing.expectEqualStrings(
         "mox: pacman: row \"ghostty\" names no pacman package in this machine's repositories\n",
         w.written(),
@@ -3394,22 +3853,23 @@ test "install: an unsynced pacman database is read through mox's copy, and synce
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "sudo ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make },
         .{ .argv = "sudo pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- bat", .stdout = "bat\n" },
         .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
-    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[5]);
-    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[6]);
-    try testing.expectEqualStrings("sudo pacman -Syu --needed --noconfirm -- bat", fake.calls.items[10]);
+    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[4]);
+    try testing.expectEqualStrings("pacman -Sl --dbpath /var/cache/mox/pacman-db", fake.calls.items[5]);
+    try testing.expectEqualStrings("sudo pacman -Syu --needed --noconfirm -- bat", fake.calls.items[11]);
     try testing.expectEqual(@as(usize, 1), pacmanSystemWrites(&fake));
 
     // A private sync that fails is not an install that failed: no install
@@ -3417,9 +3877,8 @@ test "install: an unsynced pacman database is read through mox's copy, and synce
     var down: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = pacman_private_sync, .code = 1 },
         .{ .argv = "test -e " ++ pdb ++ "/db.lck", .code = 1 },
     } };
@@ -3433,15 +3892,14 @@ test "install: an unsynced pacman database is read through mox's copy, and synce
     var conf: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/mnt/arch/var/lib/pacman\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /mnt/arch/var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacmanMakeCall("/mnt/arch/var/lib/pacman/local") },
         .{ .argv = pacman_private_sync, .code = 1 },
         .{ .argv = "test -e " ++ pdb ++ "/db.lck", .code = 1 },
     } };
     var d3: Distro = .{ .manager = .pacman, .runner = conf.runner(), .force_elevate = false };
     try testing.expectError(Error.DistroRefreshFailed, d3.backend().install(a, &.{rowOf("bat", &.{})}));
-    try testing.expect(conf.called("ln -sfn /mnt/arch/var/lib/pacman/local /var/cache/mox/pacman-db/local"));
+    try testing.expect(conf.called(pacmanMakeCall("/mnt/arch/var/lib/pacman/local")));
 }
 
 test "install: apt refuses the qualifiers apt reads as the native architecture" {
@@ -3460,6 +3918,7 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
     }) |c| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "apt-mark showauto" },
+            .{ .argv = apt_installed_call },
             .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
             .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
             .{ .argv = aptNamesCall("arm64"), .stdout = "bsdextrautils\nbsdmainutils\nsl\n" },
@@ -3481,16 +3940,17 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
     // A real foreign architecture still installs: it is the one name apt
     // reports with a colon in it.
     var ok: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
         .{
             .argv = "apt-cache madison libc6:armhf",
             .stdout = "libc6:armhf | 2.41-12+deb13u4 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
-        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("libc6:armhf") },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- libc6:armhf" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = ok.runner(), .force_elevate = false };
@@ -3507,6 +3967,7 @@ test "install: a listing that answers nothing stops the install, saying which" {
     // machine, and name a cause none of the rows has.
     var apt: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .stdout = "" },
@@ -3526,13 +3987,14 @@ test "install: a listing that answers nothing stops the install, saying which" {
     var pac: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
-        .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db" },
-        .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local" },
+        .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
+        .{ .argv = pacman_make },
         .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null" },
         .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "" },
         .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
     } };
     var w2: std.Io.Writer.Allocating = .init(a);
     var d2: Distro = .{ .manager = .pacman, .runner = pac.runner(), .force_elevate = false, .err = &w2.writer };
@@ -3554,6 +4016,7 @@ test "install: a listing past the cap stops the install, saying that is what hap
     // that names no package.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .fail = error.StreamTooLong },
@@ -3577,6 +4040,8 @@ test "install: whether the manager ran is what says the rows may have landed" {
     // refresh, the name listing, the architecture query, and a refused row.
     // None of them can have installed anything.
     var refresh: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .code = 100 },
     } };
@@ -3585,9 +4050,10 @@ test "install: whether the manager ran is what says the rows may have landed" {
     try testing.expect(!d1.backend().installSpawned());
 
     var timeout: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
-        .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .timed_out = true },
     } };
     var d2: Distro = .{ .manager = .apt, .runner = timeout.runner(), .force_elevate = false };
@@ -3595,8 +4061,6 @@ test "install: whether the manager ran is what says the rows may have landed" {
     try testing.expect(!d2.backend().installSpawned());
 
     var arch: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "apt-mark showauto" },
-        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .code = 2 },
     } };
     var d3: Distro = .{ .manager = .apt, .runner = arch.runner(), .force_elevate = false };
@@ -3620,7 +4084,7 @@ test "install: whether the manager ran is what says the rows may have landed" {
     var ran: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "dnf install -y bat", .code = 1 },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 bat", .code = 1 },
     } };
     var d5: Distro = .{ .manager = .dnf, .runner = ran.runner(), .force_elevate = false };
     try testing.expectError(Error.DistroInstallFailed, d5.backend().install(a, &.{rowOf("bat", &.{})}));
@@ -3641,7 +4105,7 @@ test "install: whether the manager ran is what says the rows may have landed" {
     var clean: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "dnf install -y bat" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
     } };
     d5.runner = clean.runner();
     try d5.backend().install(a, &.{rowOf("bat", &.{})});
@@ -3660,6 +4124,7 @@ test "install: a qualifier apt reads as native is judged before the package list
     // what to declare.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
     } };
@@ -3693,9 +4158,11 @@ test "install: a foreign-architecture row beside a good one installs both" {
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = comptime (aptStanza("wine32:armhf") ++ aptStanza("sl")) },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf sl" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
@@ -3723,7 +4190,7 @@ test "install: a bare row apt has only as a locally installed package is kept" {
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nsl\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\nmoxlocaldemo arm64 install ok installed\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("moxlocaldemo") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- moxlocaldemo" },
     } };
@@ -3750,7 +4217,7 @@ test "install: a bare row whose package is an Architecture: all one is kept" {
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = apt_installed_call, .stdout = "moxallpkg all install ok installed\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("moxallpkg") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- moxallpkg" },
     } };
@@ -3920,9 +4387,10 @@ test "install: a qualified row whose package is installed for that architecture 
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
         .{ .argv = "apt-cache madison moxforeigndemo:armhf", .stdout = "" },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = apt_installed_call, .stdout = "moxforeigndemo armhf install ok installed\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("moxforeigndemo:armhf") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- moxforeigndemo:armhf" },
     } };
@@ -3955,7 +4423,7 @@ test "install: a bare row apt has only for a foreign architecture is refused, na
             .stdout = "armv8-support:armhf |         27 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy sl", .stdout = aptStanza("sl") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl" },
     } };
@@ -3972,7 +4440,7 @@ test "install: a bare row apt has only for a foreign architecture is refused, na
     try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl"));
 }
 
-test "install: the bare-name listing asks for the native architecture alone, and for no dpkg status" {
+test "install: the bare-name listing asks for the native architecture alone, no dpkg status, and no virtual names" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -3982,21 +4450,25 @@ test "install: the bare-name listing asks for the native architecture alone, and
     // prints bare on trixie; the status option drops the dpkg status file,
     // which prints an already-installed foreign package bare and keeps the
     // listing non-empty (78 lines on trixie, 88 on bookworm) on a machine
-    // with no repositories at all.
+    // with no repositories at all. The AllNames option overrides an apt.conf
+    // `APT::Cache::AllNames "true"`, under which the listing prints `awk`
+    // (119883 lines against 62840 on bookworm) and the row would be refused
+    // as pinned rather than told what provides it.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
         .{ .argv = "apt-mark showhold" },
-        .{ .argv = "apt-cache policy", .match = .prefix },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expect(fake.called(
-        "apt-cache -o APT::Architectures=amd64 -o Dir::State::status=/dev/null --generate pkgnames",
+        "apt-cache -o APT::Architectures=amd64 -o Dir::State::status=/dev/null -o APT::Cache::AllNames=false --generate pkgnames",
     ));
 }
 
@@ -4016,6 +4488,7 @@ test "install: apt refuses a held row and installs the rest of the batch" {
         .{ .argv = "apt-mark showhold", .stdout = "sl\n" },
         .{ .argv = "apt-cache policy", .match = .prefix, .stdout = "bat:\n  Installed: (none)\n  Candidate: 0.25.0-2\n" },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4065,6 +4538,7 @@ test "install: apt refuses a row a pin leaves no candidate for, and installs the
             ,
         },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4090,10 +4564,13 @@ test "install: a qualified row is judged by its own policy stanza, which carries
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
         .{
             .argv = "apt-cache madison libc6:armhf",
             .stdout = "libc6:armhf | 2.41-12+deb13u4 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = "apt-mark showhold" },
         .{
             .argv = "apt-cache policy libc6:armhf",
@@ -4109,11 +4586,452 @@ test "install: a qualified row is judged by its own policy stanza, which carries
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "apt-get install") == null);
 }
 
-const pacman_probe = "stat -c %a " ++ pacman_cache ++ " " ++ pdb;
+/// What `apt-cache policy mox-flat-armhf mox-flat-i386 sl` printed on apt
+/// 3.0.3 (trixie, arm64 with armhf added) over a flat repository holding an
+/// armhf and an i386 package: every operand gets a stanza, the i386 one
+/// included though dpkg has not enabled i386.
+const flat_policy_303 =
+    \\mox-flat-armhf:armhf:
+    \\  Installed: (none)
+    \\  Candidate: 1.0
+    \\  Version table:
+    \\     1.0 500
+    \\        500 file:/repo ./ Packages
+    \\mox-flat-i386:i386:
+    \\  Installed: (none)
+    \\  Candidate: 1.0
+    \\  Version table:
+    \\     1.0 500
+    \\        500 file:/repo ./ Packages
+    \\sl:
+    \\  Installed: (none)
+    \\  Candidate: 5.02-1+b1
+    \\  Version table:
+    \\     5.02-1+b1 500
+    \\        500 http://deb.debian.org/debian stable/main arm64 Packages
+    \\
+;
+
+/// The same query on apt 2.6.1 (bookworm): the i386 operand gets no stanza
+/// at all, and nothing on stderr either.
+const flat_policy_261 =
+    \\mox-flat-armhf:armhf:
+    \\  Installed: (none)
+    \\  Candidate: 1.0
+    \\  Version table:
+    \\     1.0 500
+    \\        500 file:/repo ./ Packages
+    \\sl:
+    \\  Installed: (none)
+    \\  Candidate: 5.02-1
+    \\  Version table:
+    \\     5.02-1 500
+    \\        500 http://deb.debian.org/debian bookworm/main arm64 Packages
+    \\
+;
+
+test "install: a bare row a flat index holds for a foreign architecture alone is refused by its policy header" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 2.6.1, 2.8.3 and 3.0.3 with `deb [trusted=yes]
+    // file:/repo ./` over an index from dpkg-scanpackages: the native
+    // listing prints both `mox-flat-armhf` and `mox-flat-i386` bare, and
+    // `apt-get install -y -- mox-flat-armhf` installs `mox-flat-armhf:armhf`,
+    // which apt-mark reports qualified. The i386 row takes the batch down
+    // instead: "Unable to locate package" on 2.6.1, "package architecture
+    // (i386) does not match system (arm64)" from dpkg on 3.0.3.
+    for ([_]struct { policy: []const u8, i386: []const u8 }{
+        .{
+            .policy = flat_policy_303,
+            .i386 = "mox: apt: row \"mox-flat-i386\" names an apt package for the architecture \"i386\" alone, which this machine's dpkg has not enabled, so an install carrying it fails at dpkg and installs nothing at all, and it was not installed; `dpkg --add-architecture i386` and declare \"mox-flat-i386:i386\" to let mox install it\n",
+        },
+        .{
+            .policy = flat_policy_261,
+            .i386 = "mox: apt: row \"mox-flat-i386\" names a package apt-cache policy prints no stanza for, which is an operand apt cannot locate at all, and an install carrying one installs nothing at all, so it was not installed\n",
+        },
+    }) |c| {
+        var fake: exec.Fake = .{ .arena = a, .entries = &.{
+            .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+            .{ .argv = apt_installed_call },
+            .{ .argv = "apt-mark showauto" },
+            .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+            .{ .argv = aptNamesCall("arm64"), .stdout = "mox-flat-i386\nmox-flat-armhf\nsl\n" },
+            .{ .argv = "apt-mark showhold" },
+            .{ .argv = "apt-cache policy mox-flat-armhf mox-flat-i386 sl", .stdout = c.policy },
+            .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
+            .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl" },
+        } };
+        var w: std.Io.Writer.Allocating = .init(a);
+        var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+        try d.backend().install(a, &.{ rowOf("mox-flat-armhf", &.{}), rowOf("mox-flat-i386", &.{}), rowOf("sl", &.{}) });
+        try testing.expectEqual(@as(usize, 2), d.backend().installRefused());
+        const want = try std.mem.concat(a, u8, &.{
+            "mox: apt: row \"mox-flat-armhf\" names an apt package for the architecture \"armhf\" alone, which apt-mark reports as \"mox-flat-armhf:armhf\", so the row could never read as installed; declare \"mox-flat-armhf:armhf\" instead\n",
+            c.i386,
+        });
+        try testing.expectEqualStrings(want, w.written());
+        try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl"));
+        // The flat index gave the listing nothing to refuse on, so madison
+        // was never the oracle here.
+        for (fake.calls.items) |call| try testing.expect(std.mem.indexOf(u8, call, "madison") == null);
+    }
+}
+
+test "install: a bare row after the qualified one for the same package takes its own stanza, not the one before it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `apt-cache policy` prints one stanza per operand, in operand order,
+    // with no dedup, so each row must take the next stanza that answers it
+    // rather than the first. Both rows are legal on a machine with armhf
+    // added, and measured there on apt 3.0.3 (trixie) and 2.6.1
+    // (bookworm), `apt-cache policy sl:armhf sl` prints the armhf stanza
+    // first:
+    //
+    //     sl:armhf:
+    //       Installed: (none)
+    //       Candidate: 5.02-1
+    //       Version table:
+    //          5.02-1 500
+    //             500 http://deb.debian.org/debian stable/main armhf Packages
+    //     sl:
+    //       Installed: (none)
+    //       Candidate: 5.02-1+b1
+    //       Version table:
+    //          5.02-1+b1 500
+    //             500 http://deb.debian.org/debian stable/main arm64 Packages
+    //
+    // A bare row taking the first stanza that answers it would read the
+    // armhf header and be refused as foreign-only, though apt installs it
+    // native.
+    const policy =
+        "sl:armhf:\n  Installed: (none)\n  Candidate: 5.02-1\n  Version table:\n     5.02-1 500\n        500 http://deb.debian.org/debian stable/main armhf Packages\n" ++
+        "sl:\n  Installed: (none)\n  Candidate: 5.02-1+b1\n  Version table:\n     5.02-1+b1 500\n        500 http://deb.debian.org/debian stable/main arm64 Packages\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
+        .{
+            .argv = "apt-cache madison sl:armhf",
+            .stdout = "sl:armhf |     5.02-1 | http://deb.debian.org/debian stable/main armhf Packages\n",
+        },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "sl\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy sl:armhf sl", .stdout = policy },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl:armhf sl" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("sl:armhf", &.{}), rowOf("sl", &.{}) });
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl:armhf sl"));
+}
+
+test "install: a stanza whose header merely extends the row's name answers the row it was printed for" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A stanza answers a bare row when its header is that name qualified,
+    // which is a `:` after the name and nothing else. Measured on apt 2.6.1
+    // (bookworm) with a flat index from dpkg-scanpackages holding
+    // `mox-flat-i386` built i386 and `mox-flat-i386-tools` built arm64,
+    // i386 not enabled: the native listing prints both bare, and
+    // `apt-cache policy mox-flat-i386 mox-flat-i386-tools` prints one
+    // stanza only --
+    //
+    //     mox-flat-i386-tools:
+    //       Installed: (none)
+    //       Candidate: 1.0
+    //       Version table:
+    //          1.0 500
+    //             500 file:/repo ./ Packages
+    //
+    // -- so a rule that took any header starting with the row's name would
+    // keep the row apt cannot locate and refuse the one it would install.
+    const policy = "mox-flat-i386-tools:\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 500\n        500 file:/repo ./ Packages\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "mox-flat-i386\nmox-flat-i386-tools\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy mox-flat-i386 mox-flat-i386-tools", .stdout = policy },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- mox-flat-i386-tools" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("mox-flat-i386", &.{}), rowOf("mox-flat-i386-tools", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"mox-flat-i386\" names a package apt-cache policy prints no stanza for, which is an operand apt cannot locate at all, and an install carrying one installs nothing at all, so it was not installed\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- mox-flat-i386-tools"));
+}
+
+test "install: the policy stanzas are matched to the rows in order, a row apt cannot locate taking none" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The unlocatable row sits between two answered ones, so a match by
+    // position would hand it the stanza after it and refuse the wrong row.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nmox-flat-i386\nsl\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy bat mox-flat-i386 sl", .stdout = comptime (aptStanza("bat") ++ aptStanza("sl")) },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat sl" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("mox-flat-i386", &.{}), rowOf("sl", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expect(std.mem.indexOf(u8, w.written(), "row \"mox-flat-i386\" names a package apt-cache policy prints no stanza for") != null);
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat sl"));
+}
+
+test "install: a qualified row a flat index carries installs, madison naming the architecture in the name column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 2.6.1 and 3.0.3: the flat line is `mox-flat-armhf:armhf
+    // |        1.0 | file:/repo ./ Packages`, whose word before `Packages`
+    // is the suite `./` rather than an architecture, and `apt-get install
+    // -y -- mox-flat-armhf:armhf` installs it, after which apt-mark reports
+    // `mox-flat-armhf:armhf` and the row converges.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
+        .{ .argv = "apt-cache madison mox-flat-armhf:armhf", .stdout = "mox-flat-armhf:armhf |        1.0 | file:/repo ./ Packages\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy mox-flat-armhf:armhf", .stdout = "mox-flat-armhf:armhf:\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 500\n        500 file:/repo ./ Packages\n" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- mox-flat-armhf:armhf" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("mox-flat-armhf:armhf", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- mox-flat-armhf:armhf"));
+
+    // The same line read for a bare row the listing lacks: the architecture
+    // comes from the name column, never from the suite, so the row is told
+    // the qualified spelling rather than kept for a `./` architecture.
+    var bare: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "sl\n" },
+        .{ .argv = "apt-cache madison mox-flat-armhf", .stdout = "mox-flat-armhf:armhf |        1.0 | file:/repo ./ Packages\n" },
+    } };
+    var bw: std.Io.Writer.Allocating = .init(a);
+    var db: Distro = .{ .manager = .apt, .runner = bare.runner(), .force_elevate = false, .err = &bw.writer };
+    try db.backend().install(a, &.{rowOf("mox-flat-armhf", &.{})});
+    try testing.expectEqual(@as(usize, 1), db.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"mox-flat-armhf\" names an apt package for the architecture \"armhf\" alone, which apt-mark reports as \"mox-flat-armhf:armhf\", so the row could never read as installed; declare \"mox-flat-armhf:armhf\" instead\n",
+        bw.written(),
+    );
+
+    // A native package in a flat index is spelled bare in that column, and
+    // is what the listing already kept: the line names no foreign
+    // architecture, so the row is refused as the listing's regex case.
+    var native: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "sl\n" },
+        .{ .argv = "apt-cache madison mox-flat-native", .stdout = "mox-flat-native |        1.0 | file:/repo ./ Packages\n" },
+        .{ .argv = "apt-cache showpkg mox-flat-native", .stdout = "" },
+    } };
+    var nw: std.Io.Writer.Allocating = .init(a);
+    var dn: Distro = .{ .manager = .apt, .runner = native.runner(), .force_elevate = false, .err = &nw.writer };
+    try dn.backend().install(a, &.{rowOf("mox-flat-native", &.{})});
+    try testing.expect(std.mem.indexOf(u8, nw.written(), "declare") == null);
+    try testing.expect(std.mem.indexOf(u8, nw.written(), "row \"mox-flat-native\" names no apt package") != null);
+}
+
+test "install: a qualified row naming an architecture dpkg has not enabled is refused, unless dpkg has the package under it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 2.6.1 and 3.0.3: `dpkg --print-foreign-architectures`
+    // prints nothing when none is enabled, and `apt-cache madison` on 3.0.3
+    // still lists `mox-flat-i386:i386` from a flat index -- so the enabled
+    // set is what says the install would fail at dpkg.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("mox-flat-i386:i386", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: apt: row \"mox-flat-i386:i386\" qualifies the architecture \"i386\", which this machine's dpkg has not enabled and has no package installed under, so it was not installed; `dpkg --add-architecture i386` to let mox install it\n",
+        w.written(),
+    );
+    for (fake.calls.items) |call| try testing.expect(std.mem.indexOf(u8, call, "madison") == null);
+
+    // `dpkg -i --force-architecture` leaves a package installed under an
+    // architecture dpkg has not enabled; measured on both, `apt-cache policy
+    // mox-force-i386:i386` answers a stanza from the status file and
+    // `apt-get install -y -- mox-force-i386:i386` exits 0 setting it manual.
+    var forced: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .stdout = "mox-force-i386 i386 install ok installed\n" },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy mox-force-i386:i386", .stdout = "mox-force-i386:i386:\n  Installed: 1.0\n  Candidate: 1.0\n  Version table:\n *** 1.0 100\n        100 /var/lib/dpkg/status\n" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- mox-force-i386:i386" },
+    } };
+    var fw: std.Io.Writer.Allocating = .init(a);
+    var df: Distro = .{ .manager = .apt, .runner = forced.runner(), .force_elevate = false, .err = &fw.writer };
+    try df.backend().install(a, &.{rowOf("mox-force-i386:i386", &.{})});
+    try testing.expectEqual(@as(usize, 0), df.backend().installRefused());
+    try testing.expectEqualStrings("", fw.written());
+    try testing.expect(forced.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- mox-force-i386:i386"));
+}
+
+test "installedExplicit: apt's manual set holds only what dpkg has configured" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 2.6.1 and 3.0.3 with `sl` unpacked by `dpkg --unpack`
+    // over its installed self: `apt-mark showmanual` prints `sl` and
+    // `dpkg-query` answers `sl arm64 install ok unpacked`. A foreign package
+    // is spelled qualified by apt-mark and bare with its architecture by
+    // dpkg-query, and a Multi-Arch: same native one is bare in both.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "apt-mark showmanual", .stdout = "sl\ncowsay\nlibc6\nlibc6:armhf\nmox-gone\n" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = apt_installed_call,
+            .stdout = "cowsay all install ok installed\nlibc6 arm64 install ok installed\nlibc6 armhf install ok installed\nmox-gone arm64 deinstall ok config-files\nsl arm64 install ok unpacked\n",
+        },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
+
+    const got = try d.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqualStrings("cowsay", got[0]);
+    try testing.expectEqualStrings("libc6", got[1]);
+    try testing.expectEqualStrings("libc6:armhf", got[2]);
+}
+
+test "install: a row apt-mark reports but dpkg left unpacked is installed, which configures it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 2.6.1 and 3.0.3: `apt-get install -y -- sl` on the
+    // unpacked package exits 0 printing `Setting up sl`, and on an unpacked
+    // package apt-mark holds as auto it prints "cowsay is already the newest
+    // version", "cowsay set to manually installed" and configures it too --
+    // where `apt-mark manual cowsay` alone leaves it unpacked. So neither
+    // row is marked; both go to the install.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .stdout = "cowsay all install ok unpacked\nsl arm64 install ok unpacked\n" },
+        .{ .argv = "apt-mark showauto", .stdout = "cowsay\n" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "cowsay\nsl\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy sl cowsay", .stdout = comptime (aptStanza("sl") ++ aptStanza("cowsay")) },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl cowsay" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("sl", &.{}), rowOf("cowsay", &.{}) });
+    try testing.expectEqual(@as(usize, 0), d.backend().installMarked());
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl cowsay"));
+    for (fake.calls.items) |call| try testing.expect(std.mem.indexOf(u8, call, "apt-mark manual") == null);
+}
+
+test "install: dnf's install and mark carry --setopt=assumeno=0, which a dnf.conf assumeno=True would otherwise beat" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured under `assumeno=True` in dnf.conf: `dnf install -y tree`
+    // exits 1 with "Operation aborted." on dnf 4.14.0 and `dnf install -y
+    // sl` with "Operation aborted by the user." on dnf5 5.2.18 and 5.4.3,
+    // nothing installed; `dnf mark user -y sl` on both dnf5 the same. With
+    // the option each exits 0 and does its work.
+    var five: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat sl", .stdout = "bat\n" },
+        .{ .argv = "dnf --version", .stdout = "dnf5 version 5.2.18.0\n" },
+        .{ .argv = "sudo dnf mark user -y --setopt=assumeno=0 bat" },
+        .{ .argv = "dnf -q repoquery --qf %{name}\n sl", .stdout = "sl\n" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 sl" },
+    } };
+    var d5: Distro = .{ .manager = .dnf, .runner = five.runner(), .force_elevate = true };
+    try d5.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("sl", &.{}) });
+    try testing.expect(five.called("sudo dnf mark user -y --setopt=assumeno=0 bat"));
+    try testing.expectEqualStrings("sudo dnf install -y --setopt=assumeno=0 sl", five.calls.items[five.calls.items.len - 1]);
+
+    var four: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat tree", .stdout = "bat\n" },
+        .{ .argv = "dnf --version", .stdout = "4.14.0\n" },
+        .{ .argv = "sudo dnf mark install --setopt=assumeno=0 bat" },
+        .{ .argv = "dnf -q repoquery --qf %{name}\n tree", .stdout = "tree\n" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 tree" },
+    } };
+    var d4: Distro = .{ .manager = .dnf, .runner = four.runner(), .force_elevate = true };
+    try d4.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("tree", &.{}) });
+    try testing.expect(four.called("sudo dnf mark install --setopt=assumeno=0 bat"));
+    try testing.expectEqualStrings("sudo dnf install -y --setopt=assumeno=0 tree", four.calls.items[four.calls.items.len - 1]);
+}
+
+const pacman_probe = "stat -L -c %n %a %F " ++ pacman_cache ++ " " ++ pdb;
+const pacman_probe_ready = pacman_cache ++ " 755 directory\n" ++ pdb ++ " 755 directory\n";
 const pacman_link = "readlink " ++ pdb ++ "/local";
-const pacman_make = "install -d -m 755 " ++ pacman_cache ++ " " ++ pdb;
+const pacman_make = pacmanMakeCall("/var/lib/pacman/local");
+
+/// The one call that makes the copy, with `local` the system's, as the
+/// Fake joins it.
+fn pacmanMakeCall(comptime local: []const u8) []const u8 {
+    return "sh -c " ++ Distro.pacman_make_script ++ " sh " ++ pacman_cache ++ " " ++ pdb ++ " " ++ local ++ " " ++ pdb ++ "/local";
+}
 const pacman_print = "pacman -S --print --print-format %n --dbpath " ++ pdb ++ " --";
 const pacman_info = "pacman -Si --dbpath " ++ pdb ++ " --";
+const pacman_pending = "pacman -Qu --dbpath " ++ pdb;
+
+/// What the upgrade's own target list prints on a machine with nothing to
+/// upgrade: measured on pacman 7.1.0, exit 0 with both streams empty.
+const nothing_to_upgrade: exec.Fake.Entry = .{ .argv = "pacman -Su --print --print-format %n --dbpath " ++ pdb };
 
 test "install: pacman refuses a row whose dependency nothing satisfies, in pacman's own words, and installs the rest" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4133,7 +5051,6 @@ test "install: pacman refuses a row whose dependency nothing satisfies, in pacma
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra amsynth 1.13.4-1\nextra cowsay 3.8.4-1\n" },
         .{ .argv = pacman_print ++ " amsynth cowsay", .code = 1, .stderr = unsat_err, .stdout = ":: unable to satisfy dependency 'gtk2' required by amsynth\n" },
@@ -4141,6 +5058,8 @@ test "install: pacman refuses a row whose dependency nothing satisfies, in pacma
         .{ .argv = pacman_print ++ " cowsay", .stdout = "cowsay\n" },
         .{ .argv = pacman_info ++ " cowsay", .stdout = "Name            : cowsay\nVersion         : 3.8.4-1\nProvides        : None\nConflicts With  : None\n" },
         .{ .argv = "pacman -Qi", .stdout = "Name            : bash\nVersion         : 5.3-1\nProvides        : sh\nConflicts With  : None\n" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Syu --needed --noconfirm -- cowsay" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4163,7 +5082,6 @@ test "install: pacman refuses a row whose dependency nothing satisfies, in pacma
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra cowsay 3.8.4-1\nside odd 1-1\n" },
         .{ .argv = pacman_print ++ " odd cowsay", .code = 1, .stderr = "error: database 'side' is not valid (invalid or corrupted database (PGP signature))\n" },
@@ -4171,6 +5089,8 @@ test "install: pacman refuses a row whose dependency nothing satisfies, in pacma
         .{ .argv = pacman_print ++ " cowsay", .stdout = "cowsay\n" },
         .{ .argv = pacman_info, .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Syu --needed --noconfirm -- cowsay" },
     } };
     var w2: std.Io.Writer.Allocating = .init(a);
@@ -4195,23 +5115,21 @@ test "install: pacman refuses a row that conflicts with an installed package, na
     // cowsay` asks "Remove pulseaudio? [y/N]", answers it no, says
     // "unresolvable package conflicts detected", exits 1, and cowsay is
     // not installed -- on every apply. `pacman -Si pipewire-pulse` reads
-    // `Conflicts With  : pulseaudio`, `pacman -T -- pulseaudio` exits 0,
-    // and `pacman -Qq -- pulseaudio` answers `pulseaudio`.
-    const si = "Name            : pipewire-pulse\nVersion         : 1:1.6.8-1\nProvides        : pulse-native-provider\nConflicts With  : pulseaudio\n\nName            : cowsay\nVersion         : 3.8.4-1\nProvides        : None\nConflicts With  : None\n";
-    const qi = "Name            : pulseaudio\nVersion         : 17.0+r98+gb096704c0-1\nProvides        : pulse-native-provider\nConflicts With  : pipewire-pulse\n\nName            : bash\nVersion         : 5.3-1\nProvides        : sh\nConflicts With  : None\n";
+    // `Conflicts With  : pulseaudio`, and `pacman -Qi` has pulseaudio.
+    const si = "Name            : pipewire-pulse\nVersion         : 1:1.6.8-1\nProvides        : pulse-native-provider\nConflicts With  : pulseaudio\nReplaces        : None\n\nName            : cowsay\nVersion         : 3.8.4-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    const qi = "Name            : pulseaudio\nVersion         : 17.0+r98+gb096704c0-1\nProvides        : pulse-native-provider\nConflicts With  : pipewire-pulse\nReplaces        : None\n\nName            : bash\nVersion         : 5.3-1\nProvides        : sh\nConflicts With  : None\nReplaces        : None\n";
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra pipewire-pulse 1:1.6.8-1\nextra cowsay 3.8.4-1\n" },
         .{ .argv = pacman_print ++ " pipewire-pulse cowsay", .stdout = "libpipewire\npipewire-pulse\ncowsay\n" },
         .{ .argv = pacman_info ++ " pipewire-pulse cowsay", .stdout = si },
-        .{ .argv = "pacman -T -- pulseaudio" },
         .{ .argv = "pacman -Qi", .stdout = qi },
-        .{ .argv = "pacman -Qq -- pulseaudio", .stdout = "pulseaudio\n" },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Syu --needed --noconfirm -- cowsay" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4225,24 +5143,24 @@ test "install: pacman refuses a row that conflicts with an installed package, na
     );
     try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- cowsay"));
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "-R") == null);
+    // A bare spec needs no comparison.
+    try testing.expectEqual(@as(usize, 0), countCalls(&fake, "vercmp"));
 
     // A conflict spelled as a provision names the package that provides
-    // it: measured, `pacman -Qq -- pulse-native-provider` answers
-    // `pulseaudio`. The spec that IS unsatisfied (`-T` prints it) is no
-    // conflict.
+    // it, `pacman -Qi` listing the provision under that package. The spec
+    // nothing installed answers to (`jack<2`) is no conflict.
     var prov: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra other-sound 1-1\n" },
         .{ .argv = pacman_print ++ " other-sound", .stdout = "other-sound\n" },
-        .{ .argv = pacman_info ++ " other-sound", .stdout = "Name            : other-sound\nVersion         : 1-1\nProvides        : None\nConflicts With  : jack<2  pulse-native-provider\n" },
-        .{ .argv = "pacman -T -- jack<2 pulse-native-provider", .code = 127, .stdout = "jack<2\n" },
+        .{ .argv = pacman_info ++ " other-sound", .stdout = "Name            : other-sound\nVersion         : 1-1\nProvides        : None\nConflicts With  : jack<2  pulse-native-provider\nReplaces        : None\n" },
         .{ .argv = "pacman -Qi", .stdout = qi },
-        .{ .argv = "pacman -Qq -- pulse-native-provider", .stdout = "pulseaudio\n" },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
     } };
     var w2: std.Io.Writer.Allocating = .init(a);
     var d2: Distro = .{ .manager = .pacman, .runner = prov.runner(), .force_elevate = false, .err = &w2.writer };
@@ -4255,6 +5173,422 @@ test "install: pacman refuses a row that conflicts with an installed package, na
     try testing.expect(!d2.backend().installSpawned());
 }
 
+test "install: a versioned pacman conflict is judged against the version the apply's upgrade leaves" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0 with a repository of `srv` at 1-1 and 2-1
+    // and `drv` declaring `conflict = srv<2`, srv 1-1 installed: `pacman
+    // -Qu --dbpath <copy>` prints `srv 1-1 -> 2-1` and exits 0, `vercmp
+    // 1-1 2` is -1 and `vercmp 2-1 2` is 0, and `pacman -Syu --needed
+    // --noconfirm -- drv` upgrades srv and installs drv in the one
+    // transaction (`Packages (2) srv-2-1  drv-1-1`, exit 0). Judged
+    // against the machine as it stood, the row was refused on every
+    // apply, with instructions to remove a package the upgrade moves past.
+    const drv = "Name            : drv\nVersion         : 1-1\nProvides        : None\nConflicts With  : srv<2\nReplaces        : None\n";
+    const srv_old = "Name            : srv\nVersion         : 1-1\nProvides        : virt=1\nConflicts With  : None\nReplaces        : None\n";
+    const srv_new = "Repository      : moxtest\nName            : srv\nVersion         : 2-1\nProvides        : virt=2\nConflicts With  : None\nReplaces        : None\n";
+    var pending: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 2-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .stdout = "libsecret 0.21.7-1 -> 0.21.8.2-1\nsrv 1-1 -> 2-1\n" },
+        nothing_to_upgrade,
+        .{ .argv = pacman_info ++ " srv", .stdout = srv_new },
+        .{ .argv = "vercmp 2-1 2", .stdout = "0\n" },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- drv" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = pending.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(pending.called("pacman -Syu --needed --noconfirm -- drv"));
+    try testing.expect(!pending.called("vercmp 1-1 2"));
+
+    // No upgrade pending: the installed version is the one judged, and it
+    // does satisfy `srv<2`.
+    var settled: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 1-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .stdout = "-1\n" },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = settled.runner(), .force_elevate = false, .err = &w2.writer };
+    try d2.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqual(@as(usize, 1), d2.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: row \"drv\" names a package that conflicts with \"srv<2\", which this machine has installed as \"srv\"; pacman would have to remove srv to install it, and mox never removes a package, so the row was not installed: remove srv yourself, or drop the row\n",
+        w2.written(),
+    );
+    try testing.expect(!d2.backend().installSpawned());
+
+    // An upgrade `IgnorePkg` keeps back is not one the apply makes: the
+    // installed version stays the one judged.
+    var ignored: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 2-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .stdout = "srv 1-1 -> 2-1 [ignored]\n" },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .stdout = "-1\n" },
+    } };
+    var w3: std.Io.Writer.Allocating = .init(a);
+    var d3: Distro = .{ .manager = .pacman, .runner = ignored.runner(), .force_elevate = false, .err = &w3.writer };
+    try d3.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqual(@as(usize, 1), d3.backend().installRefused());
+    try testing.expect(!ignored.called(pacman_info ++ " srv"));
+
+    // A provision the upgrade raises past the spec: `virt<2` against
+    // `virt=1` today and `virt=2` after.
+    const vdrv = "Name            : vdrv\nVersion         : 1-1\nProvides        : None\nConflicts With  : virt<2\nReplaces        : None\n";
+    var provided: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest vdrv 1-1\nmoxtest srv 2-1\n" },
+        .{ .argv = pacman_print ++ " vdrv", .stdout = "vdrv\n" },
+        .{ .argv = pacman_info ++ " vdrv", .stdout = vdrv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .stdout = "srv 1-1 -> 2-1\n" },
+        nothing_to_upgrade,
+        .{ .argv = pacman_info ++ " srv", .stdout = srv_new },
+        .{ .argv = "vercmp 2 2", .stdout = "0\n" },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- vdrv" },
+    } };
+    var d4: Distro = .{ .manager = .pacman, .runner = provided.runner(), .force_elevate = false };
+    try d4.backend().install(a, &.{rowOf("vdrv", &.{})});
+    try testing.expectEqual(@as(usize, 0), d4.backend().installRefused());
+    try testing.expect(provided.called("pacman -Syu --needed --noconfirm -- vdrv"));
+
+    // `vercmp` that could not compare: said, and the row left to pacman.
+    var broken: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 1-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .code = 127 },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- drv" },
+    } };
+    var w5: std.Io.Writer.Allocating = .init(a);
+    var d5: Distro = .{ .manager = .pacman, .runner = broken.runner(), .force_elevate = false, .err = &w5.writer };
+    try d5.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqual(@as(usize, 0), d5.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: `vercmp 1-1 2` exited 127 rather than comparing them, so whether \"srv<2\" is a conflict is left to pacman, which then installs none of the batch if it is\n",
+        w5.written(),
+    );
+    try testing.expect(broken.called("pacman -Syu --needed --noconfirm -- drv"));
+}
+
+test "install: a package the row replaces is no conflict, since the apply's upgrade replaces it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0 with `newpkg` declaring `conflict = oldpkg`
+    // and `replaces = oldpkg<2`, oldpkg 1-1 installed: `pacman -Si` reads
+    // `Conflicts With  : oldpkg` and `Replaces        : oldpkg<2`, `vercmp
+    // 1-1 2` is -1, and `pacman -Syu --needed --noconfirm -- newpkg` asks
+    // ":: Replace oldpkg with moxtest/newpkg? [Y/n]", takes the yes, and
+    // exits 0 with newpkg installed and oldpkg gone. Judged as a conflict,
+    // the row was refused on every apply, with instructions to remove a
+    // package pacman would have replaced.
+    const si = "Name            : newpkg\nVersion         : 1-1\nProvides        : None\nConflicts With  : oldpkg\nReplaces        : oldpkg<2\n";
+    const qi = "Name            : oldpkg\nVersion         : 1-1\nProvides        : None\nConflicts With  : newpkg\nReplaces        : None\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest newpkg 1-1\nmoxtest oldpkg 1-1\n" },
+        .{ .argv = pacman_print ++ " newpkg", .stdout = "newpkg\n" },
+        .{ .argv = pacman_info ++ " newpkg", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .stdout = "-1\n" },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- newpkg" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("newpkg", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- newpkg"));
+
+    // A replacement the installed version does not satisfy replaces
+    // nothing, and the conflict stands.
+    var newer: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest newpkg 1-1\nmoxtest oldpkg 3-1\n" },
+        .{ .argv = pacman_print ++ " newpkg", .stdout = "newpkg\n" },
+        .{ .argv = pacman_info ++ " newpkg", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = "Name            : oldpkg\nVersion         : 3-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 3-1 2", .stdout = "1\n" },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = newer.runner(), .force_elevate = false, .err = &w2.writer };
+    try d2.backend().install(a, &.{rowOf("newpkg", &.{})});
+    try testing.expectEqual(@as(usize, 1), d2.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: row \"newpkg\" names a package that conflicts with \"oldpkg\", which this machine has installed; pacman would have to remove oldpkg to install it, and mox never removes a package, so the row was not installed: remove oldpkg yourself, or drop the row\n",
+        w2.written(),
+    );
+}
+
+test "install: an installed package a THIRD package replaces is no conflict, read from the upgrade's own targets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `pacman -Qu` is blind to a replacement, so the row's own `Replaces`
+    // is not the whole answer. Measured on pacman 7.1.0 with `oldname 1-1`
+    // installed and the repository carrying `newname 2-1` alone, whose
+    // `Replaces        : oldname`: `pacman -Qu --dbpath <copy>` exits 1
+    // printing nothing on either stream, `pacman -Su --print --print-format
+    // '%n' --dbpath <copy>` exits 0 printing `newname`, and `pacman -Syu
+    // --needed --noconfirm -- conflictrow goodpkg` exits 0 having answered
+    // ":: Replace oldname with moxtest/newname? [Y/n]" yes, removing
+    // oldname and installing all three. Judged against `-Qu` alone, mox
+    // refused conflictrow and told the user to remove oldname itself.
+    const si = "Name            : conflictrow\nVersion         : 1-1\nProvides        : None\nConflicts With  : oldname\nReplaces        : None\n";
+    const qi = "Name            : oldname\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    const newname = "Repository      : moxtest\nName            : newname\nVersion         : 2-1\nProvides        : None\nConflicts With  : None\nReplaces        : oldname\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest conflictrow 1-1\nmoxtest newname 2-1\n" },
+        .{ .argv = pacman_print ++ " conflictrow", .stdout = "conflictrow\n" },
+        .{ .argv = pacman_info ++ " conflictrow", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        .{ .argv = "pacman -Su --print --print-format %n --dbpath " ++ pdb, .stdout = "newname\n" },
+        .{ .argv = pacman_info ++ " newname", .stdout = newname },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- conflictrow" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("conflictrow", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- conflictrow"));
+    // Only the names the machine does not already have are asked about.
+    try testing.expect(!fake.called(pacman_info ++ " oldname"));
+
+    // Nothing pending replaces it: oldname is on the machine the upgrade
+    // leaves, and the conflict stands.
+    var settled: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest conflictrow 1-1\nmoxtest oldname 1-1\n" },
+        .{ .argv = pacman_print ++ " conflictrow", .stdout = "conflictrow\n" },
+        .{ .argv = pacman_info ++ " conflictrow", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = settled.runner(), .force_elevate = false, .err = &w2.writer };
+    try d2.backend().install(a, &.{rowOf("conflictrow", &.{})});
+    try testing.expectEqual(@as(usize, 1), d2.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: row \"conflictrow\" names a package that conflicts with \"oldname\", which this machine has installed; pacman would have to remove oldname to install it, and mox never removes a package, so the row was not installed: remove oldname yourself, or drop the row\n",
+        w2.written(),
+    );
+    try testing.expect(!d2.backend().installSpawned());
+
+    // A `Replaces` the installed version does not satisfy replaces nothing.
+    const bounded = "Repository      : moxtest\nName            : newname\nVersion         : 2-1\nProvides        : None\nConflicts With  : None\nReplaces        : oldname<1\n";
+    var unsatisfied: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest conflictrow 1-1\nmoxtest newname 2-1\n" },
+        .{ .argv = pacman_print ++ " conflictrow", .stdout = "conflictrow\n" },
+        .{ .argv = pacman_info ++ " conflictrow", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        .{ .argv = "pacman -Su --print --print-format %n --dbpath " ++ pdb, .stdout = "newname\n" },
+        .{ .argv = pacman_info ++ " newname", .stdout = bounded },
+        .{ .argv = "vercmp 1-1 1", .stdout = "0\n" },
+    } };
+    var w3: std.Io.Writer.Allocating = .init(a);
+    var d3: Distro = .{ .manager = .pacman, .runner = unsatisfied.runner(), .force_elevate = false, .err = &w3.writer };
+    try d3.backend().install(a, &.{rowOf("conflictrow", &.{})});
+    try testing.expectEqual(@as(usize, 1), d3.backend().installRefused());
+    try testing.expect(std.mem.indexOf(u8, w3.written(), "remove oldname yourself") != null);
+
+    // The other direction: the replaced package is the one declaring the
+    // conflict, and it is gone from the same machine.
+    const plain = "Name            : rowx\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    const declares = "Name            : oldname\nVersion         : 1-1\nProvides        : None\nConflicts With  : rowx\nReplaces        : None\n";
+    var reverse: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest rowx 1-1\nmoxtest newname 2-1\n" },
+        .{ .argv = pacman_print ++ " rowx", .stdout = "rowx\n" },
+        .{ .argv = pacman_info ++ " rowx", .stdout = plain },
+        .{ .argv = "pacman -Qi", .stdout = declares },
+        .{ .argv = pacman_pending, .code = 1 },
+        .{ .argv = "pacman -Su --print --print-format %n --dbpath " ++ pdb, .stdout = "newname\n" },
+        .{ .argv = pacman_info ++ " newname", .stdout = newname },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- rowx" },
+    } };
+    var w4: std.Io.Writer.Allocating = .init(a);
+    var d4: Distro = .{ .manager = .pacman, .runner = reverse.runner(), .force_elevate = false, .err = &w4.writer };
+    try d4.backend().install(a, &.{rowOf("rowx", &.{})});
+    try testing.expectEqual(@as(usize, 0), d4.backend().installRefused());
+    try testing.expectEqualStrings("", w4.written());
+    try testing.expect(reverse.called("pacman -Syu --needed --noconfirm -- rowx"));
+}
+
+test "install: a target list that could not be read is said, never read as nothing to upgrade" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const si = "Name            : conflictrow\nVersion         : 1-1\nProvides        : None\nConflicts With  : oldname\nReplaces        : None\n";
+    const qi = "Name            : oldname\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    const said = "error: 'failed to resolve path '/var/cache/mox/pacman-db' passed to '--dbpath': No such file or directory\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest conflictrow 1-1\n" },
+        .{ .argv = pacman_print ++ " conflictrow", .stdout = "conflictrow\n" },
+        .{ .argv = pacman_info ++ " conflictrow", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        .{ .argv = "pacman -Su --print --print-format %n --dbpath " ++ pdb, .code = 1, .stderr = said },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("conflictrow", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: what the apply's `-Syu` would install could not be read (`pacman -Su --print --print-format %n --dbpath /var/cache/mox/pacman-db` exited 1: error: 'failed to resolve path '/var/cache/mox/pacman-db' passed to '--dbpath': No such file or directory), so an installed package the upgrade would replace is judged as still installed, and a row that conflicts with it may be refused\n" ++
+            "mox: pacman: row \"conflictrow\" names a package that conflicts with \"oldname\", which this machine has installed; pacman would have to remove oldname to install it, and mox never removes a package, so the row was not installed: remove oldname yourself, or drop the row\n",
+        w.written(),
+    );
+}
+
+test "install: a -Qu that failed for a reason is said, never read as no upgrade pending" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Exit 1 with both streams empty is how pacman 7.1.0 answers "nothing
+    // pending", so only that shape may pass in silence. Measured on the
+    // same pacman, a dbpath that is not there exits 1 with `error: 'failed
+    // to resolve path '/no/such/path' passed to '--dbpath': No such file or
+    // directory` on stderr, and one whose `local` is a regular file exits
+    // 255 with `error: failed to initialize alpm library:` and `(root: /,
+    // dbpath: /tmp/broken)` and `could not open database`. Read as an empty
+    // answer, every versioned conflict was then judged against the version
+    // installed now with nothing said.
+    const drv = "Name            : drv\nVersion         : 1-1\nProvides        : None\nConflicts With  : srv<2\nReplaces        : None\n";
+    const srv_old = "Name            : srv\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    const said = "error: failed to initialize alpm library:\n(root: /, dbpath: /var/cache/mox/pacman-db)\ncould not open database\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 2-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .code = 255, .stderr = said },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .stdout = "-1\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: what the apply's `-Syu` will bring forward could not be read (`pacman -Qu --dbpath /var/cache/mox/pacman-db` exited 255: error: failed to initialize alpm library:; (root: /, dbpath: /var/cache/mox/pacman-db); could not open database), so a versioned conflict is judged against the version installed now, and a row the upgrade would have made room for may be refused\n" ++
+            "mox: pacman: row \"drv\" names a package that conflicts with \"srv<2\", which this machine has installed as \"srv\"; pacman would have to remove srv to install it, and mox never removes a package, so the row was not installed: remove srv yourself, or drop the row\n",
+        w.written(),
+    );
+
+    // The empty exit 1 is the no-upgrades answer, and says nothing at all.
+    var quiet: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 2-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .stdout = "-1\n" },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = quiet.runner(), .force_elevate = false, .err = &w2.writer };
+    try d2.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqualStrings(
+        "mox: pacman: row \"drv\" names a package that conflicts with \"srv<2\", which this machine has installed as \"srv\"; pacman would have to remove srv to install it, and mox never removes a package, so the row was not installed: remove srv yourself, or drop the row\n",
+        w2.written(),
+    );
+}
+
 test "install: pacman refuses a row an installed package declares a conflict with, versions judged by pacman" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4265,18 +5599,19 @@ test "install: pacman refuses a row an installed package declares a conflict wit
     // `exfatprogs` names `exfat-utils` and exfat-utils names nothing back,
     // so a row `exfat-utils` beside an installed exfatprogs is refused by
     // pacman all the same, and only `pacman -Qi` can say so.
-    const qi = "Name            : exfatprogs\nVersion         : 1.2.9-1\nProvides        : None\nConflicts With  : exfat-utils\n\nName            : xorg-server\nVersion         : 21.1.18-1\nProvides        : X-ABI-VIDEODRV_VERSION=25.2\nConflicts With  : nvidia-utils<=331.20  glamor-egl  xf86-video-modesetting\n";
+    const qi = "Name            : exfatprogs\nVersion         : 1.2.9-1\nProvides        : None\nConflicts With  : exfat-utils\nReplaces        : None\n\nName            : xorg-server\nVersion         : 21.1.18-1\nProvides        : X-ABI-VIDEODRV_VERSION=25.2\nConflicts With  : nvidia-utils<=331.20  glamor-egl  xf86-video-modesetting\nReplaces        : None\n";
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra exfat-utils 1.4.0-1\nextra cowsay 3.8.4-1\n" },
         .{ .argv = pacman_print ++ " exfat-utils cowsay", .stdout = "exfat-utils\ncowsay\n" },
-        .{ .argv = pacman_info ++ " exfat-utils cowsay", .stdout = "Name            : exfat-utils\nVersion         : 1.4.0-1\nProvides        : None\nConflicts With  : None\n\nName            : cowsay\nVersion         : 3.8.4-1\nProvides        : None\nConflicts With  : None\n" },
+        .{ .argv = pacman_info ++ " exfat-utils cowsay", .stdout = "Name            : exfat-utils\nVersion         : 1.4.0-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n\nName            : cowsay\nVersion         : 3.8.4-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
         .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "pacman -Syu --needed --noconfirm -- cowsay" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4289,27 +5624,25 @@ test "install: pacman refuses a row an installed package declares a conflict wit
         w.written(),
     );
     try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- cowsay"));
-    // No candidate declares a conflict, so `-T` had nothing to ask.
-    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "pacman -T") == null);
+    try testing.expectEqual(@as(usize, 0), countCalls(&fake, "vercmp"));
 
-    // A versioned declaration is pacman's to judge: `pacman -S --print --
-    // 'nvidia-utils<=331.20'` resolves to nvidia-utils only when the
-    // repository's version satisfies it (measured: `pipewire-pulse<2`
-    // against 1:1.6.8-1 is "target not found", `pipewire-pulse>=99`
-    // prints it, the epoch deciding).
-    const nv_info = "Name            : nvidia-utils\nVersion         : 580.82-1\nProvides        : vulkan-driver  opengl-driver\nConflicts With  : None\n";
+    // A versioned declaration is judged by `vercmp` against the version the
+    // row would install: `nvidia-utils<=331.20` holds against 331.20-1
+    // (`vercmp 331.20-1 331.20` is 0) and not against 580.82-1 (1).
+    const nv_info = "Name            : nvidia-utils\nVersion         : 580.82-1\nProvides        : vulkan-driver  opengl-driver\nConflicts With  : None\nReplaces        : None\n";
     var newer: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra nvidia-utils 580.82-1\n" },
         .{ .argv = pacman_print ++ " nvidia-utils", .stdout = "nvidia-utils\n" },
         .{ .argv = pacman_info ++ " nvidia-utils", .stdout = nv_info },
         .{ .argv = "pacman -Qi", .stdout = qi },
-        .{ .argv = pacman_print ++ " nvidia-utils<=331.20", .code = 1, .stderr = "error: target not found: nvidia-utils<=331.20\n" },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 580.82-1 331.20", .stdout = "1\n" },
         .{ .argv = "pacman -Syu --needed --noconfirm -- nvidia-utils" },
     } };
     var w2: std.Io.Writer.Allocating = .init(a);
@@ -4324,13 +5657,14 @@ test "install: pacman refuses a row an installed package declares a conflict wit
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "old nvidia-utils 331.20-1\n" },
         .{ .argv = pacman_print ++ " nvidia-utils", .stdout = "nvidia-utils\n" },
-        .{ .argv = pacman_info ++ " nvidia-utils", .stdout = nv_info },
+        .{ .argv = pacman_info ++ " nvidia-utils", .stdout = "Name            : nvidia-utils\nVersion         : 331.20-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
         .{ .argv = "pacman -Qi", .stdout = qi },
-        .{ .argv = pacman_print ++ " nvidia-utils<=331.20", .stdout = "nvidia-utils\n" },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 331.20-1 331.20", .stdout = "0\n" },
     } };
     var w3: std.Io.Writer.Allocating = .init(a);
     var d3: Distro = .{ .manager = .pacman, .runner = older.runner(), .force_elevate = false, .err = &w3.writer };
@@ -4341,6 +5675,54 @@ test "install: pacman refuses a row an installed package declares a conflict wit
         w3.written(),
     );
     try testing.expect(!d3.backend().installSpawned());
+
+    // An installed package the apply's upgrade brings forward declares
+    // what its NEW version declares: `guard` 1-1 names `rowb`, and the
+    // 2-1 the copy carries names nothing, so the row goes in beside the
+    // upgrade.
+    var upgraded: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest rowb 1-1\nmoxtest guard 2-1\n" },
+        .{ .argv = pacman_print ++ " rowb", .stdout = "rowb\n" },
+        .{ .argv = pacman_info ++ " rowb", .stdout = "Name            : rowb\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
+        .{ .argv = "pacman -Qi", .stdout = "Name            : guard\nVersion         : 1-1\nProvides        : None\nConflicts With  : rowb\nReplaces        : None\n" },
+        .{ .argv = pacman_pending, .stdout = "guard 1-1 -> 2-1\n" },
+        nothing_to_upgrade,
+        .{ .argv = pacman_info ++ " guard", .stdout = "Repository      : moxtest\nName            : guard\nVersion         : 2-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
+        .{ .argv = "pacman -Syu --needed --noconfirm -- rowb" },
+    } };
+    var w4: std.Io.Writer.Allocating = .init(a);
+    var d4: Distro = .{ .manager = .pacman, .runner = upgraded.runner(), .force_elevate = false, .err = &w4.writer };
+    try d4.backend().install(a, &.{rowOf("rowb", &.{})});
+    try testing.expectEqual(@as(usize, 0), d4.backend().installRefused());
+    try testing.expectEqualStrings("", w4.written());
+    try testing.expect(upgraded.called("pacman -Syu --needed --noconfirm -- rowb"));
+
+    // The same name in two repositories: the block at the pending version
+    // is the one read (`-Si` prints one block per repository, measured).
+    var twice: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest rowb 1-1\nmoxtest guard 2-1\n" },
+        .{ .argv = pacman_print ++ " rowb", .stdout = "rowb\n" },
+        .{ .argv = pacman_info ++ " rowb", .stdout = "Name            : rowb\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
+        .{ .argv = "pacman -Qi", .stdout = "Name            : guard\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n" },
+        .{ .argv = pacman_pending, .stdout = "guard 1-1 -> 2-1\n" },
+        nothing_to_upgrade,
+        .{ .argv = pacman_info ++ " guard", .stdout = "Repository      : testing\nName            : guard\nVersion         : 3-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n\nRepository      : moxtest\nName            : guard\nVersion         : 2-1\nProvides        : None\nConflicts With  : rowb\nReplaces        : None\n" },
+    } };
+    var w5: std.Io.Writer.Allocating = .init(a);
+    var d5: Distro = .{ .manager = .pacman, .runner = twice.runner(), .force_elevate = false, .err = &w5.writer };
+    try d5.backend().install(a, &.{rowOf("rowb", &.{})});
+    try testing.expectEqual(@as(usize, 1), d5.backend().installRefused());
+    try testing.expect(std.mem.indexOf(u8, w5.written(), "\"guard\", which this machine has installed, declares a conflict with (\"rowb\")") != null);
 }
 
 test "install: a conflict check that cannot read the machine says so and leaves the row to pacman" {
@@ -4353,12 +5735,10 @@ test "install: a conflict check that cannot read the machine says so and leaves 
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
         .{ .argv = pacman_probe, .code = 1 },
         .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra pipewire-pulse 1:1.6.8-1\n" },
         .{ .argv = pacman_print ++ " pipewire-pulse", .stdout = "pipewire-pulse\n" },
-        .{ .argv = pacman_info ++ " pipewire-pulse", .stdout = "Name            : pipewire-pulse\nVersion         : 1:1.6.8-1\nProvides        : None\nConflicts With  : pulseaudio\n" },
-        .{ .argv = "pacman -T -- pulseaudio", .code = 255 },
+        .{ .argv = pacman_info ++ " pipewire-pulse", .stdout = "Name            : pipewire-pulse\nVersion         : 1:1.6.8-1\nProvides        : None\nConflicts With  : pulseaudio\nReplaces        : None\n" },
         .{ .argv = "pacman -Qi", .code = 255 },
         .{ .argv = "pacman -Syu --needed --noconfirm -- pipewire-pulse" },
     } };
@@ -4368,11 +5748,11 @@ test "install: a conflict check that cannot read the machine says so and leaves 
     try d.backend().install(a, &.{rowOf("pipewire-pulse", &.{})});
     try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
     try testing.expectEqualStrings(
-        "mox: pacman: `pacman -T` could not say which of what these rows conflict with is installed (exit 255), so a row that conflicts with an installed package is left to pacman, which then installs none of the batch\n" ++
-            "mox: pacman: what this machine has installed could not be read in full (`pacman -Qi` exited 255), so a row an installed package declares a conflict with is left to pacman, which then installs none of the batch\n",
+        "mox: pacman: what this machine has installed could not be read in full (`pacman -Qi` exited 255), so a row that conflicts with an installed package, or that one declares a conflict with, is left to pacman, which then installs none of the batch\n",
         w.written(),
     );
     try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- pipewire-pulse"));
+    try testing.expectEqual(@as(usize, 0), countCalls(&fake, pacman_pending));
 }
 
 test "install: the pacman copy is made and repaired only when a probe finds it wanting, so a settled machine elevates pacman alone" {
@@ -4380,20 +5760,22 @@ test "install: the pacman copy is made and repaired only when a probe finds it w
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Measured on pacman 7.1.0: an unprivileged user reads `stat -c %a`
+    // Measured on pacman 7.1.0: an unprivileged user reads `stat -L`
     // and `readlink` of the copy, and `sudo pacman -Sy --dbpath <copy>`
     // into a tree already there succeeds. So a sudoers rule granting
     // `/usr/bin/pacman` alone serves every apply once the copy exists.
     var settled: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = pacman_probe, .stdout = "755\n755\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
         .{ .argv = pacman_link, .stdout = "/var/lib/pacman/local\n" },
         .{ .argv = "sudo " ++ pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = pacman_print ++ " bat", .stdout = "bat\n" },
         .{ .argv = pacman_info, .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     } };
     var d: Distro = .{ .manager = .pacman, .runner = settled.runner(), .force_elevate = true };
@@ -4401,7 +5783,7 @@ test "install: the pacman copy is made and repaired only when a probe finds it w
     var elevated: usize = 0;
     for (settled.calls.items) |c| {
         try testing.expect(std.mem.indexOf(u8, c, "install -d") == null);
-        try testing.expect(std.mem.indexOf(u8, c, "ln -sfn") == null);
+        try testing.expect(std.mem.indexOf(u8, c, "sh -c") == null);
         if (std.mem.startsWith(u8, c, "sudo ")) {
             try testing.expect(std.mem.startsWith(u8, c, "sudo pacman "));
             elevated += 1;
@@ -4417,14 +5799,15 @@ test "install: the pacman copy is made and repaired only when a probe finds it w
     var narrow: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = pacman_probe, .stdout = "750\n755\n" },
+        .{ .argv = pacman_probe, .stdout = "/var/cache/mox 750 directory\n/var/cache/mox/pacman-db 755 directory\n" },
         .{ .argv = "sudo " ++ pacman_make },
-        .{ .argv = "sudo ln -sfn /var/lib/pacman/local " ++ pdb ++ "/local" },
         .{ .argv = "sudo " ++ pacman_private_sync },
         .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "core bat 0.25.0-1\n" },
         .{ .argv = pacman_print ++ " bat", .stdout = "bat\n" },
         .{ .argv = pacman_info, .match = .prefix },
         .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 },
+        nothing_to_upgrade,
         .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
     } };
     var d2: Distro = .{ .manager = .pacman, .runner = narrow.runner(), .force_elevate = true };
@@ -4436,16 +5819,15 @@ test "install: the pacman copy is made and repaired only when a probe finds it w
     var moved: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/mnt/root/var/lib/pacman\n" },
-        .{ .argv = pacman_probe, .stdout = "755\n755\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
         .{ .argv = pacman_link, .stdout = "/var/lib/pacman/local\n" },
-        .{ .argv = pacman_make },
-        .{ .argv = "ln -sfn /mnt/root/var/lib/pacman/local " ++ pdb ++ "/local" },
+        .{ .argv = pacmanMakeCall("/mnt/root/var/lib/pacman/local") },
         .{ .argv = pacman_private_sync, .code = 1 },
         .{ .argv = "test -e " ++ pdb ++ "/db.lck", .code = 1 },
     } };
     var d3: Distro = .{ .manager = .pacman, .runner = moved.runner(), .force_elevate = false };
     try testing.expectError(Error.DistroRefreshFailed, d3.backend().install(a, &.{rowOf("bat", &.{})}));
-    try testing.expect(moved.called("ln -sfn /mnt/root/var/lib/pacman/local " ++ pdb ++ "/local"));
+    try testing.expect(moved.called(pacmanMakeCall("/mnt/root/var/lib/pacman/local")));
 }
 
 test "install: a copy that could not be made says what needed elevation, and the one-time command" {
@@ -4453,9 +5835,8 @@ test "install: a copy that could not be made says what needed elevation, and the
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A sudoers rule granting pacman alone: sudo refuses `install` (its
-    // own message on the terminal) and the apply said only
-    // `DistroQueryFailed`.
+    // A sudoers rule granting pacman alone: sudo refuses `sh` (its own
+    // message on the terminal) and the apply said only `DistroQueryFailed`.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
@@ -4467,12 +5848,176 @@ test "install: a copy that could not be made says what needed elevation, and the
 
     try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expectEqualStrings(
-        "mox: pacman: `sudo install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db` exited 1, so the copy of pacman's databases the check reads at /var/cache/mox/pacman-db could not be made; make it once as root with `install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db && ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local`, after which an apply elevates nothing but pacman\n",
+        "mox: pacman: `sudo sh -c` making the copy of pacman's databases the check reads at /var/cache/mox/pacman-db exited 1, so the copy could not be made; make it once as root with `install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db && { [ -L /var/cache/mox/pacman-db/local ] || [ ! -d /var/cache/mox/pacman-db/local ] || rmdir /var/cache/mox/pacman-db/local; } && ln -sfnT /var/lib/pacman/local /var/cache/mox/pacman-db/local`, after which an apply elevates nothing but pacman\n",
         w.written(),
     );
     try testing.expect(!d.backend().installSpawned());
     try testing.expectEqual(@as(usize, 0), pacmanSystemWrites(&fake));
     try testing.expectEqual(@as(usize, 0), countCalls(&fake, "sudo " ++ pacman_private_sync));
+
+    // Unelevated, the same call is `sh -c` alone.
+    var root: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make, .code = 1 },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = root.runner(), .force_elevate = false, .err = &w2.writer };
+    try testing.expectError(Error.DistroQueryFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expect(std.mem.startsWith(u8, w2.written(), "mox: pacman: `sh -c` making the copy"));
+}
+
+test "install: the pacman copy is made by one streamed call, so sudo can ask for its password" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0 with a user sudoers grants with a password,
+    // under `script`: the make as two captured calls stopped at sudo's
+    // prompt, the read loop reported "stopped, and this run has no
+    // terminal that could resume it; killed", the first apply failed and
+    // no copy was made. Streamed, sudo asks on the terminal once.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = "sudo " ++ pacman_make },
+        .{ .argv = "sudo " ++ pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "core bat 0.25.0-1\n" },
+        .{ .argv = pacman_print ++ " bat", .stdout = "bat\n" },
+        .{ .argv = pacman_info, .match = .prefix },
+        .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath " ++ pdb, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "sudo pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqualStrings(pacman_probe, fake.calls.items[2]);
+    try testing.expect(!fake.streamed.items[2]);
+    try testing.expectEqualStrings("sudo " ++ pacman_make, fake.calls.items[3]);
+    try testing.expect(fake.streamed.items[3]);
+    try testing.expectEqualStrings("sudo " ++ pacman_private_sync, fake.calls.items[4]);
+    try testing.expect(fake.streamed.items[4]);
+    try testing.expectEqual(@as(usize, 1), countCalls(&fake, "sudo " ++ pacman_make));
+    try testing.expectEqualStrings(
+        "sudo sh -c install -d -m 755 \"$1\" \"$2\" && { [ -L \"$4\" ] || [ ! -d \"$4\" ] || rmdir \"$4\" || exit 3; } && ln -sfnT \"$3\" \"$4\" sh /var/cache/mox /var/cache/mox/pacman-db /var/lib/pacman/local /var/cache/mox/pacman-db/local",
+        fake.calls.items[3],
+    );
+}
+
+test "install: a real directory at the pacman copy's local is replaced when empty, and named when not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured with coreutils 9.11: `readlink` exits 1 on a directory, so
+    // the probe finds the copy wanting; the make removes an empty one
+    // (`rmdir`) and links over it, and exits 3 leaving one with entries.
+    var empty: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
+        .{ .argv = pacman_link, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "core bat 0.25.0-1\n" },
+        .{ .argv = pacman_print ++ " bat", .stdout = "bat\n" },
+        .{ .argv = pacman_info, .match = .prefix },
+        .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath " ++ pdb, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = empty.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(empty.called(pacman_make));
+    try testing.expectEqualStrings("", w.written());
+
+    var kept: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
+        .{ .argv = pacman_link, .code = 1 },
+        .{ .argv = pacman_make, .code = 3 },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = kept.runner(), .force_elevate = false, .err = &w2.writer };
+    try testing.expectError(Error.DistroQueryFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expectEqualStrings(
+        "mox: pacman: /var/cache/mox/pacman-db/local is a directory with entries in it, where the copy of pacman's databases the check reads keeps a link to /var/lib/pacman/local; mox removes nothing there, so move it aside as root, after which an apply makes the link\n",
+        w2.written(),
+    );
+    try testing.expect(!d2.backend().installSpawned());
+    try testing.expectEqual(@as(usize, 0), countCalls(&kept, pacman_private_sync));
+}
+
+test "install: a non-directory where the pacman copy goes is named, and the make never runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured with coreutils 9.11 and a regular file at /var/cache/mox:
+    // `stat -L -c '%n %a %F'` prints `/var/cache/mox 644 regular empty
+    // file` and exits 1 (the level under it "Not a directory"), and
+    // `install -d` on it fails "File exists" -- the one-time command the
+    // message used to give would have failed the same way.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1, .stdout = "/var/cache/mox 644 regular empty file\n", .stderr = "stat: cannot statx '/var/cache/mox/pacman-db': Not a directory\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true, .err = &w.writer };
+    try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expectEqualStrings(
+        "mox: pacman: /var/cache/mox is a regular empty file, not a directory, so the copy of pacman's databases the check reads at /var/cache/mox/pacman-db cannot be made; move it aside as root, after which an apply makes the copy\n",
+        w.written(),
+    );
+    try testing.expectEqual(@as(usize, 3), fake.calls.items.len);
+
+    // The inner level as a file: the outer one reads fine first.
+    var inner: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .stdout = "/var/cache/mox 755 directory\n/var/cache/mox/pacman-db 644 regular file\n" },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = inner.runner(), .force_elevate = true, .err = &w2.writer };
+    try testing.expectError(Error.DistroQueryFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expect(std.mem.startsWith(u8, w2.written(), "mox: pacman: /var/cache/mox/pacman-db is a regular file, not a directory, so"));
+}
+
+test "install: what pacman says beside a batch it does resolve reaches the terminal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0 with a directive pacman.conf does not know:
+    // `pacman -S --print` prints the transaction, exits 0, and says this on
+    // stderr -- which the batch's capture used to drop.
+    const warning = "warning: config file /etc/pacman.conf, line 97: directive 'BogusDirective' in section 'options' not recognized.\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
+        .{ .argv = pacman_link, .stdout = "/var/lib/pacman/local\n" },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "core bat 0.25.0-1\n" },
+        .{ .argv = pacman_print ++ " bat", .stdout = "bat\n", .stderr = warning },
+        .{ .argv = pacman_info, .match = .prefix },
+        .{ .argv = "pacman -Qi" },
+        .{ .argv = "pacman -Qu --dbpath " ++ pdb, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "pacman -Syu --needed --noconfirm -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expectEqualStrings(warning, w.written());
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- bat"));
 }
 
 test "install: a stale lock in the pacman copy is named when the sync fails" {
@@ -4489,7 +6034,7 @@ test "install: a stale lock in the pacman copy is named when the sync fails" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = pacman_probe, .stdout = "755\n755\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
         .{ .argv = pacman_link, .stdout = "/var/lib/pacman/local\n" },
         .{ .argv = pacman_private_sync, .code = 1 },
         .{ .argv = "test -e " ++ pdb ++ "/db.lck" },
@@ -4511,7 +6056,7 @@ test "install: a stale lock in the pacman copy is named when the sync fails" {
     var plain: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "pacman -Qdq", .code = 1 },
         .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-        .{ .argv = pacman_probe, .stdout = "755\n755\n" },
+        .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
         .{ .argv = pacman_link, .stdout = "/var/lib/pacman/local\n" },
         .{ .argv = pacman_private_sync, .code = 1 },
         .{ .argv = "test -e " ++ pdb ++ "/db.lck", .code = 1 },
@@ -4543,7 +6088,7 @@ test "install: a captured pacman call killed at its bound inside the install is 
             .{ .argv = "pacman -Qdq", .code = 1 },
             .{ .argv = argv, .timed_out = true },
             .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
-            .{ .argv = pacman_probe, .stdout = "755\n755\n" },
+            .{ .argv = pacman_probe, .stdout = pacman_probe_ready },
             .{ .argv = pacman_link, .stdout = "/var/lib/pacman/local\n" },
             .{ .argv = pacman_private_sync },
             .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "core bat 0.25.0-1\n" },

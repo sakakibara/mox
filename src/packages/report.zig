@@ -353,8 +353,8 @@ test "fromManifest: a manager no row names failing a verb is a note, not this re
     // the run over it would fail an apply that had no work for it either way.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 3 },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .code = 3 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 3 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .code = 3 },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io, .scratch_dir = "" };
     var bindings = std.StringHashMap([]const u8).init(a);
@@ -409,8 +409,8 @@ test "fromManifest: drift comes back per backend" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\nhtop\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\nhtop\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
@@ -441,8 +441,8 @@ test "fromManifest: a manifest matching the machine is clean" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
@@ -692,8 +692,8 @@ test "fromManifest: a probe error on a backend no row names is a note, and the r
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
@@ -744,8 +744,8 @@ test "fromManifest: a usable backend leaves no note about usability" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 

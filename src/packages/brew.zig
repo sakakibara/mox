@@ -164,7 +164,15 @@ pub const Brew = struct {
     /// timer, so a read-only `mox status` does not go to the network for
     /// age alone. A cache that does not exist yet is still populated, once.
     /// Through `env` because an adapter has no environment of its own.
-    const query_env = [_][]const u8{ "env", "HOMEBREW_NO_AUTO_UPDATE=1" };
+    ///
+    /// `HOMEBREW_NO_INSTALL_FROM_API` is unset for the same reason: under it
+    /// brew reads homebrew/core and homebrew/cask from local checkouts
+    /// instead of the API, and `brew list --installed-on-request` on a
+    /// machine that has never tapped homebrew/core clones the whole tap
+    /// first -- minutes of network for a listing that needs only the
+    /// install receipts. The install is streamed under the user's own
+    /// environment, so a user who set it still installs the way they chose.
+    const query_env = [_][]const u8{ "env", "-u", "HOMEBREW_NO_INSTALL_FROM_API", "HOMEBREW_NO_AUTO_UPDATE=1" };
 
     /// A row names one formula or cask, and takes `kind` alone.
     ///
@@ -694,7 +702,7 @@ const testing = std.testing;
 /// The answer that leaves every formula row to `brew install`: an install
 /// asks which formulae are installed already, and a machine with none sends
 /// nothing down the marking path.
-const nothing_installed: exec.Fake.Entry = .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name" };
+const nothing_installed: exec.Fake.Entry = .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name" };
 
 fn rowOf(name: []const u8, fields: []const manifest_mod.Pair) Row {
     return .{
@@ -798,10 +806,10 @@ test "installedExplicit: formulae bare, tapped fully qualified, casks prefixed" 
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request",
             .stdout = "ripgrep\nd12frosted/emacs-plus/emacs-plus@30\n",
         },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n1password\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n1password\n" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();
@@ -831,14 +839,14 @@ test "installedExplicit: the cask query is the whole Caskroom, which is what the
     // declares the two options as conflicting, so that argv exits 1 with its
     // usage and every cask row would read as missing.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "ghostty\n" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
 
     const got = try b.backend().installedExplicit(a);
     try testing.expectEqual(@as(usize, 1), got.len);
-    try testing.expect(!fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name --installed-on-request"));
+    try testing.expect(!fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name --installed-on-request"));
 }
 
 test "installedExplicit: a failed query is an error, never an empty set" {
@@ -849,7 +857,7 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     // An empty list would read as "nothing installed" and make every desired
     // package look missing.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 1 },
     } };
     var b: Brew = .{ .runner = fake.runner() };
     const be = b.backend();
@@ -932,7 +940,7 @@ test "install: a tapped cask is trusted as a cask, not as a formula" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap" },
         .{ .argv = "brew trust --cask -- owner/tap/somecask" },
         .{ .argv = "brew install --cask -- owner/tap/somecask" },
@@ -951,7 +959,7 @@ test "install: a tapped formula is tapped and trusted narrowly before installing
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- d12frosted/emacs-plus" },
         .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
         .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
@@ -971,7 +979,7 @@ test "install: a core formula is neither tapped nor trusted" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
@@ -988,7 +996,7 @@ test "install: a cask installs through --cask" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install --cask -- ghostty" },
     } };
     var b: Brew = .{ .runner = fake.runner() };
@@ -1046,7 +1054,7 @@ test "install: a failed tap fails its row and the rows after it still run" {
     // would fail the test with a different error than the one asserted.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
         .{ .argv = "brew install -- ripgrep" },
     } };
@@ -1065,7 +1073,7 @@ test "install: a failed trust fails its row and the rows after it still run" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap" },
         .{ .argv = "brew trust --cask -- owner/tap/somecask", .code = 1 },
         .{ .argv = "brew install --cask -- ghostty" },
@@ -1087,7 +1095,7 @@ test "install: a failed install is an error, not a silent skip" {
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep", .code = 1 },
     } };
     var b: Brew = .{ .runner = fake.runner() };
@@ -1124,7 +1132,7 @@ test "install: every name brew is handed comes after a --" {
     // exits 0. `brew tap` and `brew trust` answer a `--` the same way.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap" },
         .{ .argv = "brew trust --formula -- owner/tap/thing" },
         .{ .argv = "brew install -- owner/tap/thing" },
@@ -1157,10 +1165,10 @@ test "install: a formula brew already has is marked on request, never handed to 
     // install, tap or trust here fails the test.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name",
             .stdout = "brotli\nd12frosted/emacs-plus/emacs-plus@30\n",
         },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tab --installed-on-request --formula -- brotli" },
         .{ .argv = "brew tab --installed-on-request --formula -- d12frosted/emacs-plus/emacs-plus@30" },
         .{ .argv = "brew install --cask -- ghostty" },
@@ -1199,8 +1207,8 @@ test "install: a formula that cannot be marked on request fails its row" {
     // with an unknown command, and the row cannot converge at all. Falling
     // back to `brew install` would report a success that leaves it missing.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = "brotli\n" },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = "brotli\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tab --installed-on-request --formula -- brotli", .code = 1 },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1218,8 +1226,8 @@ test "install: a query that cannot say what is installed leaves the rows to brew
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .code = 1 },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1240,7 +1248,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
     // landed.
     var tap: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
     } };
     var b1: Brew = .{ .runner = tap.runner() };
@@ -1250,7 +1258,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
     // An install that ran and failed is the other answer.
     var ran: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew install -- ripgrep", .code = 1 },
     } };
     var b2: Brew = .{ .runner = ran.runner() };
@@ -1260,7 +1268,7 @@ test "install: whether brew's installer ran is what says the rows may have lande
     // And the answer is the last batch's, never the one before it.
     var tap2: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tap -- owner/tap", .code = 1 },
     } };
     b2.runner = tap2.runner();
@@ -1281,7 +1289,7 @@ test "install: an alias row is refused, naming the formula brew reports" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag ripgrep",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag ripgrep",
             .stdout =
             \\{"formulae":[{"full_name":"the_silver_searcher","aliases":["ag"],"oldnames":[]},{"full_name":"ripgrep","aliases":[],"oldnames":[]}],"casks":[]}
             ,
@@ -1309,7 +1317,7 @@ test "install: a cask's old token is refused the same way, and asks only about c
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- oldghost",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- oldghost",
             .stdout =
             \\{"formulae":[],"casks":[{"token":"ghostty","full_token":"ghostty","old_tokens":["oldghost"]}]}
             ,
@@ -1337,7 +1345,7 @@ test "install: a name brew resolves to nothing is handed to brew, not refused he
     // brew itself is what answers for a name it has never heard of.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- nosuchthing", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- nosuchthing", .code = 1 },
         .{ .argv = "brew install -- nosuchthing", .code = 1 },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1360,7 +1368,7 @@ test "install: a row naming a tap the machine lacks is kept, brew answering noth
     // that tap.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30", .code = 1 },
         .{ .argv = "brew tap -- d12frosted/emacs-plus" },
         .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
         .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
@@ -1384,7 +1392,7 @@ test "install: a row qualifying a tap brew reports bare is refused, naming the b
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- homebrew/core/ripgrep",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- homebrew/core/ripgrep",
             .stdout =
             \\{"formulae":[{"full_name":"ripgrep","name":"ripgrep","tap":"homebrew/core","aliases":[],"oldnames":[]}],"casks":[]}
             ,
@@ -1414,7 +1422,7 @@ test "install: a row qualifying a third-party tap is kept, brew reporting it qua
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- d12frosted/emacs-plus/emacs-plus@30",
             .stdout =
             \\{"formulae":[{"full_name":"d12frosted/emacs-plus/emacs-plus@30","name":"emacs-plus@30","tap":"d12frosted/emacs-plus","aliases":[],"oldnames":[]}],"casks":[]}
             ,
@@ -1443,14 +1451,14 @@ test "install: one unresolvable name does not disable alias refusal for the batc
     // would otherwise turn the check off for all of it.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag zzz-removed-formula", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag zzz-removed-formula", .code = 1 },
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
             .stdout =
             \\{"formulae":[{"full_name":"the_silver_searcher","name":"the_silver_searcher","tap":"homebrew/core","aliases":["ag"],"oldnames":[]}],"casks":[]}
             ,
         },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- zzz-removed-formula", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- zzz-removed-formula", .code = 1 },
         .{ .argv = "brew install -- zzz-removed-formula", .code = 1 },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1481,7 +1489,7 @@ test "install: the per-name fallback stops at its budget, saying what went unask
     // setting caps the total. One budget over all of them does.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat zzz-removed-formula", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat zzz-removed-formula", .code = 1 },
         .{ .argv = "brew install -- ag" },
         .{ .argv = "brew install -- bat" },
         .{ .argv = "brew install -- zzz-removed-formula" },
@@ -1497,7 +1505,7 @@ test "install: the per-name fallback stops at its budget, saying what went unask
     // Unasked is not refused: the rows stand, which is the direction that
     // installs rather than the one that keeps packages off the machine.
     try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
-    try testing.expect(!fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag"));
+    try testing.expect(!fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag"));
     try testing.expect(fake.called("brew install -- ag"));
 }
 
@@ -1510,14 +1518,14 @@ test "install: a budget mox has no clock for leaves the fallback as it was" {
     // not silently turn the check off.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat", .code = 1 },
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
             .stdout =
             \\{"formulae":[{"full_name":"the_silver_searcher","name":"the_silver_searcher","tap":"homebrew/core","aliases":["ag"],"oldnames":[]}],"casks":[]}
             ,
         },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- bat", .code = 1 },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- bat", .code = 1 },
         .{ .argv = "brew install -- bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1525,7 +1533,7 @@ test "install: a budget mox has no clock for leaves the fallback as it was" {
 
     try b.backend().install(a, &.{ rowOf("ag", &.{}), rowOf("bat", &.{}) });
     try testing.expectEqual(@as(usize, 1), b.backend().installRefused());
-    try testing.expect(fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag"));
+    try testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag"));
     try testing.expect(std.mem.indexOf(u8, w.written(), "went unasked") == null);
 }
 
@@ -1540,14 +1548,14 @@ test "install: a batch answered past the capture cap is asked name by name" {
     // large; each name on its own is an answer that fits.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat", .fail = error.StreamTooLong },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag bat", .fail = error.StreamTooLong },
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ag",
             .stdout =
             \\{"formulae":[{"full_name":"the_silver_searcher","name":"the_silver_searcher","tap":"homebrew/core","aliases":["ag"],"oldnames":[]}],"casks":[]}
             ,
         },
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- bat", .fail = error.StreamTooLong },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- bat", .fail = error.StreamTooLong },
         .{ .argv = "brew install -- bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -1580,13 +1588,13 @@ test "install: a formula row and a cask row of one name each get their own answe
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- docker",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- docker",
             .stdout =
             \\{"formulae":[{"full_name":"docker","name":"docker","tap":"homebrew/core","aliases":[],"oldnames":[]}],"casks":[]}
             ,
         },
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- docker",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- docker",
             .stdout =
             \\{"formulae":[],"casks":[{"token":"docker-desktop","full_token":"docker-desktop","tap":"homebrew/cask","old_tokens":["docker"]}]}
             ,
@@ -1620,13 +1628,13 @@ test "install: a cask row and a formula row of one name each get their own answe
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         nothing_installed,
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- dash",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- dash",
             .stdout =
             \\{"formulae":[],"casks":[{"token":"dash","full_token":"dash","tap":"homebrew/cask","old_tokens":[]}]}
             ,
         },
         .{
-            .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- dash",
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- dash",
             .stdout =
             \\{"formulae":[{"full_name":"dash-shell","name":"dash-shell","tap":"homebrew/core","aliases":[],"oldnames":["dash"]}],"casks":[]}
             ,
@@ -1647,4 +1655,37 @@ test "install: a cask row and a formula row of one name each get their own answe
     );
     try testing.expect(fake.called("brew install --cask -- dash"));
     try testing.expect(!fake.called("brew install -- dash"));
+}
+
+test "the captured queries run without HOMEBREW_NO_INSTALL_FROM_API, and the install keeps the caller's environment" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Under that variable brew reads homebrew/core from a local checkout,
+    // and `brew list --installed-on-request` on a machine that has never
+    // tapped it clones the whole tap first -- minutes of network for a
+    // read-only status. The install is the user's own call, in the user's
+    // own environment.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" },
+        nothing_installed,
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "brew install -- bat" },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    const got = try b.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try b.backend().install(a, &.{rowOf("bat", &.{})});
+
+    for (fake.calls.items, fake.streamed.items) |call, streamed| {
+        if (streamed) {
+            try testing.expect(std.mem.startsWith(u8, call, "brew "));
+        } else {
+            try testing.expect(std.mem.startsWith(u8, call, "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew "));
+        }
+    }
+    try testing.expect(fake.called("brew install -- bat"));
 }

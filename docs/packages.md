@@ -148,9 +148,9 @@ package manager at all is usable here, `status` notes
 
 | Backend | Identity | Explicitly installed | Row keys |
 |---|---|---|---|
-| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1`, so a read-only `status` never refreshes brew's cached API data on a timer (a cache that does not exist yet is still populated once). The cask half is not an explicit-install query (below) | `kind` (`formula`, `cask`) |
-| `apt` | name | `apt-mark showmanual`; an install runs `apt-get update` first, so the index it resolves against is current | -- |
-| `dnf` | name | `dnf -q repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; the format string because its default packs several to a line) | -- |
+| `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1`, so a read-only `status` never refreshes brew's cached API data on a timer (a cache that does not exist yet is still populated once), and with `HOMEBREW_NO_INSTALL_FROM_API` unset, since under it the listing clones homebrew/core on a machine that has never tapped it. The install runs under the user's own environment. The cask half is not an explicit-install query (below) | `kind` (`formula`, `cask`) |
+| `apt` | name | `apt-mark showmanual`, intersected with what `dpkg-query` reports `installed`: a package an interrupted run left unpacked is listed as manual and is not on the machine in any usable sense, so its row reads missing and the install configures it. An install runs `apt-get update` first, so the index it resolves against is current | -- |
+| `dnf` | name | `dnf -q repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; the format string because its default packs several to a line); the install and the mark carry `--setopt=assumeno=0`, since a dnf.conf `assumeno=True` otherwise outranks `-y` and aborts both | -- |
 | `pacman` | name | `pacman -Qeq`; an install is one `pacman -Syu --needed --noconfirm` transaction with the rows as its targets, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
@@ -208,18 +208,36 @@ literal-matching whole-universe query -- and refuses a row naming anything
 absent from it: `apt-get install` otherwise falls back to reading the operand
 as an unanchored regular expression, so `libz.dev` installs ten packages the
 manifest never declared and `ruby.dev` installs hundreds. The listing is
-asked for under `APT::Architectures=<native>` and
-`Dir::State::status=/dev/null`, so it holds the native architecture's
-repository packages and nothing else: the plain listing prints most
-foreign-architecture-only names bare, and a bare row naming one would install
-`name:<arch>`, which `apt-mark showmanual` then reports qualified. Such a row
-is refused with the qualified spelling to declare. That listing holds bare
-names alone, and it omits a package that exists only for a foreign
-architecture -- `wine32` is in no listing on an amd64 or arm64 machine, while
-apt installs `wine32:i386` and `apt-mark showmanual` reports exactly that --
-so a row carrying an architecture is asked about as written, with
-`apt-cache madison`, the query verified to match a qualified name literally
-where `apt-cache show` and `apt-cache policy` both fall back to a regex.
+asked for under `APT::Architectures=<native>`,
+`Dir::State::status=/dev/null` and `APT::Cache::AllNames=false`, so it holds
+the native architecture's repository packages and nothing else: the plain
+listing prints most foreign-architecture-only names bare, and a bare row
+naming one would install `name:<arch>`, which `apt-mark showmanual` then
+reports qualified; and an apt.conf `APT::Cache::AllNames "true"` would put
+virtual names in it, where `awk` would then be refused as pinned rather than
+told what provides it. Such a row is refused with the qualified spelling to
+declare. That listing holds bare names alone, and it omits a package that
+exists only for a foreign architecture -- `wine32` is in no listing on an
+amd64 or arm64 machine, while apt installs `wine32:i386` and `apt-mark
+showmanual` reports exactly that -- so a row carrying an architecture is
+asked about as written, with `apt-cache madison`, the query verified to match
+a qualified name literally where `apt-cache show` and `apt-cache policy` both
+fall back to a regex. A row qualifying an architecture dpkg has not enabled
+(`dpkg --print-foreign-architectures`) is refused with the command that
+enables it, unless dpkg already has the package installed under it.
+
+A flat repository (`deb [trusted=yes] file:/repo ./`) keeps every
+architecture in one index, so the listing prints its foreign-only names bare
+too. The stanza `apt-cache policy` prints for the row settles those: apt
+heads it with the name it resolves the row to, and a bare row headed
+`name:<arch>` is refused with that spelling to declare when dpkg has the
+architecture enabled, and told to enable it when not -- an install carrying
+such a package fails at dpkg and installs nothing. A row apt prints no
+stanza for at all is an operand apt cannot locate, which is all the empty
+answer says: a purely virtual name and a package built for one architecture
+alone each get a stanza of their own and are refused on the branches above.
+An operand apt cannot locate takes the whole batch down, so that row is
+refused too.
 
 The repositories are not the whole answer, because a package installed from a
 `.deb` is in none of them. mox reads `dpkg-query` too, and a bare row whose
@@ -239,6 +257,14 @@ answers a batch carrying one by installing nothing at all -- so one such row
 would keep every other package in the manifest off the machine. mox reads
 `apt-mark showhold` and `apt-cache policy` before the install and refuses the
 row. A hold is the user's decision, so it is never overridden.
+
+A package dpkg has left `install ok unpacked` -- an interrupted run -- is on
+the disk and not set up. `apt-mark showmanual` lists it and `apt-mark
+showauto` may too, so both the explicit set and the already-installed set are
+intersected with what `dpkg-query` reports `installed`: the row reads
+missing, and goes to `apt-get install`, which configures it (and marks it
+manual when it was auto), where `apt-mark manual` alone would have left it
+unpacked.
 
 Before a dnf install, mox asks `dnf repoquery` the same question, and a name
 that is only an rpm capability rather than a package -- `zlib-devel`, which
@@ -273,13 +299,30 @@ well. `pacman -S --print` does not report that -- the transaction prints and
 exits 0 -- and the install then asks "Remove <package>? [y/N]", which
 `--noconfirm` answers no, so the batch fails as one with "unresolvable
 package conflicts detected" and nothing beside the row lands, on every apply.
-mox never removes a package, so the row goes rather than the batch: its
-`Conflicts With` (from `pacman -Si`) is judged by `pacman -T`, which says
-whether an installed package satisfies each spec, versions included, and the
-installed packages' own `Conflicts With` (from `pacman -Qi`) are read for a
-conflict declared on that side alone, a versioned one judged by whether
-`pacman -S --print` resolves the spec to the row's package. The refusal names
-the installed package pacman would have removed.
+mox never removes a package, so the row goes rather than the batch. The
+install is one `-Syu`, so the conflict is judged against the machine that
+upgrade leaves, not the one it starts from: an installed package the row's
+`Replaces` (from `pacman -Si`) names is one pacman replaces in that
+transaction, answering its own "Replace X with Y?" yes under `--noconfirm`,
+and is no conflict; an installed package some other pending package replaces
+is gone from that machine too, and is no conflict either -- `pacman -Qu` is
+blind to a replacement, so the upgrade's own targets are asked for with
+`pacman -Su --print --print-format '%n'` against the copy, `pacman -Si` read
+for the ones the machine does not already have, and each installed package
+their `Replaces` names at a version it satisfies counted as gone; and a
+versioned spec is compared, with `vercmp`, against the version `pacman -Qu`
+against mox's database copy says the upgrade will leave, or the installed
+version when no upgrade is pending -- the `xf86-*` drivers declare
+`xorg-server<21.1.1`, which the same upgrade moves past. Exit 1 with both
+streams empty is how `pacman -Qu` says nothing is pending; any other failure
+of either query is said out loud, naming the command, its exit code and what
+it printed, since the answer read in its place is the machine as it stands.
+Both directions are read: the row's `Conflicts With` against what
+`pacman -Qi` says is installed, by name or by provision, and each installed
+package's own `Conflicts With` -- of the version the upgrade will leave,
+read from `pacman -Si` against the copy when one is pending -- against the
+row and what it provides, for a conflict declared on that side alone. The
+refusal names the installed package pacman would have removed.
 
 Every one of these answers is a sync database's, and the system's is only as
 current as the machine's last sync -- absence from a database synced months
@@ -293,14 +336,24 @@ database, so that `--print` resolves against what the machine has. The copy
 lives under `/var/cache` rather than mox's state directory because pacman 7
 downloads as its `DownloadUser`, which cannot reach into a home directory of
 mode 0700, Arch's default; it is root-owned, kept between applies, and read
-by nothing but these checks. It is made with
-`install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db` and
-`ln -sfn <DBPath>/local /var/cache/mox/pacman-db/local`, both elevated, and
-only when `stat` and `readlink` find it missing, with a mode the download
-user could not traverse, or with `local` pointing elsewhere -- so after the
-first apply an apply elevates `pacman` alone, and a sudoers rule that grants
-nothing else serves it. When those two commands cannot run, the message
-gives them to run once as root. A sync that fails with `db.lck` left in the
+by nothing but these checks. It is made by one elevated `sh -c` --
+`install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db`, then an
+`rmdir` of the copy's `local` when a real empty directory stands there,
+then `ln -sfnT <DBPath>/local /var/cache/mox/pacman-db/local` -- run on the
+terminal, so that sudo can ask for a password once, and only when `stat` and
+`readlink` find it missing, with a mode the download user could not
+traverse, or with `local` not a link to the system's -- so after the first
+apply an apply elevates `pacman` alone, and a sudoers rule that grants
+nothing else serves it. An empty directory at the copy's `local`, which a
+sync into the copy before the link leaves, is removed for the link; one with
+entries in it is named and left. When the make cannot run, the message gives
+that same command line to run once as root, `rmdir` and all, since `ln
+-sfnT` against a real directory there fails with "cannot overwrite
+directory"; a regular file or other non-directory
+at either level is named instead, since `install -d` could only fail on it.
+Beside these, what pacman itself says on stderr while resolving a batch it
+does resolve -- a warning about pacman.conf -- reaches the terminal as it
+came. A sync that fails with `db.lck` left in the
 copy -- what a pacman killed outright mid-sync leaves behind -- names the
 file and says it may be removed once no pacman is running. The install that
 follows is the single `pacman -Syu --needed --noconfirm` transaction with
@@ -521,8 +574,9 @@ explicit-install record when it installs something, and installing a package
 it has already is nothing it does: the row would read missing on every status
 and every apply would install nothing at all. So mox runs the manager's own
 mark command instead -- `brew tab --installed-on-request`, `apt-mark manual`,
-`dnf mark install` on dnf4 and `dnf mark user` on dnf5, `pacman -D
---asexplicit` -- which changes that record and leaves the machine alone. The
+`dnf mark install` on dnf4 and `dnf mark user` on dnf5 (each with
+`--setopt=assumeno=0`, as the install has), `pacman -D --asexplicit` -- which
+changes that record and leaves the machine alone. The
 summary counts those rows apart from the ones mox installed:
 
 ```

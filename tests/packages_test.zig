@@ -76,13 +76,13 @@ fn brewWithInstalled(
 ) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
-    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = formulae });
-    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = casks });
-    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = installed });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = formulae });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = casks });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = installed });
     // What an install asks brew each row's name stands for. Answered with
     // nothing, so no row is refused as an alias: these fixtures are about the
     // install, and the alias refusal is exercised on its own elsewhere.
-    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 });
     try absentLinuxManagers(a, &entries);
     for (extra) |e| try entries.append(a, e);
 
@@ -543,8 +543,8 @@ test "linux: a dnf machine reports and installs through the same core" {
     // uid running this suite, and the fixture must not depend on that.
     const fake = try dnfWith(a, "bat\nhtop\n", &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "sudo dnf install -y ripgrep" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -559,12 +559,12 @@ test "linux: a dnf machine reports and installs through the same core" {
     const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
-        .{ .argv = "sudo dnf install -y ripgrep" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
     useFake(fake2);
     _ = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(fake2.called("sudo dnf install -y ripgrep"));
+    try std.testing.expect(fake2.called("sudo dnf install -y --setopt=assumeno=0 ripgrep"));
 }
 
 test "apply: a row the manager already has is counted apart from the one it installed" {
@@ -592,11 +592,11 @@ test "apply: a row the manager already has is counted apart from the one it inst
     // second is something mox installs.
     const fake = try dnfWith(a, "bat\n", &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\n" },
-        .{ .argv = "sudo dnf mark install groff-base" },
-        .{ .argv = "dnf mark install groff-base" },
+        .{ .argv = "sudo dnf mark install --setopt=assumeno=0 groff-base" },
+        .{ .argv = "dnf mark install --setopt=assumeno=0 groff-base" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
-        .{ .argv = "sudo dnf install -y ripgrep" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -667,13 +667,13 @@ test "apply: a mark that fails is one row's failure, and the rows beside it are 
     // failure -- not the batch, and not "may have landed" over rows that did.
     const fake = try dnfWith(a, "bat\n", &.{
         .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base less ripgrep", .stdout = "groff-base\nless\n" },
-        .{ .argv = "sudo dnf mark install groff-base", .code = 1 },
-        .{ .argv = "dnf mark install groff-base", .code = 1 },
-        .{ .argv = "sudo dnf mark install less" },
-        .{ .argv = "dnf mark install less" },
+        .{ .argv = "sudo dnf mark install --setopt=assumeno=0 groff-base", .code = 1 },
+        .{ .argv = "dnf mark install --setopt=assumeno=0 groff-base", .code = 1 },
+        .{ .argv = "sudo dnf mark install --setopt=assumeno=0 less" },
+        .{ .argv = "dnf mark install --setopt=assumeno=0 less" },
         .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
-        .{ .argv = "sudo dnf install -y ripgrep" },
-        .{ .argv = "dnf install -y ripgrep" },
+        .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -1040,6 +1040,8 @@ test "commit: a declared row its own backend would refuse is not written" {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = "nano-\n" });
+    try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    try entries.append(a, .{ .argv = apt_installed_call, .stdout = "nano- arm64 install ok installed\n" });
     try entries.append(a, .{ .argv = "brew --version", .code = 127 });
     try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
     try entries.append(a, .{ .argv = "pacman --version", .code = 127 });
@@ -1075,6 +1077,8 @@ test "commit: a foreign-architecture package apt reports is recorded, not refuse
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = "libc6:armhf\n" });
+    try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    try entries.append(a, .{ .argv = apt_installed_call, .stdout = "libc6 arm64 install ok installed\nlibc6 armhf install ok installed\n" });
     try entries.append(a, .{ .argv = "brew --version", .code = 127 });
     try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
     try entries.append(a, .{ .argv = "pacman --version", .code = 127 });
@@ -1111,8 +1115,8 @@ test "status: one backend failing a verb does not throw away what the others ans
     // every row brew just computed and describe a machine nobody looked at.
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" });
-    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg\n" });
-    try entries.append(a, .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .code = 7 });
     try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
@@ -1165,7 +1169,7 @@ test "status: a broken manager is BROKEN drift in every format, and no usable ma
     try std.testing.expect(std.mem.indexOf(u8, r.out, "  BROKEN    brew (brew --version exited 1)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no package manager is usable on this machine\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "treated as absent") == null);
-    try std.testing.expect(!fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
+    try std.testing.expect(!fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 
     // Machine formats carry it as a record, keep stdout pure, and put the
@@ -1215,7 +1219,7 @@ test "bootstrap: a manager already present is left alone" {
     }
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping") == null);
     // The package pass still ran over the manager that was already there.
-    try std.testing.expect(fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
+    try std.testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
@@ -2232,7 +2236,7 @@ test "plugin: a not-runnable twin of a built-in is noted, and the built-in stays
         "note      backend brew: scripts/backends/brew.ps1: a windows-only kind; not runnable here; the built-in stays\n",
     ) != null);
     // The built-in answered: the row is neither inert nor missing.
-    try std.testing.expect(fake.called("env HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
+    try std.testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -3033,9 +3037,22 @@ fn aptWith(
     extra: []const mox.packages.exec.Fake.Entry,
 ) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    // A fixture's own entries answer first, so one can stand in for any of
+    // the defaults below.
+    for (extra) |e| try entries.append(a, e);
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 3.0.3 (arm64)\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = manual });
     try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    // dpkg has every package apt-mark reports configured, under the
+    // architecture the name carries or the native one.
+    var dpkg: std.Io.Writer.Allocating = .init(a);
+    var names = std.mem.splitScalar(u8, manual, '\n');
+    while (names.next()) |name| {
+        if (name.len == 0) continue;
+        const arch = mox.packages.backend.archOf(name) orelse "arm64";
+        try dpkg.writer.print("{s} {s} install ok installed\n", .{ mox.packages.backend.bareName(name), arch });
+    }
+    try entries.append(a, .{ .argv = apt_installed_call, .stdout = dpkg.written() });
     // A machine with neither a hold nor a pin, which is what these fixtures
     // are about: the checks are exercised on their own elsewhere.
     try entries.append(a, .{ .argv = "apt-mark showhold" });
@@ -3050,11 +3067,18 @@ fn aptWith(
     }) |argv| {
         try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
     }
-    for (extra) |e| try entries.append(a, e);
 
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     return fake;
+}
+
+const apt_installed_call = "dpkg-query -W -f ${Package} ${Architecture} ${Status}\\n";
+
+/// The stanza `apt-cache policy` prints for a package it has a version of,
+/// in the shape apt 2.6.1 and 3.0.3 print it.
+fn aptStanza(comptime name: []const u8) []const u8 {
+    return name ++ ":\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 500\n        500 http://deb.debian.org/debian trixie/main arm64 Packages\n";
 }
 
 test "apply: a row no manager has fails alone, and the rows beside it install" {
@@ -3079,11 +3103,12 @@ test "apply: a row no manager has fails alone, and the rows beside it install" {
 
     const fake = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
-        .{ .argv = "apt-cache -o APT::Architectures=arm64 -o Dir::State::status=/dev/null --generate pkgnames", .stdout = "sl\nbat\n" },
-        .{ .argv = "dpkg-query -W -f ${Package} ${Architecture} ${Status}\\n", .stdout = "sl arm64 install ok installed\n" },
+        .{ .argv = "apt-cache -o APT::Architectures=arm64 -o Dir::State::status=/dev/null -o APT::Cache::AllNames=false --generate pkgnames", .stdout = "sl\nbat\n" },
+        .{ .argv = apt_installed_call, .stdout = "sl arm64 install ok installed\n" },
         .{ .argv = "apt-cache madison ruby.dev", .stdout = "" },
         .{ .argv = "apt-cache showpkg ruby.dev", .stdout = "" },
         .{ .argv = "apt-mark showauto" },
+        .{ .argv = "apt-cache policy sl", .stdout = aptStanza("sl") },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- sl", .match = .suffix },
     });
     useFake(fake);
@@ -3123,10 +3148,12 @@ test "apply: a foreign-architecture row apt's listing omits still installs" {
     const fake = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-cache policy wine32:armhf", .stdout = aptStanza("wine32:armhf") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf", .match = .suffix },
     });
@@ -3235,13 +3262,14 @@ test "apply: a pacman install that fails is reported as the whole-system upgrade
     }
     try entries.append(a, .{ .argv = "pacman -Qdq", .code = 1 });
     try entries.append(a, .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" });
-    try entries.append(a, .{ .argv = "stat -c %a /var/cache/mox /var/cache/mox/pacman-db", .code = 1 });
-    try entries.append(a, .{ .argv = "install -d -m 755 /var/cache/mox /var/cache/mox/pacman-db", .match = .suffix });
-    try entries.append(a, .{ .argv = "ln -sfn /var/lib/pacman/local /var/cache/mox/pacman-db/local", .match = .suffix });
+    try entries.append(a, .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 });
+    try entries.append(a, .{ .argv = " sh /var/cache/mox /var/cache/mox/pacman-db /var/lib/pacman/local /var/cache/mox/pacman-db/local", .match = .suffix });
     try entries.append(a, .{ .argv = "pacman -Sy --dbpath /var/cache/mox/pacman-db --logfile /dev/null", .match = .suffix });
     try entries.append(a, .{ .argv = "pacman -Sl --dbpath /var/cache/mox/pacman-db", .stdout = "core foo 1-1\n" });
     try entries.append(a, .{ .argv = "pacman -Si --dbpath /var/cache/mox/pacman-db --", .match = .prefix });
     try entries.append(a, .{ .argv = "pacman -Qi" });
+    try entries.append(a, .{ .argv = "pacman -Qu --dbpath /var/cache/mox/pacman-db", .code = 1 });
+    try entries.append(a, .{ .argv = "pacman -Su --print --print-format %n --dbpath /var/cache/mox/pacman-db" });
     try entries.append(a, .{ .argv = "pacman -S --print --print-format %n --dbpath /var/cache/mox/pacman-db -- foo", .stdout = "foo\n" });
     try entries.append(a, .{ .argv = "pacman -Syu --needed --noconfirm -- foo", .code = 1, .match = .suffix });
     const fake = try a.create(mox.packages.exec.Fake);
@@ -3336,6 +3364,64 @@ test "apply: a zypper batch whose read-back found a row landed says how many" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
 }
 
+test "apply: a failed batch that landed a row has the machine re-read, so a fact it bound reaches the post scripts" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try writeManifest(io, h, a, "suse.toml", zypper_two_rows);
+
+    // The batch fails having landed `bat`, and what that install left is a
+    // directory a fact is bound by: only a re-capture after the batch puts
+    // it in the post script's environment. The read-back said what landed,
+    // so nothing is `attempted` here; the re-read rides on `landed` alone.
+    const home = try std.fs.path.join(a, &.{ h.repo, ".landed-home" });
+    const facts = try std.fs.path.join(a, &.{ h.repo, "data", "facts.toml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts, .data = try std.fmt.allocPrint(
+        a,
+        "[[facts]]\nname = \"landedhome\"\ncandidates = [\"{s}\"]\n",
+        .{home},
+    ) });
+    const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
+    try Io.Dir.cwd().createDirPath(io, post_dir);
+    const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = post, .data = try std.fmt.allocPrint(
+        a,
+        "#!/bin/sh\nprintf '%s\\n' \"${{MOX_FACT_LANDEDHOME:-unset}}\" > \"{s}\"\n",
+        .{seen},
+    ) });
+    try Io.Dir.cwd().setFilePermissions(io, post, Io.File.Permissions.fromMode(0o755), .{});
+
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "zypper --version", .stdout = "zypper 1.14.101\n" });
+    for ([_][]const u8{ "brew --version", "apt-get --version", "dnf --version", "pacman --version", "scoop --version", "winget --version" }) |argv| {
+        try entries.append(a, .{ .argv = argv, .fail = error.FileNotFound });
+    }
+    try entries.append(a, .{ .argv = "zypper --non-interactive refresh", .match = .suffix });
+    try entries.append(a, .{
+        .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep bat",
+        .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | bat | a package | package\n",
+    });
+    try entries.append(a, .{ .argv = "zypper --non-interactive install -- ripgrep bat", .code = 4, .match = .suffix, .makes_dir = home, .io = io });
+    try entries.append(a, .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n", .once = true });
+    try entries.append(a, .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nbat\n" });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed (1 row(s) in failed batches landed)") != null);
+    const got = try Io.Dir.cwd().readFileAlloc(io, seen, a, .limited(1 << 20));
+    try std.testing.expectEqualStrings(home, std.mem.trimEnd(u8, got, "\n"));
+}
+
 test "commit then apply: a row commit records is a row apply installs, architecture and all" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3364,10 +3450,12 @@ test "commit then apply: a row commit records is a row apply installs, architect
     const fake2 = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
         },
+        .{ .argv = "apt-cache policy wine32:armhf", .stdout = aptStanza("wine32:armhf") },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- wine32:armhf", .match = .suffix },
     });

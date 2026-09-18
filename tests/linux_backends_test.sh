@@ -73,8 +73,14 @@
 # package, in each direction, which `--print` passes and the install then
 # refuses as a batch; one covers the database copy under a umask of 077,
 # which pacman's download user must still traverse; and one covers a stale
-# lock in that copy. The hermetic suite proves what the adapter does; only
-# the real manager proves what the row would have done. These run with the
+# lock in that copy; one covers a flat apt repository, whose single index
+# puts foreign-only names in the native listing bare and a package for an
+# architecture dpkg has not enabled in the batch; one covers an apt.conf
+# that lists virtual names as packages; one covers a package dpkg left
+# unpacked, which apt-mark lists as manual and only an install can finish;
+# and one covers a dnf.conf `assumeno=True`, which outranks `-y`. The
+# hermetic suite proves what the adapter does; only the real manager proves
+# what the row would have done. These run with the
 # default set, not from the image/backend/package arguments.
 #
 # A manager's IMAGE TAGS are part of what this suite covers. A floating tag
@@ -1197,6 +1203,7 @@ pacman_mkpkg='mkpkg() {
     printf "pkgname = %s\npkgver = %s\npkgdesc = a test package\nurl = http://localhost\nbuilddate = 0\npackager = mox\nsize = 0\narch = any\n" "$1" "$2"
     if [ -n "$3" ]; then printf "depend = %s\n" "$3"; fi
     if [ -n "${5:-}" ]; then printf "conflict = %s\n" "$5"; fi
+    if [ -n "${6:-}" ]; then printf "replaces = %s\n" "$6"; fi
   } > "$d/.PKGINFO"
   (cd "$d" && bsdtar -cf "$4/$1-$2-any.pkg.tar" .PKGINFO usr)
 }
@@ -3016,16 +3023,38 @@ name = "rowb"
 
 [[packages]]
 name = "$pkg"
+
+[[packages]]
+name = "succ"
+
+[[packages]]
+name = "drv"
+
+[[packages]]
+name = "rowc"
+
+[[packages]]
+name = "conflictrow"
 EOF
 
   out="$case_dir/out.txt"
   pull_image "$image" "$backend" "$case_dir" || return 0
 
+  # Beside the two genuine conflicts, four the apply's own `-Syu` resolves,
+  # which were refused all the same when judged against the machine as it
+  # stood: `succ` replaces the installed `holder2` it conflicts with (pacman
+  # answers its own "Replace holder2 with succ?" yes under --noconfirm);
+  # `drv` conflicts with `srv<2` and the upgrade takes srv from 1-1 to 2-1;
+  # the installed `guard2` 1-1 conflicts with `rowc` and its 2-1 does not;
+  # and `conflictrow` conflicts with the installed `oldname`, which no row
+  # names at all -- the repository has dropped it for `newname`, whose
+  # `replaces` names it, so the same `-Syu` removes it. `pacman -Qu` is
+  # blind to that rename, printing nothing and exiting 1.
   if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c "$pacman_mkpkg"'
       set -e
       export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
       pkg="$1"
-      for p in holder guard newcomer rowb "$pkg"; do
+      for p in holder guard newcomer rowb holder2 succ srv drv guard2 rowc oldname newname conflictrow "$pkg"; do
         pacman -Q "$p" >/dev/null 2>&1 && { echo "the image ships $p; the case cannot run"; exit 1; }
       done
       pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
@@ -3034,14 +3063,30 @@ EOF
       mkpkg guard 1-1 "" /srv/repo rowb
       mkpkg newcomer 1-1 "" /srv/repo holder
       mkpkg rowb 1-1 "" /srv/repo
-      (cd /srv/repo && repo-add -q moxtest.db.tar.gz holder-1-1-any.pkg.tar guard-1-1-any.pkg.tar newcomer-1-1-any.pkg.tar rowb-1-1-any.pkg.tar >/dev/null 2>&1)
+      mkpkg holder2 1-1 "" /srv/repo
+      mkpkg succ 1-1 "" /srv/repo holder2 "holder2<2"
+      mkpkg srv 1-1 "" /srv/repo
+      mkpkg srv 2-1 "" /srv/repo
+      mkpkg drv 1-1 "" /srv/repo "srv<2"
+      mkpkg guard2 1-1 "" /srv/repo rowc
+      mkpkg guard2 2-1 "" /srv/repo
+      mkpkg rowc 1-1 "" /srv/repo
+      mkpkg oldname 1-1 "" /srv/repo
+      mkpkg newname 2-1 "" /srv/repo "" oldname
+      mkpkg conflictrow 1-1 "" /srv/repo oldname
+      (cd /srv/repo && repo-add -q moxtest.db.tar.gz holder-1-1-any.pkg.tar guard-1-1-any.pkg.tar newcomer-1-1-any.pkg.tar rowb-1-1-any.pkg.tar holder2-1-1-any.pkg.tar succ-1-1-any.pkg.tar srv-1-1-any.pkg.tar drv-1-1-any.pkg.tar guard2-1-1-any.pkg.tar rowc-1-1-any.pkg.tar oldname-1-1-any.pkg.tar conflictrow-1-1-any.pkg.tar >/dev/null 2>&1)
       printf "[moxtest]\nSigLevel = Never\nServer = file:///srv/repo\n" >> /etc/pacman.conf
       pacman -Sy --noconfirm >/dev/null 2>&1
-      pacman -S --noconfirm holder guard >/dev/null 2>&1
+      pacman -S --noconfirm holder guard holder2 srv guard2 oldname >/dev/null 2>&1
+      (cd /srv/repo && repo-add -q -R moxtest.db.tar.gz srv-2-1-any.pkg.tar guard2-2-1-any.pkg.tar newname-2-1-any.pkg.tar >/dev/null 2>&1)
+      (cd /srv/repo && repo-remove -q moxtest.db.tar.gz oldname >/dev/null 2>&1)
       echo "--- premise ---"
       rc=0; pacman -S --print --print-format "%n" --noconfirm -- newcomer rowb "$pkg" >/tmp/print.txt 2>&1 || rc=$?
       echo "print-exit=$rc"
       echo "print-rows=$(grep -c "^newcomer$\|^rowb$" /tmp/print.txt || true)"
+      rc=0; pacman -Qu >/tmp/qu.txt 2>&1 || rc=$?
+      echo "qu-exit=$rc"
+      echo "qu-names-newname=$(grep -c "^newname " /tmp/qu.txt || true)"
       echo "--- apply ---"
       rc=0
       /w/mox apply || rc=$?
@@ -3049,6 +3094,10 @@ EOF
       echo "installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
       echo "kept=$(pacman -Qq holder guard 2>/dev/null | grep -c . || true)"
       echo "collateral=$(pacman -Qq newcomer rowb 2>/dev/null | grep -c . || true)"
+      echo "replaced=$(pacman -Qq succ >/dev/null 2>&1 && echo 1 || echo 0)/$(pacman -Qq holder2 >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "versioned=$(pacman -Qq drv >/dev/null 2>&1 && echo 1 || echo 0)/$(pacman -Q srv 2>/dev/null | tr " " "-")"
+      echo "reverse=$(pacman -Qq rowc >/dev/null 2>&1 && echo 1 || echo 0)/$(pacman -Q guard2 2>/dev/null | tr " " "-")"
+      echo "renamed=$(pacman -Qq conflictrow >/dev/null 2>&1 && echo 1 || echo 0)/$(pacman -Qq newname >/dev/null 2>&1 && echo 1 || echo 0)/$(pacman -Qq oldname >/dev/null 2>&1 && echo 1 || echo 0)"
     ' sh "$pkg" >"$out" 2>&1; then
     no "$backend ($image): container run failed" "$(tail -3 "$out")"
     return
@@ -3077,10 +3126,40 @@ EOF
     no "$backend ($image): the row an installed package conflicts with was not refused" "$(grep 'row "rowb"' "$out" | tail -2)"
   fi
 
-  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 2 failed" "$out"; then
-    ok "$backend ($image): the row beside them installed; two bad rows kept nothing off the machine"
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 5 installed, 2 failed" "$out"; then
+    ok "$backend ($image): the rows beside them installed; two bad rows kept nothing off the machine"
   else
-    no "$backend ($image): the good row did not install" "$(grep -E '^installed=|Packages:|^mox apply' "$out" | tail -3)"
+    no "$backend ($image): the good rows did not install" "$(grep -E '^installed=|Packages:|^mox apply' "$out" | tail -3)"
+  fi
+
+  if grep -q "^replaced=1/0" "$out" && ! grep -q 'row "succ"' "$out"; then
+    ok "$backend ($image): a row that replaces the installed package it conflicts with installs, pacman replacing it in the upgrade"
+  else
+    no "$backend ($image): the row replacing an installed package was refused, or did not replace it" "$(grep -E '^replaced=|row "succ"' "$out" | tail -2)"
+  fi
+
+  if grep -q "^versioned=1/srv-2-1" "$out" && ! grep -q 'row "drv"' "$out"; then
+    ok "$backend ($image): a versioned conflict the upgrade moves past installs beside that upgrade"
+  else
+    no "$backend ($image): the row whose versioned conflict the upgrade resolves was refused" "$(grep -E '^versioned=|row "drv"' "$out" | tail -2)"
+  fi
+
+  if grep -q "^reverse=1/guard2-2-1" "$out" && ! grep -q 'row "rowc"' "$out"; then
+    ok "$backend ($image): a conflict the installed package's own upgrade drops installs beside that upgrade"
+  else
+    no "$backend ($image): the row an installed package's old version conflicted with was refused" "$(grep -E '^reverse=|row "rowc"' "$out" | tail -2)"
+  fi
+
+  if grep -q "^qu-names-newname=0" "$out"; then
+    ok "$backend ($image): -Qu is blind to the rename, so it cannot be the whole oracle"
+  else
+    no "$backend ($image): -Qu already reports the rename here, so this case proves nothing" "$(grep -E '^qu-' "$out")"
+  fi
+
+  if grep -q "^renamed=1/1/0" "$out" && ! grep -q 'row "conflictrow"' "$out"; then
+    ok "$backend ($image): a row conflicting with a package the upgrade replaces away installs"
+  else
+    no "$backend ($image): the row conflicting with a replaced package was refused, or the rename did not happen" "$(grep -E '^renamed=|row "conflictrow"' "$out" | tail -2)"
   fi
 
   if grep -q "^kept=2" "$out" && grep -q "^collateral=0" "$out"; then
@@ -3174,6 +3253,197 @@ EOF
   fi
 }
 
+# The first apply of a user sudo asks for a password: the copy's make is
+# elevated, and as a captured call it had no terminal for sudo to ask on --
+# sudo stopped it, the read loop reported it killed, and the apply failed
+# with no copy made, on every apply until root made the copy by hand. The
+# make is one streamed call now, so sudo asks once, on the terminal, and
+# the apply goes on to make the copy and install.
+run_pacman_sudo_password_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman sudo-password"
+
+  case_dir="$work/pacman-sudo-password"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "$pkg"
+EOF
+  # `expect` gives the apply a terminal and answers the one prompt on it.
+  cat >"$case_dir/inner.sh" <<'EOF'
+export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/home/tester
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+EOF
+  cat >"$case_dir/drive.exp" <<'EOF'
+set timeout 900
+spawn setpriv --reuid=tester --regid=tester --init-groups bash /w/inner.sh
+expect {
+  -re "password for tester:" { send "pw\r"; exp_continue }
+  eof
+}
+catch wait result
+exit [lindex $result 3]
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      pkg="$1"
+      pacman -Q "$pkg" >/dev/null 2>&1 && { echo "the image ships $pkg; the case cannot run"; exit 1; }
+      [ -e /var/cache/mox ] && { echo "the image ships /var/cache/mox; the case cannot run"; exit 1; }
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      pacman -S --noconfirm sudo expect >/dev/null 2>&1 || { echo "sync=failed"; exit 0; }
+      useradd -m tester
+      echo tester:pw | chpasswd
+      echo "tester ALL=(ALL:ALL) ALL" >/etc/sudoers.d/tester
+      chmod 440 /etc/sudoers.d/tester
+      chown -R tester /w/state
+      echo "--- apply ---"
+      rc=0
+      expect -f /w/drive.exp || rc=$?
+      echo "expect-exit=$rc"
+      echo "copy=$(stat -L -c %F /var/cache/mox 2>&1)"
+      echo "link=$(readlink /var/cache/mox/pacman-db/local 2>&1)"
+      echo "installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so sudo and expect could not be installed" "$(tail -2 "$out")"
+    return
+  fi
+
+  prompts="$(grep -c 'password for tester' "$out" || true)"
+  if [ "$prompts" -ge 1 ] && ! grep -q "stopped, and this run has no terminal" "$out"; then
+    ok "$backend ($image): sudo asked for the password on the terminal ($prompts prompt(s)), and nothing was stopped waiting for one"
+  else
+    no "$backend ($image): sudo did not get to ask on the terminal" "$(grep -E 'password|stopped|^mox' "$out" | tail -3)"
+  fi
+
+  if grep -q "^apply-exit=0" "$out" && grep -q "^copy=directory" "$out" && grep -q "^link=/var/lib/pacman/local" "$out"; then
+    ok "$backend ($image): the first apply made the copy, with local linked to the system's"
+  else
+    no "$backend ($image): the first apply did not make the copy" "$(grep -E '^apply-exit=|^copy=|^link=|^mox' "$out" | tail -4)"
+  fi
+
+  if grep -q "^installed=1" "$out" && grep -q "Packages: 1 installed, 0 failed" "$out"; then
+    ok "$backend ($image): and installed the row through it"
+  else
+    no "$backend ($image): the row did not install on the first apply" "$(grep -E '^installed=|Packages:|^mox' "$out" | tail -3)"
+  fi
+}
+
+# What stands where the copy goes: a real directory at the copy's `local`
+# (what a sync into the copy before the link leaves), which `ln -sfn`
+# nested the link inside so that every apply after re-ran the make and
+# `--print` resolved against an empty local; the same with entries in it,
+# which nothing may remove; and a regular file at `/var/cache/mox`, which
+# `install -d` fails on with "File exists". With it, a warning pacman prints
+# beside a transaction it does resolve, which the batch `--print` used to
+# drop.
+run_pacman_local_dir_case() {
+  image="$1"
+  pkg="$2"
+  backend="pacman local-dir"
+
+  case_dir="$work/pacman-local-dir"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
+backend = "pacman"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
+      set -e
+      export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+      pkg="$1"
+      pacman -Q "$pkg" >/dev/null 2>&1 && { echo "the image ships $pkg; the case cannot run"; exit 1; }
+      [ -e /var/cache/mox ] && { echo "the image ships /var/cache/mox; the case cannot run"; exit 1; }
+      pacman -Sy --noconfirm >/tmp/sy.txt 2>&1 || { echo "sync=failed"; exit 0; }
+      printf "\n[options]\nMoxBogus = 1\n" >> /etc/pacman.conf
+      echo "--- empty directory at local ---"
+      install -d -m 755 /var/cache/mox/pacman-db/local
+      rc=0
+      /w/mox apply || rc=$?
+      echo "empty-exit=$rc"
+      echo "empty-link=$(readlink /var/cache/mox/pacman-db/local 2>&1)"
+      echo "empty-installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "--- directory with entries at local ---"
+      pacman -Rns --noconfirm "$pkg" >/dev/null 2>&1 || true
+      rm -rf /var/cache/mox /w/state
+      mkdir -p /w/state
+      install -d -m 755 /var/cache/mox/pacman-db/local
+      touch /var/cache/mox/pacman-db/local/keep
+      rc=0
+      /w/mox apply || rc=$?
+      echo "kept-exit=$rc"
+      echo "kept-file=$(stat -c %F /var/cache/mox/pacman-db/local/keep 2>&1)"
+      echo "kept-installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+      echo "--- regular file at /var/cache/mox ---"
+      rm -rf /var/cache/mox /w/state
+      mkdir -p /w/state
+      touch /var/cache/mox
+      rc=0
+      /w/mox apply || rc=$?
+      echo "file-exit=$rc"
+      echo "file-after=$(stat -c %F /var/cache/mox 2>&1)"
+      echo "file-installed=$(pacman -Qq "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
+    ' sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  if grep -q "^sync=failed" "$out"; then
+    skip "$backend ($image): pacman could not sync here, so no copy could be made" "$(tail -2 "$out")"
+    return
+  fi
+
+  if grep -q "^empty-exit=0" "$out" && grep -q "^empty-link=/var/lib/pacman/local" "$out" && grep -q "^empty-installed=1" "$out"; then
+    ok "$backend ($image): an empty directory at the copy's local is replaced by the link, and the row installed"
+  else
+    no "$backend ($image): the empty directory at local was not replaced" "$(grep -E '^empty-|^mox' "$out" | tail -4)"
+  fi
+
+  empty="$(sed -n '/--- empty directory at local ---/,/--- directory with entries at local ---/p' "$out")"
+  if echo "$empty" | grep -q "warning: config file /etc/pacman.conf, line [0-9]*: directive 'MoxBogus' in section 'options' not recognized."; then
+    ok "$backend ($image): pacman's own warning beside a transaction it resolved reached the terminal"
+  else
+    no "$backend ($image): pacman's warning was dropped" "$(echo "$empty" | grep -c warning)"
+  fi
+
+  if grep -q "^kept-exit=[1-9]" "$out" && grep -q "^kept-file=regular empty file" "$out" && grep -q "^kept-installed=0" "$out" \
+    && grep -q "mox: pacman: /var/cache/mox/pacman-db/local is a directory with entries in it, where the copy of pacman's databases the check reads keeps a link to /var/lib/pacman/local; mox removes nothing there, so move it aside as root, after which an apply makes the link" "$out"; then
+    ok "$backend ($image): a directory with entries at local is named and left, and nothing was installed through an empty local"
+  else
+    no "$backend ($image): the directory with entries at local was not named, or was removed" "$(grep -E '^kept-|^mox' "$out" | tail -4)"
+  fi
+
+  if grep -q "^file-exit=[1-9]" "$out" && grep -q "^file-after=regular empty file" "$out" && grep -q "^file-installed=0" "$out" \
+    && grep -q "mox: pacman: /var/cache/mox is a regular empty file, not a directory, so the copy of pacman's databases the check reads at /var/cache/mox/pacman-db cannot be made; move it aside as root, after which an apply makes the copy" "$out"; then
+    ok "$backend ($image): a regular file where the copy goes is named, and no make was tried against it"
+  else
+    no "$backend ($image): the regular file at /var/cache/mox was not named" "$(grep -E '^file-|^mox' "$out" | tail -4)"
+  fi
+}
+
 # A stale `db.lck` in the copy, which a pacman killed outright mid-sync
 # leaves behind: pacman says only "unable to lock database" for a sync, and
 # the apply named nothing but an error. It must name the file.
@@ -3248,6 +3518,430 @@ EOF
   fi
 }
 
+# A flat repository (`deb [trusted=yes] file:/repo ./`) keeps every
+# architecture in one index, so apt's native listing prints its foreign-only
+# names bare and cannot refuse them: `apt-get install -y -- mox-flat-armhf`
+# installs `mox-flat-armhf:armhf`, which apt-mark reports qualified, and the
+# row is missing and the package untracked on every run after. A package in
+# that index built for an architecture dpkg has not enabled takes the whole
+# batch down instead: apt 2.6.1 answers "Unable to locate package", apt
+# 2.8.3 and 3.0.3 reach dpkg, which refuses the architecture. The stanza
+# `apt-cache policy` heads with the qualified name is what tells the two
+# rows apart from a native one, so both must be refused with the rest of
+# the batch installed -- and the qualified spelling must still install and
+# converge, madison having named no architecture for a flat line.
+run_apt_flat_repo_case() {
+  image="$1"
+  foreign="$2"
+  backend="apt flat-repo"
+  case "$foreign" in
+    i386) other=armhf ;;
+    *) other=i386 ;;
+  esac
+
+  case_dir="$work/apt-flat-repo"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<EOF
+backend = "apt"
+
+[[packages]]
+name = "mox-flat-$foreign"
+
+[[packages]]
+name = "mox-flat-$other"
+
+[[packages]]
+name = "sl"
+EOF
+  cat >"$case_dir/qualified.toml" <<EOF
+backend = "apt"
+
+[[packages]]
+name = "mox-flat-$foreign:$foreign"
+EOF
+  cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+apt-get update >/dev/null
+apt-get install -y dpkg-dev >/dev/null 2>&1
+apt-get --version | head -1
+dpkg --add-architecture "$FOREIGN"
+build() {
+  rm -rf /tmp/p
+  mkdir -p /tmp/p/DEBIAN
+  printf "Package: %s\nVersion: 1.0\nArchitecture: %s\nMaintainer: mox <mox@example.invalid>\nDescription: a package a flat repository carries\n" "$1" "$2" > /tmp/p/DEBIAN/control
+  dpkg-deb --build /tmp/p "/repo/${1}_1.0_$2.deb" >/dev/null
+}
+mkdir -p /repo
+build "mox-flat-$FOREIGN" "$FOREIGN"
+build "mox-flat-$OTHER" "$OTHER"
+(cd /repo && dpkg-scanpackages . /dev/null > Packages 2>/dev/null)
+echo "deb [trusted=yes] file:/repo ./" > /etc/apt/sources.list.d/flat.list
+apt-get update >/dev/null 2>&1
+native="$(dpkg --print-architecture)"
+echo "--- premise ---"
+apt-cache -o "APT::Architectures=$native" -o Dir::State::status=/dev/null -o APT::Cache::AllNames=false --generate pkgnames | grep -x "mox-flat-$FOREIGN" || echo "listing-lacks-foreign"
+apt-cache -o "APT::Architectures=$native" -o Dir::State::status=/dev/null -o APT::Cache::AllNames=false --generate pkgnames | grep -x "mox-flat-$OTHER" || echo "listing-lacks-other"
+echo "--- madison ---"
+apt-cache madison "mox-flat-$FOREIGN:$FOREIGN"
+echo "--- policy ---"
+apt-cache policy "mox-flat-$FOREIGN" "mox-flat-$OTHER"
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+echo "--- after ---"
+/w/mox status || true
+echo "--- qualified ---"
+cp /w/qualified.toml /w/repo/data/packages/apt.toml
+/w/mox status || true
+echo "--- qualified apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "qualified-apply-exit=$rc"
+echo "--- qualified after ---"
+/w/mox status || true
+echo "--- showmanual ---"
+apt-mark showmanual | grep -x "mox-flat-$FOREIGN:$FOREIGN" || echo "foreign-not-manual"
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" -e FOREIGN="$foreign" -e OTHER="$other" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  premise="$(sed -n '/--- premise ---/,/--- madison ---/p' "$out")"
+  if echo "$premise" | grep -qx "mox-flat-$foreign" && echo "$premise" | grep -qx "mox-flat-$other"; then
+    ok "$backend ($image): the native listing prints both flat-index names bare"
+  else
+    no "$backend ($image): the flat index did not defeat the listing, so this case proves nothing" "$premise"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- qualified ---/p' "$out")"
+  policy="$(sed -n '/--- policy ---/,/--- before ---/p' "$out")"
+
+  if echo "$before" | grep -qE "MISSING[[:space:]]+apt mox-flat-$foreign" && echo "$before" | grep -qE "MISSING[[:space:]]+apt mox-flat-$other"; then
+    ok "$backend ($image): both bare rows read MISSING before the apply"
+  else
+    no "$backend ($image): expected both flat rows MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  want="mox: apt: row \"mox-flat-$foreign\" names an apt package for the architecture \"$foreign\" alone, which apt-mark reports as \"mox-flat-$foreign:$foreign\", so the row could never read as installed; declare \"mox-flat-$foreign:$foreign\" instead"
+  if grep -qF "$want" "$out"; then
+    ok "$backend ($image): the bare row for the enabled foreign architecture is refused with the qualified spelling"
+  else
+    no "$backend ($image): the foreign flat row was not refused with the qualified spelling" "$(grep '^mox: apt' "$out" | tail -3)"
+  fi
+
+  # Which refusal the un-enabled architecture gets follows what apt printed:
+  # a stanza headed with the qualified name (apt 2.8.3, 3.0.3) or none at all
+  # (apt 2.4.14, 2.6.1).
+  if echo "$policy" | grep -q "^mox-flat-$other:$other:"; then
+    want="mox: apt: row \"mox-flat-$other\" names an apt package for the architecture \"$other\" alone, which this machine's dpkg has not enabled, so an install carrying it fails at dpkg and installs nothing at all, and it was not installed; \`dpkg --add-architecture $other\` and declare \"mox-flat-$other:$other\" to let mox install it"
+    shape="a stanza apt heads with the qualified name"
+  else
+    want="mox: apt: row \"mox-flat-$other\" names a package apt-cache policy prints no stanza for, which is an operand apt cannot locate at all, and an install carrying one installs nothing at all, so it was not installed"
+    shape="no stanza at all"
+  fi
+  if grep -qF "$want" "$out"; then
+    ok "$backend ($image): the bare row for an architecture dpkg has not enabled is refused, apt having printed $shape"
+  else
+    no "$backend ($image): the un-enabled architecture's row was not refused as $shape" "$(grep '^mox: apt' "$out" | tail -3)"
+  fi
+
+  if grep -q "Packages: 1 installed, 2 failed" "$out" && ! grep -q "may have landed" "$out"; then
+    ok "$backend ($image): the row beside them installed, and the two refusals are their own failures"
+  else
+    no "$backend ($image): apply did not install the rest of the batch alone" "$(grep -i 'packages:\|apply-exit=' "$out" | head -2)"
+  fi
+
+  if echo "$after" | grep -qE "UNTRACKED[[:space:]]+apt mox-flat"; then
+    no "$backend ($image): a flat-index package landed under a name no row could match" "$(echo "$after" | grep 'mox-flat')"
+  else
+    ok "$backend ($image): nothing landed under the qualified name behind a bare row"
+  fi
+
+  qualified="$(sed -n '/--- qualified after ---/,/--- showmanual ---/p' "$out")"
+  if grep -q "qualified-apply-exit=0" "$out" && sed -n '/--- qualified apply ---/,/--- qualified after ---/p' "$out" | grep -q "Packages: 1 installed, 0 failed"; then
+    ok "$backend ($image): the qualified row installs from the flat index"
+  else
+    no "$backend ($image): the qualified row did not install" "$(sed -n '/--- qualified apply ---/,/--- qualified after ---/p' "$out" | grep -i 'mox: apt\|packages:' | tail -3)"
+  fi
+
+  if echo "$qualified" | grep -qE "MISSING[[:space:]]+apt" || ! grep -qx "mox-flat-$foreign:$foreign" "$out"; then
+    no "$backend ($image): the qualified row did not converge" "$(echo "$qualified" | tail -4)"
+  else
+    ok "$backend ($image): the drift over the qualified row is clean after apply, and apt-mark reports the qualified name"
+  fi
+}
+
+# apt.conf `APT::Cache::AllNames "true"` makes `apt-cache pkgnames` list
+# virtual names too, so `awk` -- a name only mawk, gawk and original-awk
+# provide -- reads as a package, and `apt-cache policy awk` then answers
+# `Candidate: (none)`: the row would be refused as pinned rather than told
+# what provides it. The listing pins the option back to false.
+run_apt_allnames_case() {
+  image="$1"
+  backend="apt allnames"
+
+  case_dir="$work/apt-allnames"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "awk"
+
+[[packages]]
+name = "sl"
+EOF
+  cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+apt-get update >/dev/null
+apt-get --version | head -1
+printf 'APT::Cache::AllNames "true";\n' > /etc/apt/apt.conf.d/99mox-case
+native="$(dpkg --print-architecture)"
+echo "--- premise ---"
+apt-cache -o "APT::Architectures=$native" -o Dir::State::status=/dev/null --generate pkgnames | grep -x awk || echo "conf-does-not-list-awk"
+apt-cache policy awk
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+echo "--- after ---"
+/w/mox status || true
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  premise="$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  if echo "$premise" | grep -qx awk && echo "$premise" | grep -q "Candidate: (none)"; then
+    ok "$backend ($image): under the conf the plain listing prints awk, which policy answers with no candidate"
+  else
+    no "$backend ($image): the conf did not put awk in the listing, so this case proves nothing" "$premise"
+  fi
+
+  if grep -q 'row "awk" names no apt package; it is a virtual name provided by' "$out"; then
+    ok "$backend ($image): awk is refused as the virtual name it is, with its providers named"
+  else
+    no "$backend ($image): awk was not refused as a virtual name" "$(grep '^mox: apt' "$out" | tail -3)"
+  fi
+
+  if grep -q "Packages: 1 installed, 1 failed" "$out"; then
+    ok "$backend ($image): the row beside it installed"
+  else
+    no "$backend ($image): apply did not install the rest of the batch" "$(grep -i 'packages:' "$out" | tail -2)"
+  fi
+}
+
+# A package an interrupted run left `install ok unpacked` is on the disk and
+# not set up, and `apt-mark showmanual` lists it all the same. The explicit
+# set is intersected with what dpkg has configured, so the row reads MISSING;
+# `apt-get install -y -- <name>` then configures it (measured: "Setting up
+# sl" on apt 2.6.1 and 3.0.3), where `apt-mark manual` on one apt holds as
+# auto would have left it unpacked -- so that row goes to the install too.
+run_apt_unpacked_case() {
+  image="$1"
+  backend="apt unpacked"
+
+  case_dir="$work/apt-unpacked"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "sl"
+
+[[packages]]
+name = "cowsay"
+EOF
+  cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+apt-get update >/dev/null
+apt-get --version | head -1
+apt-get install -y sl cowsay >/dev/null 2>&1
+apt-mark auto cowsay >/dev/null
+cd /tmp && apt-get download sl cowsay >/dev/null 2>&1 && dpkg --unpack sl_*.deb cowsay_*.deb >/dev/null 2>&1
+echo "--- premise ---"
+dpkg-query -W -f '${Package} ${Status}\n' sl cowsay
+apt-mark showmanual | grep -x sl || echo "sl-not-manual"
+apt-mark showauto | grep -x cowsay || echo "cowsay-not-auto"
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+echo "--- after ---"
+/w/mox status || true
+echo "--- dpkg ---"
+dpkg-query -W -f '${Package} ${Status}\n' sl cowsay
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  premise="$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  if echo "$premise" | grep -q "^sl install ok unpacked" && echo "$premise" | grep -q "^cowsay install ok unpacked" && echo "$premise" | grep -qx sl && echo "$premise" | grep -qx cowsay; then
+    ok "$backend ($image): both packages are unpacked, one manual and one auto"
+  else
+    no "$backend ($image): the case could not put the packages in the state it is about" "$premise"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- dpkg ---/p' "$out")"
+  if echo "$before" | grep -qE "MISSING[[:space:]]+apt sl" && echo "$before" | grep -qE "MISSING[[:space:]]+apt cowsay"; then
+    ok "$backend ($image): a package apt-mark lists but dpkg has not configured reads MISSING"
+  else
+    no "$backend ($image): expected both rows MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q "Packages: 2 installed, 0 failed" "$out" && ! grep -q "marking it manually installed" "$out"; then
+    ok "$backend ($image): both rows go to the install, and neither is merely marked"
+  else
+    no "$backend ($image): apply did not install both rows" "$(grep -i 'packages:\|marking it' "$out" | tail -3)"
+  fi
+
+  dpkg_after="$(sed -n '/--- dpkg ---/,$p' "$out")"
+  if echo "$dpkg_after" | grep -q "^sl install ok installed" && echo "$dpkg_after" | grep -q "^cowsay install ok installed"; then
+    ok "$backend ($image): the real apt-get configured both"
+  else
+    no "$backend ($image): a package is still unpacked after the apply" "$dpkg_after"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+apt"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+}
+
+# dnf.conf `assumeno=True` outranks `-y`: `dnf install -y tree` under it
+# exits 1 with "Operation aborted." (dnf 4.14.0) or "Operation aborted by
+# the user." (dnf5 5.2.18, 5.4.3) and installs nothing, and dnf5's `dnf mark
+# user -y` aborts the same way. The install and the mark each carry
+# `--setopt=assumeno=0`, which puts the answer back.
+run_dnf_assumeno_case() {
+  image="$1"
+  backend="dnf assumeno"
+
+  case_dir="$work/dnf-assumeno"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/dnf.toml" <<'EOF'
+backend = "dnf"
+
+[[packages]]
+name = "tree"
+
+[[packages]]
+name = "groff-base"
+EOF
+  cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+dnf --version | head -1
+dnf install -y man-db >/dev/null 2>&1 || true
+printf 'assumeno=True\n' >> /etc/dnf/dnf.conf
+echo "--- premise ---"
+rc=0
+LC_ALL=C dnf install -y tree > /tmp/plain.txt 2>&1 || rc=$?
+echo "plain-install-exit=$rc"
+tail -1 /tmp/plain.txt
+rpm -q tree || true
+if dnf -q repoquery --installed --qf '%{name}\n' groff-base | grep -qx groff-base; then
+  echo "dependency-installed=yes"
+else
+  echo "dependency-installed=no"
+fi
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+echo "--- after ---"
+/w/mox status || true
+echo "--- record ---"
+rpm -q tree || true
+if dnf -q repoquery --userinstalled --qf '%{name}\n' | grep -qx groff-base; then
+  echo "record=asked-for"
+else
+  echo "record=dependency"
+fi
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  premise="$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  if echo "$premise" | grep -q "plain-install-exit=1" && echo "$premise" | grep -q "Operation aborted" && echo "$premise" | grep -q "package tree is not installed" && echo "$premise" | grep -q "dependency-installed=yes"; then
+    ok "$backend ($image): under assumeno=True the manager's own -y install aborts, and groff-base is a dependency"
+  else
+    no "$backend ($image): the case could not put dnf in the state it is about" "$premise"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- record ---/p' "$out")"
+  if echo "$before" | grep -qE "MISSING[[:space:]]+dnf tree" && echo "$before" | grep -qE "MISSING[[:space:]]+dnf groff-base"; then
+    ok "$backend ($image): both rows read MISSING before the apply"
+  else
+    no "$backend ($image): expected both rows MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  if grep -q "Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out" && grep -q "apply-exit=0" "$out"; then
+    ok "$backend ($image): the install and the mark both went through under the conf"
+  else
+    no "$backend ($image): apply did not install one row and mark the other" "$(grep -i 'packages:\|Operation aborted\|apply-exit=' "$out" | tail -3)"
+  fi
+
+  record="$(sed -n '/--- record ---/,$p' "$out")"
+  if echo "$record" | grep -q "^tree-" && echo "$record" | grep -q "record=asked-for"; then
+    ok "$backend ($image): rpm has tree, and dnf records groff-base as asked for"
+  else
+    no "$backend ($image): the machine does not show what the apply reported" "$record"
+  fi
+
+  if echo "$after" | grep -qE "MISSING[[:space:]]+dnf"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -3277,6 +3971,14 @@ else
   run_apt_no_repositories_case debian:stable
   run_dependency_case debian:stable apt
   run_apt_held_dependency_case debian:stable
+  # The flat-index refusal differs by apt version -- 2.6.1 prints no policy
+  # stanza for an architecture dpkg has not enabled, 3.0.3 prints one -- so
+  # the pinned release and the floating one both run.
+  run_apt_flat_repo_case debian:12 "$foreign_arch"
+  run_apt_flat_repo_case debian:stable "$foreign_arch"
+  run_apt_allnames_case debian:12
+  run_apt_unpacked_case debian:12
+  run_apt_unpacked_case debian:stable
   # Both dnf generations: dnf5 (fedora) logs to stderr, dnf4 (rocky) writes
   # its metadata line to stdout, which the adapter's query must not read as
   # a package name.
@@ -3297,6 +3999,9 @@ else
   run_dependency_case fedora:latest dnf
   run_dnf_no_repository_case rockylinux:9
   run_dnf_no_repository_case fedora:latest
+  run_dnf_assumeno_case rockylinux:9
+  run_dnf_assumeno_case fedora:42
+  run_dnf_assumeno_case fedora:latest
   run_case opensuse/tumbleweed zypper ripgrep
   # zypper's only other case installs a real package; these two are the
   # negative half every other manager already has.
@@ -3323,6 +4028,8 @@ else
   run_pacman_conflict_case archlinux:latest cowsay
   run_pacman_umask_case archlinux:latest cowsay
   run_pacman_stale_lock_case archlinux:latest cowsay
+  run_pacman_sudo_password_case archlinux:latest cowsay
+  run_pacman_local_dir_case archlinux:latest cowsay
   run_case debian:stable brew hello
 fi
 

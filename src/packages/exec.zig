@@ -742,7 +742,9 @@ pub const Fake = struct {
         match: Match = .exact,
         stdout: []const u8 = "",
         /// Answered only to a call that captures stderr, as the real stderr
-        /// reaches a `Result` only then.
+        /// reaches a `Result` only then; a call that would not read it is
+        /// refused, so a `run` where a `runBoth` was meant cannot pass on
+        /// the "" it would have read.
         stderr: []const u8 = "",
         code: u8 = 0,
         /// Raised instead of answering, for the failures a manager reports by
@@ -753,6 +755,9 @@ pub const Fake = struct {
         /// Write `stdout` to the file the argument after this flag names,
         /// instead of returning it: what `curl -o <path>` does.
         write_after: ?[]const u8 = null,
+        /// Create this directory when matched: what an install leaves on the
+        /// machine, for a test about what is read back after one.
+        makes_dir: ?[]const u8 = null,
         io: ?Io = null,
         /// Answers the first matching call only, then steps aside for a
         /// later entry: a manager absent before a bootstrap and present after.
@@ -816,6 +821,8 @@ pub const Fake = struct {
             if (e.once) self.spent.items[i] = true;
             if (e.fail) |err| return err;
             if (e.timed_out) return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
+            if (e.stderr.len > 0 and (is_streamed or capture != .both)) return error.StderrNotCaptured;
+            if (e.makes_dir) |path| try Io.Dir.cwd().createDirPath(e.io.?, path);
             if (e.write_after) |flag| {
                 for (argv, 0..) |a, j| {
                     if (std.mem.eql(u8, a, flag) and j + 1 < argv.len) {
@@ -1011,8 +1018,10 @@ test "Fake: stderr is answered to a runBoth call alone" {
     } };
     const both = try fake.runner().runBoth(a, &.{ "pacman", "-S", "--print", "--", "x" });
     try testing.expectEqualStrings("error: target not found: x\n", both.stderr);
-    const one = try fake.runner().run(a, &.{ "pacman", "-S", "--print", "--", "x" });
-    try testing.expectEqualStrings("", one.stderr);
+    // A `run` here would read "" where the code under test meant to read
+    // pacman's line: the mix-up fails the test rather than passing it.
+    try testing.expectError(error.StderrNotCaptured, fake.runner().run(a, &.{ "pacman", "-S", "--print", "--", "x" }));
+    try testing.expectError(error.StderrNotCaptured, fake.runner().stream(a, &.{ "pacman", "-S", "--print", "--", "x" }));
 }
 
 test "Process: a streamed call is not bounded by the captured bound" {
@@ -1528,6 +1537,19 @@ test "Process: a child that never stops writing is ended at the cap, not waited 
     try testing.expectError(error.StreamTooLong, p.runner().run(a, &.{ "sh", "-c", "yes" }));
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(elapsed_ms < 30_000);
+}
+
+test "Process: a child that writes past the cap on stderr alone is refused, as one on stdout is" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Twice the cap, so the refusal comes mid-stream; `head` ends the child
+    // on its own, so a regression here reads to the end rather than hanging.
+    var p: Process = .{ .io = std.testing.io, .timeout_ms = 30_000 };
+    const over = try std.fmt.allocPrint(a, "yes | head -c {d} >&2", .{2 * max_query_bytes});
+    try testing.expectError(error.StreamTooLong, p.runner().runBoth(a, &.{ "sh", "-c", over }));
 }
 
 test "Process: a child that ignores SIGTERM is still ended at the bound" {

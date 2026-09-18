@@ -485,10 +485,20 @@ pub const Zypper = struct {
         for (keep) |row| try ids.append(arena, row.name);
         // What the machine has before the batch, so that a failed batch is
         // credited with what it landed and not with a package the user
-        // installed by hand beside a failing sibling.
+        // installed by hand beside a failing sibling. rpm answering with
+        // a failure is the one "no baseline" case; a read killed at its
+        // bound, or one past the cap, is a machine that could not be read,
+        // and is that error before any install.
         const before: ?[]const []const u8 = self.presentOf(arena, ids.items, true) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            else => null,
+            Error.ZypperQueryFailed => null,
+            error.StreamTooLong => {
+                self.say(
+                    "mox: zypper: `rpm -qa` answered with more than the {d} MiB mox reads from one query, so what the machine has could not be read and nothing was installed\n",
+                    .{exec.max_query_bytes / (1024 * 1024)},
+                );
+                return e;
+            },
+            else => return e,
         };
 
         self.spawned = true;
@@ -690,6 +700,7 @@ test "install: refreshes, installs the batch, and records what landed" {
         .{ .argv = "sudo zypper --non-interactive refresh" },
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | bat | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
@@ -930,6 +941,7 @@ test "install: an informational refresh exit is not a failed install" {
             .{ .argv = "sudo zypper --non-interactive refresh", .code = code },
             .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
             .{ .argv = "sudo zypper --non-interactive install -- bat" },
+            .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
         } };
         var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
         try z.backend().install(a, &.{rowOf("bat", &.{})});
@@ -956,6 +968,7 @@ test "install: root installs without sudo" {
         .{ .argv = "zypper --non-interactive refresh" },
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
         .{ .argv = "zypper --non-interactive install -- bat" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
     z.force_elevate = false;
@@ -1131,6 +1144,7 @@ test "install: the name check asks zypper for a plain table, whatever zypper.con
             .stdout = "S | Name    | Summary                                  | Type\n--+---------+------------------------------------------+--------\n  | ripgrep | A search tool that combines ag with grep | package\n",
         },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
 
@@ -1160,6 +1174,7 @@ test "install: a row naming an rpm virtual provide is refused, naming what provi
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep smtp_daemon", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n" },
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package --provides -- smtp_daemon", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | postfix | a mailer | package\n   | exim | a mailer | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -1194,6 +1209,7 @@ test "install: a row zypper has nothing at all for is refused, and the batch bes
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep nosuchpkgxyz", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n" },
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package --provides -- nosuchpkgxyz", .code = 104 },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -1227,6 +1243,7 @@ test "install: a locked package is refused, naming the lock to lift, and the bat
             .stdout = "S  | Name    | Summary   | Type\n---+---------+-----------+--------\n   | bat     | a package | package\n l | ripgrep | a package | package\n",
         },
         .{ .argv = "sudo zypper --non-interactive install -- bat" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -1274,6 +1291,7 @@ test "install: a package installed and locked with no update pending is not refu
         },
         .{ .argv = zypper_updates, .stdout = "" },
         .{ .argv = "sudo zypper --non-interactive install -- bat ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -1293,6 +1311,7 @@ test "install: a package installed and locked with no update pending is not refu
             .stdout = "S  | Name    | Summary   | Type\n---+---------+-----------+--------\ni+ | bat     | a package | package\n   | ripgrep | a package | package\n",
         },
         .{ .argv = "sudo zypper --non-interactive install -- bat ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var z2 = try tmpZypper(a, io, &tmp.sub_path, &plain);
     try z2.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("ripgrep", &.{}) });
@@ -1323,6 +1342,7 @@ test "install: a package installed and locked with an update pending is refused,
         .{ .argv = search, .stdout = table },
         .{ .argv = zypper_updates, .stdout = updates },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
@@ -1344,6 +1364,7 @@ test "install: a package installed and locked with an update pending is refused,
         .{ .argv = search, .stdout = table },
         .{ .argv = zypper_updates, .code = 1 },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w2: std.Io.Writer.Allocating = .init(a);
     var z2 = try tmpZypper(a, io, &tmp.sub_path, &blind);
@@ -1382,6 +1403,46 @@ test "install: a captured call killed at its bound inside the install is reporte
     var z2 = try tmpZypper(a, io, &tmp.sub_path, &status);
     try z2.ledger.add(a, &.{"bat"});
     try testing.expectError(error.TimedOut, z2.backend().installedExplicit(a));
+}
+
+test "install: a baseline read killed at its bound, or past the cap, is that error, and zypper never runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The read before the batch used to swallow every failure into "no
+    // baseline" and run the install anyway: a kill under the capture
+    // bound was then reported as the batch's own failure, or not at all.
+    const search = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- bat";
+    const table = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n";
+    var killed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = search, .stdout = table },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .timed_out = true },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &killed);
+    try testing.expectError(error.CaptureTimedOut, z.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expect(!z.backend().installSpawned());
+    try testing.expect(!killed.called("sudo zypper --non-interactive install -- bat"));
+
+    var wide: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = search, .stdout = table },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .fail = error.StreamTooLong },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z2 = try tmpZypper(a, io, &tmp.sub_path, &wide);
+    z2.err = &w.writer;
+    try testing.expectError(error.StreamTooLong, z2.backend().install(a, &.{rowOf("bat", &.{})}));
+    try testing.expect(!z2.backend().installSpawned());
+    try testing.expectEqualStrings(
+        "mox: zypper: `rpm -qa` answered with more than the 8 MiB mox reads from one query, so what the machine has could not be read and nothing was installed\n",
+        w.written(),
+    );
+    try testing.expect(!wide.called("sudo zypper --non-interactive install -- bat"));
 }
 
 test "install: a failed batch says how many of its rows landed, when rpm could say" {
@@ -1436,6 +1497,7 @@ test "install: a failed batch says how many of its rows landed, when rpm could s
         .{ .argv = "sudo zypper --non-interactive refresh" },
         .{ .argv = search, .stdout = table },
         .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var z4 = try tmpZypper(a, io, &tmp.sub_path, &fine);
     try z4.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("bat", &.{}) });
@@ -1499,6 +1561,7 @@ test "install: a record that cannot be written is said, not reported as a failed
         .{ .argv = "sudo zypper --non-interactive refresh" },
         .{ .argv = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- bat", .stdout = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n" },
         .{ .argv = "sudo zypper --non-interactive install -- bat" },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var z: Zypper = .{
