@@ -5,6 +5,30 @@ const Io = std.Io;
 
 const tmp_suffix: []const u8 = ".mox-tmp";
 
+var tmp_seq: std.atomic.Value(u32) = .init(0);
+
+/// The sidecar path one write stages through, named for this process and this
+/// call. A name every writer shares is one they can be inside at once: two
+/// mox runs writing the same target -- which the state lock does not exclude,
+/// keying as it does on a state directory each of them has its own of -- then
+/// splice their contents into one inode, and the second rename finds nothing
+/// left to rename.
+fn tempPath(buf: []u8, live_path: []const u8) error{PathTooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}.{d}.{d}", .{
+        live_path,
+        tmp_suffix,
+        processId(),
+        tmp_seq.fetchAdd(1, .monotonic),
+    }) catch error.PathTooLong;
+}
+
+fn processId() u32 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
 /// The unix mode to carry over when copying an existing file. A filesystem
 /// with no mode bits (Windows) exposes no mode to read, so its files take the
 /// 0o644 default; a restrictive mode there comes from `.mox/attributes.toml`.
@@ -151,10 +175,7 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
 
     // Build the temp path in a fixed buffer (most paths fit easily).
     var tmp_buf: [4096]u8 = undefined;
-    if (live_path.len + tmp_suffix.len > tmp_buf.len) return error.PathTooLong;
-    @memcpy(tmp_buf[0..live_path.len], live_path);
-    @memcpy(tmp_buf[live_path.len..][0..tmp_suffix.len], tmp_suffix);
-    const tmp_path = tmp_buf[0 .. live_path.len + tmp_suffix.len];
+    const tmp_path = try tempPath(&tmp_buf, live_path);
 
     // Write content to tmp, then set the requested mode before rename so
     // the file appears at the target path with the correct permissions
@@ -231,6 +252,30 @@ fn chmodPath(path: []const u8, mode: u32) bool {
     return std.c.chmod(@ptrCast(&buf), @intCast(mode)) == 0;
 }
 
+/// Fail unless `dir_path` holds no staging sidecar at all. The name one
+/// carries is the writer's own, so a test can only ask whether any is left.
+fn expectNoStaging(io: Io, dir_path: []const u8) !void {
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (std.mem.indexOf(u8, e.name, tmp_suffix) != null) return error.StagingFileLeft;
+    }
+}
+
+test "tempPath: no two writes stage through one name" {
+    var buf_a: [4096]u8 = undefined;
+    var buf_b: [4096]u8 = undefined;
+    const first = try tempPath(&buf_a, "/tmp/mox/target");
+    const second = try tempPath(&buf_b, "/tmp/mox/target");
+    try std.testing.expect(std.mem.startsWith(u8, first, "/tmp/mox/target" ++ tmp_suffix ++ "."));
+    try std.testing.expect(std.mem.startsWith(u8, second, "/tmp/mox/target" ++ tmp_suffix ++ "."));
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+
+    var short: [8]u8 = undefined;
+    try std.testing.expectError(error.PathTooLong, tempPath(&short, "/tmp/mox/target"));
+}
+
 fn failingFileSync(userdata: ?*anyopaque, file: Io.File) Io.File.SyncError!void {
     _ = userdata;
     _ = file;
@@ -257,8 +302,7 @@ test "writeAtomic: a fsync failure removes the temp file and propagates, like th
     try std.testing.expectError(error.InputOutput, writeAtomic(faulty, p, "data\n", 0o644));
 
     // The tmp sidecar is removed, and nothing was ever renamed into place.
-    const tmp_p = try std.mem.concat(a, u8, &.{ p, tmp_suffix });
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, tmp_p, .{}));
+    try expectNoStaging(io, base);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, p, .{}));
 }
 
@@ -290,8 +334,7 @@ test "writeAtomicPartial: refuses when the live file changed between read and re
     const still = try Io.Dir.cwd().readFileAlloc(io, p, a, .limited(4096));
     try std.testing.expectEqualStrings("candidate one\n", still);
     // The refused write's temp file is cleaned up.
-    const tmp_p = try std.mem.concat(a, u8, &.{ p, tmp_suffix });
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, tmp_p, .{}));
+    try expectNoStaging(io, base);
 
     // A creation (expected absent) refuses when a file appeared meanwhile.
     const created = try std.fs.path.join(a, &.{ base, "appears" });

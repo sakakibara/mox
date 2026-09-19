@@ -165,7 +165,16 @@ jobs:
     # This is the only place those adapters meet the real managers, and a
     # schedule runs only from the default branch, so gating it on one left
     # every branch that changes them ungated. A manager missing from the
-    # runner skips loudly rather than passing.
+    # runner skips loudly rather than passing, which fails the job.
+    #
+    # winget is the exception the runner forces: the image provisions none --
+    # it is absent from the published software manifest and from the
+    # image-build sources -- and what the Windows Server build leaves behind
+    # is an App Installer the image registers or wedges on its own, which
+    # nothing here can repair. So the script reports a winget it cannot get
+    # an answer out of as n/a rather than as a skip, and scoop, which mox
+    # bootstraps itself, carries the job. A winget that does answer is gated
+    # like any other manager.
     if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 30

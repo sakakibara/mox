@@ -693,7 +693,14 @@ nothing, and leave the row missing.
 
 A row is always **appended**, never edited in place, so every existing byte
 of that file -- comments, ordering, a row you were mid-thought on -- survives
-untouched, and it is appended the moment it is chosen: `q` at a package
+untouched. The read and the rewrite run under an exclusive lock on the
+directory the manifest file lives in, so a second mox writing that file waits
+rather than reading the same bytes and dropping whichever row landed first --
+which the state lock alone would not prevent, keying as it does on a state
+directory that `mox commit` and `sudo mox commit` have one each of. A
+directory takes no such lock on Windows, where two runs are serialized only
+by the state lock they share. A row is appended the moment it is chosen:
+`q` at a package
 prompt ends the run before the file pass and says how many rows were already
 recorded (rc 1), and `--abort-on-prompt` exits 2 at the first package prompt
 the same way. A path-scoped `mox commit <file>` names files and skips
@@ -922,17 +929,23 @@ answered without the real thing:
 | `sh tests/linux_backends_test.sh` | apt, dnf (both generations), zypper, pacman -- a full install round trip per image, in containers; and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply |
 | `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget: read-only where present; on a runner without scoop, a bootstrap from the pinned installer plus one install |
 
-All three run nightly in CI, or on demand. Only the real manager can say
+All three run nightly in CI, or on demand; the Windows one runs on every
+push as well, a schedule firing only from the default branch. Only the real
+manager can say
 whether a query's format string still yields one name per line, or whether
 an image without `sudo` installs at all; the hermetic tests cannot. A skip
 is never a pass: under CI every one of the three fails when a case skipped,
 because there the case is the reason the job exists. A check that cannot
 apply to a backend at all is reported N/A instead, and does not fail
 anything: zypper's ledger reports nothing untracked by construction, so the
-check that measures untracked names has nothing to measure there. The one
-real exception is brew's tap check, which needs a formula installed from a
-third-party tap -- something no CI runner should do -- so it skips there and
-says so. The brew checks compare the adapter
+check that measures untracked names has nothing to measure there. A manager
+only the OS can supply reads the same way: no runner image provisions
+winget, and mox declares no installer for it, so a winget that will not
+answer `winget --version` under a bound is N/A rather than a skip -- while
+one that answers is gated like every other manager, and scoop, which mox
+bootstraps from its own pinned installer, is never excused. brew's tap check
+skips even under CI, needing a formula installed from a
+third-party tap -- something no CI runner should do -- and says so. The brew checks compare the adapter
 against Homebrew's own install receipts rather than against the command the
 adapter runs, so an adapter asking the wrong question cannot agree with the
 oracle.

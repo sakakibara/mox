@@ -57,7 +57,12 @@ All notable changes to mox are documented here. The format follows
   that had happened), and `commit` offers each untracked package to add,
   blacklist or skip, appending a row the moment it is chosen and never
   editing one (`q` ends the run before the file pass, saying how many rows
-  were already recorded). Nothing ever uninstalls. A repo without
+  were already recorded); the append holds an exclusive lock on the manifest
+  file's directory across its read and its rewrite, so two runs that share a
+  repo but have a state directory each -- `mox commit` beside `sudo mox
+  commit` -- cannot both read the file before either writes it and drop a
+  row. Windows locks no directory, and there the state lock is what stands
+  between them. Nothing ever uninstalls. A repo without
   `data/packages/` queries no manager and reports nothing; one with the
   directory and no file yet is in use and reports everything installed as
   untracked, ready for a first file to record it in.
@@ -171,7 +176,11 @@ All notable changes to mox are documented here. The format follows
   in a Debian container. All three run nightly or on demand, and the Windows
   one runs on every push too: a schedule fires only from the default branch,
   so the branch that changes those adapters was the one branch it never ran
-  on.
+  on. A manager the runner does not supply is a skip and fails the gate,
+  except winget, which no runner image provisions and mox declares no
+  installer for: a winget that will not answer `winget --version` under a
+  bound is reported n/a and fails nothing, while one that answers is gated
+  like any other.
 
 ### Changed
 - BREAKING: `status --json` emits `{"files":[...],"packages":[...]}` rather

@@ -178,9 +178,12 @@ pub fn inlineRow(arena: std.mem.Allocator, name: []const u8, fields: []const man
 /// wrote and `load` refuses. The rewrite is atomic: a manifest in the private
 /// layer lives in no git repo, and a crash mid-write must not leave it empty.
 /// A manifest that is a symlink is rewritten where the link points, so the
-/// link survives.
+/// link survives. The read and the rewrite are one critical section, held
+/// against every other writer of that file by `DirLock`.
 pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, header: []const u8, block: []const u8) !void {
     const path = try resolveLinks(arena, io, link_path);
+    const guard = DirLock.acquire(io, std.fs.path.dirname(path) orelse ".");
+    defer guard.release(io);
     const existing = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20)) catch |e| switch (e) {
         error.FileNotFound => {
             const body = if (header.len == 0)
@@ -203,6 +206,46 @@ pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, header: [
     try buf.appendSlice(arena, block);
     try apply_write.writeAtomic(io, path, buf.items, try modeOf(io, path));
 }
+
+/// Exclusive access to the directory a manifest file lives in, held across an
+/// append's read and rewrite so that two of them cannot both read the file
+/// before either writes it, which drops whichever row was written first.
+///
+/// The state lock does not reach this far: it keys on the state directory,
+/// and two runs sharing one MOX_REPO have a state directory each -- `mox
+/// commit` beside `sudo mox commit`, or either under a `MOX_STATE` of its
+/// own. What is locked is the directory rather than the manifest, because the
+/// rewrite renames a new inode over the old one: a lock on the file excludes
+/// nobody once the first writer has swapped it, while the directory is one
+/// inode every writer of every file in it opens. Appending in place under the
+/// lock would keep the file's inode but give up the atomic replace, and a
+/// crash would then leave a half-written trailing block that no later command
+/// can parse.
+///
+/// Advisory and best effort. A directory is not lockable on Windows, and a
+/// filesystem may refuse the lock anywhere; the append then runs as it would
+/// with no lock at all, where the per-writer staging path still keeps the two
+/// rewrites out of one inode and leaves at most a dropped row.
+const DirLock = struct {
+    file: ?Io.File,
+
+    fn acquire(io: Io, dir_path: []const u8) DirLock {
+        if (builtin.os.tag == .windows) return .{ .file = null };
+        Io.Dir.cwd().createDirPath(io, dir_path) catch {};
+        const f = Io.Dir.cwd().openFile(io, dir_path, .{}) catch return .{ .file = null };
+        f.lock(io, .exclusive) catch {
+            f.close(io);
+            return .{ .file = null };
+        };
+        return .{ .file = f };
+    }
+
+    fn release(self: DirLock, io: Io) void {
+        const f = self.file orelse return;
+        f.unlock(io);
+        f.close(io);
+    }
+};
 
 const max_link_hops: usize = 8;
 
@@ -746,4 +789,136 @@ test "append then load: the appended row parses back as written" {
     try testing.expectEqualStrings("ghostty", m.packages[0].name);
     try testing.expectEqualStrings("brew", m.packages[0].backend);
     try testing.expectEqualStrings("cask", m.packages[0].field("kind").?.string);
+}
+
+/// One writer of `path`, run concurrently with the others by the two tests
+/// below: the whole of what `mox commit` does to a manifest, repeated.
+const Appender = struct {
+    io: Io,
+    path: []const u8,
+    name: []const u8,
+    rounds: usize,
+    started: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Appender) void {
+        self.started.store(true, .release);
+        var round: usize = 0;
+        while (round < self.rounds) : (round += 1) {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const block = std.fmt.allocPrint(a, "\n[[packages]]\nname = \"{s}-{d}\"\n", .{ self.name, round }) catch {
+                self.failed.store(true, .release);
+                break;
+            };
+            append(a, self.io, self.path, "", block) catch {
+                self.failed.store(true, .release);
+                break;
+            };
+        }
+        self.done.store(true, .release);
+    }
+};
+
+fn seededManifest(a: std.mem.Allocator, io: Io, sub_path: []const u8) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", sub_path, "data", "packages" });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(a, &.{ dir, "shared.toml" });
+    try apply_write.writeAtomic(io, path, "backend = \"brew\"\n", 0o644);
+    return path;
+}
+
+fn countRows(content: []const u8) usize {
+    var n: usize = 0;
+    var rest = content;
+    while (std.mem.indexOf(u8, rest, "[[packages]]")) |i| {
+        n += 1;
+        rest = rest[i + "[[packages]]".len ..];
+    }
+    return n;
+}
+
+test "append: a writer waits for whoever holds the manifest directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // a directory takes no lock there
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const path = try seededManifest(a, io, &tmp.sub_path);
+    const held = try Io.Dir.cwd().openFile(io, std.fs.path.dirname(path).?, .{});
+    defer held.close(io);
+    try held.lock(io, .exclusive);
+
+    var appender: Appender = .{ .io = io, .path = path, .name = "waiter", .rounds = 1 };
+    var fut = io.concurrent(Appender.run, .{&appender}) catch |e| switch (e) {
+        error.ConcurrencyUnavailable => {
+            held.unlock(io);
+            return error.SkipZigTest;
+        },
+    };
+    while (!appender.started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+
+    // Longer than an append that took no lock would take, so that what is
+    // measured is the lock and not the scheduler.
+    var waited: usize = 0;
+    while (waited < 500 and !appender.done.load(.acquire)) : (waited += 10) {
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const waiting = !appender.done.load(.acquire);
+
+    // The holder's own read-modify-write: the second process's half of the
+    // race, whose row the waiter's rewrite must not drop.
+    const existing = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    const merged = try std.fmt.allocPrint(a, "{s}\n[[packages]]\nname = \"holder\"\n", .{existing});
+    try apply_write.writeAtomic(io, path, merged, 0o644);
+    held.unlock(io);
+
+    fut.await(io);
+    const final = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    try testing.expect(waiting);
+    try testing.expect(!appender.failed.load(.acquire));
+    try testing.expect(std.mem.indexOf(u8, final, "\"holder\"") != null);
+    try testing.expect(std.mem.indexOf(u8, final, "\"waiter-0\"") != null);
+}
+
+test "append: concurrent writers of one manifest lose no row" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // a directory takes no lock there
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const path = try seededManifest(a, io, &tmp.sub_path);
+    const names = [_][]const u8{ "one", "two", "three", "four" };
+    const rounds: usize = 15;
+
+    var appenders: [names.len]Appender = undefined;
+    var futs: [names.len]Io.Future(void) = undefined;
+    var spawned: usize = 0;
+    for (&appenders, names) |*ap, name| {
+        ap.* = .{ .io = io, .path = path, .name = name, .rounds = rounds };
+        futs[spawned] = io.concurrent(Appender.run, .{ap}) catch break;
+        spawned += 1;
+    }
+    for (futs[0..spawned]) |*f| f.await(io);
+    if (spawned < 2) return error.SkipZigTest;
+
+    const final = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    for (appenders[0..spawned]) |*ap| try testing.expect(!ap.failed.load(.acquire));
+    try testing.expectEqual(spawned * rounds, countRows(final));
+    for (names[0..spawned]) |name| {
+        var round: usize = 0;
+        while (round < rounds) : (round += 1) {
+            const row = try std.fmt.allocPrint(a, "name = \"{s}-{d}\"\n", .{ name, round });
+            try testing.expect(std.mem.indexOf(u8, final, row) != null);
+        }
+    }
 }

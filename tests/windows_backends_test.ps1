@@ -15,8 +15,18 @@
 # the user's PATH in the registry.
 #
 # A manager that is absent anywhere else SKIPS, loudly and counted. A skip is
-# never a pass: "this runner had no winget" must never read as "the winget
+# never a pass: "this runner had no scoop" must never read as "the scoop
 # adapter works".
+#
+# winget is the one manager mox declares no installer for -- it is the App
+# Installer's CLI, an OS component -- so a machine either supplies a working
+# one or does not, and neither mox nor this script can change which. That
+# answer is N/A: printed, counted, and kept out of the skips, so a gate that
+# was never the machine's to run does not fail a green run. Whether it
+# answers `winget --version` at all is the whole of the question, asked under
+# a bound, because a Windows image that stages an App Installer it cannot
+# register leaves the command on PATH and hanging. A winget that does answer
+# is a hard gate like any other: from there, anything wrong is the adapter's.
 $ErrorActionPreference = 'Stop'
 # mox's exit code is read from $LASTEXITCODE: rc 1 for drift is an answer,
 # not an error to stop on.
@@ -24,11 +34,14 @@ $PSNativeCommandUseErrorActionPreference = $false
 $repo = Split-Path -Parent $PSScriptRoot
 $work = Join-Path ([IO.Path]::GetTempPath()) ("mox-winpkg-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
-$passes = 0; $fails = 0; $skips = 0
+$passes = 0; $fails = 0; $skips = 0; $nas = 0
 
 function Ok([string]$m)   { Write-Host "  ok   $m";                  $script:passes++ }
 function No([string]$m, [string]$d) { Write-Host "  FAIL $m`n      $d"; $script:fails++ }
 function Skip([string]$m, [string]$d) { Write-Host "  SKIP $m`n      $d"; $script:skips++ }
+# Not a skip: this machine cannot supply the manager at all, and mox has no
+# installer to give it one. Counted apart from skips, which fail CI.
+function Na([string]$m, [string]$d) { Write-Host "  n/a  $m`n      $d"; $script:nas++ }
 
 try {
     $mox = Join-Path $repo 'zig-out\bin\mox.exe'
@@ -61,13 +74,44 @@ try {
         return ($text -split "`n" | Select-Object -Last 5 | Out-String)
     }
 
-    function Probe([string]$backend, [string]$exe) {
+    # Whether `$exe` answers at all, under a bound: a wedged App Installer
+    # leaves winget on PATH and hanging, so a call that never returns is one
+    # of the ways a machine says it has none.
+    function Answers([string]$exe) {
+        $cmd = Get-Command $exe -ErrorAction SilentlyContinue
+        if (-not $cmd -or -not $cmd.Source) { return $false }
+        $out = Join-Path $work ("answers-" + [Guid]::NewGuid().ToString('N') + ".txt")
+        try {
+            $p = Start-Process -FilePath $cmd.Source -ArgumentList '--version' -NoNewWindow -PassThru `
+                 -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            if (-not $p.WaitForExit(60000)) {
+                try { $p.Kill() } catch { }
+                return $false
+            }
+            return ($p.ExitCode -eq 0)
+        } catch {
+            return $false
+        }
+    }
+
+    function Probe([string]$backend, [string]$exe, [bool]$osOwned = $false) {
         if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) {
             if ($backend -eq 'scoop' -and $env:CI) {
                 BootstrapScoop
                 return
             }
+            if ($osOwned) {
+                Na "$backend`: this machine has no $exe" `
+                   "the OS supplies it or nothing does; mox declares no installer for it"
+                return
+            }
             Skip "$backend`: $exe is not on PATH" "install it on the runner to cover this adapter"
+            return
+        }
+
+        if ($osOwned -and -not (Answers $exe)) {
+            Na "$backend`: $exe is on PATH but does not answer '$exe --version'" `
+               "the component behind it is not registered on this machine, which is nothing mox can repair"
             return
         }
 
@@ -195,18 +239,18 @@ name = "7zip"
     }
 
     Probe 'scoop'  'scoop'
-    Probe 'winget' 'winget'
+    Probe 'winget' 'winget' $true
 
     Write-Host ""
-    if ($skips -gt 0) {
-        Write-Host "$passes passed, $fails failed, $skips skipped"
-    } else {
-        Write-Host "$passes passed, $fails failed"
-    }
+    $summary = "$passes passed, $fails failed"
+    if ($skips -gt 0) { $summary += ", $skips skipped" }
+    if ($nas -gt 0)   { $summary += ", $nas n/a" }
+    Write-Host $summary
     if ($fails -gt 0) { exit 1 }
     # A skip is never a pass. On a developer machine an absent manager is a
     # fact of life; on CI it means this gate proved nothing it exists to
-    # prove, so it fails the run.
+    # prove, so it fails the run. N/A is not counted here: it says the machine
+    # itself cannot supply the manager, which no runner setting can change.
     if ($env:CI -and $skips -gt 0) {
         Write-Host "CI: $skips case(s) skipped; this gate must run them all"
         exit 1

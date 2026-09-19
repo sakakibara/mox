@@ -313,23 +313,22 @@ test "apply: tmp file does not linger after success" {
 
     const cwd = try std.process.currentPathAlloc(io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const live_path = try std.fs.path.join(std.testing.allocator, &.{
-        cwd, ".zig-cache", "tmp", &tmp.sub_path, "file.txt",
+    const base = try std.fs.path.join(std.testing.allocator, &.{
+        cwd, ".zig-cache", "tmp", &tmp.sub_path,
     });
+    defer std.testing.allocator.free(base);
+    const live_path = try std.fs.path.join(std.testing.allocator, &.{ base, "file.txt" });
     defer std.testing.allocator.free(live_path);
 
     try mox.apply.write.writeAtomic(io, live_path, "hello\n", 0o644);
 
-    // .mox-tmp shouldn't exist after success.
-    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.mox-tmp", .{live_path});
-    defer std.testing.allocator.free(tmp_path);
-    const result = Io.Dir.cwd().openFile(io, tmp_path, .{});
-    if (result) |f| {
-        var fmut = f;
-        fmut.close(io);
-        try std.testing.expect(false); // tmp file should not exist
-    } else |_| {
-        // Expected: file not found
+    // A staging sidecar is named for the writer, so what must hold after a
+    // success is that the directory holds none of them at all.
+    var dir = try Io.Dir.cwd().openDir(io, base, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, e.name, ".mox-tmp") == null);
     }
 }
 
