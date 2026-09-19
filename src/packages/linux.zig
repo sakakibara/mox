@@ -260,6 +260,10 @@ pub const Distro = struct {
             if (machine) |m| {
                 if (!m.hasConfigured(line)) continue;
             }
+            // dnf writes prose onto the stdout this reads names from, so a
+            // line that is not a package name is the manager talking; every
+            // name here is offered to the user as one to record.
+            if (self.manager == .dnf and backend_mod.nameProblem(line, self.manager.nameClass()) != null) continue;
             try out.append(arena, line);
         }
         return out.toOwnedSlice(arena);
@@ -2150,7 +2154,7 @@ pub const Distro = struct {
             if (pending.contains(p.name)) try argv.append(arena, p.name);
         }
         if (argv.items.len > 5) {
-            const res = try self.runner.run(arena, argv.items);
+            const res = try self.runner.runBoth(arena, argv.items);
             try exec.checkCaptureTimedOut(res);
             if (res.ok) {
                 for (try pacmanInfoBlocks(arena, res.stdout)) |block| {
@@ -2158,6 +2162,12 @@ pub const Distro = struct {
                     const have = out.upgraded.get(block.name);
                     if (have == null or std.mem.eql(u8, block.version, new)) try out.upgraded.put(block.name, block);
                 }
+            } else {
+                const said = try oneLine(arena, res.stderr);
+                self.say(
+                    "mox: pacman: what the apply's `-Syu` will leave of the packages it upgrades could not be read (`pacman -Si --dbpath {s}` exited {d}{s}{s}), so each of them is judged at the version installed now, and a row the upgrade would have made room for may be refused\n",
+                    .{ pacman_private_db, res.code, if (said.len > 0) ", saying: " else ", saying nothing", said },
+                );
             }
         }
 
@@ -2169,9 +2179,16 @@ pub const Distro = struct {
             } else try newcomers.append(arena, name);
         }
         if (newcomers.items.len == 5) return out;
-        const info = try self.runner.run(arena, newcomers.items);
+        const info = try self.runner.runBoth(arena, newcomers.items);
         try exec.checkCaptureTimedOut(info);
-        if (!info.ok) return out;
+        if (!info.ok) {
+            const said = try oneLine(arena, info.stderr);
+            self.say(
+                "mox: pacman: what the apply's `-Syu` will install in place of a package it removes could not be read (`pacman -Si --dbpath {s}` exited {d}{s}{s}), so an installed package the upgrade would replace is judged as still installed, and a row that conflicts with it may be refused\n",
+                .{ pacman_private_db, info.code, if (said.len > 0) ", saying: " else ", saying nothing", said },
+            );
+            return out;
+        }
         for (try pacmanInfoBlocks(arena, info.stdout)) |block| {
             for (installed) |p| {
                 if (try self.pacmanReplaces(arena, block, p)) try out.removed.put(p.name, {});
@@ -2242,8 +2259,15 @@ pub const Distro = struct {
         var si: std.ArrayList([]const u8) = .empty;
         try si.appendSlice(arena, &.{ "pacman", "-Si", "--dbpath", pacman_private_db, "--" });
         for (rows) |row| try si.append(arena, row.name);
-        const info = try self.runner.run(arena, si.items);
+        const info = try self.runner.runBoth(arena, si.items);
         try exec.checkCaptureTimedOut(info);
+        if (!info.ok) {
+            const said = try oneLine(arena, info.stderr);
+            self.say(
+                "mox: pacman: what the rows to install conflict with could not be read (`pacman -Si --dbpath {s}` exited {d}{s}{s}), so a row it did not describe is left to pacman, which then installs none of the batch if that row conflicts with an installed package\n",
+                .{ pacman_private_db, info.code, if (said.len > 0) ", saying: " else ", saying nothing", said },
+            );
+        }
         const candidates = try pacmanInfoBlocks(arena, info.stdout);
 
         const qi = try self.runner.run(arena, &.{ "pacman", "-Qi" });
@@ -2813,6 +2837,39 @@ test "install: no argv dnf parses carries a --, which dnf5 5.2.x refuses" {
 
     // The query that drives `mox status` is built the same way.
     for (Manager.dnf.queryArgv()) |arg| try testing.expect(!std.mem.eql(u8, arg, "--"));
+}
+
+test "install: no dnf listing carries -y, which would import a repository's key to answer its own question" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on dnf 4.14.0 (rockylinux:9) with `repo_gpgcheck=1` and
+    // `skip_if_unavailable=1` on a repository whose signing key rpm has not
+    // imported: `-y` says yes to importing it and takes the same listing
+    // from 0 names to 5735. Accepting a key is the administrator's
+    // decision, so a read-only listing declines the question instead.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat zlib-devel", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("zlib-devel", &.{}) });
+    var listings: usize = 0;
+    for (fake.calls.items) |c| {
+        if (std.mem.indexOf(u8, c, "repoquery") == null) continue;
+        listings += 1;
+        try testing.expect(std.mem.indexOf(u8, c, " -y") == null);
+    }
+    try testing.expectEqual(@as(usize, 3), listings);
+    // The listing `mox status` reads is built the same way.
+    for (Manager.dnf.queryArgv()) |arg| try testing.expect(!std.mem.eql(u8, arg, "-y"));
+    for (Distro.dnf_names_argv) |arg| try testing.expect(!std.mem.eql(u8, arg, "-y"));
+    for (Distro.dnf_installed_argv) |arg| try testing.expect(!std.mem.eql(u8, arg, "-y"));
 }
 
 test "install: apt refuses a name it would resolve as a regular expression" {
@@ -5382,6 +5439,17 @@ test "query: dnf's key question is not read back as a package name, whatever put
         w.written(),
     );
     for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "dnf install") == null);
+
+    // The listing that answers what the user installed on purpose is read
+    // the same way: a question left on it would otherwise be a package
+    // `status` calls untracked and `commit` offers to record.
+    var listed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q --assumeno repoquery --userinstalled --qf %{name}\n", .stdout = "Is this ok [y/N]: jq\n\nbat\n" },
+    } };
+    var d2: Distro = .{ .manager = .dnf, .runner = listed.runner(), .force_elevate = false };
+    const explicit = try d2.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 1), explicit.len);
+    try testing.expectEqualStrings("bat", explicit[0]);
 }
 
 const pacman_probe = "stat -L -c %n %a %F " ++ pacman_cache ++ " " ++ pdb;
@@ -5956,6 +6024,152 @@ test "install: a -Qu that failed for a reason is said, never read as no upgrade 
         "mox: pacman: row \"drv\" names a package that conflicts with \"srv<2\", which this machine has installed as \"srv\"; pacman would have to remove srv to install it, and mox never removes a package, so the row was not installed: remove srv yourself, or drop the row\n",
         w2.written(),
     );
+}
+
+test "install: rows the repositories could not describe are said, never read as rows that conflict with nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0: a dbpath that is not there exits 1 with
+    // `error: 'failed to resolve path '/no/such/path' passed to '--dbpath':
+    // No such file or directory` on stderr and no block on stdout, and
+    // `pacman -Si -- bash mox-no-such-package` exits 1 having printed
+    // bash's block and said `error: package 'mox-no-such-package' was not
+    // found`. Read as "this row conflicts with nothing", the row went to an
+    // install pacman then refuses whole, with nothing said.
+    const qi = "Name            : pulseaudio\nVersion         : 17.0-1\nProvides        : None\nConflicts With  : pipewire-pulse\nReplaces        : None\n";
+    const said = "error: 'failed to resolve path '/var/cache/mox/pacman-db' passed to '--dbpath': No such file or directory\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra pipewire-pulse 1:1.6.8-1\n" },
+        .{ .argv = pacman_print ++ " pipewire-pulse", .stdout = "pipewire-pulse\n" },
+        .{ .argv = pacman_info ++ " pipewire-pulse", .code = 1, .stderr = said },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "pacman -Syu --needed --noconfirm -- pipewire-pulse" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("pipewire-pulse", &.{})});
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: what the rows to install conflict with could not be read (`pacman -Si --dbpath /var/cache/mox/pacman-db` exited 1, saying: error: 'failed to resolve path '/var/cache/mox/pacman-db' passed to '--dbpath': No such file or directory), so a row it did not describe is left to pacman, which then installs none of the batch if that row conflicts with an installed package\n",
+        w.written(),
+    );
+    try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- pipewire-pulse"));
+
+    // The blocks a partly failed read did print are still read: the row it
+    // described is judged against the machine, the one it left out is the
+    // one left to pacman.
+    const partial = "Name            : pipewire-pulse\nVersion         : 1:1.6.8-1\nProvides        : None\nConflicts With  : pulseaudio\nReplaces        : None\n";
+    var some: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "extra pipewire-pulse 1:1.6.8-1\nextra cowsay 3.8.4-1\n" },
+        .{ .argv = pacman_print ++ " pipewire-pulse cowsay", .stdout = "pipewire-pulse\ncowsay\n" },
+        .{ .argv = pacman_info ++ " pipewire-pulse cowsay", .code = 1, .stdout = partial, .stderr = "error: package 'cowsay' was not found\n" },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        nothing_to_upgrade,
+        .{ .argv = "pacman -Syu --needed --noconfirm -- cowsay" },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var d2: Distro = .{ .manager = .pacman, .runner = some.runner(), .force_elevate = false, .err = &w2.writer };
+    try d2.backend().install(a, &.{ rowOf("pipewire-pulse", &.{}), rowOf("cowsay", &.{}) });
+    try testing.expectEqual(@as(usize, 1), d2.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: what the rows to install conflict with could not be read (`pacman -Si --dbpath /var/cache/mox/pacman-db` exited 1, saying: error: package 'cowsay' was not found), so a row it did not describe is left to pacman, which then installs none of the batch if that row conflicts with an installed package\n" ++
+            "mox: pacman: row \"pipewire-pulse\" names a package that conflicts with \"pulseaudio\", which this machine has installed; pacman would have to remove pulseaudio to install it, and mox never removes a package, so the row was not installed: remove pulseaudio yourself, or drop the row\n",
+        w2.written(),
+    );
+    try testing.expect(some.called("pacman -Syu --needed --noconfirm -- cowsay"));
+}
+
+test "install: a pending upgrade's own block, unread, is said and judged at the version installed now" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0: a dbpath whose `local` is a regular file
+    // exits 255 with `error: failed to initialize alpm library:` and
+    // `could not open database`. Read as "no pending block", the version
+    // the upgrade will leave is judged as the version installed now, and a
+    // row the upgrade makes room for is refused with nothing said.
+    const drv = "Name            : drv\nVersion         : 1-1\nProvides        : None\nConflicts With  : srv<2\nReplaces        : None\n";
+    const srv_old = "Name            : srv\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    const said = "error: failed to initialize alpm library:\n(root: /, dbpath: /var/cache/mox/pacman-db)\ncould not open database\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest drv 1-1\nmoxtest srv 2-1\n" },
+        .{ .argv = pacman_print ++ " drv", .stdout = "drv\n" },
+        .{ .argv = pacman_info ++ " drv", .stdout = drv },
+        .{ .argv = "pacman -Qi", .stdout = srv_old },
+        .{ .argv = pacman_pending, .stdout = "srv 1-1 -> 2-1\n" },
+        .{ .argv = pacman_info ++ " srv", .code = 255, .stderr = said },
+        nothing_to_upgrade,
+        .{ .argv = "vercmp 1-1 2", .stdout = "-1\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("drv", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: what the apply's `-Syu` will leave of the packages it upgrades could not be read (`pacman -Si --dbpath /var/cache/mox/pacman-db` exited 255, saying: error: failed to initialize alpm library:; (root: /, dbpath: /var/cache/mox/pacman-db); could not open database), so each of them is judged at the version installed now, and a row the upgrade would have made room for may be refused\n" ++
+            "mox: pacman: row \"drv\" names a package that conflicts with \"srv<2\", which this machine has installed as \"srv\"; pacman would have to remove srv to install it, and mox never removes a package, so the row was not installed: remove srv yourself, or drop the row\n",
+        w.written(),
+    );
+    try testing.expect(!d.backend().installSpawned());
+}
+
+test "install: an upgrade newcomer's own block, unread, is said and the package it replaces judged as installed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on pacman 7.1.0: `pacman -Si -- <name>` the repositories do
+    // not carry exits 1 with `error: package '<name>' was not found` on
+    // stderr. Read as "the upgrade replaces nothing", an installed package
+    // the upgrade removes is judged as still on the machine, and the row
+    // that conflicts with it is refused with nothing said.
+    const si = "Name            : conflictrow\nVersion         : 1-1\nProvides        : None\nConflicts With  : oldname\nReplaces        : None\n";
+    const qi = "Name            : oldname\nVersion         : 1-1\nProvides        : None\nConflicts With  : None\nReplaces        : None\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qdq", .code = 1 },
+        .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
+        .{ .argv = pacman_probe, .code = 1 },
+        .{ .argv = pacman_make },
+        .{ .argv = pacman_private_sync },
+        .{ .argv = "pacman -Sl --dbpath " ++ pdb, .stdout = "moxtest conflictrow 1-1\nmoxtest newname 2-1\n" },
+        .{ .argv = pacman_print ++ " conflictrow", .stdout = "conflictrow\n" },
+        .{ .argv = pacman_info ++ " conflictrow", .stdout = si },
+        .{ .argv = "pacman -Qi", .stdout = qi },
+        .{ .argv = pacman_pending, .code = 1 },
+        .{ .argv = "pacman -Su --print --print-format %n --dbpath " ++ pdb, .stdout = "newname\n" },
+        .{ .argv = pacman_info ++ " newname", .code = 1, .stderr = "error: package 'newname' was not found\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+    try d.backend().install(a, &.{rowOf("conflictrow", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: pacman: what the apply's `-Syu` will install in place of a package it removes could not be read (`pacman -Si --dbpath /var/cache/mox/pacman-db` exited 1, saying: error: package 'newname' was not found), so an installed package the upgrade would replace is judged as still installed, and a row that conflicts with it may be refused\n" ++
+            "mox: pacman: row \"conflictrow\" names a package that conflicts with \"oldname\", which this machine has installed; pacman would have to remove oldname to install it, and mox never removes a package, so the row was not installed: remove oldname yourself, or drop the row\n",
+        w.written(),
+    );
+    try testing.expect(!d.backend().installSpawned());
 }
 
 test "install: pacman refuses a row an installed package declares a conflict with, versions judged by pacman" {

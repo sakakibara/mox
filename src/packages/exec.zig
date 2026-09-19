@@ -1785,13 +1785,17 @@ test "Process: a straggler that keeps writing does not cost the child its answer
     // succeeds. A child asked how it is only when a read comes back empty is
     // never asked here at all: the call then runs to its bound and throws the
     // answer away as a timeout the child never had.
+    //
+    // Both write down one pipe with nothing ordering them, so which byte
+    // arrives first is not the contract: that the child's own line is in the
+    // answer at all, and that the call ended long before its bound, is.
     var p: Process = .{ .io = io, .timeout_ms = 3_000 };
     const started = Io.Clock.awake.now(io);
     const res = try p.runner().run(a, &.{ "sh", "-c", "i=0; while [ $i -lt 400 ]; do printf . ; sleep 0.02; i=$((i+1)); done & printf 'ok\\n'" });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try testing.expect(!res.timed_out);
     try testing.expect(res.ok);
-    try testing.expect(std.mem.startsWith(u8, res.stdout, "ok\n"));
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "ok\n") != null);
     try testing.expect(elapsed_ms < 2_000);
 }
 

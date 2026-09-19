@@ -18,9 +18,11 @@
 //! Two vehicles share one step engine: a deterministic loop over a fixed set of
 //! seeded sequences that runs on every `zig build test` (so CI exercises it on
 //! all platforms), and a Smith fuzz target that derives sequences from bytes and
-//! explores continuously under `zig build fuzz --fuzz`. The deterministic sweep
-//! is a fixed regression sample; the space itself was swept far wider (tens of
-//! thousands of applies) during development and stayed invariant-clean.
+//! runs as a bounded smoke check under `zig build fuzz`. Continuous fuzzing is
+//! unavailable: under Zig 0.16.0 `--fuzz` fails to compile the shipped test
+//! runner. The deterministic sweep is a fixed regression sample; the space
+//! itself was swept far wider (tens of thousands of applies) during
+//! development and stayed invariant-clean.
 
 const std = @import("std");
 const mox = @import("mox");
@@ -264,8 +266,8 @@ test "property: generator prune preserves exactness, no collateral, recoverabili
 }
 
 /// Smith fuzz target: derive a step sequence from arbitrary bytes and run it
-/// through the same invariant checks. Runs once as a smoke test under
-/// `zig build test`; explores continuously under `zig build fuzz --fuzz`.
+/// through the same invariant checks. Runs once as a bounded smoke check under
+/// `zig build test` and under `zig build fuzz`.
 fn fuzzPrune(_: void, smith: *Smith) anyerror!void {
     var buf: [64]u8 = undefined;
     const n = smith.slice(&buf);

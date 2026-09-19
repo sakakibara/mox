@@ -549,7 +549,7 @@ pub const command = app.command(Spec, .{
     .name = "diff",
     .usage = "mox diff [--flags] [<paths...>]",
     .summary = "Show a unified diff of composed output vs each live file",
-    .details = "Read-only, always exits 0.",
+    .details = "Read-only and takes no lock. A difference is not an error: exit 0 whether or not anything differs, 1 on a refusal -- a path that is not managed, a malformed ownership declaration or attributes.toml.",
     .group = .general,
     .needs_context = true,
 }, run);

@@ -485,12 +485,14 @@ pub const Zypper = struct {
         for (keep) |row| try ids.append(arena, row.name);
         // What the machine has before the batch, so that a failed batch is
         // credited with what it landed and not with a package the user
-        // installed by hand beside a failing sibling. rpm answering with
-        // a failure is the one "no baseline" case; a read killed at its
-        // bound, or one past the cap, is a machine that could not be read,
-        // and is that error before any install.
+        // installed by hand beside a failing sibling. rpm answering with a
+        // failure, or not being there to answer at all, is a "no baseline"
+        // case the record is written around; a read killed at its bound, or
+        // one past the cap, is a machine that could not be read, and is that
+        // error before any install.
         const before: ?[]const []const u8 = self.presentOf(arena, ids.items, true) catch |e| switch (e) {
             Error.ZypperQueryFailed => null,
+            error.OutOfMemory => return e,
             error.StreamTooLong => {
                 self.say(
                     "mox: zypper: `rpm -qa` answered with more than the {d} MiB mox reads from one query, so what the machine has could not be read and nothing was installed\n",
@@ -498,7 +500,20 @@ pub const Zypper = struct {
                 );
                 return e;
             },
-            else => return e,
+            error.CaptureTimedOut => {
+                self.say(
+                    "mox: zypper: `rpm -qa` was killed at the bound a captured read gets, so what the machine has could not be read and nothing was installed\n",
+                    .{},
+                );
+                return e;
+            },
+            else => blk: {
+                self.say(
+                    "mox: zypper: `rpm -qa` could not be run ({s}), so what this machine had before the batch is unknown and the install went ahead without it\n",
+                    .{exec.errorText(e)},
+                );
+                break :blk null;
+            },
         };
 
         self.spawned = true;
@@ -1413,9 +1428,10 @@ test "install: a baseline read killed at its bound, or past the cap, is that err
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The read before the batch used to swallow every failure into "no
-    // baseline" and run the install anyway: a kill under the capture
-    // bound was then reported as the batch's own failure, or not at all.
+    // A kill under the capture bound, or an answer past the cap, is a
+    // machine that could not be read rather than an empty one, and each
+    // says which read it was: what apply prints of the error names the
+    // bound alone, so the read behind it is named here.
     const search = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- bat";
     const table = "S  | Name | Summary | Type\n---+------+---------+--------\n   | bat | a package | package\n";
     var killed: exec.Fake = .{ .arena = a, .entries = &.{
@@ -1423,9 +1439,15 @@ test "install: a baseline read killed at its bound, or past the cap, is that err
         .{ .argv = search, .stdout = table },
         .{ .argv = "rpm -qa --qf %{NAME}\n", .timed_out = true },
     } };
+    var w0: std.Io.Writer.Allocating = .init(a);
     var z = try tmpZypper(a, io, &tmp.sub_path, &killed);
+    z.err = &w0.writer;
     try testing.expectError(error.CaptureTimedOut, z.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expect(!z.backend().installSpawned());
+    try testing.expectEqualStrings(
+        "mox: zypper: `rpm -qa` was killed at the bound a captured read gets, so what the machine has could not be read and nothing was installed\n",
+        w0.written(),
+    );
     try testing.expect(!killed.called("sudo zypper --non-interactive install -- bat"));
 
     var wide: exec.Fake = .{ .arena = a, .entries = &.{
@@ -1443,6 +1465,56 @@ test "install: a baseline read killed at its bound, or past the cap, is that err
         w.written(),
     );
     try testing.expect(!wide.called("sudo zypper --non-interactive install -- bat"));
+}
+
+test "install: an rpm that cannot be run at all is a batch with no baseline, said, not an install that never ran" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The baseline is what a FAILED batch is credited against, and the
+    // record is written around its absence. A spawn that finds no rpm is
+    // that absence, not a machine that could not be read: zypper installs
+    // what it can either way, and refusing to run it would keep every
+    // package off this machine over a read the record does without.
+    const search = "zypper --non-interactive --quiet --no-color search --match-exact --type package -- ripgrep bat";
+    const table = "S  | Name | Summary | Type\n---+------+---------+--------\n   | ripgrep | a package | package\n   | bat | a package | package\n";
+    const said = "mox: zypper: `rpm -qa` could not be run (it is not on this machine), so what this machine had before the batch is unknown and the install went ahead without it\n";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = search, .stdout = table },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .fail = error.FileNotFound },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    z.err = &w.writer;
+    try z.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("bat", &.{}) });
+    try testing.expect(z.backend().installSpawned());
+    try testing.expect(fake.called("sudo zypper --non-interactive install -- ripgrep bat"));
+    try testing.expectEqualStrings(said, w.written());
+    try testing.expectEqual(@as(usize, 2), (try z.ledger.read(a)).len);
+
+    // A batch that then fails records all of its rows, since nothing says
+    // which of them the machine already had.
+    var failed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "sudo zypper --non-interactive refresh" },
+        .{ .argv = search, .stdout = table },
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .fail = error.FileNotFound },
+        .{ .argv = "sudo zypper --non-interactive install -- ripgrep bat", .code = 4 },
+    } };
+    var w2: std.Io.Writer.Allocating = .init(a);
+    var z2 = try tmpZypper(a, io, &tmp.sub_path, &failed);
+    z2.err = &w2.writer;
+    try testing.expectError(Error.ZypperInstallFailed, z2.backend().install(a, &.{ rowOf("ripgrep", &.{}), rowOf("bat", &.{}) }));
+    try testing.expectEqual(@as(?usize, null), z2.backend().installLanded());
+    try testing.expectEqualStrings(
+        said ++ "mox: zypper: rpm could not say what the machine had before the batch; all 2 are recorded, and every read narrows them to what rpm reports\n",
+        w2.written(),
+    );
 }
 
 test "install: a failed batch says how many of its rows landed, when rpm could say" {

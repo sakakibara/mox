@@ -45,7 +45,7 @@ const Label = enum {
 };
 
 /// The file table's labels, counted. The summary line's only input AND the
-/// file half of the exit code, so the leading count and `$?` are one fact.
+/// file half of the exit code, which the package pass adds its problems to.
 const Tally = struct {
     n: std.EnumArray(Label, usize) = .initFill(0),
 

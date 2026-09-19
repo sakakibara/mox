@@ -180,33 +180,31 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
     // Write content to tmp, then set the requested mode before rename so
     // the file appears at the target path with the correct permissions
     // atomically.
+    var f = try Io.Dir.cwd().createFile(io, tmp_path, .{});
+    // The name is this writer's alone, so nothing else will ever truncate it
+    // and no later run can tell it from a file the user keeps: every way out
+    // of this function but the rename takes it with it.
+    errdefer Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
     {
-        var f = try Io.Dir.cwd().createFile(io, tmp_path, .{});
         defer f.close(io);
         try f.writeStreamingAll(io, content);
         // Flush the data to disk before the rename so a crash cannot leave the
         // target (and, via snapshot.save, its snapshot) renamed-but-empty --
         // which would destroy both the live file and its only backup.
-        f.sync(io) catch |e| {
-            Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            return e;
-        };
+        try f.sync(io);
     }
     // chmod after close to enforce the exact mode regardless of umask.
     // Zig 0.16's std.posix doesn't expose chmod; std.c.chmod is the
     // cross-POSIX path (linux + darwin + BSDs). A discarded failure would
     // leave a restrictive-mode file (0600/0444) at the umask default (e.g.
-    // 0644), exposing a secret: on failure, remove the temp file and fail the
-    // write rather than materializing it with the wrong permissions.
+    // 0644), exposing a secret: on failure the write fails rather than
+    // materializing the file with the wrong permissions.
     // On POSIX, chmod the tmp file before the rename so the target never
     // appears at a wrong (umask) mode -- the atomicity a secret's 0600 needs.
     // On Windows `mode` is only the read-only bit and a read-only file cannot
     // be renamed, so there the mode is applied to the target after the rename.
     if (builtin.os.tag != .windows) {
-        if (!chmodPath(tmp_path, mode)) {
-            Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            return error.ChmodFailed;
-        }
+        if (!chmodPath(tmp_path, mode)) return error.ChmodFailed;
     }
 
     // Post-fsync, pre-rename recheck (partial targets only): the candidate
@@ -215,18 +213,11 @@ fn writeAtomicImpl(io: Io, live_path: []const u8, content: []const u8, mode: u32
     switch (recheck) {
         .none => {},
         .absent => {
-            if (liveStat(io, live_path) != null) {
-                Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-                return error.LiveChangedDuringWrite;
-            }
+            if (liveStat(io, live_path) != null) return error.LiveChangedDuringWrite;
         },
         .stat => |expected| {
-            const now = liveStat(io, live_path) orelse {
-                Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-                return error.LiveChangedDuringWrite;
-            };
+            const now = liveStat(io, live_path) orelse return error.LiveChangedDuringWrite;
             if (now.inode != expected.inode or now.size != expected.size or now.mtime_ns != expected.mtime_ns) {
-                Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
                 return error.LiveChangedDuringWrite;
             }
         },
@@ -304,6 +295,41 @@ test "writeAtomic: a fsync failure removes the temp file and propagates, like th
     // The tmp sidecar is removed, and nothing was ever renamed into place.
     try expectNoStaging(io, base);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, p, .{}));
+}
+
+test "writeAtomic: a failed write, and a failed rename, take their staging file with them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const p = try std.fs.path.join(a, &.{ base, "target" });
+
+    // Each staging name is this writer's alone, so one left behind is left
+    // for good: nothing truncates it on the next write and nothing sweeps
+    // it, and it sits beside the user's own files carrying their content.
+    var write_vtable = io.vtable.*;
+    write_vtable.operate = Io.failingOperate;
+    const no_write: Io = .{ .userdata = io.userdata, .vtable = &write_vtable };
+    try std.testing.expectError(error.InputOutput, writeAtomic(no_write, p, "data\n", 0o644));
+    try expectNoStaging(io, base);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, p, .{}));
+
+    var rename_vtable = io.vtable.*;
+    rename_vtable.dirRename = Io.failingDirRename;
+    const no_rename: Io = .{ .userdata = io.userdata, .vtable = &rename_vtable };
+    try std.testing.expectError(error.FileNotFound, writeAtomic(no_rename, p, "data\n", 0o644));
+    try expectNoStaging(io, base);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, p, .{}));
+
+    // The write that does land still lands, and leaves nothing beside it.
+    try writeAtomic(io, p, "data\n", 0o644);
+    try std.testing.expectEqualStrings("data\n", try Io.Dir.cwd().readFileAlloc(io, p, a, .limited(4096)));
+    try expectNoStaging(io, base);
 }
 
 test "writeAtomicPartial: refuses when the live file changed between read and rename" {

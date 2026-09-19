@@ -45,9 +45,9 @@ refused rather than read as a directory named `~user`; on Windows, spell
 the tail with `/`.
 
 This is the live-path rule, and it covers the commands above.
-`export --facts <path>` names a file outside the live tree and takes it
-as given: mox expands no tilde there, so spell the path out or leave it
-unquoted for the shell to expand.
+`export --facts <path>` names a file outside the live tree and is
+resolved the same way: absolute, `~`-relative, or relative to the current
+directory.
 
 Environment variables are the shell's to expand, and mox does not: a
 literal `$HOME` reaches it only when something meant it literally.

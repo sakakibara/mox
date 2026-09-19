@@ -11,8 +11,9 @@
 //!
 //! Each property has two vehicles sharing one checker: a deterministic
 //! seeded sweep that runs on every `zig build test`, and a Smith target that
-//! runs once as a smoke test there and explores continuously under
-//! `zig build fuzz --fuzz`.
+//! runs once as a bounded smoke check there and under `zig build fuzz`.
+//! Continuous fuzzing is unavailable: under Zig 0.16.0 `--fuzz` fails to
+//! compile the shipped test runner.
 
 const std = @import("std");
 const mox = @import("mox");
