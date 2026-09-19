@@ -499,10 +499,19 @@ fn reconcilePackages(
     for (rep.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
     // A manager that cannot answer has nothing to reconcile: it can neither
     // list what is installed nor be asked to record it.
-    for (rep.broken) |b| try ctx.out.print(
-        "  note       {s}: {s} exited {d}; nothing to reconcile for it\n",
-        .{ b.backend, b.probe, b.code },
-    );
+    for (rep.broken) |b| {
+        if (b.code) |code| {
+            try ctx.out.print(
+                "  note       {s}: {s} exited {d}; nothing to reconcile for it\n",
+                .{ b.backend, b.probe, code },
+            );
+        } else {
+            try ctx.out.print(
+                "  note       {s}: {s}: {s}; nothing to reconcile for it\n",
+                .{ b.backend, b.probe, b.why },
+            );
+        }
+    }
 
     var res: PackageReconcile = .{};
     const choices = [_]prompt.Choice{

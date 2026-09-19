@@ -366,9 +366,10 @@ fn applyPass(
         try applyPackages(ctx, context, &bindings, dry_run, &script_env, &mox_path_dirs);
 
     // A failed batch may have landed some of its rows, so the machine is
-    // re-read after any attempt, not only after a clean success; a
-    // bootstrapped manager changed the machine even with no row to install.
-    if (pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.landed > 0 or pkg_counts.bootstrapped > 0) {
+    // re-read after any attempt, not only after a clean success; an installer
+    // that ran changed the machine even with no row to install, and even
+    // where the manager it was fetched for is still not there.
+    if (pkg_counts.installed > 0 or pkg_counts.attempted > 0 or pkg_counts.landed > 0 or pkg_counts.bootstrap_ran > 0) {
         if (!try recapture.run()) return 2;
     }
     // $MOX_PATH additions named since the last fold: into this run's probe
@@ -837,6 +838,10 @@ fn applyPass(
 /// installs that follow only through it. Returns how many were installed and
 /// how many failed: a manager that will not install is a genuine failure,
 /// not a reason to press on quietly installing nothing.
+///
+/// An installer is believed only as far as the manager it was supposed to
+/// leave behind: the probe is asked again afterwards, and one that still
+/// answers absent is this row's failure, whatever the installer exited.
 fn bootstrapBackends(
     ctx: *app.Ctx,
     context: app.Context,
@@ -845,9 +850,11 @@ fn bootstrapBackends(
     m: mox.packages.manifest.Manifest,
     bindings: *const mox.dsl.resolver.Resolver,
     script_env: *std.process.Environ.Map,
+    pkg_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
-) !struct { bootstrapped: usize, failed: usize, failed_backends: []const []const u8 } {
+) !struct { bootstrapped: usize, ran: usize, failed: usize, failed_backends: []const []const u8 } {
     var bootstrapped: usize = 0;
+    var ran: usize = 0;
     var failed: usize = 0;
     var failed_names: std.ArrayList([]const u8) = .empty;
     for (m.bootstrap) |b| {
@@ -911,6 +918,10 @@ fn bootstrapBackends(
             try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
+        // The installer executed, whatever it left behind: the machine may
+        // have changed, so the run must re-read it even where the manager it
+        // was supposed to install is still not there.
+        ran += 1;
         if (bin_dir) |dir| {
             if (!std.fs.path.isAbsolute(dir) or (std.Io.Dir.cwd().access(ctx.io, dir, .{}) catch null) == null) {
                 try ctx.err.print("mox apply: {s}: bootstrap reported a bin dir that is not an absolute existing directory: {s}\n", .{ b.backend, dir });
@@ -923,12 +934,38 @@ fn bootstrapBackends(
             // run's PATH additions so the re-capture that this install
             // triggers folds it back in for the post scripts and check hooks.
             try script_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, script_env.get("PATH"), &.{dir}));
+            try pkg_env.put("PATH", try mox.apply.mox_path.prependToPath(ctx.alloc, pkg_env.get("PATH"), &.{dir}));
             try mox_path_dirs.append(ctx.alloc, dir);
             try ctx.out.print("  on PATH         {s}\n", .{dir});
         }
+        // The installer's own exit says only that it ran. A manager that is
+        // still not there installs nothing this run, and reporting it as
+        // bootstrapped would have the rows below handed to a manager that
+        // just answered absent -- and every later apply fetch and run the
+        // installer again over the same nothing.
+        const after = backend.available(ctx.alloc) catch |e| {
+            try ctx.err.print(
+                "mox apply: {s}: its installer ran, but the manager could not be probed afterwards: {s}\n",
+                .{ b.backend, mox.packages.exec.errorText(e) },
+            );
+            try ctx.err.flush();
+            failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
+            continue;
+        };
+        if (after == .absent) {
+            try ctx.err.print(
+                "mox apply: {s}: its installer exited 0 but the manager is still absent; run the installer by hand to see why nothing landed\n",
+                .{b.backend},
+            );
+            try ctx.err.flush();
+            failed += 1;
+            try failed_names.append(ctx.alloc, b.backend);
+            continue;
+        }
         bootstrapped += 1;
     }
-    return .{ .bootstrapped = bootstrapped, .failed = failed, .failed_backends = failed_names.items };
+    return .{ .bootstrapped = bootstrapped, .ran = ran, .failed = failed, .failed_backends = failed_names.items };
 }
 
 fn bootstrapFailedFor(failed: []const []const u8, backend: []const u8) bool {
@@ -956,6 +993,10 @@ const PackageCounts = struct {
     /// Managers installed from their declared installer: the machine changed
     /// even when no row was left to install.
     bootstrapped: usize = 0,
+    /// Declared installers that executed, the ones that left their manager
+    /// absent included: an installer that ran may have changed the machine
+    /// whether or not it did the one thing it was fetched for.
+    bootstrap_ran: usize = 0,
     installed: usize = 0,
     /// Rows converged without an install: the package was on the machine
     /// already and only its manager's record of who asked for it changed.
@@ -1010,13 +1051,23 @@ fn applyPackages(
     };
     if (!manifest.inUse()) return .{};
 
+    // What every backend and plugin here runs under: apply's script
+    // environment plus this run's recursion marker, which a setup script has
+    // no business carrying. A copy rather than the map itself, so the marker
+    // stays inside the package pass; `bootstrapBackends` widens the PATH of
+    // both, so an installed manager's bin dir still reaches the probes that
+    // follow in this same run.
+    const pkg_env = try ctx.alloc.create(std.process.Environ.Map);
+    pkg_env.* = try script_env.clone(ctx.alloc);
+    try app.putPackagesDepth(ctx.alloc, pkg_env, context.env);
+
     var pkg_backends: app.PackageBackends = .{};
     const registry = pkg_backends.registry(
         ctx.alloc,
         ctx.io,
         context.paths.state_dir,
         context.paths.home,
-        script_env,
+        pkg_env,
         context.paths.repo_dir,
         true,
         ctx.out,
@@ -1061,12 +1112,14 @@ fn applyPackages(
     // no bootstrap, but plans as though it had, so what it lists is what the
     // real run would install.
     var bootstrapped: usize = 0;
+    var bootstrap_ran: usize = 0;
     var bootstrap_failed: usize = 0;
     var failed_backends: []const []const u8 = &.{};
     var would_bootstrap: std.ArrayList([]const u8) = .empty;
     if (!dry_run) {
-        const done = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, mox_path_dirs);
+        const done = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, pkg_env, mox_path_dirs);
         bootstrapped = done.bootstrapped;
+        bootstrap_ran = done.ran;
         bootstrap_failed = done.failed;
         failed_backends = done.failed_backends;
     } else {
@@ -1120,15 +1173,23 @@ fn applyPackages(
     // A manager that cannot answer cannot be converged: say which, and fail
     // the run rather than report success over a machine left as it was.
     for (rep.broken) |b| {
-        try ctx.err.print(
-            "mox apply: {s}: {s} exited {d}; its packages were left alone\n",
-            .{ b.backend, b.probe, b.code },
-        );
+        if (b.code) |code| {
+            try ctx.err.print(
+                "mox apply: {s}: {s} exited {d}; its packages were left alone\n",
+                .{ b.backend, b.probe, code },
+            );
+        } else {
+            try ctx.err.print(
+                "mox apply: {s}: {s}: {s}; its packages were left alone\n",
+                .{ b.backend, b.probe, b.why },
+            );
+        }
         try ctx.err.flush();
     }
     var counts: PackageCounts = .{
         .in_use = true,
         .bootstrapped = bootstrapped,
+        .bootstrap_ran = bootstrap_ran,
         .failed = bootstrap_failed + rep.broken.len,
         .would_bootstrap = would_bootstrap.items.len,
     };

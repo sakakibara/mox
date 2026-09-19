@@ -226,6 +226,23 @@ fall back to a regex. A row qualifying an architecture dpkg has not enabled
 (`dpkg --print-foreign-architectures`) is refused with the command that
 enables it, unless dpkg already has the package installed under it.
 
+Every one of those judgements keys on the architecture dpkg reports, so mox
+asks apt which one it resolves against -- `apt-config dump
+APT::Architecture` -- and refuses the whole apt pass when the two disagree,
+naming the setting and both architectures. Nothing else shows the
+difference: `apt-cache policy` heads the stanza bare over a version table
+holding the other architecture's package alone, `apt-cache madison` reports
+that package alone, and the native listing still carries the name, so the row
+passes every refusal and the install then fails on dependencies and takes the
+batch with it, identically on every apply after. `apt-mark showmanual`
+answers about apt's architecture too, printing a set of dependencies no row
+declares and dpkg has installed and configured, so the refusal covers
+`status` as much as `apply`: apt is reported broken rather than reporting
+another machine's packages untracked. The plural `APT::Architectures` cannot
+put apt on another architecture -- apt inserts its own into that list
+whatever the configuration names -- so the singular key is the one asked
+about.
+
 A flat repository (`deb [trusted=yes] file:/repo ./`) keeps every
 architecture in one index, so the listing prints its foreign-only names bare
 too. The stanza `apt-cache policy` prints for the row settles those: apt

@@ -83,21 +83,25 @@ pub fn discover(
                 try skipped.append(arena, try std.fmt.allocPrint(
                     arena,
                     "scripts/backends/{s}: ignored; a backend name never begins with a dot",
-                    .{e.name},
+                    .{try diag_mod.oneLine(arena, e.name)},
                 ));
             }
             continue;
         }
         const kind = kindOf(e.name);
         const name = stemOf(e.name, kind);
+        // The path is spawned as it is and printed escaped: a filename
+        // carrying a control byte would otherwise split the one-line
+        // diagnostic it is named in, and every note built from the label.
+        const shown_path = try diag_mod.oneLine(arena, path);
 
         if (!nameOk(name)) {
-            if (diag) |d| d.set("{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends", .{path});
+            if (diag) |d| d.set("{s}: not a backend name (use [A-Za-z0-9_-]); move it out of scripts/backends", .{shown_path});
             return Error.BadBackendName;
         }
 
-        var found = try classify(arena, io, path, name, kind, e.kind, diag);
-        found.label = try std.fmt.allocPrint(arena, "scripts/backends/{s}", .{e.name});
+        var found = try classify(arena, io, path, shown_path, name, kind, e.kind, diag);
+        found.label = try std.fmt.allocPrint(arena, "scripts/backends/{s}", .{try diag_mod.oneLine(arena, e.name)});
 
         if (seen.get(name)) |other| {
             // Two runnable files for one name is ambiguous; a runnable file
@@ -106,14 +110,14 @@ pub fn discover(
             const prev = &out.items[indexOf(out.items, name)];
             if (prev.not_runnable != null and found.not_runnable == null) {
                 prev.* = found;
-                try seen.put(name, path);
+                try seen.put(name, shown_path);
                 continue;
             }
             if (prev.not_runnable == null and found.not_runnable != null) continue;
-            if (diag) |d| d.set("{s} and {s} both name backend \"{s}\"", .{ other, path, name });
+            if (diag) |d| d.set("{s} and {s} both name backend \"{s}\"", .{ other, shown_path, name });
             return Error.DuplicateBackend;
         }
-        try seen.put(name, path);
+        try seen.put(name, shown_path);
         try out.append(arena, found);
     }
     return out.toOwnedSlice(arena);
@@ -171,6 +175,9 @@ fn classify(
     arena: std.mem.Allocator,
     io: Io,
     path: []const u8,
+    /// `path` as a message may print it: escaped of the control bytes that
+    /// would otherwise split a one-line diagnostic.
+    shown_path: []const u8,
     name: []const u8,
     kind: Kind,
     entry_kind: Io.File.Kind,
@@ -182,7 +189,7 @@ fn classify(
     // kind decides it on every OS, since Windows classifies by extension and
     // would otherwise take `macports.exe/` for an executable.
     if (entry_kind == .directory) {
-        if (diag) |d| d.set("{s}: not a file; a backend is an executable file", .{path});
+        if (diag) |d| d.set("{s}: not a file; a backend is an executable file", .{shown_path});
         return Error.BackendNotExecutable;
     }
     if (builtin.os.tag == .windows) {
@@ -215,17 +222,17 @@ fn classify(
     }
 
     const st = Io.Dir.cwd().statFile(io, path, .{}) catch |e| {
-        if (diag) |d| d.set("{s}: cannot stat: {s}", .{ path, @errorName(e) });
+        if (diag) |d| d.set("{s}: cannot stat: {s}", .{ shown_path, @errorName(e) });
         return e;
     };
     if (st.kind != .file) {
-        if (diag) |d| d.set("{s}: not a file; a backend is an executable file", .{path});
+        if (diag) |d| d.set("{s}: not a file; a backend is an executable file", .{shown_path});
         return Error.BackendNotExecutable;
     }
     if (Io.File.Permissions.has_executable_bit and (st.permissions.toMode() & 0o111) == 0) {
         if (diag) |d| d.set(
             "{s}: not executable; a scripts directory holds executables only (chmod +x it, or move it out)",
-            .{path},
+            .{shown_path},
         );
         return Error.BackendNotExecutable;
     }

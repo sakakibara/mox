@@ -158,15 +158,69 @@ pub fn checkCaptureTimedOut(res: Result) error{CaptureTimedOut}!void {
     if (res.timed_out) return error.CaptureTimedOut;
 }
 
-/// A call's failure in words where words exist, and its error name where they
-/// do not. Reached from every report of a verb that did not answer, so one
-/// failure never reads two ways.
+/// A call's failure in words. Reached from every report of a verb that did
+/// not answer, so one failure never reads two ways: what the terminal, the
+/// porcelain and the JSON each say of a call is this text.
+///
+/// Every failure a backend verb, a plugin, or the spawn behind either can end
+/// in is named here. The fall-through is for an error no path is known to
+/// raise, where a name the reader can search for beats a guess at what it
+/// meant.
 pub fn errorText(e: anyerror) []const u8 {
     return switch (e) {
+        // Ended before it could answer.
+        error.TimedOut, error.CaptureTimedOut, error.PluginTimedOut => "timed out, killed",
         error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
+        error.StreamTooLong => "it wrote more than mox will read from one call, and was killed",
+
+        // The spawn, and the file behind it.
         Error.SudoNotFound => "sudo was not found; mox is not running as root, so the install needed it to elevate",
+        error.FileNotFound => "it is not on this machine",
+        error.AccessDenied => "this user may not run it",
+        error.IsDir => "its path is a directory, not a program",
+        error.NotDir => "a directory in its path is not a directory",
+        error.SymLinkLoop => "its path is a loop of symlinks",
+        error.NameTooLong => "its path is longer than this system allows",
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => "there was no file descriptor left to run it with",
+        error.SystemResources => "the system had no resources left to run it with",
+        error.OutOfMemory => "mox ran out of memory",
+        error.BrokenPipe => "it stopped reading before mox finished writing to it",
+        error.Unexpected => "the system refused the call for a reason it did not name",
+
+        // The plugin protocol.
+        error.PluginNotRunnable => "this machine cannot run the plugin file",
+        error.PluginRefusedRow => "the plugin refused the row, in the words it printed above",
+        error.PluginVerbNotImplemented => "the plugin does not implement that verb",
+        error.PluginFailed => "the plugin exited nonzero, saying why above",
+        error.PluginBadOutput => "the plugin answered in a shape the protocol does not define",
+        error.PluginRoundTripMismatch => "the plugin's declare and id disagree: the row it wrote back does not name the package it was asked about",
+        error.NoBootstrapForBackend => "this backend has no installer to run",
+
+        // What a manager answered, or failed to.
+        error.BrewQueryFailed,
+        error.DistroQueryFailed,
+        error.ScoopQueryFailed,
+        error.WingetQueryFailed,
+        error.ZypperQueryFailed,
+        => "the manager's own listing exited nonzero, saying why above",
+        error.ScoopBucketListFailed => "scoop could not list its buckets, saying why above",
+        error.UnreadableExport => "scoop wrote an export file mox could not read back",
+        error.BrewInstallFailed,
+        error.DistroInstallFailed,
+        error.ScoopInstallFailed,
+        error.WingetInstallFailed,
+        error.ZypperInstallFailed,
+        => "the install did not complete, and the manager's own message is above",
         error.DistroUpgradeInstallFailed => "the install did not complete, and on pacman an install is the whole-system upgrade pacman requires of one, so pacman's own message above may name a package no row declares",
         error.DistroRefreshFailed => "the index or database refresh the install resolves against did not complete, so nothing was installed",
+        error.DistroArchitectureDisagrees => "apt resolves against an architecture dpkg does not report, so what it answers is about another machine and no row could be judged against it",
+
+        // A fetched installer, before anything ran it.
+        error.BootstrapDownloadFailed => "the installer could not be downloaded",
+        error.BootstrapDigestMismatch => "the installer that came back is not the one the manifest's sha256 names",
+        error.BootstrapInstallerTooLarge => "the installer that came back is larger than mox will run",
+        error.BootstrapFailed => "the installer did not leave the manager on this machine",
+
         else => @errorName(e),
     };
 }
@@ -350,6 +404,15 @@ pub const max_query_bytes: usize = 8 << 20;
 /// chatty query costs a handful of extra syscalls.
 const read_step_ms: i64 = 200;
 
+/// How long a captured read goes on once the direct child has been reaped.
+/// A child inherits the write end of the pipe to everything it spawns, so a
+/// verb that backgrounds anything (`( sleep 600 ) &`, an everyday idiom)
+/// leaves it open after exiting; without a bound of its own the read would
+/// wait out the whole call bound and then report the verb as having timed
+/// out, which it did not. What a straggler writes is not the call's answer,
+/// so this is only long enough to drain what the child itself wrote.
+const post_exit_ms: i64 = read_step_ms;
+
 /// End what the call still has running: the child and its group, or -- where
 /// the child was already reaped between reads -- whatever it left in that
 /// group, which is what still holds the pipe open.
@@ -526,8 +589,10 @@ pub const Process = struct {
         var err_out: []const u8 = "";
         // Set when the child was found already finished between reads, so the
         // status is this and there is nothing left to wait for. The pipe may
-        // still be held by something it left behind, so the read goes on.
+        // still be held by something it left behind, so the read goes on --
+        // for `post_exit_ms` from `exited_at`, and no longer.
         var read_term: ?std.process.Child.Term = null;
+        var exited_at: ?Io.Timestamp = null;
         if (child.stdout) |f| {
             // Both pipes are read by the one reader, so a child that fills
             // stderr while mox drains stdout never blocks on either.
@@ -568,6 +633,16 @@ pub const Process = struct {
                     }
                     if (left < step_ms) step_ms = left;
                 }
+                // The direct child is gone and the pipe is still open, so
+                // what holds it is something the child left running. Its
+                // output is not this call's answer: drain what the child
+                // itself wrote, then end the read rather than wait out a
+                // bound the child never reached.
+                if (exited_at) |at| {
+                    const left = post_exit_ms - at.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+                    if (left <= 0) break :read;
+                    if (left < step_ms) step_ms = left;
+                }
                 mr.fill(4096, timeoutOf(step_ms).toDeadline(io)) catch |e| switch (e) {
                     error.EndOfStream => break :read,
                     // The step expired with nothing read. Whether the bound
@@ -580,12 +655,11 @@ pub const Process = struct {
                             return error.StoppedWantingTerminal;
                         },
                         // Reaped by the asking, so this is the status the
-                        // caller gets. Reading continues under the same bound
-                        // and the same cap: what still holds the pipe open is
-                        // something the child left behind, and it may hold it
-                        // for as long as it likes.
+                        // caller gets, and the clock the loop head reads
+                        // starts here.
                         .done => |t| {
                             read_term = t;
+                            exited_at = Io.Clock.awake.now(io);
                             continue :read;
                         },
                     },
@@ -628,6 +702,10 @@ pub const Process = struct {
         if (read_term) |t| {
             signals.release();
             if (tty) |x| x.takeBack();
+            // The call is over, so nothing the child left in its group may
+            // outlive it -- the same rule the bound and the streamed
+            // interrupt already keep.
+            if (child_group) |id| job.killStragglersOf(id);
             job.closePipes(io, &child);
             return fromTerm(t, out, err_out);
         }

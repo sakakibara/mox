@@ -32,12 +32,19 @@ pub const Error = error{
 
 /// The rows to install on this machine, in manifest order. `active` names the
 /// backends usable here; rows for any other registered backend are inert.
+///
+/// `gated_out` collects the rows an active backend declares whose gate
+/// excludes this machine. They are not desired and nothing is done about
+/// them, but a row that leaves no trace anywhere is indistinguishable from a
+/// row the manifest never carried -- which is what a misplaced top-level
+/// `when` produces -- so a caller that reports is given them to name.
 pub fn select(
     arena: std.mem.Allocator,
     m: Manifest,
     r: *const Resolver,
     registry: Registry,
     active: []const []const u8,
+    gated_out: ?*std.ArrayList(Row),
     diag: ?*Diag,
 ) ![]const Row {
     var out: std.ArrayList(Row) = .empty;
@@ -46,7 +53,10 @@ pub fn select(
     for (m.packages) |row| {
         if (!contains(active, row.backend)) continue;
         const b = registry.find(row.backend) orelse continue;
-        if (!try gateHolds(arena, row, r)) continue;
+        if (!try gateHolds(arena, row, r)) {
+            if (gated_out) |g| try g.append(arena, row);
+            continue;
+        }
 
         const id = b.idOf(arena, row) catch |e| {
             if (diag) |d| d.set("{s}: row \"{s}\": id failed: {s}", .{ row.label, row.name, exec.errorText(e) });
@@ -138,7 +148,7 @@ test "select: keeps rows whose backend is active and whose gate holds" {
         rowOf("work-tool", "brew", "profile=work", "data/packages/darwin.toml"),
     } };
 
-    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null, null);
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualStrings("ripgrep", got[0].name);
     try testing.expectEqualStrings("steam", got[1].name);
@@ -157,7 +167,7 @@ test "select: a row for an inactive backend is inert" {
         rowOf("bat", "dnf", null, "data/packages/fedora.toml"),
     } };
 
-    const got = try select(a, m, &r, brewRegistry(), &.{"dnf"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"dnf"}, null, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings("bat", got[0].name);
 }
@@ -181,7 +191,7 @@ test "select: the same package active twice is refused, naming both files" {
     try bindings.put("os", "darwin");
 
     var d: Diag = .{};
-    try testing.expectError(Error.DuplicatePackageRow, select(a, m, &r, brewRegistry(), &.{"brew"}, &d));
+    try testing.expectError(Error.DuplicatePackageRow, select(a, m, &r, brewRegistry(), &.{"brew"}, null, &d));
     try testing.expectEqualStrings(
         "data/packages/darwin.toml: row 2 and data/packages/local.toml: row 0 both declare \"ripgrep\" for backend \"brew\" on this machine",
         d.capture().?,
@@ -202,7 +212,7 @@ test "select: a formula and the cask of the same name are two packages" {
         caskRow("docker", "data/packages/darwin.toml"),
     } };
 
-    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null, null);
     try testing.expectEqual(@as(usize, 2), got.len);
 }
 
@@ -220,7 +230,7 @@ test "select: disjoint gates for one package are not a duplicate" {
         rowOf("ripgrep", "brew", "not profile=work", "data/packages/darwin.toml"),
     } };
 
-    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{"brew"}, null, null);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings("profile=work", got[0].when.?);
 }
@@ -238,6 +248,6 @@ test "select: the same name on two backends is not a duplicate" {
         rowOf("ripgrep", "dnf", null, "data/packages/fedora.toml"),
     } };
 
-    const got = try select(a, m, &r, brewRegistry(), &.{ "brew", "dnf" }, null);
+    const got = try select(a, m, &r, brewRegistry(), &.{ "brew", "dnf" }, null, null);
     try testing.expectEqual(@as(usize, 2), got.len);
 }

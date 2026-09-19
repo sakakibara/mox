@@ -354,15 +354,18 @@ fn discover(
     var out: std.ArrayList(SourceFile) = .empty;
     for (names.items) |n| {
         const pick = chosen.get(n).?;
+        // Every message about this file interpolates the label, and each is
+        // one line; a filename carrying a newline would split them all.
+        const shown = try diag_mod.oneLine(arena, n);
         try out.append(arena, .{
             .path = pick.path,
             // The layer is part of the name every message prints: a private
             // file shadowing a repo file of the same basename would otherwise
             // report its faults against the repo file, which is intact.
             .label = if (pick.private)
-                try std.fmt.allocPrint(arena, "data/packages/{s} (private layer)", .{n})
+                try std.fmt.allocPrint(arena, "data/packages/{s} (private layer)", .{shown})
             else
-                try std.fmt.allocPrint(arena, "data/packages/{s}", .{n}),
+                try std.fmt.allocPrint(arena, "data/packages/{s}", .{shown}),
             .private = pick.private,
         });
     }

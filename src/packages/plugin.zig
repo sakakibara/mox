@@ -9,6 +9,7 @@
 //!     <plugin> id                 stdin: one row as an inline table
 //!                                 stdout: exactly one id
 //!                                 exit 1: the row is refused; stderr says why
+//!                                 answers whether or not the manager is here
 //!     <plugin> list               stdout: one id per line, explicitly installed
 //!     <plugin> install            stdin: rows, one per line; stdio streamed
 //!     <plugin> declare <id>       stdout: a TOML row body naming this id
@@ -30,6 +31,24 @@
 //! with the plugin's own reason, which is stronger than any key list mox could
 //! check against. Ids are opaque; a plugin with two namespaces prefixes them
 //! itself, and mox compares strings.
+//!
+//! `id` must answer WITHOUT the manager installed. It is a naming function --
+//! a row in, the identity mox compares by out -- and it is asked before
+//! `available` on every command, of every machine the manifest reaches: a
+//! manifest is checked ungated so a mistake is caught everywhere rather than
+//! only where the manager happens to be, and `status` and `apply` ask it of a
+//! manager they are about to install. A plugin whose `id` shells out to its
+//! manager exits 1 there, which the table above defines as a considered
+//! refusal, so its manifest is refused on every machine that has not got the
+//! manager yet -- including the one the `[[bootstrap]]` row exists for, which
+//! could then never install it.
+//!
+//! A captured verb's answer is the direct child's, and ends when it exits.
+//! Anything the verb leaves running inherits the pipe mox reads, so a verb
+//! that backgrounds work is read for a moment longer and no further; what the
+//! straggler writes is not the answer, and it is killed with the call. Work
+//! that must outlive a verb belongs in `install` or `bootstrap`, which are
+//! streamed.
 //!
 //! An optional verb signals its absence with exit 64 (EX_USAGE), reported at
 //! the call site by plugin and verb. Nothing is substituted for a missing

@@ -38,6 +38,11 @@ pub const Error = error{
     /// install is the whole-system upgrade pacman requires of one, so what
     /// stopped it may be a package no row declares.
     DistroUpgradeInstallFailed,
+    /// apt resolves against one architecture and dpkg reports another, so
+    /// neither half of the apt oracle answers for this machine. Its own error
+    /// because nothing was asked of apt that it failed to answer: it answered,
+    /// about a machine other than this one.
+    DistroArchitectureDisagrees,
 };
 
 pub const Manager = enum {
@@ -1186,6 +1191,46 @@ pub const Distro = struct {
         return std.mem.trim(u8, res.stdout, " \t\r\n");
     }
 
+    /// The architecture apt itself resolves against, or null where apt names
+    /// none at all.
+    ///
+    /// `apt-config dump APT::Architecture` answers with one line, `APT::Architecture
+    /// "<arch>";`, and with nothing at all for a key apt has no value for
+    /// (exit 0 either way). Measured identically on apt 2.6.1 (bookworm) and
+    /// 3.0.3 (trixie), arm64 with armhf added, unset and set alike. The
+    /// plural `APT::Architectures` is a sibling node rather than a child, so
+    /// it is not in this answer, and its own lines are `APT::Architectures
+    /// "";` followed by one `APT::Architectures:: "<arch>";` per
+    /// architecture -- neither of which starts with the singular key and a
+    /// space.
+    ///
+    /// Only the singular key can put apt on another machine's architecture.
+    /// apt forces its own into the plural list whatever the configuration
+    /// says: with `APT::Architectures { "armhf"; };` configured on an arm64
+    /// machine, both versions dump `arm64` then `armhf`, `apt-cache policy
+    /// sl` still heads an arm64 candidate and `apt-get install -y -- sl`
+    /// installs the arm64 package, which `apt-mark showmanual` then reports
+    /// bare.
+    fn aptConfiguredArch(self: *Distro, arena: std.mem.Allocator) anyerror!?[]const u8 {
+        const res = try self.runner.run(arena, &apt_arch_argv);
+        try exec.checkCaptureTimedOut(res);
+        if (!res.ok) return Error.DistroQueryFailed;
+
+        const key = "APT::Architecture ";
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (!std.mem.startsWith(u8, line, key)) continue;
+            const rest = std.mem.trimStart(u8, line[key.len..], " \t");
+            if (rest.len == 0 or rest[0] != '"') continue;
+            const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse continue;
+            const arch = rest[1..end];
+            if (arch.len == 0) continue;
+            return arch;
+        }
+        return null;
+    }
+
     /// The architectures dpkg has enabled beside the native one, one per
     /// line. A machine with none prints nothing and exits 0 (measured on
     /// apt 2.6.1 and 3.0.3).
@@ -1220,9 +1265,43 @@ pub const Distro = struct {
         }
     };
 
+    /// What dpkg says of this machine, refused whole where apt is answering
+    /// about a different one.
+    ///
+    /// Both halves of the apt oracle key on dpkg's architecture -- the
+    /// bare-name listing is generated for it, the qualifier rules judge
+    /// against it, and apt-mark's bare spelling is what it means -- so apt
+    /// resolving against another architecture makes every one of them answer
+    /// about a machine that is not this one. Measured on apt 2.6.1 and 3.0.3,
+    /// arm64 with armhf added and `APT::Architecture "armhf";` configured:
+    /// `apt-cache policy sl` heads the stanza bare over an armhf-only version
+    /// table and madison reports the armhf line alone, so nothing in the parse
+    /// notices; the row passes every refusal and `apt-get install -y -- sl`
+    /// then fails on `libc6`, `libncurses6` and `libtinfo6`, taking every
+    /// other row of the batch with it, identically on every apply after. The
+    /// same setting makes `apt-mark showmanual` print a set no row declares
+    /// and dpkg has as dependencies -- 10 names on bookworm and 9 on trixie
+    /// where an untouched machine prints none -- each of them installed and
+    /// configured, so `status` would report them untracked and `commit` would
+    /// write them into the manifest.
+    ///
+    /// Machine-level rather than per-row because no row can converge under it
+    /// and none of them caused it: the same message per row would say a
+    /// hundred times what one setting did once, and would still leave the
+    /// installed set wrong.
     fn aptMachine(self: *Distro, arena: std.mem.Allocator) anyerror!AptMachine {
+        const native = try self.aptNativeArch(arena);
+        if (try self.aptConfiguredArch(arena)) |configured| {
+            if (!std.mem.eql(u8, configured, native)) {
+                self.say(
+                    "mox: apt: apt's own APT::Architecture is \"{s}\" while dpkg's architecture is \"{s}\", so apt resolves every row against packages dpkg cannot install and no row on this machine could converge; unset APT::Architecture so apt agrees with `dpkg --print-architecture`\n",
+                    .{ configured, native },
+                );
+                return Error.DistroArchitectureDisagrees;
+            }
+        }
         return .{
-            .native = try self.aptNativeArch(arena),
+            .native = native,
             .installed = try self.aptInstalledArches(arena),
         };
     }
@@ -2201,6 +2280,11 @@ pub const Distro = struct {
     /// `sudo` resets the environment.
     const apt_env = [_][]const u8{ "env", "DEBIAN_FRONTEND=noninteractive" };
 
+    /// The one key that says which architecture apt resolves against. Asked
+    /// of apt itself rather than read from `/etc/apt/apt.conf.d`, which is
+    /// one of the places apt reads and not the answer.
+    const apt_arch_argv = [_][]const u8{ "apt-config", "dump", "APT::Architecture" };
+
     /// Whether an install needs `sudo`. Root already has the privilege, and
     /// a minimal image that runs as root often ships no `sudo` binary.
     fn elevates(self: *Distro) bool {
@@ -2222,6 +2306,15 @@ fn aptNamesCall(comptime native: []const u8) []const u8 {
 
 /// The installed-architecture listing argv the apt adapter builds.
 const apt_installed_call = "dpkg-query -W -f ${Package} ${Architecture} ${Status}\\n";
+
+/// The argv that asks apt which architecture it resolves against.
+const apt_arch_call = "apt-config dump APT::Architecture";
+
+/// What that argv answers on a machine apt agrees with, in the shape apt
+/// 2.6.1 and 3.0.3 print it.
+fn aptArchDump(comptime arch: []const u8) []const u8 {
+    return "APT::Architecture \"" ++ arch ++ "\";\n";
+}
 
 /// The stanza `apt-cache policy` prints for a package it has a version of,
 /// in the shape apt 2.6.1 and 3.0.3 print it.
@@ -2277,6 +2370,7 @@ test "installedExplicit: manual packages come back one per line" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showmanual", .stdout = "bat\nfd-find\n\nripgrep\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\nfd-find arm64 install ok installed\nripgrep arm64 install ok installed\n" },
     } };
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
@@ -2337,6 +2431,7 @@ test "install: apt as root refreshes without sudo too" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nnano\n" },
         .{ .argv = "apt-mark showhold" },
         .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
@@ -2360,6 +2455,7 @@ test "install: apt refreshes the index, then installs the whole set at once, deb
     // from the environment along with everything else.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -2371,7 +2467,7 @@ test "install: apt refreshes the index, then installs the whole set at once, deb
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
 
     try d.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("fd-find", &.{}) });
-    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[3]);
+    try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get update", fake.calls.items[4]);
     try testing.expectEqualStrings("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat fd-find", fake.calls.items[fake.calls.items.len - 1]);
 }
 
@@ -2631,6 +2727,7 @@ test "install: the install argv is exactly this, per manager" {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update" },
             .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+            .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
             .{ .argv = apt_installed_call },
             .{ .argv = "apt-mark showauto" },
             .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
@@ -2698,6 +2795,7 @@ test "install: apt refuses a name it would resolve as a regular expression" {
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nbsdextrautils\nnano\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\n" },
         .{ .argv = "apt-cache madison bsdextrautil.", .stdout = "" },
@@ -2725,6 +2823,7 @@ test "install: apt refuses the bad names and installs the rest of the batch" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
         .{ .argv = apt_installed_call, .stdout = "bat amd64 install ok installed\n" },
         .{ .argv = "apt-cache madison", .match = .prefix, .stdout = "" },
@@ -2763,6 +2862,7 @@ test "install: a foreign-architecture row is asked about as written, never by it
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{
             .argv = "apt-cache madison wine32:armhf",
             .stdout = "wine32:armhf | 10.0~repack-6 | http://deb.debian.org/debian trixie/main armhf Packages\n",
@@ -2795,6 +2895,7 @@ test "install: apt refuses a qualified name madison has no binary package for" {
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{
             .argv = "apt-cache madison wine:armhf",
             .stdout = "      wine | 10.0~repack-6 | http://deb.debian.org/debian trixie/main Sources\n",
@@ -2827,6 +2928,7 @@ test "install: apt refuses a qualifier naming this machine's own architecture" {
         .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bsdextrautils\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -2850,6 +2952,7 @@ test "install: a name query that cannot run stops the install, never waves it th
         .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .code = 100 },
     } };
     var d: Distro = .{ .manager = .apt, .runner = apt.runner(), .force_elevate = false };
@@ -3031,6 +3134,7 @@ test "install: a row apt has as a dependency is marked manual, never installed" 
     // index refresh, no listing, no hold or pin check.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\nlibc6 arm64 install ok installed\n" },
         .{ .argv = "apt-mark showauto", .stdout = "bat\nlibc6\n" },
         .{ .argv = "apt-mark manual bat" },
@@ -3041,7 +3145,7 @@ test "install: a row apt has as a dependency is marked manual, never installed" 
     try d.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expectEqual(@as(usize, 1), d.backend().installMarked());
     try testing.expect(fake.called("apt-mark manual bat"));
-    try testing.expectEqual(@as(usize, 4), fake.calls.items.len);
+    try testing.expectEqual(@as(usize, 5), fake.calls.items.len);
     try testing.expect(std.mem.indexOf(u8, w.written(), "marking it manually installed") != null);
 }
 
@@ -3061,6 +3165,7 @@ test "install: a held package apt already has is marked, never refused for the h
         .{ .argv = "apt-mark manual groff-base" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\ngroff-base\n" },
         .{ .argv = "apt-mark showhold", .stdout = "groff-base\n" },
         .{ .argv = "apt-cache policy bat", .stdout = "bat:\n  Installed: (none)\n  Candidate: 0.25.0-2\n" },
@@ -3211,6 +3316,7 @@ test "install: a listing that could not be read leaves the rows to the install, 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = "apt-mark showhold" },
         .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
@@ -3498,6 +3604,7 @@ test "install: an elevated install with no sudo on the machine says so" {
         .{ .argv = "apt-mark showauto" },
         .{ .argv = apt_installed_call },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = "sudo env DEBIAN_FRONTEND=noninteractive apt-get update", .fail = error.FileNotFound },
     } };
     var d2: Distro = .{ .manager = .apt, .runner = apt.runner(), .force_elevate = true };
@@ -3921,6 +4028,7 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
             .{ .argv = apt_installed_call },
             .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
             .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+            .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
             .{ .argv = aptNamesCall("arm64"), .stdout = "bsdextrautils\nbsdmainutils\nsl\n" },
         } };
         var w: std.Io.Writer.Allocating = .init(a);
@@ -3941,6 +4049,7 @@ test "install: apt refuses the qualifiers apt reads as the native architecture" 
     // reports with a colon in it.
     var ok: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -3970,6 +4079,7 @@ test "install: a listing that answers nothing stops the install, saying which" {
         .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4019,6 +4129,7 @@ test "install: a listing past the cap stops the install, saying that is what hap
         .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .fail = error.StreamTooLong },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -4041,6 +4152,7 @@ test "install: whether the manager ran is what says the rows may have landed" {
     // None of them can have installed anything.
     var refresh: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .code = 100 },
@@ -4051,6 +4163,7 @@ test "install: whether the manager ran is what says the rows may have landed" {
 
     var timeout: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4127,6 +4240,7 @@ test "install: a qualifier apt reads as native is judged before the package list
         .{ .argv = apt_installed_call },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -4153,6 +4267,7 @@ test "install: a foreign-architecture row beside a good one installs both" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "sl\nbat\n" },
         .{
             .argv = "apt-cache madison wine32:armhf",
@@ -4187,6 +4302,7 @@ test "install: a bare row apt has only as a locally installed package is kept" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nsl\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\nmoxlocaldemo arm64 install ok installed\n" },
         .{ .argv = "apt-mark showhold" },
@@ -4214,6 +4330,7 @@ test "install: a bare row whose package is an Architecture: all one is kept" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = apt_installed_call, .stdout = "moxallpkg all install ok installed\n" },
         .{ .argv = "apt-mark showhold" },
@@ -4242,6 +4359,7 @@ test "install: a bare row whose package is installed for a foreign architecture 
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = apt_installed_call, .stdout = "moxforeigndemo armhf install ok installed\n" },
         .{ .argv = "apt-cache madison moxforeigndemo", .stdout = "" },
@@ -4270,6 +4388,7 @@ test "install: a package removed but left in config-files is not a row apt would
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = apt_installed_call, .stdout = "moxgonedemo arm64 deinstall ok config-files\n" },
         .{ .argv = "apt-cache madison moxgonedemo", .stdout = "" },
@@ -4301,6 +4420,7 @@ test "install: apt names what provides a virtual name rather than warning about 
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nliba52-0.7.4-dev\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\n" },
         .{ .argv = "apt-cache madison a52dec", .stdout = "" },
@@ -4344,6 +4464,7 @@ test "install: showpkg answers about a regex, so only the stanza this row names 
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\n" },
         .{ .argv = "apt-cache madison ruby.dev", .stdout = "" },
@@ -4386,6 +4507,7 @@ test "install: a qualified row whose package is installed for that architecture 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = "apt-cache madison moxforeigndemo:armhf", .stdout = "" },
         .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{ .argv = apt_installed_call, .stdout = "moxforeigndemo armhf install ok installed\n" },
@@ -4416,6 +4538,7 @@ test "install: a bare row apt has only for a foreign architecture is refused, na
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = aptNamesCall("arm64"), .stdout = "bat\nsl\n" },
         .{ .argv = apt_installed_call, .stdout = "bat arm64 install ok installed\n" },
         .{
@@ -4457,6 +4580,7 @@ test "install: the bare-name listing asks for the native architecture alone, no 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
         .{ .argv = "apt-mark showhold" },
         .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
@@ -4484,6 +4608,7 @@ test "install: apt refuses a held row and installs the rest of the batch" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\nsl\n" },
         .{ .argv = "apt-mark showhold", .stdout = "sl\n" },
         .{ .argv = "apt-cache policy", .match = .prefix, .stdout = "bat:\n  Installed: (none)\n  Candidate: 0.25.0-2\n" },
@@ -4517,6 +4642,7 @@ test "install: apt refuses a row a pin leaves no candidate for, and installs the
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "amd64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("amd64") },
         .{ .argv = aptNamesCall("amd64"), .stdout = "bat\ncowsay\n" },
         .{ .argv = "apt-mark showhold" },
         .{
@@ -4564,6 +4690,7 @@ test "install: a qualified row is judged by its own policy stanza, which carries
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{
@@ -4654,6 +4781,7 @@ test "install: a bare row a flat index holds for a foreign architecture alone is
     }) |c| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{
             .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+            .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
             .{ .argv = apt_installed_call },
             .{ .argv = "apt-mark showauto" },
             .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4714,6 +4842,7 @@ test "install: a bare row after the qualified one for the same package takes its
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
@@ -4761,6 +4890,7 @@ test "install: a stanza whose header merely extends the row's name answers the r
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = aptNamesCall("arm64"), .stdout = "mox-flat-i386\nmox-flat-i386-tools\n" },
@@ -4789,6 +4919,7 @@ test "install: the policy stanzas are matched to the rows in order, a row apt ca
     // position would hand it the stanza after it and refuse the wrong row.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4818,6 +4949,7 @@ test "install: a qualified row a flat index carries installs, madison naming the
     // `mox-flat-armhf:armhf` and the row converges.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4840,6 +4972,7 @@ test "install: a qualified row a flat index carries installs, madison naming the
     // the qualified spelling rather than kept for a `./` architecture.
     var bare: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4860,6 +4993,7 @@ test "install: a qualified row a flat index carries installs, madison naming the
     // architecture, so the row is refused as the listing's regex case.
     var native: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4885,6 +5019,7 @@ test "install: a qualified row naming an architecture dpkg has not enabled is re
     // set is what says the install would fail at dpkg.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4907,6 +5042,7 @@ test "install: a qualified row naming an architecture dpkg has not enabled is re
     // `apt-get install -y -- mox-force-i386:i386` exits 0 setting it manual.
     var forced: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call, .stdout = "mox-force-i386 i386 install ok installed\n" },
         .{ .argv = "apt-mark showauto" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
@@ -4935,6 +5071,7 @@ test "installedExplicit: apt's manual set holds only what dpkg has configured" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "apt-mark showmanual", .stdout = "sl\ncowsay\nlibc6\nlibc6:armhf\nmox-gone\n" },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{
             .argv = apt_installed_call,
             .stdout = "cowsay all install ok installed\nlibc6 arm64 install ok installed\nlibc6 armhf install ok installed\nmox-gone arm64 deinstall ok config-files\nsl arm64 install ok unpacked\n",
@@ -4947,6 +5084,142 @@ test "installedExplicit: apt's manual set holds only what dpkg has configured" {
     try testing.expectEqualStrings("cowsay", got[0]);
     try testing.expectEqualStrings("libc6", got[1]);
     try testing.expectEqualStrings("libc6:armhf", got[2]);
+}
+
+test "install: apt is asked which architecture it resolves against, and agreeing costs the run nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The argv, and the answer, measured identically on apt 2.6.1 (Debian
+    // bookworm) and 3.0.3 (Debian trixie), arm64 with armhf added, both with
+    // `APT::Architecture "arm64";` configured and with the key unset:
+    //
+    //     $ apt-config dump APT::Architecture
+    //     APT::Architecture "arm64";
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"arm64\";\n" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(fake.called("apt-config dump APT::Architecture"));
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat"));
+    try testing.expectEqual(@as(usize, 0), d.backend().installRefused());
+    try testing.expectEqualStrings("", w.written());
+}
+
+test "install: apt resolving against another architecture than dpkg's stops the whole pass, naming both" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on apt 2.6.1 and 3.0.3, arm64 with armhf added and
+    // `APT::Architecture "armhf";` in /etc/apt/apt.conf.d: `dpkg
+    // --print-architecture` still answers `arm64` while
+    //
+    //     $ apt-config dump APT::Architecture
+    //     APT::Architecture "armhf";
+    //
+    // Nothing else in the oracle sees it -- `apt-cache policy sl` heads the
+    // stanza bare over an armhf-only version table and `apt-cache madison sl`
+    // reports the armhf line alone -- so the row passes every refusal and
+    // `apt-get install -y -- sl` then fails on libc6, libncurses6 and
+    // libtinfo6, taking the rest of the batch with it.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"armhf\";\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try testing.expectError(
+        Error.DistroArchitectureDisagrees,
+        d.backend().install(a, &.{ rowOf("sl", &.{}), rowOf("bat", &.{}) }),
+    );
+    // The refusal lands before anything is read, refreshed or installed, so
+    // no row of the batch is judged and none is put on the machine.
+    try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+    try testing.expect(!d.backend().installSpawned());
+    try testing.expectEqualStrings(
+        "mox: apt: apt's own APT::Architecture is \"armhf\" while dpkg's architecture is \"arm64\", so apt resolves every row against packages dpkg cannot install and no row on this machine could converge; unset APT::Architecture so apt agrees with `dpkg --print-architecture`\n",
+        w.written(),
+    );
+}
+
+test "installedExplicit: the same disagreement stops the report, so apt-mark's other machine is never read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The same setting makes apt-mark answer about the architecture apt is
+    // configured for: measured on apt 2.6.1 and 3.0.3 under `APT::Architecture
+    // "armhf";`, `apt-mark showmanual` prints 10 names on bookworm and 9 on
+    // trixie -- adduser, debconf, debian-archive-keyring and the rest -- where
+    // the same untouched machine prints none. Every one of them is installed
+    // and configured, so nothing downstream would drop them and `status` would
+    // report each as untracked.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "apt-mark showmanual", .stdout = "debconf\ndebian-archive-keyring\ninit-system-helpers\n" },
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"armhf\";\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true, .err = &w.writer };
+
+    try testing.expectError(Error.DistroArchitectureDisagrees, d.backend().installedExplicit(a));
+    try testing.expect(!fake.called(apt_installed_call));
+    try testing.expect(std.mem.indexOf(u8, w.written(), "APT::Architecture is \"armhf\"") != null);
+}
+
+test "install: apt naming no architecture of its own is nothing to disagree with" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `apt-config dump <key>` prints nothing at all and exits 0 for a key apt
+    // has no value for, measured on apt 2.6.1 and 3.0.3. apt always has one
+    // for this key, so an empty answer is a shape neither version produces;
+    // reading it as a disagreement would refuse a machine over an answer that
+    // names no architecture to disagree about.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture" },
+        .{ .argv = apt_installed_call },
+        .{ .argv = "apt-mark showauto" },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },
+        .{ .argv = aptNamesCall("arm64"), .stdout = "bat\n" },
+        .{ .argv = "apt-mark showhold" },
+        .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
+        .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat" },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
+
+    try d.backend().install(a, &.{rowOf("bat", &.{})});
+    try testing.expect(fake.called("env DEBIAN_FRONTEND=noninteractive apt-get install -y -- bat"));
+}
+
+test "install: an apt-config that cannot answer is a failed query, never an agreement" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture", .code = 100 },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = false };
+
+    try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
 }
 
 test "install: a row apt-mark reports but dpkg left unpacked is installed, which configures it" {
@@ -4962,6 +5235,7 @@ test "install: a row apt-mark reports but dpkg left unpacked is installed, which
     // row is marked; both go to the install.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_arch_call, .stdout = aptArchDump("arm64") },
         .{ .argv = apt_installed_call, .stdout = "cowsay all install ok unpacked\nsl arm64 install ok unpacked\n" },
         .{ .argv = "apt-mark showauto", .stdout = "cowsay\n" },
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update" },

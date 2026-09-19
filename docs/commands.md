@@ -367,7 +367,12 @@ other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING`, each installed
 package `UNTRACKED` (declared nowhere and not blacklisted), and each manager
-that is installed but cannot answer `BROKEN`. A manifest mox would not read
+that is installed but cannot answer `BROKEN`. A declared row whose `when`
+excludes this machine is `GATED` there, printed with the gate that excluded
+it: it is not drift and counts toward nothing, but a row that appeared in no
+output at all could not be told from a row the manifest never carried, which
+is what a `when` written under the wrong table header produces. A manifest
+mox would not read
 at all is one `ERROR` row naming where the refusal is, since an empty section
 would read as a clean machine. A
 path-scoped `mox status <file>` names files and reports no packages, as a
@@ -391,9 +396,11 @@ modes.
 `--drift` shows only the drift set (the report `mox apply` prints for the
 same tree, from the same classifier -- the two never disagree), dropping
 the clean/gated table and the probe/unbound context. The `packages:`
-section is drift, so `--drift` keeps it, but only its drift: clean rows go
-the way the clean file table does, the notes go to stderr as they do under
-`--json`, and a machine with no package drift at all prints no section.
+section is drift, so `--drift` keeps it, but only its drift: clean and
+`GATED` rows go the way the clean file table does, the notes go to stderr as
+they do under `--json`, and a machine with no package drift at all prints no
+section. A `GATED` package is not in the serialized set either, exactly as a
+`GATED` file is not.
 One asymmetry to know: a `MISSING` file is not in the drift set (apply
 writes it without asking) while a `MISSING` package is (apply installs it,
 and `commit` may record it instead). `--json` and
@@ -401,7 +408,11 @@ and `commit` may record it instead). `--json` and
 
 `--json` emits `{"files": [...], "packages": [...]}`. A file is
 `{path, kind, key?, first_contact}`; a broken manager is
-`{backend, state: "broken", exit}`; a manifest that would not load is
+`{backend, state: "broken", exit, probe, why?}`, where `exit` is the exit
+code or `null` for a call that never reached one -- killed at its bound,
+ended for want of a terminal, or answered in a shape that is not an answer
+-- and `why` states that reason in words, so a genuine exit of 255 is never
+read as one of them; a manifest that would not load is
 `{state: "refused"}`, alone and leading the package set, since it is the
 whole pass rather than one backend; a package is
 `{backend, state, id, name?}`, where `state` is `missing` or `untracked`
@@ -414,7 +425,11 @@ missing package.
 the record kind as the first field. File records are `kind`, `key`,
 `first_contact` (0/1), `path`. Package records are `package_missing` or
 `package_untracked`, then `backend`, then `id`; a broken manager is
-`package_broken`, then `backend`, then the exit code; a manifest that would
+`package_broken`, then `backend`, then the exit code, then the probe, then
+why -- the exit code being `-` for a call that never reached one (killed at
+its bound, ended for want of a terminal, or answered in a shape that is not
+an answer), which is what tells those apart from a genuine exit of 255, and
+`why` being empty wherever the code already says it; a manifest that would
 not load is `package_refused`, a record of one field. Field count varies by
 kind, so switch on the first field before reading the rest. In
 `--porcelain` the free-form fields are
@@ -428,7 +443,7 @@ break the framing; unescape those four to recover exact bytes. Both imply
 | `--color <color>` | auto|always|never |
 | `--drift` | show only the drift set (suppress the clean/gated table) |
 | `--json` | emit the drift set as JSON (implies --drift) |
-| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
+| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
 <!-- /generated -->
 
 ## export

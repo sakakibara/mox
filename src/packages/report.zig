@@ -32,6 +32,11 @@ pub const BackendDrift = struct {
     /// Carried from the adapter so a caller can state what this backend
     /// cannot see without knowing which manager it is.
     limitation: ?[]const u8 = null,
+    /// The rows this backend declares whose gate excludes this machine. Not
+    /// drift and not a problem: carried so a report can name them, because a
+    /// row that appears in no output at all reads exactly like a row the
+    /// manifest never carried.
+    gated: []const Row = &.{},
 };
 
 /// A manager that is there but cannot answer its own version query. Treated
@@ -41,15 +46,13 @@ pub const Broken = struct {
     backend: []const u8,
     /// What was asked of it, for the message.
     probe: []const u8,
-    /// The exit code where there was one. A call that did not get far enough
-    /// to have one -- killed at its bound, ended for want of a terminal --
-    /// carries `no_exit`, and `why` is what to read instead.
-    code: u8,
+    /// The exit code, or null for a call that never reached an exit of its
+    /// own -- killed at its bound, ended for want of a terminal, or answered
+    /// in a shape that is not an answer. A real exit of 255 is not that, and
+    /// must not read as it.
+    code: ?u8,
     /// Why it could not answer, in words. Empty where `code` says it.
     why: []const u8 = "",
-
-    /// The code for a call that never reached an exit of its own.
-    pub const no_exit: u8 = 255;
 };
 
 pub const Report = struct {
@@ -130,7 +133,7 @@ fn noteBroken(
     try broken.append(arena, .{
         .backend = name,
         .probe = verb,
-        .code = Broken.no_exit,
+        .code = null,
         .why = why,
     });
 }
@@ -220,7 +223,8 @@ pub fn fromManifest(
     }
     if (active.items.len == 0) try notes.append(arena, "no package manager is usable on this machine");
 
-    const rows = try desired_mod.select(arena, m, r, registry, active.items, diag);
+    var gated: std.ArrayList(Row) = .empty;
+    const rows = try desired_mod.select(arena, m, r, registry, active.items, &gated, diag);
 
     var out: std.ArrayList(BackendDrift) = .empty;
     for (assumed.items) |b| {
@@ -231,6 +235,7 @@ pub fn fromManifest(
                 continue;
             },
             .limitation = if (contains(assume_available, b.name)) null else "absent; apply will bootstrap it",
+            .gated = try gatedFor(arena, gated.items, b.name),
         });
     }
     for (usable.items) |b| {
@@ -248,7 +253,7 @@ pub fn fromManifest(
             try broken.append(arena, .{
                 .backend = b.name,
                 .probe = "list",
-                .code = Broken.no_exit,
+                .code = null,
                 .why = "its list output lost its shape",
             });
             shape_ok = false;
@@ -275,6 +280,7 @@ pub fn fromManifest(
                 continue;
             },
             .limitation = limitation,
+            .gated = try gatedFor(arena, gated.items, b.name),
         });
     }
 
@@ -284,6 +290,15 @@ pub fn fromManifest(
         .notes = try notes.toOwnedSlice(arena),
         .broken = try broken.toOwnedSlice(arena),
     };
+}
+
+/// The gated-out rows naming `backend`, in manifest order.
+fn gatedFor(arena: std.mem.Allocator, gated: []const Row, backend: []const u8) ![]const Row {
+    var out: std.ArrayList(Row) = .empty;
+    for (gated) |row| {
+        if (std.mem.eql(u8, row.backend, backend)) try out.append(arena, row);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Whether any package, blacklist, or bootstrap row names `backend`.

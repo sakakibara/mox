@@ -604,7 +604,20 @@ pub fn packageEnv(
     );
     const map = try ctx.alloc.create(std.process.Environ.Map);
     map.* = built.map;
-    const depth = @min(max_packages_depth, packagesDepth(ctx.alloc, context.env) + 1);
-    try map.put(packages_depth_var, try std.fmt.allocPrint(ctx.alloc, "{d}", .{depth}));
+    try putPackagesDepth(ctx.alloc, map, context.env);
     return map;
+}
+
+/// Count this run into `map`'s `packages_depth_var`: one more than the depth
+/// `env` already carries. Every command that runs a backend puts it there --
+/// `apply` builds the package environment from its script environment rather
+/// than through `packageEnv`, and a marker written on only some commands is
+/// a guard a plugin cannot rely on.
+pub fn putPackagesDepth(
+    arena: std.mem.Allocator,
+    map: *std.process.Environ.Map,
+    env: Env,
+) !void {
+    const depth = @min(max_packages_depth, packagesDepth(arena, env) + 1);
+    try map.put(packages_depth_var, try std.fmt.allocPrint(arena, "{d}", .{depth}));
 }

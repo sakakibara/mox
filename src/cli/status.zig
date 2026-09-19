@@ -30,7 +30,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -506,8 +506,8 @@ fn printPackages(
     // without a word here the empty section reads as a clean machine.
     if (pkgs.broken) try ctx.out.writeAll("  ERROR     the package pass was refused; the reason is the mox status: packages: line\n");
     for (rep.broken) |b| {
-        if (b.why.len == 0) {
-            try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, b.code });
+        if (b.code) |code| {
+            try ctx.out.print("  {s:<9} {s} ({s} exited {d})\n", .{ "BROKEN", b.backend, b.probe, code });
         } else {
             try ctx.out.print("  {s:<9} {s} ({s}: {s})\n", .{ "BROKEN", b.backend, b.probe, b.why });
         }
@@ -520,13 +520,26 @@ fn printPackages(
         }
         if (b.drift.clean()) {
             if (!drift_only) try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
-            continue;
+        } else {
+            for (b.drift.missing) |m| {
+                try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, m.row.name });
+            }
+            for (b.drift.untracked) |id| {
+                try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
+            }
         }
-        for (b.drift.missing) |m| {
-            try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, m.row.name });
-        }
-        for (b.drift.untracked) |id| {
-            try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
+        // A row this machine's gate excludes, named with the gate that
+        // excluded it. Not drift, so it keeps the company of the clean rows
+        // and stays out of `--drift` and both machine formats -- but a `when`
+        // that landed on the wrong row is undiagnosable while the row it
+        // swallowed appears nowhere at all.
+        if (drift_only) continue;
+        for (b.gated) |row| {
+            const gate = if (row.when) |w|
+                try std.fmt.allocPrint(ctx.alloc, " (when {s})", .{w})
+            else
+                "";
+            try ctx.out.print("  {s:<9} {s} {s}{s}\n", .{ "GATED", b.backend, row.name, gate });
         }
     }
     return pkgs;
@@ -538,7 +551,11 @@ fn printPackages(
 /// backend compares by (a brew cask carries its `cask:` prefix, so it can
 /// never be confused with the formula of the same name). `name` is what the
 /// manifest row spells, present only for a missing package. A manager that
-/// is there but broken is `{backend, state: "broken", exit}`. A manifest that
+/// is there but broken is `{backend, state: "broken", exit, probe, [why]}`,
+/// `exit` being the exit code or null for a call that never reached one
+/// (killed at its bound, ended for want of a terminal, answered in a shape
+/// that is not an answer); `why` carries the reason in words for exactly
+/// those, so a genuine exit of 255 can never read as one of them. A manifest that
 /// would not load or validate is `{"state":"refused"}`, carrying no `backend`
 /// because nothing was reached: without it the empty array is byte-identical
 /// to a machine whose every package is accounted for, and the reason is on
@@ -593,7 +610,9 @@ fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
         first = false;
         try out.writeAll("{\"backend\":");
         try writeJsonString(out, b.backend);
-        try out.print(",\"state\":\"broken\",\"exit\":{d},\"probe\":", .{b.code});
+        try out.writeAll(",\"state\":\"broken\",\"exit\":");
+        if (b.code) |code| try out.print("{d}", .{code}) else try out.writeAll("null");
+        try out.writeAll(",\"probe\":");
         try writeJsonString(out, b.probe);
         if (b.why.len > 0) {
             try out.writeAll(",\"why\":");
@@ -647,7 +666,12 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
 /// A package record is `package_missing` / `package_untracked` \t backend \t
-/// id, or `package_broken` \t backend \t exit code. A manifest that would not
+/// id, or `package_broken` \t backend \t exit code \t probe \t why -- the exit
+/// code being `-` for a call that never reached one (killed at its bound,
+/// ended for want of a terminal, answered in a shape that is not an answer),
+/// which is the only thing that tells those apart from a genuine exit of 255;
+/// `probe` is what was asked and `why` the reason in words, empty where the
+/// code says it. A manifest that would not
 /// load or validate is the single field `package_refused`, with no backend
 /// because nothing was reached: without it the absence of package records is
 /// byte-identical to a machine whose every package is accounted for, and the
@@ -673,8 +697,12 @@ fn emitPorcelain(
     for (rep.broken) |b| {
         try out.writeAll("package_broken\t");
         try writePorcelainField(out, b.backend);
-        try out.print("\t{d}\t", .{b.code});
-        try writePorcelainField(out, if (b.why.len > 0) b.why else b.probe);
+        try out.writeByte('\t');
+        if (b.code) |code| try out.print("{d}", .{code}) else try out.writeByte('-');
+        try out.writeByte('\t');
+        try writePorcelainField(out, b.probe);
+        try out.writeByte('\t');
+        try writePorcelainField(out, b.why);
         try out.writeByte('\n');
     }
     for (rep.backends) |b| {
@@ -828,7 +856,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row whose when excludes this machine is a GATED row there, named with its gate and counted in nothing; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -963,12 +991,45 @@ test "emitPorcelain / emitJson: a broken manager is a record of its own" {
 
     var pw: std.Io.Writer.Allocating = .init(al);
     try emitPorcelain(&pw.writer, &.{}, .{ .report = rep });
-    try testing.expectEqualStrings("package_broken\tbrew\t1\tbrew --version\n", pw.written());
+    try testing.expectEqualStrings("package_broken\tbrew\t1\tbrew --version\t\n", pw.written());
 
     var jw: std.Io.Writer.Allocating = .init(al);
     try emitJson(&jw.writer, &.{}, .{ .report = rep });
     try testing.expectEqualStrings(
         "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":1,\"probe\":\"brew --version\"}]}\n",
+        jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: a call that never exited is told apart from a genuine exit 255" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Two managers a reader must be able to tell apart: one whose probe
+    // really exited 255, one whose verb was killed before it could exit. The
+    // exit field is the only thing that says which, and the reason rides its
+    // own field rather than standing in for the probe.
+    const broken = [_]mox.packages.report.Broken{
+        .{ .backend = "brew", .probe = "brew --version", .code = 255 },
+        .{ .backend = "macports", .probe = "list", .code = null, .why = "timed out, killed" },
+    };
+    const rep: mox.packages.report.Report = .{ .in_use = true, .broken = &broken };
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, .{ .report = rep });
+    try testing.expectEqualStrings(
+        "package_broken\tbrew\t255\tbrew --version\t\n" ++
+            "package_broken\tmacports\t-\tlist\ttimed out, killed\n",
+        pw.written(),
+    );
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, .{ .report = rep });
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[" ++
+            "{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":255,\"probe\":\"brew --version\"}," ++
+            "{\"backend\":\"macports\",\"state\":\"broken\",\"exit\":null,\"probe\":\"list\",\"why\":\"timed out, killed\"}]}\n",
         jw.written(),
     );
 }

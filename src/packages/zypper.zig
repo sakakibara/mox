@@ -883,7 +883,7 @@ test "install: a failed batch whose read-back cannot run records the batch, and 
     const recorded = try z.ledger.read(a);
     try testing.expectEqual(@as(usize, 2), recorded.len);
     try testing.expectEqualStrings(
-        "mox: zypper: rpm could not say which of the batch landed (ZypperQueryFailed); all 2 are recorded, and every read narrows them to what rpm reports\n",
+        "mox: zypper: rpm could not say which of the batch landed (the manager's own listing exited nonzero, saying why above); all 2 are recorded, and every read narrows them to what rpm reports\n",
         w.written(),
     );
 

@@ -1041,6 +1041,7 @@ test "commit: a declared row its own backend would refuse is not written" {
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = "nano-\n" });
     try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    try entries.append(a, .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"arm64\";\n" });
     try entries.append(a, .{ .argv = apt_installed_call, .stdout = "nano- arm64 install ok installed\n" });
     try entries.append(a, .{ .argv = "brew --version", .code = 127 });
     try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
@@ -1078,6 +1079,7 @@ test "commit: a foreign-architecture package apt reports is recorded, not refuse
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = "libc6:armhf\n" });
     try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    try entries.append(a, .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"arm64\";\n" });
     try entries.append(a, .{ .argv = apt_installed_call, .stdout = "libc6 arm64 install ok installed\nlibc6 armhf install ok installed\n" });
     try entries.append(a, .{ .argv = "brew --version", .code = 127 });
     try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
@@ -1131,7 +1133,7 @@ test "status: one backend failing a verb does not throw away what the others ans
     // brew's own drift survives, and apt says what it could not do.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   brew ripgrep") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "UNTRACKED brew agg") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    apt (list: DistroQueryFailed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    apt (list: the manager's own listing exited nonzero, saying why above)") != null);
     // Not a refusal: the pass reached every backend and reported each one.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "was refused") == null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
@@ -1141,7 +1143,7 @@ test "status: one backend failing a verb does not throw away what the others ans
     try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_missing\tbrew\tripgrep\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_untracked\tbrew\tagg\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_refused") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_broken\tapt\t255\tDistroQueryFailed\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pw.out, "package_broken\tapt\t-\tlist\tthe manager's own listing exited nonzero, saying why above\n") != null);
 }
 
 test "status: a broken manager is BROKEN drift in every format, and no usable manager is said" {
@@ -1176,7 +1178,7 @@ test "status: a broken manager is BROKEN drift in every format, and no usable ma
     // notes on stderr.
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
     try expectPorcelain(p.out);
-    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t1\tbrew --version\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t1\tbrew --version\t\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, p.out, "note") == null);
     try std.testing.expect(std.mem.indexOf(u8, p.err, "mox status: note: no package manager is usable on this machine\n") != null);
     try std.testing.expectEqual(@as(u8, 1), p.rc);
@@ -1264,7 +1266,7 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
         try std.testing.expect(std.mem.indexOf(u8, c, "/bin/bash") == null);
     }
     try std.testing.expect(fetched);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: BootstrapDigestMismatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: the installer that came back is not the one the manifest's sha256 names") != null);
     // The substituted file is not left where a later run could find it.
     const staged = try std.fs.path.join(a, &.{
         h.state,                                                                           "tmp",
@@ -1969,7 +1971,7 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     const r = try h.run(&.{ "mox", "status" });
     const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
 
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: available failed: PluginTimedOut") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "brew: available failed: timed out, killed") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     // Killed at the bound, not waited out.
     try std.testing.expect(elapsed_ms < 60_000);
@@ -2009,7 +2011,7 @@ fn noManagers(a: std.mem.Allocator) !*mox.packages.exec.Fake {
 }
 
 /// Every line of a porcelain report is one record -- a kind token and its
-/// tab-separated fields, four for a file and three for a package or a
+/// tab-separated fields, four for a file, three for a package and five for a
 /// broken manager -- so a note or heading on stdout would break a
 /// consumer's split.
 fn expectPorcelain(out: []const u8) !void {
@@ -2029,12 +2031,13 @@ fn expectPorcelain(out: []const u8) !void {
         } else false;
         try std.testing.expect(known);
         // A refused pass reached no backend and no package, so the kind is the
-        // whole record. A broken manager carries a fourth field saying what it
-        // could not answer, which the exit code alone cannot.
+        // whole record. A broken manager carries what it was asked and why it
+        // could not answer beside the exit code, neither of which the code
+        // alone can say.
         const want: usize = if (std.mem.eql(u8, kind, "package_refused"))
             1
         else if (std.mem.eql(u8, kind, "package_broken"))
-            4
+            5
         else if (std.mem.startsWith(u8, kind, "package_")) 3 else 4;
         try std.testing.expectEqual(want, n);
     }
@@ -2639,7 +2642,7 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
     const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
 
     errdefer std.debug.print("stderr was:\n{s}\n", .{r.err});
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    pipes (list: PluginTimedOut)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    pipes (list: timed out, killed)") != null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(elapsed_ms < 60_000);
 }
@@ -3043,6 +3046,7 @@ fn aptWith(
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 3.0.3 (arm64)\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .stdout = manual });
     try entries.append(a, .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" });
+    try entries.append(a, .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"arm64\";\n" });
     // dpkg has every package apt-mark reports configured, under the
     // architecture the name carries or the native one.
     var dpkg: std.Io.Writer.Allocating = .init(a);
@@ -3148,6 +3152,7 @@ test "apply: a foreign-architecture row apt's listing omits still installs" {
     const fake = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"arm64\";\n" },
         .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{
             .argv = "apt-cache madison wine32:armhf",
@@ -3450,6 +3455,7 @@ test "commit then apply: a row commit records is a row apply installs, architect
     const fake2 = try aptWith(a, "", &.{
         .{ .argv = "env DEBIAN_FRONTEND=noninteractive apt-get update", .match = .suffix },
         .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = "apt-config dump APT::Architecture", .stdout = "APT::Architecture \"arm64\";\n" },
         .{ .argv = "dpkg --print-foreign-architectures", .stdout = "armhf\n" },
         .{
             .argv = "apt-cache madison wine32:armhf",
@@ -3464,4 +3470,363 @@ test "commit then apply: a row commit records is a row apply installs, architect
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "plugin: every command puts the recursion marker in what a plugin receives" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+
+    // The marker is what stops a plugin that calls `mox` from having that mox
+    // discover and run the same plugins again, so it has to be there whatever
+    // command reached the plugin -- a guard only some commands set is one no
+    // plugin can rely on.
+    const log = try std.fs.path.join(a, &.{ h.root, "depth-seen.txt" });
+    try writePlugin(io, h, a, "logger", try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\echo "${{1:-none}} ${{MOX_PACKAGES_DEPTH:-unset}}" >> "{s}"
+        \\case "${{1:-}}" in
+        \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+        \\list) exit 0 ;;
+        \\install) exit 0 ;;
+        \\esac
+        \\exit 0
+        \\
+    , .{log}));
+    try writeManifest(io, h, a, "p.toml", "backend = \"logger\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    _ = try h.run(&.{ "mox", "status" });
+    _ = try h.run(&.{ "mox", "apply", "--dry-run" });
+    _ = try h.run(&.{ "mox", "apply" });
+    _ = try h.runWithInput(&.{ "mox", "commit" }, "");
+
+    const seen = try Io.Dir.cwd().readFileAlloc(io, log, a, .limited(1 << 20));
+    errdefer std.debug.print("plugin saw:\n{s}\n", .{seen});
+    // Every verb of every command, the install included.
+    try std.testing.expect(std.mem.indexOf(u8, seen, "unset") == null);
+    for ([_][]const u8{ "available 1", "id 1", "list 1", "install 1" }) |want| {
+        try std.testing.expect(std.mem.indexOf(u8, seen, want) != null);
+    }
+}
+
+test "bootstrap: an installer that exits 0 without installing its manager is a failed run" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/sh\nexit 0\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writePlugin(io, h, a, "fakeports", "#!/bin/sh\nexit 0\n");
+    try writeManifest(io, h, a, "ports.toml", try std.fmt.allocPrint(a,
+        \\backend = "fakeports"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{hex}));
+
+    const plugin = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends", "fakeports" });
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    // The manager is absent before the installer and absent after it: the
+    // installer exits 0 and leaves nothing behind, which is what an installer
+    // whose download silently no-ops does.
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} available", .{plugin}), .code = 1 });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} id", .{plugin}), .stdout = "ripgrep\n" });
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    // The installer runs and leaves a directory behind, as a half-finished
+    // one does: it changed the machine without landing the manager.
+    const made = try std.fs.path.join(a, &.{ h.repo, ".fakeports-home" });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} bootstrap ", .{plugin}), .match = .prefix, .makes_dir = made, .io = io });
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    // A fact bound by that directory, and a post script that records what it
+    // was handed: only a machine re-read after the installer ran can put the
+    // fresh value there.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ h.repo, "data", "facts.toml" }),
+        .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"fakeportshome\"\ncandidates = [\"{s}\"]\n", .{made}),
+    });
+    const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
+    try Io.Dir.cwd().createDirPath(io, post_dir);
+    const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = post, .data = try std.fmt.allocPrint(
+        a,
+        "#!/bin/sh\nprintf '%s\\n' \"${{MOX_FACT_FAKEPORTSHOME:-unset}}\" > \"{s}\"\n",
+        .{seen},
+    ) });
+    try Io.Dir.cwd().setFilePermissions(io, post, Io.File.Permissions.fromMode(0o755), .{});
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.err,
+        "mox apply: fakeports: its installer exited 0 but the manager is still absent; run the installer by hand to see why nothing landed\n",
+    ) != null);
+    // The installer ran, so the machine was re-read whether or not it left
+    // the manager behind.
+    const recaptured = try Io.Dir.cwd().readFileAlloc(io, seen, a, .limited(1 << 20));
+    try std.testing.expectEqualStrings(made, std.mem.trimEnd(u8, recaptured, "\n"));
+    // Not a success, and no row handed to a manager that just answered absent:
+    // the scripted runner has no `install` entry, so one would fail the run
+    // with a different message than this.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "installing       fakeports") == null);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    for (fake.calls.items) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, "fakeports install") == null);
+    }
+}
+
+test "plugin: a captured verb ends when the plugin does, whatever it left running" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    // Generous, so that waiting the bound out is unmistakable next to a run
+    // that ends when the plugin does.
+    const bound_ms = 20_000;
+    const h = try setup(a, io, &tmp, .{
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "20000" } },
+    });
+
+    // The plugin answers and exits at once; what it backgrounded inherits the
+    // pipe mox reads and holds it for ten minutes. The answer is the
+    // plugin's, and the run must not be held for what it left behind.
+    try writePlugin(io, h, a, "backgrounder",
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do [ -n "$l" ] || continue; printf '%s\n' "$l" | sed -n 's/.*name = "\([^"]*\)".*/\1/p'; done ;;
+        \\list) ( sleep 600 ) & echo ripgrep ;;
+        \\esac
+        \\exit 0
+        \\
+    );
+    try writeManifest(io, h, a, "p.toml", "backend = \"backgrounder\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    const started = Io.Timestamp.now(io, .awake);
+    const r = try h.run(&.{ "mox", "status" });
+    const elapsed_ms = started.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+
+    // What the plugin itself wrote before exiting is the answer, and the
+    // backend is neither broken nor timed out.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     backgrounder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "timed out") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Ended with the plugin, not at the bound the plugin never reached.
+    try std.testing.expect(elapsed_ms < bound_ms);
+}
+
+test "status: a package row this machine's gate excludes is named, not silently absent" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A `when` that lands under the wrong table header attaches to one row and
+    // excludes it everywhere else. With nothing printed for it, that reads
+    // exactly like a manifest that never carried the row at all.
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "steam"
+        \\when = "os=linux"
+        \\
+    );
+
+    const fake = try brewWith(a, "ripgrep\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\n", .{r.out});
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "GATED     brew steam (when os=linux)\n") != null);
+    // Not drift: the backend is clean and the run says so.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew\n") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // A gated row is not in the drift set, exactly as a gated file is not.
+    const d = try h.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "GATED") == null);
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try std.testing.expectEqualStrings("", p.out);
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    try std.testing.expectEqualStrings("{\"files\":[],\"packages\":[]}\n", j.out);
+}
+
+test "status: a control byte in a manifest filename cannot break the diagnostic framing" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The label is interpolated into every message about the file, and each
+    // is one line: a newline in the name would split them, and a wrapper
+    // keeping only the first line would lose the reason.
+    try writeManifest(io, h, a, "dar\nwin.toml", "backend = \"brew\"\n[[packages]\nname = \"x\"\n");
+
+    const fake = try noManagers(a);
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stderr was:\n{s}\n", .{r.err});
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.err,
+        "mox status: packages: data/packages/dar\\x0awin.toml: TOML parse failed:",
+    ) != null);
+    // One line, with the reason on it: nothing about this file wrapped.
+    var lines = std.mem.splitScalar(u8, r.err, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "data/packages/dar") == null) continue;
+        try std.testing.expect(std.mem.indexOf(u8, line, "TOML parse failed") != null);
+    }
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "plugin: a manifest for a manager not installed yet is checked through id, then bootstrapped" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/sh\nexit 0\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writePlugin(io, h, a, "fakeports", "#!/bin/sh\nexit 0\n");
+    try writeManifest(io, h, a, "ports.toml", try std.fmt.allocPrint(a,
+        \\backend = "fakeports"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{hex}));
+
+    const plugin = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends", "fakeports" });
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    // `id` answers with the manager absent, which is what the protocol
+    // requires of it: the manifest is checked ungated and before any probe,
+    // so a plugin whose `id` needed its manager would refuse the very
+    // manifest whose `[[bootstrap]]` row exists to install it.
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} id", .{plugin}), .stdout = "ripgrep\n" });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} available", .{plugin}), .code = 1, .once = true });
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} bootstrap ", .{plugin}), .match = .prefix });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} available", .{plugin}) });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} list", .{plugin}), .stdout = "" });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} install", .{plugin}) });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} limitation", .{plugin}), .code = 64 });
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping   fakeports") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // The row was named through `id` before the installer ran at all.
+    const asked_id = for (fake.calls.items, 0..) |c, i| {
+        if (std.mem.endsWith(u8, c, "fakeports id")) break i;
+    } else fake.calls.items.len;
+    const ran_installer = for (fake.calls.items, 0..) |c, i| {
+        if (std.mem.indexOf(u8, c, "fakeports bootstrap ") != null) break i;
+    } else fake.calls.items.len;
+    try std.testing.expect(asked_id < ran_installer);
+}
+
+test "apply: a manager whose verb failed says why, not that it exited" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    // brew answers its probe and then fails the listing: the call never
+    // reached an exit of its own, so there is no code to print and the reason
+    // is the only thing that says what happened.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 3 });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stderr was:\n{s}\n", .{r.err});
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.err,
+        "mox apply: brew: list: the manager's own listing exited nonzero, saying why above; its packages were left alone\n",
+    ) != null);
+    // Never an exit code it never had.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "exited 255") == null);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+
+    // status says the same thing of the same machine.
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        s.out,
+        "BROKEN    brew (list: the manager's own listing exited nonzero, saying why above)\n",
+    ) != null);
 }

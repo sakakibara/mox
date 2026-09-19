@@ -76,7 +76,9 @@
 # lock in that copy; one covers a flat apt repository, whose single index
 # puts foreign-only names in the native listing bare and a package for an
 # architecture dpkg has not enabled in the batch; one covers an apt.conf
-# that lists virtual names as packages; one covers a package dpkg left
+# that lists virtual names as packages; one covers an apt.conf that puts apt
+# on another architecture than dpkg's, where every query still answers and
+# none of them shows the difference; one covers a package dpkg left
 # unpacked, which apt-mark lists as manual and only an install can finish;
 # and one covers a dnf.conf `assumeno=True`, which outranks `-y`. The
 # hermetic suite proves what the adapter does; only the real manager proves
@@ -857,6 +859,143 @@ EOF
     ok "$backend ($image): the run says the machine has no repositories, not that the row names none"
   else
     no "$backend ($image): the guard did not fire" "$(grep -E '^mox|Packages:' "$out" | tail -3)"
+  fi
+}
+
+# apt's resolution architecture is a setting of its own, and dpkg's is what
+# both halves of mox's apt oracle key on. Under `APT::Architecture "<foreign>";`
+# every query still answers and none of them shows the difference: `dpkg
+# --print-architecture` keeps saying the native one, `apt-cache policy sl`
+# heads the stanza BARE over a version table holding the foreign package
+# alone, `apt-cache madison sl` reports the foreign line alone, and the native
+# listing still carries the name. So the row passes every refusal and the
+# install fails on dependencies, taking the whole batch with it on every apply
+# after. The same setting makes `apt-mark showmanual` answer about apt's
+# architecture rather than dpkg's, and every name it then prints is installed
+# and configured, so `status` would report each of them untracked.
+run_apt_arch_desync_case() {
+  image="$1"
+  foreign="$2"
+  backend="apt arch-desync"
+
+  case_dir="$work/apt-arch-desync"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
+backend = "apt"
+
+[[packages]]
+name = "sl"
+
+[[packages]]
+name = "hello"
+EOF
+  cat >"$case_dir/case.sh" <<CASE
+set -e
+export DEBIAN_FRONTEND=noninteractive MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+foreign=$foreign
+CASE
+  cat >>"$case_dir/case.sh" <<'CASE'
+apt-get --version | head -1
+native="$(dpkg --print-architecture)"
+dpkg --add-architecture "$foreign"
+apt-get update >/dev/null
+echo "manual-agreeing=$(apt-mark showmanual | grep -c . || true)"
+
+printf 'APT::Architecture "%s";\n' "$foreign" > /etc/apt/apt.conf.d/99mox-arch
+echo "--- premise ---"
+echo "dpkg=$native"
+apt-config dump APT::Architecture
+echo "policy-header=$(apt-cache policy sl | head -1)"
+echo "madison=$(apt-cache madison sl | head -1)"
+echo "listed=$(apt-cache -o "APT::Architectures=$native" -o Dir::State::status=/dev/null -o APT::Cache::AllNames=false --generate pkgnames | grep -cx sl || true)"
+echo "manual-desync=$(apt-mark showmanual | grep -c . || true)"
+echo "--- status ---"
+/w/mox status || true
+echo "--- apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+echo "installed=$(dpkg-query -W -f '${Status}' sl 2>/dev/null | grep -c 'ok installed' || true)"
+
+echo "--- agreeing ---"
+printf 'APT::Architecture "%s";\n' "$native" > /etc/apt/apt.conf.d/99mox-arch
+rc=0
+/w/mox apply || rc=$?
+echo "agree-exit=$rc"
+echo "agree-installed=$(dpkg-query -W -f '${Status}' sl 2>/dev/null | grep -c 'ok installed' || true)"
+echo "--- after ---"
+/w/mox status || true
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  premise="$(sed -n '/--- premise ---/,/--- status ---/p' "$out")"
+  if echo "$premise" | grep -q "^dpkg=" && echo "$premise" | grep -qx "APT::Architecture \"$foreign\";"; then
+    ok "$backend ($image): apt resolves against $foreign while dpkg still reports its own"
+  else
+    no "$backend ($image): the premise does not hold; apt and dpkg agree here" "$premise"
+  fi
+
+  if echo "$premise" | grep -qx "policy-header=sl:" && echo "$premise" | grep -q "^madison=.* $foreign Packages$"; then
+    ok "$backend ($image): policy heads the stanza bare and madison names the foreign package, so no parse can see it"
+  else
+    no "$backend ($image): policy or madison showed the difference, so this case proves nothing" "$premise"
+  fi
+
+  if echo "$premise" | grep -qx "listed=1"; then
+    ok "$backend ($image): the native listing still carries the name, so the row passes every refusal"
+  else
+    no "$backend ($image): the listing does not carry the name" "$premise"
+  fi
+
+  if [ "$(sed -n 's/^manual-agreeing=//p' "$out")" != "$(sed -n 's/^manual-desync=//p' "$out")" ]; then
+    ok "$backend ($image): apt-mark answers about apt's architecture, so the explicit set is another machine's"
+  else
+    no "$backend ($image): apt-mark reported the same set either way" \
+      "$(grep -E '^manual-' "$out")"
+  fi
+
+  if grep -q 'mox: apt: apt'"'"'s own APT::Architecture is "'"$foreign"'" while dpkg'"'"'s architecture is' "$out" &&
+    grep -q 'unset APT::Architecture so apt agrees with `dpkg --print-architecture`' "$out"; then
+    ok "$backend ($image): the pass is refused, naming the setting and both architectures"
+  else
+    no "$backend ($image): the machine-level refusal did not fire" "$(grep -E '^mox: apt|Packages:' "$out" | tail -3)"
+  fi
+
+  if grep -q "^apply-exit=0$" "$out" || grep -q "^installed=1" "$out"; then
+    no "$backend ($image): the apply went ahead under the disagreement" \
+      "$(grep -E '^apply-exit=|^installed=' "$out")"
+  else
+    ok "$backend ($image): nothing was installed and the run exits non-zero"
+  fi
+
+  status="$(sed -n '/--- status ---/,/--- apply ---/p' "$out")"
+  if echo "$status" | grep -q "BROKEN *apt" && ! echo "$status" | grep -q "UNTRACKED *apt"; then
+    ok "$backend ($image): status calls apt broken rather than reporting another machine's packages untracked"
+  else
+    no "$backend ($image): status did not refuse the apt pass" "$status"
+  fi
+
+  if grep -q "^agree-exit=0$" "$out" && grep -q "^agree-installed=1" "$out"; then
+    ok "$backend ($image): the setting agreeing with dpkg refuses nothing and installs as usual"
+  else
+    no "$backend ($image): a setting that agrees with dpkg was refused" \
+      "$(grep -E '^agree-exit=|^agree-installed=' "$out")"
+  fi
+
+  after="$(sed -n '/--- after ---/,$p' "$out")"
+  if echo "$after" | grep -qE "(MISSING|UNTRACKED|BROKEN) +apt"; then
+    no "$backend ($image): drift over apt survived the agreeing apply" "$after"
+  else
+    ok "$backend ($image): the drift is clean once apt and dpkg agree"
   fi
 }
 
@@ -3969,6 +4108,8 @@ else
   run_apt_hold_pin_case debian:stable
   run_apt_pin_locale_case debian:stable
   run_apt_no_repositories_case debian:stable
+  run_apt_arch_desync_case debian:12 "$foreign_arch"
+  run_apt_arch_desync_case debian:stable "$foreign_arch"
   run_dependency_case debian:stable apt
   run_apt_held_dependency_case debian:stable
   # The flat-index refusal differs by apt version -- 2.6.1 prints no policy
