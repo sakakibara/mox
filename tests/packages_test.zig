@@ -1427,11 +1427,16 @@ const fakeports_sh =
     \\
 ;
 
+/// Where `writePlugin` puts `name`.
+fn pluginPath(h: Harness, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+    return std.fs.path.join(a, &.{ h.repo, "scripts", "backends", name });
+}
+
 /// An executable `scripts/backends/<name>` holding `body`.
 fn writePlugin(io: Io, h: Harness, a: std.mem.Allocator, name: []const u8, body: []const u8) !void {
     const dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends" });
     try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try std.fs.path.join(a, &.{ dir, name });
+    const path = try pluginPath(h, a, name);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
     try Io.Dir.cwd().setFilePermissions(io, path, Io.File.Permissions.fromMode(0o755), .{});
 }
@@ -2108,9 +2113,8 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
     defer herm.deinit();
     const io = herm.io;
     const h = try setup(a, io, &tmp, .{
-        // Generous next to the sleep below: the bound must outlast a cold
-        // machine's first spawn of the plugin (`id` runs before the probe),
-        // and still end the hang long before it would finish on its own.
+        // Generous next to the sleep below, and still far short of what the
+        // hang would take on its own.
         .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "1000" } },
     });
 
@@ -2128,6 +2132,13 @@ test "plugin: one that hangs on available is killed at the bound, and the timeou
         \\exit 0
         \\
     );
+    // The first run of a script at a path nothing has run before costs many
+    // times every run after it. `id` is asked before the probe is and answers
+    // to the same bound, so that cost is paid here rather than by `id`, which
+    // killed at the bound would end the run before the probe was ever asked.
+    var warm: mox.packages.exec.Process = .{ .io = io };
+    _ = try warm.runner().run(a, &.{ try pluginPath(h, a, "brew"), "list" });
+
     // A row names the backend, so a probe that cannot answer is the run's
     // error: the rows it governs can be neither judged nor installed.
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
@@ -2785,9 +2796,8 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
     });
 
     // `sleep` keeps the pipe's write end after `sh` would have exited; a
-    // kill that reached only `sh` would leave the read blocked for 12s. The
-    // bound leaves room for every stub probed before this plugin: the first
-    // run of a freshly written script is slow on a loaded host.
+    // kill that reached only `sh` would leave the read blocked for the whole
+    // 300s.
     try writePlugin(io, h, a, "pipes",
         \\#!/bin/sh
         \\case "${1:-}" in
@@ -2798,6 +2808,14 @@ test "plugin: a helper left holding the pipe dies with the plugin at the bound" 
         \\exit 0
         \\
     );
+    // The first run of a script at a path nothing has run before costs many
+    // times every run after it. `available` and `id` are asked before `list`
+    // is and answer to the same bound, so that cost is paid here rather than
+    // by one of them: either killed at the bound would end the run with
+    // nothing to say about `list` at all.
+    var warm: mox.packages.exec.Process = .{ .io = io };
+    _ = try warm.runner().run(a, &.{ try pluginPath(h, a, "pipes"), "available" });
+
     // A row names it, so what it cannot do is this repo's business: a backend
     // nothing asks anything of is a note instead.
     try writeManifest(io, h, a, "p.toml", "backend = \"pipes\"\n\n[[packages]]\nname = \"anything\"\n");
