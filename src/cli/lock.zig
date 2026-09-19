@@ -1,14 +1,19 @@
 //! Single-writer lock for mutating commands.
 //!
-//! A mutating command (apply, commit, rollback, facts set, sync) creates `state/mox.lock`
-//! exclusively before touching anything and removes it on exit. The lock
-//! records `<pid> <start> <command>`, where `<start>` is the holder's process
-//! start time, so a second process can report who holds it and can tell
-//! whether the pid still names the same process instance. A lock left by a
-//! process that no longer exists (crash, kill -9), that belongs to another
-//! user, or whose pid the system has since handed to something else -- which
-//! a reboot is one way of doing -- is taken over automatically; a lock held
-//! by the live process that wrote it is refused.
+//! A mutating command -- add, apply, commit, mv, publish, remove, rollback,
+//! uninstall, update, facts set, facts ask, a bare facts that reaches the
+//! interview, and doctor under a rebuild flag -- creates `mox.lock` in the
+//! state directory exclusively before touching anything and removes it on
+//! exit. The lock is per state directory, so it serializes runs that share
+//! one and nothing else: two runs given different `MOX_STATE_DIR` values can
+//! write the same live tree at once. The lock records `<pid> <start>
+//! <command>`, where `<start>` is the holder's process start time, so a
+//! second process can report who holds it and can tell whether the pid still
+//! names the same process instance. A lock left by a process that no longer
+//! exists (crash, kill -9), that belongs to another user, or whose pid the
+//! system has since handed to something else -- which a reboot is one way of
+//! doing -- is taken over automatically; a lock held by the live process that
+//! wrote it is refused.
 
 const std = @import("std");
 const builtin = @import("builtin");

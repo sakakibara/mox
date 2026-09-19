@@ -486,11 +486,6 @@ fn applyPass(
         if (composed) |bytes| {
             if (file.is_symlink) {
                 const target = std.mem.trim(u8, bytes, " \t\r\n");
-                if (dry_run) {
-                    counts.ok += 1;
-                    try ctx.out.print("  would symlink {s} -> {s}\n", .{ shown, target });
-                    continue;
-                }
 
                 // Inspect the live path WITHOUT following the link, so an
                 // existing regular file / dir / different symlink is protected
@@ -501,13 +496,18 @@ fn applyPass(
 
                 if (disposition == .unchanged) {
                     counts.unchanged += 1;
-                    try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
+                    if (!dry_run) try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
                     try ctx.out.print("  unchanged {s} -> {s}\n", .{ shown, target });
                     continue;
                 }
                 if (disposition == .drift and !force) {
                     counts.drift += 1;
                     if (mox.apply.drift.symlink(file.live_path, site, recorded_target, target)) |u| try units.append(ctx.alloc, u);
+                    continue;
+                }
+                if (dry_run) {
+                    counts.ok += 1;
+                    try ctx.out.print("  would symlink {s} -> {s}\n", .{ shown, target });
                     continue;
                 }
                 if (site == .directory) {
@@ -816,7 +816,7 @@ fn applyPass(
         color,
     ) };
     try drift_report.render(ctx.alloc, ctx.out, units.items, .{
-        .written = counts.ok,
+        .written = if (dry_run) null else counts.ok,
         .unrowed = unrowed_drift,
         .home = m_state.home,
         .sty = sty,
@@ -2369,7 +2369,7 @@ pub const command = app.command(Spec, .{
     .name = "apply",
     .usage = "mox apply [--flags] [<paths...>]",
     .summary = "Compose all managed files and write to live paths",
-    .details = "Never prompts. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
+    .details = "Never prompts about drift. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
     .group = .general,
     .needs_context = true,
 }, run);

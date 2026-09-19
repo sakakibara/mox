@@ -242,14 +242,6 @@ pub fn driftedPath(
     return null;
 }
 
-/// The phrase a DRIFT message names the changed content with: the spelled
-/// owned path, or the whole owned scope for a secret record's per-file
-/// comparison.
-pub fn driftWhat(arena: std.mem.Allocator, drift: ?[]const u8) error{OutOfMemory}![]const u8 {
-    const p = drift orelse return "owned content";
-    return std.fmt.allocPrint(arena, "owned path {s}", .{p});
-}
-
 /// Segment-set equality of two path lists, order-independent (own lists
 /// never hold duplicates: overlapping declarations are refused).
 pub fn samePathSet(a: []const OwnPath, b: []const OwnPath) bool {

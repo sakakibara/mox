@@ -29,8 +29,8 @@ pub const Context = struct {
     cwd: ?[]const u8,
 };
 
-/// mox's help is currently flat (no sections); a single group is the safe
-/// default until help-format fidelity is ported in a later task.
+/// mox's help is one flat list of commands, so every command names the same
+/// group and no section headings are printed.
 pub const Group = enum { general };
 
 /// The environment `loadContext` hands every command, when it should not be
@@ -333,7 +333,6 @@ pub const Ctx = MoxCli.Ctx;
 pub const Command = MoxCli.Command;
 pub const run = MoxCli.run;
 pub const command = MoxCli.command;
-pub const About = MoxCli.About;
 
 /// Writes `fmt` (caller supplies its own "mox <cmd>: " / "usage: " prefix)
 /// to `ctx.err` and returns exit code 2. Used by a subcommand-group's own

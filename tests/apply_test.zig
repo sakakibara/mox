@@ -1161,7 +1161,7 @@ fn writeConditionalCorpus(io: Io, tmp: *std.testing.TmpDir) !void {
     });
 }
 
-test "apply interview: a personal/icloud answer path never asks gdrive_account or the onepassword pair" {
+test "apply interview: a personal profile with holt_backend declined never asks gdrive_account or the onepassword pair" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3718,7 +3718,7 @@ test "apply drift: an unscoped --overwrite resolves every drifted file, exit 0" 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "status" })).rc);
 }
 
-test "apply drift: non-interactive skip-and-report, --dry-run, and --overwrite (--overwrite's retained alias)" {
+test "apply drift: non-interactive skip-and-report, --dry-run, and --overwrite" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3744,11 +3744,113 @@ test "apply drift: non-interactive skip-and-report, --dry-run, and --overwrite (
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try c.homePath("b.conf")));
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "Dry run:") != null);
 
-    // --overwrite (the retained alias of --overwrite) still overwrites everything
-    // with no prompt.
+    // --overwrite overwrites everything with no prompt.
     const forced = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), forced.rc);
     try std.testing.expectEqualStrings("full = source\n", try read(io, a, try c.homePath("b.conf")));
+}
+
+test "apply drift: the report says \"Applied\" for a real run and says nothing of the sort for a dry run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("b.conf"), .data = "mine\n" });
+    // One new source beside the drift, so both runs have exactly one file to
+    // write and the report has drift to render its success line above.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/c.conf", .data = "fresh = source\n" });
+
+    const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "1 drifted, left untouched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "Applied ") == null);
+    try std.testing.expectError(error.FileNotFound, read(io, a, try c.homePath("c.conf")));
+
+    const real = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), real.rc);
+    try std.testing.expect(std.mem.indexOf(u8, real.out, "Applied 1 file. 1 drifted, left untouched") != null);
+    try std.testing.expectEqualStrings("fresh = source\n", try read(io, a, try c.homePath("c.conf")));
+}
+
+test "apply symlink: a dry run calls an existing correct link unchanged, not a write" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/mylink", .data = "/tmp/mox-symlink-target\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data =
+        \\["mylink"]
+        \\symlink = true
+        \\
+        ,
+    });
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("mylink");
+
+    // Nothing there yet: the plan is a write.
+    const first = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), first.rc);
+    try std.testing.expect(std.mem.indexOf(u8, first.out, "would symlink") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.out, "Dry run: 1 would be written, 0 would be removed, 0 unchanged") != null);
+    try std.testing.expect(!isSymlink(io, live));
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try expectLinkTarget(io, a, live, "/tmp/mox-symlink-target");
+
+    // The link now points exactly where the plan proposes, so the plan must
+    // agree with `status` and call it unchanged rather than counting a write.
+    const second = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), second.rc);
+    try std.testing.expect(std.mem.indexOf(u8, second.out, "would symlink") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second.out, "unchanged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.out, "Dry run: 0 would be written, 0 would be removed, 1 unchanged") != null);
+}
+
+test "apply symlink: a dry run reports a foreign link as drift instead of proposing a write" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/mylink", .data = "/tmp/mox-symlink-target\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/.mox/attributes.toml",
+        .data =
+        \\["mylink"]
+        \\symlink = true
+        \\
+        ,
+    });
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("mylink");
+    try Io.Dir.cwd().symLink(io, "/tmp/somewhere-else", live, .{});
+
+    const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would symlink") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "Dry run: 0 would be written, 0 would be removed, 0 unchanged, 0 skipped, 1 drifted") != null);
+    try expectLinkTarget(io, a, live, "/tmp/somewhere-else");
 }
 
 // Partial ownership: a file with an `own` declaration is patched per
@@ -6132,4 +6234,70 @@ test "run_scripts: gate directories are run or reported in their sorted order" {
     const mmm = std.mem.indexOf(u8, out, "gate=mmm") orelse return error.TestExpectedMmm;
     const zzz = std.mem.indexOf(u8, out, "gate=zzz") orelse return error.TestExpectedZzz;
     try std.testing.expect(aaa < mmm and mmm < zzz);
+}
+
+// The status summary line: what the table above it adds up to, and the fact
+// the exit code is decided by.
+
+test "status: the summary line names every label the table printed, and leads with the exit code's own count" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/keep.conf", .data = "keep\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/edited.conf", .data = "mine\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/moved.conf", .data = "old\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/gated.conf", .data = "# mox: when os=darwin\nnever here\n" });
+    const c = try testutil.setup(a, io, &tmp, .{ .os = "linux" });
+
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // Nothing outstanding: the line still accounts for every printed row.
+    const clean = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), clean.rc);
+    try std.testing.expect(std.mem.indexOf(u8, clean.out, "  Nothing to do. 3 clean, 1 gated.\n") != null);
+
+    // One of each actionable label, in table order.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("edited.conf"), .data = "hand edit\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/moved.conf", .data = "new\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/fresh.conf", .data = "fresh\n" });
+
+    const r = try c.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\n", .{r.out});
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  3 need attention: 1 OUTDATED, 1 DRIFT, 1 MISSING. 1 clean, 1 gated.\n") != null);
+
+    // Under --drift the clean and gated rows were never printed, so the line
+    // does not claim them.
+    const d = try c.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expectEqual(@as(u8, 1), d.rc);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "  3 need attention: 1 OUTDATED, 1 DRIFT, 1 MISSING.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "clean") == null);
+
+    // Neither machine format carries it: both are parsed, not read.
+    const j = try c.run(&.{ "mox", "status", "--json" });
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "need attention") == null);
+    const p = try c.run(&.{ "mox", "status", "--porcelain" });
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "need attention") == null);
+}
+
+test "status: a clean --drift run says nothing at all, summary included" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeDriftPair(io, &tmp);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    const d = try c.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expectEqualStrings("", d.out);
 }

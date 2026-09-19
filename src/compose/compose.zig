@@ -14,7 +14,6 @@ const ManagedFile = source.tree.ManagedFile;
 const Segment = prov_mod.map.Segment;
 
 const peek_limit: usize = 4096;
-const peek_max_read: usize = 1024 * 1024;
 
 /// Top-level compose: dispatch by category. Returns null if the file
 /// should not be materialized (e.g. whole-file when_gate evaluated false

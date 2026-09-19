@@ -265,7 +265,7 @@ test "enumerate: force_other adds one unnamed-value representative per axis" {
     try std.testing.expect(saw_other);
 }
 
-test "enumerate: never pairs this machine's hostname with a sibling configuration" {
+test "enumerate: never pairs this machine's machine name with a sibling configuration" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -286,7 +286,7 @@ test "enumerate: never pairs this machine's hostname with a sibling configuratio
     }
 }
 
-test "enumerate: never pairs this machine's hostname axis with a sibling configuration" {
+test "enumerate: never pairs this machine's hostname with a sibling configuration" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

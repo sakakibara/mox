@@ -2590,7 +2590,7 @@ test "validate: a key meant for another manager is refused" {
     try testing.expect(std.mem.indexOf(u8, diag.capture().?, "apt accepts no key \"kind\"") != null);
 }
 
-test "available: absent means not usable, any other failure propagates" {
+test "available: absent, present, and a manager that answers nonzero is broken; only a spawn failure propagates" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

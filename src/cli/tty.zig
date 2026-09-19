@@ -67,10 +67,11 @@ pub fn terminalWidth(fallback: usize) usize {
     return if (ws.col > 0) ws.col else fallback;
 }
 
-test "isInteractive is callable for a standard fd" {
-    // A test runner's stdin is typically not a console; assert the call
-    // returns without panicking rather than a specific value.
-    _ = isInteractive(0);
+test "isInteractive: an fd that names no stream is never interactive" {
+    // The runner's own streams answer differently depending on how the suite
+    // was started, so the only fd with one answer everywhere is a descriptor
+    // that cannot exist: no POSIX fd, and no Windows standard handle.
+    try std.testing.expect(!isInteractive(-1));
 }
 
 test "terminalWidth: falls back when stdout is not a console (the test runner's pipe)" {

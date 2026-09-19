@@ -3,8 +3,9 @@
 //! `commit` reconciles what it reports untracked. Building it once keeps
 //! those three from drifting apart in what they consider desired.
 //!
-//! A repo with no `data/packages/` is not using the subsystem, and `gather`
-//! says so rather than reporting every installed package as untracked.
+//! A repo with no `data/packages/` is not using the subsystem, and
+//! `fromManifest` says so rather than reporting every installed package as
+//! untracked.
 
 const std = @import("std");
 
@@ -15,8 +16,6 @@ const desired_mod = @import("desired.zig");
 const drift_mod = @import("drift.zig");
 const manifest_mod = @import("manifest.zig");
 const validate_mod = @import("validate.zig");
-
-const Io = std.Io;
 
 pub const Backend = backend_mod.Backend;
 pub const Registry = backend_mod.Registry;
@@ -84,23 +83,13 @@ pub const Report = struct {
         for (self.backends) |b| n += b.drift.untracked.len;
         return n;
     }
-};
 
-/// Load the manifest, check it, and compute drift for every backend usable
-/// here. A backend the machine cannot use contributes nothing: its rows are
-/// inert and it is never queried.
-pub fn gather(
-    arena: std.mem.Allocator,
-    io: Io,
-    registry: Registry,
-    repo_dir: []const u8,
-    private_dir: []const u8,
-    r: *const Resolver,
-    diag: ?*Diag,
-) !Report {
-    const m = try manifest_mod.load(arena, io, repo_dir, private_dir, diag);
-    return fromManifest(arena, m, registry, r, &.{}, diag);
-}
+    pub fn gatedCount(self: Report) usize {
+        var n: usize = 0;
+        for (self.backends) |b| n += b.gated.len;
+        return n;
+    }
+};
 
 /// Record that a backend could not answer, and say so. One backend failing a
 /// verb is that backend's problem: the others were asked and answered, and

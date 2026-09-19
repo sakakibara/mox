@@ -23,9 +23,6 @@ pub const PathError = error{
     OutOfMemory,
 };
 
-/// The separator inside a key. Never the platform's.
-pub const key_sep = env_path.rel_sep;
-
 /// Join `parts` into a key. Always `/`-separated.
 pub const joinKey = env_path.joinSegments;
 

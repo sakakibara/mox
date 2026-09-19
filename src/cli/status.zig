@@ -9,20 +9,133 @@ const style = @import("style.zig");
 const drift_report = @import("drift_report.zig");
 const display = @import("display.zig");
 
-/// One status cell: the label to print and whether it counts against the
-/// exit code (the scripting contract: rc 1 when any file or package needs
-/// attention).
-const Cell = struct { label: []const u8, problem: bool };
+/// Every label a file row can carry, in the order the summary names them.
+/// One enum serves the row, the tally beside it and the exit code, so a
+/// summary that disagreed with the rows it counted would have to name a label
+/// that cannot be spelled.
+const Label = enum {
+    clean,
+    outdated,
+    drift,
+    missing,
+    stale,
+    err,
+    gated,
+
+    fn text(self: Label) []const u8 {
+        return switch (self) {
+            .clean => "clean",
+            .outdated => "OUTDATED",
+            .drift => "DRIFT",
+            .missing => "MISSING",
+            .stale => "STALE",
+            .err => "ERROR",
+            .gated => "GATED",
+        };
+    }
+
+    /// Whether this label counts against the exit code (the scripting
+    /// contract: rc 1 when any file or package needs attention).
+    fn problem(self: Label) bool {
+        return switch (self) {
+            .clean, .gated => false,
+            .outdated, .drift, .missing, .stale, .err => true,
+        };
+    }
+};
+
+/// The file table's labels, counted. The summary line's only input AND the
+/// file half of the exit code, so the leading count and `$?` are one fact.
+const Tally = struct {
+    n: std.EnumArray(Label, usize) = .initFill(0),
+
+    fn add(self: *Tally, label: Label) void {
+        self.n.getPtr(label).* += 1;
+    }
+
+    fn get(self: Tally, label: Label) usize {
+        return self.n.get(label);
+    }
+
+    /// Rows that need attention. The summary's leading count and the file
+    /// half of the exit code are both this call, so they are one value.
+    fn attention(self: Tally) usize {
+        var total: usize = 0;
+        for (std.enums.values(Label)) |l| {
+            if (l.problem()) total += self.n.get(l);
+        }
+        return total;
+    }
+};
+
+/// The one-line summary under the file table: what needs attention, named by
+/// label, then what does not. `actionable_only` is `--drift`, where the clean
+/// and gated rows were never printed and so are not summarized -- and where a
+/// run with nothing to report says nothing at all, as the table does.
+fn printFileSummary(w: *std.Io.Writer, t: Tally, actionable_only: bool) !void {
+    const n = t.attention();
+    if (n == 0) {
+        if (actionable_only) return;
+        try w.print("  Nothing to do. {d} clean, {d} gated.\n", .{ t.get(.clean), t.get(.gated) });
+        return;
+    }
+    try w.print("  {d} need attention: ", .{n});
+    var first = true;
+    for (std.enums.values(Label)) |l| {
+        if (!l.problem()) continue;
+        const c = t.get(l);
+        if (c == 0) continue;
+        if (!first) try w.writeAll(", ");
+        try w.print("{d} {s}", .{ c, l.text() });
+        first = false;
+    }
+    if (actionable_only) {
+        try w.writeAll(".\n");
+    } else {
+        try w.print(". {d} clean, {d} gated.\n", .{ t.get(.clean), t.get(.gated) });
+    }
+}
+
+/// The one-line summary closing the packages section, in the shape the file
+/// summary uses. A refused pass has no counts to give -- nothing was reached
+/// -- so it names the line that says why instead of reading as a clean
+/// machine.
+fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool) !void {
+    if (pkgs.broken) {
+        try w.writeAll("  Packages: the pass was refused; see the mox status: packages: line above.\n");
+        return;
+    }
+    const counts = [_]struct { n: usize, word: []const u8 }{
+        .{ .n = pkgs.report.missingCount(), .word = "missing" },
+        .{ .n = pkgs.report.untrackedCount(), .word = "untracked" },
+        .{ .n = pkgs.report.broken.len, .word = "broken" },
+        .{ .n = if (actionable_only) 0 else pkgs.report.gatedCount(), .word = "gated" },
+    };
+    var total: usize = 0;
+    for (counts) |c| total += c.n;
+    if (total == 0) {
+        try w.writeAll("  Packages: nothing to do.\n");
+        return;
+    }
+    try w.writeAll("  Packages:");
+    var first = true;
+    for (counts) |c| {
+        if (c.n == 0) continue;
+        try w.print("{s} {d} {s}", .{ if (first) "" else ",", c.n, c.word });
+        first = false;
+    }
+    try w.writeAll(".\n");
+}
 
 /// Map an apply disposition to its status label. `MISSING`/`OUTDATED`/`DRIFT`
 /// each mean `mox apply` would change the file, so all three set the exit
 /// code; `clean` does not. `GATED` and `ERROR` are handled by the caller.
-fn cellFor(disp: mox.apply.applied.Disposition) Cell {
+fn cellFor(disp: mox.apply.applied.Disposition) Label {
     return switch (disp) {
-        .unchanged => .{ .label = "clean", .problem = false },
-        .fresh_write => .{ .label = "MISSING", .problem = true },
-        .safe_overwrite => .{ .label = "OUTDATED", .problem = true },
-        .drift => .{ .label = "DRIFT", .problem = true },
+        .unchanged => .clean,
+        .fresh_write => .missing,
+        .safe_overwrite => .outdated,
+        .drift => .drift,
     };
 }
 
@@ -104,7 +217,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var discarding: std.Io.Writer.Discarding = .init(&discard_buf);
     const rows: *std.Io.Writer = if (show_table) ctx.out else &discarding.writer;
 
-    var problems: usize = 0;
+    var tally: Tally = .{};
     // Every drifted unit this run finds, classified the same way `mox apply`
     // does (same classifier, `apply/drift.zig`) -- fed to the shared renderer
     // below so the two commands' drift summaries can never disagree.
@@ -116,8 +229,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
         if (file.head_error.len > 0) {
-            try rows.print("  {s:<8} {s} ({s})\n", .{ "ERROR", shown, file.head_error });
-            problems += 1;
+            tally.add(.err);
+            try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), shown, file.head_error });
             continue;
         }
         // A tracked source matching an ignore rule (itself or a containing
@@ -130,11 +243,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             var gdiag: mox.compose.interp.Diag = .{};
             if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
                 if (gdiag.capture()) |cap| {
-                    try rows.print("  {s:<8} {s} (compose failed: {s}: {s})\n", .{ "ERROR", shown, @errorName(e), cap });
+                    try rows.print("  {s:<8} {s} (compose failed: {s}: {s})\n", .{ Label.err.text(), shown, @errorName(e), cap });
                 } else {
-                    try rows.print("  {s:<8} {s} (compose failed: {s})\n", .{ "ERROR", shown, @errorName(e) });
+                    try rows.print("  {s:<8} {s} (compose failed: {s})\n", .{ Label.err.text(), shown, @errorName(e) });
                 }
-                problems += 1;
+                tally.add(.err);
                 continue;
             }) |outputs| {
                 // The drift summary scopes a generator to its own row: any
@@ -146,16 +259,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     // Kind guard BEFORE the open: a FIFO here would block the
                     // read and brick the whole report.
                     if (mox.apply.write.guardLiveRead(ctx.io, o.live_path) == .special) {
-                        try rows.print("  {s:<8} {s}\n", .{ "ERROR", leaf_shown });
-                        problems += 1;
+                        tally.add(.err);
+                        try rows.print("  {s:<8} {s}\n", .{ Label.err.text(), leaf_shown });
                         continue;
                     }
                     const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, o.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
                         error.FileNotFound => null,
                         error.OutOfMemory => return e,
                         else => {
-                            try rows.print("  {s:<8} {s}\n", .{ "ERROR", leaf_shown });
-                            problems += 1;
+                            tally.add(.err);
+                            try rows.print("  {s:<8} {s}\n", .{ Label.err.text(), leaf_shown });
                             continue;
                         },
                     };
@@ -163,8 +276,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     const disp = mox.apply.applied.classify(recorded, live, o.content);
                     if (disp == .drift) gen_drifted = true;
                     const cell = cellFor(disp);
-                    if (cell.problem) problems += 1;
-                    try rows.print("  {s:<8} {s}\n", .{ cell.label, leaf_shown });
+                    tally.add(cell);
+                    try rows.print("  {s:<8} {s}\n", .{ cell.text(), leaf_shown });
                 }
                 if (gen_drifted) try units.append(ctx.alloc, mox.apply.drift.generatedSet(file.live_path));
                 continue;
@@ -177,12 +290,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 std.Io.Dir.cwd().access(ctx.io, file.live_path, .{}) catch break :blk false;
                 break :blk true;
             };
-            if (present) {
-                try rows.print("  {s:<8} {s}\n", .{ "clean", shown });
-            } else {
-                problems += 1;
-                try rows.print("  {s:<8} {s}\n", .{ "MISSING", shown });
-            }
+            const cell: Label = if (present) .clean else .missing;
+            tally.add(cell);
+            try rows.print("  {s:<8} {s}\n", .{ cell.text(), shown });
             continue;
         }
         // A symlink target must be inspected WITHOUT following the link:
@@ -191,12 +301,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // apply's symlink classification, read-only.
         if (file.is_symlink) {
             const composed = mox.compose.composeFile(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets) catch {
-                try rows.print("  {s:<8} {s}\n", .{ "ERROR", shown });
-                problems += 1;
+                tally.add(.err);
+                try rows.print("  {s:<8} {s}\n", .{ Label.err.text(), shown });
                 continue;
             };
             if (composed == null) {
-                try rows.print("  {s:<8} {s}\n", .{ "GATED", shown });
+                tally.add(.gated);
+                try rows.print("  {s:<8} {s}\n", .{ Label.gated.text(), shown });
                 continue;
             }
             const target = std.mem.trim(u8, composed.?, " \t\r\n");
@@ -204,9 +315,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             const recorded_target = try mox.apply.applied.readSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
             const disp = mox.apply.drift.symlinkDisposition(site, recorded_target, target);
             const cell = cellFor(disp);
-            if (cell.problem) problems += 1;
+            tally.add(cell);
             if (mox.apply.drift.symlink(file.live_path, site, recorded_target, target)) |u| try units.append(ctx.alloc, u);
-            try rows.print("  {s:<8} {s}\n", .{ cell.label, shown });
+            try rows.print("  {s:<8} {s}\n", .{ cell.text(), shown });
             continue;
         }
         // Partial files carry their ownership inventory on every line, so the
@@ -215,11 +326,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, null, &diag) catch |e| {
             if (diag.capture()) |cap| {
-                try rows.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ "ERROR", shown, annot, @errorName(e), cap });
+                try rows.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ Label.err.text(), shown, annot, @errorName(e), cap });
             } else {
-                try rows.print("  {s:<8} {s}{s} (compose failed: {s})\n", .{ "ERROR", shown, annot, @errorName(e) });
+                try rows.print("  {s:<8} {s}{s} (compose failed: {s})\n", .{ Label.err.text(), shown, annot, @errorName(e) });
             }
-            problems += 1;
+            tally.add(.err);
             continue;
         };
         if (composed == null) {
@@ -237,16 +348,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch null;
             if (recorded != null and live_omit != null) {
                 const live_hash = mox.apply.applied.contentHashHex(live_omit.?);
-                problems += 1;
                 if (std.mem.eql(u8, &recorded.?, &live_hash)) {
-                    try rows.print("  {s:<8} {s}{s}\n", .{ "STALE", shown, annot });
+                    tally.add(.stale);
+                    try rows.print("  {s:<8} {s}{s}\n", .{ Label.stale.text(), shown, annot });
                 } else {
+                    tally.add(.drift);
                     try units.append(ctx.alloc, mox.apply.drift.vanished(file.live_path));
-                    try rows.print("  {s:<8} {s}{s}\n", .{ "DRIFT", shown, annot });
+                    try rows.print("  {s:<8} {s}{s}\n", .{ Label.drift.text(), shown, annot });
                 }
                 continue;
             }
-            try rows.print("  {s:<8} {s}{s}\n", .{ "GATED", shown, annot });
+            tally.add(.gated);
+            try rows.print("  {s:<8} {s}{s}\n", .{ Label.gated.text(), shown, annot });
             continue;
         }
 
@@ -254,16 +367,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // program activity outside the declared paths can never surface.
         if (file.own_paths.len > 0) {
             const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?, &units);
-            if (cell.problem) problems += 1;
-            try rows.print("  {s:<8} {s}{s}\n", .{ cell.label, shown, annot });
+            tally.add(cell);
+            try rows.print("  {s:<8} {s}{s}\n", .{ cell.text(), shown, annot });
             continue;
         }
 
         // Kind guard BEFORE the open: a FIFO here would block the read and
         // brick the whole report.
         if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
-            try rows.print("  {s:<8} {s}\n", .{ "ERROR", shown });
-            problems += 1;
+            tally.add(.err);
+            try rows.print("  {s:<8} {s}\n", .{ Label.err.text(), shown });
             continue;
         }
         const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
@@ -272,22 +385,26 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             // reason to abort the whole status report.
             error.OutOfMemory => return e,
             else => {
-                try rows.print("  {s:<8} {s}\n", .{ "ERROR", shown });
-                problems += 1;
+                tally.add(.err);
+                try rows.print("  {s:<8} {s}\n", .{ Label.err.text(), shown });
                 continue;
             },
         };
         const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
         const disp = mox.apply.applied.classify(recorded, live, composed.?);
         const cell = cellFor(disp);
-        if (cell.problem) problems += 1;
+        tally.add(cell);
         if (mox.apply.drift.wholeFile(file.live_path, recorded, live, composed.?)) |u| try units.append(ctx.alloc, u);
-        try rows.print("  {s:<8} {s}\n", .{ cell.label, shown });
+        try rows.print("  {s:<8} {s}\n", .{ cell.text(), shown });
     }
 
     // One order for every consumer -- the report and both serializers -- so
     // machine output is stable across runs, OSes, and pipes.
     mox.apply.drift.sortByPath(units.items);
+
+    // The exit code's file half IS the summary's leading count, read off the
+    // same tally: there is no second traversal that could count differently.
+    var problems: usize = tally.attention();
 
     if (machine) {
         // stdout is the serialized drift set and nothing else; what the
@@ -318,6 +435,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         context.env.get(ctx.alloc, "NO_COLOR") != null,
         a.color orelse .auto,
     ) };
+    try printFileSummary(ctx.out, tally, a.drift);
     try drift_report.render(ctx.alloc, ctx.out, units.items, .{
         .home = home,
         .sty = sty,
@@ -542,6 +660,7 @@ fn printPackages(
             try ctx.out.print("  {s:<9} {s} {s}{s}\n", .{ "GATED", b.backend, row.name, gate });
         }
     }
+    try printPackageSummary(ctx.out, pkgs, drift_only);
     return pkgs;
 }
 
@@ -804,10 +923,10 @@ fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![
 /// document (OUTDATED), clean when all equal. A composed document violating
 /// its declaration, or an unparseable composed/live file, is ERROR --
 /// the same shapes apply refuses.
-fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit)) !Cell {
+fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit)) !Label {
     const partial_mod = mox.apply.partial;
     const owned_mod = mox.apply.owned;
-    const err_cell: Cell = .{ .label = "ERROR", .problem = true };
+    const err_cell: Label = .err;
     // The walk only attaches own_paths to structured targets.
     const format = mox.source.format.formatOfPath(file.source_base_path).?;
 
@@ -856,7 +975,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row whose when excludes this machine is a GATED row there, named with its gate and counted in nothing; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -864,17 +983,37 @@ pub const command = app.command(Spec, .{
 const testing = std.testing;
 
 test "cellFor: dispositions map to labels and problem flags" {
-    try testing.expectEqualStrings("clean", cellFor(.unchanged).label);
-    try testing.expect(!cellFor(.unchanged).problem);
+    try testing.expectEqualStrings("clean", cellFor(.unchanged).text());
+    try testing.expect(!cellFor(.unchanged).problem());
 
-    try testing.expectEqualStrings("MISSING", cellFor(.fresh_write).label);
-    try testing.expect(cellFor(.fresh_write).problem);
+    try testing.expectEqualStrings("MISSING", cellFor(.fresh_write).text());
+    try testing.expect(cellFor(.fresh_write).problem());
 
-    try testing.expectEqualStrings("OUTDATED", cellFor(.safe_overwrite).label);
-    try testing.expect(cellFor(.safe_overwrite).problem);
+    try testing.expectEqualStrings("OUTDATED", cellFor(.safe_overwrite).text());
+    try testing.expect(cellFor(.safe_overwrite).problem());
 
-    try testing.expectEqualStrings("DRIFT", cellFor(.drift).label);
-    try testing.expect(cellFor(.drift).problem);
+    try testing.expectEqualStrings("DRIFT", cellFor(.drift).text());
+    try testing.expect(cellFor(.drift).problem());
+}
+
+test "Tally: the attention count is every actionable label and nothing else" {
+    var t: Tally = .{};
+    t.add(.clean);
+    t.add(.gated);
+    try testing.expectEqual(@as(usize, 0), t.attention());
+
+    var actionable: usize = 0;
+    for (std.enums.values(Label)) |l| {
+        if (!l.problem()) continue;
+        t.add(l);
+        actionable += 1;
+    }
+    try testing.expectEqual(actionable, t.attention());
+    // The labels the exit code is decided by, named, so a label that changed
+    // sides silently cannot pass here.
+    try testing.expect(!Label.clean.problem());
+    try testing.expect(!Label.gated.problem());
+    for ([_]Label{ .outdated, .drift, .missing, .stale, .err }) |l| try testing.expect(l.problem());
 }
 
 test "ownAnnotation: own and disown counts, empty for whole-file targets" {

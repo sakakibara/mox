@@ -326,10 +326,6 @@ pub const Registry = struct {
         }
         return null;
     }
-
-    pub fn has(self: Registry, name: []const u8) bool {
-        return self.find(name) != null;
-    }
 };
 
 pub const Backend = struct {
@@ -396,8 +392,10 @@ pub const Backend = struct {
         /// none, where the answer is always zero.
         installRefused: ?*const fn (ctx: *anyopaque) usize = null,
         /// How many of the last `install`'s rows were converged without an
-        /// install: a package already on the machine that needed only its
-        /// manager's record of who asked for it. Absent for an adapter with
+        /// install: a package already on the machine. What that convergence
+        /// left behind differs by manager -- apt, dnf, pacman and brew record
+        /// who asked for the package, winget records nothing -- so the count
+        /// says only that no install was needed. Absent for an adapter with
         /// no such path, where the answer is always zero.
         installMarked: ?*const fn (ctx: *anyopaque) usize = null,
         /// How many of the last `install`'s rows named a package already on

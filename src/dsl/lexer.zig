@@ -164,6 +164,11 @@ test "lex identifier with + and -" {
     var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
     const toks = try lex(fba.allocator(), "tool=fdfind-2.0");
     try std.testing.expectEqualStrings("fdfind-2.0", toks[2].kind.ident);
+
+    var plus_buf: [4096]u8 = undefined;
+    var plus_fba = std.heap.FixedBufferAllocator.init(&plus_buf);
+    const plus = try lex(plus_fba.allocator(), "tool=gtk+3");
+    try std.testing.expectEqualStrings("gtk+3", plus[2].kind.ident);
 }
 
 test "lex consecutive whitespace and tabs" {

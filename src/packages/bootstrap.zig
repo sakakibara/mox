@@ -435,12 +435,30 @@ test "fetchVerified: a failed download is an error, not an empty file" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
     const dir = try tmpDir(a, io, &tmp.sub_path);
+    const path = try std.fs.path.join(a, &.{ dir, "install.sh" });
 
-    // The Fake errors on the unscripted curl; wget is tried and errors too.
-    try testing.expectError(error.UnexpectedCommand, fetchVerified(a, io, fake.runner(), dir, "install.sh", .{
+    // curl exits nonzero. The leftover an earlier interrupted run left at the
+    // same path must not survive it as a "downloaded" installer.
+    var partial: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .code = 22 },
+    } };
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "half a scr" });
+    try testing.expectError(Error.BootstrapDownloadFailed, fetchVerified(a, io, partial.runner(), dir, "install.sh", .{
         .url = "https://example.invalid/install.sh",
         .sha256 = "00",
     }));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+
+    // No curl at all: wget is tried, and its failure is the same refusal.
+    var no_curl: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "curl -fsSL -o", .match = .prefix, .fail = error.FileNotFound },
+        .{ .argv = "wget -qO-", .match = .prefix, .code = 4 },
+    } };
+    try testing.expectError(Error.BootstrapDownloadFailed, fetchVerified(a, io, no_curl.runner(), dir, "install.sh", .{
+        .url = "https://example.invalid/install.sh",
+        .sha256 = "00",
+    }));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
 }

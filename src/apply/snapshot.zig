@@ -667,7 +667,7 @@ test "formatId renders a known epoch" {
     try std.testing.expectEqualStrings("20260710T081500Z", &id);
 }
 
-test "relToHome strips the home prefix" {
+test "liveKeyUnderHome: the key a snapshot is filed by, and null for a path outside home" {
     const a = std.testing.allocator;
     const one = (try source_path.liveKeyUnderHome(a, "/home/me", "/home/me/.zshrc")).?;
     defer a.free(one);

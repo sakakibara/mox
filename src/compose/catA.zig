@@ -42,7 +42,6 @@ pub const ComposeError = error{
 };
 
 const max_layer_bytes: usize = 4 * 1024 * 1024;
-const encode_buffer_initial: usize = 4096;
 
 /// Compose a Category A managed file: TOML, JSON (JSONC input), and YAML
 /// deep-merge; gitconfig and INI section-merge.

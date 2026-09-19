@@ -50,19 +50,6 @@ pub const Graph = struct {
         }
         return count;
     }
-
-    /// Total distinct files referenced by any token.
-    pub fn totalFiles(self: *const Graph) usize {
-        var seen: std.StringHashMap(void) = std.StringHashMap(void).init(self.arena);
-        defer seen.deinit();
-        var iter = self.map.valueIterator();
-        while (iter.next()) |list_ptr| {
-            for (list_ptr.items) |o| {
-                _ = seen.getOrPut(o.file_id) catch continue;
-            }
-        }
-        return seen.count();
-    }
 };
 
 test "Graph: add and lookup" {

@@ -210,7 +210,7 @@ test "load: every reserved axis name errors as a fact name" {
     }
 }
 
-test "load: a non-reserved name alongside an unrelated table keeps working" {
+test "load: a name that merely begins with a reserved axis name is not reserved" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

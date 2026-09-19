@@ -79,10 +79,9 @@ pub const Brew = struct {
     exe: []const u8 = "brew",
     /// Where the installer leaves `brew`; probed after a bootstrap.
     prefixes: []const []const u8 = &default_prefixes,
-    /// Whether the last `install` reached the point of changing the machine
-    /// -- brew's installer, or the receipt `brew tab` writes -- which
-    /// `installSpawned` answers with: a tap or a trust that fails stops the
-    /// row before it, and a batch of one such row never reaches brew at all.
+    /// Whether the last `install` ran `brew install`, which `installSpawned`
+    /// answers with: a tap or a trust that fails stops the row before it, and
+    /// a batch of one such row never reaches brew at all.
     spawned: bool = false,
     /// How many of the last `install`'s rows brew was never handed, which
     /// `installRefused` answers with.
@@ -90,6 +89,9 @@ pub const Brew = struct {
     /// How many of the last `install`'s rows were converged by marking a
     /// formula brew already had, which `installMarked` answers with.
     marked: usize = 0,
+    /// How many of the last `install`'s rows named a formula brew already had
+    /// and could not be marked, which `installUnmarked` answers with.
+    unmarked: usize = 0,
     /// Where a row refused at install time is said. The install's own error
     /// is what the call site reports, so the row and the name to write in its
     /// place have nowhere else to go.
@@ -121,6 +123,7 @@ pub const Brew = struct {
         .installSpawned = installSpawnedImpl,
         .installRefused = installRefusedImpl,
         .installMarked = installMarkedImpl,
+        .installUnmarked = installUnmarkedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
     };
@@ -249,7 +252,9 @@ pub const Brew = struct {
 
     /// One `brew install` per row, every row attempted: a formula that fails
     /// halfway down the list must not leave the ones after it uninstalled.
-    /// The batch then fails as a whole if any row did.
+    /// The batch then fails as a whole if any row's install, tap or trust
+    /// did. A mark that does not take is that row's own failure instead,
+    /// counted in `unmarked`: the rows beside it install all the same.
     ///
     /// `--` before the name, verified against Homebrew 7.0.1: `brew install
     /// --help` exits 0 having installed nothing, while `brew install --
@@ -261,6 +266,7 @@ pub const Brew = struct {
         self.spawned = false;
         self.refused = 0;
         self.marked = 0;
+        self.unmarked = 0;
         const keep = try self.refuseAliases(arena, rows);
         self.refused = rows.len - keep.len;
         // Asked once for the batch, and only when a formula row is in it.
@@ -274,7 +280,7 @@ pub const Brew = struct {
                 // the trust an install needs are moot: the tap is on this
                 // machine or the formula could not have come from it.
                 if (installed.?.contains(row.name)) {
-                    if (!try self.markOnRequest(arena, row.name)) failed = true;
+                    try self.markOnRequest(arena, row.name);
                     continue;
                 }
             }
@@ -351,8 +357,9 @@ pub const Brew = struct {
         );
     }
 
-    /// Record that the user asked for an already-installed formula by name,
-    /// and answer whether brew accepted it.
+    /// Record that the user asked for an already-installed formula by name.
+    /// A mark that does not take is that row's own failure, counted in
+    /// `unmarked`, never the batch's: the rows beside it are untouched by it.
     ///
     /// `brew install` cannot do this. Homebrew drops a formula it already has,
     /// linked and current, from the install list before a `FormulaInstaller`
@@ -371,23 +378,22 @@ pub const Brew = struct {
     /// Only the formula half needs it. The cask query lists the whole
     /// Caskroom, so an installed cask is already reported and its row is
     /// never missing.
-    fn markOnRequest(self: *Brew, arena: std.mem.Allocator, name: []const u8) anyerror!bool {
+    fn markOnRequest(self: *Brew, arena: std.mem.Allocator, name: []const u8) anyerror!void {
         self.say(
             "mox: brew: \"{s}\" is installed already but not on request, so \"brew install\" would do nothing and leave the row missing; marking it as installed on request instead\n",
             .{name},
         );
-        self.spawned = true;
         const res = try self.runner.stream(arena, &.{ self.exe, "tab", "--installed-on-request", "--formula", "--", name });
         try exec.checkTimedOut(res);
         if (res.ok) {
             self.marked += 1;
-            return true;
+            return;
         }
         self.say(
             "mox: brew: \"{s}\" could not be marked as installed on request, so the row stays missing; \"brew tab\" is in Homebrew 4.3.6 and newer\n",
             .{name},
         );
-        return false;
+        self.unmarked += 1;
     }
 
     fn installSpawnedImpl(ctx: *anyopaque) bool {
@@ -403,6 +409,11 @@ pub const Brew = struct {
     fn installMarkedImpl(ctx: *anyopaque) usize {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         return self.marked;
+    }
+
+    fn installUnmarkedImpl(ctx: *anyopaque) usize {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        return self.unmarked;
     }
 
     /// Say `fmt` where a refused row can be read, if anywhere.
@@ -1198,7 +1209,7 @@ test "install: a formula brew already has is marked on request, never handed to 
     try testing.expect(std.mem.indexOf(u8, w.written(), "marking it as installed on request instead") != null);
 }
 
-test "install: a formula that cannot be marked on request fails its row" {
+test "install: a mark that fails is that row's failure, and the rows beside it go on" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1206,18 +1217,45 @@ test "install: a formula that cannot be marked on request fails its row" {
     // `brew tab` arrived in Homebrew 4.3.6; an older brew answers this argv
     // with an unknown command, and the row cannot converge at all. Falling
     // back to `brew install` would report a success that leaves it missing.
+    // Nor is it the batch's failure: the row beside it installs all the same.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = "brotli\n" },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
         .{ .argv = "brew tab --installed-on-request --formula -- brotli", .code = 1 },
+        .{ .argv = "brew install -- ripgrep" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
 
-    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{rowOf("brotli", &.{})}));
+    try b.backend().install(a, &.{ rowOf("brotli", &.{}), rowOf("ripgrep", &.{}) });
+    try testing.expectEqual(@as(usize, 1), b.backend().installUnmarked());
     try testing.expectEqual(@as(usize, 0), b.backend().installMarked());
-    try testing.expect(b.backend().installSpawned());
+    try testing.expectEqual(@as(usize, 0), b.backend().installRefused());
+    try testing.expect(fake.called("brew install -- ripgrep"));
+    try testing.expect(!fake.called("brew install -- brotli"));
     try testing.expect(std.mem.indexOf(u8, w.written(), "could not be marked as installed on request") != null);
+}
+
+test "install: a mark alone never says the batch reached brew's installer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `brew tab` writes a receipt; it installs nothing. A batch of marks
+    // that a later row's tap then fails has landed no row at all, so the
+    // hedge `installSpawned` drives must not be raised over it.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = "brotli\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 },
+        .{ .argv = "brew tab --installed-on-request --formula -- brotli" },
+        .{ .argv = "brew tap -- owner/tap", .code = 1 },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{ rowOf("brotli", &.{}), rowOf("owner/tap/thing", &.{}) }));
+    try testing.expectEqual(@as(usize, 1), b.backend().installMarked());
+    try testing.expect(!b.backend().installSpawned());
 }
 
 test "install: a query that cannot say what is installed leaves the rows to brew, and says so" {

@@ -515,7 +515,6 @@ test "render: only a path that alone overruns the terminal is truncated, basenam
     // Narrower than the path itself: now it gives way, middle-first.
     const s = try renderToString(a, &units, .{ .home = test_home, .sty = off, .width = 40 });
     try testing.expect(std.mem.indexOf(u8, s, "...") != null);
-    try testing.expect(std.mem.endsWith(u8, "settings.json", "settings.json"));
     try testing.expect(std.mem.indexOf(u8, s, "settings.json\n") != null);
 
     // The guidance below prints the whole path either way -- a command has to

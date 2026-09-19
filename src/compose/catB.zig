@@ -167,9 +167,6 @@ fn overlayOrigin(file: ManagedFile) Origin {
 
 pub const ComposeError = error{
     NoBase,
-    NoMatchingFragment,
-    UnsupportedDirective,
-    UnknownCommentMarker,
     DataSourceArrayNotFound,
     RecursionTooDeep,
     UnknownLoopVariable,

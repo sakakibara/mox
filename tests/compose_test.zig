@@ -4599,6 +4599,12 @@ test "completions: content beside the directive falls through to the loud inline
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     // Not a pure generator: composeGenerator declines it...
     try std.testing.expect(try mox.compose.catB.composeGenerator(a, io, gen, &bindings_r, null, null, null) == null);
+    // ... and the single-file composer it then falls through to refuses it by
+    // name, rather than emitting the directive line as content.
+    try std.testing.expectError(
+        error.CompletionsOnNonGenerator,
+        mox.compose.catB.compose(a, io, gen, &bindings_r, null),
+    );
 }
 
 test "loop body: a doubled comment marker emits a literal marker line" {

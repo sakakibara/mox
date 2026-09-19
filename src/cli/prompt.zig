@@ -152,7 +152,7 @@ pub fn renderChoices(arena: std.mem.Allocator, choices: []const Choice) ![]const
 
 const testing = std.testing;
 
-test "ask: interactive maps letters, numbers, and empty-default" {
+test "ask: interactive maps a letter, a whole word by its first letter, and empty to the default" {
     const choices = [_]Choice{
         .{ .key = "y", .label = "yes" },
         .{ .key = "n", .label = "no" },

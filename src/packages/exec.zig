@@ -1393,9 +1393,20 @@ test "sweepScratch: a dead process's files go, this process's and a live one's s
 }
 
 test "sweepScratch: a scratch directory that does not exist is nothing to sweep" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    sweepScratch(std.testing.io, arena.allocator(), "/nonexistent/mox-scratch");
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "never-made" });
+
+    sweepScratch(io, a, scratch);
+
+    // Nothing to sweep is not something to create: a best-effort sweep that
+    // made its own directory would leave one behind on every failed probe.
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, scratch, .{}));
 }
 
 test "runPowerShell: pwsh is tried first, and powershell answers when it is absent" {

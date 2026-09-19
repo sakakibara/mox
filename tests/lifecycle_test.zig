@@ -640,6 +640,51 @@ test "export --facts: a path that is not there refuses instead of composing fact
     try std.testing.expect(!exists(io, out));
 }
 
+test "export: <out> and --facts expand a tilde, and refuse the spellings that cannot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.mailrc", "# mox: when profile=work\nfrom = me\n# mox: end\n");
+    try writeRepo(io, &tmp, "home/myfacts.toml", "profile = \"work\"\n");
+
+    // A shell expands a bare tilde, but a quoted one, a PowerShell argument
+    // and a non-shell caller all deliver it verbatim -- and the run's cwd is
+    // HOME here, so a literal `~` directory would land beside the facts file.
+    const r = try h.run(&.{ "mox", "export", "--facts", "~/myfacts.toml", "~/baked" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, try h.liveOf("~")));
+    try std.testing.expectEqualStrings("from = me\n", try read(io, a, try std.fs.path.join(a, &.{ h.home, "baked", ".mailrc" })));
+
+    // The `=` spelling is the same argument, so it expands the same way.
+    const eq = try h.run(&.{ "mox", "export", "--facts=~/myfacts.toml", "~/baked2" });
+    try std.testing.expectEqual(@as(u8, 0), eq.rc);
+    try std.testing.expectEqualStrings("from = me\n", try read(io, a, try std.fs.path.join(a, &.{ h.home, "baked2", ".mailrc" })));
+
+    // A tilde that names no home mox can resolve is refused, never turned
+    // into a directory whose first component is a literal `~`.
+    const other = try h.run(&.{ "mox", "export", "~other/baked" });
+    try std.testing.expectEqual(@as(u8, 2), other.rc);
+    try std.testing.expect(std.mem.indexOf(u8, other.err, "'~user' is not supported") != null);
+    try std.testing.expect(!exists(io, try h.liveOf("~other")));
+
+    const bad_facts = try h.run(&.{ "mox", "export", "--facts", "~other/f.toml", "~/baked3" });
+    try std.testing.expectEqual(@as(u8, 2), bad_facts.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bad_facts.err, "'~user' is not supported") != null);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.home, "baked3" })));
+
+    // A `--facts` path that is not there names the path mox resolved, not the
+    // tilde it was handed.
+    const missing = try h.run(&.{ "mox", "export", "--facts", "~/no-such.toml", "~/baked4" });
+    try std.testing.expectEqual(@as(u8, 2), missing.rc);
+    try std.testing.expect(std.mem.indexOf(u8, missing.err, "no facts file at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.err, "~") == null);
+}
+
 test "export bakes the same bytes apply writes to live" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -826,14 +871,18 @@ test "add -r: a coupling-graph persistence failure warns once for the whole walk
 
     const h = try setup(a, io, &tmp, null);
     try tmp.dir.createDirPath(io, "home/.config/app");
+    // Three files, so a per-file warning is distinguishable from one warning
+    // for the walk -- with one file the two are the same output.
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/a.conf", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/b.conf", .data = "b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/c.conf", .data = "c\n" });
 
     try Io.Dir.cwd().createDirPath(io, h.state);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "coupling" }), .data = "" });
 
     const r = try h.run(&.{ "mox", "add", "-r", ".config/app" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox add: coupling graph not updated") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.err, "mox add: coupling graph not updated"));
 }
 
 test "add -r: adds every non-junk file under a live dir, skipping junk" {
@@ -4290,8 +4339,9 @@ test "doctor: OS noise in a stage is passed over, as apply passes over it" {
     try tmp.dir.createDirPath(io, "repo/scripts/pre/os=linux.swp");
     try testutil.gitTracked(io, a, h.repo);
     const r = try h.run(&.{ "mox", "doctor" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "bad-stage-tuple") == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "bad-axis-value") == null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bad-stage-tuple") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bad-axis-value") == null);
 }
 
 test "export: an unwalkable tree is reported the way apply reports it, at exit 2" {

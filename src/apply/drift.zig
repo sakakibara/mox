@@ -75,25 +75,6 @@ pub fn kindLabel(arena: std.mem.Allocator, kind: Kind) ![]const u8 {
     };
 }
 
-/// The parenthetical explanation for one drifted unit's report row, in the
-/// wording `mox apply`'s DRIFT messages have always used (so a script or
-/// test matching that text still matches).
-pub fn describe(arena: std.mem.Allocator, unit: Unit) ![]const u8 {
-    return switch (unit.kind) {
-        .whole_file => if (unit.first_contact)
-            "mox did not write this file; 'mox commit' it or re-run with --overwrite"
-        else
-            "live file was edited; 'mox commit' it or re-run with --overwrite",
-        .owned_key => |k| blk: {
-            const what = if (k) |key| try std.fmt.allocPrint(arena, "owned path {s}", .{key}) else "owned content";
-            break :blk try std.fmt.allocPrint(arena, "{s} changed; 'mox commit' it or re-run with --overwrite", .{what});
-        },
-        .symlink_target => "live entry was not written by mox; 'mox commit' it or re-run with --overwrite",
-        .generated_set => "generated set drifted; 'mox commit' it or re-run with --overwrite",
-        .vanished => "mox no longer produces this file; re-run with --overwrite to remove it (your copy is snapshotted first), or restore the data that filled it",
-    };
-}
-
 /// Whole-file drift: wraps `applied.classify`'s disposition into a report
 /// unit, null unless it is `.drift`. `first_contact` is read straight off
 /// `recorded`, the same last-applied hash lookup `classify` itself takes:

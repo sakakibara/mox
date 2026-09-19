@@ -32,6 +32,9 @@ pub fn main(init: std.process.Init) !u8 {
     return exit_code;
 }
 
-test "main module compiles" {
-    try std.testing.expect(true);
+test "main: the entry point has the shape the process expects, over a non-empty command table" {
+    const info = @typeInfo(@TypeOf(main)).@"fn";
+    try std.testing.expectEqual(std.process.Init, info.params[0].type.?);
+    try std.testing.expectEqual(u8, @typeInfo(info.return_type.?).error_union.payload);
+    try std.testing.expect(mox.cli.app.command_table.len > 0);
 }

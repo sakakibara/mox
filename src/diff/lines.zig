@@ -268,15 +268,19 @@ test "diff: pathological alternating input completes within a bounded budget" {
     defer arena.deinit();
     const al = arena.allocator();
     // Fully-alternating sequences maximize the Myers edit distance (~2N), the
-    // O(ND) worst case. Bound N so a regression that reintroduced unbounded
-    // work fails the test's implicit `zig build test` timeout rather than
-    // hanging, and assert the search still terminates with a sane result.
+    // O(ND) worst case.
     const n = 4000;
     const a = try al.alloc([]const u8, n);
     const b = try al.alloc([]const u8, n);
     for (a, 0..) |*line, i| line.* = if (i % 2 == 0) "x" else "y";
     for (b, 0..) |*line, i| line.* = if (i % 2 == 0) "y" else "x";
+    const io = testing.io;
+    const started = std.Io.Clock.awake.now(io);
     const hunks = try diff(al, a, b);
+    // The budget the name promises: a regression to unbounded work must fail
+    // here rather than hang the suite forever. This search costs milliseconds.
+    const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(elapsed_ms < 30_000);
     // Reconstruct b by splicing the hunks into a: proves the search terminated
     // with a correct edit script, not just that it returned.
     var rebuilt: std.ArrayList([]const u8) = .empty;

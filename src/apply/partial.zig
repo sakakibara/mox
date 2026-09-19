@@ -328,8 +328,8 @@ pub fn replaceOwned(
 
 /// The executable core invariant, both parts:
 /// 1. per declared path, the candidate's parsed content equals the owned
-///    document's content (deep value equality; fold 3 upgrades this to a
-///    canonical-byte comparison);
+///    document's content, compared as parsed values rather than as bytes:
+///    a writer's own spelling of the same value is not a difference;
 /// 2. live bytes minus owned spans equal candidate bytes minus owned spans
 ///    (appended spans count only on the candidate side).
 pub fn verifyInvariant(
@@ -3557,7 +3557,7 @@ test "ini: section match is case-insensitive under the dialect" {
     try testing.expectEqualStrings(expected, cand);
 }
 
-test "ini: a section appearing in disjoint regions is refused" {
+test "gitconfig: a section appearing in disjoint regions is refused" {
     try testLocateError(
         .gitconfig,
         "[user]\na = 1\n[core]\nx = 1\n[user]\nb = 2\n",
@@ -3648,12 +3648,12 @@ test "verifier: a corrupted remainder and a wrong owned value both fail" {
     );
 }
 
-test "verifier: every replaced format reparses cleanly" {
+test "verifier: a toml replace, remove and append in one file reparses cleanly" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     // Each testApply above already verifies; this pins the reparse of a
-    // mixed replace+remove+append in one file per format family.
+    // mixed replace+remove+append in one file.
     const cand = try testApply(
         arena,
         .toml,

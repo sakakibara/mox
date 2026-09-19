@@ -9,7 +9,6 @@ const Io = std.Io;
 
 pub const InterpError = error{
     UnknownField,
-    NonScalarField,
     UnknownMachineField,
     MachineRefWithoutState,
     EntryRefWithoutRecord,

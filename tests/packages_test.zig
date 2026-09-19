@@ -387,13 +387,19 @@ test "apply: a formula that cannot be marked on request is a failure, not a clea
         \\[[packages]]
         \\name = "brotli"
         \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
     );
 
     // A brew too old to have `brew tab` cannot converge the row at all, so
     // the run must say so rather than fall back to an install that does
-    // nothing and report it as one that worked.
+    // nothing and report it as one that worked. The row beside it is absent
+    // and installs cleanly: that one is not the failed row's to drag down,
+    // and the summary must count it as installed rather than hedge over it.
     const fake = try brewWithInstalled(a, "brotli\n", "", "", &.{
         .{ .argv = "brew tab --installed-on-request --formula -- brotli", .code = 1 },
+        .{ .argv = "brew install -- ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -401,8 +407,10 @@ test "apply: a formula that cannot be marked on request is a failure, not a clea
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(!fake.called("brew install -- brotli"));
+    try std.testing.expect(fake.called("brew install -- ripgrep"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be marked as installed on request") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 1 failed\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
 }
 
 /// The position of the first call matching `argv`, or null.
@@ -3849,6 +3857,42 @@ test "status: a package row this machine's gate excludes is named, not silently 
     try std.testing.expectEqualStrings("{\"files\":[],\"packages\":[]}\n", j.out);
 }
 
+test "status: a backend this machine cannot use contributes no rows at all, gated ones included" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // pacman is not on this machine, so neither of its rows is judged here.
+    // Naming the gated one alone would say the row beside it is fine, when
+    // nothing looked at either.
+    try writeManifest(io, h, a, "arch.toml",
+        \\backend = "pacman"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "steam"
+        \\when = "os=linux"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\n", .{r.out});
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "GATED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "pacman") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "steam") == null);
+}
+
 test "status: a control byte in a manifest filename cannot break the diagnostic framing" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
@@ -3986,4 +4030,94 @@ test "apply: a manager whose verb failed says why, not that it exited" {
         s.out,
         "BROKEN    brew (list: the manager's own listing exited nonzero, saying why above)\n",
     ) != null);
+}
+
+// The packages summary line: what the section above it adds up to.
+
+test "status: the packages summary names every category the section printed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "steam"
+        \\when = "os=linux"
+        \\
+    );
+
+    // ripgrep is there, fd is not, htop is there and declared nowhere, steam
+    // is gated out: one of each category the line can name.
+    const fake = try brewWith(a, "ripgrep\nhtop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\n", .{r.out});
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  Packages: 1 missing, 1 untracked, 1 gated.\n") != null);
+
+    // --drift never printed the gated row, so the line does not claim it.
+    const d = try h.run(&.{ "mox", "status", "--drift" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "  Packages: 1 missing, 1 untracked.\n") != null);
+
+    // Neither machine format carries it.
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "Packages:") == null);
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "Packages:") == null);
+}
+
+test "status: a machine with nothing outstanding says so rather than closing the section in silence" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+    const fake = try brewWith(a, "ripgrep\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  Packages: nothing to do.\n") != null);
+}
+
+test "status: a refused pass has no counts to give, and says which line says why" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]\nname = \"ripgrep\"\n");
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = &.{} };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  Packages: the pass was refused; see the mox status: packages: line above.\n") != null);
+    // Never "nothing to do": a refusal that read as a clean machine is the
+    // whole reason this line exists.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "nothing to do") == null);
 }

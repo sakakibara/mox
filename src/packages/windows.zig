@@ -1867,7 +1867,7 @@ test "winget: the export's blind spots are declared, in both directions" {
     );
 }
 
-test "available: present, absent and broken on both managers" {
+test "available: scoop present then broken, winget absent then broken" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1960,7 +1960,7 @@ test "validate: the bucket value that would leave its own argv on Windows is ref
     try testing.expect(std.mem.indexOf(u8, d2.capture().?, "holds only letters") != null);
 }
 
-test "install: a refused bucket never reaches scoop's argv" {
+test "install: an accepted bucket is one operand of `bucket add` and the prefix of the install target" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -8,10 +8,6 @@ const Io = std.Io;
 const ManagedFile = source.tree.ManagedFile;
 const AxisTuple = source.tree.AxisTuple;
 
-pub const ComposeError = error{
-    NoMatchingOverlay,
-};
-
 const max_file_bytes: usize = 256 * 1024 * 1024;
 
 /// Compose a Category C managed file. Returns the bytes that should be
@@ -19,8 +15,8 @@ const max_file_bytes: usize = 256 * 1024 * 1024;
 ///
 /// Picks the most-specific overlay tuple matching `bindings`. When
 /// `has_base` is true, the base file is treated as an implicit
-/// universal overlay. Returns `error.NoMatchingOverlay` when no overlay
-/// (and no base) matches.
+/// universal overlay. Returns null when no overlay (and no base) matches:
+/// the file composes to nothing on this machine, which is not an error.
 pub fn compose(
     arena: std.mem.Allocator,
     io: Io,

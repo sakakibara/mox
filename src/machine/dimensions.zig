@@ -3471,8 +3471,13 @@ test "discover: pathologically deep nested when-gates do not hang or overflow th
     try writeFile(io, tmp.dir, "src/.zshrc", content.items);
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    // Must return (not hang, not crash) regardless of the exact result.
+    // Must return (not hang, not crash) regardless of the exact result, so
+    // the wall clock is what the assertion is on: a regression to unbounded
+    // recursion fails here instead of hanging the suite forever.
+    const started = std.Io.Clock.awake.now(io);
     _ = try discover(a, io, repo);
+    const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(elapsed_ms < 30_000);
 }
 
 test "discover: an empty repo (no src, no scripts) yields no dimensions and no scripts" {

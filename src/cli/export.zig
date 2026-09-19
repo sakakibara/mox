@@ -20,6 +20,7 @@ const app = @import("app.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
 const apply_cmd = @import("apply.zig");
+const edit = @import("edit.zig");
 
 const Io = std.Io;
 const AxisTuple = mox.source.tree.AxisTuple;
@@ -90,9 +91,31 @@ const Spec = struct {
     out: cli.Pos([]const u8, .{ .help = "output directory" }),
 };
 
+/// Resolve one path argument the way every other mox path argument is
+/// resolved: `~`/`~/x` against mox's own home, anything else against the
+/// current directory. Null means the reason was already printed and the
+/// caller should fail. A shell expands a bare tilde itself, but a quoted
+/// `"~/x"`, a PowerShell argument to a native executable and a non-shell
+/// caller all deliver it verbatim -- and an export that answered one by
+/// creating a literal `~` directory under the current one is never what was
+/// asked for.
+fn resolveArg(ctx: *app.Ctx, home: []const u8, cwd: ?[]const u8, name: []const u8) !?[]const u8 {
+    return edit.liveTarget(ctx.alloc, home, cwd, name) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => |f| {
+            _ = try edit.reportTarget(ctx.err, "mox export", name, f);
+            return null;
+        },
+    };
+}
+
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
-    const out_dir = a.out;
+    const out_dir = (try resolveArg(ctx, context.paths.home, context.cwd, a.out)) orelse return 2;
+    const facts_arg: ?[]const u8 = if (a.facts) |f|
+        (try resolveArg(ctx, context.paths.home, context.cwd, f)) orelse return 2
+    else
+        null;
 
     // A tuple's values are filename-safe by grammar, so they cannot carry an
     // address or a key. `--facts` replaces the machine's own facts.toml
@@ -101,9 +124,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // `--facts` makes this file user-supplied, so every way it can be wrong
     // has to name the file and the offending key rather than surfacing a bare
     // error name. `facts_src` is what the user typed, or the machine's own.
-    const facts_src = a.facts orelse context.paths.facts_path;
+    const facts_src = facts_arg orelse context.paths.facts_path;
     var facts_diag: mox.machine.diag.Diag = .{};
-    const m_state = mox.machine.state.captureWith(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir, .{ .diag = &facts_diag, .facts_path = a.facts }) catch |e| switch (e) {
+    const m_state = mox.machine.state.captureWith(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir, .{ .diag = &facts_diag, .facts_path = facts_arg }) catch |e| switch (e) {
         error.FactsFileNotFound => {
             try ctx.err.print("mox export: no facts file at {s}\n", .{facts_src});
             return 2;
@@ -396,7 +419,7 @@ pub const command = app.command(Spec, .{
     .name = "export",
     .summary = "Bake a flat resolved tree into a dir",
     .usage = "mox export [--as <tuple>] [--facts <path>] [--cleartext-secrets] <out>",
-    .details = "Composes every file under <out>/<rel>. A partially owned target exports its canonical owned serialization (the '= <path>' sections) -- the ownership contract, not a whole live file. Everything is composed before anything is written, so a run that cannot compose every file writes nothing; an export that would bake a resolved secret as cleartext names those files and refuses until --cleartext-secrets is passed.",
+    .details = "Composes every file under <out>/<rel>. A partially owned target exports its canonical owned serialization (the '= <path>' sections) -- the ownership contract, not a whole live file. Everything is composed before anything is written, so a run that cannot compose every file writes nothing; an export that would bake a resolved secret as cleartext names those files and refuses until --cleartext-secrets is passed. <out> and --facts are each absolute, ~-relative, or relative to the current directory.",
     .group = .general,
     .needs_context = true,
 }, run);
