@@ -509,7 +509,7 @@ fn dnfWith(
     try entries.append(a, .{ .argv = "zypper --version", .fail = error.FileNotFound });
     try entries.append(a, .{ .argv = "dnf --version", .stdout = "4.18.0\n" });
     try entries.append(a, .{
-        .argv = "dnf -q repoquery --userinstalled --qf %{name}\n",
+        .argv = "dnf -q --assumeno repoquery --userinstalled --qf %{name}\n",
         .stdout = installed,
     });
     for (extra) |e| try entries.append(a, e);
@@ -542,7 +542,7 @@ test "linux: a dnf machine reports and installs through the same core" {
     // Both spellings are scripted: whether an install elevates depends on the
     // uid running this suite, and the fixture must not depend on that.
     const fake = try dnfWith(a, "bat\nhtop\n", &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
@@ -557,8 +557,8 @@ test "linux: a dnf machine reports and installs through the same core" {
     // rpm virtual provide is spelled like one and would otherwise install a
     // package of another name.
     const fake2 = try dnfWith(a, "bat\nhtop\n", &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
@@ -591,10 +591,10 @@ test "apply: a row the manager already has is counted apart from the one it inst
     // for it and the row is missing; ripgrep is not there at all. Only the
     // second is something mox installs.
     const fake = try dnfWith(a, "bat\n", &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n groff-base ripgrep", .stdout = "groff-base\n" },
         .{ .argv = "sudo dnf mark install --setopt=assumeno=0 groff-base" },
         .{ .argv = "dnf mark install --setopt=assumeno=0 groff-base" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });
@@ -626,8 +626,8 @@ test "apply: a check that could not run reports nothing landed" {
     // built, so the machine is exactly as it was, and a hedge about rows that
     // may have landed would send the user looking for a change nothing made.
     const fake = try dnfWith(a, "bat\n", &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n ripgrep" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .code = 1 },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n ripgrep" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrep", .code = 1 },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -666,12 +666,12 @@ test "apply: a mark that fails is one row's failure, and the rows beside it are 
     // for certain, so the summary must say so, and only the failed mark is a
     // failure -- not the batch, and not "may have landed" over rows that did.
     const fake = try dnfWith(a, "bat\n", &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n groff-base less ripgrep", .stdout = "groff-base\nless\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n groff-base less ripgrep", .stdout = "groff-base\nless\n" },
         .{ .argv = "sudo dnf mark install --setopt=assumeno=0 groff-base", .code = 1 },
         .{ .argv = "dnf mark install --setopt=assumeno=0 groff-base", .code = 1 },
         .{ .argv = "sudo dnf mark install --setopt=assumeno=0 less" },
         .{ .argv = "dnf mark install --setopt=assumeno=0 less" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 ripgrep" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     });

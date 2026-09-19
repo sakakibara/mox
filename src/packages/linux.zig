@@ -87,8 +87,9 @@ pub const Manager = enum {
             // (`bat-0:0.24.0-1.fc44.aarch64`), which matches no row either.
             // `-q` because dnf4 (RHEL 8 and 9, Fedora up to 40) prints
             // "Last metadata expiration check ..." on stdout, where it would
-            // read as a package name.
-            .dnf => &.{ "dnf", "-q", "repoquery", "--userinstalled", "--qf", "%{name}\n" },
+            // read as a package name. `--assumeno` for the reason
+            // `dnf_names_argv` gives.
+            .dnf => &.{ "dnf", "-q", "--assumeno", "repoquery", "--userinstalled", "--qf", "%{name}\n" },
             .pacman => &.{ "pacman", "-Qeq" },
         };
     }
@@ -554,11 +555,12 @@ pub const Distro = struct {
     const pacman_deps_argv = [_][]const u8{ "pacman", "-Qdq" };
 
     /// Which of the operands rpm has installed, whatever reason it records
-    /// for them. `-q` and the trailing newline for the reasons `queryArgv`
-    /// gives; no `--` for the reason the install argv gives. An operand rpm
-    /// has nothing for contributes no line and does not fail the query
-    /// (measured on dnf 4.14.0, dnf5 5.2.18 and 5.4.3).
-    const dnf_installed_argv = [_][]const u8{ "dnf", "-q", "repoquery", "--installed", "--qf", "%{name}\n" };
+    /// for them. `-q`, `--assumeno` and the trailing newline for the reasons
+    /// `queryArgv` and `dnf_names_argv` give; no `--` for the reason the
+    /// install argv gives. An operand rpm has nothing for contributes no line
+    /// and does not fail the query (measured on dnf 4.14.0, dnf5 5.2.18 and
+    /// 5.4.3).
+    const dnf_installed_argv = [_][]const u8{ "dnf", "-q", "--assumeno", "repoquery", "--installed", "--qf", "%{name}\n" };
 
     /// Say `fmt` where a refused row can be read, if anywhere.
     fn say(self: *Distro, comptime fmt: []const u8, args: anytype) void {
@@ -1364,8 +1366,35 @@ pub const Distro = struct {
     /// on an operand that matches nothing, so a non-zero exit is a query that
     /// could not run at all. No `--` before the operands, for the reason the
     /// install argv gives.
-    const dnf_names_argv = [_][]const u8{ "dnf", "-q", "repoquery", "--qf", "%{name}\n" };
+    ///
+    /// `--assumeno` because dnf4 otherwise writes a QUESTION to the stdout
+    /// this reads names from: whether to import a repository's signing key.
+    /// Measured on dnf 4.14.0 (rockylinux:9) with `repo_gpgcheck=1` and
+    /// `skip_if_unavailable=1` on one repository whose key rpm has not
+    /// imported -- both are settable per repository and in dnf.conf, where
+    /// they hold for every one -- `dnf -q repoquery --qf '%{name}\n' jq`
+    /// exits 0 having written `Is this ok [y/N]: jq\n\n`. The question ends
+    /// without a newline of its own, so the listing's first name is glued to
+    /// it and lost with it; with every repository so configured the whole of
+    /// stdout is the question repeated. Without `skip_if_unavailable` the
+    /// query exits non-zero instead, which is already read as a query that
+    /// could not run.
+    ///
+    /// Not `-y`, which answers that question rather than declining it: with
+    /// every repository so configured it takes the same listing from 0 names
+    /// to 5735, having said yes on the machine's behalf to a key rpm does not
+    /// hold. Accepting a signing key is the administrator's decision, never a
+    /// listing's.
+    ///
+    /// The option is neutral otherwise. Measured over every name, the
+    /// installed listing and the `--userinstalled` listing on dnf 4.14.0,
+    /// dnf5 5.2.18 and 5.4.3: exit 0 and byte-identical output with it and
+    /// without it (12076, 72747 and 69627 lines). Both dnf5 releases take
+    /// the option, so one argv serves the pair.
+    const dnf_names_argv = [_][]const u8{ "dnf", "-q", "--assumeno", "repoquery", "--qf", "%{name}\n" };
 
+    /// A line that is not a package name is not read as one: the manager's
+    /// stdout is a listing, and anything else on it is the manager talking.
     fn dnfNameSet(self: *Distro, arena: std.mem.Allocator, argv: []const []const u8) anyerror!std.StringHashMap(void) {
         const res = try self.runner.run(arena, argv);
         try exec.checkCaptureTimedOut(res);
@@ -1376,6 +1405,7 @@ pub const Distro = struct {
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0) continue;
+            if (backend_mod.nameProblem(line, self.manager.nameClass()) != null) continue;
             try set.put(line, {});
         }
         return set;
@@ -2396,7 +2426,7 @@ test "installedExplicit: a failed query is an error, never an empty set" {
 test "dnf: the query asks for newline-separated bare names" {
     // Verified against dnf5 5.4.3: the default format is full NEVRA, and a
     // format string without the newline concatenates every name into one.
-    try testing.expectEqualStrings("%{name}\n", Manager.dnf.queryArgv()[5]);
+    try testing.expectEqualStrings("%{name}\n", Manager.dnf.queryArgv()[6]);
 }
 
 test "dnf: the query is quiet, so dnf4's metadata notice cannot read as a package" {
@@ -2412,8 +2442,8 @@ test "install: root installs without sudo, which a minimal image lacks" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
@@ -2477,8 +2507,8 @@ test "install: dnf takes one non-interactive command" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat ripgrep", .stdout = "bat\nripgrep\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat ripgrep", .stdout = "bat\nripgrep\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 bat ripgrep" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
@@ -2522,8 +2552,8 @@ test "install: a failed install is an error, not a silent skip" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 bat", .code = 1 },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
@@ -2733,7 +2763,7 @@ test "install: the install argv is exactly this, per manager" {
             .{ .argv = aptNamesCall("amd64"), .stdout = "bat\n" },
             .{ .argv = "apt-mark showhold" },
             .{ .argv = "apt-cache policy", .match = .prefix, .stdout = aptStanza("bat") },
-            .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+            .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .stdout = "bat\n" },
             .{ .argv = "pacman-conf DBPath", .stdout = "/var/lib/pacman/\n" },
             .{ .argv = "stat -L -c %n %a %F /var/cache/mox /var/cache/mox/pacman-db", .code = 1 },
             .{ .argv = "sudo " ++ pacman_make },
@@ -2762,9 +2792,9 @@ test "install: no argv dnf parses carries a --, which dnf5 5.2.x refuses" {
     // 9 (dnf4 4.14) accept it. A `--` here is therefore every dnf row on
     // three current Fedora releases failing, so no argv may carry one.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat zlib-devel", .stdout = "bat\n" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat zlib-devel", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -2959,11 +2989,11 @@ test "install: a name query that cannot run stops the install, never waves it th
     try testing.expectError(Error.DistroQueryFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
 
     var dnf: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .code = 1 },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .code = 1 },
     } };
     var d2: Distro = .{ .manager = .dnf, .runner = dnf.runner(), .force_elevate = false };
     try testing.expectError(Error.DistroQueryFailed, d2.backend().install(a, &.{rowOf("bat", &.{})}));
-    try testing.expect(dnf.called("dnf -q repoquery --installed --qf %{name}\n bat"));
+    try testing.expect(dnf.called("dnf -q --assumeno repoquery --installed --qf %{name}\n bat"));
 }
 
 test "install: dnf refuses a virtual provide, naming the package that provides it" {
@@ -2975,9 +3005,9 @@ test "install: dnf refuses a virtual provide, naming the package that provides i
     // there, only a capability `zlib-ng-compat-devel` provides. rpm reports
     // the provider's name, so the row is missing on every status after.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n zlib-devel" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n zlib-devel", .stdout = "" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n zlib-devel" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n zlib-devel", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -3008,7 +3038,7 @@ test "install: a row dnf has as a dependency is marked user installed, never ins
     // -y groff-base` exits 0. A row judged by the repositories first is
     // refused for ever, for a package the machine demonstrably has.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.2.18.0\ndnf5 plugin API version 2.0\n" },
         .{ .argv = "sudo dnf mark user -y --setopt=assumeno=0 bat" },
     } };
@@ -3038,7 +3068,7 @@ test "install: dnf4 takes the other mark spelling, which dnf5 exits 2 on" {
     // each exiting 2 on the other's, and only dnf5's version line names
     // itself.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "4.14.0\n  Installed: dnf-0:4.14.0-8.el9.noarch\n" },
         .{ .argv = "dnf mark install --setopt=assumeno=0 bat" },
     } };
@@ -3059,11 +3089,11 @@ test "install: a mark that fails is that row's failure, and the rows beside it g
     // is it the batch's failure: the row beside it is marked, and the one
     // after that installed, exactly as if the failed row were not there.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat fd-find ripgrep", .stdout = "bat\nfd-find\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat fd-find ripgrep", .stdout = "bat\nfd-find\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.4.3.0\n" },
         .{ .argv = "dnf mark user -y --setopt=assumeno=0 bat", .code = 1 },
         .{ .argv = "dnf mark user -y --setopt=assumeno=0 fd-find" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -3084,7 +3114,7 @@ test "install: a dnf whose generation cannot be read marks nothing and says whic
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat fd-find", .stdout = "bat\nfd-find\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat fd-find", .stdout = "bat\nfd-find\n" },
         .{ .argv = "dnf --version", .code = 1 },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
@@ -3105,10 +3135,10 @@ test "install: the rows a manager already has are counted apart from the ones it
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat ripgrep", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat ripgrep", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.4.3.0\n" },
         .{ .argv = "dnf mark user -y --setopt=assumeno=0 bat" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrep", .stdout = "ripgrep\n" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 ripgrep" },
     } };
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
@@ -3339,10 +3369,10 @@ test "install: dnf names every provider of a capability several packages carry" 
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n java-devel" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n java-devel", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n java-devel" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n java-devel", .stdout = "" },
         .{
-            .argv = "dnf -q repoquery --qf %{name}\n --whatprovides java-devel",
+            .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides java-devel",
             .stdout = "java-21-openjdk-devel\njava-17-openjdk-devel\njava-21-openjdk-devel\n",
         },
     } };
@@ -3363,9 +3393,9 @@ test "install: dnf says so plainly when nothing provides the name either" {
     const a = arena.allocator();
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n ripgrepp" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrepp", .stdout = "" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides ripgrepp", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n ripgrepp" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrepp", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides ripgrepp", .stdout = "" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
     var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
@@ -3574,8 +3604,8 @@ test "install: a batch that fails names the rows that were in it" {
 
     // The other managers' install is an install and nothing more.
     var dnf: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .stdout = "bat\n" },
         .{ .argv = "dnf install -y --setopt=assumeno=0 bat", .code = 1 },
     } };
     var d2: Distro = .{ .manager = .dnf, .runner = dnf.runner(), .force_elevate = false };
@@ -4183,9 +4213,9 @@ test "install: whether the manager ran is what says the rows may have landed" {
     // A batch whose every row is refused reaches no manager either: there is
     // nothing left to hand it.
     var refused: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n zlib-devel" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n zlib-devel", .stdout = "" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n zlib-devel" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n zlib-devel", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides zlib-devel", .stdout = "zlib-ng-compat-devel\n" },
     } };
     var d4: Distro = .{ .manager = .dnf, .runner = refused.runner(), .force_elevate = false };
     try d4.backend().install(a, &.{rowOf("zlib-devel", &.{})});
@@ -4195,8 +4225,8 @@ test "install: whether the manager ran is what says the rows may have landed" {
     // A manager that ran and failed part-way through is the other answer: its
     // rows may be on the machine, and a re-read must assume they are.
     var ran: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "dnf install -y --setopt=assumeno=0 bat", .code = 1 },
     } };
     var d5: Distro = .{ .manager = .dnf, .runner = ran.runner(), .force_elevate = false };
@@ -4206,9 +4236,9 @@ test "install: whether the manager ran is what says the rows may have landed" {
     // An adapter is asked afresh each time, never left saying what the last
     // batch did.
     var again: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n ripgrepp" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n ripgrepp", .stdout = "" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n --whatprovides ripgrepp", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n ripgrepp" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n ripgrepp", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides ripgrepp", .stdout = "" },
     } };
     d5.runner = again.runner();
     try d5.backend().install(a, &.{rowOf("ripgrepp", &.{})});
@@ -4216,8 +4246,8 @@ test "install: whether the manager ran is what says the rows may have landed" {
     try testing.expect(!d5.backend().installSpawned());
     // And the count is the last batch's, never the one before it.
     var clean: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --qf %{name}\n bat", .stdout = "bat\n" },
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n", .match = .prefix },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n bat", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n", .match = .prefix },
         .{ .argv = "dnf install -y --setopt=assumeno=0 bat" },
     } };
     d5.runner = clean.runner();
@@ -5265,10 +5295,10 @@ test "install: dnf's install and mark carry --setopt=assumeno=0, which a dnf.con
     // nothing installed; `dnf mark user -y sl` on both dnf5 the same. With
     // the option each exits 0 and does its work.
     var five: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat sl", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat sl", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "dnf5 version 5.2.18.0\n" },
         .{ .argv = "sudo dnf mark user -y --setopt=assumeno=0 bat" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n sl", .stdout = "sl\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n sl", .stdout = "sl\n" },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 sl" },
     } };
     var d5: Distro = .{ .manager = .dnf, .runner = five.runner(), .force_elevate = true };
@@ -5277,16 +5307,78 @@ test "install: dnf's install and mark carry --setopt=assumeno=0, which a dnf.con
     try testing.expectEqualStrings("sudo dnf install -y --setopt=assumeno=0 sl", five.calls.items[five.calls.items.len - 1]);
 
     var four: exec.Fake = .{ .arena = a, .entries = &.{
-        .{ .argv = "dnf -q repoquery --installed --qf %{name}\n bat tree", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n bat tree", .stdout = "bat\n" },
         .{ .argv = "dnf --version", .stdout = "4.14.0\n" },
         .{ .argv = "sudo dnf mark install --setopt=assumeno=0 bat" },
-        .{ .argv = "dnf -q repoquery --qf %{name}\n tree", .stdout = "tree\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n tree", .stdout = "tree\n" },
         .{ .argv = "sudo dnf install -y --setopt=assumeno=0 tree" },
     } };
     var d4: Distro = .{ .manager = .dnf, .runner = four.runner(), .force_elevate = true };
     try d4.backend().install(a, &.{ rowOf("bat", &.{}), rowOf("tree", &.{}) });
     try testing.expect(four.called("sudo dnf mark install --setopt=assumeno=0 bat"));
     try testing.expectEqualStrings("sudo dnf install -y --setopt=assumeno=0 tree", four.calls.items[four.calls.items.len - 1]);
+}
+
+test "query: every dnf listing carries --assumeno, which declines the question dnf asks on stdout" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on dnf 4.14.0 (rockylinux:9), dnf5 5.2.18 (fedora:42) and
+    // 5.4.3 (fedora:latest): each of these three listings exits 0 and comes
+    // back byte for byte identical with the option and without it, the whole
+    // name listing among them at 12076, 72747 and 69627 lines.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q --assumeno repoquery --userinstalled --qf %{name}\n", .stdout = "bat\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n jq", .stdout = "" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n jq", .stdout = "jq\n" },
+        .{ .argv = "dnf install -y --setopt=assumeno=0 jq" },
+    } };
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false };
+
+    const explicit = try d.backend().installedExplicit(a);
+    try testing.expectEqual(@as(usize, 1), explicit.len);
+    try d.backend().install(a, &.{rowOf("jq", &.{})});
+
+    var listings: usize = 0;
+    for (fake.calls.items) |c| {
+        if (std.mem.indexOf(u8, c, "repoquery") == null) continue;
+        listings += 1;
+        try testing.expect(std.mem.indexOf(u8, c, "dnf -q --assumeno repoquery") != null);
+    }
+    try testing.expectEqual(@as(usize, 3), listings);
+    try testing.expect(fake.called("dnf install -y --setopt=assumeno=0 jq"));
+}
+
+test "query: dnf's key question is not read back as a package name, whatever puts it on stdout" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Measured on dnf 4.14.0 (rockylinux:9) with `repo_gpgcheck=1` and
+    // `skip_if_unavailable=1` on the `extras` repository, whose signing key
+    // rpm has not imported, and `jq` in `baseos`, which answers: `dnf -q
+    // repoquery --qf '%{name}\n' jq` exits 0 having written `Is this ok
+    // [y/N]: jq\n\n` -- the question, ended without a newline of its own, so
+    // the one real name is glued to it, then dnf4's own blank line.
+    // `--assumeno` keeps the question off that stdout; this is the second
+    // line of defence, so the double writes those bytes back on the argv
+    // that carries the option.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dnf -q --assumeno repoquery --installed --qf %{name}\n jq" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n jq", .stdout = "Is this ok [y/N]: jq\n\n" },
+        .{ .argv = "dnf -q --assumeno repoquery --qf %{name}\n --whatprovides jq", .stdout = "Is this ok [y/N]: jq\n\n" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = false, .err = &w.writer };
+
+    try d.backend().install(a, &.{rowOf("jq", &.{})});
+    try testing.expectEqual(@as(usize, 1), d.backend().installRefused());
+    try testing.expectEqualStrings(
+        "mox: dnf: row \"jq\" names no package dnf will install here: no enabled repository carries it, or an exclude in dnf's configuration keeps it out\n",
+        w.written(),
+    );
+    for (fake.calls.items) |c| try testing.expect(std.mem.indexOf(u8, c, "dnf install") == null);
 }
 
 const pacman_probe = "stat -L -c %n %a %F " ++ pacman_cache ++ " " ++ pdb;

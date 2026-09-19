@@ -150,7 +150,7 @@ package manager at all is usable here, `status` notes
 |---|---|---|---|
 | `brew` | name; a cask is a separate namespace | `brew list --full-name --installed-on-request`, `brew list --cask --full-name`, both under `HOMEBREW_NO_AUTO_UPDATE=1`, so a read-only `status` never refreshes brew's cached API data on a timer (a cache that does not exist yet is still populated once), and with `HOMEBREW_NO_INSTALL_FROM_API` unset, since under it the listing clones homebrew/core on a machine that has never tapped it. The install runs under the user's own environment. The cask half is not an explicit-install query (below) | `kind` (`formula`, `cask`) |
 | `apt` | name | `apt-mark showmanual`, intersected with what `dpkg-query` reports `installed`: a package an interrupted run left unpacked is listed as manual and is not on the machine in any usable sense, so its row reads missing and the install configures it. An install runs `apt-get update` first, so the index it resolves against is current | -- |
-| `dnf` | name | `dnf -q repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; the format string because its default packs several to a line); the install and the mark carry `--setopt=assumeno=0`, since a dnf.conf `assumeno=True` otherwise outranks `-y` and aborts both | -- |
+| `dnf` | name | `dnf -q --assumeno repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; `--assumeno` because dnf4 writes its key-import question there too, ending it without a newline, so the first name of the listing is glued to it; the format string because its default packs several to a line); the install and the mark carry `--setopt=assumeno=0`, since a dnf.conf `assumeno=True` otherwise outranks `-y` and aborts both | -- |
 | `pacman` | name | `pacman -Qeq`; an install is one `pacman -Syu --needed --noconfirm` transaction with the rows as its targets, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
 | `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
@@ -579,6 +579,18 @@ legitimately compile for an hour -- and `MOX_INSTALL_TIMEOUT_MS` bounds it
 when set: at the bound the manager gets SIGINT first, so it can roll back
 its transaction, and SIGKILL ten seconds later.
 `--dry-run` lists what it would install and installs nothing.
+
+A dnf install answers dnf's own questions, and the import of a repository's
+signing key is one of them: on a machine whose rpm holds no key for a
+repository dnf installs from, the first install imports the one that
+repository's `gpgkey=` names, and every package signed with it is trusted
+from then on. Nothing is asked. What reaches the terminal is dnf's record of
+having done it, the install being streamed -- on dnf 4.14.0, `Importing GPG
+key 0x350D275D:`, the fingerprint, and `Key imported successfully`. The
+queries mox runs import nothing: they decline that question, so a repository
+that would have needed the import contributes no name to them. Where
+accepting that key is a decision to take deliberately, import it before the
+first `mox apply`.
 
 apply **only ever installs**. Removal is never automatic: an untracked
 package is reported and reconciled, never uninstalled behind you. (What a

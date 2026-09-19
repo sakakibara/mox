@@ -80,7 +80,9 @@
 # on another architecture than dpkg's, where every query still answers and
 # none of them shows the difference; one covers a package dpkg left
 # unpacked, which apt-mark lists as manual and only an install can finish;
-# and one covers a dnf.conf `assumeno=True`, which outranks `-y`. The
+# one covers a dnf.conf `assumeno=True`, which outranks `-y`; and one covers
+# a dnf repository whose signing key rpm has not imported, where dnf4 asks
+# about the import on the stdout a query reads its names from. The
 # hermetic suite proves what the adapter does; only the real manager proves
 # what the row would have done. These run with the
 # default set, not from the image/backend/package arguments.
@@ -155,6 +157,33 @@ pull_image() {
   return 1
 }
 
+# Whether pacman can sync on this host at all, asked once and remembered.
+# Every pacman check reads a database, and mox syncs its own copy to answer
+# from; a host whose pacman cannot run its download sandbox -- `error
+# restricting syscalls via seccomp: 22!` under x86 emulation -- fails that
+# sync in every case, which is the host's limitation and not the adapter's.
+# The cases that build a database of their own already tell the two apart
+# with their own guard; this asks the same question for the ones that take
+# the image's. Returns 1 when the case cannot run, having already reported
+# why, on the same terms as `pull_image`.
+pacman_sync_probe=""
+pacman_can_sync() {
+  image="$1"
+  backend="$2"
+  probe="$work/pacman-sync-probe.txt"
+  if [ -z "$pacman_sync_probe" ]; then
+    if docker run --rm --platform "$platform" "$image" pacman -Sy --noconfirm >"$probe" 2>&1; then
+      pacman_sync_probe=ok
+    else
+      pacman_sync_probe=failed
+    fi
+  fi
+  [ "$pacman_sync_probe" = ok ] && return 0
+  skip "$backend ($image): pacman could not sync here, so the database every check reads could not be built" \
+    "$(tail -2 "$probe")"
+  return 1
+}
+
 # One round trip: declare `pkg` for `backend`, and require MISSING -> install
 # -> clean against `image`.
 run_case() {
@@ -179,6 +208,9 @@ EOF
 
   out="$case_dir/out.txt"
   pull_image "$image" "$backend" "$case_dir" || return 0
+  if [ "$backend" = pacman ]; then
+    pacman_can_sync "$image" "$backend" || return 0
+  fi
 
   # `sh -c` rather than separate runs: the container is torn down each time,
   # so the install and the status that must see it have to share one.
@@ -1287,6 +1319,7 @@ EOF
 
   out="$case_dir/out.txt"
   pull_image "$image" "$backend" "$case_dir" || return 0
+  pacman_can_sync "$image" "$backend" || return 0
 
   if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
       set -e
@@ -1376,6 +1409,7 @@ EOF
 
   out="$case_dir/out.txt"
   pull_image "$image" "$backend" "$case_dir" || return 0
+  pacman_can_sync "$image" "$backend" || return 0
 
   if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh -c '
       set -e
@@ -2957,14 +2991,19 @@ EOF
 # none of the batch -- while one installed and locked at its newest lets the
 # batch land. The search table reads `il` for both; only `zypper
 # list-updates --all` tells them apart. The image's own pending updates
-# supply the package; a lock on one with none pending (bash) must not be
-# refused.
+# supply the package, or `down` names one to step back a build so that there
+# is one; a lock on a package with none pending (bash) must not be refused.
 run_zypper_installed_lock_case() {
   image="$1"
   pkg="$2"
+  down="${3:-}"
   backend="zypper installed-lock"
 
-  case_dir="$work/zypper-installed-lock"
+  # One directory per image, never one reused: this case writes its manifest
+  # from INSIDE the container, so `data/packages` is empty when the bind
+  # mount is made, and a second mount of a path just deleted and recreated
+  # showed the container an empty tree the host had already filled.
+  case_dir="$work/zypper-installed-lock-$(printf '%s' "$image" | tr '/:.' '---')"
   rm -rf "$case_dir"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
@@ -2976,9 +3015,18 @@ run_zypper_installed_lock_case() {
       set -e
       export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
       pkg="$1"
+      down="${2:-}"
       rpm -q "$pkg" >/dev/null 2>&1 && { echo "the image ships $pkg; the case cannot run"; exit 1; }
       zypper --non-interactive refresh >/dev/null 2>&1 || true
-      LC_ALL=C zypper --non-interactive --quiet --no-color list-updates --all > /tmp/lu.txt 2>/dev/null || true
+      # A stable release ships what its repositories already hold, so nothing
+      # on it has an update pending: `down` names a package to step back one
+      # build, which gives the lock something to stop.
+      if [ -n "$down" ]; then
+        zypper --non-interactive install --oldpackage --allow-downgrade "$down<$(rpm -q --qf "%{VERSION}-%{RELEASE}" "$down")" >/dev/null 2>&1 || true
+      fi
+      # A warning about a repository is not a row of the table, and Leap
+      # writes one to stdout.
+      LC_ALL=C zypper --non-interactive --quiet --no-color list-updates --all 2>/dev/null | grep -v "^Warning:" | grep -v "^$" > /tmp/lu.txt || true
       # The image ships no awk: the third row of the table, third column.
       name=$(sed -n 3p /tmp/lu.txt | cut -d "|" -f 3 | tr -d " ")
       [ -n "$name" ] || { echo "pending=none"; exit 0; }
@@ -2995,7 +3043,7 @@ run_zypper_installed_lock_case() {
       echo "apply-exit=$rc"
       echo "landed-pkg=$(rpm -q "$pkg" >/dev/null 2>&1 && echo 1 || echo 0)"
       echo "locks-kept=$(zypper ll | grep -c "$name\|bash" || true)"
-    ' sh "$pkg" >"$out" 2>&1; then
+    ' sh "$pkg" "$down" >"$out" 2>&1; then
     no "$backend ($image): container run failed" "$(tail -3 "$out")"
     return
   fi
@@ -4081,6 +4129,109 @@ CASE
   fi
 }
 
+# A repository whose signing key rpm has not imported, under
+# `repo_gpgcheck=1` and `skip_if_unavailable=1`: dnf4 asks whether to import
+# it on the STDOUT a query reads names from, exits 0, and ends the question
+# without a newline, so it is glued to the first name of the listing.
+# Measured on dnf 4.14.0 with rockylinux:9's `extras` repository so
+# configured and `jq` in `baseos`: `dnf -q repoquery --qf '%{name}\n' jq`
+# exits 0 with stdout `Is this ok [y/N]: jq\n\n`, where `dnf -q --assumeno
+# repoquery --qf '%{name}\n' jq` answers `jq\n\n`. Without the option mox
+# finds no package of that name and the row never converges; the name class
+# keeps the question out of the name set besides, so no message can quote it
+# back as the package to declare.
+run_dnf_unimported_key_case() {
+  image="$1"
+  pkg="$2"
+  backend="dnf unimported-key"
+
+  case_dir="$work/dnf-unimported-key"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/dnf.toml" <<EOF
+backend = "dnf"
+
+[[packages]]
+name = "$pkg"
+EOF
+  cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+pkg="$1"
+dnf --version | head -1
+rpm -q gpg-pubkey >/dev/null 2>&1 && { echo "this image has a signing key imported already; the case cannot run"; exit 1; }
+rpm -q "$pkg" >/dev/null 2>&1 && { echo "this image ships $pkg; the case cannot run"; exit 1; }
+# Not every repository: the one that carries the package must still answer,
+# or there is no name for the question to be glued to.
+sed -i '/^\[extras\]/a repo_gpgcheck=1\nskip_if_unavailable=1' /etc/yum.repos.d/rocky-extras.repo
+echo "--- premise ---"
+rc=0
+LC_ALL=C dnf -q repoquery --qf '%{name}\n' "$pkg" > /tmp/plain.txt 2>/dev/null || rc=$?
+echo "plain-exit=$rc"
+echo "plain-stdout=$(tr -d '\n' < /tmp/plain.txt)"
+echo "--- before ---"
+/w/mox status || true
+echo "--- apply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "apply-exit=$rc"
+echo "--- after ---"
+/w/mox status || true
+echo "--- record ---"
+rpm -q "$pkg" || true
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh "$pkg" >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  premise="$(sed -n '/--- premise ---/,/--- before ---/p' "$out")"
+  if echo "$premise" | grep -q "^plain-exit=0" && echo "$premise" | grep -q "^plain-stdout=Is this ok \[y/N\]: $pkg$"; then
+    ok "$backend ($image): dnf's own query writes the key question to stdout, glued to the one name it answers"
+  else
+    no "$backend ($image): the case could not put dnf in the state it is about" "$premise"
+  fi
+
+  before="$(sed -n '/--- before ---/,/--- apply ---/p' "$out")"
+  if echo "$before" | grep -qE "MISSING[[:space:]]+dnf $pkg"; then
+    ok "$backend ($image): the row reads MISSING before the apply"
+  else
+    no "$backend ($image): expected '$pkg' MISSING before apply" "$(echo "$before" | tail -5)"
+  fi
+
+  # The question is dnf talking, never a package: mox must not read it as a
+  # name, and must not quote it back as the one to declare.
+  if grep -q "^mox: dnf: .*Is this ok" "$out"; then
+    no "$backend ($image): mox read dnf's question as a package name" "$(grep '^mox: dnf: ' "$out" | head -1)"
+  else
+    ok "$backend ($image): no mox message names dnf's question"
+  fi
+
+  if grep -q "Packages: 1 installed, 0 failed" "$out" && grep -q "apply-exit=0" "$out"; then
+    ok "$backend ($image): the row installs through the repository that did answer"
+  else
+    no "$backend ($image): apply did not install the row" "$(grep -i 'packages:\|apply-exit=\|^mox: dnf' "$out" | tail -3)"
+  fi
+
+  after="$(sed -n '/--- after ---/,/--- record ---/p' "$out")"
+  if echo "$after" | grep -qE "MISSING[[:space:]]+dnf"; then
+    no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
+  else
+    ok "$backend ($image): the drift is clean after apply"
+  fi
+
+  if sed -n '/--- record ---/,$p' "$out" | grep -q "^$pkg-"; then
+    ok "$backend ($image): rpm has the package the apply reported"
+  else
+    no "$backend ($image): the machine does not show what the apply reported" "$(sed -n '/--- record ---/,$p' "$out")"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -4143,6 +4294,9 @@ else
   run_dnf_assumeno_case rockylinux:9
   run_dnf_assumeno_case fedora:42
   run_dnf_assumeno_case fedora:latest
+  # dnf4 alone: dnf5 5.2.18 and 5.4.3 both send the key question to stderr,
+  # where it is no part of the listing.
+  run_dnf_unimported_key_case rockylinux:9 jq
   run_case opensuse/tumbleweed zypper ripgrep
   # zypper's only other case installs a real package; these two are the
   # negative half every other manager already has.
@@ -4152,6 +4306,11 @@ else
   run_zypper_color_case opensuse/tumbleweed ripgrep
   run_zypper_lock_case opensuse/tumbleweed bat
   run_zypper_installed_lock_case opensuse/tumbleweed ripgrep
+  # The same case on the older zypper of a stable release, whose
+  # `list-updates --all` table is the one this parse reads: 1.14.94 against
+  # Tumbleweed's 1.14.101. Leap ships what its repositories hold, so curl
+  # steps back one build to give the lock an update to stop.
+  run_zypper_installed_lock_case opensuse/leap:15.6 ripgrep curl
   # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
