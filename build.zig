@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) void {
 
     // Generator-prune property + fuzz test at tests/prune_property_test.zig.
     // The deterministic property test runs on every `zig build test`; its Smith
-    // target also fuzzes continuously under `zig build fuzz --fuzz`.
+    // target is also one of the `zig build fuzz` targets.
     const prune_prop_mod = b.createModule(.{
         .root_source_file = b.path("tests/prune_property_test.zig"),
         .target = target,
@@ -324,7 +324,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(prune_prop_tests).step);
 
     // Fuzz targets at tests/fuzz_test.zig. Run once as smoke tests under the
-    // normal test step; fuzz continuously with `zig build fuzz --fuzz`.
+    // normal test step and under `zig build fuzz`. Continuous fuzzing is
+    // unavailable: under Zig 0.16.0 `--fuzz` fails to compile the shipped
+    // test runner.
     const fuzz_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/fuzz_test.zig"),
         .target = target,
@@ -334,7 +336,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_tests_mod });
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
-    const fuzz_step = b.step("fuzz", "Run the fuzz targets (add --fuzz to fuzz continuously)");
+    const fuzz_step = b.step("fuzz", "Run the fuzz targets once as bounded smoke checks");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
     fuzz_step.dependOn(&b.addRunArtifact(prune_prop_tests).step);
 }

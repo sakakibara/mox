@@ -4,7 +4,7 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] - 2026-09-19
 
 ### Added
 - Packages. A `data/packages/*.toml` manifest of `[[packages]]` rows (core
@@ -49,115 +49,112 @@ All notable changes to mox are documented here. The format follows
   accident. A directory named like a plugin says what it is rather than that
   no such backend exists.
 - `status` reports each backend's MISSING and UNTRACKED packages, `apply`
-  installs the missing and counts a plan's own failures under `--dry-run`
-  as the real run counts its own (after the pre stage and its re-capture, and
-  first installing a declared manager that is absent from its verified
-  installer, then using it in the same run -- brew and scoop by the path it
-  landed at, a plugin by the bin dir it reports; `--dry-run` plans as though
-  that had happened), and `commit` offers each untracked package to add,
-  blacklist or skip, appending a row the moment it is chosen and never
-  editing one (`q` ends the run before the file pass, saying how many rows
-  were already recorded); the append holds an exclusive lock on the manifest
-  file's directory across its read and its rewrite, so two runs that share a
-  repo but have a state directory each -- `mox commit` beside `sudo mox
-  commit` -- cannot both read the file before either writes it and drop a
-  row. Windows locks no directory, and there the state lock is what stands
-  between them. Nothing ever uninstalls. A repo without
+  installs the missing, and `commit` offers each untracked package to add,
+  blacklist or skip. Nothing ever uninstalls. A repo without
   `data/packages/` queries no manager and reports nothing; one with the
   directory and no file yet is in use and reports everything installed as
-  untracked, ready for a first file to record it in.
-  Every captured manager call is bounded by the setup-script timeout: the
+  untracked, ready for a first file to record it in. `--skip-scripts` and a
+  path-scoped `apply`, `commit` or `status` reach no package.
+- `apply` installs a declared manager that is absent from its verified
+  installer and then uses it in the same run -- brew and scoop by the path it
+  landed at, a plugin by the bin dir it reports -- after the pre stage and its
+  re-capture. `--dry-run` plans as though that had happened, and counts a
+  plan's own failures as the real run counts its own.
+- `commit` appends a package row the moment it is chosen and never edits one;
+  `q` ends the run before the file pass, saying how many rows were already
+  recorded. The append holds an exclusive lock on the manifest file's
+  directory across its read and its rewrite, so two runs that share a repo but
+  have a state directory each -- `mox commit` beside `sudo mox commit` --
+  cannot both read the file before either writes it and drop a row. Windows
+  locks no directory, and there the state lock is what stands between them.
+- `status` reports the rows of an absent manager that has a bootstrap row as
+  missing and notes that apply will bootstrap it; a manager whose `--version`
+  fails is reported `BROKEN` and counted in the exit code, as is one that
+  answered its probe and then failed a query -- one manager that cannot answer
+  is that manager's row, beside every other manager's results, never a refusal
+  of the whole pass. A `BROKEN` row says what was asked and why it could not
+  answer; the `package_broken` porcelain record carries backend, exit code and
+  that reason, and the JSON entry is `{backend, state, exit, probe, why?}`.
+- A package pass that produced nothing at all -- a manifest that would not
+  load or validate, or a plugin set that could not be discovered -- is a
+  record of its own on stdout and in both machine formats (`ERROR     the
+  package pass was refused; the reason is the mox status: packages: line`,
+  `{"state":"refused"}` and `package_refused`), so a refusal is never read as
+  a clean machine.
+- Every captured manager call is bounded by the setup-script timeout: the
   bound covers reading its output and waiting for it, and a kill is reported
   as a timeout naming the backend. A streamed install is not bounded unless
-  `MOX_INSTALL_TIMEOUT_MS` is set. Every child leads its own process group,
-  and a streamed one is handed the terminal for its run, so `sudo` can
-  prompt and Ctrl-C reaches the manager (and ends mox with it); at a bound
-  the child's whole group is interrupted and then killed, so no manager
-  outlives the run that started it (Windows has neither groups nor job
-  control, so there the direct process is terminated at once). Under
-  `--json` and `--porcelain`, plugin notes go to stderr and stdout stays
-  machine-pure. A Ctrl-C during a query kills the query's group before mox
-  dies of the interrupt; a Ctrl-Z during an install suspends the job and
-  hands the terminal back, so the shell can resume it. `--skip-scripts`
-  and a path-scoped `apply`, `commit` or `status` reach no package. `status`
-  reports the rows of an absent manager that has a bootstrap row as missing
-  and notes that apply will bootstrap it; a manager whose `--version` fails
-  is reported `BROKEN` and counted in the exit code, as is one that answered
-  its probe and then failed a query -- one manager that cannot answer is that
-  manager's row, beside every other manager's results, never a refusal of the
-  whole pass. A `BROKEN` row says what was asked and why it could not answer;
-  the `package_broken` porcelain record carries backend, exit code and that
-  reason, and the JSON entry is `{backend, state, exit, probe, why?}`. A
-  package pass that produced nothing at all -- a manifest that would not load
-  or validate, or a plugin set that could not be discovered -- is a record of
-  its own on stdout and in both machine formats (`ERROR     the package pass
-  was refused; the reason is the mox status: packages: line`,
-  `{"state":"refused"}` and `package_refused`), so a refusal is never read as
-  a clean machine. `mox --help` names
+  `MOX_INSTALL_TIMEOUT_MS` is set. `mox --help` names
   `MOX_SCRIPT_TIMEOUT_MS`, `MOX_INSTALL_TIMEOUT_MS` and
-  `MOX_PACKAGES_DEPTH`. A manifest refuses a `name` its manager would read
-  as an operation rather than a package. Each manager has its own class,
-  because each has its own grammar. apt, dnf, pacman and zypper take a name
-  beginning with a letter or a digit and carrying only `[A-Za-z0-9._+-]`,
-  never ending in `-`, which all four read as a request to REMOVE that
-  package; a trailing `+` stays legal, since `g++` is a package, and an apt
-  name may carry one `:<arch>` qualifier, which is the one name apt itself
-  reports with a colon in it. brew takes a formula or cask, `@` included for
-  `openssl@3`, or a tap-qualified `owner/tap/name`, so a row cannot be an
-  option (`brew install --help` exits 0 having installed nothing, which
-  would count as installed and reinstall forever), a local Ruby file or a
-  URL. scoop takes one token, so a row cannot be a manifest path, a URL, a
-  bucket-qualified name or a pinned version that scoop then reports under
-  its bare name; winget's identifiers are the publisher's own strings, so
-  its rule refuses what would make one a path, a URL, a pattern or an option
-  rather than narrowing what an identifier may hold. A row naming a capability rather than a
-  package (`pkgconfig(...)`), a version relation, or an architecture suffix
-  is refused for the same reason: it installs under one name and is read back
-  under another, so it would be reported missing and reinstalled forever.
-  The field values an adapter splices into its manager's argv -- scoop's
-  `bucket`, winget's `source` -- are held to the same class as a name, and
-  winget's `override`, which exists to carry an installer's own command
-  line, is held to what an argv can carry intact. `mox commit` puts a row it
-  is about to write through that same check, so no manager's answer can
-  produce a file a later command refuses.
-
-  Whether a manager HAS a package of that name is asked of the manager
-  itself before an install -- apt against `apt-cache --generate pkgnames`,
-  narrowed to the native architecture and to repository packages so a bare
-  row can only mean the package apt-mark would report bare, or against
-  `apt-cache madison` for a name carrying an architecture, dnf against `dnf
-  repoquery`, pacman against `pacman -Sg`, brew against `brew info
-  --json=v2` -- so a name apt would read as a regular expression, a name apt
-  has only for a foreign architecture, a name apt has as a virtual name
-  rather than a package, a name that is only an rpm capability, a pacman
-  group, a brew alias, and an apt row carrying the machine's own
-  architecture or apt's `:native`, `:all` or `:any` are each refused with
-  the name to declare instead, having installed nothing. The repositories
-  are not apt's whole answer: `dpkg-query` says which architecture an
-  already-installed package is under, so a bare row whose package came from
-  a `.deb` and is native (or `all`) is kept -- apt-get marks it manual and
-  the row converges -- while one whose package is installed only for a
-  foreign architecture is refused with the qualified spelling. apt is
-  asked two more questions, because a held package and a pinned one each
-  make `apt-get install` install nothing at all: `apt-mark showhold` and
+  `MOX_PACKAGES_DEPTH`. Under `--json` and `--porcelain`, plugin notes go to
+  stderr and stdout stays machine-pure.
+- Every child leads its own process group, and a streamed one is handed the
+  terminal for its run, so `sudo` can prompt and Ctrl-C reaches the manager
+  (and ends mox with it); at a bound the child's whole group is interrupted
+  and then killed, so no manager outlives the run that started it (Windows has
+  neither groups nor job control, so there the direct process is terminated at
+  once). A Ctrl-C during a query kills the query's group before mox dies of
+  the interrupt; a Ctrl-Z during an install suspends the job and hands the
+  terminal back, so the shell can resume it.
+- A manifest refuses a `name` its manager would read as an operation rather
+  than a package. Each manager has its own class, because each has its own
+  grammar. apt, dnf, pacman and zypper take a name beginning with a letter or
+  a digit and carrying only `[A-Za-z0-9._+-]`, never ending in `-`, which all
+  four read as a request to REMOVE that package; a trailing `+` stays legal,
+  since `g++` is a package, and an apt name may carry one `:<arch>` qualifier,
+  which is the one name apt itself reports with a colon in it.
+- brew takes a formula or cask, `@` included for `openssl@3`, or a
+  tap-qualified `owner/tap/name`, so a row cannot be an option (`brew install
+  --help` exits 0 having installed nothing, which would count as installed and
+  reinstall forever), a local Ruby file or a URL. scoop takes one token, so a
+  row cannot be a manifest path, a URL, a bucket-qualified name or a pinned
+  version that scoop then reports under its bare name; winget's identifiers
+  are the publisher's own strings, so its rule refuses what would make one a
+  path, a URL, a pattern or an option rather than narrowing what an identifier
+  may hold.
+- A row naming a capability rather than a package (`pkgconfig(...)`), a
+  version relation, or an architecture suffix is refused for the same reason:
+  it installs under one name and is read back under another, so it would be
+  reported missing and reinstalled forever. The field values an adapter
+  splices into its manager's argv -- scoop's `bucket`, winget's `source` --
+  are held to the same class as a name, and winget's `override`, which exists
+  to carry an installer's own command line, is held to what an argv can carry
+  intact. `mox commit` puts a row it is about to write through that same
+  check, so no manager's answer can produce a file a later command refuses.
+- Whether a manager HAS a package of that name is asked of the manager itself
+  before an install -- apt against `apt-cache --generate pkgnames`, narrowed
+  to the native architecture and to repository packages so a bare row can only
+  mean the package apt-mark would report bare, or against `apt-cache madison`
+  for a name carrying an architecture, dnf against `dnf repoquery`, pacman
+  against `pacman -Sg`, brew against `brew info --json=v2` -- so a name apt
+  would read as a regular expression, a name apt has only for a foreign
+  architecture, a name apt has as a virtual name rather than a package, a name
+  that is only an rpm capability, a pacman group, a brew alias, and an apt row
+  carrying the machine's own architecture or apt's `:native`, `:all` or `:any`
+  are each refused with the name to declare instead, having installed nothing.
+- The repositories are not apt's whole answer: `dpkg-query` says which
+  architecture an already-installed package is under, so a bare row whose
+  package came from a `.deb` and is native (or `all`) is kept -- apt-get marks
+  it manual and the row converges -- while one whose package is installed only
+  for a foreign architecture is refused with the qualified spelling. apt is
+  asked two more questions, because a held package and a pinned one each make
+  `apt-get install` install nothing at all: `apt-mark showhold` and
   `apt-cache policy` name the row to refuse, and a hold is never overridden.
-  brew is asked once per kind, formulae and casks being separate namespaces
-  that share names, and about tap-qualified rows as well, since brew reports
-  a `homebrew/core` formula bare; a batch brew answers for none of is asked
-  again one name at a time, so one name brew cannot resolve does not turn
-  the check off for the rest. A name a manager merely cannot find is not
-  refused where absence is no evidence: pacman's database is whatever the
-  machine last synced, and the install syncs it. pacman's "this is no
-  group" answer IS acted on, so it is asked of a database every repository
-  in `pacman-conf --repo-list` answered for, and mox syncs first when one of
-  them did not. A refused row is its own failure: the rows beside it are
-  installed, since one bad row in a manifest must not keep every other
-  package off the machine. `mox apply --dry-run` runs none of those checks --
-  they refresh an index and elevate,
-  which a dry run may not do -- and says, beside the rows it would install,
-  which manager list it left them unchecked against.
-
-  A manifest also refuses an unknown top-level key, a `name` that is blank
+- brew is asked once per kind, formulae and casks being separate namespaces
+  that share names, and about tap-qualified rows as well, since brew reports a
+  `homebrew/core` formula bare; a batch brew answers for none of is asked
+  again one name at a time, so one name brew cannot resolve does not turn the
+  check off for the rest. A name a manager merely cannot find is not refused
+  where absence is no evidence: pacman's database is whatever the machine last
+  synced, and the install syncs it. pacman's "this is no group" answer IS
+  acted on, so it is asked of a database every repository in `pacman-conf
+  --repo-list` answered for, and mox syncs first when one of them did not.
+- A refused row is its own failure: the rows beside it are installed, since
+  one bad row in a manifest must not keep every other package off the machine.
+  `mox apply --dry-run` runs none of those checks -- they refresh an index and
+  elevate, which a dry run may not do -- and says, beside the rows it would
+  install, which manager list it left them unchecked against.
+- A manifest also refuses an unknown top-level key, a `name` that is blank
   or carries whitespace, a control byte or a byte that is not UTF-8 or runs
   past 256 bytes -- one rule with the shape an id must have, so a row an
   adapter writes is a row the loader reads back -- a file-level `backend`
@@ -1037,3 +1034,23 @@ Nothing about a machine is recorded outside it.
   to nothing under every configuration in its axis space, which is typically a
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
+
+[0.12.0]: https://github.com/sakakibara/mox/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/sakakibara/mox/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/sakakibara/mox/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/sakakibara/mox/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/sakakibara/mox/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/sakakibara/mox/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/sakakibara/mox/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/sakakibara/mox/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/sakakibara/mox/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/sakakibara/mox/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/sakakibara/mox/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/sakakibara/mox/compare/v0.1.6...v0.2.0
+[0.1.6]: https://github.com/sakakibara/mox/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/sakakibara/mox/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/sakakibara/mox/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/sakakibara/mox/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/sakakibara/mox/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/sakakibara/mox/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/sakakibara/mox/releases/tag/v0.1.0

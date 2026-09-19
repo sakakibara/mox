@@ -2,17 +2,23 @@
 
 The behavioral contract of every command, with each one's flags in a
 table beneath it. Those tables are rendered from the same declarations
-`mox <cmd> --help`, shell completion, and `mox __schema` are derived
-from, and a test fails when they and argv disagree -- so a flag here is
-one mox accepts, spelled the way it accepts it. What a flag *means* is
+`mox <cmd> --help` and `mox __schema` are derived from (the schema
+carries each positional's completion behavior, so a completion generator
+reads the same table), and a test fails when they and argv disagree --
+so a flag here is one mox accepts, spelled the way it accepts it. What a flag *means* is
 prose, and hand-written. [usage.md](usage.md) walks through the
 day-to-day tasks.
 
-Mutating commands (`apply`, `commit`, `rollback`, `facts set`, `update`,
-`publish`,
-`upgrade`, `mv`, `remove`, `uninstall`) take a single-writer lock at
-`state/mox.lock`; a second process is refused while the first runs. An
-unknown command exits 2.
+Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
+`rollback`, `uninstall`, `update`, `facts set`, `facts ask`, a bare `facts`
+that reaches the interview, and `doctor` under `--fix`, `--rebuild-provenance`
+or `--rebuild-coupling`) take a single-writer lock at `<state dir>/mox.lock`
+(`$MOX_STATE_DIR`, default `$XDG_STATE_HOME/mox`); a second process sharing
+that state directory is refused while the first runs. The lock is per state
+directory, so runs given different `MOX_STATE_DIR` values take different locks
+and do not serialize against each other -- one state directory per live tree.
+`upgrade` takes no lock: it replaces the mox binary, not the repo or the live
+tree. An unknown command exits 2.
 
 ## Path arguments
 
@@ -32,11 +38,16 @@ other command's. `.` and `..` resolve, so any spelling of a path equals
 the file it names.
 
 The tilde is expanded by mox as well as by the shell, because a shell
-does not always get there first: quoting stops it (`"~/x"`), so does a
-non-initial position (`--path=~/x`), PowerShell passes `~` through to a
-native program verbatim, and a script may build the argument without a
-shell at all. `~user` is not expanded and is refused rather than read as
-a directory named `~user`; on Windows, spell the tail with `/`.
+does not always get there first: quoting stops it (`"~/x"`), PowerShell
+passes `~` through to a native program verbatim, and a script may build
+the argument without a shell at all. `~user` is not expanded and is
+refused rather than read as a directory named `~user`; on Windows, spell
+the tail with `/`.
+
+This is the live-path rule, and it covers the commands above.
+`export --facts <path>` names a file outside the live tree and takes it
+as given: mox expands no tilde there, so spell the path out or leave it
+unquoted for the shell to expand.
 
 Environment variables are the shell's to expand, and mox does not: a
 literal `$HOME` reaches it only when something meant it literally.
@@ -59,6 +70,11 @@ interview is the ordinary interactive one; add `--defaults` (see
 [apply](#apply)) for the zero-touch form that binds declared defaults
 and declines the rest instead of prompting.
 
+The skeleton is not a git repository: run `git init` in it, and add a
+remote, before `mox publish`, `mox update` or `mox git` can work, and
+`mox doctor` skips its tracked-source check until you do. `--clone`
+arrives with git history already.
+
 `--clone` accepts shorthand alongside full URLs:
 
 | Argument | Clones |
@@ -66,7 +82,8 @@ and declines the rest instead of prompting.
 | `owner` | `https://github.com/owner/dotfiles` |
 | `owner/repo` | `https://github.com/owner/repo` |
 | `host/owner/repo` | `https://host/owner/repo` |
-| anything else | used as given |
+| `host/owner/.../repo` (more segments) | `https://host/owner/.../repo` |
+| anything with a scheme, a colon, or a leading `/`, `.` or `~` | used as given |
 
 The shorthand is sugar only: an argument with a scheme, a colon
 (scp-style `git@host:path` remotes, drive letters), a leading `/`, `.`,
@@ -136,12 +153,14 @@ into the timestamped trash first (recoverable); its
 `.mox/attributes.toml` entry (mode, symlink, seed-once) is carried to
 the new name; a head ownership declaration travels inside the renamed
 source, and a partial target's owned record is re-keyed -- the old live
-file keeps its owned content, like any orphaned live file.
+file keeps its owned content, like any orphaned live file. The old live
+path is not removed: apply writes the new one and leaves the old file
+orphaned, to delete yourself.
 
 ## remove
 
 Stop managing a file: move its source (base + `.d/`) into
-`<state>/trash/<timestamp>/` recoverably and leave the live file
+`<state dir>/trash/<timestamp>/` recoverably and leave the live file
 orphaned. mox forgets the path's applied state, so a later re-add
 starts from first contact. `--purge` also deletes the live file,
 snapshotting it first; it is refused for a partially owned file (the
@@ -199,7 +218,7 @@ bootstrap's own download is a captured call, bounded like every other by
 `MOX_SCRIPT_TIMEOUT_MS`.
 A repo without `data/packages/` never queries a package manager.
 
-apply is non-interactive. It writes every file that is clean or absent
+apply never prompts about drift. It writes every file that is clean or absent
 and never silently changes one that has drifted -- a live file edited
 since mox last wrote it, or one mox never wrote (a first apply or
 migration). Drifted files are left untouched, listed in a report on
@@ -254,17 +273,19 @@ counted under `failed` too, though none of them is a script.
 
 Route edits made to live files back into their sources.
 
-Each change is confirmed on a terminal:
+Each change is confirmed on a terminal, and every prompt also accepts
+`q`, which aborts the whole run without writing anything. The keys are:
 
-- `[y/s]` for a routed hunk.
-- `[s/x]` for one that lies in no single source (`x` splits it at its
-  origin boundaries).
-- `[f/d/s]` for an interpolated value: write the fact, or the source's
-  `| default`.
+- `y` accept, `s` skip, for a routed hunk.
+- `s` skip, `x` split, for one that lies in no single source (`x` splits
+  it at its origin boundaries).
+- `f` fact, `d` default, `s` skip, for an interpolated value: write the
+  fact, or the source's `| default`.
 
-`--yes` takes the defaults; `--dry-run` or a non-TTY reports only and
-exits 1 if edits remain; `--abort-on-prompt` is strict CI mode, exiting
-2 on the first would-be prompt.
+`--yes` takes the defaults, terminal or not; `--dry-run`, or a non-TTY
+without `--yes`, reports only and exits 1 if edits remain;
+`--abort-on-prompt` is strict CI mode, exiting 2 on the first would-be
+prompt.
 
 Routing: base lines go to `src/`, fragment lines to their fragment,
 loop-row edits to the data source. Private-origin edits go only to the
@@ -279,12 +300,18 @@ the edit against it. A source that now composes to nothing is the one
 exception: there is no file to route into, so commit reports it and
 leaves the live copy for you to remove or re-fill.
 
-A file merged from several layers routes per KEY instead of per line,
-`[y/p/s]`: each changed key goes to the layer that defines it, and `p`
-picks a different layer. A shared (base or universal-fragment) edit
-prompts for where it belongs: keep it universal (the default, and what
-`--yes` takes) or narrow it to an axis the source compares by value
-(synthesizing a `replace from` region). Anything that would reach a
+A first-contact hunk always needs a human. `--yes` takes no default for
+one: it is reported as `manual: <path>:<line> first contact, needs
+confirmation`, the source is left untouched, and -- unlike the package
+pass -- the run still exits 0. In a script, read the `N manual` count
+rather than the exit code.
+
+A file merged from several layers routes per KEY instead of per line
+(`y` accept, `p` pick a layer, `s` skip): each changed key goes to the
+layer that defines it, and `p` picks a different layer. A shared (base
+or universal-fragment) edit prompts for where it belongs: keep it
+universal (the default, and what `--yes` takes) or narrow it to an axis
+the source compares by value (synthesizing a `replace from` region). Anything that would reach a
 machine beyond the one you chose -- promoting a key to a layer other
 machines read, say -- lists those configurations and asks first.
 
@@ -301,9 +328,10 @@ is a hash -- edit the source directly).
 
 A repo carrying a `data/packages/` manifest is reconciled before the file
 pass: each untracked package (installed, declared nowhere, not
-blacklisted) is offered `[y/b/s]` -- add a row to the file that declares
-its backend, blacklist it, or skip; skip is the default, so `--yes` records
-nothing and exits 1 while anything stays untracked. A row is appended the
+blacklisted) is offered `y` add, `b` blacklist, `s` skip -- add a row to
+the file that declares its backend, blacklist it, or skip; skip is the
+default, so `--yes` records nothing and exits 1 while anything stays
+untracked. A row is appended the
 moment it is
 chosen, so `q` here ends the run before the file pass and says how many
 rows were already recorded (rc 1); `--abort-on-prompt` exits 2 at the
@@ -326,7 +354,10 @@ skips packages entirely.
 Show a unified diff of the composed output against each live file
 (`--stat` for a per-file added/removed summary). A partially owned
 file diffs its canonical owned content only, with secret-bearing keys
-masked on both sides. Read-only; takes no lock and always exits 0.
+masked on both sides. Read-only and takes no lock. A difference is not
+an error, so a run that completes exits 0 whether or not anything
+differs; a refusal -- a path that is not managed, a malformed ownership
+declaration or `attributes.toml` -- exits 1.
 
 <!-- generated: flags diff -->
 | Flag | Description |
@@ -367,14 +398,19 @@ other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING`, each installed
 package `UNTRACKED` (declared nowhere and not blacklisted), and each manager
-that is installed but cannot answer `BROKEN`. A declared row whose `when`
-excludes this machine is `GATED` there, printed with the gate that excluded
-it: it is not drift and counts toward nothing, but a row that appeared in no
-output at all could not be told from a row the manifest never carried, which
-is what a `when` written under the wrong table header produces. A manifest
+that is installed but cannot answer `BROKEN`. A declared row of a backend this machine
+can use whose `when` excludes this machine is `GATED` there, printed with the
+gate that excluded it: it is not drift and counts toward nothing, but a row
+that appeared in no output at all could not be told from a row the manifest
+never carried, which is what a `when` written under the wrong table header
+produces. A backend this machine cannot use contributes no rows at all, gated
+ones included. A manifest
 mox would not read
 at all is one `ERROR` row naming where the refusal is, since an empty section
-would read as a clean machine. A
+would read as a clean machine. The file table and the packages section each close with a
+one-line summary: what needs attention by label, then what does not;
+`--drift` prints only the actionable half and the machine formats print
+neither. A
 path-scoped `mox status <file>` names files and reports no packages, as a
 path-scoped apply or commit reaches none.
 A repo without that directory is not using the package subsystem, so no
@@ -450,7 +486,9 @@ break the framing; unescape those four to recover exact bytes. Both imply
 
 `export [--as <tuple>] [--facts <path>] [--cleartext-secrets] <out>` bakes a
 flat resolved tree: compose every managed file for the current machine (or the
-given axis tuple) and write it under `<out>/<live-rel>`. A partially owned
+given axis tuple) and write it under `<out>/<live-rel>`. `<out>` and
+`--facts` are each absolute, `~`-relative, or relative to the current
+directory. A partially owned
 target exports its canonical owned serialization -- the ownership contract,
 not a whole live file. Read-only wrt mox state; the walk-away guarantee and CI
 parity input.
@@ -504,7 +542,9 @@ does not compose, or a resolved secret with no `--cleartext-secrets`.
 List facts (`name = "value"` lines, a machine-readable format kept
 byte-frozen for other tooling to parse); interview for any discovered
 fact still unanswered. Refuses loudly (rather than reporting an empty
-config space) when the source tree cannot be scanned. `--report` replaces
+config space) when the source tree exists but cannot be parsed; a repo
+with no `src/` at all lists nothing and exits 0, and `mox status` is
+what reports a missing source tree. `--report` replaces
 the listing with every discovered fact's state -- `bound "<value>"`,
 `declined (bound empty)`, or `UNBOUND`, each with its provenance (source
 count, needing scripts) and, when conditioned, the expression it is
@@ -524,7 +564,7 @@ fact currently unbound or declined whose condition holds -- wider than
 the standard interview, which never revisits a decline.
 
 `facts probe tool=<name>` / `facts probe env=<name>` resolves a single
-live probe scriptably (exit 0 present, 1 absent, 2 error), unchanged.
+live probe scriptably: exit 0 present, 1 absent, 2 error.
 
 <!-- generated: flags facts -->
 | Flag | Description |
@@ -557,12 +597,12 @@ repo no longer reads is the user's call. When the unused name is a probable
 rename of some still-unbound fact (a short edit distance), the advisory
 bridges the two and names the migration directly: `unused-fact persona (bound
 but unused; unbound "profile" -- renamed? mox facts set profile <value>)`. A
-leftover `data/facts-schema.toml` gets its own one-line notice: it is no
-longer read (the interview derives from the repo's own sources), delete it.
+leftover `data/facts-schema.toml` gets its own one-line notice: nothing
+reads it (the interview derives from the repo's own sources), delete it.
 `--rebuild-provenance` recomposes and re-records every tracked file's
 provenance (partial targets keep no line provenance and are skipped);
 `--rebuild-coupling` rescans source tokens and rewrites the stored coupling
-graph under `<state>/coupling/`; `--fix` performs the safe rebuilds. Mutating
+graph under `<state dir>/coupling/`; `--fix` performs the safe rebuilds. Mutating
 runs take the lock; exits 1 while any problem or advisory remains, or a check
 could not run (a source tree outside git skips the tracked-source check), so
 it can gate CI.
@@ -693,8 +733,9 @@ for a specific one; never auto-downgrades; `--yes` skips the prompt.
 ## uninstall
 
 Remove mox's machine-local state (applied records, provenance, ...).
-The private layer is preserved unless `--purge-private`; snapshots and
-trash -- your recoverable pre-mox originals -- are preserved unless
+The private layer is preserved unless `--purge-private`; snapshots (the
+pre-mox content of every file mox overwrote) and trash (the sources
+`remove` and `mv` displaced) are preserved unless
 `--purge-snapshots` / `--purge-trash` or confirmed on a terminal. The
 user's source repo is never touched.
 
@@ -708,8 +749,9 @@ user's source repo is never touched.
 
 ## For tooling
 
-Two surfaces exist for a program rather than a person, and neither is
-listed in `mox --help` -- they answer questions a human already has
+Two surfaces exist for a program rather than a person. `mox __schema` is
+not listed in `mox --help` at all; `mox status --json` / `--porcelain`
+are listed under `mox status` but answer questions a human already has
 better answers to.
 
 `mox status --json` / `--porcelain` emit the drift set (see

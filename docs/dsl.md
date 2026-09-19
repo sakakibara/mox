@@ -3,7 +3,7 @@
 mox has no template language. A managed file is composed from a base file plus
 overlays selected by *axes*, with a small set of directives written as comment
 lines. The normative grammar is in `dsl-grammar.ebnf`; this page is the
-practical one-page tour. If it grows past one page, the DSL has overreached.
+practical tour: every directive, with the rules that govern it.
 
 A directive is a comment line whose body starts with `mox:`. The comment
 marker is the file's own line-comment lead, inferred from extension, shebang,
@@ -21,7 +21,7 @@ One line, no body.
 
 | Directive | Effect |
 |---|---|
-| `include "<path>" [when <axis>]` | Splice fragment `<base>.d/<path>` in place, optionally gated by an axis expression. |
+| `include "<path>" [when <axis>]` | Splice fragment `<name>.d/<path>` in place, optionally gated by an axis expression. |
 | `secret "<uri>"` | Resolve a secret and emit its value. Schemes: `op://`, `pass://`, `env:`, `file://`, `cmd:` (runs the system shell -- `/bin/sh -c`, or `cmd.exe /c` on Windows -- and takes the first stdout line). |
 | `default <name>="<value>"` | Declare the interview default for fact `<name>`; stripped from output, never gates or emits anything. `<name>` is `[a-z][a-z0-9_]*`. |
 | `keep-empty` | Materialize the file even when it composes to nothing, instead of omitting it (see Empty output). No arguments; stripped from output. |
@@ -60,7 +60,8 @@ drift and kept until `mox apply --overwrite <path>`.
 
 A region opens with a directive line, spans the following lines, and closes at
 `# mox: end`. A standalone `when` may omit `end` to gate to end of file (a
-whole-file gate must be at line 1, or line 2 after a shebang). The lines
+whole-file gate must be the first line that is neither a shebang nor another
+consumed head directive; see File attributes and head directives). The lines
 between opener and `end` are the region's literal fallback body, used when the
 selecting condition is false or no fragment matches. A body is itself a
 template: it may contain nested directives -- a `when` or `for` inside a `for`,
@@ -68,7 +69,7 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 
 | Directive | Effect |
 |---|---|
-| `replace "<path>" when <axis>` | When the axis matches, substitute fragment `<base>.d/<path>`; else keep the body. |
+| `replace "<path>" when <axis>` | When the axis matches, substitute fragment `<name>.d/<path>`; else keep the body. |
 | `replace from "<region>"` | Pick the best-matching fragment from an overlay region by axis; else keep the body. |
 | `append "<path>" [when <axis>]` | Emit the body, then splice the fragment after it. |
 | `prepend "<path>" [when <axis>]` | Splice the fragment first, then emit the body. |
@@ -90,13 +91,13 @@ overlay instead, or keep the file single-layer.
 
 ## Axis expressions
 
-Axes are machine facts: `os`, `arch`, `profile`, `machine`, `hostname`, any
-custom or `data/facts.toml`-derived fact (below); and the open `tool`, `env`
-(any name is a live query, below). `path` is a reserved name -- it named a
-closed axis mox has since deleted, so a leftover `path=` source errors
-loudly instead of silently never matching. `machine` is the first label of
-the hostname (e.g.
-`Foo` out of `Foo.attlocal.net`), stable across networks; `hostname` is the
+Axes are machine facts: the built-ins `os`, `arch`, `machine` and `hostname`,
+any custom or `data/facts.toml`-derived fact (below) -- one you name yourself,
+such as `profile`, is an axis the moment a source compares it -- and the open
+`tool`, `env` (any name is a live query, below). `path` is a reserved name
+that binds nothing, so a `path=` comparison errors loudly instead of silently
+never matching. `machine` is the first label of the hostname (e.g. `Foo` out
+of `Foo.attlocal.net`), stable across networks; `hostname` is the
 full name, for the rarer case that wants it. An axis expression is boolean
 over them:
 
@@ -137,7 +138,7 @@ what was actually asked and its outcome.
 ## Loops
 
 `for <var> in <source>` iterates a TOML array. `<source>` is either a bare name
-(the per-file data file `<base>.d/<name>`), a quoted repo-relative path
+(the per-file data file `<name>.d/<source>`), a quoted repo-relative path
 (`"data/abbreviations.toml"`, which the private layer shadows), or -- inside
 another loop -- an enclosing row's list field (`for url in id.match_urls`). The
 array is the file's stem (`abbreviations`). Each body line is a template
@@ -222,7 +223,7 @@ is the registry filename stem, so `data/completions.toml` holds
 - `name` (required): the completed command; first char `[A-Za-z0-9_]`,
   then `[A-Za-z0-9_.-]`.
 - `command`: completion-emitting command prefix; the shell name is
-  appended (`herdr completion` -> `herdr completion fish`).
+  appended (`kubectl completion` -> `kubectl completion fish`).
 - `fish` / `zsh` / `bash` / `powershell`: full per-shell override for
   irregular CLIs (`pip completion --zsh`); wins over `command`.
 - `shells`: allow-list of shells the row covers; the only way a requested
@@ -275,9 +276,10 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   literal backslash, and every other backslash stands for itself. (The
   whole-line `secret` directive has no `>` terminator and so does no such
   unescaping: a `cmd:` payload moved between the two forms must adjust its
-  backslashes.) With no secrets configured it emits a `<SECRET:URI>` placeholder
-  rather
-  than resolving. A resolution failure is a fatal compose error that never
+  backslashes.) Off the resolving path -- the parse-only compose, never a
+  run that writes or compares content -- it emits a `<SECRET:URI>`
+  placeholder instead of resolving. A resolution failure is a fatal compose
+  error that never
   echoes the value; an empty `<secret:>` is rejected up front. A resolved
   secret never reaches disk or the terminal: its value is kept out of the
   applied-content cache and snapshots, and `mox diff` redacts any hunk touching
@@ -326,10 +328,10 @@ committed or CI directory cannot ship a secret unnoticed.
   `facts ask`, `facts --report`, `status`'s `unbound facts:` section,
   `doctor`'s stale-fact advisory, `apply --defaults` -- is in
   [commands.md](commands.md).
-- **Data files** are `data/*.toml` (shared, repo-relative) or `<base>.d/*.toml`
+- **Data files** are `data/*.toml` (shared, repo-relative) or `<name>.d/*.toml`
   (per-file). Their arrays feed `for` loops; their top-level scalars feed
   `<data.FILE.KEY>` captures.
-- **Fragments** live under `<base>.d/`; overlay regions select the
+- **Fragments** live under `<name>.d/`; overlay regions select the
   best-matching one by axis tuple.
 
 ### Derived facts (`data/facts.toml`)
@@ -478,11 +480,12 @@ never a silent skip.
 
 ## File attributes and head directives
 
-Bodies carry no template language, but a managed file still has a mode, may be
-a symlink or seeded once, and may be owned only in part. mox has no filename
-prefix for any of these. Filesystem metadata git cannot carry lives in
-`.mox/attributes.toml`; the ownership contract is content semantics and lives
-in the source file itself, as head directives.
+A body expresses content, not metadata: a managed file still has a mode, may
+be a symlink or seeded once, and may be owned only in part, and none of that
+can be written inside it. mox has no filename prefix for any of these.
+Filesystem metadata git cannot carry lives in `.mox/attributes.toml`; the
+ownership contract is content semantics and lives in the source file itself,
+as head directives.
 
 ### Attributes (`.mox/attributes.toml`)
 
@@ -531,7 +534,9 @@ everywhere, `//` for JSONC):
   path, and a disowned path's live content is always preserved byte-for-byte,
   present or not. `own` and `disown` are mutually exclusive per file.
 - **`check "<repo-relative exe>" ["arg" ...]`** (quoted argv items, once)
-  names a validation hook; see below.
+  names a validation hook; see below. It requires an `own` or `disown`
+  declaration in the same head -- a source carrying `check` alone is
+  refused.
 
 The directives never reach composed output: compose strips exactly the
 recognized lines from the base text, so the live file a program reads contains
@@ -596,8 +601,11 @@ run and the check-bearing file is not written.
 
 ## Concurrency and snapshots
 
-mox serializes its own mutating runs with a single-writer lock
-(`state/mox.lock`), so two `apply` / `commit` / `rollback` runs never overlap.
+mox serializes its own mutating runs with a single-writer lock at
+`<state dir>/mox.lock`, so two `apply` / `commit` / `rollback` runs that share
+a state directory never overlap. The lock is per state directory: runs given
+different `MOX_STATE_DIR` values take different locks and can write the same
+live tree at the same time, so keep one state directory per live tree.
 The lock does not cover third-party writers: an external edit made to a live
 file between mox reading it and writing it in the same run is not captured in
 that run's snapshot, so a later `mox rollback` restores the pre-run content, not

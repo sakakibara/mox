@@ -17,7 +17,7 @@ On a machine that already has your dotfiles repo published:
 ```sh
 # install mox, clone the repo, and apply -- in one line
 # (<you> expands to https://github.com/<you>/dotfiles; owner/repo,
-# host/owner/repo, full URLs, and ssh remotes work too)
+# host/owner/repo, full URLs, ssh remotes, and local paths work too)
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/install.sh)" -- \
     init --clone <you> --apply
 ```
@@ -104,7 +104,9 @@ and asks first:
 
 ```
 config.toml  key 1/1  ->  write to os=darwin.toml
-    theme  ->  "solarized"
+    theme  ->  write to os=darwin.toml
+      - "gruvbox"
+      + "solarized"
   [Y]es  [p]ick  [s]kip  [q]uit  [?]help
 ```
 
@@ -116,8 +118,8 @@ For a file mox owns only part of, `commit` sees just the owned content: an
 edit on the program's side of the contract is never routed. See [A file a program also writes](#a-file-a-program-also-writes).
 
 Every routed edit is verified before it sticks: mox recomposes the file under
-every configuration the sources express, and anything you did not choose to
-affect composing differently rolls the file back.
+every configuration its sources express, and if any configuration you did not
+choose to change composes differently, the edit is rolled back.
 
 When the repo declares packages, the same run then offers each untracked one
 `[y/b/s]` -- see [Packages](#packages).
@@ -148,8 +150,9 @@ each names it directly. With more than one they take a `<path>` instead: a
 pre-filled command that names the wrong file is worse than one you complete
 yourself.
 
-Every path a human reads is shown against `~`, including in those commands --
-mox expands the tilde itself, so they survive being pasted anywhere.
+Every path in the drift report is shown against `~`, including in those
+commands -- mox expands the tilde itself, so they survive being pasted
+anywhere; `mox diff` labels its `---`/`+++` headers with the absolute path.
 `--json`/`--porcelain` emit the real absolute path. When a row's details do
 not fit the terminal they move under the path rather than shortening it; only
 a path wider than the terminal itself is elided, and never in the commands.
@@ -237,9 +240,9 @@ resolves an `op://`/`pass://` secret is written 0600.
 ## Keeping secrets out
 
 A fresh repo from `mox init` already has a `.moxignore` guarding common
-credential paths (SSH keys, `*.pem`, Claude's credential files); `add` and
-`add` refuses a path it matches (`--force` overrides), and
-`apply` skips a tracked one that a rule now covers. Add your own patterns to
+credential paths (SSH keys, `*.pem`, Claude's credential files): `add`
+refuses a path it matches (`--force` overrides), and `apply` skips a
+tracked one a rule has come to cover. Add your own patterns to
 `.moxignore` (gitignore syntax) to keep other paths out. Full reference:
 [docs/ignore.md](ignore.md).
 
@@ -482,8 +485,8 @@ you leap.
 ## Keeping mox current
 
 ```sh
-mox upgrade             # latest release, verified against SHA256SUMS
-mox upgrade v0.1.2      # a specific version (never auto-downgrades on `latest`)
+mox upgrade             # latest release, verified against SHA256SUMS; never downgrades
+mox upgrade v0.1.2      # a specific version -- an explicit older one does downgrade
 ```
 
 ## When something looks wrong

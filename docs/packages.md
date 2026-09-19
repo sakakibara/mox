@@ -564,7 +564,7 @@ set comes down: declare what you meant to keep, blacklist the rest.
 
 zypper has no explicitly-installed query (`--userinstalled` is not a flag it
 knows, and `--installed-only` includes every dependency), so mox records what
-it installed in `<state_dir>/zypper.txt` and treats that as the explicit set.
+it installed in `<state dir>/zypper.txt` and treats that as the explicit set.
 
 That record is never trusted on its own: it is intersected with what `rpm`
 reports actually present, so a package removed behind mox's back drops out,
@@ -587,7 +587,7 @@ under the backend rather than leaving it to be discovered.
 - **UNTRACKED** -- installed, declared nowhere in the manifest, not
   blacklisted.
 - **ERROR** -- the manifest itself was refused, so no backend was reached
-  (`ERROR     the manifest was refused; the reason is the mox status:
+  (`ERROR     the package pass was refused; the reason is the mox status:
   packages: line`). Counted toward the exit code: an empty section would
   otherwise read as a clean machine.
 - **BROKEN** -- the manager is installed but cannot answer
@@ -789,7 +789,7 @@ backend.
 - **`install` gets the whole set.** A manager that resolves a batch in one
   pass gets one call; a per-item manager loops over its stdin.
 - **No ledger mode.** A manager with no explicitly-installed query keeps its
-  own record under `$MOX_STATE_DIR` and intersects it in `list`; `list` has
+  own record under `<state dir>` and intersects it in `list`; `list` has
   one meaning.
 - **Exit 64 means "this optional verb is not implemented"** -- `bootstrap` and
   `limitation` are the optional ones -- reported by plugin and verb where it

@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, master, packages-subsystem]
+    branches: [main, master]
   pull_request:
     branches: [main, master]
   schedule:
@@ -156,16 +156,17 @@ jobs:
         run: sh tests/linux_backends_test.sh
 
   backends-windows:
-    # Every push, nightly, or dispatched by hand. The scoop and winget adapters
-    # against the REAL managers
+    # On a push this workflow runs for, nightly, or dispatched by hand. The
+    # scoop and winget adapters against the REAL managers
     # (tests/windows_backends_test.ps1): read-only where a manager is present,
     # and on a runner without scoop the fresh-machine case, bootstrapping it
     # from the pinned installer and installing one app through it.
     #
     # This is the only place those adapters meet the real managers, and a
-    # schedule runs only from the default branch, so gating it on one left
-    # every branch that changes them ungated. A manager missing from the
-    # runner skips loudly rather than passing, which fails the job.
+    # schedule runs only from the default branch, so gating it on one would
+    # leave every branch that changes them ungated. Dispatch this workflow on
+    # such a branch to gate it before merge. A manager missing from the runner
+    # skips loudly rather than passing, which fails the job.
     #
     # winget is the exception the runner forces: the image provisions none --
     # it is absent from the published software manifest and from the

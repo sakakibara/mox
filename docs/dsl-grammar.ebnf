@@ -50,7 +50,7 @@ region_open   = "replace" ( string [ "when" axis_expr ] | "from" string )
               | "for" ident "in" data_source [ "when" axis_expr ] [ "where" row_expr ]
                     [ "into" string ] ;
 
-(* A `for` data source is a bare ident (the per-file `<base>.d/<name>` data
+(* A `for` data source is a bare ident (the per-file `<name>.d/<ident>` data
    file), a quoted repo-relative path (e.g. "data/abbreviations.toml", which the
    private layer shadows), or -- inside another loop -- an enclosing row's list
    field `var.field`. `into "<path>"` (top-level `for` only) makes the loop a

@@ -82,7 +82,7 @@ template language in the body.
 | You want to... | Do this |
 | --- | --- |
 | Change a config | edit the live file, then `mox commit` |
-| Make something Mac-only (or per-profile) | `mox edit <path>` (`--axis` for an overlay), add a `foo.toml.d/os=darwin.toml` overlay or a `# mox: when os=darwin` block, then `mox apply` |
+| Make something Mac-only (or per-profile) | `mox edit <path>` (`--axis` for an overlay), add a `foo.toml.d/os=darwin.toml` overlay or a `# mox: when os=darwin` region, then `mox apply` |
 | See what's managed and what changed | `mox status` (`mox diff` for the actual diff) |
 | Manage a new file / a whole dir | `mox add <path>` / `mox add -r <dir>` |
 | Preview before writing | `mox apply --dry-run` |
@@ -96,9 +96,9 @@ A step-by-step walkthrough of each task is in [docs/usage.md](docs/usage.md).
 ## How it works
 
 mox composes each managed file from a **base** file in `src/` plus
-**overlays** selected by *axes* -- `os`, `arch`, `profile`, `machine`, and
-any fact your source compares by value. How an overlay applies depends on
-the file's format:
+**overlays** selected by *axes* -- the machine's own `os`, `arch`,
+`machine` and `hostname`, plus any fact your source compares by value
+(`profile`, say). How an overlay applies depends on the file's format:
 
 - **Structured files** (TOML, JSON, YAML, INI, gitconfig): overlays are
   sibling files in a `<name>.d/` directory, named by the axis tuple they
@@ -108,7 +108,7 @@ the file's format:
 - **Text and code files** (`.zshrc`, a Lua config): per-axis content is
   selected *in place* by a small comment DSL -- a `# mox: when os=darwin`
   region, an `include` / `replace from` splice from the file's `.d/`
-  directory, a `for` loop over data rows. The full DSL is one page:
+  directory, a `for` loop over data rows. The full DSL reference is
   [docs/dsl.md](docs/dsl.md).
 - **Whole-file gating**, either kind: a leading `# mox: when <expr>`
   governs whether the file appears at all; a file with overlays and no
@@ -167,16 +167,16 @@ Full behavioral contracts for every command are in
 
 | Command | What it does |
 | --- | --- |
-| `init` | Initialize a fresh repo; `--clone <url>` clones an existing one and stops for review (`--apply` to bootstrap in one step) |
+| `init` | Initialize a fresh repo skeleton (`git init` it yourself before publishing); `--clone <url>` clones an existing one and stops for review (`--apply` to bootstrap in one step) |
 | `add <path>` / `add -r <dir>` | Start managing a live file (or every file under a dir) as `src/` sources; `--own`/`--disown` key-paths onboard a partially owned file |
 | `apply` | Compose and write every managed file. Never silently overwrites a hand-edited live file: leaves drift untouched and reports it, resolved with `apply --overwrite <path>` or `commit <path>`; also installs the packages a `data/packages/` manifest declares, bootstrapping an absent manager first |
 | `commit` | Route live-file edits back into their sources -- per hunk for text, per key for merged layers -- confirming each, and verifying that no configuration you did not choose changes; also offers each untracked package to record or blacklist |
 | `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, ...) plus the live probe log, plus a `packages:` section when the repo declares one. `status` exits 1 on anything actionable |
 | `edit <name>` | Open the source behind a live path in `$EDITOR`; `--axis <tuple>` opens the overlay or fragment for that variant |
-| `mv <old> <new>` / `remove <name>` | Rename a source (live target moves on next apply) / stop managing (source to recoverable trash; `--purge` also removes the live file) |
+| `mv <old> <new>` / `remove <name>` | Rename a source (apply writes the new live path; the old live file is left orphaned in place) / stop managing (source to recoverable trash; `--purge` also removes the live file) |
 | `export <out>` | Bake the fully composed tree to a directory (`--as <tuple>` for another machine's view) -- the walk-away guarantee |
 | `facts` | List, set, and interview for facts; `facts probe` resolves one `tool=`/`env=` query scriptably |
-| `data get <name>` | Print a data source as TOML or JSON, private layer applied |
+| `data <name>` | Print a data source as TOML or JSON, with your machine-local private copy shadowing the repo's |
 | `doctor` | Health report (untracked sources, uncarriable modes, dead gates, malformed state, a private `data/` file nothing applies); exits 1 while any problem or advisory remains or a check could not run; `--fix` performs the safe rebuilds |
 | `snapshot` / `rollback [<id>]` | List pre-overwrite snapshots; restore live files from one, newest by default |
 | `update` | Fetch, rebase, and apply -- the inbound edge; refuses uncommitted changes and stops on a rebase conflict |
