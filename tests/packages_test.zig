@@ -215,6 +215,55 @@ test "apply: installs what is missing, and a cask through --cask" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 installed, 0 failed") != null);
 }
 
+test "apply: the batch being installed is staged, so a run a signal ends can still name it" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    const fake = try brewWith(a, "", "", &.{
+        .{ .argv = "brew install -- fd" },
+        .{ .argv = "brew install -- ripgrep" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // An interrupt kills mox under the signal's default disposition, so
+    // nothing deferred runs and the last thing said is `installing`. What the
+    // install was part-way through has to be staged before the spawn or it is
+    // never said at all -- and only for as long as that install is running.
+    const want = "mox apply: interrupted installing brew: fd, ripgrep (row(s) in this batch may have landed)\n";
+    var staged_at_install = false;
+    for (fake.calls.items, fake.notes.items) |call, note| {
+        if (!std.mem.endsWith(u8, call, "brew install -- ripgrep")) continue;
+        try std.testing.expectEqualStrings(want, note);
+        staged_at_install = true;
+    }
+    try std.testing.expect(staged_at_install);
+    // The probe that runs before any row is chosen has nothing to name, and
+    // the batch being over leaves nothing staged for the run that follows it.
+    try std.testing.expectEqualStrings("", fake.notes.items[0]);
+    try std.testing.expectEqualStrings("", mox.machine.job.stagedNote());
+}
+
 test "apply --dry-run: reports what it would install and installs nothing" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -314,8 +363,13 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     try std.testing.expect(std.mem.indexOf(
         u8,
         r.out,
-        "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for",
+        "Packages: 0 installed, 0 failed, 1 already on the machine",
     ) != null);
+    // What a mark leaves behind differs by manager -- brew and the distro
+    // managers record who asked for the package, winget records nothing --
+    // so the one summary every manager shares claims no record at all, and
+    // the per-row message above says what this one did.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "recorded as asked for") == null);
 }
 
 test "apply: a formula that cannot be marked on request is a failure, not a clean run" {
@@ -606,7 +660,7 @@ test "apply: a row the manager already has is counted apart from the one it inst
     try std.testing.expect(std.mem.indexOf(
         u8,
         r.out,
-        "Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for",
+        "Packages: 1 installed, 0 failed, 1 already on the machine",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it user installed") != null);
 }
@@ -684,7 +738,7 @@ test "apply: a mark that fails is one row's failure, and the rows beside it are 
     try std.testing.expect(std.mem.indexOf(
         u8,
         r.out,
-        "Packages: 1 installed, 1 failed, 1 already on the machine and now recorded as asked for",
+        "Packages: 1 installed, 1 failed, 1 already on the machine",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "\"groff-base\" could not be marked user installed, so the row stays missing") != null);
@@ -1885,6 +1939,42 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
+}
+
+test "plugin: a verb a signal killed is not reported as one that exited nonzero" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var herm = try hermetic(a, std.testing.io, &tmp);
+    defer herm.deinit();
+    const io = herm.io;
+    const h = try setup(a, io, &tmp, .{ .extra_env = herm.env });
+
+    // What the out-of-memory killer does to a manager, and what a `kill` from
+    // another terminal does: the verb ends without exiting and without
+    // printing a word. Reported as an exit, it reads exactly like a plugin
+    // that refused the query in a message above -- and there is no message.
+    try writePlugin(io, h, a, "brew",
+        \\#!/bin/sh
+        \\case "${1:-}" in
+        \\available) exit 0 ;;
+        \\id) while IFS= read -r l; do case "$l" in *'name = "'*) n=${l#*name = \"}; printf '%s\n' "${n%%\"*}" ;; esac; done ;;
+        \\list) kill -KILL $$ ;;
+        \\*) exit 64 ;;
+        \\esac
+        \\exit 0
+        \\
+    );
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "BROKEN    brew (list: it was killed by a signal rather than exiting, so it named no reason of its own") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "exited nonzero") == null);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
 
 test "plugin: a captured verb that stops for a terminal is ended with no bound armed" {

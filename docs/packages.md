@@ -609,7 +609,7 @@ changes that record and leaves the machine alone. The
 summary counts those rows apart from the ones mox installed:
 
 ```
-Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for
+Packages: 1 installed, 0 failed, 1 already on the machine
 ```
 
 What the machine already has is asked before anything else, so such a row is
@@ -744,8 +744,11 @@ backend.
   a `list` blocked on a manager's lock is a timeout failure naming the
   backend, not a hung `mox status`. The bound covers the whole call, and
   every child leads its own process group, so the kill takes whatever the
-  call left behind -- a helper holding the pipe (`port ... | awk`), a
-  manager behind a `sudo`. Interrupting mox takes them with it too: a
+  call left in that group -- a helper holding the pipe (`port ... | awk`), a
+  manager behind a `sudo`. What it does not take is something that left the
+  group on purpose: a process that makes itself a group leader (`setsid`,
+  `setpgrp`) is no longer addressed by the kill, which is how a manager
+  starting a daemon leaves one running. Interrupting mox takes them with it too: a
   Ctrl-C during a query kills the query's group before mox dies of the
   interrupt itself, so no manager is left holding a lock.
 - A streamed call (`install`, `bootstrap`) is handed the terminal for its

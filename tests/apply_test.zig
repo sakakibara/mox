@@ -1071,6 +1071,36 @@ test "facts set: a value with a control character is refused, facts file uncorru
     try std.testing.expect(std.mem.indexOf(u8, facts, "admin = 1") == null);
 }
 
+test "apply: refuses while another live process holds the lock" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "one\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+
+    // A live process (this test) already holds the lock.
+    const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
+    try Io.Dir.cwd().createDirPath(io, state);
+    const start = mox.cli.lock.processStart(a, io, mox.cli.lock.selfPid());
+    const stamp = if (start.len > 0) start else "-";
+    const lock_line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "mox.lock" }), .data = lock_line });
+
+    // apply is the command that installs packages and writes live files, so
+    // a second one proceeding is two managers and two writers on one machine.
+    // Lock contention is the error code, not the drift one.
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "lock held") != null);
+    try std.testing.expect(!exists(io, try c.homePath("notes.txt")));
+}
+
 test "facts interview: persist is guarded by the command lock" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1092,8 +1122,8 @@ test "facts interview: persist is guarded by the command lock" {
     // A live process (this test) already holds the lock.
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
     try Io.Dir.cwd().createDirPath(io, state);
-    const boot = mox.cli.lock.bootId(a, io);
-    const stamp = if (boot.len > 0) boot else "-";
+    const start = mox.cli.lock.processStart(a, io, mox.cli.lock.selfPid());
+    const stamp = if (start.len > 0) start else "-";
     const lock_line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "mox.lock" }), .data = lock_line });
 

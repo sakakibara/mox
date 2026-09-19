@@ -1591,11 +1591,14 @@ pub const Distro = struct {
         // pacman says only "unable to lock database" for a sync, and prints
         // its "you can remove" hint for a transaction alone (measured on
         // 7.1.0). An interrupt makes pacman remove the lock; a kill, an
-        // out-of-memory kill or a power loss leaves it, and nothing but this
-        // sync ever takes it.
+        // out-of-memory kill or a power loss leaves it. Which of the two this
+        // is cannot be decided from here: the copy is one machine-global
+        // path, mox's own lock is one per state directory, and an apply under
+        // another state directory syncs this same copy without taking any
+        // lock this apply can see.
         if (try self.pacmanLockLeft(arena)) self.say(
-            "mox: pacman: the sync of mox's database copy failed and {s} exists, which a pacman killed outright mid-sync leaves behind; only this sync ever takes that lock, so once no pacman is running it may be removed, as root\n",
-            .{pacman_private_lock},
+            "mox: pacman: the sync of mox's database copy failed and {s} exists, which is either a pacman syncing that copy at this moment -- {s} is one path every mox on this machine shares, while the lock mox takes is one per state directory -- or one killed outright mid-sync; once no pacman is running it may be removed, as root\n",
+            .{ pacman_private_lock, pacman_private_db },
         );
         return Error.DistroRefreshFailed;
     }
@@ -6386,7 +6389,7 @@ test "install: what pacman says beside a batch it does resolve reaches the termi
     try testing.expect(fake.called("pacman -Syu --needed --noconfirm -- bat"));
 }
 
-test "install: a stale lock in the pacman copy is named when the sync fails" {
+test "install: a lock in the pacman copy is named when the sync fails, with both things it can mean" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -6410,7 +6413,7 @@ test "install: a stale lock in the pacman copy is named when the sync fails" {
 
     try testing.expectError(Error.DistroRefreshFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
     try testing.expectEqualStrings(
-        "mox: pacman: the sync of mox's database copy failed and /var/cache/mox/pacman-db/db.lck exists, which a pacman killed outright mid-sync leaves behind; only this sync ever takes that lock, so once no pacman is running it may be removed, as root\n",
+        "mox: pacman: the sync of mox's database copy failed and /var/cache/mox/pacman-db/db.lck exists, which is either a pacman syncing that copy at this moment -- /var/cache/mox/pacman-db is one path every mox on this machine shares, while the lock mox takes is one per state directory -- or one killed outright mid-sync; once no pacman is running it may be removed, as root\n",
         w.written(),
     );
     try testing.expectEqualStrings(

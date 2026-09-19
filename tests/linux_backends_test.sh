@@ -1591,7 +1591,7 @@ EOF
 
   # The kept row is MARKED rather than installed, apt having had the package
   # since the `dpkg -i` above; the refused one is still one row's failure.
-  if grep -q "Packages: 0 installed, 1 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+  if grep -q "Packages: 0 installed, 1 failed, 1 already on the machine" "$out"; then
     ok "$backend ($image): the kept row converged and the refused one is counted as its own failure"
   else
     no "$backend ($image): apply did not converge one row and refuse the other" "$(grep -i 'packages:\|apply-exit=' "$out" | tail -3)"
@@ -2662,7 +2662,7 @@ CASE
     no "$backend ($image): expected '$pkg' MISSING before apply" "$(echo "$before" | tail -5)"
   fi
 
-  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine" "$out"; then
     ok "$backend ($image): the apply says the row was marked, never that it was installed"
   else
     no "$backend ($image): apply did not report the row as marked" "$(grep -i 'packages:' "$out" | tail -3)"
@@ -2767,7 +2767,7 @@ EOF
     ok "$backend ($image): the repositories were never asked about a package the machine already has"
   fi
 
-  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine" "$out"; then
     ok "$backend ($image): the apply says the row was marked, never that it was installed"
   else
     no "$backend ($image): apply did not report the row as marked" "$(grep -i 'packages:' "$out" | tail -3)"
@@ -2866,7 +2866,7 @@ EOF
     ok "$backend ($image): the hold was never asked about a package the machine already has"
   fi
 
-  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+  if grep -q "Packages: 0 installed, 0 failed, 1 already on the machine" "$out"; then
     ok "$backend ($image): the apply says the row was marked, never that it was installed"
   else
     no "$backend ($image): apply did not report the row as marked" "$(grep -i 'packages:' "$out" | tail -3)"
@@ -2967,7 +2967,7 @@ EOF
     no "$backend ($image): expected 'acl' MISSING before apply" "$(echo "$before" | tail -5)"
   fi
 
-  if grep -q "Packages: 0 installed, 1 failed, 1 already on the machine and now recorded as asked for" "$out"; then
+  if grep -q "Packages: 0 installed, 1 failed, 1 already on the machine" "$out"; then
     ok "$backend ($image): the apply marked the row the machine has, and failed only the one that needed the sync"
   else
     no "$backend ($image): apply did not report one row marked and one failed" "$(grep -i 'packages:\|^mox apply' "$out" | tail -3)"
@@ -3692,7 +3692,7 @@ EOF
     no "$backend ($image): the premise does not hold on this pacman" "$(grep -E '^sync-' "$out")"
   fi
 
-  if grep -q "mox: pacman: the sync of mox's database copy failed and /var/cache/mox/pacman-db/db.lck exists, which a pacman killed outright mid-sync leaves behind; only this sync ever takes that lock, so once no pacman is running it may be removed, as root" "$out"; then
+  if grep -q "mox: pacman: the sync of mox's database copy failed and /var/cache/mox/pacman-db/db.lck exists, which is either a pacman syncing that copy at this moment -- /var/cache/mox/pacman-db is one path every mox on this machine shares, while the lock mox takes is one per state directory -- or one killed outright mid-sync; once no pacman is running it may be removed, as root" "$out"; then
     ok "$backend ($image): the apply names the lock file and says it may be removed"
   else
     no "$backend ($image): the apply did not name the lock file" "$(grep '^mox' "$out" | tail -3)"
@@ -4109,7 +4109,7 @@ CASE
     no "$backend ($image): expected both rows MISSING before apply" "$(echo "$before" | tail -5)"
   fi
 
-  if grep -q "Packages: 1 installed, 0 failed, 1 already on the machine and now recorded as asked for" "$out" && grep -q "apply-exit=0" "$out"; then
+  if grep -q "Packages: 1 installed, 0 failed, 1 already on the machine" "$out" && grep -q "apply-exit=0" "$out"; then
     ok "$backend ($image): the install and the mark both went through under the conf"
   else
     no "$backend ($image): apply did not install one row and mark the other" "$(grep -i 'packages:\|Operation aborted\|apply-exit=' "$out" | tail -3)"

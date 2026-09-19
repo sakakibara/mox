@@ -789,9 +789,13 @@ fn applyPass(
             try ctx.out.print("Packages: {d} installed, {d} failed", .{ pkg_counts.installed, pkg_counts.failed });
             // A marked row is neither installed nor failed, and calling it
             // installed would say mox put a package on a machine that already
-            // had it.
+            // had it. What the mark left behind is the adapter's to say and
+            // differs by manager -- apt, dnf, pacman and brew record who asked
+            // for the package, winget records nothing -- so the summary says
+            // only what holds for every one of them, and the per-row messages
+            // say the rest.
             if (pkg_counts.marked > 0) try ctx.out.print(
-                ", {d} already on the machine and now recorded as asked for",
+                ", {d} already on the machine",
                 .{pkg_counts.marked},
             );
             if (pkg_counts.attempted > 0) try ctx.out.print(
@@ -1230,6 +1234,12 @@ fn applyPackages(
         // a time. The adapter streams its own output, so which package failed
         // is on the terminal from the manager itself.
         var batch_failed = false;
+        // An install is where a run that is killed leaves the machine in a
+        // state nothing recorded: the ledger and the manifest are written
+        // after it, and a signal that ends mox runs no deferred code at all.
+        // Staged before the spawn, so the death itself can say what was in
+        // flight; dropped again the moment the batch is over.
+        mox.machine.job.stageNote(try interruptNote(ctx.alloc, b.backend, rows.items));
         backend.install(ctx.alloc, rows.items) catch |e| {
             // A batch that never got as far as running its manager did not
             // fail to install: it failed before an install was attempted, and
@@ -1259,6 +1269,7 @@ fn applyPackages(
                 }
             }
         };
+        mox.machine.job.clearNote();
         // A row the adapter refused, or one whose mark did not take, is a
         // failure of that row alone: the rows beside it were installed, so
         // counting the batch instead would report work that happened as work
@@ -1272,6 +1283,23 @@ fn applyPackages(
         if (!batch_failed) counts.installed += rows.items.len - refused - marked - unmarked;
     }
     return counts;
+}
+
+/// The sentence an apply killed mid-install leaves behind: which batch was
+/// running, and the hedge the external-kill path already prints over rows a
+/// failed batch may have landed.
+fn interruptNote(
+    arena: std.mem.Allocator,
+    backend: []const u8,
+    rows: []const mox.packages.manifest.Row,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.print("mox apply: interrupted installing {s}:", .{backend});
+    for (rows, 0..) |row, i| {
+        try out.writer.print("{s} {s}", .{ if (i == 0) "" else ",", row.name });
+    }
+    try out.writer.writeAll(" (row(s) in this batch may have landed)\n");
+    return out.written();
 }
 
 /// True when `a` and `b` name the same facts in the same order (the order

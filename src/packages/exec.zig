@@ -102,15 +102,33 @@ pub fn sweepScratch(io: Io, arena: std.mem.Allocator, scratch_dir: []const u8) v
     while (it.next(io) catch null) |e| {
         if (e.kind != .file) continue;
         const pid = scratchPidOf(e.name) orelse continue;
-        if (pid == processId()) continue;
-        if (builtin.os.tag == .windows) {
+        var age_ms: i64 = 0;
+        if (by_age) {
             const st = dir.statFile(io, e.name, .{}) catch continue;
-            const age_ms = st.mtime.durationTo(Io.Timestamp.now(io, .real)).toMilliseconds();
-            if (age_ms < 3_600_000) continue;
-        } else if (processAlive(pid)) continue;
+            age_ms = st.mtime.durationTo(Io.Timestamp.now(io, .real)).toMilliseconds();
+        }
+        if (!scratchStale(pid, processId(), age_ms, by_age)) continue;
         stale.append(arena, arena.dupe(u8, e.name) catch return) catch return;
     }
     for (stale.items) |name| dir.deleteFile(io, name) catch {};
+}
+
+/// Whether a platform decides a scratch file's owner is gone by the file's
+/// age rather than by asking after the pid.
+const by_age = builtin.os.tag == .windows;
+
+/// How old a scratch file must be before age alone condemns it.
+const scratch_stale_age_ms: i64 = 3_600_000;
+
+/// Whether the file named for `pid`, last written `age_ms` ago, is one an
+/// interrupted run left behind. The pid `self_pid` names is answered first and
+/// on its own: where `age_decides`, this call's own stdin file is condemned by
+/// the rule that follows the moment the run passes an hour, and the file that
+/// rule would take is the one the child is reading.
+fn scratchStale(pid: u32, self_pid: u32, age_ms: i64, age_decides: bool) bool {
+    if (pid == self_pid) return false;
+    if (age_decides) return age_ms >= scratch_stale_age_ms;
+    return !processAlive(pid);
 }
 
 /// The pid a scratch file is named for, or null for any other file.
@@ -136,9 +154,16 @@ fn scratchPidOf(name: []const u8) ?u32 {
     return std.fmt.parseInt(u31, digits, 10) catch null;
 }
 
-/// Signal 0 delivers nothing and answers whether the pid exists. A pid
-/// this user may not signal still exists.
+/// Signal 0 delivers nothing and answers whether the pid exists. EPERM is
+/// alive: what this sweep must not delete is a file a running process is
+/// reading, and who owns that process decides nothing about it. (`cli/lock.zig`
+/// asks the same question and answers EPERM the other way, because its lock
+/// sits under a per-user state directory and so was never written by a
+/// process this user may not signal.) Windows cannot put the question at all
+/// and decides by age instead, so nothing there asks this; unasked, the answer
+/// that deletes nothing is the one to give.
 fn processAlive(pid: u32) bool {
+    if (builtin.os.tag == .windows) return true;
     std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |e| return e == error.PermissionDenied;
     return true;
 }
@@ -172,6 +197,7 @@ pub fn errorText(e: anyerror) []const u8 {
         error.TimedOut, error.CaptureTimedOut, error.PluginTimedOut => "timed out, killed",
         error.StoppedWantingTerminal => "stopped, and this run has no terminal that could resume it; killed",
         error.StreamTooLong => "it wrote more than mox will read from one call, and was killed",
+        error.KilledBySignal => "it was killed by a signal rather than exiting, so it named no reason of its own: an out-of-memory kill and a kill from outside this run both end a call this way",
 
         // The spawn, and the file behind it.
         Error.SudoNotFound => "sudo was not found; mox is not running as root, so the install needed it to elevate",
@@ -204,7 +230,7 @@ pub fn errorText(e: anyerror) []const u8 {
         error.ZypperQueryFailed,
         => "the manager's own listing exited nonzero, saying why above",
         error.ScoopBucketListFailed => "scoop could not list its buckets, saying why above",
-        error.UnreadableExport => "scoop wrote an export file mox could not read back",
+        error.UnreadableExport => "the manager's export came back in a shape mox could not read",
         error.BrewInstallFailed,
         error.DistroInstallFailed,
         error.ScoopInstallFailed,
@@ -622,16 +648,42 @@ pub const Process = struct {
             // bound is disabled. The remaining time is what each step waits
             // for when that is shorter, so a bound below one step is still
             // kept to the millisecond.
+            var last_peek = started;
             read: while (true) {
+                const now = Io.Clock.awake.now(io);
                 var step_ms = read_step_ms;
                 if (bound > 0) {
-                    const left = bound - started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+                    const left = bound - started.durationTo(now).toMilliseconds();
                     if (left <= 0) {
                         killWhatIsLeft(io, &child, child_group);
                         signals.release();
                         return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
                     }
                     if (left < step_ms) step_ms = left;
+                }
+                // The child is asked how it is on a schedule, never only when
+                // a read came back empty: a straggler that writes at least
+                // once a step keeps every read succeeding, and a child asked
+                // only between those would never be asked at all -- its answer
+                // then waits out the whole call bound and is thrown away as a
+                // timeout the child never had.
+                if (read_term == null and last_peek.durationTo(now).toMilliseconds() >= post_exit_ms) {
+                    last_peek = now;
+                    switch (job.peek(&child)) {
+                        .running => {},
+                        .stopped => {
+                            killWhatIsLeft(io, &child, child_group);
+                            signals.release();
+                            return error.StoppedWantingTerminal;
+                        },
+                        // Reaped by the asking, so this is the status the
+                        // caller gets, and the clock the loop head reads
+                        // starts here.
+                        .done => |t| {
+                            read_term = t;
+                            exited_at = now;
+                        },
+                    }
                 }
                 // The direct child is gone and the pipe is still open, so
                 // what holds it is something the child left running. Its
@@ -646,23 +698,9 @@ pub const Process = struct {
                 mr.fill(4096, timeoutOf(step_ms).toDeadline(io)) catch |e| switch (e) {
                     error.EndOfStream => break :read,
                     // The step expired with nothing read. Whether the bound
-                    // expired with it is decided at the top of the next turn.
-                    error.Timeout => switch (job.peek(&child)) {
-                        .running => continue :read,
-                        .stopped => {
-                            killWhatIsLeft(io, &child, child_group);
-                            signals.release();
-                            return error.StoppedWantingTerminal;
-                        },
-                        // Reaped by the asking, so this is the status the
-                        // caller gets, and the clock the loop head reads
-                        // starts here.
-                        .done => |t| {
-                            read_term = t;
-                            exited_at = Io.Clock.awake.now(io);
-                            continue :read;
-                        },
-                    },
+                    // expired with it, and whether the child is still there,
+                    // are both decided at the top of the next turn.
+                    error.Timeout => continue :read,
                     else => {
                         killWhatIsLeft(io, &child, child_group);
                         signals.release();
@@ -707,6 +745,9 @@ pub const Process = struct {
             // interrupt already keep.
             if (child_group) |id| job.killStragglersOf(id);
             job.closePipes(io, &child);
+            // Nothing here armed a bound that could have sent it, so a signal
+            // came from outside this run.
+            if (t == .signal) return error.KilledBySignal;
             return fromTerm(t, out, err_out);
         }
 
@@ -750,9 +791,11 @@ pub const Process = struct {
         signals.release();
         if (killer) |*k| _ = k.cancel(io);
         if (tty) |t| t.takeBack();
-        // A shell reaped on the interrupt leaves whatever it backgrounded
-        // in its group; the call is over, so nothing there may outlive it.
-        if (guard.fired) {
+        // A shell reaped on a signal leaves whatever it backgrounded in its
+        // group; the call is over, so nothing there may outlive it. The
+        // bound's interrupt is one such signal and a kill from outside this
+        // run is another: the group is what the child left either way.
+        if (guard.fired or term == .signal) {
             if (child_group) |id| job.killStragglersOf(id);
         }
 
@@ -760,10 +803,16 @@ pub const Process = struct {
         if (guard.fired) {
             res.ok = false;
             res.timed_out = true;
-        } else if (tty != null and term == .signal and term.signal == .INT) {
-            if (self.out) |w| w.flush() catch {};
-            if (self.err) |w| w.flush() catch {};
-            job.dieOfInterrupt();
+        } else if (term == .signal) {
+            if (tty != null and term.signal == .INT) {
+                if (self.out) |w| w.flush() catch {};
+                if (self.err) |w| w.flush() catch {};
+                // The user interrupted the child, so this run ends here with
+                // nothing deferred left to say what it was part-way through.
+                job.writeStagedNote();
+                job.dieOfInterrupt();
+            }
+            return error.KilledBySignal;
         }
         return res;
     }
@@ -849,6 +898,10 @@ pub const Fake = struct {
     inputs: std.ArrayList([]const u8) = .empty,
     /// Whether each call was streamed rather than captured, in call order.
     streamed: std.ArrayList(bool) = .empty,
+    /// What a run ended by a signal would have said at each call, in call
+    /// order: the real spawn stages that before the child exists, so this is
+    /// where a test reads whether the staging bracketed the right call.
+    notes: std.ArrayList([]const u8) = .empty,
     arena: std.mem.Allocator,
 
     pub fn runner(self: *Fake) Runner {
@@ -885,6 +938,7 @@ pub const Fake = struct {
         try self.calls.append(self.arena, joined);
         try self.inputs.append(self.arena, try self.arena.dupe(u8, stdin orelse ""));
         try self.streamed.append(self.arena, is_streamed);
+        try self.notes.append(self.arena, try self.arena.dupe(u8, job.stagedNote()));
         if (self.spent.items.len == 0) {
             for (self.entries) |_| try self.spent.append(self.arena, false);
         }
@@ -1645,6 +1699,138 @@ test "Process: a child that ignores SIGTERM is still ended at the bound" {
     try testing.expect(elapsed_ms < 30_000);
 }
 
+test "Process: a streamed child killed from outside takes what it backgrounded with it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const pid_file = try pidFilePath(a, io, &tmp);
+
+    // Unbounded, the way an install is: no watchdog of mox's can have sent
+    // this signal, so what ended the shell came from outside the run -- the
+    // out-of-memory killer, or a `kill`. The sleep it backgrounded is still
+    // in its group, and the call is over.
+    var p: Process = .{ .io = io };
+    try testing.expectError(
+        error.KilledBySignal,
+        p.runner().stream(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300 & kill -TERM $$", pid_file }),
+    );
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 20_000));
+}
+
+test "Process: a captured child killed from outside is named as killed, and its group goes too" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const pid_file = try pidFilePath(a, io, &tmp);
+
+    // The shell is killed between reads while the sleep it left holds the
+    // pipe open, so the status comes from the look between reads rather than
+    // from the wait. 255 is not this call's answer -- it has none.
+    var p: Process = .{ .io = io, .timeout_ms = 30_000 };
+    try testing.expectError(
+        error.KilledBySignal,
+        p.runner().run(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300 & kill -KILL $$", pid_file }),
+    );
+    try testing.expect(groupGone(io, try pidIn(a, io, pid_file), 20_000));
+}
+
+test "errorText: an export mox cannot read names no manager, two of them raising it" {
+    // scoop writes its export as JSON on stdout and winget writes a file, and
+    // the one error stands for both: wording that names either manager, or
+    // says where the export was, is wrong wherever the other raised it.
+    const why = errorText(error.UnreadableExport);
+    try testing.expectEqualStrings("the manager's export came back in a shape mox could not read", why);
+    try testing.expect(std.mem.indexOf(u8, why, "scoop") == null);
+    try testing.expect(std.mem.indexOf(u8, why, "winget") == null);
+}
+
+test "errorText: a call a signal ended is not described as one that exited" {
+    // 255 is what a signal death has instead of an exit code, and "exited
+    // nonzero, saying why above" over a child that printed nothing sends the
+    // reader looking for a message no one wrote.
+    try testing.expectEqualStrings(
+        "it was killed by a signal rather than exiting, so it named no reason of its own: an out-of-memory kill and a kill from outside this run both end a call this way",
+        errorText(error.KilledBySignal),
+    );
+}
+
+test "Process: a straggler that keeps writing does not cost the child its answer" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    // The shell answers and exits at once; the straggler it left holds the
+    // pipe and writes far more often than the read waits, so every read
+    // succeeds. A child asked how it is only when a read comes back empty is
+    // never asked here at all: the call then runs to its bound and throws the
+    // answer away as a timeout the child never had.
+    var p: Process = .{ .io = io, .timeout_ms = 3_000 };
+    const started = Io.Clock.awake.now(io);
+    const res = try p.runner().run(a, &.{ "sh", "-c", "i=0; while [ $i -lt 400 ]; do printf . ; sleep 0.02; i=$((i+1)); done & printf 'ok\\n'" });
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(!res.timed_out);
+    try testing.expect(res.ok);
+    try testing.expect(std.mem.startsWith(u8, res.stdout, "ok\n"));
+    try testing.expect(elapsed_ms < 2_000);
+}
+
+test "sweepScratch: this process's own scratch file is never swept" {
+    // Where a platform cannot ask whether a pid is alive, age is the whole
+    // rule, and a run of an hour makes this call's own stdin file older than
+    // the threshold -- while the child is still reading it. The pid it is
+    // named for is what keeps the sweep off it, and is asked first.
+    const own = processId();
+    try testing.expect(!scratchStale(own, own, 10 * scratch_stale_age_ms, true));
+    try testing.expect(scratchStale(2_147_483_000, own, 10 * scratch_stale_age_ms, true));
+    // Where the pid can be asked after, a file of any age whose process is
+    // gone goes, and this process's own stays.
+    if (builtin.os.tag == .windows) return;
+    try testing.expect(!scratchStale(own, own, 10 * scratch_stale_age_ms, false));
+    try testing.expect(scratchStale(2_147_483_000, own, 0, false));
+}
+
+test "Process: a call's stdin file is named for this process alone" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const tmp_dir = try scratchTmpDir(a, scratch);
+    try Io.Dir.cwd().createDirPath(io, tmp_dir);
+
+    // Two names in the one scratch directory: this process's, and the one a
+    // mox running beside it would use. The call takes the first and leaves
+    // the second untouched -- a second mox sharing a state directory must not
+    // have its stdin truncated out from under the child reading it.
+    const mine = try std.fs.path.join(a, &.{ tmp_dir, try std.fmt.allocPrint(a, "stdin-{d}.txt", .{processId()}) });
+    const other = try std.fs.path.join(a, &.{ tmp_dir, "stdin-0.txt" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = "stale\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = other, .data = "another mox's\n" });
+
+    var p: Process = .{ .io = io, .scratch_dir = scratch };
+    const res = try p.runner().runInput(a, &.{"cat"}, "hello from stdin\n");
+    try testing.expectEqualStrings("hello from stdin\n", res.stdout);
+
+    // Written, opened, and unlinked: the name this process's file had is the
+    // one the call used.
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, mine, .{}));
+    try testing.expectEqualStrings("another mox's\n", try Io.Dir.cwd().readFileAlloc(io, other, a, .limited(64)));
+}
+
 test "Process: stdin bytes reach the child and stdout is captured" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -1827,9 +2013,11 @@ test "Process: a captured call holds the child's group for the handler, and lets
     // merely slow never turns this into a timeout: the child ends when the
     // watcher kills the group it read, and the watcher ends it either way.
     var p: Process = .{ .io = io, .timeout_ms = 180_000 };
-    const res = try p.runner().run(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300", pid_file });
+    // The watcher kills the group, which is a kill from outside this run: the
+    // call has no answer of its own to give, and says that rather than
+    // passing off the 255 a signal death has no exit code for.
+    try testing.expectError(error.KilledBySignal, p.runner().run(a, &.{ "sh", "-c", "echo $$ > \"$0\"; sleep 300", pid_file }));
     watcher.await(io);
-    try testing.expect(!res.timed_out);
     try testing.expectEqual(try pidIn(a, io, pid_file), seen.load(.acquire));
     try testing.expectEqual(@as(i32, 0), job.SpawnSignals.group.load(.acquire));
 }

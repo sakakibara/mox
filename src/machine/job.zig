@@ -132,6 +132,7 @@ pub const PosixSpawnSignals = struct {
     }
 
     pub fn onSignal(sig: std.posix.SIG) callconv(.c) void {
+        writeStagedNote();
         killHeldGroup();
         _ = std.c.sigaction(sig, &default, null);
         _ = std.c.raise(sig);
@@ -151,6 +152,60 @@ pub const PosixSpawnSignals = struct {
         _ = std.c.kill(-pgid, .KILL);
     }
 };
+
+/// The one sentence a run that ends of a signal leaves behind, staged before
+/// the call it describes and dropped when that call returns.
+///
+/// A run ended by INT, HUP, QUIT or TERM dies under the signal's default
+/// disposition, and a run whose streamed child took the user's Ctrl-C dies
+/// of SIGINT the same way: no `defer` runs on either, so anything mox has not
+/// already said is never said. What an install was part-way through when that
+/// happened is exactly what the user needs and exactly what is lost -- the
+/// last line of an interrupted apply is `installing`, and nothing after it
+/// says whether the package landed.
+///
+/// Staged as rendered bytes in a fixed buffer, because the handler that reads
+/// them may not format, allocate, or lock: one `write` to standard error is
+/// the whole of what it does here.
+var note_buf: [512]u8 = undefined;
+var note_len: std.atomic.Value(usize) = .init(0);
+
+/// Stage `text` (a whole line, newline included) as that sentence, or clear
+/// it when empty. Longer than the buffer is truncated rather than dropped: a
+/// batch named as far as it fits still says which install was running.
+pub fn stageNote(text: []const u8) void {
+    if (text.len <= note_buf.len) {
+        @memcpy(note_buf[0..text.len], text);
+        note_len.store(text.len, .release);
+        return;
+    }
+    const cut = "...\n";
+    const keep = note_buf.len - cut.len;
+    @memcpy(note_buf[0..keep], text[0..keep]);
+    @memcpy(note_buf[keep..], cut);
+    note_len.store(note_buf.len, .release);
+}
+
+pub fn clearNote() void {
+    note_len.store(0, .release);
+}
+
+/// What is staged, for a caller that wants to assert on it.
+pub fn stagedNote() []const u8 {
+    return note_buf[0..note_len.load(.acquire)];
+}
+
+/// Write the staged sentence to standard error, if there is one. Async-signal
+/// safe: no formatting, no allocation, no lock, and the buffered writers mox
+/// uses are empty for the length of a call -- a spawn flushes them before the
+/// child that inherits those streams can write a byte. Windows has none of
+/// the signals that reach this, so nothing there ever asks.
+pub fn writeStagedNote() void {
+    if (builtin.os.tag == .windows) return;
+    const n = note_len.load(.acquire);
+    if (n == 0) return;
+    _ = std.c.write(2, &note_buf, n);
+}
 
 /// The controlling terminal, handed to a streamed child for its run and
 /// taken back once it is reaped. Handed over only when stdin is a terminal
@@ -436,6 +491,52 @@ fn groupGone(io: Io, pgid: std.posix.pid_t, ms: i64) bool {
         step.sleep(io) catch return false;
     }
     return false;
+}
+
+test "stageNote: what a run ended by a signal has left to say reaches standard error" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "note.txt" });
+    defer clearNote();
+
+    // With nothing staged the handler writes nothing: a run that was between
+    // calls has nothing to report about one.
+    clearNote();
+    try testing.expectEqualStrings("", stagedNote());
+    try testing.expectEqualStrings("", try writtenToStderr(io, a, path));
+
+    const note = "mox apply: interrupted installing brew: ripgrep (row(s) in this batch may have landed)\n";
+    stageNote(note);
+    try testing.expectEqualStrings(note, stagedNote());
+    try testing.expectEqualStrings(note, try writtenToStderr(io, a, path));
+
+    // A batch too long for the buffer is cut, not dropped: which install was
+    // running is the first thing in the line and survives either way.
+    const long = "mox apply: interrupted installing brew:" ++ (" ripgrep," ** 200);
+    stageNote(long);
+    try testing.expectEqual(@as(usize, note_buf.len), stagedNote().len);
+    try testing.expect(std.mem.startsWith(u8, stagedNote(), "mox apply: interrupted installing brew:"));
+    try testing.expect(std.mem.endsWith(u8, stagedNote(), "...\n"));
+}
+
+/// What `writeStagedNote` puts on descriptor 2, captured by pointing that
+/// descriptor at a file for the length of the call.
+fn writtenToStderr(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    const saved = std.c.dup(2);
+    if (saved < 0) return error.Unexpected;
+    _ = std.c.dup2(f.handle, 2);
+    writeStagedNote();
+    _ = std.c.dup2(saved, 2);
+    _ = std.c.close(saved);
+    f.close(io);
+    return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096));
 }
 
 test "SpawnSignals: the terminal's four ways of ending a run are all handled" {

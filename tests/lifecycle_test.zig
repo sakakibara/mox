@@ -3138,8 +3138,8 @@ test "add: refuses while another live process holds the lock" {
 
     // A live process (this test) already holds the lock.
     try Io.Dir.cwd().createDirPath(io, h.state);
-    const boot = mox.cli.lock.bootId(a, io);
-    const stamp = if (boot.len > 0) boot else "-";
+    const start = mox.cli.lock.processStart(a, io, mox.cli.lock.selfPid());
+    const stamp = if (start.len > 0) start else "-";
     const line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "mox.lock" }), .data = line });
 
