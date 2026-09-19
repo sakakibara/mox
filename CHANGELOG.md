@@ -21,9 +21,12 @@ All notable changes to mox are documented here. The format follows
   the tap and the decision to trust that one formula or cask, never the
   whole tap), apt, dnf, pacman, zypper (no explicitly-installed query, so mox
   keeps a ledger and intersects it with what rpm reports present), scoop and
-  winget. A backend that cannot be asked what the user explicitly installed
-  says so as a note under itself: brew has no explicit-install query for
-  casks, and `winget export` reports only what a source supplied.
+  winget. A backend whose query answers something other than "what did the
+  user ask for" says so as a note under itself, in whichever direction:
+  brew has no explicit-install query for casks and `winget export` reports
+  only what a source supplied, while `scoop export` is every app directory
+  and `winget export` also carries every installed package a source can
+  correlate.
 - Any other manager is a plugin: an executable at `scripts/backends/<name>`
   speaking seven verbs (`available`, `id`, `list`, `install`, `declare`,
   `bootstrap`, `limitation`) on the same contract as a shipped backend. `id`
@@ -165,7 +168,10 @@ All notable changes to mox are documented here. The format follows
   `tests/windows_backends_test.ps1` probes scoop and winget read-only where
   present and, on a runner without scoop, bootstraps it from the pinned
   installer and installs one app; the Linux suite also bootstraps Homebrew
-  in a Debian container. All three run nightly, or on demand.
+  in a Debian container. All three run nightly or on demand, and the Windows
+  one runs on every push too: a schedule fires only from the default branch,
+  so the branch that changes those adapters was the one branch it never ran
+  on.
 
 ### Changed
 - BREAKING: `status --json` emits `{"files":[...],"packages":[...]}` rather

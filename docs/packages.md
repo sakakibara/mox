@@ -120,7 +120,12 @@ absent: the file is fetched, refused unless it hashes to the declared
 sha256, handed to the backend, and deleted afterwards whether the bootstrap
 succeeded or not. brew and scoop know how to run their installers and where
 the result lands, so the same apply installs packages through the manager
-it just put in place; a plugin runs `bootstrap <path> <out>` itself, streamed
+it just put in place. scoop looks there first: its installer puts the shims
+directory on PATH by writing the registry and its own session, so a terminal
+opened before the first apply never sees it and the next apply in that
+terminal probes scoop as absent -- where a scoop that answers is adopted
+rather than installed over, which its installer refuses anyway. A plugin runs
+`bootstrap <path> <out>` itself, streamed
 like an install, and writes the directory to put on PATH -- one absolute
 existing directory -- as one line into `<out>`, if there is one. If a
 bootstrap fails, the rows of that manager are not attempted and the run
@@ -153,21 +158,47 @@ package manager at all is usable here, `status` notes
 | `dnf` | name | `dnf -q --assumeno repoquery --userinstalled --qf %{name}\n` (`-q` because dnf4 writes its metadata line to stdout; `--assumeno` because dnf4 writes its key-import question there too, ending it without a newline, so the first name of the listing is glued to it; the format string because its default packs several to a line); the install and the mark carry `--setopt=assumeno=0`, since a dnf.conf `assumeno=True` otherwise outranks `-y` and aborts both | -- |
 | `pacman` | name | `pacman -Qeq`; an install is one `pacman -Syu --needed --noconfirm` transaction with the rows as its targets, which upgrades the whole system, since a partial sync is not something Arch supports | -- |
 | `zypper` | name | a mox-kept ledger (see below) | -- |
-| `scoop` | name; a bucket is provenance, not identity | `scoop export` | `bucket` |
-| `winget` | `PackageIdentifier` | `winget export`, which reports only what a source supplied (below) | `source`, `scope` (`user`/`machine`), `override` |
+| `scoop` | name, compared without case; a bucket is provenance, not identity | `scoop export`, which is every app directory (below) | `bucket` |
+| `winget` | `PackageIdentifier` | `winget export`, which misses what no source supplied and carries what nobody asked for (below) | `source`, `scope` (`user`/`machine`), `override` |
 
 An export reports identifiers alone, so a package is one row: two rows for
 one identifier under different scopes are a duplicate, not two packages.
 
+scoop's namespace is case-insensitive -- it finds a manifest with a
+case-insensitive filter and installs into a directory the filesystem compares
+the same way -- so `FiraCode-NF` and `firacode-nf` are one app, one id, and
+two rows spelling both are a duplicate. `mox commit` records the spelling
+scoop reports, along with the bucket the app came from unless that is `main`:
+without it, `scoop install` on a machine that has not added that bucket
+aborts with "Couldn't find manifest".
+
 An install through scoop adds a row's bucket only when `scoop bucket list`
-does not already have it, and winget installs with `--exact` (`--id`
+does not already have it, and passes `--no-update-scoop`, since
+`scoop install` otherwise updates scoop and git-pulls every bucket first --
+a row declares presence, not currency. winget installs with `--exact` (`--id`
 restricts the field searched, not the match type, and winget's default is a
-case-insensitive substring match) and `--no-upgrade`, then
-asks `winget list` whether a failed install is nonetheless there: both
-managers answer a second `apply` with an error otherwise, and winget's exit
-codes cannot be told apart once truncated to a byte. zypper's ledger records what a failed batch still
-landed, read back from `rpm`, so a package installed beside one that failed
-is not asked for again.
+case-insensitive substring match), `--no-upgrade`, and
+`--disable-interactivity` plus `--silent`, since an apply has no terminal to
+answer a prompt with and no time bound by default; a row carrying `override`
+gets no `--silent`, because an override replaces the installer's whole
+argument string and is then what decides. Before installing, winget is asked
+`winget list` whether it has the package already, and asked again if the
+install failed: a package its export cannot see is there either way, and such
+a row is marked rather than installed (below). zypper's ledger records what a
+failed batch still landed, read back from `rpm`, so a package installed
+beside one that failed is not asked for again.
+
+A scoop app whose install FAILED is reported by `scoop export` like any
+other, and is not installed in any usable sense, so mox reads its row as
+missing and hands it back to `scoop install`, which repairs it. Two such apps
+are refused instead, each as that row's own failure: repairing a HELD app
+would undo a hold you set, and mox installs for this user alone, so repairing
+a GLOBAL one here would leave a second copy. The refusal names the
+`scoop reset` to run.
+
+Each of those asks the manager, so `mox apply --dry-run` runs none of them
+and says beside the rows what it left unchecked, exactly as it does for the
+Linux managers.
 
 ### What an apt, dnf, pacman or zypper row may name
 
@@ -458,6 +489,14 @@ pinned version: `scoop install git@2.1` installs a version that
 `scoop export` reports under the bare name, which reads as missing on every
 status after.
 
+A `bucket` is a bucket NAME and never a repository. `scoop bucket add <name>`
+takes the repository as a second operand and looks an unqualified name up in
+scoop's own list of ten, so a bucket outside that list can only be added with
+a URL -- and a URL is not one token, which is the class a value spliced into
+scoop's argv is held to. Such a row is refused before anything runs, naming
+the `scoop bucket add <name> <repository>` to run once; after that the bucket
+is in `scoop bucket list` and every row in it installs like any other.
+
 A winget `name` is one `PackageIdentifier`, and that one is deliberately
 wider: an identifier is the publisher's own string (`Notepad++.Notepad++`, a
 bare store id), mox cannot enumerate them, and a class narrower than
@@ -497,18 +536,29 @@ a third-party tap is trusted as a cask; the two namespaces are distinct.
 
 ### What a manager cannot be asked
 
-Three of the queries above answer a narrower question than "what did the user
-ask for", and each backend says so as a note under itself in `status`, the
-way zypper does below.
+Every query above answers the question its manager can answer, and that is
+not always "what did the user ask for". Some answer something NARROWER, and
+miss a package you really have; others answer something WIDER, and report
+packages nobody chose. Each backend says which as a note under itself in
+`status`, the way zypper does below.
 
-brew declares `--cask` and `--installed-on-request` as conflicting options, so
-there is no explicit-install query for casks: `brew list --cask --full-name`
-is the whole Caskroom, and a cask another cask pulled in through
-`depends_on cask:` is reported untracked until it is declared or blacklisted.
+**Narrower.** brew declares `--cask` and `--installed-on-request` as
+conflicting options, so there is no explicit-install query for casks:
+`brew list --cask --full-name` is the whole Caskroom, and a cask another cask
+pulled in through `depends_on cask:` is reported untracked until it is
+declared or blacklisted. zypper has no such query at all, which is what the
+ledger below exists for. And `winget export` reports only packages a source
+supplied, so one installed outside a source is invisible to it: its row is
+reported missing on every status, and every apply marks it (below) rather
+than reporting an install that did not happen.
 
-`winget export` reports only packages a source supplied, so one installed
-outside a source is invisible to it: its row is reported missing on every
-status, and an install mox runs for it reports success each time.
+**Wider.** Neither Windows manager records who asked for a package, so
+neither can be asked. `scoop export` is every app directory, dependencies
+included. `winget export` is every installed package a configured source can
+correlate, which on a real machine is every redistributable and every Store
+app. So a first `mox status` there reports a great deal untracked, and none
+of it is wrong -- it is what the manager can see. `mox commit` is how that
+set comes down: declare what you meant to keep, blacklist the rest.
 
 ### zypper's ledger
 
@@ -605,7 +655,11 @@ and every apply would install nothing at all. So mox runs the manager's own
 mark command instead -- `brew tab --installed-on-request`, `apt-mark manual`,
 `dnf mark install` on dnf4 and `dnf mark user` on dnf5 (each with
 `--setopt=assumeno=0`, as the install has), `pacman -D --asexplicit` -- which
-changes that record and leaves the machine alone. The
+changes that record and leaves the machine alone. winget has no such
+record and so no mark command: a package its export cannot see is one
+`winget list` reports and `winget install` refuses, so the row is counted
+there too, and counted as already present rather than installed, since mox
+put nothing on the machine. The
 summary counts those rows apart from the ones mox installed:
 
 ```

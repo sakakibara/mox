@@ -877,31 +877,98 @@ test "windows: scoop drift and install run through the same core" {
     );
 
     const export_json =
-        \\{ "apps": [ { "Name": "7zip", "Source": "main" }, { "Name": "curl", "Source": "main" } ] }
+        \\{ "apps": [ { "Name": "7zip", "Source": "main" }, { "Name": "Curl", "Source": "main" } ] }
     ;
-    const fake = try windowsWith(a, export_json, &.{
-        .{ .argv = "scoop bucket add extras" },
-        .{ .argv = "scoop install extras/firefox" },
-    });
+    const fake = try windowsWith(a, export_json, &.{});
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
     const s = try h.run(&.{ "mox", "status" });
     // `7zip` is declared and installed; `firefox` is declared only; `curl` is
-    // installed only.
+    // installed only, and under a spelling scoop treats as the same app.
     try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING   scoop firefox") != null);
     try std.testing.expect(std.mem.indexOf(u8, s.out, "UNTRACKED scoop curl") != null);
     try std.testing.expect(std.mem.indexOf(u8, s.out, "scoop 7zip") == null);
 
     const fake2 = try windowsWith(a, export_json, &.{
         .{ .argv = "scoop bucket list", .stdout = "main\n" },
+        .{ .argv = "scoop bucket known", .stdout = "main\nextras\nversions\n" },
         .{ .argv = "scoop bucket add extras" },
-        .{ .argv = "scoop install extras/firefox" },
+        .{ .argv = "scoop install --no-update-scoop extras/firefox" },
     });
     useFake(fake2);
     _ = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(fake2.called("scoop bucket add extras"));
-    try std.testing.expect(fake2.called("scoop install extras/firefox"));
+    try std.testing.expect(fake2.called("scoop install --no-update-scoop extras/firefox"));
+}
+
+test "windows: a scoop row spelled in another case is the app scoop has" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // The `nerd-fonts` bucket names its manifests `FiraCode-NF`, and scoop's
+    // namespace is case-insensitive, so a row spelled either way is the app
+    // scoop installed. Compared byte-exact the row is BOTH missing and
+    // untracked, apply runs an install scoop exits 0 without doing, and the
+    // next status says missing again -- for ever, at exit 0 each time.
+    try writeManifest(io, h, a, "windows.toml",
+        \\backend = "scoop"
+        \\
+        \\[[packages]]
+        \\name = "firacode-nf"
+        \\bucket = "nerd-fonts"
+        \\
+    );
+
+    const fake = try windowsWith(a,
+        \\{ "apps": [ { "Info": "", "Name": "FiraCode-NF", "Source": "nerd-fonts" } ] }
+    , &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "UNTRACKED") == null);
+}
+
+test "windows: two scoop rows differing only in case are one duplicate" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // Two rows for one package: scoop installs one app, so whichever is
+    // second could only ever be reported missing or reinstalled.
+    try writeManifest(io, h, a, "windows.toml",
+        \\backend = "scoop"
+        \\
+        \\[[packages]]
+        \\name = "Ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+
+    const fake = try windowsWith(a, "{ \"apps\": [] }", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        s.err,
+        "both declare \"ripgrep\" for backend \"scoop\" with the same gate",
+    ) != null);
 }
 
 test "windows: a winget row is validated even where winget cannot run" {

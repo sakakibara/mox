@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, packages-subsystem]
   pull_request:
     branches: [main, master]
   schedule:
@@ -156,14 +156,17 @@ jobs:
         run: sh tests/linux_backends_test.sh
 
   backends-windows:
-    # Nightly, or dispatched by hand. The scoop and winget adapters against the REAL managers
+    # Every push, nightly, or dispatched by hand. The scoop and winget adapters
+    # against the REAL managers
     # (tests/windows_backends_test.ps1): read-only where a manager is present,
     # and on a runner without scoop the fresh-machine case, bootstrapping it
     # from the pinned installer and installing one app through it.
     #
-    # This is the only place those adapters meet the real managers. A manager
-    # missing from the runner skips loudly rather than passing.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # This is the only place those adapters meet the real managers, and a
+    # schedule runs only from the default branch, so gating it on one left
+    # every branch that changes them ungated. A manager missing from the
+    # runner skips loudly rather than passing.
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:

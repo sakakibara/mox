@@ -180,8 +180,8 @@ pub const PackageBackends = struct {
         self.apt = .{ .manager = .apt, .runner = r, .err = err };
         self.dnf = .{ .manager = .dnf, .runner = r, .err = err };
         self.pacman = .{ .manager = .pacman, .runner = r, .err = err };
-        self.scoop = .{ .runner = r, .home = home, .env = env };
-        self.winget = .{ .runner = r, .io = io, .scratch_dir = scratch_dir };
+        self.scoop = .{ .runner = r, .home = home, .env = env, .err = err, .io = io };
+        self.winget = .{ .runner = r, .io = io, .scratch_dir = scratch_dir, .err = err };
         self.zypper = .{
             .runner = r,
             .ledger = .{ .io = io, .dir = scratch_dir, .backend = "zypper" },
