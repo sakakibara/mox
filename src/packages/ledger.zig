@@ -162,7 +162,9 @@ test "add: an empty id is never recorded" {
     const l = try tmpLedger(a, io, &tmp.sub_path, "zypper");
     try l.add(a, &.{ "", "bat" });
 
-    const got = try l.read(a);
-    try testing.expectEqual(@as(usize, 1), got.len);
-    try testing.expectEqualStrings("bat", got[0]);
+    // The file, not the ids it parses to: `read` skips empty lines, so a
+    // blank line written here would be invisible through it.
+    const p = try l.path(a);
+    const text = try Io.Dir.cwd().readFileAlloc(io, p, a, .limited(4 << 20));
+    try testing.expectEqualStrings("bat\n", text);
 }

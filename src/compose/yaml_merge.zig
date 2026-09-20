@@ -179,6 +179,21 @@ test "yaml merge: multi-overlay folds left to right (later overlay wins)" {
     try std.testing.expectEqual(@as(i64, 3), merged.getT(i64, "c").?);
 }
 
+test "yaml merge: a base entry with a sequence key survives an overlay that touches another key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try yaml.parse(a, "? - a\n  - b\n: mapped\nname: base\n", .{});
+    const overlay = try yaml.parse(a, "name: overlay\n", .{});
+    const merged = try deepMerge(a, base, overlay);
+
+    try std.testing.expectEqual(@as(usize, 2), merged.map.len);
+    try std.testing.expect(merged.map[0].key == .seq);
+    try std.testing.expectEqualStrings("mapped", merged.map[0].value.string);
+    try std.testing.expectEqualStrings("overlay", merged.getT([]const u8, "name").?);
+}
+
 test "yaml merge: exact block-style emit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

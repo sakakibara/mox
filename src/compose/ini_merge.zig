@@ -436,6 +436,49 @@ test "merge: overlay trailing comment on a replaced line is kept" {
     try std.testing.expectEqualStrings("[core]\n\tautocrlf = true  # windows checkout\n", merged);
 }
 
+test "merge: the continuation lines of a replaced base key go with it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const base = "[alias]\n\tlg = log --graph \\\n\t\t--oneline\n\tst = status\n";
+    const overlay = "[alias]\n\tlg = log --all\n";
+    const merged = try merge(arena.allocator(), base, overlay, .gitconfig);
+    try std.testing.expectEqualStrings(
+        "[alias]\n\tlg = log --all\n\tst = status\n",
+        merged,
+    );
+}
+
+test "merge: the continuation lines of a base key the overlay leaves alone pass through" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const base = "[alias]\n\tlg = log --graph \\\n\t\t--oneline\n\tst = status\n";
+    const overlay = "[alias]\n\tst = status --short\n";
+    const merged = try merge(arena.allocator(), base, overlay, .gitconfig);
+    try std.testing.expectEqualStrings(
+        "[alias]\n\tlg = log --graph \\\n\t\t--oneline\n\tst = status --short\n",
+        merged,
+    );
+}
+
+test "merge: a malformed base section header is emitted verbatim and detaches the keys after it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // `[broken` never closes, so it matches no overlay section: the overlay's
+    // unconsumed `[user]` entry lands at the end of the section it belongs to,
+    // the header survives byte for byte, and the base key that follows is no
+    // longer inside any overlay section, so it is not replaced.
+    const base = "[user]\n\tname = Ada\n[broken\n\temail = base@example.com\n";
+    const overlay = "[user]\n\tname = Grace\n\temail = work@example.com\n";
+    const merged = try merge(arena.allocator(), base, overlay, .gitconfig);
+    try std.testing.expectEqualStrings(
+        "[user]\n\tname = Grace\n\temail = work@example.com\n[broken\n\temail = base@example.com\n",
+        merged,
+    );
+}
+
 test "merge: CRLF base round-trips as CRLF" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

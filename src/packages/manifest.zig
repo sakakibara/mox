@@ -796,6 +796,24 @@ test "load: a non-scalar field is refused, never silently dropped" {
         "data/packages/a.toml: row \"ripgrep\": \"opts\" must be a string, integer, boolean, or array of strings",
         d.capture().?,
     );
+
+    // TOML 1.0 arrays may mix types, so an argument list is refused whole or
+    // it reaches the manager one flag short with nothing to say so.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data =
+        \\backend = "winget"
+        \\
+        \\[[packages]]
+        \\name = "Microsoft.PowerShell"
+        \\args = ["--silent", 1]
+        \\
+    });
+
+    var mixed: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &mixed));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: row \"Microsoft.PowerShell\": \"args\" must be a string, integer, boolean, or array of strings",
+        mixed.capture().?,
+    );
 }
 
 test "load: a float field is refused rather than stringified" {
@@ -1386,6 +1404,35 @@ test "load: a bootstrap row missing a key is named by its index, not by its back
     try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
     try testing.expectEqualStrings(
         "data/packages/a.toml: bootstrap row 1 for backend \"brew\" has no \"url\"",
+        d.capture().?,
+    );
+}
+
+test "load: an unknown key in a bootstrap row is refused, naming the key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    // A misspelled pin reads as a pin the user set and does nothing.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data =
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\digest = "11"
+        \\
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(Error.MalformedPackageRow, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(
+        "data/packages/a.toml: bootstrap row 0 for backend \"brew\": unknown key \"digest\" (a bootstrap row takes \"backend\", \"url\", \"sha256\", \"when\")",
         d.capture().?,
     );
 }

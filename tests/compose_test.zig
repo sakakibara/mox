@@ -4896,3 +4896,85 @@ test "compose catA: a line directive in a merged source is refused too, and the 
     const cap = diag.capture() orelse return error.TestExpectedDiag;
     try std.testing.expect(std.mem.indexOf(u8, cap, "hd.toml:5: # mox: secret") != null);
 }
+
+// Cat C provenance origin
+
+test "compose catC: the recorded origin of a base-plus-overlay file is the overlay" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/icon.png", "BASE\n");
+    try writeFile(io, tmp.dir, "src/icon.png.d/os=darwin.png", "DARWIN\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("os", "darwin");
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    const out = try mox.compose.composeFileTracked(a, io, tree.files[0], &bindings_r, null, null, &prov, null);
+    try std.testing.expectEqualStrings("DARWIN\n", out.?);
+    try std.testing.expectEqual(@as(usize, 1), prov.items.len);
+    try std.testing.expect(prov.items[0].origin == .overlay);
+}
+
+test "compose catC: the recorded origin of a base-only file is the base" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/icon.png", "BASE\n");
+    try writeFile(io, tmp.dir, "src/icon.png.d/os=darwin.png", "DARWIN\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    try bindings.put("os", "linux");
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    const out = try mox.compose.composeFileTracked(a, io, tree.files[0], &bindings_r, null, null, &prov, null);
+    try std.testing.expectEqualStrings("BASE\n", out.?);
+    try std.testing.expectEqual(@as(usize, 1), prov.items.len);
+    try std.testing.expect(prov.items[0].origin == .base);
+}
+
+test "compose catA: a check line in an overlay of a merged source is inert, not an inline directive" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Only the base is head-parsed, so only its head directives are stripped
+    // before the layer scan; an overlay is scanned as written. A scan that did
+    // not skip `check` would see the overlay's line as content and refuse.
+    try writeFile(io, tmp.dir, "src/app.toml", "base = 1\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/os=darwin.toml", "# mox: check scripts/guard\nother = 2\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("profile", "personal");
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "base = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "other = 2") != null);
+}

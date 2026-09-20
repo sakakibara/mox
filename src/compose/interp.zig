@@ -907,6 +907,20 @@ test "expand: a data capture's default rescues a missing data context" {
     try std.testing.expectError(error.DataRefWithoutContext, expand(a, "<data.f.k>", null, .{}));
 }
 
+test "expand: a data capture with an io but an empty repo dir is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The walk derives the repo root as the parent of the source directory and
+    // falls back to "", so a relative `src` leaves an empty root beside a live
+    // io. Without the emptiness check `data/` would be read from the process
+    // working directory instead of the repo.
+    try std.testing.expectError(
+        error.DataRefWithoutContext,
+        expand(a, "<data.f.k>", null, .{ .io = std.testing.io }),
+    );
+}
+
 const chain_test_facts = [_]machine.state.Fact{.{ .name = "brew_prefix", .value = "/opt/homebrew" }};
 
 /// `cargo_home` is deliberately NOT among `chain_test_facts`: a chain member
@@ -1352,6 +1366,22 @@ test "expand: an escaped '>' does not close the secret capture, and the placehol
     // the `\>` and `&2>y` would leak into the output.
     const exp = try expandTracked(a, "x=<secret:cmd:echo a 1\\>&2>y", null, .{});
     try std.testing.expectEqualStrings("x=<SECRET:cmd:echo a 1\\>&2>y", exp.bytes);
+    try std.testing.expect(!exp.secret);
+}
+
+test "lint and expand close a secret URI ending in an escaped backslash at the following '>'" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The URI is `cmd:echo a\\`, so the `>` after it is unescaped and closes
+    // the capture; the trailing `y` is literal. Scanner and decoder must share
+    // one escape alphabet: a scanner that knew only `\>` would pair the second
+    // backslash with the `>`, run off the end, and call the capture unclosed --
+    // and lint and expand would agree on that wrong answer, since both ask the
+    // same function where the capture ends.
+    try lintT("x=<secret:cmd:echo a\\\\>y");
+    const exp = try expandTracked(a, "x=<secret:cmd:echo a\\\\>y", null, .{});
+    try std.testing.expectEqualStrings("x=<SECRET:cmd:echo a\\\\>y", exp.bytes);
     try std.testing.expect(!exp.secret);
 }
 

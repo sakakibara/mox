@@ -125,3 +125,15 @@ test "detect: no-extension content dense with control bytes is C" {
     const content = [_]u8{ 0x1b, 0x1b, 0x1b, 0x1b, 'a', 'b' };
     try std.testing.expectEqual(Category.c, detect("mystery", &content));
 }
+
+test "detect: no-extension content with exactly 30 percent control bytes is B" {
+    var content = [_]u8{'a'} ** 100;
+    for (content[0..30]) |*b| b.* = 0x1b;
+    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+}
+
+test "detect: no-extension content with 31 percent control bytes is C" {
+    var content = [_]u8{'a'} ** 100;
+    for (content[0..31]) |*b| b.* = 0x1b;
+    try std.testing.expectEqual(Category.c, detect("mystery", &content));
+}
