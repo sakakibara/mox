@@ -46,9 +46,9 @@ pub const Result = struct {
 /// `file_live` is not within `dir_live`. `~/.config` + `~/.config/nvim/init.lua`
 /// yields `nvim`; `~/.config` + `~/.config/foo` yields `foo`.
 pub fn managedChildName(dir_live: []const u8, file_live: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, file_live, dir_live)) return null;
-    // Both are filesystem paths, so the boundary is the platform's separator.
-    if (file_live.len <= dir_live.len or !std.fs.path.isSep(file_live[dir_live.len])) return null;
+    if (!source_path.isUnderDir(file_live, dir_live)) return null;
+    // `isUnderDir` admits the directory itself, which names no child.
+    if (file_live.len == dir_live.len) return null;
     const tail = file_live[dir_live.len + 1 ..];
     for (tail, 0..) |c, i| {
         if (std.fs.path.isSep(c)) return tail[0..i];

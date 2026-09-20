@@ -4372,7 +4372,11 @@ fn routeHunk(
             const start = (o.line - 1) + (hunk.a_start - seg.out_start);
             if (!try sourceLinesMatch(arena, io, file.source_base_abs, start, old_lines))
                 return .{ .manual = "source no longer matches recorded provenance" };
-            return lineRoute(arena, file.source_base_abs, file.source_base_path, start, hunk.a_len, new_lines, true, isUnderPrivate(file.source_base_abs, file.private_dir));
+            // A private-ONLY whole file composes as `.base` (it is a base file
+            // of the private tree), so the provenance tag alone cannot flag it;
+            // its location must. Any edit under the private root is
+            // private-origin and must never couple into the shared repo.
+            return lineRoute(arena, file.source_base_abs, file.source_base_path, start, hunk.a_len, new_lines, true, mox.source.path.isUnderDir(file.source_base_abs, file.private_dir));
         },
         .fragment => |o| {
             const start = (o.line - 1) + (hunk.a_start - seg.out_start);
@@ -4380,7 +4384,7 @@ fn routeHunk(
                 return .{ .manual = "source no longer matches recorded provenance" };
             // A region fragment is already axis-gated; an include/append/prepend
             // fragment is universal, so its edit is shared and gets classified.
-            return lineRoute(arena, o.path, o.path, start, hunk.a_len, new_lines, !isRegionFragment(file, o.path), isUnderPrivate(o.path, file.private_dir));
+            return lineRoute(arena, o.path, o.path, start, hunk.a_len, new_lines, !isRegionFragment(file, o.path), mox.source.path.isUnderDir(o.path, file.private_dir));
         },
         .private => |o| {
             const start = (o.line - 1) + (hunk.a_start - seg.out_start);
@@ -4561,16 +4565,6 @@ fn sourceLinesMatch(
         if (!std.mem.eql(u8, e, lines[start + i])) return false;
     }
     return true;
-}
-
-/// True when `path` lives under the private layer root. A private-ONLY whole
-/// file composes as `.base` (it is a base file of the private tree), so the
-/// provenance tag alone cannot flag it; its location must. Any edit under the
-/// private root is private-origin and must never couple into the shared repo.
-fn isUnderPrivate(path: []const u8, private_dir: []const u8) bool {
-    if (private_dir.len == 0) return false;
-    if (!std.mem.startsWith(u8, path, private_dir)) return false;
-    return path.len == private_dir.len or std.fs.path.isSep(path[private_dir.len]);
 }
 
 fn lineRoute(
@@ -5721,14 +5715,6 @@ test "resolveCoupling: a private-origin rename never couples into a shared sourc
     try testing.expectEqual(@as(usize, 0), reported);
 }
 
-test "isUnderPrivate: boundary-aware membership" {
-    try testing.expect(isUnderPrivate("/h/.priv/.token", "/h/.priv"));
-    try testing.expect(isUnderPrivate("/h/.priv", "/h/.priv")); // the root itself
-    try testing.expect(!isUnderPrivate("/h/.private-other/x", "/h/.priv")); // sibling sharing a prefix
-    try testing.expect(!isUnderPrivate("/h/src/.token", "/h/.priv"));
-    try testing.expect(!isUnderPrivate("/h/src/.token", "")); // no private layer
-}
-
 test "routeHunk: a private-only base file's edit is flagged private by location" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -5774,6 +5760,53 @@ test "routeHunk: a private-only base file's edit is flagged private by location"
     const route = try routeHunk(a, io, &segs, hunk, file, &a_lines, &b_lines, &m_state);
     try testing.expect(route == .line);
     try testing.expect(route.line.edit.private);
+}
+
+test "routeHunk: a base file in a sibling directory whose name extends the private root is not flagged private" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const private_dir = try std.fs.path.join(a, &.{ base, "private" });
+    const sibling_dir = try std.fs.path.join(a, &.{ base, "private-backup" });
+    const src_abs = try std.fs.path.join(a, &.{ sibling_dir, ".token" });
+    try Io.Dir.cwd().createDirPath(io, private_dir);
+    try Io.Dir.cwd().createDirPath(io, sibling_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_abs, .data = "key = old\n" });
+
+    const file: mox.source.tree.ManagedFile = .{
+        .source_base_path = ".token",
+        .source_base_abs = src_abs,
+        .live_path = try std.fs.path.join(a, &.{ base, "home", ".token" }),
+        .has_base = true,
+        .overlays = &.{},
+        .regions = &.{},
+        .private_dir = private_dir,
+    };
+    var segs = [_]mox.provenance.map.Segment{.{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } }};
+    const hunk: mox.diff.lines.Hunk = .{ .a_start = 0, .a_len = 1, .b_start = 0, .b_len = 1 };
+    const a_lines = [_][]const u8{"key = old"};
+    const b_lines = [_][]const u8{"key = new"};
+
+    const m_state: mox.machine.state.MachineState = .{
+        .os = "linux",
+        .arch = "x86_64",
+        .hostname = "h",
+        .username = "u",
+        .home = "/home/u",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+    };
+    const route = try routeHunk(a, io, &segs, hunk, file, &a_lines, &b_lines, &m_state);
+    try testing.expect(route == .line);
+    try testing.expect(!route.line.edit.private);
 }
 
 test "resolveCoupling: a q-abort after a decline persists no decline" {

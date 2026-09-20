@@ -48,6 +48,25 @@ pub const joinKeyOnto = env_path.joinRel;
 /// under `home`.
 pub const liveKeyUnderHome = env_path.relUnder;
 
+/// True when the filesystem path `path` is `dir` itself or lies beneath it.
+/// Membership ends at the separator: the byte after `dir` must be one, or a
+/// sibling whose name merely extends `dir` (`<dir>-backup/x`) reads as being
+/// inside it. An empty `dir` names no directory and so contains nothing.
+pub fn isUnderDir(path: []const u8, dir: []const u8) bool {
+    if (dir.len == 0) return false;
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    return path.len == dir.len or std.fs.path.isSep(path[dir.len]);
+}
+
+test "isUnderDir: the dir itself and paths past its separator boundary are under it; a name-extending sibling and an empty dir are not" {
+    try testing.expect(isUnderDir("/h/.priv/.token", "/h/.priv"));
+    try testing.expect(isUnderDir("/h/.priv/a/b/c", "/h/.priv"));
+    try testing.expect(isUnderDir("/h/.priv", "/h/.priv"));
+    try testing.expect(!isUnderDir("/h/.private-other/x", "/h/.priv"));
+    try testing.expect(!isUnderDir("/h/src/.token", "/h/.priv"));
+    try testing.expect(!isUnderDir("/h/src/.token", ""));
+}
+
 /// True when `key` would escape its base once joined onto a directory: it is
 /// absolute (leading separator) or any `/`- or `\`-separated segment is `..`.
 /// `relUnder` matches HOME textually and `std.fs.path.join` does not normalize,

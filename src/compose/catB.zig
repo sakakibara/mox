@@ -152,18 +152,9 @@ fn emitSecretAwareBody(
 /// it is 2 when a pacifier line was stripped, so commit maps edits back to the
 /// right line instead of assuming a 1:1 start at line 1.
 fn fragmentOrigin(file: ManagedFile, frag_abs: []const u8, first_line: u32) Origin {
-    if (underDir(frag_abs, file.private_dir))
+    if (source.path.isUnderDir(frag_abs, file.private_dir))
         return .{ .private = .{ .path = frag_abs, .line = first_line } };
     return .{ .fragment = .{ .path = frag_abs, .line = first_line } };
-}
-
-/// True when `path` sits under `dir`. The separator boundary is what keeps a
-/// sibling whose name merely extends `dir` (`<dir>-backup/...`) out of it, so
-/// this answers the private-root question exactly as commit's own routing does.
-fn underDir(path: []const u8, dir: []const u8) bool {
-    if (dir.len == 0) return false;
-    if (!std.mem.startsWith(u8, path, dir)) return false;
-    return path.len == dir.len or std.fs.path.isSep(path[dir.len]);
 }
 
 /// Origin for a directive's literal fallback body: attributed to the whole
