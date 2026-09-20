@@ -345,7 +345,7 @@ test "commit: a narrowing whose fact value cannot name a fragment file is left u
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".zshrc")), "export EDITOR=vim\n") != null);
 }
 
-test "commit: a changed secret value is shown without its old resolved value, and never routed" {
+test "commit: a hunk contained in one secret segment is shown without its old resolved value, and never routed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -488,7 +488,7 @@ test "commit: edit to a line after a stripped pacifier routes to the right fragm
     try std.testing.expectEqual(@as(u8, 0), res.rc);
 }
 
-test "commit: private-origin edit never touches repo src" {
+test "commit: a private-only file's edit lands in the private layer and leaves repo src byte-identical" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4447,4 +4447,92 @@ test "commit: a first-contact structured file with no axis to name an overlay by
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "no source matches this machine") != null);
+}
+
+test "commit: a hunk straddling a secret line and a plain one withholds the old resolved value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const resolved = "STRADDLE-s3cr3t-DO-NOT-LEAK-7777dddd";
+    try writeRepo(io, &tmp, "repo/src/.straddlerc", "export A=one\n" ++
+        "export TOKEN=<secret:env:MOX_TEST_STRADDLE>\n" ++
+        "export B=two\n");
+    var h = try setup(a, io, &tmp, .{});
+    var map = std.process.Environ.Map.init(a);
+    try map.put("HOME", h.home);
+    try map.put("USER", "tester");
+    try map.put("MOX_REPO", h.repo);
+    try map.put("MOX_STATE_DIR", h.state);
+    try map.put("MOX_TEST_STRADDLE", resolved);
+    const map_ptr = try a.create(std.process.Environ.Map);
+    map_ptr.* = map;
+    h.env = .{ .map = map_ptr };
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // One contiguous edit over the secret line AND the plain line after it, so
+    // the hunk overlaps a `.secret` segment without being contained in one.
+    const live = try h.liveOf(".straddlerc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export A=one\n" ++
+        "export TOKEN=changed\n" ++
+        "export B=TWO\n" });
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ res.out, res.err });
+
+    try std.testing.expect(std.mem.indexOf(u8, res.out, resolved) == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, resolved) == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "old value withheld") != null);
+
+    try std.testing.expectEqualStrings("export A=one\n" ++
+        "export TOKEN=<secret:env:MOX_TEST_STRADDLE>\n" ++
+        "export B=two\n", try read(io, a, try h.srcOf(".straddlerc")));
+}
+
+test "commit: a private universal fragment's edit is confirmed as private, never offered the shared candidates" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A private-only base whose `include` pulls a UNIVERSAL fragment (not
+    // axis-gated, so nothing but the private origin keeps it off the shared
+    // route), in a file that names an axis of its own -- which is what gives
+    // it a configuration space wide enough for commit to ask where a SHARED
+    // edit belongs.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    try writeRepo(io, &tmp, "state/private/.zsecret", "# mox: include \"frag.sh\"\n# mox: include \"darwin.sh\" when os=darwin\n");
+    try writeRepo(io, &tmp, "state/private/.zsecret.d/frag.sh", "secret_one\nsecret_two\n");
+    try writeRepo(io, &tmp, "state/private/.zsecret.d/darwin.sh", "mac_line\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
+    const before = try treeDigest(io, a, src_dir);
+
+    const live = try h.liveOf(".zsecret");
+    try editLive(io, a, live, "secret_two", "secret_two_edited");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    // The plain private confirm, not the classifier: no candidate list, no
+    // repo axis to narrow into, no "choose>" question.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[Y]es") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "choose>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "os=darwin") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "universal") == null);
+
+    // The edit landed in the private fragment, and repo src is byte-identical.
+    const frag = try read(io, a, try std.fs.path.join(a, &.{ h.state, "private", ".zsecret.d", "frag.sh" }));
+    try std.testing.expectEqualStrings("secret_one\nsecret_two_edited\n", frag);
+    const after = try treeDigest(io, a, src_dir);
+    try std.testing.expectEqualSlices(u8, &before, &after);
 }

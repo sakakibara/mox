@@ -264,8 +264,8 @@ const partial_cases = [_]PartialCase{
 /// Partial-ownership properties for one scenario under hostile live bytes:
 /// locate and replace errors are expected outcomes; located spans lie within
 /// the live text; and a candidate replaceOwned builds must pass
-/// verifyInvariant against the same inputs (the self-consistency the apply
-/// pipeline relies on before writing).
+/// verifyInvariant against the same inputs -- the two functions' agreement
+/// with each other, not any write path's reliance on the recheck.
 fn checkPartialCase(a: std.mem.Allocator, case: PartialCase, live: []const u8) anyerror!void {
     const partial = mox.apply.partial;
     const paths = try a.alloc(partial.OwnPath, case.raws.len);

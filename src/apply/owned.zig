@@ -440,6 +440,32 @@ test "classify: a secret record with a stale path scope is outdated, never drift
     try testing.expect(try classifyToml(arena, "[api]\ntoken = \"new\"\n", live, &raws, rec) == .outdated);
 }
 
+test "classify: a secret record with no stored hash is drift, never clean" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raws = [_][]const u8{"api"};
+    // A record that carries neither cleartext nor a hash: an older writer, a
+    // truncated write. There is nothing to compare the live secret against,
+    // so it must not read as clean and be silently reasserted over.
+    const rec: applied.OwnedRecord = .{
+        .canonical = null,
+        .canonical_hash = null,
+        .secret = true,
+        .own_paths = &raws,
+        .secret_paths = &raws,
+    };
+    const c = try classifyToml(
+        arena,
+        "[api]\ntoken = \"composed\"\n",
+        "[api]\ntoken = \"hand edited\"\n",
+        &raws,
+        rec,
+    );
+    try testing.expect(c == .drift);
+    try testing.expect(c.drift == null);
+}
+
 fn classifyDisownToml(
     arena: std.mem.Allocator,
     composed: []const u8,
@@ -541,4 +567,65 @@ test "classifyDisown: a grown disown list stops comparing; a shrunk one is first
     const live_shrunk = "[user]\nname = \"me\"\n\n[state]\ncount = 42\n";
     const c = try classifyDisownToml(arena, "[user]\nname = \"me\"\n", live_shrunk, &none, rec);
     try testing.expectEqualStrings("state", c.drift.?);
+}
+
+test "classifyDisown: a secret record with no stored hash is drift, never clean" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raws = [_][]const u8{"state"};
+    const rec: applied.OwnedRecord = .{
+        .mode = .disown,
+        .canonical = null,
+        .canonical_hash = null,
+        .secret = true,
+        .own_paths = &raws,
+        .secret_paths = &.{"api"},
+    };
+    const c = try classifyDisownToml(
+        arena,
+        "[api]\ntoken = \"composed\"\n",
+        "[api]\ntoken = \"hand edited\"\n\n[state]\ncount = 1\n",
+        &raws,
+        rec,
+    );
+    try testing.expect(c == .drift);
+    try testing.expect(c.drift == null);
+}
+
+test "classifyDisown: an absent or unparseable record blob is drift, never outdated" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The disown list grew past the record's, so the stored blob has to be
+    // reparsed to subtract the newly protected path.
+    const record_raws = [_][]const u8{"state"};
+    const grown = [_][]const u8{ "state", "survey" };
+    const composed = "[user]\nname = \"me\"\n";
+    const live = "[user]\nname = \"edited\"\n\n[state]\ncount = 1\n\n[survey]\nseen = 9\n";
+
+    const unparseable: applied.OwnedRecord = .{
+        .mode = .disown,
+        .canonical = "not a canonical blob\n",
+        .canonical_hash = null,
+        .secret = false,
+        .own_paths = &record_raws,
+        .secret_paths = &.{},
+    };
+    const c = try classifyDisownToml(arena, composed, live, &grown, unparseable);
+    try testing.expect(c == .drift);
+    try testing.expect(c.drift == null);
+
+    const absent: applied.OwnedRecord = .{
+        .mode = .disown,
+        .canonical = null,
+        .canonical_hash = null,
+        .secret = false,
+        .own_paths = &record_raws,
+        .secret_paths = &.{},
+    };
+    const c2 = try classifyDisownToml(arena, composed, live, &grown, absent);
+    try testing.expect(c2 == .drift);
+    try testing.expect(c2.drift == null);
 }

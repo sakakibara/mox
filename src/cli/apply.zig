@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
@@ -1851,6 +1852,26 @@ pub fn partialCheckAccepts(ctx: *app.Ctx, check_argv: []const []const u8, live_p
     return false;
 }
 
+/// Test seam, declared only in a test build: the shipped binary has no
+/// `invariant_refusal` to reach, so the branch below reaching it would not
+/// compile were it ever analyzed outside one.
+pub const test_seam = if (builtin.is_test) struct {
+    /// Makes a passing ownership invariant recheck report this error instead.
+    pub var invariant_refusal: ?mox.apply.partial.VerifyError = null;
+} else struct {};
+
+/// `verdict` as the write path sees it, which a test build's seam can turn
+/// from a pass into a refusal. No source or live file spells a shape that
+/// makes the real recheck reject -- every shape it catches, the splice running
+/// before it refuses first -- so a test reaches the refusal branch of a write
+/// path only from there. `verdict` itself is evaluated identically either way.
+pub fn invariantVerdict(verdict: mox.apply.partial.VerifyError!void) mox.apply.partial.VerifyError!void {
+    try verdict;
+    if (builtin.is_test) {
+        if (test_seam.invariant_refusal) |forced| return forced;
+    }
+}
+
 /// Write one partially owned file: compose is already done, so this runs
 /// the declaration check, the per-path drift rule against the owned record,
 /// the span splice with its invariant, the masked snapshot, and the
@@ -2052,7 +2073,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
             return;
         },
     };
-    (switch (mode) {
+    invariantVerdict(switch (mode) {
         .own => partial_mod.verifyInvariant(ctx.alloc, format, live_text, candidate, own_paths, &owned, &pdiag),
         .disown => partial_mod.verifyDisownInvariant(ctx.alloc, format, live_text, candidate, own_paths, in.bytes, &owned, &pdiag),
     }) catch |e| switch (e) {
@@ -2307,7 +2328,7 @@ fn liveMatchesInitial(io: std.Io, arena: std.mem.Allocator, live_path: []const u
     return std.mem.eql(u8, initial.?, now.?);
 }
 
-test "liveMatchesInitial: detects an interleaved external change before a write" {
+test "liveMatchesInitial: true only when the path still holds what was read, absence included" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

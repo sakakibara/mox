@@ -268,7 +268,7 @@ fn repatchPartial(
             return false;
         },
     };
-    (switch (file.ownership) {
+    apply_cmd.invariantVerdict(switch (file.ownership) {
         .disown => partial.verifyDisownInvariant(ctx.alloc, format, live_text, candidate, file.own_paths, snap_owned_text, &snap_owned_doc, &pdiag),
         else => partial.verifyInvariant(ctx.alloc, format, live_text, candidate, file.own_paths, &snap_doc, &pdiag),
     }) catch |e| switch (e) {

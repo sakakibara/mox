@@ -494,6 +494,50 @@ test "apply: a file that stops composing to content is removed, its prior conten
     try std.testing.expect(!exists(io, live));
 }
 
+test "apply: an external edit between the read and the removal is refused, keeping the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src/.config/git");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.config/git/ids.inc",
+        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+    });
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath(".config/git/ids.inc");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("id one\n", try read(io, a, live));
+
+    // The data empties, so this apply reaches the removal.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ c.repo, "data", "ids.toml" }),
+        .data = "ids = []\n",
+    });
+
+    Interleaved.real = io;
+    Interleaved.trigger_dir = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    Interleaved.live_path = live;
+    Interleaved.edit = "id one\nthe user's own line\n";
+    Interleaved.fired = false;
+    var vtable: Io.VTable = undefined;
+    const raced = try testutil.setup(a, Interleaved.io(&vtable), &tmp, .{});
+
+    const r = try raced.run(&.{ "mox", "apply" });
+    try std.testing.expect(Interleaved.fired);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "changed underneath mox mid-apply") != null);
+    // The edit stands byte for byte: the snapshot holds the pre-edit bytes,
+    // so an unlink here would have left it nowhere to come back from.
+    try std.testing.expectEqualStrings("id one\nthe user's own line\n", try read(io, a, live));
+}
+
 test "apply: an emptied file the user edited is reported as drift, not silently removed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2098,7 +2142,7 @@ test "apply: a directiveless Cat A file resolves an inline secret and keeps it o
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
 }
 
-test "diff: a rotated secret is redacted on both sides, never printing a resolved value" {
+test "diff: a rotated secret, marked on both provenances, prints neither resolved value" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5109,6 +5153,98 @@ test "apply partial check: an unparseable MOX_CHECK_TIMEOUT_MS warns exactly onc
     try std.testing.expectEqual(first, std.mem.lastIndexOf(u8, r.err, "MOX_CHECK_TIMEOUT_MS=notanumber"));
 }
 
+test "apply partial: a refused ownership invariant recheck writes nothing and says so" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    const program_live = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 1\n\n[state]\ncount = 1\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The source moves on, so this apply reaches the splice and its recheck.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
+
+    const saved = mox.cli.apply_cmd.test_seam.invariant_refusal;
+    mox.cli.apply_cmd.test_seam.invariant_refusal = error.OwnedContentMismatch;
+    defer mox.cli.apply_cmd.test_seam.invariant_refusal = saved;
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "invariant check failed") != null);
+    try std.testing.expectEqualStrings(program_live, try read(io, a, live));
+}
+
+/// An `Io` that overwrites `live_path` with `edit` the first time a file is
+/// created under `trigger_dir`, and forwards everything else. The pre-write
+/// snapshot is what lands there, so the edit falls in the window between
+/// apply's read of the live file and its write -- the one window in which an
+/// edit is both overwritten and absent from the snapshot.
+const Interleaved = struct {
+    var real: Io = undefined;
+    var trigger_dir: []const u8 = "";
+    var live_path: []const u8 = "";
+    var edit: []const u8 = "";
+    var fired: bool = false;
+
+    fn createFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+        const f = try real.vtable.dirCreateFile(userdata, dir, sub_path, opts);
+        if (!fired and std.mem.indexOf(u8, sub_path, trigger_dir) != null) {
+            fired = true;
+            Io.Dir.cwd().writeFile(real, .{ .sub_path = live_path, .data = edit }) catch {};
+        }
+        return f;
+    }
+
+    fn io(vtable: *Io.VTable) Io {
+        vtable.* = real.vtable.*;
+        vtable.dirCreateFile = createFile;
+        return .{ .userdata = real.userdata, .vtable = vtable };
+    }
+};
+
+test "apply: an external edit between the read and the write is refused, keeping the edit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "v1\n" });
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("notes.txt");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, live));
+
+    // The source moves on, so this apply overwrites instead of reporting
+    // the file unchanged.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "v2\n" });
+
+    Interleaved.real = io;
+    Interleaved.trigger_dir = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    Interleaved.live_path = live;
+    Interleaved.edit = "the user's own edit\n";
+    Interleaved.fired = false;
+    var vtable: Io.VTable = undefined;
+    const raced = try testutil.setup(a, Interleaved.io(&vtable), &tmp, .{});
+
+    const r = try raced.run(&.{ "mox", "apply" });
+    try std.testing.expect(Interleaved.fired);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "changed underneath mox mid-apply") != null);
+    // The edit stands byte for byte. The snapshot holds the pre-edit bytes,
+    // so an overwrite here would have left it nowhere to come back from.
+    try std.testing.expectEqualStrings("the user's own edit\n", try read(io, a, live));
+}
+
 // Rollback on partial targets: the snapshot's owned subtree is re-patched
 // onto the CURRENT live file; the remainder is never whole-file clobbered.
 
@@ -5273,6 +5409,40 @@ test "rollback partial: a secret-masked snapshot is refused, live untouched" {
     // The refusal wrote nothing: no placeholder ever lands live.
     try std.testing.expectEqualStrings(before, try read(io, a, live));
     try std.testing.expect(std.mem.indexOf(u8, before, mox.apply.partial.secret_mask) == null);
+}
+
+test "rollback partial: a refused ownership invariant recheck writes nothing and says so" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePartialFixture(io, &tmp, "# mox: own tui\n[tui]\nk = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 1\n\n[state]\ncount = 1\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    // The source moves on; that write snapshots the pre-write live file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const before = try read(io, a, live);
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+
+    const saved = mox.cli.apply_cmd.test_seam.invariant_refusal;
+    mox.cli.apply_cmd.test_seam.invariant_refusal = error.RemainderMismatch;
+    defer mox.cli.apply_cmd.test_seam.invariant_refusal = saved;
+
+    const r = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "invariant check failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "re-patched") == null);
+    try std.testing.expectEqualStrings(before, try read(io, a, live));
 }
 
 test "apply: un-declaring ownership drops the owned record and rollback whole-file restores" {
@@ -6308,4 +6478,87 @@ test "status: a clean --drift run says nothing at all, summary included" {
     const d = try c.run(&.{ "mox", "status", "--drift" });
     try std.testing.expectEqual(@as(u8, 0), d.rc);
     try std.testing.expectEqualStrings("", d.out);
+}
+
+test "diff: a secret directive added since the last apply never prints its freshly resolved value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const new_secret = "ADDED-diff-s3cr3t-DO-NOT-LEAK-5555eeee";
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = new_secret });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zshrc",
+        .data = "export FOO=bar\nexport TOKEN=plaintext-placeholder\nexport BAZ=qux\n",
+    });
+
+    const c = try cliSetup(a, io, &tmp);
+
+    // Applied while the token line was plain: the live file holds cleartext
+    // and the persisted provenance marks nothing secret.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const secret_abs = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "secret.txt" });
+    const src = try std.fmt.allocPrint(
+        a,
+        "export FOO=bar\nexport TOKEN=<secret:file://{s}>\nexport BAZ=qux\n",
+        .{secret_abs},
+    );
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.zshrc", .data = src });
+
+    // Only the composed side is secret now, so the composed-side mask alone
+    // has to carry the redaction.
+    const r = try c.run(&.{ "mox", "diff" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, new_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, new_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, mox.provenance.map.secret_redaction) != null);
+}
+
+test "diff: a secret directive dropped since the last apply never prints the resolved value still live" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const old_secret = "DROPPED-diff-s3cr3t-DO-NOT-LEAK-6666ffff";
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = old_secret });
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const secret_abs = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "secret.txt" });
+    const src = try std.fmt.allocPrint(
+        a,
+        "export FOO=bar\nexport TOKEN=<secret:file://{s}>\nexport BAZ=qux\n",
+        .{secret_abs},
+    );
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.zshrc", .data = src });
+
+    const c = try cliSetup(a, io, &tmp);
+
+    // Applied while the token line was a secret: the live file holds the
+    // resolved value and the persisted provenance marks that line secret.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zshrc",
+        .data = "export FOO=bar\nexport TOKEN=plaintext-placeholder\nexport BAZ=qux\n",
+    });
+
+    // Only the live side is secret now, so the live-side mask alone has to
+    // carry the redaction.
+    const r = try c.run(&.{ "mox", "diff" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, old_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, old_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, mox.provenance.map.secret_redaction) != null);
 }

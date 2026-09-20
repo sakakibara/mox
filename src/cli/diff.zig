@@ -594,7 +594,7 @@ test "renderFile: no hunks renders empty" {
     try testing.expectEqualStrings("", out);
 }
 
-test "renderFile: a hunk touching a secret line redacts both sides" {
+test "renderFile: a hunk secret on both masks redacts its removed and added lines" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = [_][]const u8{ "user = me", "token = old-s3cr3t" };

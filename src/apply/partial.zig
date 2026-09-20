@@ -3399,8 +3399,12 @@ test "toml: a path inside an inline table value is refused" {
     try testLocateError(.toml, "tui = { keymap = { global = 1 } }\n", &.{"tui.keymap.global"}, error.OwnedPathUnaddressable);
 }
 
-test "overlapping declared paths are refused" {
+test "overlapping declared paths are refused in either declaration order" {
+    // The source tree hands the paths over in source-file order, unsorted, so
+    // the ancestor may be declared after the descendant.
     try testLocateError(.toml, "", &.{ "a", "a.b" }, error.OwnedPathDuplicate);
+    try testLocateError(.toml, "", &.{ "a.b", "a" }, error.OwnedPathDuplicate);
+    try testLocateError(.toml, "", &.{ "a", "a" }, error.OwnedPathDuplicate);
 }
 
 test "json: comma correctness at first, middle, and last member removals" {
@@ -3462,6 +3466,73 @@ test "json: removing a non-last member keeps a standalone comment between member
 
 test "json: a duplicate key on the declared path is refused" {
     try testLocateError(.json, "{\"a\": 1, \"a\": 2}", &.{"a"}, error.OwnedPathDuplicate);
+}
+
+test "json: a live key differing from the declared one only in case keeps its value" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cand = try testApply(
+        arena,
+        .json,
+        "{\"editor\": {\"FontSize\": 12, \"theme\": \"d\"}}",
+        &.{"editor.fontSize"},
+        "{\"editor\": {\"fontSize\": 14}}",
+    );
+    try testing.expectEqualStrings(
+        "{\"editor\": {\"FontSize\": 12, \"theme\": \"d\", \"fontSize\": 14}}",
+        cand,
+    );
+}
+
+test "json: a declared key differing from a live key only in case locates no span" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"editor.fontSize"});
+    const loc = try locateSpans(
+        arena,
+        .json,
+        "{\"editor\": {\"FontSize\": 12, \"theme\": \"d\"}}",
+        paths,
+        null,
+    );
+    try testing.expect(loc.spans[0] == null);
+}
+
+test "json: two live keys differing only in case are not a duplicate of the declared key" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cand = try testApply(
+        arena,
+        .json,
+        "{\"a\": {\"k\": 1, \"K\": 2}}",
+        &.{"a.k"},
+        "{\"a\": {\"k\": 9}}",
+    );
+    try testing.expectEqualStrings("{\"a\": {\"k\": 9, \"K\": 2}}", cand);
+}
+
+test "json: spaces between an owned member's comma and the line break outlive its removal" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "{\n  \"a\": 1,  \n  \"b\": 2\n}\n";
+    const cand = try testApply(arena, .json, live, &.{"a"}, "{}");
+    try testing.expectEqualStrings("{\n    \n  \"b\": 2\n}\n", cand);
+}
+
+test "json: an owned member's span ends at its comma when only spaces follow it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "{\n  \"a\": 1,  \n  \"b\": 2\n}\n";
+    const paths = try testOwn(arena, &.{"a"});
+    const loc = try locateSpans(arena, .json, live, paths, null);
+    const sp = loc.spans[0].?;
+    try testing.expectEqual(std.mem.indexOf(u8, live, "\"a\"").?, sp.start);
+    try testing.expectEqual(std.mem.indexOf(u8, live, ",").? + 1, sp.end);
 }
 
 test "yaml: block mapping replace preserves siblings" {
@@ -3530,6 +3601,13 @@ test "yaml: anchors, aliases, merge keys, and non-string keys are refused" {
         error.OwnedPathMergeKey,
     );
     try testLocateError(.yaml, "tui:\n  1: x\n", &.{"tui.1"}, error.OwnedPathNonStringKey);
+}
+
+test "yaml: a tag on the owned path or inside its subtree is refused" {
+    try testLocateError(.yaml, "tui: !!str hello\n", &.{"tui"}, error.OwnedPathAliased);
+    try testLocateError(.yaml, "tui:\n  k: !!str hello\n", &.{"tui"}, error.OwnedPathAliased);
+    try testLocateError(.yaml, "tui:\n  k: !!str hello\n", &.{"tui.k"}, error.OwnedPathAliased);
+    try testLocateError(.yaml, "tui: !custom\n  a: 1\n", &.{"tui"}, error.OwnedPathAliased);
 }
 
 test "ini: section match is case-insensitive under the dialect" {
@@ -3616,6 +3694,32 @@ test "gitconfig: key entry replace and multi-value append" {
     );
 }
 
+test "gitconfig: entries for the owned key split by another key's line are refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "[user]\n\temail = a\n\tname = zz\n\temail = b\n";
+    const paths = try testOwn(arena, &.{"user.email"});
+    var diag: Diag = .{};
+    try testing.expectError(
+        error.OwnedPathDuplicate,
+        locateSpans(arena, .gitconfig, live, paths, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "not contiguous") != null);
+}
+
+test "gitconfig: a two-entry key's span ends where the next key's line begins" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const live = "[user]\n\temail = a\n\temail = b\n\tname = zz\n";
+    const paths = try testOwn(arena, &.{"user.email"});
+    const loc = try locateSpans(arena, .gitconfig, live, paths, null);
+    const sp = loc.spans[0].?;
+    try testing.expectEqual(std.mem.indexOf(u8, live, "\temail = a").?, sp.start);
+    try testing.expectEqual(std.mem.indexOf(u8, live, "\tname = zz").?, sp.end);
+}
+
 test "verifier: a corrupted remainder and a wrong owned value both fail" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -3646,6 +3750,50 @@ test "verifier: a corrupted remainder and a wrong owned value both fail" {
         error.OwnedContentMismatch,
         verifyInvariant(arena, .toml, live, bad_owned, paths, &owned, &diag),
     );
+}
+
+test "verifier: over a missing json file only the created root braces are exempt" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"b"});
+    const owned = try OwnedDoc.parse(arena, .json, "{\"b\": 2}");
+    var diag: Diag = .{};
+
+    try verifyInvariant(arena, .json, "", "{\"b\": 2}", paths, &owned, &diag);
+
+    // A member beyond the declared path is remainder the missing live file
+    // never held: the exemption covers the braces and nothing else.
+    try testing.expectError(error.RemainderMismatch, verifyInvariant(
+        arena,
+        .json,
+        "",
+        "{\"b\": 2, \"z\": 9}",
+        paths,
+        &owned,
+        &diag,
+    ));
+}
+
+test "verifier: only a newline may be attributed to an owned span as its separator" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Live ends without a newline, so the separator rule is consulted. The
+    // candidate's owned span is preceded by a space it did not own, and the
+    // remainders differ by exactly that one byte.
+    const paths = try testOwn(arena, &.{"b"});
+    const owned = try OwnedDoc.parse(arena, .json, "{\"b\": 0}");
+    var diag: Diag = .{};
+    try testing.expectError(error.RemainderMismatch, verifyInvariant(
+        arena,
+        .json,
+        "{\"b\": 0, \"z\": 9}",
+        "{ \"b\": 0, \"z\": 9}",
+        paths,
+        &owned,
+        &diag,
+    ));
 }
 
 test "verifier: a toml replace, remove and append in one file reparses cleanly" {
@@ -4020,6 +4168,41 @@ test "disown verify: a smuggled owned byte and a mutated protected span both fai
         .toml,
         live,
         "[user]\nname = \"me\"\n\n[state]\ncount = 43\n",
+        paths,
+        composed,
+        &composed_doc,
+        &diag,
+    ));
+}
+
+test "disown verify: a protected span the candidate gained or lost fails" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try testOwn(arena, &.{"state"});
+    const composed = "[user]\nname = \"me\"\n";
+    const composed_doc = try OwnedDoc.parse(arena, .toml, composed);
+    var diag: Diag = .{};
+
+    // Gained: live holds nothing under the protected path, the candidate
+    // invents content there.
+    try testing.expectError(error.RemainderMismatch, verifyDisownInvariant(
+        arena,
+        .toml,
+        "[user]\nname = \"me\"\n",
+        "[user]\nname = \"me\"\n[state]\ncount = 42\n",
+        paths,
+        composed,
+        &composed_doc,
+        &diag,
+    ));
+
+    // Lost: the candidate dropped the protected span altogether.
+    try testing.expectError(error.RemainderMismatch, verifyDisownInvariant(
+        arena,
+        .toml,
+        "[user]\nname = \"me\"\n\n[state]\ncount = 42\n",
+        "[user]\nname = \"me\"\n",
         paths,
         composed,
         &composed_doc,

@@ -4146,3 +4146,40 @@ test "status: a refused pass has no counts to give, and says which line says why
     // whole reason this line exists.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "nothing to do") == null);
 }
+
+test "status: a manager whose list output lost its separators is BROKEN, and none of its rows is judged" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+
+    // brew answers its probe, then hands back its whole list on one line.
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg ripgrep bat\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
+    try absentLinuxManagers(a, &entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  BROKEN    brew (list: its list output lost its shape)\n") != null);
+    // An unreadable listing answers nothing about any row: a declared package
+    // called MISSING here would send apply off to reinstall the lot.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "UNTRACKED") == null);
+
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    try expectPorcelain(p.out);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t-\tlist\tits list output lost its shape\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing") == null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_untracked") == null);
+}

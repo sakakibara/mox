@@ -64,17 +64,6 @@ pub fn overwriteScope(kind: Kind) []const u8 {
     };
 }
 
-/// The human label naming `kind` for a report row.
-pub fn kindLabel(arena: std.mem.Allocator, kind: Kind) ![]const u8 {
-    return switch (kind) {
-        .whole_file => "whole file",
-        .owned_key => |k| if (k) |key| try std.fmt.allocPrint(arena, "owned key '{s}'", .{key}) else "owned content",
-        .symlink_target => "symlink target",
-        .generated_set => "generated set",
-        .vanished => "file to remove",
-    };
-}
-
 /// Whole-file drift: wraps `applied.classify`'s disposition into a report
 /// unit, null unless it is `.drift`. `first_contact` is read straight off
 /// `recorded`, the same last-applied hash lookup `classify` itself takes:
@@ -203,21 +192,12 @@ test "generatedSet: always one unit at the generator's own path, never first con
     try testing.expect(!u.first_contact);
 }
 
-test "overwriteScope and kindLabel: one phrase per kind" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-
+test "overwriteScope: one phrase per kind" {
     try testing.expectEqualStrings("whole file", overwriteScope(.whole_file));
     try testing.expectEqualStrings("that key", overwriteScope(.{ .owned_key = "k" }));
     try testing.expectEqualStrings("re-point", overwriteScope(.symlink_target));
     try testing.expectEqualStrings("regenerate the set", overwriteScope(.generated_set));
-
-    try testing.expectEqualStrings("whole file", try kindLabel(a, .whole_file));
-    try testing.expectEqualStrings("owned key 'tui.keymap'", try kindLabel(a, .{ .owned_key = "tui.keymap" }));
-    try testing.expectEqualStrings("owned content", try kindLabel(a, .{ .owned_key = null }));
-    try testing.expectEqualStrings("symlink target", try kindLabel(a, .symlink_target));
-    try testing.expectEqualStrings("generated set", try kindLabel(a, .generated_set));
+    try testing.expectEqualStrings("remove the file", overwriteScope(.vanished));
 }
 
 test "sortByPath: deterministic order regardless of insertion order" {

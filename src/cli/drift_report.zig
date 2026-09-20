@@ -309,16 +309,18 @@ test "render: one row per kind, aligned columns, exact bytes" {
         .{ .path = "/home/u/.claude/CLAUDE.md", .kind = .whole_file, .first_contact = false },
         .{ .path = "/home/u/.claude/hooks", .kind = .symlink_target, .first_contact = false },
         .{ .path = "/home/u/.config/gen.inc", .kind = .generated_set, .first_contact = false },
+        .{ .path = "/home/u/.config/git/ids.inc", .kind = .vanished, .first_contact = false },
     };
     const s = try renderToString(a, &units, .{ .written = 18, .home = test_home, .sty = off, .width = 200 });
     try testing.expectEqualStrings(
         \\
-        \\  Applied 18 files. 4 drifted, left untouched -- nothing was overwritten.
+        \\  Applied 18 files. 5 drifted, left untouched -- nothing was overwritten.
         \\
         \\    ~/.claude/CLAUDE.md      edited since mox wrote it   overwrite: whole file
         \\    ~/.claude/hooks          symlink target differs      overwrite: re-point
         \\    ~/.claude/settings.json  owned key 'enabledPlugins'  overwrite: that key
         \\    ~/.config/gen.inc        generated set drifted       overwrite: regenerate the set
+        \\    ~/.config/git/ids.inc    no longer composed; edited  overwrite: remove the file
         \\
         \\  take the repo's version:  mox apply --overwrite <path>
         \\  keep your edit:           mox commit <path>

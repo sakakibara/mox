@@ -732,3 +732,40 @@ fn driftRows(a: std.mem.Allocator, out: []const u8) ![]const u8 {
     }
     return rows.toOwnedSlice(a);
 }
+
+test "status: the drift set is path-ordered even when the files reach it in another order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "src a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/z.conf", .data = "src z\n" });
+
+    const c = try cliSetup(a, io, &tmp);
+    for ([_][]const u8{ "a.conf", "z.conf" }) |name| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(name), .data = "preexisting\n" });
+    }
+
+    // A path-scoped run takes its files in the order the operands name them,
+    // so naming them backwards is what makes this tree's arrival order differ
+    // from its path order.
+    const za = [_][]const u8{ try c.homePath("z.conf"), try c.homePath("a.conf") };
+
+    // The per-file table is written as each file is reached, so it is what
+    // establishes that the arrival order here really is z before a.
+    const t = try c.run(&.{ "mox", "status", za[0], za[1] });
+    try std.testing.expectEqual(@as(u8, 1), t.rc);
+    try std.testing.expect(std.mem.indexOf(u8, t.out, "z.conf").? < std.mem.indexOf(u8, t.out, "a.conf").?);
+
+    const p = try c.run(&.{ "mox", "status", "--porcelain", za[0], za[1] });
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "a.conf").? < std.mem.indexOf(u8, p.out, "z.conf").?);
+
+    const j = try c.run(&.{ "mox", "status", "--json", za[0], za[1] });
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "a.conf").? < std.mem.indexOf(u8, j.out, "z.conf").?);
+}
