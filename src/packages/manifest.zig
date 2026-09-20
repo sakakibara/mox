@@ -702,6 +702,24 @@ fn tmpAbs(a: std.mem.Allocator, io: Io, sub: []const u8, rel: []const u8) ![]con
     return std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", sub, rel });
 }
 
+fn expectRefusal(
+    a: std.mem.Allocator,
+    io: Io,
+    body: []const u8,
+    want: anyerror,
+    want_message: []const u8,
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/a.toml", .data = body });
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+
+    var d: Diag = .{};
+    try testing.expectError(want, load(a, io, repo, "", &d));
+    try testing.expectEqualStrings(want_message, d.capture().?);
+}
+
 test "load: file-level backend default, row override, and adapter fields" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1543,4 +1561,318 @@ test "load: an unreadable data/packages directory is named" {
         const want = try std.fmt.allocPrint(a, "data/packages: cannot open {s}: AccessDenied", .{dir_path});
         try testing.expectEqualStrings(want, d.capture().?);
     }
+}
+
+test "load: a top-level packages, bootstrap, or blacklist that is not an array is refused" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectRefusal(a, io,
+        \\packages = 1
+        \\
+    , Error.MalformedPackageFile, "data/packages/a.toml: \"packages\" must be a [[packages]] array");
+
+    try expectRefusal(a, io,
+        \\bootstrap = 1
+        \\
+    , Error.MalformedPackageFile, "data/packages/a.toml: \"bootstrap\" must be a [[bootstrap]] array");
+
+    try expectRefusal(a, io,
+        \\blacklist = 1
+        \\
+    , Error.MalformedPackageFile, "data/packages/a.toml: \"blacklist\" must be a [[blacklist]] array");
+}
+
+test "load: an element of packages, bootstrap, or blacklist that is not a table is refused by its index" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\packages = [{ name = "ripgrep" }, 1]
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: row 1 is not a table");
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\bootstrap = [{ url = "https://example.invalid/i.sh", sha256 = "00" }, 1]
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: bootstrap row 1 is not a table");
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\blacklist = [{ name = "usage" }, 1]
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: blacklist row 1 is not a table");
+}
+
+test "load: a file-level backend or when that is not a non-empty string is refused, as is a when that will not parse" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const backend_message = "data/packages/a.toml: file-level \"backend\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\backend = 1
+        \\
+    , Error.MalformedPackageFile, backend_message);
+    try expectRefusal(a, io,
+        \\backend = ""
+        \\
+    , Error.MalformedPackageFile, backend_message);
+
+    const when_message = "data/packages/a.toml: file-level \"when\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\when = 1
+        \\
+    , Error.MalformedPackageFile, when_message);
+    try expectRefusal(a, io,
+        \\when = ""
+        \\
+    , Error.MalformedPackageFile, when_message);
+
+    try expectRefusal(a, io,
+        \\when = "os=darwin os=linux"
+        \\
+    , Error.MalformedPackageFile, "data/packages/a.toml: file-level \"when\" is not a valid axis expression: os=darwin os=linux");
+}
+
+test "load: a packages row with no name, or a name, backend, or when that is not a non-empty string, is refused" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\pin = true
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: row 1 has no \"name\"");
+
+    const name_message = "data/packages/a.toml: row 0: \"name\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = 1
+        \\
+    , Error.MalformedPackageRow, name_message);
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = ""
+        \\
+    , Error.MalformedPackageRow, name_message);
+
+    const backend_message = "data/packages/a.toml: row \"ripgrep\": \"backend\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\backend = 1
+        \\
+    , Error.MalformedPackageRow, backend_message);
+    try expectRefusal(a, io,
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\backend = ""
+        \\
+    , Error.MalformedPackageRow, backend_message);
+
+    const when_message = "data/packages/a.toml: row \"ripgrep\": \"when\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\when = 1
+        \\
+    , Error.MalformedPackageRow, when_message);
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\when = ""
+        \\
+    , Error.MalformedPackageRow, when_message);
+}
+
+test "load: a bootstrap row with no backend and no file default, or a backend that is not a non-empty string, is refused" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const backend_message = "data/packages/a.toml: bootstrap row 0: \"backend\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\[[bootstrap]]
+        \\backend = 1
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\
+    , Error.MalformedPackageRow, backend_message);
+    try expectRefusal(a, io,
+        \\[[bootstrap]]
+        \\backend = ""
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\
+    , Error.MalformedPackageRow, backend_message);
+
+    try expectRefusal(a, io,
+        \\[[bootstrap]]
+        \\backend = "brew"
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/j.sh"
+        \\sha256 = "11"
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: bootstrap row 1 has no \"backend\" and the file declares no default");
+}
+
+test "load: a bootstrap row whose url, sha256, or when is not a non-empty string is refused, as is a when that will not parse" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = 1
+        \\sha256 = "00"
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: bootstrap row 0 for backend \"brew\": \"url\" must be a non-empty string");
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = ""
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: bootstrap row 0 for backend \"brew\": \"sha256\" must be a non-empty string");
+
+    const when_message = "data/packages/a.toml: bootstrap row 0 for backend \"brew\": \"when\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\when = 1
+        \\
+    , Error.MalformedPackageRow, when_message);
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\when = ""
+        \\
+    , Error.MalformedPackageRow, when_message);
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/i.sh"
+        \\sha256 = "00"
+        \\when = "os=darwin os=linux"
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: bootstrap row 0 for backend \"brew\": \"when\" is not a valid axis expression: os=darwin os=linux");
+}
+
+test "load: a blacklist row with no name, a name or backend that is not a non-empty string, or no backend and no file default, is refused" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+        \\[[blacklist]]
+        \\kind = "cask"
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: blacklist row 1 has no \"name\"");
+
+    const name_message = "data/packages/a.toml: blacklist row 0: \"name\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[blacklist]]
+        \\name = 1
+        \\
+    , Error.MalformedPackageRow, name_message);
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[blacklist]]
+        \\name = ""
+        \\
+    , Error.MalformedPackageRow, name_message);
+
+    const backend_message = "data/packages/a.toml: blacklist row \"usage\": \"backend\" must be a non-empty string";
+    try expectRefusal(a, io,
+        \\[[blacklist]]
+        \\name = "usage"
+        \\backend = 1
+        \\
+    , Error.MalformedPackageRow, backend_message);
+    try expectRefusal(a, io,
+        \\[[blacklist]]
+        \\name = "usage"
+        \\backend = ""
+        \\
+    , Error.MalformedPackageRow, backend_message);
+
+    try expectRefusal(a, io,
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: blacklist row \"usage\" has no \"backend\" and the file declares no default");
+}
+
+test "load: a non-scalar field on a blacklist row is refused, never silently dropped" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectRefusal(a, io,
+        \\backend = "brew"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\opts = { verbose = true }
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: blacklist row \"usage\": \"opts\" must be a string, integer, boolean, or array of strings");
+
+    try expectRefusal(a, io,
+        \\backend = "winget"
+        \\
+        \\[[blacklist]]
+        \\name = "Microsoft.PowerShell"
+        \\args = ["--silent", 1]
+        \\
+    , Error.MalformedPackageRow, "data/packages/a.toml: blacklist row \"Microsoft.PowerShell\": \"args\" must be a string, integer, boolean, or array of strings");
 }
