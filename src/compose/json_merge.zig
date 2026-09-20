@@ -128,7 +128,7 @@ test "json merge: type mismatch (object base + scalar overlay) -> overlay wins" 
     try std.testing.expectEqualStrings("disabled", merged.object.get("settings").?.string);
 }
 
-test "json merge: errors on non-object inputs" {
+test "json merge: errors when the base is not an object" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -136,6 +136,38 @@ test "json merge: errors on non-object inputs" {
     const base = json.Value{ .integer = 1 };
     const overlay = try json.parse(a, "{\"x\":2}", .{ .dialect = .jsonc });
     try std.testing.expectError(error.NotAnObject, deepMerge(a, base, overlay));
+}
+
+test "json merge: errors when the overlay is not an object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try json.parse(a, "{\"x\":1}", .{ .dialect = .jsonc });
+    const overlay = json.Value{ .integer = 2 };
+    try std.testing.expectError(error.NotAnObject, deepMerge(a, base, overlay));
+}
+
+test "json merge: errors when the overlay is an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try json.parse(a, "{\"x\":1}", .{ .dialect = .jsonc });
+    const overlay = try json.parse(a, "[1,2]", .{ .dialect = .jsonc });
+    try std.testing.expectError(error.NotAnObject, deepMerge(a, base, overlay));
+}
+
+test "json merge: scalar base with object overlay -> overlay object wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try json.parse(a, "{\"settings\":\"disabled\"}", .{ .dialect = .jsonc });
+    const overlay = try json.parse(a, "{\"settings\":{\"foo\":1}}", .{ .dialect = .jsonc });
+    const merged = try deepMerge(a, base, overlay);
+
+    try std.testing.expectEqual(@as(i64, 1), merged.getT(i64, "settings.foo").?);
 }
 
 test "json merge: jsonc input (comments + trailing commas) parses" {

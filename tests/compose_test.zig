@@ -4978,3 +4978,229 @@ test "compose catA: a check line in an overlay of a merged source is inert, not 
     try std.testing.expect(std.mem.indexOf(u8, out, "base = 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "other = 2") != null);
 }
+
+// -- a gated single layer composes structurally, never through Cat B --
+
+test "compose catA toml: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/g.toml", "# mox: when os=macos\n[a]\nx = 1\n# mox: when profile=work\ny = 2\n# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "macos");
+    try b.put("profile", "personal");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when os=macos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when profile=work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "y = 2") != null);
+}
+
+test "compose catA json: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/g.json", "// mox: when os=macos\n{\n  \"a\": 1,\n  // mox: when profile=work\n  \"b\": 2\n  // mox: end\n}\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "macos");
+    try b.put("profile", "personal");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "// mox: when os=macos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "// mox: when profile=work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"b\": 2") != null);
+}
+
+test "compose catA yaml: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/g.yaml", "# mox: when os=macos\na: 1\n# mox: when profile=work\nb: 2\n# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "macos");
+    try b.put("profile", "personal");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when os=macos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when profile=work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b: 2") != null);
+}
+
+test "compose catA gitconfig: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when os=macos\n[user]\n\temail = a@b.com\n# mox: when profile=work\n\tname = Work\n# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "macos");
+    try b.put("profile", "personal");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when os=macos") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when profile=work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "name = Work") != null);
+}
+
+// -- multi-overlay fold order --
+
+test "compose catA json: with two matching overlays the more specific one wins" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/m.json", "{\n  \"k\": \"base\"\n}\n");
+    try writeFile(io, tmp.dir, "src/m.json.d/os=darwin.json", "{\n  \"k\": \"one\"\n}\n");
+    try writeFile(io, tmp.dir, "src/m.json.d/os=darwin+arch=arm64.json", "{\n  \"k\": \"two\"\n}\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("arch", "arm64");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expectEqualStrings("{\n  \"k\": \"two\"\n}\n", out);
+}
+
+test "compose catA yaml: with two matching overlays the more specific one wins" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/m.yaml", "k: base\n");
+    try writeFile(io, tmp.dir, "src/m.yaml.d/os=darwin.yaml", "k: one\n");
+    try writeFile(io, tmp.dir, "src/m.yaml.d/os=darwin+arch=arm64.yaml", "k: two\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("arch", "arm64");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "one") == null);
+}
+
+test "compose catA gitconfig: with two matching overlays the more specific one wins" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n\temail = base@x\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/os=darwin", "[user]\n\temail = one@x\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/os=darwin+arch=arm64", "[user]\n\temail = two@x\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try b.put("arch", "arm64");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "two@x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "one@x") == null);
+}
+
+// -- content-driven category routing --
+
+test "composeFile: an extension-less file whose content sniffs binary routes to Cat C" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Nothing but the content sniff makes this Cat C, and only Cat C copies it
+    // verbatim: Cat B would read the region as a directive and drop its body.
+    const content = "\x00\x01\x02\x03\n# mox: when os=linux\nKEEP-ME\n# mox: end\n";
+    try writeFile(io, tmp.dir, "src/.local/share/blob", content);
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expectEqualStrings(content, out);
+}
+
+test "compose catC: the recorded overlay origin of a base-less file names the source path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/icon.png.d/os=darwin.png", "DARWIN\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    const out = (try mox.compose.composeFileTracked(a, io, tree.files[0], &b_r, null, null, &prov, null)).?;
+    try std.testing.expectEqualStrings("DARWIN\n", out);
+    try std.testing.expectEqual(@as(usize, 1), prov.items.len);
+    try std.testing.expect(!tree.files[0].has_base);
+    try std.testing.expectEqualStrings(tree.files[0].source_base_path, prov.items[0].origin.overlay.path);
+    try std.testing.expect(prov.items[0].origin.overlay.path.len > 0);
+}

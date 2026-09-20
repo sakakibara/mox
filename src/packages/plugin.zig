@@ -568,6 +568,28 @@ test "declare: a core key or an unquotable key is bad output, never written" {
     try testing.expectError(Error.PluginBadOutput, p.backend().declare(a, "y"));
 }
 
+test "declare: a key with an underscore or a hyphen is accepted, not read as unquotable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "/r/scripts/backends/macports declare +universal:gcc14",
+            .stdout = "name = \"gcc14\"\nno-quarantine = true\nbuild_arch = \"universal\"\n",
+        },
+        .{ .argv = "/r/scripts/backends/macports id", .stdout = "+universal:gcc14\n" },
+    } };
+    var p = pluginWith(&fake);
+
+    const decl = try p.backend().declare(a, "+universal:gcc14");
+    try testing.expectEqualStrings("gcc14", decl.name);
+    try testing.expectEqualStrings("no-quarantine", decl.fields[0].key);
+    try testing.expectEqual(true, decl.fields[0].value.boolean);
+    try testing.expectEqualStrings("build_arch", decl.fields[1].key);
+    try testing.expectEqualStrings("universal", decl.fields[1].value.string);
+}
+
 test "id: a refused row is the plugin's decision, surfaced through validate" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

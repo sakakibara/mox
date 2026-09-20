@@ -109,11 +109,19 @@ test "detect: known C extension overrides text content" {
     try std.testing.expectEqual(Category.c, detect("foo.png", "Hello\n"));
 }
 
-test "detect: a text extension wins over an isolated control byte" {
+test "detect: a .sh with control bytes far under the binary threshold is B" {
     // A .sh whose first 4KB embeds a raw ESC (color-code prompt) is still Cat B,
     // so its `# mox:` directives get processed rather than copied verbatim.
     const content = "# mox: when os=darwin\nexport PS1=$'\x1b[31m%n\x1b[0m'\n";
     try std.testing.expectEqual(Category.b, detect("prompt.sh", content));
+}
+
+test "detect: a .sh over the binary threshold is still B, so the extension outranks the sniff" {
+    // 60 percent control bytes: the sniff alone would call this Cat C and copy
+    // it verbatim, skipping every directive in it.
+    var content = [_]u8{'a'} ** 100;
+    for (content[0..60]) |*b| b.* = 0x1b;
+    try std.testing.expectEqual(Category.b, detect("prompt.sh", &content));
 }
 
 test "detect: no-extension content with NUL is binary C" {
@@ -136,4 +144,22 @@ test "detect: no-extension content with 31 percent control bytes is C" {
     var content = [_]u8{'a'} ** 100;
     for (content[0..31]) |*b| b.* = 0x1b;
     try std.testing.expectEqual(Category.c, detect("mystery", &content));
+}
+
+test "detect: no-extension content 31 percent tabs is B" {
+    var content = [_]u8{'a'} ** 100;
+    for (content[0..31]) |*b| b.* = '\t';
+    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+}
+
+test "detect: no-extension content 31 percent newlines is B" {
+    var content = [_]u8{'a'} ** 100;
+    for (content[0..31]) |*b| b.* = '\n';
+    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+}
+
+test "detect: no-extension content 31 percent carriage returns is B" {
+    var content = [_]u8{'a'} ** 100;
+    for (content[0..31]) |*b| b.* = '\r';
+    try std.testing.expectEqual(Category.b, detect("mystery", &content));
 }

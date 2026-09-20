@@ -4099,6 +4099,30 @@ test "install: an unsynced pacman database is read through mox's copy, and synce
     try testing.expect(conf.called(pacmanMakeCall("/mnt/arch/var/lib/pacman/local")));
 }
 
+test "install: a DBPath answered empty falls back to pacman's own default, never to /local" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `pacman-conf DBPath` answering with nothing, and answering with the
+    // bare root whose trailing slash is trimmed off, leave the same empty
+    // string; linking the copy's `local` at `/local` would point it at a
+    // path no machine has.
+    for ([_][]const u8{ "\n", "/\n" }) |answer| {
+        var fake: exec.Fake = .{ .arena = a, .entries = &.{
+            .{ .argv = "pacman -Qdq", .code = 1 },
+            .{ .argv = "pacman-conf DBPath", .stdout = answer },
+            .{ .argv = pacman_probe, .code = 1 },
+            .{ .argv = pacman_make },
+            .{ .argv = pacman_private_sync, .code = 1 },
+            .{ .argv = "test -e " ++ pdb ++ "/db.lck", .code = 1 },
+        } };
+        var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = false };
+        try testing.expectError(Error.DistroRefreshFailed, d.backend().install(a, &.{rowOf("bat", &.{})}));
+        try testing.expect(fake.called(pacmanMakeCall("/var/lib/pacman/local")));
+    }
+}
+
 test "install: apt refuses the qualifiers apt reads as the native architecture" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

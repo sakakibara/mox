@@ -203,7 +203,9 @@ pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, header: [
     if (existing.len > 0 and existing[existing.len - 1] != '\n') {
         try buf.append(arena, '\n');
     }
-    try buf.appendSlice(arena, block);
+    // An empty file gets the block the way a missing one does: the leading
+    // newline separates a block from what precedes it, and nothing does.
+    try buf.appendSlice(arena, if (existing.len == 0) std.mem.trimStart(u8, block, "\n") else block);
     try apply_write.writeAtomic(io, path, buf.items, try modeOf(io, path));
 }
 
@@ -417,6 +419,55 @@ test "inlineRow: a key outside the bare charset is quoted, never misparsed" {
     try testing.expectEqualStrings("{ name = \"x\", \"my key\" = 1, \"a.b\" = \"v\" }", got);
 }
 
+test "inlineRow: an underscore or a hyphen in a key is written bare, not quoted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try inlineRow(a, "x", &.{
+        .{ .key = "auto_update", .value = .{ .boolean = false } },
+        .{ .key = "no-quarantine", .value = .{ .boolean = true } },
+        .{ .key = "x86_64", .value = .{ .int = 1 } },
+    });
+    try testing.expectEqualStrings(
+        "{ name = \"x\", auto_update = false, no-quarantine = true, x86_64 = 1 }",
+        got,
+    );
+}
+
+test "inlineRow: a string-array field renders as a bracketed list, comma-separated" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try inlineRow(a, "nginx", &.{
+        .{ .key = "args", .value = .{ .strings = &.{ "--with-http_v2", "--with-debug" } } },
+        .{ .key = "kind", .value = .{ .string = "formula" } },
+    });
+    try testing.expectEqualStrings(
+        "{ name = \"nginx\", args = [\"--with-http_v2\", \"--with-debug\"], kind = \"formula\" }",
+        got,
+    );
+}
+
+test "render: an underscore or a hyphen in a key is written bare, not quoted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try render(a, .packages, .{
+        .name = "ghostty",
+        .fields = &.{
+            .{ .key = "auto_update", .value = .{ .boolean = false } },
+            .{ .key = "no-quarantine", .value = .{ .boolean = true } },
+        },
+    }, null);
+    try testing.expectEqualStrings(
+        "\n[[packages]]\nname = \"ghostty\"\nauto_update = false\nno-quarantine = true\n",
+        got,
+    );
+}
+
 test "targetFor: a file carrying only a blacklist row for the backend speaks it" {
     const row: manifest_mod.BlacklistRow = .{
         .name = "usage",
@@ -487,6 +538,102 @@ test "targetFor: falls back to a file already carrying a row for the backend" {
         .sources = &.{sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false)},
     };
     try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
+}
+
+test "targetFor: a row for another backend, or one belonging to another file, is not a file speaking the backend" {
+    const foreign: manifest_mod.Row = .{
+        .name = "bat",
+        .backend = "dnf",
+        .when = null,
+        .fields = &.{},
+        .origin = "/r/a.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+    const mine: manifest_mod.Row = .{
+        .name = "htop",
+        .backend = "brew",
+        .when = null,
+        .fields = &.{},
+        .origin = "/r/b.toml",
+        .label = "data/packages/b.toml",
+        .index = 1,
+    };
+    // Neither file declares a default, so a.toml is reached first and holds
+    // a row of its own; only b.toml holds one for brew.
+    const m: Manifest = .{
+        .packages = &.{ foreign, mine },
+        .sources = &.{
+            sourceOf("data/packages/a.toml", "/r/a.toml", null, false),
+            sourceOf("data/packages/b.toml", "/r/b.toml", null, false),
+        },
+    };
+    try testing.expectEqualStrings("/r/b.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
+}
+
+test "targetFor: a repo file carrying a row beats a private file carrying one, whatever their order" {
+    const priv_row: manifest_mod.Row = .{
+        .name = "ripgrep",
+        .backend = "brew",
+        .when = null,
+        .fields = &.{},
+        .origin = "/p/local.toml",
+        .label = "data/packages/local.toml (private layer)",
+        .index = 0,
+    };
+    const repo_row: manifest_mod.Row = .{
+        .name = "htop",
+        .backend = "brew",
+        .when = null,
+        .fields = &.{},
+        .origin = "/r/mixed.toml",
+        .label = "data/packages/mixed.toml",
+        .index = 0,
+    };
+    // Neither file declares a default, so both are reached by the same arm,
+    // and the private one comes first.
+    const m: Manifest = .{
+        .packages = &.{ priv_row, repo_row },
+        .sources = &.{
+            sourceOf("data/packages/local.toml", "/p/local.toml", null, true),
+            sourceOf("data/packages/mixed.toml", "/r/mixed.toml", null, false),
+        },
+    };
+    try testing.expectEqualStrings("/r/mixed.toml", (try targetFor(testing.allocator, m, "brew", &unbound, .packages)).?.path);
+}
+
+test "targetFor: a file already carrying a row for the backend is still refused when its gate excludes it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const row: manifest_mod.Row = .{
+        .name = "ripgrep",
+        .backend = "brew",
+        .when = null,
+        .fields = &.{},
+        .origin = "/r/linux.toml",
+        .label = "data/packages/linux.toml",
+        .index = 0,
+    };
+    const listed: manifest_mod.BlacklistRow = .{
+        .name = "usage",
+        .backend = "brew",
+        .fields = &.{},
+        .origin = "/r/linux.toml",
+        .label = "data/packages/linux.toml",
+        .index = 0,
+    };
+    const m: Manifest = .{
+        .packages = &.{row},
+        .blacklist = &.{listed},
+        .sources = &.{gatedSource("data/packages/linux.toml", "/r/linux.toml", null, "os=linux")},
+    };
+    try testing.expect((try targetFor(a, m, "brew", &r, .packages)) == null);
+    try testing.expect((try targetFor(a, m, "brew", &r, .blacklist)) == null);
 }
 
 test "targetFor: no file speaks the backend" {
@@ -668,8 +815,6 @@ test "append: a symlinked manifest is rewritten through the link, which survives
     try tmp.dir.createDirPath(io, "real");
     try tmp.dir.createDirPath(io, "repo");
     try tmp.dir.writeFile(io, .{ .sub_path = "real/p.toml", .data = "backend = \"brew\"\n" });
-    // A relative link, resolved against the link's own directory, through a
-    // second hop, so both the relative and the chained case are covered.
     try tmp.dir.symLink(io, "../real/p.toml", "repo/mid.toml", .{});
     try tmp.dir.symLink(io, "mid.toml", "repo/p.toml", .{});
 
@@ -687,6 +832,37 @@ test "append: a symlinked manifest is rewritten through the link, which survives
     try testing.expectEqualStrings("mid.toml", buf[0..try Io.Dir.cwd().readLink(io, link, &buf)]);
     const after = try Io.Dir.cwd().readFileAlloc(io, real, a, .limited(1 << 20));
     try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n", after);
+}
+
+test "append: each hop of a symlink chain resolves against its own directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "one");
+    try tmp.dir.createDirPath(io, "two");
+    try tmp.dir.writeFile(io, .{ .sub_path = "two/real.toml", .data = "backend = \"brew\"\n" });
+    // The second hop's target is bare, so it names two/real.toml only when
+    // it is read against two/, the directory holding the link that spells
+    // it -- against one/, the first link's, it names a file that is not
+    // there and the append creates that instead.
+    try tmp.dir.symLink(io, "../two/mid.toml", "one/p.toml", .{});
+    try tmp.dir.symLink(io, "real.toml", "two/mid.toml", .{});
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const link = try std.fs.path.join(a, &.{ root, "one", "p.toml" });
+    const real = try std.fs.path.join(a, &.{ root, "two", "real.toml" });
+
+    try append(a, io, link, "", "\n[[packages]]\nname = \"htop\"\n");
+
+    const after = try Io.Dir.cwd().readFileAlloc(io, real, a, .limited(1 << 20));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n", after);
+    const stray = try std.fs.path.join(a, &.{ root, "one", "real.toml" });
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, stray, .{}));
 }
 
 test "append: a symlink chain past the hop bound is refused by name" {
@@ -720,6 +896,50 @@ test "append: a missing file is created without a leading blank line" {
 
     const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     try testing.expectEqualStrings("[[packages]]\nname = \"htop\"\n", after);
+}
+
+test "append: a manifest created because it had vanished is created 0644" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "new.toml" });
+
+    try append(a, io, path, "backend = \"brew\"\n", "\n[[packages]]\nname = \"htop\"\n");
+
+    const st = try Io.Dir.cwd().statFile(io, path, .{});
+    try testing.expectEqual(@as(u32, 0o644), @as(u32, st.permissions.toMode() & 0o777));
+}
+
+test "append: a zero-length manifest takes the block with no leading blank line, and the row loads back" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+    // A file the user made and left empty: `readFileAlloc` answers with no
+    // bytes, and the last-byte look the append takes has none to read.
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/packages/darwin.toml", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const path = try std.fs.path.join(a, &.{ repo, "data", "packages", "darwin.toml" });
+
+    try append(a, io, path, "", "\n[[packages]]\nbackend = \"brew\"\nname = \"htop\"\n");
+
+    const after = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+    try testing.expectEqualStrings("[[packages]]\nbackend = \"brew\"\nname = \"htop\"\n", after);
+
+    const m = try manifest_mod.load(a, io, repo, "", null);
+    try testing.expectEqual(@as(usize, 1), m.packages.len);
+    try testing.expectEqualStrings("htop", m.packages[0].name);
 }
 
 test "append: a file that vanished comes back declaring what the block left out" {

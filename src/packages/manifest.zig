@@ -1196,7 +1196,9 @@ test "load: a data/packages that is a file is named, not a raw error" {
 
     var d: Diag = .{};
     try testing.expectError(error.NotDir, load(a, io, repo, "", &d));
-    try testing.expect(std.mem.startsWith(u8, d.capture().?, "data/packages: not a directory"));
+    const dir_path = try std.fs.path.join(a, &.{ repo, "data", "packages" });
+    const want = try std.fmt.allocPrint(a, "data/packages: not a directory: {s}", .{dir_path});
+    try testing.expectEqualStrings(want, d.capture().?);
 }
 
 test "load: a missing packages directory yields an empty manifest" {
@@ -1561,6 +1563,45 @@ test "load: an unreadable data/packages directory is named" {
         const want = try std.fmt.allocPrint(a, "data/packages: cannot open {s}: AccessDenied", .{dir_path});
         try testing.expectEqualStrings(want, d.capture().?);
     }
+}
+
+test "load: a data/packages whose listing runs out of memory is named, with the reason" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/data/packages");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo = try tmpAbs(a, io, &tmp.sub_path, "repo");
+    const dir_path = try std.fs.path.join(a, &.{ repo, "data", "packages" });
+    // Enough entries, each named long, that reading them out asks the
+    // allocator for memory several times over.
+    var made: usize = 0;
+    while (made < 200) : (made += 1) {
+        const name = try std.fmt.allocPrint(a, "repo/data/packages/entry-{d:0>4}-padded-so-the-read-allocates.note", .{made});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    }
+    const want = try std.fmt.allocPrint(a, "data/packages: cannot read {s}: OutOfMemory", .{dir_path});
+
+    // The open succeeds and the listing is what runs out of memory. Which
+    // allocation that is depends on how the arena happens to have grown, so
+    // every one of them is tried and the message is looked for among them.
+    var fail_index: usize = 0;
+    var named = false;
+    while (fail_index < 80 and !named) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var starved = std.heap.ArenaAllocator.init(failing.allocator());
+        defer starved.deinit();
+        var d: Diag = .{};
+        if (load(starved.allocator(), io, repo, "", &d)) |_| {
+            continue;
+        } else |_| {
+            if (d.capture()) |got| named = std.mem.eql(u8, got, want);
+        }
+    }
+    try testing.expect(named);
 }
 
 test "load: a top-level packages, bootstrap, or blacklist that is not an array is refused" {

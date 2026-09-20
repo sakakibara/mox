@@ -124,7 +124,7 @@ test "merge: type mismatch (table base + scalar overlay) -> overlay wins" {
     try std.testing.expectEqualStrings("disabled", merged.table.get("settings").?.string);
 }
 
-test "merge: errors on non-table inputs" {
+test "merge: errors when the base is not a table" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -132,4 +132,90 @@ test "merge: errors on non-table inputs" {
     const base = toml.Value{ .integer = 1 };
     const overlay = try toml.parse(a, "x = 2\n", .{});
     try std.testing.expectError(error.NotATable, mergeTables(a, base, overlay));
+}
+
+test "merge: errors when the overlay is not a table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try toml.parse(a, "x = 1\n", .{});
+    const overlay = toml.Value{ .integer = 2 };
+    try std.testing.expectError(error.NotATable, mergeTables(a, base, overlay));
+}
+
+test "merge: errors when the overlay is an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try toml.parse(a, "x = 1\n", .{});
+    const overlay = (try toml.parse(a, "items = [1, 2]\n", .{})).table.get("items").?;
+    try std.testing.expectError(error.NotATable, mergeTables(a, base, overlay));
+}
+
+test "merge: scalar base with table overlay -> overlay table wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try toml.parse(a, "settings = \"disabled\"\n", .{});
+    const overlay = try toml.parse(a, "[settings]\nfoo = 1\n", .{});
+    const merged = try mergeTables(a, base, overlay);
+
+    const settings = merged.table.get("settings").?.table;
+    try std.testing.expectEqual(@as(i64, 1), settings.get("foo").?.integer);
+}
+
+test "merge: emitted bytes keep base key order, then overlay-only keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try toml.parse(a, "name = \"base\"\nversion = 1\n\n[user]\nname = \"foo\"\nage = 30\n", .{});
+    const overlay = try toml.parse(a, "extra = true\n\n[user]\nname = \"bar\"\n", .{});
+    const merged = try mergeTables(a, base, overlay);
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try toml.encode(&aw.writer, merged, .{});
+
+    const expected =
+        \\name = "base"
+        \\version = 1
+        \\extra = true
+        \\
+        \\[user]
+        \\name = "bar"
+        \\age = 30
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, aw.written());
+}
+
+test "merge: emitted bytes drop comments and blank lines around a replaced key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try toml.parse(a,
+        \\# leading comment
+        \\
+        \\name = "base" # trailing comment
+        \\
+        \\# comment before version
+        \\version = 1
+        \\
+    , .{});
+    const overlay = try toml.parse(a, "name = \"overlay\"\n", .{});
+    const merged = try mergeTables(a, base, overlay);
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try toml.encode(&aw.writer, merged, .{});
+
+    const expected =
+        \\name = "overlay"
+        \\version = 1
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, aw.written());
 }
