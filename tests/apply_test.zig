@@ -2686,15 +2686,23 @@ test "run_scripts: what a timed-out script left running is killed with it" {
     // only a kill addressed to the group reaches it. Both sleeps outlast the
     // bound by far, so a survivor is a real leak and not a race.
     const body = try std.fmt.allocPrint(a, "#!/bin/sh\necho $$ > {s}\nsleep 300 &\nsleep 300\n", .{pid_file});
-    try writeExecScript(io, tmp.dir, "scripts/00-leaky.sh", body, try std.fs.path.join(a, &.{ root, "scripts/00-leaky.sh" }));
+    const script = try std.fs.path.join(a, &.{ root, "scripts/00-leaky.sh" });
+    // The first run of a script at a path nothing has run before costs many
+    // times every run after it, and the cost is the path's, not the content's.
+    // Paid here under no bound at all, by a body that returns, so what the
+    // bound below governs is only the leak the test is about: a script killed
+    // before its first line ran would leave no pid to look for.
+    try writeExecScript(io, tmp.dir, "scripts/00-leaky.sh", "#!/bin/sh\nexit 0\n", script);
+    var warm: mox.packages.exec.Process = .{ .io = io };
+    _ = try warm.runner().run(a, &.{script});
+
+    try writeExecScript(io, tmp.dir, "scripts/00-leaky.sh", body, script);
     const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
 
     var bindings = std.StringHashMap([]const u8).init(a);
     var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
     var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home", &.{}, true)).map;
-    // Long enough that a loaded machine has certainly forked, exec'd and
-    // written the pid before the bound fires, and a hundredth of the sleeps
-    // it interrupts.
+    // A hundredth of the sleeps it interrupts.
     try script_env.put("MOX_SCRIPT_TIMEOUT_MS", "3000");
 
     var out_aw: std.Io.Writer.Allocating = .init(a);

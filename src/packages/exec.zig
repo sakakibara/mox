@@ -1656,16 +1656,27 @@ test "Process: a straggler holding the pipe after the child is reaped is bounded
     const io = std.testing.io;
 
     // The shell exits at once and is reaped between reads, while the sleep it
-    // left behind holds the write end open. The read that follows is the
-    // call's, so it answers to the call's bound, not to the straggler. The
-    // straggler ends itself well before the suite would notice a hang, so a
-    // regression fails this assertion rather than waiting it out.
-    var p: Process = .{ .io = io, .timeout_ms = 400 };
+    // left behind holds the write end open. What ends the read is the drain
+    // the reaped child opened: the first peek is scheduled a drain after the
+    // read begins, so that drain cannot close before two have passed. The
+    // bound is looked at ahead of it, so one at or under that point takes the
+    // tie and ends the call instead -- this one sits far enough past it that
+    // a loaded machine's spawn does not reach it either.
+    const drain_end_ms = 2 * post_exit_ms;
+    const bound_ms = 50 * post_exit_ms;
+    comptime std.debug.assert(bound_ms > drain_end_ms);
+    var p: Process = .{ .io = io, .timeout_ms = bound_ms };
     const started = Io.Clock.awake.now(io);
     const res = try p.runner().run(a, &.{ "sh", "-c", "sleep 20 & printf ok\n" });
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
-    try testing.expect(res.timed_out);
-    try testing.expect(elapsed_ms < 10_000);
+    // What the child itself wrote, whole and not called a timeout: the drain
+    // ended the read, and the straggler's twenty seconds held nothing.
+    try testing.expect(!res.timed_out);
+    try testing.expectEqualStrings("ok", res.stdout);
+    // Short of the drain's own end there was nothing on the pipe to drain, so
+    // a pass would no longer say anything about a straggler.
+    try testing.expect(elapsed_ms >= drain_end_ms);
+    try testing.expect(elapsed_ms < bound_ms);
 }
 
 test "Process: a child that never stops writing is ended at the cap, not waited on" {

@@ -3794,11 +3794,18 @@ test "plugin: a captured verb ends when the plugin does, whatever it left runnin
     var herm = try hermetic(a, std.testing.io, &tmp);
     defer herm.deinit();
     const io = herm.io;
-    // Generous, so that waiting the bound out is unmistakable next to a run
-    // that ends when the plugin does.
-    const bound_ms = 20_000;
+    // What a single held call would be stopped at, so the ceiling below can
+    // sit under it with room to spare.
+    const bound_ms = 60_000;
+    // The run under measurement is a whole `mox status`: three captured calls
+    // to this plugin and the work around them, not one call's bound. So the
+    // ceiling is that span's, with room for a machine running the rest of the
+    // suite beside it -- and under `bound_ms`, so one call held to its bound
+    // lands past this however little the other two cost.
+    const ceiling_ms = 30_000;
+    comptime std.debug.assert(ceiling_ms < bound_ms);
     const h = try setup(a, io, &tmp, .{
-        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = "20000" } },
+        .extra_env = &.{ herm.env[0], .{ .name = "MOX_SCRIPT_TIMEOUT_MS", .value = std.fmt.comptimePrint("{d}", .{bound_ms}) } },
     });
 
     // The plugin answers and exits at once; what it backgrounded inherits the
@@ -3828,7 +3835,7 @@ test "plugin: a captured verb ends when the plugin does, whatever it left runnin
     try std.testing.expect(std.mem.indexOf(u8, r.out, "timed out") == null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     // Ended with the plugin, not at the bound the plugin never reached.
-    try std.testing.expect(elapsed_ms < bound_ms);
+    try std.testing.expect(elapsed_ms < ceiling_ms);
 }
 
 test "status: a package row this machine's gate excludes is named, not silently absent" {
