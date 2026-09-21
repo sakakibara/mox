@@ -235,7 +235,9 @@ export TOKEN="<secret:op://Personal/GitHub/token>"
 ```
 
 Schemes: `env:`, `file://`, `op://` (1Password), `pass://`, `cmd:`. A file that
-resolves an `op://`/`pass://` secret is written 0600.
+resolves an `op://`/`pass://` secret is written owner-only: 0600, unless
+`.mox/attributes.toml` sets the mode (which wins outright) or the live file is
+already no wider than that (a hand-set 0400 is kept, not loosened).
 
 ## Keeping secrets out
 

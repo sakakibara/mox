@@ -9,10 +9,11 @@ powers everything else.
 
 ## Install
 
-One command, depending on nothing a fresh machine lacks (a shell, curl or wget,
-tar, and sha256sum, shasum or openssl). It downloads the release binary for
-your platform, verifies it against the release's `SHA256SUMS`, and installs to
-`~/.local/bin` (override with `BINDIR`):
+One command, depending on nothing a fresh machine lacks. It downloads the
+release binary for your platform, verifies it against the release's
+`SHA256SUMS`, and installs to `~/.local/bin` (override with `BINDIR`). The sh
+forms need a shell, curl or wget, tar, and sha256sum, shasum or openssl; the
+powershell form uses what Windows already ships:
 
 ### sh & curl
 
@@ -62,9 +63,9 @@ Two motions cover everything:
 - **Tweak a config**: edit the live file, where it lives, in its normal
   format -- then `mox commit` routes the change back into the right
   source, verified.
-- **Change how a config varies**: per-OS overlays, gated regions, and
-  per-machine facts live in `src/` -- edit the source (`mox edit`) and
-  `mox apply`.
+- **Change how a config varies**: per-OS overlays, gated regions, and the
+  references to per-machine facts live in `src/` -- edit the source
+  (`mox edit`) and `mox apply`.
 
 ```sh
 mox init                              # a fresh repo (or: init --clone <url> --apply)
@@ -184,7 +185,8 @@ Full behavioral contracts for every command are in
 | `path` / `git -- <args>` | Print the repo dir (`cd $(mox path)`); run git in it from anywhere |
 | `secret <uri>` | Resolve a secret URI to stdout |
 | `trigger ...` | Staleness primitives for setup scripts (`hash`, `seen-version`, `every`) |
-| `upgrade` / `uninstall` | Self-update, `SHA256SUMS`-verified / remove machine-local state, preserving your repo and recoverable trash |
+| `upgrade` / `uninstall` | Self-update, `SHA256SUMS`-verified / remove machine-local state, preserving your repo, the private layer, snapshots and trash |
+| `version` | Show the running mox version |
 
 ## Privacy
 

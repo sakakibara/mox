@@ -18,9 +18,10 @@
 //!     enclosing loop frame -- and is recorded the same way).
 //!   - captured: `<machine.NAME>` occurrences anywhere compose would actually
 //!     emit them -- a managed file's base content (recursing into every
-//!     nested `# mox: when`/`for` region), a directive's literal body, and
-//!     the fragment file an `include`/`append`/`prepend`/`replace`/`from`
-//!     target or a Cat B region names -- each with its `| default`.
+//!     nested `# mox: when`/`for` region), a directive's literal body, a
+//!     generator `for`'s `into` path template, and the fragment file an
+//!     `include`/`append`/`prepend`/`replace`/`from` target or a Cat B
+//!     region names -- each with its `| default`.
 //!   - presence-only: a bare `when NAME` gate.
 //!
 //! Every occurrence of every role -- value-compared, presence, or captured
@@ -761,11 +762,15 @@ const Discoverer = struct {
                 }
             },
             .for_loop => |loop| {
+                const stack = try appendIf(self.arena, nest.gate_stack, loop.when);
+                // A generator's `into` template is expanded per row exactly
+                // like its body, so a capture there is as real as one in it.
+                if (loop.into) |into| try self.scanFlatText(into, stack, source_key);
                 const loop_vars = try appendStr(self.arena, nest.loop_vars, loop.variable);
                 const inner: Nest = .{
                     .file = nest.file,
                     .marker = nest.marker,
-                    .gate_stack = nest.gate_stack,
+                    .gate_stack = stack,
                     .loop_vars = loop_vars,
                     .in_for = true,
                     .depth = nest.depth + 1,
@@ -2713,6 +2718,111 @@ test "discover: a for-loop body's capture is unconditioned (per-row emission is 
     const dim = findDim(d, "for_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a generator loop's `into` path template capture is discovered" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.ssh/config",
+        "# mox: for host in \"data/hosts.toml\" into \"<machine.into_site>-<host.name>.conf\"\n" ++
+            "# Host <host.name>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "into_site").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a generator loop's `into` capture with a declared default is a dimension carrying that default, not an unclaimed default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.ssh/config",
+        "# mox: for host in \"data/hosts.toml\" into \"<machine.into_default_site>-<host.name>.conf\"\n" ++
+            "# Host <host.name>\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: default into_default_site=\"prod\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "into_default_site").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
+    try std.testing.expectEqualStrings("prod", dim.declared_defaults[0]);
+    try std.testing.expectEqual(@as(usize, 0), d.default_diagnostics.len);
+}
+
+test "discover: a for-loop body's capture is conditioned on the loop's own `when`" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for entry in \"data/tools.toml\" when profile=work\n" ++
+            "# x <machine.for_gated_dim>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "for_gated_dim").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+    try std.testing.expect(cond.* == .eq);
+    try std.testing.expectEqualStrings("profile", cond.eq.axis);
+    try std.testing.expectEqualStrings("work", cond.eq.value);
+}
+
+test "discover: a generator loop's `into` capture is conditioned on the loop's own `when`" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.ssh/config",
+        "# mox: for host in \"data/hosts.toml\" when profile=work into \"<machine.into_gated_site>-<host.name>.conf\"\n" ++
+            "# Host <host.name>\n" ++
+            "# mox: end\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "into_gated_site").?;
+    try std.testing.expect(dim.roles.captured);
+    const cond = dim.asking_condition.?;
+    try std.testing.expect(cond.* == .eq);
+    try std.testing.expectEqualStrings("profile", cond.eq.axis);
+    try std.testing.expectEqualStrings("work", cond.eq.value);
 }
 
 test "discover: a Cat B region fragment's own capture is unconditioned (tuple matching contributes nothing)" {

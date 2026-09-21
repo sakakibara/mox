@@ -9,6 +9,10 @@ so a flag here is one mox accepts, spelled the way it accepts it. What a flag *m
 prose, and hand-written. [usage.md](usage.md) walks through the
 day-to-day tasks.
 
+The source repo lives at `$MOX_REPO`, default `$XDG_DATA_HOME/mox/dotfiles`;
+`mox path` prints it. Machine-local state lives at `$MOX_STATE_DIR`, default
+`$XDG_STATE_HOME/mox`.
+
 Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
 `rollback`, `uninstall`, `update`, `facts set`, `facts ask`, a bare `facts`
 that reaches the interview, and `doctor` under `--fix`, `--rebuild-provenance`
@@ -273,8 +277,9 @@ counted under `failed` too, though none of them is a script.
 
 Route edits made to live files back into their sources.
 
-Each change is confirmed on a terminal, and every prompt also accepts
-`q`, which aborts the whole run without writing anything. The keys are:
+Each change is confirmed on a terminal. Every prompt also accepts `q`, which
+aborts the whole run without writing anything, and `?`, which explains that
+prompt's choices. The per-hunk keys are:
 
 - `y` accept, `s` skip, for a routed hunk.
 - `s` skip, `x` split, for one that lies in no single source (`x` splits

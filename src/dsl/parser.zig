@@ -15,6 +15,7 @@ pub const ParseError = error{
     ExpectedIdent,
     ExpectedDataSource,
     RemoveRequiresWhen,
+    WhenOnReplaceFrom,
     ExpectedAxisName,
     ExpectedEquals,
     ExpectedAxisValue,
@@ -363,10 +364,13 @@ pub fn parseRegionOpener(arena: std.mem.Allocator, args: []const u8, line_no: u3
         if (ps.isKeyword("from")) {
             ps.advance();
             from_dir = try ps.expectString();
+            // This form already selects by the axis tuples on the region's
+            // fragment filenames, so a gate here has no false branch to define.
+            if (ps.isKeyword("when")) return error.WhenOnReplaceFrom;
         } else {
             path = try ps.expectString();
+            when = try ps.parseOptionalWhen();
         }
-        when = try ps.parseOptionalWhen();
         try ps.expectEof();
     } else if (std.mem.eql(u8, verb, "append")) {
         kind_tag = .append;
@@ -479,6 +483,13 @@ test "parseRegionOpener: replace from shorthand" {
     const op = try parseRegionOpener(fba.allocator(), "replace from \"profile\"", 1, false);
     try std.testing.expect(op.kind_tag == .replace);
     try std.testing.expectEqualStrings("profile", op.from_dir.?);
+}
+
+test "parseRegionOpener: replace from rejects a when clause" {
+    var allocator_buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const result = parseRegionOpener(fba.allocator(), "replace from \"profile\" when profile=work", 1, false);
+    try std.testing.expectError(error.WhenOnReplaceFrom, result);
 }
 
 test "parseRegionOpener: standalone when" {

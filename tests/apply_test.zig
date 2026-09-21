@@ -6126,6 +6126,27 @@ test "apply completions: an unknown shell names the accepted set" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "accepted shells: fish, zsh, bash, powershell") != null);
 }
 
+test "apply: a when clause on replace from is refused and the message names the two ways to gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.zshrc",
+        .data = "# mox: replace from \"profile\" when profile=work\nbody\n# mox: end\n",
+    });
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "compose failed: WhenOnReplaceFrom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "`replace from` already picks its fragment by the axes in the region's filenames, so a `when` on it would decide nothing: name the axes on the fragments instead, or gate with `replace \"<path>\" when <axis>`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "failing item: line 1: replace from \"profile\" when profile=work") != null);
+}
+
 test "apply: a path= gate is refused as a reserved axis name, any value" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -1,9 +1,10 @@
 # Ignoring files
 
-mox never manages a file unless you `add` it -- but `add -r` and a scaffolded
-starter repo both want a way to say "never even offer this one," the way
-`.gitignore` does for git. An **ignore rule** is that: a repo-scoped,
-gitignore-syntax pattern that keeps a path out of mox entirely.
+mox takes on a file when you `add` it, and when its source appears in `src/`
+by any other route -- a clone, an edit in the repo -- but `add -r` and a
+scaffolded starter repo both want a way to say "never even offer this one,"
+the way `.gitignore` does for git. An **ignore rule** is that: a repo-scoped,
+gitignore-syntax pattern that keeps a path from being taken on or written.
 
 ## Where rules live
 
@@ -31,11 +32,13 @@ path of the live file (`.claude/.credentials.json`, not an absolute path):
 - `**` matches zero or more path segments, so `.claude/**` covers everything
   under `.claude` at any depth, and a pattern that starts or ends with `**`
   spans left or right accordingly.
-- A pattern containing no `/` matches a basename at any depth (`*.jsonl`
-  matches `.claude/projects/x.jsonl`); a pattern containing a `/`, or an
-  explicit leading `/`, is rooted at the repo root's corresponding
-  home-relative position (`/CLAUDE.md` matches `CLAUDE.md` but not
-  `sub/CLAUDE.md`).
+- A pattern containing no `/` matches any one path component, at any depth
+  (`*.jsonl` matches `.claude/projects/x.jsonl`); a pattern containing a `/`,
+  or an explicit leading `/`, is anchored at your home directory
+  (`/CLAUDE.md` matches `CLAUDE.md` but not `sub/CLAUDE.md`).
+- Matching compares bytes, so a rule is case-sensitive even on a
+  case-insensitive filesystem: `*.pem` does not cover `KEY.PEM`. Spell a
+  credential rule in the case the file actually carries, or write both.
 - A trailing `/` makes the rule directory-only: it matches a directory but
   never a file of the same name.
 - A leading `!` negates the rule, re-including a path an earlier rule
@@ -46,6 +49,13 @@ A directory rule also covers everything inside it: a file under an ignored
 directory is itself ignored even though no rule names the file directly. A
 rule that only matches a directory when checked as a directory (a trailing-`/`
 rule) still reaches a file inside it through this ancestor check.
+
+Negation cannot reach back through that check: once a directory is ignored,
+no later `!` rule re-includes anything under it. `.claude/**` matches
+`.claude` itself, so `.claude/**` followed by `!.claude/CLAUDE.md` still
+ignores the file, while `.claude/*` followed by the same negation re-includes
+it. git re-includes it either way, so this is the one place the two
+syntaxes part company; reach for the `dir/*` form when a negation follows.
 
 ## Axis-gating
 
@@ -69,7 +79,8 @@ comment-marker inference needed.
 ## What "ignored" means
 
 The same check -- has this home-relative path (or one of its ancestor
-directories) matched a rule -- applies everywhere mox touches a live path:
+directories) matched a rule -- governs every command that decides whether to
+take on a live path or write one:
 
 - **`add`** refuses an ignored path rather than starting to manage
   it. `add` reports `matches an ignore rule; use --force to add it anyway` and
@@ -85,7 +96,7 @@ directories) matched a rule -- applies everywhere mox touches a live path:
   matches; it prints `skipping <path> (ignored)` for each one.
 - **`.mox-exact` pruning** -- a directory marked exact has its unmanaged live
   entries swept on `apply` so it mirrors the source exactly -- never deletes
-  an ignored live entry, even under `--force`. If a foreign, unmanaged
+  an ignored live entry, even under `--overwrite`. If a foreign, unmanaged
   directory is not itself ignored but contains an ignored file somewhere
   inside it, the whole directory is refused rather than deleted around the
   ignored file.
@@ -94,7 +105,15 @@ directories) matched a rule -- applies everywhere mox touches a live path:
 - **`doctor`** flags a tracked source that also matches an ignore rule as an
   advisory (`tracked-and-ignored`): the file is tracked in `src/` but will
   never be applied, a contradiction it asks you to resolve by removing one
-  side or the other.
+  side or the other. It reads the ignore files with every axis-gated region
+  stripped, so it reports the rules that hold on every machine rather than
+  the ones this machine composes; a file covered only by a gated rule is
+  skipped by `apply` here without `doctor` naming it.
+
+`commit`, `export`, `edit`, `mv`, `remove` and `rollback` do not consult the
+rules. They act on a source that is already tracked, so a rule written after
+the fact does not retract what `src/` already holds, and an edit to the live
+file still routes back into it. To stop tracking the file, remove the source.
 
 ## The `mox init` scaffold
 
@@ -102,8 +121,11 @@ directories) matched a rule -- applies everywhere mox touches a live path:
 locations -- `.claude/.credentials.json`, `.ssh/id_*` (with the corresponding
 `.pub` keys re-included), `*.pem`, and similar. Its header explains that any
 line can be deleted, e.g. to track a secret in a private repo. The scaffold is
-a plain, fully-editable file: mox places no other restriction on what you can
-manage, and never refuses to manage a file that no ignore rule names.
+a plain, fully-editable file, and an ignore rule is the only rule you write
+about what may be managed. A few refusals stand apart from it: `add` takes no
+path outside your home directory, and `add -r` passes over editor and OS junk
+(`.DS_Store`, `*~`), anything that is not a regular file, and a target another
+source already partly owns.
 
 ## warn-on-add
 

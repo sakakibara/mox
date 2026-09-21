@@ -43,6 +43,23 @@ test "reject: an unmatched end marker with no open region" {
     );
 }
 
+test "reject: a when clause on the replace-from form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // `replace from` selects by the axis tuples on the region's fragment
+    // filenames, so a gate on it has no false branch to define. Parsing it and
+    // dropping it at compose emitted the fragment whatever the gate said.
+    const src =
+        \\# mox: replace from "profile" when profile=work
+        \\body
+        \\# mox: end
+    ;
+    try std.testing.expectError(
+        error.WhenOnReplaceFrom,
+        mox.dsl.driver.parseFile(arena.allocator(), src, "#", null),
+    );
+}
+
 test "reject: adjacent captures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

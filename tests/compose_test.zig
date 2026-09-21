@@ -1414,6 +1414,48 @@ test "compose catB: machine.brew_prefix interpolation in fragment" {
     try std.testing.expect(std.mem.indexOf(u8, out.?, "/opt/homebrew/bin/brew shellenv") != null);
 }
 
+test "compose catB: a true replace gate emits the fragment and a false one emits the body" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: replace \"frag.sh\" when os=darwin\n" ++
+        "export H=/body\n" ++
+        "# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "export H=/frag\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tree = try mox.source.tree.walk(arena.allocator(), io, src_dir, "/home/me");
+
+    for ([_][3][]const u8{
+        .{ "darwin", "export H=/frag", "export H=/body" },
+        .{ "linux", "export H=/body", "export H=/frag" },
+    }) |case| {
+        var bindings = std.StringHashMap([]const u8).init(arena.allocator());
+        var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+        try bindings.put("os", case[0]);
+
+        const m_state = mox.machine.state.MachineState{
+            .os = case[0],
+            .arch = "aarch64",
+            .hostname = "h",
+            .username = "u",
+            .home = "/home/u",
+            .xdg_config_home = "",
+            .xdg_cache_home = "",
+            .xdg_data_home = "",
+            .xdg_state_home = "",
+        };
+
+        const out = (try mox.compose.catB.compose(arena.allocator(), io, tree.files[0], &bindings_r, &m_state)).?;
+        try std.testing.expect(std.mem.indexOf(u8, out, case[1]) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, case[2]) == null);
+    }
+}
+
 test "compose catB: a directive fallback body interpolates machine captures" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

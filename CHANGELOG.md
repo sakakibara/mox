@@ -4,7 +4,7 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.0] - 2026-09-19
+## [0.12.0] - 2026-09-21
 
 ### Added
 - Packages. A `data/packages/*.toml` manifest of `[[packages]]` rows (core
@@ -66,7 +66,10 @@ All notable changes to mox are documented here. The format follows
   directory across its read and its rewrite, so two runs that share a repo but
   have a state directory each -- `mox commit` beside `sudo mox commit` --
   cannot both read the file before either writes it and drop a row. Windows
-  locks no directory, and there the state lock is what stands between them.
+  locks no directory, and there the state lock is what stands between them. A
+  row appended to a manifest the user created and left empty begins where a
+  row appended to a manifest that never existed begins: the newline that
+  separates a block from what precedes it is dropped when nothing does.
 - `status` reports the rows of an absent manager that has a bootstrap row as
   missing and notes that apply will bootstrap it; a manager whose `--version`
   fails is reported `BROKEN` and counted in the exit code, as is one that
@@ -96,6 +99,31 @@ All notable changes to mox are documented here. The format follows
   once). A Ctrl-C during a query kills the query's group before mox dies of
   the interrupt; a Ctrl-Z during an install suspends the job and hands the
   terminal back, so the shell can resume it.
+- A call a signal ended says which signal ended it, rather than reporting an
+  exit of 255 that a manager refusing a row with a printed reason would also
+  report -- a manager the out-of-memory killer took said nothing at all. A
+  child killed from outside takes whatever it left running with it, as one
+  killed at its bound does, so a manager that outlived the shell in front of
+  it keeps no database lock with nothing to explain it. A captured call asks
+  after its child on a schedule rather than only when a read comes back empty:
+  anything the child left running holds the pipe the answer is read from, so a
+  straggler writing even once a step could keep the loop from noticing the
+  child had exited and turn an answer already in hand into a timeout. A run a
+  signal ends names the batch it was installing, in one write from the handler
+  itself, so an interrupted install says more than that it began.
+- A read that a refusal rests on says when it came back empty. Three reads of
+  what the repositories hold answered nothing on failure: two left the machine
+  an upgrade would produce looking like the machine as it stands, so a row was
+  judged against a version the upgrade replaces, and the third never asked
+  whether it had an answer at all, so a failed read found no package
+  conflicting with anything and sent every row to the install, which is the
+  outcome that read exists to prevent. Each says so now, in pacman's own
+  words, as the four reads beside them already did. A baseline read that
+  cannot run at all is no reason to install nothing: where rpm is missing the
+  batch goes ahead without a baseline and says so, and a read killed at its
+  bound still stops the install and says that too. A listing drops a line that
+  is not a package name wherever that line could be read back as one, the dnf
+  listing a `status` reports from included.
 - A manifest refuses a `name` its manager would read as an operation rather
   than a package. Each manager has its own class, because each has its own
   grammar. apt, dnf, pacman and zypper take a name beginning with a letter or
@@ -153,7 +181,10 @@ All notable changes to mox are documented here. The format follows
   one bad row in a manifest must not keep every other package off the machine.
   `mox apply --dry-run` runs none of those checks -- they refresh an index and
   elevate, which a dry run may not do -- and says, beside the rows it would
-  install, which manager list it left them unchecked against.
+  install, which manager list it left them unchecked against. A brew mark that
+  fails is that row's own failure too, as it already was for every other
+  manager, so the count of what landed stays true and a run that only marked
+  says so rather than claiming it reached the installer.
 - A manifest also refuses an unknown top-level key, a `name` that is blank
   or carries whitespace, a control byte or a byte that is not UTF-8 or runs
   past 256 bytes -- one rule with the shape an id must have, so a row an
@@ -213,10 +244,52 @@ All notable changes to mox are documented here. The format follows
   asked what it is doing between reads. mox answers SIGQUIT as it answers
   SIGINT, SIGTERM and SIGHUP: Ctrl-backslash takes the child's group with it
   rather than leaving it running.
+- The report a run closes with leads with the count the exit code is made of,
+  so the line and the code cannot disagree, and then names what needs
+  attention, by label, before what does not; the package section closes the
+  same way. The count a `status` leads with is the files, and the packages add
+  their own. A row whose manager this machine cannot use contributes nothing
+  to any of them, gated rows included, which the help had promised in wider
+  terms than it could keep.
 - `mox upgrade`'s help no longer names a specific repository: it fetches from
   the release the running build was built to look for.
 
 ### Fixed
+- A lock names its holder by the process that took it, recorded as the time
+  that process started -- from the kernel's process table on macOS, from the
+  process's own stat line on Linux -- so a later run can tell a holder still
+  working from one a reboot left behind. The marker was the machine's boot
+  wall-clock time, which macOS moves whenever the clock is disciplined,
+  observed changing twice in one session with no reboot: a run whose lock was
+  written before such a step was judged to belong to a dead machine, so a
+  second run took the lock while the first was still working, and each then
+  deleted the other's.
+- `apply --dry-run` reports what it would do rather than what it did. The
+  count of files written reached the report whether or not any were, so a plan
+  said it had applied the files it was only describing. A dry run also
+  proposed every symlink afresh and counted each as a write, answering before
+  working out whether the link already pointed where it was meant to; it asks
+  the question the real run asks, so a plan and a `status` of the same machine
+  agree.
+- A source fragment is private when it sits under the private root, not when
+  its path merely begins with the same letters. A repository whose own root is
+  a sibling of that root -- a directory whose name extends it -- had its
+  ordinary files read as private ones. Nothing private escaped that way, since
+  a real private path always carries the separator the test was missing, but a
+  shared fragment taken for private loses the offer to place its edit, and the
+  sync that carries a rename into the sources coupled to it was skipped
+  without a word. The question is answered in one place now, the module that
+  owns what a path means here, which the commit path already reached.
+- A staging file goes with the write that failed. It was removed when a
+  permission check or a recheck failed but not when the write or the rename
+  did, so what an interrupted write left behind stayed beside the file it was
+  meant to become. A staging path carries its own writer's name, so no two
+  writers share one entry.
+- `export` resolves a path it is given the way every other path argument is
+  resolved, rather than taking a leading tilde literally and making a
+  directory of it.
+- `diff --help` says what its exit codes mean, since a difference is not a
+  failure but a refusal is.
 - The timeout watchdog for setup scripts and check hooks runs on its own
   thread. On a host with one CPU it could run inline, sleeping out the
   whole bound before the wait began and then reporting every script as

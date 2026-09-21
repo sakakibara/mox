@@ -69,8 +69,8 @@ and so on -- each closed by its own `# mox: end`, matched by depth.
 
 | Directive | Effect |
 |---|---|
-| `replace "<path>" when <axis>` | When the axis matches, substitute fragment `<name>.d/<path>`; else keep the body. |
-| `replace from "<region>"` | Pick the best-matching fragment from an overlay region by axis; else keep the body. |
+| `replace "<path>" [when <axis>]` | When the axis matches, substitute fragment `<name>.d/<path>`; else keep the body. With no `when` the body is always kept and the fragment never read. |
+| `replace from "<region>"` | Pick the best-matching fragment from an overlay region by axis; else keep the body. Takes no `when`: the fragment filenames carry the axes, so a gate is refused (`WhenOnReplaceFrom`) rather than accepted and ignored. |
 | `append "<path>" [when <axis>]` | Emit the body, then splice the fragment after it. |
 | `prepend "<path>" [when <axis>]` | Splice the fragment first, then emit the body. |
 | `remove when <axis>` | Drop the body when the axis matches; else keep it. |
