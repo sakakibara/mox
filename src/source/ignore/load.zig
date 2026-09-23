@@ -26,7 +26,7 @@ fn resolve(
     m_state: *const mox.machine.state.MachineState,
 ) !?[]u8 {
     const raw = (try readOptional(arena, io, path)) orelse return null;
-    if (std.mem.indexOf(u8, raw, "# mox:") == null) return raw;
+    if (mox.dsl.comment.markerForFile(path, raw) == null) return raw;
     const file: mox.source.tree.ManagedFile = .{
         .source_base_path = path,
         .source_base_abs = path,
@@ -64,25 +64,47 @@ pub fn load(
     return match.compile(arena, buf.items);
 }
 
-/// Strip a file's `# mox: when ... # mox: end` regions, keeping only lines at
-/// when-depth 0. A tracked when-region marker is dropped along with the
-/// gated lines it brackets; a kept line (including any stray `#`-comment) is
-/// harmless, since `match.compile` treats a `#`-led line as a comment.
-fn stripConditional(arena: std.mem.Allocator, text: []const u8) ![]u8 {
+/// The lines of `text` that compose emits on every machine: those outside any
+/// region, plus the body of a region that always emits it (`append`,
+/// `prepend`, and a `replace` with neither `when` nor `from`), whose nested
+/// directive lines compose also emits as literal text. Regions are found with
+/// the marker and classification compose uses. A kept `#`-led line is harmless,
+/// since `match.compile` treats it as a comment.
+fn stripConditional(arena: std.mem.Allocator, path: []const u8, text: []const u8) ![]u8 {
+    const marker = mox.dsl.comment.markerForFile(path, text) orelse return @constCast(text);
+    const events = try mox.dsl.scanner.scan(arena, text, marker);
     var buf: std.ArrayList(u8) = .empty;
     var depth: usize = 0;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, "# mox: when")) {
-            depth += 1;
-            continue;
-        }
-        if (std.mem.startsWith(u8, trimmed, "# mox: end")) {
-            if (depth > 0) depth -= 1;
-            continue;
-        }
-        if (depth == 0) {
+    var keep_body = false;
+    for (events) |ev| {
+        const line = switch (ev) {
+            .content => |c| c.text,
+            .directive => |d| blk: {
+                switch (try mox.dsl.driver.classify(d.args)) {
+                    .opener => {
+                        if (depth == 0) {
+                            const opener = try mox.dsl.parser.parseRegionOpener(arena, d.args, d.line_no, false);
+                            keep_body = switch (opener.kind_tag) {
+                                .append, .prepend => true,
+                                .replace => opener.when == null and opener.from_dir == null,
+                                .remove, .from, .when_gate, .for_loop => false,
+                            };
+                            depth = 1;
+                            continue;
+                        }
+                        depth += 1;
+                    },
+                    .end => {
+                        if (depth == 0) continue;
+                        depth -= 1;
+                        if (depth == 0) continue;
+                    },
+                    .other => {},
+                }
+                break :blk d.original_line;
+            },
+        };
+        if (depth == 0 or keep_body) {
             try buf.appendSlice(arena, line);
             try buf.append(arena, '\n');
         }
@@ -90,8 +112,8 @@ fn stripConditional(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     return buf.toOwnedSlice(arena);
 }
 
-/// Load only the unconditional ignore rules -- those outside any
-/// `# mox: when ... # mox: end` region. Used by `doctor` to flag a file that
+/// Load only the unconditional ignore rules -- those compose emits on every
+/// machine (see `stripConditional`). Used by `doctor` to flag a file that
 /// is ignored under EVERY configuration (a real contradiction), as opposed to
 /// one ignored only on some machines via axis gating (intentional). Reads the
 /// same two files as `load` but does not compose them: an unconditional rule
@@ -102,11 +124,11 @@ pub fn loadUnconditional(arena: std.mem.Allocator, io: Io, repo_dir: []const u8)
 
     var buf: std.ArrayList(u8) = .empty;
     if (try readOptional(arena, io, namespaced)) |t| {
-        try buf.appendSlice(arena, try stripConditional(arena, t));
+        try buf.appendSlice(arena, try stripConditional(arena, namespaced, t));
         try buf.append(arena, '\n');
     }
     if (try readOptional(arena, io, root)) |t| {
-        try buf.appendSlice(arena, try stripConditional(arena, t));
+        try buf.appendSlice(arena, try stripConditional(arena, root, t));
         try buf.append(arena, '\n');
     }
     return match.compile(arena, buf.items);
@@ -234,6 +256,105 @@ test "loadUnconditional: keeps unconditional rules, drops when-gated ones" {
     const set = try loadUnconditional(a, io, repo);
     try testing.expect(set.isIgnored("always.txt", false));
     try testing.expect(!set.isIgnored("cond.txt", false));
+}
+
+test "load: a gate spelled with a tab after the marker still gates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = pathbuf[0..try tmp.dir.realPath(io, &pathbuf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".moxignore", .data = "always.txt\n#\tmox: when os=linux\nlinux-only/\n#\tmox: end\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const darwin_state = stateForOs("darwin");
+    var darwin_bindings = try mox.machine.bindings.fromMachineState(a, darwin_state);
+    var darwin_bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &darwin_bindings } };
+    const darwin = try load(a, io, repo, &darwin_bindings_r, &darwin_state);
+    try testing.expect(darwin.isIgnored("always.txt", false));
+    try testing.expect(!darwin.isIgnored("linux-only", true));
+}
+
+test "loadUnconditional: drops rules under every spelling the scanner reads as a gate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = pathbuf[0..try tmp.dir.realPath(io, &pathbuf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".moxignore", .data = "always.txt\n# mox:when os=linux\na.txt\n# mox: end\n#\tmox: when os=linux\nb.txt\n#  mox: end\n# mox: when(os=linux)\nc.txt\n# mox: end\n# mox: for x in \"d.toml\"\nd.txt\n# mox: end\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const set = try loadUnconditional(a, io, repo);
+    try testing.expect(set.isIgnored("always.txt", false));
+    try testing.expect(!set.isIgnored("a.txt", false));
+    try testing.expect(!set.isIgnored("b.txt", false));
+    try testing.expect(!set.isIgnored("c.txt", false));
+    try testing.expect(!set.isIgnored("d.txt", false));
+}
+
+test "loadUnconditional: keeps the body of a region that always emits it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = pathbuf[0..try tmp.dir.realPath(io, &pathbuf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".moxignore", .data = "# mox: replace \"r\"\nr.txt\n# mox: end\n" ++
+        "# mox: append \"w\" when os=linux\nw.txt\n# mox: end\n" ++
+        "# mox: prepend \"q\"\n# mox: when os=linux\ng.txt\n# mox: end\nq.txt\n# mox: end\n" ++
+        "# mox: replace \"c\" when os=linux\nc.txt\n# mox: end\n" ++
+        "# mox: remove when os=linux\nm.txt\n# mox: end\n" ++
+        "# mox: replace from \"profile\"\nf.txt\n# mox: end\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const set = try loadUnconditional(a, io, repo);
+    try testing.expect(set.isIgnored("r.txt", false));
+    try testing.expect(set.isIgnored("w.txt", false));
+    try testing.expect(set.isIgnored("q.txt", false));
+    try testing.expect(set.isIgnored("g.txt", false));
+    try testing.expect(!set.isIgnored("c.txt", false));
+    try testing.expect(!set.isIgnored("m.txt", false));
+    try testing.expect(!set.isIgnored("f.txt", false));
+}
+
+test "load: a gate under the doubled marker compose infers still gates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo = pathbuf[0..try tmp.dir.realPath(io, &pathbuf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".moxignore", .data = "always.txt\n## mox: when os=linux\nlinux-only/\n## mox: end\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const darwin_state = stateForOs("darwin");
+    var darwin_bindings = try mox.machine.bindings.fromMachineState(a, darwin_state);
+    var darwin_bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &darwin_bindings } };
+    const darwin = try load(a, io, repo, &darwin_bindings_r, &darwin_state);
+    try testing.expect(darwin.isIgnored("always.txt", false));
+    try testing.expect(!darwin.isIgnored("linux-only", true));
+
+    const set = try loadUnconditional(a, io, repo);
+    try testing.expect(set.isIgnored("always.txt", false));
+    try testing.expect(!set.isIgnored("linux-only", true));
 }
 
 test "load: missing files yield an empty (never-ignoring) set" {

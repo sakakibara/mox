@@ -279,6 +279,16 @@ All notable changes to mox are documented here. The format follows
 - A malformed directive in a file whose head carries `own`, `disown` or
   `check` is named by its line in the source file; the count skipped the
   head lines.
+- The ignore files find their regions with the marker and nesting rules
+  compose uses. A gate written with a tab between `#` and `mox:` was never
+  composed, so its rules applied on every machine; such a file whose
+  `mox:` line is not a directive is now refused, as the same line with one
+  space already was. `doctor`, which looks for rules that apply on every
+  machine, counted as one a rule inside a `for`, `remove`, `from` or gated
+  `replace`, or under a gate spelled with a tab, extra spaces, or no space
+  after `mox:`; and it missed a rule the body of an `append`, `prepend` or
+  plain `replace` emits everywhere when a `when` line sat above it in that
+  body, where compose emits the line as text.
 - A lock names its holder by the process that took it, recorded as the time
   that process started -- from the kernel's process table on macOS, from the
   process's own stat line on Linux -- so a later run can tell a holder still
