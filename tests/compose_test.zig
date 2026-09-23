@@ -1127,6 +1127,28 @@ test "compose catB: a for-loop over a missing data source names the path" {
     try std.testing.expect(std.mem.indexOf(u8, cap, "nope.toml") != null);
 }
 
+test "compose catB: a malformed directive is named by its line in the source file, head lines counted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "src/p.toml", "# mox: own a\n# mox: check \"bin/ok\"\n[a]\nx = 1\n# mox: when os=macos\ny = 2\n# mox: end # note\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(error.TextAfterEnd, mox.compose.composeFileTracked(a, io, tree.files[0], &bindings_r, null, null, null, &diag));
+    try std.testing.expectEqualStrings("line 7: end # note", diag.capture() orelse return error.TestExpectedDiag);
+}
+
 test "compose catB: for-loop with when filter (machine doesn't match) suppresses entire loop" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

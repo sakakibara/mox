@@ -276,6 +276,9 @@ All notable changes to mox are documented here. The format follows
   later `end`, swallowing the lines between, or, with none, became a gate to
   end of file. This includes such a line inside a literal `replace`,
   `append`, `prepend`, `remove` or `from` body, which was emitted as text.
+- A malformed directive in a file whose head carries `own`, `disown` or
+  `check` is named by its line in the source file; the count skipped the
+  head lines.
 - A lock names its holder by the process that took it, recorded as the time
   that process started -- from the kernel's process table on macOS, from the
   process's own stat line on Linux -- so a later run can tell a holder still

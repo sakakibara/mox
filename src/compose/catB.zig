@@ -405,7 +405,7 @@ pub fn composeTrackedContent(
         if (ctx.diag) |d| {
             if (parse_loc.line > 0) {
                 var buf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "line {d}: {s}", .{ parse_loc.line, parse_loc.directive }) catch parse_loc.directive;
+                const msg = std.fmt.bufPrint(&buf, "line {d}: {s}", .{ source.head.sourceLine(base_removed, parse_loc.line), parse_loc.directive }) catch parse_loc.directive;
                 d.set(msg);
             }
         }
