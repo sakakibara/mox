@@ -172,6 +172,45 @@ pub fn stripSpans(arena: std.mem.Allocator, text: []const u8, spans: []const Spa
     return out.toOwnedSlice(arena);
 }
 
+/// The 1-based lines of `text` that `spans` removes, ascending. Stripping
+/// shortens the text a composer sees, so a provenance record that must name
+/// lines of the file AS WRITTEN maps its numbers back through this list.
+pub fn removedLines(arena: std.mem.Allocator, text: []const u8, spans: []const Span) error{OutOfMemory}![]const u32 {
+    if (spans.len == 0) return &.{};
+    const out = try arena.alloc(u32, spans.len);
+    var line: u32 = 1;
+    var cursor: usize = 0;
+    for (spans, 0..) |s, i| {
+        while (cursor < s.start) : (cursor += 1) {
+            if (text[cursor] == '\n') line += 1;
+        }
+        out[i] = line;
+        line += 1;
+        cursor = s.end;
+    }
+    return out;
+}
+
+/// `removed` with `line` merged in, keeping it ascending.
+pub fn withRemovedLine(arena: std.mem.Allocator, removed: []const u32, line: u32) error{OutOfMemory}![]const u32 {
+    const out = try arena.alloc(u32, removed.len + 1);
+    var i: usize = 0;
+    while (i < removed.len and removed[i] < line) : (i += 1) out[i] = removed[i];
+    out[i] = line;
+    while (i < removed.len) : (i += 1) out[i + 1] = removed[i];
+    return out;
+}
+
+/// The 1-based line of the original text that stripped line `line` came from.
+/// `removed` is the ascending list `removedLines` builds.
+pub fn sourceLine(removed: []const u32, line: u32) u32 {
+    var n = line;
+    for (removed) |r| {
+        if (r <= n) n += 1;
+    }
+    return n;
+}
+
 /// The args of a `<marker> mox: <args>` line, or null when the (already
 /// left-trimmed) comment line is not a mox directive. Mirrors the DSL
 /// scanner's match rules: whitespace required after the marker, then `mox:`.
@@ -375,4 +414,41 @@ test "strip: no directives leaves the text untouched, CRLF line survives" {
     try testing.expectEqualStrings(plain, try strip(a, plain, "#"));
     const crlf = "# mox: own a\r\n[a]\r\nk = 1\r\n";
     try testing.expectEqualStrings("[a]\r\nk = 1\r\n", try strip(a, crlf, "#"));
+}
+
+test "removedLines: names each consumed directive line of the text as written" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const text = "# note\n# mox: own a\n# mox: check \"x\"\n[a]\n";
+    const p = try parse(a, text, "#");
+    try testing.expectEqualSlices(u32, &.{ 2, 3 }, try removedLines(a, text, p.spans));
+
+    const lead = try parse(a, "# mox: own a\n# note\n[a]\n", "#");
+    try testing.expectEqualSlices(u32, &.{1}, try removedLines(a, "# mox: own a\n# note\n[a]\n", lead.spans));
+
+    const none = try parse(a, "# note\n[a]\n", "#");
+    try testing.expectEqualSlices(u32, &.{}, try removedLines(a, "# note\n[a]\n", none.spans));
+}
+
+test "sourceLine: maps a stripped line back to the line the source file has it on" {
+    // Stripped "# note\n[a]\n" came from lines 1 and 4 of a file whose lines
+    // 2 and 3 were consumed.
+    try testing.expectEqual(@as(u32, 1), sourceLine(&.{ 2, 3 }, 1));
+    try testing.expectEqual(@as(u32, 4), sourceLine(&.{ 2, 3 }, 2));
+    // Leading consumed lines shift everything by their count.
+    try testing.expectEqual(@as(u32, 2), sourceLine(&.{1}, 1));
+    try testing.expectEqual(@as(u32, 3), sourceLine(&.{1}, 2));
+    // No consumed line leaves the numbering alone.
+    try testing.expectEqual(@as(u32, 7), sourceLine(&.{}, 7));
+}
+
+test "withRemovedLine: merges a further consumed line and keeps the list ascending" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, try withRemovedLine(a, &.{1}, 2));
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, try withRemovedLine(a, &.{2}, 1));
+    try testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, try withRemovedLine(a, &.{ 1, 5 }, 3));
 }

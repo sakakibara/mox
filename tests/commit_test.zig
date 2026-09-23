@@ -4620,3 +4620,32 @@ test "commit: a private universal fragment's edit is confirmed as private, never
     const after = try treeDigest(io, a, src_dir);
     try std.testing.expectEqualSlices(u8, &before, &after);
 }
+
+test "commit: an insertion into a whole-file-gated target lands after the source line it follows" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The gate line is consumed before composing, so live line 1 is source
+    // line 2. An insertion carries no old text for the router to check, so a
+    // provenance number that is short by the gate line writes the new line
+    // one line too early.
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: when os=darwin\n[a]\nx = 1\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    const apply_res = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), apply_res.rc);
+
+    const live = try h.liveOf("app.toml");
+    try std.testing.expectEqualStrings("[a]\nx = 1\n", try read(io, a, live));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[a]\nx = 1\ny = 2\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    const src = try read(io, a, try h.srcOf("app.toml"));
+    try std.testing.expectEqualStrings("# mox: when os=darwin\n[a]\nx = 1\ny = 2\n", src);
+}

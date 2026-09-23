@@ -84,10 +84,14 @@ const Head = struct {
     /// line is NOT one of them: it stays, so the text handed to Cat B still
     /// carries the gate that scopes the rest of the file.
     text: []const u8,
-    /// `text` with a holding whole-file gate's own line removed too: the gate's
-    /// body, which is what the structural routes compose. Equal to `text` when
-    /// the file has no whole-file gate.
+    /// `text` with a whole-file gate's own line removed too: the gate's body,
+    /// which is what the structural routes compose. Equal to `text` when the
+    /// file has no whole-file gate.
     body: []const u8,
+    /// The source lines `text` and `body` respectively leave out, ascending,
+    /// so provenance can name the lines the source file actually has.
+    text_removed: []const u32 = &.{},
+    body_removed: []const u32 = &.{},
     /// A leading whole-file gate evaluated false: the file is absent on this
     /// machine.
     absent: bool = false,
@@ -123,16 +127,49 @@ fn readBaseHead(
     };
     const partial = parsed.ownership != .none;
     const stripped = if (parsed.spans.len == 0) raw else try source.head.stripSpans(arena, raw, parsed.spans);
-    if (parsed.gate == null) return .{ .text = stripped, .body = stripped, .partial = partial };
+    const removed = try source.head.removedLines(arena, raw, parsed.spans);
+    const whole: Head = .{ .text = stripped, .body = stripped, .text_removed = removed, .body_removed = removed, .partial = partial };
+    if (parsed.gate == null) return whole;
     // The candidate is a whole-file existence gate only when the DSL agrees:
     // the file must parse, and the gate must run to EOF (a matching `end`
     // later makes it a region, composed through Cat B).
-    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return .{ .text = stripped, .body = stripped, .partial = partial };
-    if (!dsl.axis.evaluate(expr, bindings)) return .{ .text = stripped, .body = stripped, .absent = true, .partial = partial };
+    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return whole;
     // The gate line is line 1 of the stripped text by construction; consume
-    // exactly it.
+    // exactly it. A gate evaluating false leaves `body` the same way, so the
+    // layered-directive scan sees the same text on every machine.
     const nl = std.mem.indexOfScalar(u8, stripped, '\n');
-    return .{ .text = stripped, .body = if (nl) |n| stripped[n + 1 ..] else "", .partial = partial };
+    return .{
+        .text = stripped,
+        .body = if (nl) |n| stripped[n + 1 ..] else "",
+        .text_removed = removed,
+        .body_removed = try source.head.withRemovedLine(arena, removed, source.head.sourceLine(removed, 1)),
+        .absent = !dsl.axis.evaluate(expr, bindings),
+        .partial = partial,
+    };
+}
+
+const Prepared = struct { layers: []const []const u8, hd: Head };
+
+/// `collectMatchingLayers` + `readBaseHead` + the layered-directive refusal, in
+/// the one order that keeps that refusal a fact about the repo: every machine
+/// runs the scan, whatever its own gate and overlay matches then decide. Null
+/// when the file does not materialize here.
+fn prepare(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    bindings: *const dsl.resolver.Resolver,
+    marker: []const u8,
+    diag: ?*interp.Diag,
+) !?Prepared {
+    const layers = try collectMatchingLayers(arena, file, bindings);
+    const hd: Head = if (layers.len == 0)
+        .{ .text = "", .body = "" }
+    else
+        try readBaseHead(arena, io, file, layers[0], marker, bindings);
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, marker, diag);
+    if (layers.len == 0 or hd.absent) return null;
+    return .{ .layers = layers, .hd = hd };
 }
 
 fn formatOf(path: []const u8) ?Format {
@@ -167,11 +204,9 @@ fn composeToml(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
-    const layers = try collectMatchingLayers(arena, file, bindings);
-    if (layers.len == 0) return null;
-
-    const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
-    if (hd.absent) return null;
+    const prep = (try prepare(arena, io, file, bindings, "#", diag)) orelse return null;
+    const layers = prep.layers;
+    const hd = prep.hd;
 
     // Single-layer base with `# mox:` content directives routes through Cat B for
     // include / from / when. A whole-file gate alone composes its body
@@ -179,10 +214,9 @@ fn composeToml(
     // its gate line, so the gate scopes the body there exactly as it does in a
     // Cat B file. The pass-through preserves comments, blank lines, and key
     // ordering.
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "#", diag);
     if (layers.len == 1) {
-        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // Multi-layer merge seeds from the head-processed base text, so no
@@ -195,7 +229,7 @@ fn composeToml(
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try toml.encode(&aw.writer, merged, .{});
-    return interpolate(arena, io, file, true, aw.written(), machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a `.json` managed file. Mirrors `composeToml`: single layer
@@ -214,16 +248,13 @@ fn composeJson(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
-    const layers = try collectMatchingLayers(arena, file, bindings);
-    if (layers.len == 0) return null;
+    const prep = (try prepare(arena, io, file, bindings, "//", diag)) orelse return null;
+    const layers = prep.layers;
+    const hd = prep.hd;
 
-    const hd = try readBaseHead(arena, io, file, layers[0], "//", bindings);
-    if (hd.absent) return null;
-
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "//", diag);
     if (layers.len == 1) {
-        if (containsMoxDirectiveJson(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirectiveJson(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // A blank seed (a directive-only base: nothing remains after the head
@@ -244,7 +275,7 @@ fn composeJson(
     try json.encode(&aw.writer, merged, .{ .indent = 2 });
     // Target files end with a newline, matching the toml composer's output.
     try aw.writer.writeByte('\n');
-    return interpolate(arena, io, file, true, aw.written(), machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a `.yaml` / `.yml` managed file. Mirrors `composeJson`: single
@@ -262,16 +293,13 @@ fn composeYaml(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
-    const layers = try collectMatchingLayers(arena, file, bindings);
-    if (layers.len == 0) return null;
+    const prep = (try prepare(arena, io, file, bindings, "#", diag)) orelse return null;
+    const layers = prep.layers;
+    const hd = prep.hd;
 
-    const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
-    if (hd.absent) return null;
-
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "#", diag);
     if (layers.len == 1) {
-        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // Same blank-seed rule as JSON: a directive-only base leaves no
@@ -290,7 +318,7 @@ fn composeYaml(
     // yaml.emit already terminates the document with a trailing newline,
     // matching the toml/json composers' single-newline output convention.
     try yaml.emit(&aw.writer, merged, .{});
-    return interpolate(arena, io, file, true, aw.written(), machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a gitconfig or INI managed file via raw-line section-merge.
@@ -308,16 +336,13 @@ fn composeSectionMerge(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
-    const layers = try collectMatchingLayers(arena, file, bindings);
-    if (layers.len == 0) return null;
+    const prep = (try prepare(arena, io, file, bindings, "#", diag)) orelse return null;
+    const layers = prep.layers;
+    const hd = prep.hd;
 
-    const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
-    if (hd.absent) return null;
-
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "#", diag);
     if (layers.len == 1) {
-        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // Raw-line merge preserves comments, so the head-processed seed matters
@@ -327,7 +352,7 @@ fn composeSectionMerge(
         const overlay = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
         merged = try ini_merge.merge(arena, merged, overlay, dialect);
     }
-    return interpolate(arena, io, file, true, merged, machine_state_opt, secrets, prov, diag);
+    return interpolate(arena, io, file, true, merged, &.{}, machine_state_opt, secrets, prov, diag);
 }
 
 /// Heuristic: does `content` contain a `# mox: ...` line? Cheap substring
@@ -383,8 +408,9 @@ fn lineOf(raw: []const u8, text: []const u8) usize {
 /// only a comment: a region's body would emit unconditionally and a line
 /// directive would vanish. Every layer is scanned, whether or not it
 /// matches this machine, so the refusal is a fact about the repo and not
-/// about who composes it: the base's head-processed text (so its own head
-/// directives are not mistaken for content), then each overlay as written.
+/// about who composes it: the base's gate body (so neither its head
+/// directives nor its whole-file gate are mistaken for content), then each
+/// overlay as written.
 /// A hit names the layer and its line in the file as written.
 fn refuseRegionInLayers(
     arena: std.mem.Allocator,
@@ -461,13 +487,14 @@ fn interpolate(
     file: ManagedFile,
     merged: bool,
     bytes: []const u8,
+    base_removed: []const u32,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
     if (machine_state_opt == null) {
-        try recordWhole(arena, prov, bytes, file, merged);
+        try recordWhole(arena, prov, bytes, file, merged, base_removed);
         return @constCast(bytes);
     }
     const ctx: interp.Ctx = .{
@@ -496,9 +523,9 @@ fn interpolate(
     }
     const result = try out.toOwnedSlice(arena);
     if (secret_seen) {
-        try recordPerLineSecret(arena, prov, result, file, merged, line_secret.items);
+        try recordPerLineSecret(arena, prov, result, file, merged, line_secret.items, base_removed);
     } else {
-        try recordWhole(arena, prov, result, file, merged);
+        try recordWhole(arena, prov, result, file, merged, base_removed);
     }
     return result;
 }
@@ -511,28 +538,44 @@ fn interpolate(
 /// DECLARES overlays: an overlay that does not match this machine contributes
 /// nothing, and a file left composing verbatim from its base still routes by
 /// line.
-fn nonSecretOrigin(file: ManagedFile, merged: bool) prov_mod.map.Origin {
-    return if (file.has_base and !merged)
-        .{ .base = .{ .line = 1 } }
+/// `base_removed` is the head pass's removed-line list for the composed text,
+/// so a `.base` line names the source file as written.
+fn nonSecretOrigin(file: ManagedFile, merged: bool, base_removed: []const u32, out_line: u32) prov_mod.map.Origin {
+    return if (routesByLine(file, merged))
+        .{ .base = .{ .line = source.head.sourceLine(base_removed, out_line + 1) } }
     else
         .{ .overlay = .{ .path = if (file.source_base_abs.len > 0) file.source_base_abs else file.source_base_path } };
 }
 
-/// Attribute the whole of `bytes` to a single `nonSecretOrigin` segment for a
-/// structural Cat A route (merge or verbatim pass-through) that resolved no
-/// inline secret. An interpolated file that did carries a secret goes through
+fn routesByLine(file: ManagedFile, merged: bool) bool {
+    return file.has_base and !merged;
+}
+
+/// Attribute the whole of `bytes` to `nonSecretOrigin` for a structural Cat A
+/// route (merge or verbatim pass-through) that resolved no inline secret. An
+/// interpolated file that does carry a secret goes through
 /// `recordPerLineSecret` instead, so only its secret lines are `.secret`.
+/// Appending line by line lets `map.append` coalesce a `.base` run, which
+/// splits exactly where a stripped head line breaks the source numbering.
 fn recordWhole(
     arena: std.mem.Allocator,
     prov: ?*std.ArrayList(Segment),
     bytes: []const u8,
     file: ManagedFile,
     merged: bool,
+    base_removed: []const u32,
 ) !void {
     const p = prov orelse return;
     const n = prov_mod.map.lineCount(bytes);
     if (n == 0) return;
-    try p.append(arena, .{ .out_start = 0, .out_len = n, .origin = nonSecretOrigin(file, merged) });
+    if (!routesByLine(file, merged)) {
+        try p.append(arena, .{ .out_start = 0, .out_len = n, .origin = nonSecretOrigin(file, merged, base_removed, 0) });
+        return;
+    }
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        try prov_mod.map.append(arena, p, i, 1, nonSecretOrigin(file, merged, base_removed, i));
+    }
 }
 
 /// Attribute an interpolated structural file per line when it carries a secret:
@@ -548,15 +591,15 @@ fn recordPerLineSecret(
     file: ManagedFile,
     merged: bool,
     line_secret: []const bool,
+    base_removed: []const u32,
 ) !void {
     const p = prov orelse return;
     const n = prov_mod.map.lineCount(bytes);
     if (n == 0) return;
-    const normal = nonSecretOrigin(file, merged);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const is_secret = i < line_secret.len and line_secret[i];
-        try prov_mod.map.append(arena, p, i, 1, if (is_secret) .secret else normal);
+        try prov_mod.map.append(arena, p, i, 1, if (is_secret) .secret else nonSecretOrigin(file, merged, base_removed, i));
     }
 }
 

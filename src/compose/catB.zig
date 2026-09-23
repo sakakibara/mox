@@ -347,7 +347,7 @@ pub fn composeTracked(
     try refuseOverlays(arena, file, diag, error.OverlayOnTextFile);
     if (!file.has_base) return error.NoBase;
     const base_raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
-    return composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, base_raw, true);
+    return composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, base_raw, &.{}, true);
 }
 
 /// `composeTracked` with the base layer's text already in hand. Cat A routes
@@ -364,6 +364,7 @@ pub fn composeTrackedContent(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
     base_content: []const u8,
+    base_removed: []const u32,
     omit_on_empty: bool,
 ) !?[]u8 {
     if (!file.has_base) return error.NoBase;
@@ -387,13 +388,13 @@ pub fn composeTrackedContent(
             var ln: u32 = 0;
             while (lines.next()) |line| {
                 ln += 1;
-                try emitBaseLine(&em, arena, line, ln, true, ctx);
+                try emitBaseLine(&em, arena, line, source.head.sourceLine(base_removed, ln), true, ctx);
             }
             if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') _ = out.pop();
             if (prov) |p| prov_mod.map.truncateTo(p, prov_mod.map.lineCount(out.items));
             return @as(?[]u8, try out.toOwnedSlice(arena));
         }
-        try recordWholeBase(arena, prov, base_content);
+        try recordWholeBase(arena, prov, base_content, base_removed);
         return @constCast(base_content);
     };
 
@@ -455,7 +456,7 @@ pub fn composeTrackedContent(
         // an inline secret becomes `.secret` (never routed, kept out of the
         // cleartext cache); one interp otherwise rewrote is `.interpolated`
         // (left manual, so the expanded value is not baked back into source).
-        try emitBaseLine(&em, arena, line, line_no, machine_state_opt != null, ctx);
+        try emitBaseLine(&em, arena, line, source.head.sourceLine(base_removed, line_no), machine_state_opt != null, ctx);
     }
 
     // The split-and-rejoin loop always introduces one extra trailing newline
@@ -1064,14 +1065,19 @@ fn loadGeneratorRows(
     return .{ .records = records, .data_path = data_path };
 }
 
-/// Record a single whole-file `.base` segment for a verbatim directiveless
-/// passthrough (no interpolation, so no secret can appear). The interpolated
-/// passthrough emits line by line instead, to attribute secrets per line.
-fn recordWholeBase(arena: std.mem.Allocator, prov: ?*std.ArrayList(Segment), bytes: []const u8) !void {
+/// Record `.base` provenance for a verbatim directiveless passthrough (no
+/// interpolation, so no secret can appear). The interpolated passthrough emits
+/// line by line instead, to attribute secrets per line. Appending a line at a
+/// time lets `map.append` coalesce the run, which splits exactly where a
+/// stripped head line breaks the source numbering.
+fn recordWholeBase(arena: std.mem.Allocator, prov: ?*std.ArrayList(Segment), bytes: []const u8, base_removed: []const u32) !void {
     const p = prov orelse return;
     const n = prov_mod.map.lineCount(bytes);
     if (n == 0) return;
-    try p.append(arena, .{ .out_start = 0, .out_len = n, .origin = .{ .base = .{ .line = 1 } } });
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        try prov_mod.map.append(arena, p, i, 1, .{ .base = .{ .line = source.head.sourceLine(base_removed, i + 1) } });
+    }
 }
 
 fn emitDirective(

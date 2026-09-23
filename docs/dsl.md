@@ -84,7 +84,10 @@ its layers, base or overlay, whether or not the layer matches the machine
 composing: in a merge a directive line is only a comment, so the region's
 body would land unconditionally. The same goes for a line directive
 (`secret`, `default`, `include`), which the merge would drop. The compose
-refuses with `InlineDirectiveWithOverlay`, naming the layer and line. A line
+refuses with `InlineDirectiveWithOverlay`, naming the layer and line. A
+whole-file gate that excludes the composing machine does not exempt the file
+either, nor does a base-less source none of whose overlays match here: the
+scan runs before either decides the file is absent. A line
 that reads as a directive is one wherever it sits, a string value included:
 the DSL reads comment lines, not the format. Gate such content with an
 overlay instead, or keep the file single-layer.

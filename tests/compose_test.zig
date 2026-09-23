@@ -5392,3 +5392,222 @@ test "compose generator: an axis-named overlay beside a structured generator sou
         mox.compose.catB.composeGenerator(a, io, tree.files[0], &b_r, null, null, null),
     );
 }
+
+test "provenance: a head-stripped structured file numbers its base lines as the source file has them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Source lines: 1 a plain comment, 2 the consumed `own` line, 3 `[tui]`,
+    // 4 `k = 1`, 5-7 a region. Output line 1 comes from source line 1 and
+    // output line 2 from source line 3.
+    try writeFile(io, tmp.dir, "src/app.toml", "# note\n" ++
+        "# mox: own tui\n" ++
+        "[tui]\n" ++
+        "k = 1\n" ++
+        "# mox: when os=darwin\n" ++
+        "mac = true\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    const out = (try mox.compose.catA.compose(a, io, tree.files[0], &b_r, null, null, &prov, null)).?;
+    try std.testing.expectEqualStrings("# note\n[tui]\nk = 1\nmac = true\n", out);
+
+    try std.testing.expectEqual(@as(usize, 3), prov.items.len);
+    try std.testing.expectEqual(@as(u32, 1), prov.items[0].origin.base.line);
+    try std.testing.expectEqual(@as(u32, 1), prov.items[0].out_len);
+    try std.testing.expectEqual(@as(u32, 3), prov.items[1].origin.base.line);
+    try std.testing.expectEqual(@as(u32, 2), prov.items[1].out_len);
+    try std.testing.expect(prov.items[2].origin == .overlay);
+}
+
+test "provenance: a structural pass-through numbers its base lines past the consumed head and gate lines" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Source lines: 1 the consumed `own` line, 2 the whole-file gate line,
+    // 3 `[tui]`, 4 `k = 1`. Output line 1 comes from source line 3.
+    try writeFile(io, tmp.dir, "src/cfg.toml", "# mox: own tui\n" ++
+        "# mox: when os=darwin\n" ++
+        "[tui]\n" ++
+        "k = 1\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    const out = (try mox.compose.catA.compose(a, io, tree.files[0], &b_r, null, null, &prov, null)).?;
+    try std.testing.expectEqualStrings("[tui]\nk = 1\n", out);
+    try std.testing.expectEqual(@as(usize, 1), prov.items.len);
+    try std.testing.expectEqual(@as(u32, 3), prov.items[0].origin.base.line);
+    try std.testing.expectEqual(@as(u32, 2), prov.items[0].out_len);
+}
+
+test "compose catA: an overlay's inline directive is refused on a machine the base's whole-file gate excludes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.toml", "# mox: when os=linux\n[a]\nx = 1\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/os=darwin.toml", "# mox: secret \"env:TOKEN\"\n[b]\ny = 2\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+
+    for ([_][]const u8{ "darwin", "linux" }) |os| {
+        var b = std.StringHashMap([]const u8).init(a);
+        var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+        try b.put("os", os);
+        var diag: mox.compose.interp.Diag = .{};
+        try std.testing.expectError(
+            error.InlineDirectiveWithOverlay,
+            mox.compose.catA.compose(a, io, tree.files[0], &b_r, null, null, null, &diag),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, diag.capture().?, "os=darwin.toml:1") != null);
+    }
+}
+
+test "compose catA: a closed whole-file gate line is not itself taken for an inline directive" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.toml", "# mox: when os=linux\n[a]\nx = 1\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/os=darwin.toml", "[b]\ny = 2\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    try std.testing.expect(try mox.compose.catA.compose(a, io, tree.files[0], &b_r, null, null, null, null) == null);
+}
+
+test "compose catA: an overlay-only source's inline directive is refused on a machine no overlay matches" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.toml.d/os=linux.toml", "# mox: secret \"env:TOKEN\"\n[b]\ny = 2\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    try std.testing.expectError(
+        error.InlineDirectiveWithOverlay,
+        mox.compose.catA.compose(a, io, tree.files[0], &b_r, null, null, null, null),
+    );
+}
+
+test "provenance: an interpolated line in a head-stripped structured file names its source line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Source lines: 1 the consumed `own` line, 2 `[tui]`, 3 the capture,
+    // 4-6 a region.
+    try writeFile(io, tmp.dir, "src/app.toml", "# mox: own tui\n" ++
+        "[tui]\n" ++
+        "email = \"<machine.email>\"\n" ++
+        "# mox: when os=linux\n" ++
+        "extra = 1\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "linux");
+
+    const facts = [_]mox.machine.state.Fact{.{ .name = "email", .value = "test@example.com" }};
+    const m_state = mox.machine.state.MachineState{
+        .os = "linux",
+        .arch = "aarch64",
+        .hostname = "h",
+        .username = "u",
+        .home = "/h",
+        .xdg_config_home = "",
+        .xdg_cache_home = "",
+        .xdg_data_home = "",
+        .xdg_state_home = "",
+        .custom_facts = &facts,
+    };
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    const out = (try mox.compose.catA.compose(a, io, tree.files[0], &b_r, &m_state, null, &prov, null)).?;
+    try std.testing.expectEqualStrings("[tui]\nemail = \"test@example.com\"\nextra = 1\n", out);
+    try std.testing.expectEqual(@as(u32, 2), prov.items[0].origin.base.line);
+    try std.testing.expectEqual(@as(u32, 3), prov.items[1].origin.interpolated.origin_line);
+}
+
+test "provenance: a secret-bearing structural pass-through numbers the lines around the secret in order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.conf.toml", "theme = \"dark\"\n" ++
+        "font = \"mono\"\n" ++
+        "api_key = \"<secret:env:MOX_TEST_SECRET>\"\n" ++
+        "port = 8080\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var cache = mox.secret.cache.Cache.init(a);
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_TEST_SECRET", "hunter2");
+    const m_state = dataTestMachine();
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    _ = (try mox.compose.catA.compose(a, io, tree.files[0], &bindings_r, &m_state, .{ .env = Env{ .map = &map }, .cache = &cache }, &prov, null)).?;
+
+    try std.testing.expectEqual(@as(usize, 3), prov.items.len);
+    try std.testing.expectEqual(@as(u32, 1), prov.items[0].origin.base.line);
+    try std.testing.expectEqual(@as(u32, 2), prov.items[0].out_len);
+    try std.testing.expect(prov.items[1].origin == .secret);
+    try std.testing.expectEqual(@as(u32, 4), prov.items[2].origin.base.line);
+    try std.testing.expectEqual(@as(u32, 1), prov.items[2].out_len);
+}
