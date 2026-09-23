@@ -192,6 +192,32 @@ pub const ManagedFile = struct {
     /// each command reports this file as its own error instead of aborting
     /// the whole run.
     head_error: []const u8 = "",
+
+    /// Absolute path of the TOML data source a `# mox: for` in this file
+    /// names: a `/`-bearing key is repo-relative, with the private layer
+    /// shadowing the repo; a bare name is this file's own `<base>.d/<name>`.
+    /// Null when a repo-relative key has no `repo_dir` to join onto. One
+    /// definition, so compose and every scanner of the same loop read the
+    /// same file.
+    pub fn dataSourcePath(
+        self: ManagedFile,
+        arena: std.mem.Allocator,
+        io: Io,
+        data_source: []const u8,
+    ) std.mem.Allocator.Error!?[]const u8 {
+        if (std.mem.indexOfScalar(u8, data_source, '/') != null) {
+            if (self.private_dir.len > 0) {
+                const priv = try path_mod.joinKeyOnto(arena, self.private_dir, data_source);
+                if (Io.Dir.cwd().access(io, priv, .{})) |_| {
+                    return priv;
+                } else |_| {}
+            }
+            if (self.repo_dir.len == 0) return null;
+            return try path_mod.joinKeyOnto(arena, self.repo_dir, data_source);
+        }
+        const overlay_dir = try std.fmt.allocPrint(arena, "{s}.d", .{self.source_base_abs});
+        return try path_mod.joinKeyOnto(arena, overlay_dir, data_source);
+    }
 };
 
 /// The complete scanned source tree.

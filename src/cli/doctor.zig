@@ -1109,3 +1109,54 @@ test "scriptStageProblems: scripts/pre-install still reports as an unknown stage
     try testing.expectEqual(@as(usize, 1), bad.len);
     try testing.expect(std.mem.indexOf(u8, bad[0], "unknown-stage scripts/pre-install") != null);
 }
+
+test "closedAxisValueProblems: flags an out-of-vocabulary os= value compared only by a nested gate" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile=work\n" ++
+            "# mox: when os=macos\n" ++
+            "program = /darwin\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    });
+
+    const repo = try tmpAbs(a, io, &tmp, "repo");
+    const bad = (try closedAxisValueProblems(a, io, repo)).?;
+    try testing.expectEqual(@as(usize, 1), bad.len);
+    try testing.expect(std.mem.indexOf(u8, bad[0], "os=macos") != null);
+}
+
+test "allNamesCompared: a presence test nested inside a gate makes the file ineligible for the never-materializing check" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when os=darwin\n" ++
+            "# mox: when signing_key\n" ++
+            "\tgpgsign = true\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    });
+
+    const src_dir = try std.fs.path.join(a, &.{ try tmpAbs(a, io, &tmp, "repo"), "src" });
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    const ax = try mox.source.axes.ofFile(a, io, tree.files[0]);
+
+    // The enumerated space cannot reproduce a machine that HAS the fact, so a
+    // null-everywhere result would not be proof -- the file must be skipped.
+    try testing.expect(!allNamesCompared(ax));
+}

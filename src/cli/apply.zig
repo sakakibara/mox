@@ -80,6 +80,8 @@ pub fn explainComposeError(w: *std.Io.Writer, prefix: []const u8, e: anyerror) !
         error.SecretEmpty => try w.print("{s}:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n", .{prefix}),
         error.InlineDirectiveWithOverlay => try w.print("{s}:   an inline directive in a file merged from .d/ overlays is only a comment there: gate the content with an overlay instead, or keep the file single-layer\n", .{prefix}),
         error.WhenOnReplaceFrom => try w.print("{s}:   `replace from` already picks its fragment by the axes in the region's filenames, so a `when` on it would decide nothing: name the axes on the fragments instead, or gate with `replace \"<path>\" when <axis>`\n", .{prefix}),
+        error.OverlayOnTextFile => try w.print("{s}:   a text file has no layer merge to fold an axis-named .d/ overlay into, so that layer would compose nowhere: move its content into a `<name>.d/<region>/` fragment a region directive picks, or gate it with `when <axis>`\n", .{prefix}),
+        error.OverlayOnGenerator => try w.print("{s}:   a generator's own path never materializes, so an axis-named .d/ overlay beside it would compose nowhere: gate the loop itself with `for ... when <axis>`, or move the per-machine part into the data source\n", .{prefix}),
         else => {},
     }
 }

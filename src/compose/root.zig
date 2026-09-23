@@ -5,11 +5,13 @@ pub const pacifier = @import("pacifier.zig");
 pub const catA = @import("catA.zig");
 pub const catB = @import("catB.zig");
 pub const catC = @import("catC.zig");
+pub const capture = @import("capture.zig");
 pub const interp = @import("interp.zig");
 pub const toml_merge = @import("toml_merge.zig");
 pub const json_merge = @import("json_merge.zig");
 pub const yaml_merge = @import("yaml_merge.zig");
 pub const ini_merge = @import("ini_merge.zig");
+pub const categoryOf = @import("compose.zig").categoryOf;
 pub const composeFile = @import("compose.zig").composeFile;
 pub const composeFileTracked = @import("compose.zig").composeFileTracked;
 pub const wholeFileGateAxisExpr = @import("compose.zig").wholeFileGateAxisExpr;
@@ -17,6 +19,7 @@ pub const wholeFileGateAxisExpr = @import("compose.zig").wholeFileGateAxisExpr;
 test {
     // Force test discovery in submodules whose `pub const` re-export above
     // doesn't get walked at comptime by `zig build test` alone.
+    _ = capture;
     _ = toml_merge;
     _ = json_merge;
     _ = yaml_merge;

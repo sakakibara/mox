@@ -253,6 +253,16 @@ All notable changes to mox are documented here. The format follows
   terms than it could keep.
 - `mox upgrade`'s help no longer names a specific repository: it fetches from
   the release the running build was built to look for.
+- A plugin gets the setup-script environment, every fact as `MOX_FACT_*`
+  included, and never the fact contract that goes with it: its text is not
+  scanned, no fact is asked for on its behalf, and no run is blocked for one
+  it lacks. A plugin is any executable, a compiled one included, so there is
+  no text mox may rely on having, and a check that held only for the plugins
+  written in a scripting language would read as coverage while skipping the
+  rest. A plugin that requires a fact tests for it in `available` and exits 1,
+  saying why on stderr or through `limitation` -- it is the one judge of
+  whether it is usable on a machine. Said in the guide, which promised the
+  environment and left the rest to be inferred.
 
 ### Fixed
 - A lock names its holder by the process that took it, recorded as the time
@@ -302,6 +312,72 @@ All notable changes to mox are documented here. The format follows
   `check/` hooks and `backends/` plugins are run too.
 - `update --help`'s description says `--no-apply` stops after the rebase,
   agreeing with the flag's own line and both guides; it said the fetch.
+- A whole-file gate on a TOML, JSON, YAML, INI or gitconfig source scopes the
+  rest of that file without disabling it. A held gate diverted the file past
+  the directive path, so every further directive under it went unread: its
+  `when` and `for` lines reached the live file as content, and the bodies they
+  were meant to select landed unconditionally. The same file without the gate
+  composed correctly, and the text categories always read the gate as the
+  region it is. A gate that does not hold still makes the file absent.
+- A capture written in a `.d/` overlay of a TOML, JSON, YAML, INI or gitconfig
+  source is a fact the interview asks for. Discovery read an overlay's
+  filename and never its content, so a `<machine.NAME>` there was interpolated
+  at compose time yet never asked: alone it failed the file with an unknown
+  machine field no interview could bind, and inside a fallback chain it
+  resolved silently to the next member. The overlay's own filename tuple
+  conditions the ask, exactly as it conditions the merge. An overlay of a text
+  or binary source is unaffected, since compose expands neither.
+- An axis-named `.d/` file beside a source that can never fold one in is
+  refused instead of silently dropped. A `.d/os=darwin.sh` beside a text
+  source was enumerated as an overlay and then read by nothing: the file
+  composed from its base alone, the whole layer vanished with no output
+  change and no diagnostic anywhere, and the same tuple beside a structured
+  source merged as written. Text has no layer to merge into and no whole-file
+  pick, so that layer is refused with `OverlayOnTextFile`, naming it; vary
+  text per machine with a region directive and its `<name>.d/<region>/`
+  fragments, or a `when` gate. A generator source (`for ... into`) refuses one
+  the same way in every category, with `OverlayOnGenerator` -- its own path
+  never materializes, so nothing beside it has anything to compose into, and a
+  structured generator dropped its overlays just as silently. Neither refusal
+  depends on the overlay matching the machine composing.
+- An overlay or region-fragment filename whose value carries a dot offers both
+  of its readings at the interview. Compose matches `.d/zone=eu.local` as the
+  whole written value first and as the extension-stripped `eu` second, but
+  only `eu` reached the observed set: the prompt suggested a value that
+  selects nothing, and answering the one that does drew an "is not among
+  zone's observed values" confirmation. Both readings are recorded, as the
+  axis scan behind the config space already recorded them.
+- A setup script inside a `scripts/<stage>/<tuple>/` gate directory is asked
+  about only where that tuple holds. Its `# mox: needs` names and its own
+  `# mox: when` head were contributed unconditioned, so a fact reachable only
+  through a gated script was asked on every machine. The gate directory's own
+  tuple is now a value comparison in its own right as well -- it registered
+  nothing at all before, so a fact named only by a gate directory was never
+  asked, leaving a gate that could not open and a script that never ran.
+- A fact a script declares with `# mox: needs` is asked wherever that script
+  runs, even where `src/` uses the same fact only behind a gate. Once anything
+  in `src/` had made the name real, the declaration contributed no occurrence
+  at all and the narrower `src/` condition stood alone: on a machine whose
+  gate is closed the fact was never asked, and the script that declared it --
+  ungated, so the runner still reached it -- blocked on a fact no interview
+  had offered to bind. A declared name
+  is an occurrence like any other now, asked under the script's own gate
+  directory, or unconditionally at a stage's top level, OR'd with every other
+  use of the same fact.
+- A fact a script consumes through a scanned `MOX_FACT_*` token, declaring no
+  `# mox: needs` head, is asked wherever that script runs. Only a declared
+  need widened the asking condition; a scanned one contributed no occurrence
+  at all, though discovery already reported the script as needing the fact and
+  the runner already blocked the run on it. An ungated script reading
+  `$MOX_FACT_OP_ACCOUNT` for a name `src/` captures only behind
+  `when profile=work` left a machine on another profile with a fact the
+  interview never offered, `mox status` never listed, and apply refused to
+  proceed without. A scanned token is now an occurrence like a declared name,
+  asked under the script's own gate directory, or unconditionally at a stage's
+  top level. It never registers a new fact the way a declared name does: a
+  token is matched text, and the projection onto it is one-way, so one
+  matching no known fact still blocks its script rather than becoming an
+  interview question for a fact that may not exist.
 
 ## [0.11.0] - 2026-09-09
 

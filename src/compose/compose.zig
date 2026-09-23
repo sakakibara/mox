@@ -52,19 +52,7 @@ pub fn composeFileTracked(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
-    // Sniff a sample of the base (or first overlay) to detect category.
-    const sample_path: ?[]const u8 = if (file.has_base)
-        file.source_base_abs
-    else if (file.overlays.len > 0)
-        file.overlays[0].path
-    else
-        null;
-
-    if (sample_path == null) return null;
-
-    const sample = try peekFile(io, arena, sample_path.?);
-
-    const cat = category.detect(file.source_base_path, sample);
+    const cat = (try categoryOf(arena, io, file)) orelse return null;
 
     switch (cat) {
         // Cat A owns its own provenance: per-line (via Cat B) for a
@@ -79,6 +67,23 @@ pub fn composeFileTracked(
             return bytes;
         },
     }
+}
+
+/// The category `composeFileTracked` will route `file` through: sniffed from
+/// a sample of its base, or of its first overlay when it has no base. Null
+/// when there is neither, which is the one case that composes to nothing
+/// without consulting a category at all. One definition, so a scanner that
+/// has to know whether a position is interpolated reads the same verdict
+/// compose acts on.
+pub fn categoryOf(arena: std.mem.Allocator, io: Io, file: ManagedFile) !?category.Category {
+    const sample_path: []const u8 = if (file.has_base)
+        file.source_base_abs
+    else if (file.overlays.len > 0)
+        file.overlays[0].path
+    else
+        return null;
+    const sample = try peekFile(io, arena, sample_path);
+    return category.detect(file.source_base_path, sample);
 }
 
 /// The whole-file gate's axis expression that just decided `file` is absent

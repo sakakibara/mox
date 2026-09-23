@@ -1,4 +1,5 @@
 const std = @import("std");
+const capture = @import("capture.zig");
 const data = @import("../data/root.zig");
 const dsl = @import("../dsl/root.zig");
 const machine = @import("../machine/root.zig");
@@ -154,54 +155,6 @@ fn noteDiag(ctx: Ctx, text: []const u8) void {
     if (ctx.diag) |d| d.set(text);
 }
 
-/// Index of the `>` that closes the capture opened at `open` (a `<`), null when
-/// unclosed. A `| default "..."` value may itself contain `>`, so when that
-/// marker is present the close is taken to be the `>` immediately after the
-/// default's closing quote (`">`) rather than the first `>` seen.
-fn captureCloseIndex(template: []const u8, open: usize) ?usize {
-    // A `<secret:URI>` capture runs the URI verbatim to the first UNESCAPED `>`:
-    // `"` and a literal ` | default "` inside a cmd: URI are payload, not
-    // capture syntax, and a `\>` is a literal `>` in the payload (see
-    // secretCloseIndex).
-    if (std.mem.startsWith(u8, template[open + 1 ..], "secret:"))
-        return secretCloseIndex(template, open + 1);
-    const naive = std.mem.indexOfScalarPos(u8, template, open + 1, '>') orelse return null;
-    const marker = " | default \"";
-    // Search only within this capture (up to the first `>`): a marker after it
-    // belongs to a later capture. Bounding the scan keeps a template with many
-    // captures from being O(n^2).
-    const mpos = std.mem.indexOfPos(u8, template[0..naive], open + 1, marker) orelse return naive;
-    const qstart = mpos + marker.len;
-    var k = qstart;
-    while (k + 1 < template.len) : (k += 1) {
-        if (template[k] == '"' and template[k + 1] == '>') return k + 1;
-    }
-    // Malformed or unusual default (no `">`): fall back to the first `>`.
-    return naive;
-}
-
-/// Index of the `>` closing a `<secret:URI>` capture, scanning from `start` =
-/// the first URI byte. Inside the URI a backslash escapes the next byte, so a
-/// `\>` is a literal `>` in the payload (letting a `cmd:` URI carry a shell
-/// redirect such as `2>&1`) and does NOT close the capture, and `\\` is a
-/// literal backslash; any other backslash stands for itself. Returns null when
-/// no unescaped `>` is found.
-fn secretCloseIndex(template: []const u8, start: usize) ?usize {
-    var k = start;
-    while (k < template.len) {
-        const ch = template[k];
-        if (ch == '\\' and k + 1 < template.len and
-            (template[k + 1] == '>' or template[k + 1] == '\\'))
-        {
-            k += 2;
-            continue;
-        }
-        if (ch == '>') return k;
-        k += 1;
-    }
-    return null;
-}
-
 /// Decode a secret URI's escapes into the payload handed to the resolver:
 /// `\>` -> `>`, `\\` -> `\`, every other byte (including a lone backslash)
 /// verbatim. Returns `raw` unchanged when it carries no escapable backslash,
@@ -233,14 +186,6 @@ fn unescapeSecretUri(arena: std.mem.Allocator, raw: []const u8) std.mem.Allocato
     return try buf.toOwnedSlice(arena);
 }
 
-/// Check a template for forbidden patterns. Returns nothing on success. The
-/// duplicate-capture set is arena-owned, so it stays unbounded regardless of
-/// how many distinct captures a template carries.
-/// Namespace heads `expandTracked` resolves. A `<...>` whose inner text starts
-/// with none of these (and carries no fallback chain) is passed through
-/// literally outside template mode, so it is text, not a capture.
-const capture_namespaces = [_][]const u8{ "machine.", "entry.", "data.", "env." };
-
 /// Whether `template` holds a capture this module would EXPAND. `Sho
 /// <me@example.com>` holds none: a bare name resolves only in template mode
 /// (against a record), and against a loop scope, neither of which a structural
@@ -249,22 +194,23 @@ const capture_namespaces = [_][]const u8{ "machine.", "entry.", "data.", "env." 
 pub fn containsCapture(template: []const u8) bool {
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, template, i, '<')) |open| {
-        const close = captureCloseIndex(template, open) orelse {
+        const close = capture.closeIndex(template, open) orelse {
             i = open + 1;
             continue;
         };
         const inner = template[open + 1 .. close];
         if (std.mem.startsWith(u8, inner, "secret:")) return true;
         // A fallback chain resolves whenever any member does.
-        if (std.mem.indexOf(u8, inner, " | ") != null) return true;
-        for (capture_namespaces) |ns| {
-            if (std.mem.startsWith(u8, inner, ns)) return true;
-        }
+        if (capture.isChain(inner)) return true;
+        if (capture.hasNamespace(inner)) return true;
         i = close + 1;
     }
     return false;
 }
 
+/// Check a template for forbidden patterns. Returns nothing on success. The
+/// duplicate-capture set is arena-owned, so it stays unbounded regardless of
+/// how many distinct captures a template carries.
 pub fn lint(arena: std.mem.Allocator, template: []const u8) LintError!void {
     var seen = std.StringHashMap(void).init(arena);
     var i: usize = 0;
@@ -273,7 +219,7 @@ pub fn lint(arena: std.mem.Allocator, template: []const u8) LintError!void {
         const c = template[i];
         if (c == '<') {
             if (prev_was_capture_end) return error.AdjacentCaptures;
-            const close = captureCloseIndex(template, i) orelse return error.UnclosedCapture;
+            const close = capture.closeIndex(template, i) orelse return error.UnclosedCapture;
             const inner = template[i + 1 .. close];
             if (inner.len == 0) return error.EmptyCaptureName;
             try lintCapture(inner);
@@ -365,7 +311,7 @@ fn expandTrackedImpl(
     while (i < template.len) {
         const c = template[i];
         if (c == '<') {
-            const close = captureCloseIndex(template, i) orelse {
+            const close = capture.closeIndex(template, i) orelse {
                 try out.append(arena, c);
                 i += 1;
                 continue;
@@ -384,7 +330,7 @@ fn expandTrackedImpl(
 
             // Optional ` | default "..."` suffix. `<machine.x | default "y">`
             // returns "y" when the field is missing instead of erroring.
-            const split = splitDefault(inner_raw);
+            const split = capture.splitDefault(inner_raw);
             const inner = split.field;
             const default_opt = split.default;
 
@@ -393,7 +339,7 @@ fn expandTrackedImpl(
             // trailing default is a compose error (fail-fast, same policy
             // as a missing single interpolation). A chain containing a bare
             // name outside template mode is not a capture: pass through.
-            if (std.mem.indexOf(u8, inner, " | ") != null) {
+            if (capture.isChain(inner)) {
                 switch (try resolveChain(arena, &out, inner, default_opt, record_opt, ctx)) {
                     .resolved => {
                         i = close + 1;
@@ -608,9 +554,8 @@ fn resolveChain(
     ctx: Ctx,
 ) InterpError!ChainResult {
     var chosen: ?[]const u8 = null;
-    var members = std.mem.splitSequence(u8, inner, " | ");
-    while (members.next()) |member_raw| {
-        const member = std.mem.trim(u8, member_raw, " \t");
+    var members = capture.members(inner);
+    while (members.next()) |member| {
         var value: []const u8 = "";
         if (try scopeChainMember(arena, ctx.scope, member)) |v| {
             value = v;
@@ -707,29 +652,17 @@ fn lintCapture(inner: []const u8) LintError!void {
         if (inner.len == "secret:".len) return error.EmptySecretUri;
         return;
     }
-    const body = splitDefault(inner).field;
+    const body = capture.splitDefault(inner).field;
     // A capture that is only a default (`< | default "x">`) or is all whitespace
     // has no field to resolve: lint would pass it but expand would fail, so
     // reject it here to keep lint and expand in agreement.
     if (std.mem.trim(u8, body, " \t").len == 0) return error.EmptyCaptureName;
-    var members = std.mem.splitSequence(u8, body, " | ");
-    while (members.next()) |member_raw| {
-        const member = std.mem.trim(u8, member_raw, " \t");
+    var members = capture.members(body);
+    while (members.next()) |member| {
         if (std.mem.startsWith(u8, member, "data.")) {
             if (parseDataSpec(member[5..]) == null) return error.MalformedDataCapture;
         }
     }
-}
-
-/// Split a `<...>` capture body into (field, default). Recognizes the suffix
-/// ` | default "..."` and strips it from the field reference.
-fn splitDefault(inner: []const u8) struct { field: []const u8, default: ?[]const u8 } {
-    const marker = " | default \"";
-    const idx = std.mem.indexOf(u8, inner, marker) orelse return .{ .field = inner, .default = null };
-    const after = inner[idx + marker.len ..];
-    const close = std.mem.lastIndexOfScalar(u8, after, '"') orelse return .{ .field = inner, .default = null };
-    const field = std.mem.trimEnd(u8, inner[0..idx], " \t");
-    return .{ .field = field, .default = after[0..close] };
 }
 
 fn formatMachineField(
@@ -760,24 +693,6 @@ fn formatMachineField(
         if (std.mem.eql(u8, field, f.name)) return arena.dupe(u8, f.value);
     }
     return error.UnknownMachineField;
-}
-
-test "splitDefault: no default" {
-    const r = splitDefault("machine.email");
-    try std.testing.expectEqualStrings("machine.email", r.field);
-    try std.testing.expect(r.default == null);
-}
-
-test "splitDefault: with default" {
-    const r = splitDefault("machine.email | default \"x@y.com\"");
-    try std.testing.expectEqualStrings("machine.email", r.field);
-    try std.testing.expectEqualStrings("x@y.com", r.default.?);
-}
-
-test "splitDefault: empty default value is fine" {
-    const r = splitDefault("env.HTTP_PROXY | default \"\"");
-    try std.testing.expectEqualStrings("env.HTTP_PROXY", r.field);
-    try std.testing.expectEqualStrings("", r.default.?);
 }
 
 /// Lint against a throwaway arena, so a test needs only the template string.

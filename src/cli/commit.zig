@@ -3300,7 +3300,7 @@ fn acceptGeneratedRow(
     if (accept) {
         try gen_row_edits.append(cc.arena, .{
             .data_source = leaf.data_source,
-            .stem = filenameStem(leaf.data_source),
+            .stem = mox.data.source.arrayName(leaf.data_source),
             .row = @intCast(leaf.row),
             .fields = fields,
         });
@@ -4401,7 +4401,7 @@ fn routeHunk(
             const fields = reverseTemplate(arena, o.template, new_lines[0]) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
             } orelse return .{ .manual = "live line does not match loop template" };
-            const stem = try arena.dupe(u8, filenameStem(o.data_source));
+            const stem = try arena.dupe(u8, mox.data.source.arrayName(o.data_source));
             const desc = try std.fmt.allocPrint(arena, "{s} row {d}", .{ o.data_source, row });
             return .{ .row = .{
                 .edit = .{ .data_source = o.data_source, .stem = stem, .row = row, .fields = fields },
@@ -5270,13 +5270,6 @@ fn rewriteField(arena: std.mem.Allocator, line: []const u8, fields: []const Fiel
         }
     }
     return error.NotAField;
-}
-
-/// Stem of a filename: basename without its trailing extension.
-fn filenameStem(path: []const u8) []const u8 {
-    const basename = std.fs.path.basename(path);
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
-    return basename[0..dot];
 }
 
 /// True when any `.secret`-origin segment overlaps the hunk's a-range. This

@@ -67,6 +67,18 @@ fn parseStem(arena: std.mem.Allocator, stem: []const u8) ParseError!AxisTuple {
     return .{ .pairs = slice };
 }
 
+/// The verbatim reading of pair `i`'s value, given the `exact_tuple` a walk
+/// recorded beside the extension-stripped one, or null when the filename
+/// carried nothing the heuristic stripped. Both readings parse the same
+/// filename, so pair `i` names the same axis in each; a shorter `exact`
+/// yields null rather than a mismatched pair. One definition, so every scan
+/// that has to ask both readings of a filename asks them the same way.
+pub fn exactValueAt(exact: ?AxisTuple, i: usize) ?[]const u8 {
+    const t = exact orelse return null;
+    if (i >= t.pairs.len) return null;
+    return t.pairs[i].value;
+}
+
 /// The part of `filename` before a trailing extension, or `filename`
 /// unchanged when the last dot-suffix isn't one (see `parseFilename`).
 pub fn stripExtension(filename: []const u8) []const u8 {

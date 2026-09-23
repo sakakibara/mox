@@ -89,6 +89,18 @@ that reads as a directive is one wherever it sits, a string value included:
 the DSL reads comment lines, not the format. Gate such content with an
 overlay instead, or keep the file single-layer.
 
+The rule reads the same way from the other side. An axis-named `.d/` file is
+an overlay only where a category has layers to fold or to pick from: a
+structural merge, or a binary file's single winning layer. A text source has
+neither -- it composes from its base and the directives written in it -- so
+a `.d/` file named for an axis tuple beside one could only ever be dropped,
+and the compose refuses it with `OverlayOnTextFile`, naming it. Vary text per
+machine with a region directive and its `<name>.d/<region>/` fragments, or a
+`when` gate. A generator source (`for ... into`) refuses one too, in every
+category, with `OverlayOnGenerator`: the generator's own path never
+materializes, so no layer beside it has anything to compose into. Neither
+refusal depends on the overlay matching the machine composing.
+
 ## Axis expressions
 
 Axes are machine facts: the built-ins `os`, `arch`, `machine` and `hostname`,
@@ -404,17 +416,35 @@ environment variable it happens to read. mox resolves it one of two ways:
 
 - **Scanned**, by default: every literal `MOX_FACT_[A-Z0-9_]+` token found
   anywhere in the script's text (CRLF-tolerant, same pattern for bash and
-  PowerShell -- `$MOX_FACT_X`, `${MOX_FACT_X}`, `%MOX_FACT_X%` all match).
+  PowerShell -- `$MOX_FACT_X`, `${MOX_FACT_X}`, `%MOX_FACT_X%` all match). A
+  token naming a fact the repo already consumes elsewhere is one more
+  occurrence of it, whose own condition the fact is asked under, exactly as a
+  declared name is. A token naming no such fact registers nothing: it is
+  matched text rather than a stated contract, and the projection is one-way
+  (`MOX_FACT_A_B` names `a.b`, `a_b` and `A-B` alike), so it stays fail-closed
+  and blocks the script instead.
 - **Declared**, with a `# mox: needs <name>...` head line (scanned the same
   window as `# mox: when`, above -- both may appear, in either order). When
   present it REPLACES the token scan entirely: an empty `# mox: needs` line
   declares "needs nothing" and always runs, regardless of what tokens the
-  script's text contains. A name the line lists that names no fact yet known
-  anywhere else registers a new, free-form interview question (closing the
-  gap where a script's own fact had no other consumer to discover it from).
+  script's text contains. Each name the line lists is a use of that fact like
+  any other: it registers a new, free-form interview question when nothing
+  else in the repo consumes the name, and either way it is one more
+  occurrence whose own condition the fact is asked under.
   A `# mox: needs` line that fails to parse (a name outside the fact-name
   charset) blocks the script outright -- its contract is unknowable, and the
   token scan is not consulted as a fallback.
+
+A gate directory's tuple is an axis comparison in its own right, so the fact
+that opens it is one the interview asks about; and a fact a script inside it
+declares with `# mox: needs`, scans a token for, or names in a `# mox: when`
+head of its own, is
+asked about where that tuple holds -- the same condition the runner requires
+before running the script at all. Conditions across uses OR together, here as
+everywhere: a fact `src/` uses only behind `when profile=work` and an ungated
+script needs is asked on every machine, because that script runs on every
+machine -- whether the script declares the need or the scan reads it from a
+token, since the runner blocks the run on either.
 
 Each needed fact (declared or scanned) is checked against THIS stage's
 actual projected environment, not an abstract name set -- so a projection

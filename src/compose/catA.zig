@@ -80,15 +80,17 @@ const Format = enum { toml, gitconfig, yaml, json, ini };
 /// A base layer after the single leading-block pass: head directives parsed
 /// once, consumed lines stripped, whole-file gate evaluated.
 const Head = struct {
-    /// Base text with every consumed head-directive line removed (ownership,
-    /// check, and -- when it holds -- the whole-file gate line).
+    /// Base text with the ownership and check lines removed. A whole-file gate
+    /// line is NOT one of them: it stays, so the text handed to Cat B still
+    /// carries the gate that scopes the rest of the file.
     text: []const u8,
+    /// `text` with a holding whole-file gate's own line removed too: the gate's
+    /// body, which is what the structural routes compose. Equal to `text` when
+    /// the file has no whole-file gate.
+    body: []const u8,
     /// A leading whole-file gate evaluated false: the file is absent on this
     /// machine.
     absent: bool = false,
-    /// A leading whole-file gate held: `text` is the gate's body and composes
-    /// by the file's native category, never through Cat B.
-    gate_on: bool = false,
     /// The file declares `own`/`disown`: mox owns only part of a file a program
     /// also writes. Such a file is patched, never materialized or omitted
     /// wholesale, so an empty render is "mox owns nothing here", not "no file".
@@ -111,26 +113,26 @@ fn readBaseHead(
     bindings: *const dsl.resolver.Resolver,
 ) !Head {
     const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    if (!file.has_base) return .{ .text = raw };
+    if (!file.has_base) return .{ .text = raw, .body = raw };
     const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
     const parsed = source.head.parse(arena, head_text, marker) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         // The walk has already refused a malformed head; keep the text
         // intact so the failure surfaces with a source location downstream.
-        else => return .{ .text = raw },
+        else => return .{ .text = raw, .body = raw },
     };
     const partial = parsed.ownership != .none;
     const stripped = if (parsed.spans.len == 0) raw else try source.head.stripSpans(arena, raw, parsed.spans);
-    if (parsed.gate == null) return .{ .text = stripped, .partial = partial };
+    if (parsed.gate == null) return .{ .text = stripped, .body = stripped, .partial = partial };
     // The candidate is a whole-file existence gate only when the DSL agrees:
     // the file must parse, and the gate must run to EOF (a matching `end`
     // later makes it a region, composed through Cat B).
-    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return .{ .text = stripped, .partial = partial };
-    if (!dsl.axis.evaluate(expr, bindings)) return .{ .text = stripped, .absent = true, .partial = partial };
+    const expr = wholeFileGateExpr(arena, stripped, marker) orelse return .{ .text = stripped, .body = stripped, .partial = partial };
+    if (!dsl.axis.evaluate(expr, bindings)) return .{ .text = stripped, .body = stripped, .absent = true, .partial = partial };
     // The gate line is line 1 of the stripped text by construction; consume
     // exactly it.
     const nl = std.mem.indexOfScalar(u8, stripped, '\n');
-    return .{ .text = if (nl) |n| stripped[n + 1 ..] else "", .gate_on = true, .partial = partial };
+    return .{ .text = stripped, .body = if (nl) |n| stripped[n + 1 ..] else "", .partial = partial };
 }
 
 fn formatOf(path: []const u8) ?Format {
@@ -172,17 +174,20 @@ fn composeToml(
     if (hd.absent) return null;
 
     // Single-layer base with `# mox:` content directives routes through Cat B for
-    // include / from / when. A whole-file gate composes its body structurally.
-    // The pass-through preserves comments, blank lines, and key ordering.
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "#", diag);
+    // include / from / when. A whole-file gate alone composes its body
+    // structurally; a gate with further directives under it goes to Cat B WITH
+    // its gate line, so the gate scopes the body there exactly as it does in a
+    // Cat B file. The pass-through preserves comments, blank lines, and key
+    // ordering.
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "#", diag);
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
     }
 
     // Multi-layer merge seeds from the head-processed base text, so no
     // consumed directive line reaches the parser.
-    var merged: toml.Value = try toml.parse(arena, hd.text, .{});
+    var merged: toml.Value = try toml.parse(arena, hd.body, .{});
     for (layers[1..]) |path| {
         const next = try parseFile(arena, io, path);
         merged = try toml_merge.mergeTables(arena, merged, next);
@@ -215,21 +220,21 @@ fn composeJson(
     const hd = try readBaseHead(arena, io, file, layers[0], "//", bindings);
     if (hd.absent) return null;
 
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "//", diag);
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "//", diag);
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirectiveJson(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirectiveJson(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
     }
 
     // A blank seed (a directive-only base: nothing remains after the head
     // pass) is not a parseable JSON document; the overlays supply all
     // content, so the first one seeds the merge. TOML's empty-table parse
     // gives the same semantics for free.
-    const blank = std.mem.trim(u8, hd.text, " \t\r\n").len == 0;
+    const blank = std.mem.trim(u8, hd.body, " \t\r\n").len == 0;
     var merged: json.Value = if (blank)
         try parseJsonFile(arena, io, layers[1])
     else
-        try json.parse(arena, hd.text, .{ .dialect = .jsonc });
+        try json.parse(arena, hd.body, .{ .dialect = .jsonc });
     for (layers[if (blank) 2 else 1..]) |path| {
         const next = try parseJsonFile(arena, io, path);
         merged = try json_merge.deepMerge(arena, merged, next);
@@ -263,19 +268,19 @@ fn composeYaml(
     const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
     if (hd.absent) return null;
 
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "#", diag);
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "#", diag);
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
     }
 
     // Same blank-seed rule as JSON: a directive-only base leaves no
     // parseable document, so the first overlay seeds the merge.
-    const blank = std.mem.trim(u8, hd.text, " \t\r\n").len == 0;
+    const blank = std.mem.trim(u8, hd.body, " \t\r\n").len == 0;
     var merged: yaml.Value = if (blank)
         try parseYamlFile(arena, io, layers[1])
     else
-        try yaml.parse(arena, hd.text, .{});
+        try yaml.parse(arena, hd.body, .{});
     for (layers[if (blank) 2 else 1..]) |path| {
         const next = try parseYamlFile(arena, io, path);
         merged = try yaml_merge.deepMerge(arena, merged, next);
@@ -309,15 +314,15 @@ fn composeSectionMerge(
     const hd = try readBaseHead(arena, io, file, layers[0], "#", bindings);
     if (hd.absent) return null;
 
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.text, "#", diag);
+    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, "#", diag);
     if (layers.len == 1) {
-        if (!hd.gate_on and containsMoxDirective(hd.text)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
-        return interpolate(arena, io, file, false, hd.text, machine_state_opt, secrets, prov, diag);
+        if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, !hd.partial);
+        return interpolate(arena, io, file, false, hd.body, machine_state_opt, secrets, prov, diag);
     }
 
     // Raw-line merge preserves comments, so the head-processed seed matters
     // here (the parse-then-emit formats would drop directive comments anyway).
-    var merged: []u8 = @constCast(hd.text);
+    var merged: []u8 = @constCast(hd.body);
     for (layers[1..]) |path| {
         const overlay = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
         merged = try ini_merge.merge(arena, merged, overlay, dialect);

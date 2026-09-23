@@ -407,3 +407,58 @@ test "impact: an absent tool= literal stays false -- the sibling is not affected
     // changes nothing observable.
     try testing.expect(!containsLabel(got.affected, "os=linux"));
 }
+
+test "impact: an axis compared only by a nested gate adds its sibling configuration and is impacted alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `profile` is compared nowhere but inside the `os=darwin` gate, so the
+    // enumerated space covers it only if the scan reaches nested directives.
+    const nested_src = "common\n" ++
+        "# mox: when os=darwin\n" ++
+        "mac line\n" ++
+        "# mox: when profile=work\n" ++
+        "work line\n" ++
+        "# mox: end\n" ++
+        "# mox: end\n";
+    try writeFile(io, tmp.dir, "src/.zshrc", nested_src);
+
+    const src_dir = try srcPathAlloc(a, &tmp);
+    const tree = try source.tree.walk(a, io, src_dir, "/home/me");
+    const file = tree.files[0];
+
+    var this = std.StringHashMap([]const u8).init(a);
+    try this.put("os", "darwin");
+    try this.put("profile", "personal");
+    const ax = try source.axes.ofFile(a, io, file);
+    try testing.expect(ax.comparesValueOf("profile"));
+
+    const configs = try config_space.enumerate(a, &this, ax, &.{}, &.{});
+    try testing.expectEqual(@as(usize, 2), configs.len);
+    try testing.expect(hasLabel(configs, "profile=work"));
+
+    var env_map = std.process.Environ.Map.init(a);
+    try env_map.put("HOME", "/home/me");
+    const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
+
+    const before = try snapshot(a, io, file, configs, &m_state, null);
+    try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
+        "# mox: when os=darwin\n" ++
+        "mac line\n" ++
+        "# mox: when profile=work\n" ++
+        "work line EDITED\n" ++
+        "# mox: end\n" ++
+        "# mox: end\n");
+    const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
+    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null);
+
+    const got = try impact(a, configs, before, after);
+    // The edit is invisible to this machine and reaches exactly the sibling
+    // the nested gate opens for.
+    try testing.expect(!got.this_machine_changes);
+    try testing.expect(containsLabel(got.affected, "profile=work"));
+}

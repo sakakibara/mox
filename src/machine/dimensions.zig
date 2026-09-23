@@ -1,15 +1,17 @@
 //! Config-space discovery: a dedicated pre-interview pass that scans a repo's
-//! `src/` tree and `scripts/pre|post` trees for every custom fact ("dimension")
-//! the repo's sources actually consume, instead of a hand-maintained schema
-//! file. Pure function of (repo_dir, io, alloc): no state is written. Wired
-//! into `apply` (before the interview) and `mox facts`.
+//! `src/` tree, `scripts/pre|post` trees, and the TOML data sources their
+//! `for` loops read, for every custom fact ("dimension") the repo's sources
+//! actually consume, instead of a hand-maintained schema file. Pure function
+//! of (repo_dir, io, alloc): no state is written. Wired into `apply` (before
+//! the interview) and `mox facts`.
 //!
 //! A dimension is discovered through three channels, at any nesting depth a
 //! directive's body reaches (a `# mox: when` nested inside a `when`/`for`/
 //! `append`/... body is honored by compose's own recursive emit, so this scan
 //! follows it there too):
 //!   - value-compared: `name=value` in a gate, region, whole-file gate, overlay
-//!     filename tuple, generator gate, or script `# mox: when` head, with the
+//!     filename tuple, scripts gate-directory tuple, generator gate, or script
+//!     `# mox: when` head, with the
 //!     observed literal value set (a `name = <var>.field` row predicate is
 //!     value-compared with an EMPTY observed set; `bound <var>.field` names no
 //!     axis and contributes nothing; a bare, undotted `present`/`has`/`eq`
@@ -19,9 +21,14 @@
 //!   - captured: `<machine.NAME>` occurrences anywhere compose would actually
 //!     emit them -- a managed file's base content (recursing into every
 //!     nested `# mox: when`/`for` region), a directive's literal body, a
-//!     generator `for`'s `into` path template, and the fragment file an
+//!     generator `for`'s `into` path template, the fragment file an
 //!     `include`/`append`/`prepend`/`replace`/`from` target or a Cat B
-//!     region names -- each with its `| default`.
+//!     region names, a Cat A `.d/` overlay's own content (Cat B never reads
+//!     `file.overlays` and Cat C copies the winning layer out verbatim, so
+//!     an overlay of either is text compose never expands), and the row
+//!     values of the TOML data source a `for` reads (compose splices a row
+//!     value into the loop body and expands the captures it carries) -- each
+//!     with its `| default`.
 //!   - presence-only: a bare `when NAME` gate.
 //!
 //! Every occurrence of every role -- value-compared, presence, or captured
@@ -30,11 +37,17 @@
 //! emission, AND its conjunction-sibling predicates within the same `and`
 //! (its own atom excluded; a sibling under an `or` contributes nothing, an
 //! atom there can be demanded alone). A negated-gate body contributes
-//! `not <gate>`; a from-fallback body, a for-loop's per-row emission, and a
-//! tuple-matched fragment pick are not cleanly expressible and contribute
-//! nothing -- over-asking is safe, under-asking is not. A dimension's
-//! `asking_condition` is the OR of every occurrence's condition, null the
-//! moment any single occurrence is itself unconditioned.
+//! `not <gate>`; an overlay's content contributes its filename tuple, each
+//! candidate reading of it, which is the test `compose.catA.
+//! collectMatchingLayers` itself makes before folding that layer in; a
+//! script's `# mox: when` head, its declared `# mox: needs`, and -- when it
+//! declares none -- each scanned `MOX_FACT_*` token naming a known dimension
+//! contribute the tuple of the gate directory holding it, which is what
+//! `apply.run_scripts` requires before running it at all. A
+//! from-fallback body, a for-loop's per-row emission, and a Cat B region's
+//! fragment pick contribute nothing -- over-asking is safe, under-asking is
+//! not. A dimension's `asking_condition` is the OR of every occurrence's
+//! condition, null the moment any single occurrence is itself unconditioned.
 //!
 //! Built-ins, the open probe axes, reserved axis names, and `data/facts.toml`-
 //! derived names are excluded by category, never by a hand-written name list.
@@ -62,6 +75,9 @@
 //! reporting an empty config space as if the tree had parsed cleanly.
 
 const std = @import("std");
+const capture = @import("../compose/capture.zig");
+const compose = @import("../compose/root.zig");
+const data = @import("../data/root.zig");
 const dsl = @import("../dsl/root.zig");
 const source = @import("../source/root.zig");
 const state = @import("state.zig");
@@ -83,10 +99,11 @@ pub const Roles = struct {
 };
 
 pub const Provenance = struct {
-    /// Number of distinct source files (`src/` tree files and scripts) that
-    /// reference this dimension via a value-compared, presence, or capture
-    /// occurrence. A script's `# mox: needs`/`MOX_FACT_*` consumption is
-    /// tracked separately in `needing_scripts`, not counted here.
+    /// Number of distinct source files (`src/` tree files, the data sources
+    /// their loops read, and scripts) that reference this dimension via a
+    /// value-compared, presence, or capture occurrence. A script's
+    /// `# mox: needs`/`MOX_FACT_*` consumption is tracked separately in
+    /// `needing_scripts`, not counted here.
     source_count: usize,
     /// Repo-relative paths of scripts that consume this dimension: via
     /// `# mox: needs` when present, else via a `MOX_FACT_<NAME>` token found
@@ -114,7 +131,8 @@ pub const Dimension = struct {
     /// via a `name = <var>.field` row predicate, or only ever captured.
     observed_values: []const []const u8,
     /// Every distinct `| default "..."` value observed on a capture of this
-    /// name, sorted and deduped.
+    /// name alone, sorted and deduped. A fallback chain's default contributes
+    /// nothing: it rescues the exhausted chain, not the machine member.
     capture_defaults: []const []const u8,
     /// The declared interview default from `# mox: default NAME="VALUE"`,
     /// when the repo's `default` directives for this name agree: a
@@ -140,8 +158,14 @@ pub const ScriptRecord = struct {
     /// Raw expression text of a `# mox: when <expr>` head line, or null.
     when_head: ?[]const u8,
     /// Literal `MOX_FACT_[A-Z0-9_]+` tokens found anywhere in the script's
-    /// text, sorted and deduped.
+    /// text, sorted and deduped. When no `# mox: needs` head replaces them
+    /// these are the script's effective demands, so each one that names a
+    /// known dimension widens that dimension's asking condition by `gate`.
     scanned_tokens: []const []const u8,
+    /// The gate-directory tuple this script sits under (null at a stage's
+    /// top level): the condition `apply.run_scripts` requires before running
+    /// it at all, and so the condition every demand it makes is asked under.
+    gate: ?*const AxisExpr = null,
     /// Parsed `# mox: needs <name>...` head line: null when the script has no
     /// such directive (or its directive failed to parse, see
     /// `needs_unparseable`); an empty (non-null) slice when it declares no
@@ -160,8 +184,9 @@ pub const ScriptRecord = struct {
 /// fail the whole discovery run: a malformed name is ignored at its own
 /// site, and scanning continues everywhere else.
 pub const Diagnostic = union(enum) {
-    /// A `<machine.NAME>` capture whose NAME failed the fact-name charset
-    /// (`[a-z][a-z0-9_]*`): recorded nowhere as a dimension.
+    /// A `machine.NAME` capture reference -- alone or as one fallback-chain
+    /// member -- whose NAME failed the fact-name charset (`[a-z][a-z0-9_]*`):
+    /// recorded nowhere as a dimension.
     capture_name: struct {
         path: []const u8,
         name: []const u8,
@@ -384,22 +409,23 @@ const Discoverer = struct {
         return gop.value_ptr;
     }
 
-    /// A `# mox: needs NAME` reference that names no dimension any other
-    /// channel already made real registers `NAME` as a scripts-only
-    /// dimension -- free-form (no role) and unconditioned (an unconditioned
-    /// occurrence, same treatment as a top-level unguarded capture), so the
-    /// interview asks it like any other. An excluded name (built-in, open
-    /// axis, reserved, `data/facts.toml`-derived) registers nothing, same as
-    /// `dimFor` everywhere else -- it already has its own resolution path,
-    /// not an interview question. A name that is ALREADY a real dimension via
-    /// some other channel is left untouched: `needingScripts` links this
-    /// script to it by name alone at `finalize` time, and pushing another
-    /// occurrence here would wrongly widen an existing conditioned
-    /// dimension's asking condition to unconditioned.
-    fn registerNeedsName(self: *Discoverer, name: []const u8) !void {
-        if (self.dims.contains(name)) return;
+    /// A `# mox: needs NAME` reference is an occurrence of `NAME` like any
+    /// other: it registers the dimension when nothing else in the repo made
+    /// it real -- free-form, no role -- and either way records its own
+    /// asking condition, `condition` (the script's gate directory, or null
+    /// at a stage's top level), which ORs with every other occurrence's.
+    /// A name the source tree already conditioned is widened, not left
+    /// alone: the script consumes the fact wherever the runner runs it, so
+    /// an ungated script needing a name `src/` only uses behind a gate makes
+    /// it unconditioned -- under-asking it would leave the script demanding,
+    /// on every machine whose gate is closed, a fact no interview ever
+    /// offers to bind. An excluded name
+    /// (built-in, open axis, reserved, `data/facts.toml`-derived) registers
+    /// nothing, same as `dimFor` everywhere else -- it already has its own
+    /// resolution path, not an interview question.
+    fn registerNeedsName(self: *Discoverer, name: []const u8, condition: ?*const AxisExpr) !void {
         const dw = (try self.dimFor(name)) orelse return;
-        try dw.occurrence_conditions.append(self.arena, null);
+        try dw.occurrence_conditions.append(self.arena, condition);
     }
 
     fn isExcluded(self: *Discoverer, name: []const u8) bool {
@@ -614,11 +640,25 @@ const Discoverer = struct {
     /// occurrences: a `.d/os=linux` variant's existence demands `os`
     /// regardless of any gate (there is no enclosing `nest` at this scan
     /// site to inherit a condition from).
-    fn recordTuple(self: *Discoverer, tuple: source.tree.AxisTuple, source_key: []const u8) !void {
-        for (tuple.pairs) |p| {
+    /// Record each pair of an overlay's, fragment's, or scripts-gate
+    /// directory's filename tuple as a value comparison. A filename whose
+    /// extension heuristic stripped a suffix carries a second, verbatim
+    /// reading in `exact`; compose matches under either, so BOTH values are
+    /// observed -- otherwise the interview offers a value that selects
+    /// nothing and warns about the one that does.
+    fn recordTuple(
+        self: *Discoverer,
+        tuple: source.tree.AxisTuple,
+        exact: ?source.tree.AxisTuple,
+        source_key: []const u8,
+    ) !void {
+        for (tuple.pairs, 0..) |p, i| {
             if (try self.dimFor(p.name)) |dw| {
                 dw.roles.value_compared = true;
                 try dw.observed_values.put(try self.arena.dupe(u8, p.value), {});
+                if (source.tuple.exactValueAt(exact, i)) |v| {
+                    try dw.observed_values.put(try self.arena.dupe(u8, v), {});
+                }
                 try dw.sources.put(source_key, {});
                 try dw.occurrence_conditions.append(self.arena, null);
             }
@@ -664,8 +704,8 @@ const Discoverer = struct {
     const ScanError = std.mem.Allocator.Error;
 
     /// Parse `content` as one directive-tree scope (a whole file, or a nested
-    /// region body) and scan its own content lines for `<machine.NAME>`
-    /// captures at `nest.gate_stack`'s condition. Each directive is then
+    /// region body) and scan its own content lines for `machine.` capture
+    /// references at `nest.gate_stack`'s condition. Each directive is then
     /// dispatched to `recurseDirective`, which visits whichever nested bodies
     /// and fragment files compose would actually emit, with the condition
     /// each position warrants.
@@ -685,7 +725,7 @@ const Discoverer = struct {
         while (lines.next()) |line| {
             line_no += 1;
             if (lineCovered(parsed.directives, line_no)) continue;
-            try self.scanCapturesInLine(line, condition, source_key);
+            try self.scanCaptures(line, condition, source_key);
         }
 
         for (parsed.directives) |d| try self.recurseDirective(d, source_key, nest);
@@ -766,6 +806,9 @@ const Discoverer = struct {
                 // A generator's `into` template is expanded per row exactly
                 // like its body, so a capture there is as real as one in it.
                 if (loop.into) |into| try self.scanFlatText(into, stack, source_key);
+                if (!isEnclosingFieldRef(loop.data_source, nest.loop_vars)) {
+                    try self.scanLoopDataSource(nest.file, loop.data_source, stack);
+                }
                 const loop_vars = try appendStr(self.arena, nest.loop_vars, loop.variable);
                 const inner: Nest = .{
                     .file = nest.file,
@@ -783,11 +826,11 @@ const Discoverer = struct {
 
     /// Scan flat text -- a directive's own literal body, or a fragment file's
     /// content, neither of which compose ever re-parses for directives -- for
-    /// `<machine.NAME>` captures at `stack`'s condition.
+    /// `machine.` capture references at `stack`'s condition.
     fn scanFlatText(self: *Discoverer, text: []const u8, stack: []const *const AxisExpr, source_key: []const u8) !void {
         const condition = try combineAnd(self.arena, stack);
         var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |line| try self.scanCapturesInLine(line, condition, source_key);
+        while (lines.next()) |line| try self.scanCaptures(line, condition, source_key);
     }
 
     /// Read and scan an `include`/`append`/`prepend`/`replace`'s fragment
@@ -808,46 +851,207 @@ const Discoverer = struct {
         try self.scanFlatText(content, stack, source_key);
     }
 
-    fn scanCapturesInLine(self: *Discoverer, line: []const u8, condition: ?*const AxisExpr, source_key: []const u8) !void {
+    /// Read the TOML data source a `for` names and scan the row values that
+    /// loop will interpolate, at `stack`'s condition -- the same condition the
+    /// loop's own body and `into` template already carry, since a row value is
+    /// spliced INTO that body and expanded there (`compose.interp`'s one-level
+    /// nested expansion). Only a string field and a string array's elements
+    /// can carry a capture: an int or bool has no text, a nested table is
+    /// dropped by the same projection compose loads rows through, and a key is
+    /// looked up rather than emitted.
+    ///
+    /// The file is READ ONLY, through that same projection, so nothing another
+    /// reader of the file sees changes. Any failure to resolve, read, or parse
+    /// it is skipped silently: a broken data source is apply's problem to
+    /// report with the offending path, exactly as an unreadable fragment
+    /// already is here.
+    fn scanLoopDataSource(
+        self: *Discoverer,
+        file: source.tree.ManagedFile,
+        data_source: []const u8,
+        stack: []const *const AxisExpr,
+    ) !void {
+        const abs = (file.dataSourcePath(self.arena, self.io, data_source) catch return) orelse return;
+        const content = Io.Dir.cwd().readFileAlloc(self.io, abs, self.arena, .limited(max_file_bytes)) catch return;
+        const rows = (data.toml.parse(self.arena, content) catch return)
+            .get(data.source.arrayName(data_source)) orelse return;
+
+        // The data file is its own source: a capture is written there, not in
+        // the file whose loop reads it, and that is where `mox facts --report`
+        // must send a reader looking for it.
+        const source_key = try self.dataSourceKey(file, data_source);
+        const condition = try combineAnd(self.arena, stack);
+        for (rows) |row| {
+            var it = row.valueIterator();
+            while (it.next()) |v| switch (v.*) {
+                .string => |s| try self.scanCaptures(s, condition, source_key),
+                .array_of_strings => |arr| for (arr) |elem| {
+                    try self.scanCaptures(elem, condition, source_key);
+                },
+                .int, .bool => {},
+            };
+        }
+    }
+
+    /// True when a `for`'s source names an enclosing loop variable's field
+    /// (`for url in id.match_urls`) rather than a file, the same test
+    /// `compose.catB.loopFieldRef` makes before it falls back to a path. Such
+    /// a loop reads no file of its own: its elements are the enclosing row's
+    /// array field, already scanned with that row.
+    fn isEnclosingFieldRef(data_source: []const u8, loop_vars: []const []const u8) bool {
+        if (std.mem.indexOfScalar(u8, data_source, '/') != null) return false;
+        const dot = std.mem.indexOfScalar(u8, data_source, '.') orelse return false;
+        for (loop_vars) |v| {
+            if (std.mem.eql(u8, v, data_source[0..dot])) return true;
+        }
+        return false;
+    }
+
+    /// The repo-relative key naming a loop's data source, matching the form
+    /// `dataSourcePath` resolved it from: a `/`-bearing source is already one,
+    /// a bare name sits in the reading file's own `<base>.d/`.
+    fn dataSourceKey(
+        self: *Discoverer,
+        file: source.tree.ManagedFile,
+        data_source: []const u8,
+    ) ![]const u8 {
+        if (std.mem.indexOfScalar(u8, data_source, '/') != null) return data_source;
+        return std.fmt.allocPrint(self.arena, "{s}.d/{s}", .{ file.source_base_path, data_source });
+    }
+
+    /// Record every `machine.NAME` reference `text` carries, at `condition`.
+    /// `text` is one interpolation unit -- a source line, or a whole data-row
+    /// value, each of which `compose.interp` expands as a unit. The walk
+    /// mirrors that interpolator's own, over the same shared capture grammar:
+    /// a `machine.` reference counts wherever a chain member may stand, since
+    /// `resolveChain` evaluates EVERY member and lets the first non-empty one
+    /// win -- which one that is depends on values discovery cannot know, so
+    /// all of them are asked.
+    fn scanCaptures(self: *Discoverer, text: []const u8, condition: ?*const AxisExpr, source_key: []const u8) !void {
+        // Every reference this can record spells `machine.` literally, so a
+        // text without it holds none, and is not worth walking capture by
+        // capture.
+        if (std.mem.indexOf(u8, text, "machine.") == null) return;
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, line, i, "<machine.")) |open| {
-            const close = captureClose(line, open) orelse {
+        while (std.mem.indexOfScalarPos(u8, text, i, '<')) |open| {
+            const close = capture.closeIndex(text, open) orelse {
                 i = open + 1;
                 continue;
             };
-            const inner = line[open + 1 .. close];
-            i = close + 1;
-
-            const split = splitDefault(inner);
-            const field = split.field["machine.".len..];
-            if (field.len == 0) continue;
-            // Open axis: excluded by category, not by name list, but skipped
-            // here up front since `tool_path.<name>` is not itself a single
-            // dimension name `dimFor` would even parse sensibly.
-            if (std.mem.startsWith(u8, field, "tool_path.")) continue;
-
-            if (!source.tuple.isValidAxisName(field)) {
-                try self.diagnostics.append(self.arena, .{ .capture_name = .{
-                    .path = source_key,
-                    .name = try self.arena.dupe(u8, field),
-                } });
+            const inner = text[open + 1 .. close];
+            // A `<secret:URI>` body is verbatim payload to the resolver, never
+            // a chain and never interpolated further.
+            if (std.mem.startsWith(u8, inner, "secret:")) {
+                i = close + 1;
                 continue;
             }
 
-            const dw = (try self.dimFor(field)) orelse continue;
-            dw.roles.captured = true;
-            try dw.sources.put(source_key, {});
-            try dw.occurrence_conditions.append(self.arena, condition);
-            if (split.default) |def| try dw.capture_defaults.put(try self.arena.dupe(u8, def), {});
+            const split = capture.splitDefault(inner);
+            const chain = capture.isChain(split.field);
+            var members = capture.members(split.field);
+            while (members.next()) |member| {
+                if (!std.mem.startsWith(u8, member, "machine.")) continue;
+                // A chain's `| default` rescues the EXHAUSTED chain, not any
+                // one member, so it is no member's own interview default.
+                try self.recordCaptureMember(
+                    member["machine.".len..],
+                    if (chain) null else split.default,
+                    condition,
+                    source_key,
+                );
+            }
+
+            // `compose.interp` consumes a capture whose body names a namespace
+            // or holds a chain, and otherwise advances a single byte (a bare
+            // name is a scope/record reference, or plain text). Advancing the
+            // same way keeps a `<machine.X>` written behind a stray `<` as
+            // discoverable as it is interpolable.
+            i = if (chain or capture.hasNamespace(split.field)) close + 1 else open + 1;
         }
+    }
+
+    /// Fold one `machine.NAME` reference into its dimension: a name outside
+    /// the fact-name charset becomes a diagnostic instead, and one excluded by
+    /// category is dropped.
+    fn recordCaptureMember(
+        self: *Discoverer,
+        field: []const u8,
+        default_opt: ?[]const u8,
+        condition: ?*const AxisExpr,
+        source_key: []const u8,
+    ) !void {
+        if (field.len == 0) return;
+        // Open axis: excluded by category, not by name list, but skipped
+        // here up front since `tool_path.<name>` is not itself a single
+        // dimension name `dimFor` would even parse sensibly.
+        if (std.mem.startsWith(u8, field, "tool_path.")) return;
+
+        if (!source.tuple.isValidAxisName(field)) {
+            try self.diagnostics.append(self.arena, .{ .capture_name = .{
+                .path = source_key,
+                .name = try self.arena.dupe(u8, field),
+            } });
+            return;
+        }
+
+        const dw = (try self.dimFor(field)) orelse return;
+        dw.roles.captured = true;
+        try dw.sources.put(source_key, {});
+        try dw.occurrence_conditions.append(self.arena, condition);
+        if (default_opt) |def| try dw.capture_defaults.put(try self.arena.dupe(u8, def), {});
     }
 
     // -- per-file dispatch ------------------------------------------------
 
+    /// Scan each axis-named `.d/` overlay's own content for captures, at the
+    /// condition its filename already imposes. Only a Cat A file reaches the
+    /// interpolator with an overlay's bytes in hand: Cat B never consults
+    /// `file.overlays` at all, and Cat C copies the winning layer out
+    /// verbatim, so a `<machine.NAME>` in either is text compose never
+    /// expands and must not become a fact the interview asks for.
+    ///
+    /// Compose reads an overlay as flat text -- no head strip (`compose.catA.
+    /// readBaseHead` returns an overlay seed verbatim) and no directive parse
+    /// (`compose.catA.refuseRegionInLayers` refuses a content directive in any
+    /// layer of an overlay-bearing file, matching or not) -- so this reads it
+    /// the same way.
+    fn scanOverlayContent(self: *Discoverer, file: source.tree.ManagedFile, source_key: []const u8) !void {
+        if (file.overlays.len == 0) return;
+        // An unreadable sample is compose's to report; there is nothing to
+        // discover behind it.
+        const cat = (compose.categoryOf(self.arena, self.io, file) catch return) orelse return;
+        if (cat != .a) return;
+        for (file.overlays) |ov| {
+            const content = Io.Dir.cwd().readFileAlloc(self.io, ov.path, self.arena, .limited(max_file_bytes)) catch continue;
+            // `compose.match.effectiveOverlayTuple` takes the verbatim-filename
+            // reading when it holds and the extension-stripped one otherwise,
+            // so the layer merges under either: one occurrence each, which the
+            // dimension's asking condition ORs.
+            try self.scanFlatText(content, try self.tupleStack(ov.tuple), source_key);
+            if (ov.exact_tuple) |exact| {
+                try self.scanFlatText(content, try self.tupleStack(exact), source_key);
+            }
+        }
+    }
+
+    /// `tuple` as a gate stack: one `axis=value` atom per pair, which
+    /// `combineAnd` conjoins into exactly the test `compose.catA.
+    /// collectMatchingLayers` makes before folding that layer in.
+    fn tupleStack(self: *Discoverer, tuple: source.tree.AxisTuple) ![]const *const AxisExpr {
+        const out = try self.arena.alloc(*const AxisExpr, tuple.pairs.len);
+        for (tuple.pairs, out) |pair, *slot| {
+            const node = try self.arena.create(AxisExpr);
+            node.* = .{ .eq = .{ .axis = pair.name, .value = pair.value } };
+            slot.* = node;
+        }
+        return out;
+    }
+
     fn scanManagedFile(self: *Discoverer, file: source.tree.ManagedFile) !void {
         const source_key = file.source_base_path;
 
-        for (file.overlays) |ov| try self.recordTuple(ov.tuple, source_key);
+        for (file.overlays) |ov| try self.recordTuple(ov.tuple, ov.exact_tuple, source_key);
+        try self.scanOverlayContent(file, source_key);
         for (file.regions) |rg| {
             // A Cat B region's mere existence means its name is compared
             // against whatever fragment stems it has, even should that ever
@@ -858,7 +1062,7 @@ const Discoverer = struct {
                 try dw.occurrence_conditions.append(self.arena, null);
             }
             for (rg.fragments) |fr| {
-                try self.recordTuple(fr.tuple, source_key);
+                try self.recordTuple(fr.tuple, fr.exact_tuple, source_key);
                 // A fragment's own captures are scanned unconditionally: which
                 // fragment compose picks is a tuple match, not a single axis
                 // equality, so the conservative-ask law has it contribute no
@@ -913,9 +1117,9 @@ const Discoverer = struct {
             if (source.junk.isJunk(e.name)) continue;
             switch (e.kind) {
                 .directory => {
-                    if (isAxisTupleDirName(self.arena, e.name)) try self.scanGatedScriptsDir(abs, rel);
+                    if (axisTupleDirName(self.arena, e.name)) |tuple| try self.scanGatedScriptsDir(abs, rel, tuple);
                 },
-                .file => try self.scanScriptFile(abs, rel),
+                .file => try self.scanScriptFile(abs, rel, null),
                 else => {},
             }
         }
@@ -923,8 +1127,20 @@ const Discoverer = struct {
 
     /// The non-recursive second level `scanScriptsTree` descends into: every
     /// regular file directly inside a matching axis-tuple directory, no
-    /// further subdirectories.
-    fn scanGatedScriptsDir(self: *Discoverer, abs_dir: []const u8, rel_prefix: []const u8) !void {
+    /// further subdirectories. `tuple` is that directory's gate, which
+    /// `apply.run_scripts` requires before it runs anything inside -- so it
+    /// is recorded as a value comparison in its own right (unconditioned,
+    /// like any overlay filename's: the fact that opens the gate must be
+    /// asked before anything behind it) and conditions every contribution the
+    /// scripts inside make.
+    fn scanGatedScriptsDir(
+        self: *Discoverer,
+        abs_dir: []const u8,
+        rel_prefix: []const u8,
+        tuple: source.tree.AxisTuple,
+    ) !void {
+        try self.recordTuple(tuple, null, rel_prefix);
+        const gate = try combineAnd(self.arena, try self.tupleStack(tuple));
         // A gate directory that cannot be read is apply's to report, as a
         // failed script; there is nothing to discover in it.
         const entries = source.dirent.sortedPath(self.arena, self.io, abs_dir, .{ .iterate = true }) catch |e| switch (e) {
@@ -935,17 +1151,22 @@ const Discoverer = struct {
             if (e.kind != .file or source.junk.isJunk(e.name)) continue;
             const abs = try std.fs.path.join(self.arena, &.{ abs_dir, e.name });
             const rel = try source.path.joinKey(self.arena, &.{ rel_prefix, e.name });
-            try self.scanScriptFile(abs, rel);
+            try self.scanScriptFile(abs, rel, gate);
         }
     }
 
-    fn scanScriptFile(self: *Discoverer, abs_path: []const u8, rel_path: []const u8) !void {
+    /// `gate` is the enclosing gate-directory tuple's condition (null at the
+    /// stage's top level), which every contribution this script makes is
+    /// conditioned on: `apply.run_scripts` runs it only where that tuple
+    /// matches, and a `# mox: when` head of its own narrows it further rather
+    /// than replacing it.
+    fn scanScriptFile(self: *Discoverer, abs_path: []const u8, rel_path: []const u8, gate: ?*const AxisExpr) !void {
         const content = Io.Dir.cwd().readFileAlloc(self.io, abs_path, self.arena, .limited(max_script_bytes)) catch return;
 
         const head = scanScriptHead(content);
         if (head.when) |expr_src| {
             if (dsl.axis.parseString(self.arena, expr_src)) |expr| {
-                try self.recordAxisExpr(expr, rel_path, null);
+                try self.recordAxisExpr(expr, rel_path, gate);
             } else |_| {
                 // A malformed head expression is the apply-time run's problem
                 // to report; discovery keeps the raw text and contributes no
@@ -966,7 +1187,7 @@ const Discoverer = struct {
                 needs_unparseable = true;
             } else {
                 needs = parsed.names;
-                for (parsed.names) |n| try self.registerNeedsName(n);
+                for (parsed.names) |n| try self.registerNeedsName(n, gate);
             }
         }
 
@@ -976,6 +1197,7 @@ const Discoverer = struct {
             .scanned_tokens = try scanMoxFactTokens(self.arena, content),
             .needs = needs,
             .needs_unparseable = needs_unparseable,
+            .gate = gate,
         });
     }
 
@@ -991,6 +1213,7 @@ const Discoverer = struct {
         var name_it = self.dims.keyIterator();
         while (name_it.next()) |k| try all_names.append(self.arena, k.*);
         const projected = try source.fact_env.project(self.arena, try all_names.toOwnedSlice(self.arena));
+        try self.widenByScannedTokens(projected);
 
         const resolved_defaults = try self.resolveDeclaredDefaults();
 
@@ -1091,45 +1314,81 @@ const Discoverer = struct {
     }
 
     /// Every script that effectively consumes `dim_name`: via `# mox: needs`
-    /// when the script declares one (direct name match, unaffected by
-    /// `projected`), else via a `MOX_FACT_<NAME>` token found in its text --
-    /// but only when `dim_name` itself projects onto a distinct token in
-    /// `projected`. A name `buildScriptEnv` would skip (non-ASCII, or
-    /// colliding with another dimension's projection) never actually reaches a
-    /// script's environment, so a scanned-token match on it would link a
-    /// script to a fact that is never really there. Sorted, deduped by
-    /// construction (one entry per script).
+    /// when the script declares one, else via a `MOX_FACT_<NAME>` token found
+    /// in its text. Sorted, deduped by construction (one entry per script).
     fn needingScripts(self: *Discoverer, dim_name: []const u8, projected: std.StringHashMap([]const u8)) ![]const []const u8 {
         const token = projected.get(dim_name);
         var out: std.ArrayList([]const u8) = .empty;
         for (self.scripts.items) |s| {
-            const consumes = if (s.needs) |names| blk: {
-                for (names) |n| {
-                    if (std.mem.eql(u8, n, dim_name)) break :blk true;
-                }
-                break :blk false;
-            } else blk: {
-                const tok = token orelse break :blk false;
-                for (s.scanned_tokens) |t| {
-                    if (std.mem.eql(u8, t, tok)) break :blk true;
-                }
-                break :blk false;
-            };
-            if (consumes) try out.append(self.arena, s.path);
+            if (consumesByNeeds(s, dim_name) or consumesByToken(s, token)) try out.append(self.arena, s.path);
         }
         const slice = try out.toOwnedSlice(self.arena);
         std.mem.sort([]const u8, slice, {}, lessThanStr);
         return slice;
     }
+
+    /// Widen each dimension by the scripts that consume it through a scanned
+    /// `MOX_FACT_*` token rather than a `# mox: needs` head. Such a token is
+    /// a demand exactly as strong as a declared one: `apply.run_scripts.
+    /// classifyToken` blocks the run on it, so under-asking it leaves the
+    /// script demanding, wherever the runner reaches it, a fact no interview
+    /// ever offered to bind. Each match appends the script's own gate as one
+    /// more occurrence condition, the same widening `registerNeedsName` does.
+    ///
+    /// It never CREATES a dimension, unlike a declared need. A token is
+    /// matched text, not a stated contract, and `fact_env.envName` is lossy
+    /// (`MOX_FACT_A_B` names `a.b`, `a_b`, `A-B` alike), so a token matching
+    /// no known fact has no name to register and must stay fail-closed at the
+    /// runner, which blocks it there rather than inventing an interview
+    /// question for a fact that may not exist at all.
+    ///
+    /// Runs before any asking condition is computed, and after `projected`,
+    /// whose collision detection is corpus-wide and so needs every name first.
+    fn widenByScannedTokens(self: *Discoverer, projected: std.StringHashMap([]const u8)) !void {
+        var it = self.dims.iterator();
+        while (it.next()) |entry| {
+            const token = projected.get(entry.key_ptr.*);
+            for (self.scripts.items) |s| {
+                if (consumesByToken(s, token)) try entry.value_ptr.occurrence_conditions.append(self.arena, s.gate);
+            }
+        }
+    }
 };
 
-/// True when `name` parses as an axis tuple (`os=linux`, `os=linux+profile=work`),
-/// mirroring `apply.run_scripts.axisDirVerdict`'s tuple-name validation --
-/// discovery has no machine bindings to match against, so it validates shape
-/// only, the same test a script-tuple dir must pass to be gated at all.
-fn isAxisTupleDirName(arena: std.mem.Allocator, name: []const u8) bool {
-    _ = source.tuple.parseFilenameVerbatim(arena, name) catch return false;
-    return true;
+/// True when `s` declares a `# mox: needs` list naming `dim_name`. Unaffected
+/// by projection: a declared name is matched directly.
+fn consumesByNeeds(s: ScriptRecord, dim_name: []const u8) bool {
+    const names = s.needs orelse return false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, dim_name)) return true;
+    }
+    return false;
+}
+
+/// True when `s` declares no `# mox: needs` list -- so its token scan is its
+/// effective consumption set -- and `token` is among the tokens scanned from
+/// its text. `token` is the dimension's own projection, null when it has
+/// none: a name `buildScriptEnv` would skip (non-ASCII, or colliding with
+/// another dimension's projection) never actually reaches a script's
+/// environment, so a scanned-token match on it would claim a fact that is
+/// never really there.
+fn consumesByToken(s: ScriptRecord, token: ?[]const u8) bool {
+    if (s.needs != null) return false;
+    const tok = token orelse return false;
+    for (s.scanned_tokens) |t| {
+        if (std.mem.eql(u8, t, tok)) return true;
+    }
+    return false;
+}
+
+/// `name` parsed as an axis tuple (`os=linux`, `os=linux+profile=work`),
+/// mirroring `apply.run_scripts.axisDirVerdict`'s own parse -- a directory
+/// name carries no extension, so there is one reading, not two. Null when
+/// `name` is not a tuple: discovery has no machine bindings to match against,
+/// so this decides shape only, the same test a script-tuple dir must pass to
+/// be gated at all.
+fn axisTupleDirName(arena: std.mem.Allocator, name: []const u8) ?source.tree.AxisTuple {
+    return source.tuple.parseFilenameVerbatim(arena, name) catch null;
 }
 
 fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
@@ -1316,33 +1575,6 @@ fn computeAskingCondition(arena: std.mem.Allocator, dw: *const DimWork) !?*const
         try conds.append(arena, cond);
     }
     return try simplifyOr(arena, conds.items);
-}
-
-/// Index of the `>` that closes a `<machine....>` capture opened at `open`
-/// (the index of `<`). Mirrors `compose.interp`'s default-aware close scan (a
-/// `| default "...>..."` value may itself embed `>`), minus the `<secret:>`
-/// special case that never applies to a `machine.` capture.
-fn captureClose(line: []const u8, open: usize) ?usize {
-    const naive = std.mem.indexOfScalarPos(u8, line, open + 1, '>') orelse return null;
-    const marker = " | default \"";
-    const mpos = std.mem.indexOfPos(u8, line[0..naive], open + 1, marker) orelse return naive;
-    const qstart = mpos + marker.len;
-    var k = qstart;
-    while (k + 1 < line.len) : (k += 1) {
-        if (line[k] == '"' and line[k + 1] == '>') return k + 1;
-    }
-    return naive;
-}
-
-/// Split a capture body (`machine.NAME` or `machine.NAME | default "..."`)
-/// into its field reference and optional default value.
-fn splitDefault(inner: []const u8) struct { field: []const u8, default: ?[]const u8 } {
-    const marker = " | default \"";
-    const idx = std.mem.indexOf(u8, inner, marker) orelse return .{ .field = inner, .default = null };
-    const after = inner[idx + marker.len ..];
-    const close = std.mem.lastIndexOfScalar(u8, after, '"') orelse return .{ .field = inner, .default = null };
-    const field = std.mem.trimEnd(u8, inner[0..idx], " \t");
-    return .{ .field = field, .default = after[0..close] };
 }
 
 const header_scan_lines: usize = 16;
@@ -2240,7 +2472,7 @@ test "discover: a `# mox: needs` name with no other occurrence anywhere register
     try std.testing.expectEqualStrings("scripts/pre/00-steam.sh", dim.provenance.needing_scripts[0]);
 }
 
-test "discover: a `# mox: needs` name that is already a gated dimension elsewhere keeps its original condition, not flipped unconditioned" {
+test "discover: an ungated script's declared need leaves a name src/ uses only under a gate unconditioned" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2249,20 +2481,203 @@ test "discover: a `# mox: needs` name that is already a gated dimension elsewher
     const a = arena.allocator();
 
     // `onepassword_account` is captured only nested inside `when
-    // profile=work`, so its own occurrence is genuinely conditioned (unlike
-    // a bare top-level `when profile=work` gate, whose own comparison is
-    // always unconditioned by design).
+    // profile=work`, so its own src/ occurrence is genuinely conditioned
+    // (unlike a bare top-level `when profile=work` gate, whose own
+    // comparison is always unconditioned by design). The script that
+    // declares it runs on every machine, so the OR of the two occurrences
+    // is unconditioned.
     try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when profile=work\nop = <machine.onepassword_account>\n# mox: end\n");
     try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\n# mox: needs onepassword_account\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
     const d = try discover(a, io, repo);
     const dim = findDim(d, "onepassword_account").?;
-    // Still conditioned by the src/ gate: a needs reference alone must not
-    // silently widen an existing dimension's asking condition to null.
-    try std.testing.expect(dim.asking_condition != null);
+    try std.testing.expect(dim.asking_condition == null);
     try std.testing.expectEqual(@as(usize, 1), dim.provenance.needing_scripts.len);
     try std.testing.expectEqualStrings("scripts/pre/00-op.sh", dim.provenance.needing_scripts[0]);
+    // The needs head is an occurrence, not a source: it links provenance
+    // through `needing_scripts` and leaves the source count to src/ alone.
+    try std.testing.expectEqual(@as(usize, 1), dim.provenance.source_count);
+}
+
+test "discover: a gated script's declared need ORs its gate directory's tuple with the src/ gate on the same name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when profile=work\nvpn = <machine.vpn_host>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "scripts/pre/os=linux/00-vpn.sh", "#!/bin/sh\n# mox: needs vpn_host\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const cond = findDim(d, "vpn_host").?.asking_condition.?;
+
+    var b = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("profile", "personal");
+    try b.put("os", "darwin");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+    try b.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+    try b.put("profile", "personal");
+    try b.put("os", "linux");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: an ungated script's scanned token leaves a name src/ uses only under a gate unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No `# mox: needs` head anywhere: the token alone is the script's
+    // contract, and `apply.run_scripts` blocks the run on it, so the fact
+    // must be asked wherever that ungated script runs -- everywhere.
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when profile=work\nop = <machine.op_account>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\necho \"$MOX_FACT_OP_ACCOUNT\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "op_account").?;
+    try std.testing.expect(dim.asking_condition == null);
+    try std.testing.expectEqual(@as(usize, 1), dim.provenance.needing_scripts.len);
+    try std.testing.expectEqualStrings("scripts/pre/00-op.sh", dim.provenance.needing_scripts[0]);
+    try std.testing.expectEqual(@as(usize, 1), dim.provenance.source_count);
+}
+
+test "discover: a gated script's scanned token ORs its gate directory's tuple with the src/ gate on the same name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when profile=work\nvpn = <machine.vpn_host>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "scripts/pre/os=linux/00-vpn.sh", "#!/bin/sh\necho \"$MOX_FACT_VPN_HOST\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const cond = findDim(d, "vpn_host").?.asking_condition.?;
+
+    var b = std.StringHashMap([]const u8).init(a);
+    var r: dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("profile", "personal");
+    try b.put("os", "darwin");
+    try std.testing.expect(!dsl.axis.evaluate(cond, &r));
+    try b.put("profile", "work");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+    try b.put("profile", "personal");
+    try b.put("os", "linux");
+    try std.testing.expect(dsl.axis.evaluate(cond, &r));
+}
+
+test "discover: a scanned token matching no known fact registers no dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "scripts/pre/00-steam.sh", "#!/bin/sh\necho \"$MOX_FACT_STEAM_LIBRARY\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 0), d.dimensions.len);
+}
+
+test "discover: a `# mox: needs` head keeps the tokens it replaces from widening any other name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `profile` is compared only inside a `when locale=ja` body, so its own
+    // src/ occurrence is conditioned; the script carries MOX_FACT_PROFILE in
+    // its text but declares a different name, so the token must contribute
+    // nothing and `profile` must keep the narrow condition.
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when locale=ja\n# mox: when profile=work\nx = 1\n# mox: end\n# mox: end\n");
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/00-op.sh",
+        "#!/bin/sh\n# mox: needs op_account\necho \"$MOX_FACT_PROFILE\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqualStrings(
+        "locale=ja",
+        try writeExprToStringForTest(a, findDim(d, "profile").?.asking_condition.?),
+    );
+    try std.testing.expectEqual(@as(usize, 0), findDim(d, "profile").?.provenance.needing_scripts.len);
+}
+
+test "discover: a name whose projection collides with another's is widened by no scanned token" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "Foo-Bar" and "foo_bar" both sanitize to MOX_FACT_FOO_BAR, so neither
+    // reaches a script's environment; a token naming it must widen neither.
+    // Both comparisons are nested so each has a condition of its own to keep.
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: when locale=ja\n" ++
+            "# mox: when Foo-Bar=x\na = 1\n# mox: end\n" ++
+            "# mox: when foo_bar=y\nb = 1\n# mox: end\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "scripts/pre/00-both.sh", "#!/bin/sh\necho \"$MOX_FACT_FOO_BAR\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqualStrings(
+        "locale=ja",
+        try writeExprToStringForTest(a, findDim(d, "Foo-Bar").?.asking_condition.?),
+    );
+    try std.testing.expectEqualStrings(
+        "locale=ja",
+        try writeExprToStringForTest(a, findDim(d, "foo_bar").?.asking_condition.?),
+    );
+}
+
+test "discover: a src/-gated name no script declares as a need keeps its own gate as its asking condition" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: when profile=work\nop = <machine.op_account>\nvault = <machine.op_vault>\n# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\n# mox: needs op_account\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "op_account").?.asking_condition == null);
+    try std.testing.expectEqualStrings(
+        "profile=work",
+        try writeExprToStringForTest(a, findDim(d, "op_vault").?.asking_condition.?),
+    );
 }
 
 test "discover: a `# mox: needs` name excluded by category (built-in) registers no dimension" {
@@ -2438,6 +2853,111 @@ test "discover: a well-formed script one level inside an axis dir is scanned" {
     try std.testing.expectEqualStrings("scripts/pre/os=linux/util.sh", d.scripts[0].path);
 }
 
+test "discover: a scripts gate directory's own tuple is value-compared and unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "scripts/pre/profile=work/00-x.sh", "#!/bin/sh\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "profile").?;
+    try std.testing.expect(dim.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
+    try std.testing.expectEqualStrings("work", dim.observed_values[0]);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a gated script's declared need is asked under its gate directory's tuple" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/profile=work/00-x.sh",
+        "#!/bin/sh\n# mox: needs work_token\necho hi\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "work_token").?;
+    try std.testing.expectEqualStrings(
+        "profile=work",
+        try writeExprToStringForTest(a, dim.asking_condition.?),
+    );
+}
+
+test "discover: a gated script's own when-head atom is asked under its gate directory's tuple too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/profile=work/00-x.sh",
+        "#!/bin/sh\n# mox: when vpn_host\necho hi\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "vpn_host").?;
+    try std.testing.expectEqualStrings(
+        "profile=work",
+        try writeExprToStringForTest(a, dim.asking_condition.?),
+    );
+}
+
+test "discover: an ungated script's declared need stays unconditioned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "scripts/pre/00-x.sh", "#!/bin/sh\n# mox: needs work_token\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "work_token").?.asking_condition == null);
+}
+
+test "discover: a need declared by both a gated and an ungated script is unconditioned, whichever is scanned first" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The gate directory sorts before the ungated script, so the conditioned
+    // occurrence is recorded first; the ungated one must still widen it.
+    try writeFile(
+        io,
+        tmp.dir,
+        "scripts/pre/arch=arm64/00-x.sh",
+        "#!/bin/sh\n# mox: needs shared_token\necho hi\n",
+    );
+    try writeFile(io, tmp.dir, "scripts/pre/zz.sh", "#!/bin/sh\n# mox: needs shared_token\necho hi\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "shared_token").?.asking_condition == null);
+}
+
 test "discover: a directory whose name is not an axis tuple is never descended into" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2534,6 +3054,457 @@ test "discover: a capture field outside the fact-name charset is not a dimension
     const diag = d.diagnostics[0].capture_name;
     try std.testing.expectEqualStrings("src/.zshrc", diag.path);
     try std.testing.expectEqualStrings("Bad-Name", diag.name);
+}
+
+// -- fallback-chain capture members ------------------------------------------
+
+test "discover: a chain's leading machine member is a dimension, not a malformed name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "x = <machine.chain_head | env.SOMETHING>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "chain_head").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
+}
+
+test "discover: a chain's trailing machine member is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "x = <env.SOMETHING | machine.chain_tail>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "chain_tail").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
+}
+
+test "discover: a chain's mid machine member is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "x = <env.SOMETHING | machine.chain_mid | data.tools.editor>\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "chain_mid").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
+}
+
+test "discover: every machine member of one chain is its own dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "x = <machine.chain_first | env.SOMETHING | machine.chain_second>\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "chain_first").?.roles.captured);
+    try std.testing.expect(findDim(d, "chain_second").?.roles.captured);
+}
+
+test "discover: a chain's default is no machine member's capture default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "x = <env.SOMETHING | machine.chain_defaulted | default \"vim\">\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "chain_defaulted").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 0), dim.capture_defaults.len);
+}
+
+test "discover: a chain member's bad fact name is reported as that member's name alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "x = <env.SOMETHING | machine.Bad-Name>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "Bad-Name") == null);
+    try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
+    const diag = d.diagnostics[0].capture_name;
+    try std.testing.expectEqualStrings("src/.zshrc", diag.path);
+    try std.testing.expectEqualStrings("Bad-Name", diag.name);
+}
+
+// -- captures inside a loop's TOML data source -------------------------------
+
+test "discover: a data row value's fallback chain makes its machine member a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_chain | env.HOME>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "row_chain").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
+}
+
+test "discover: a data row value's plain capture is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_plain>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "row_plain").?.roles.captured);
+}
+
+test "discover: a data row's string-array element is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for e in \"data/tools.toml\"\n" ++
+            "# mox: for d in e.dirs\n" ++
+            "v=<d>\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndirs = [\"a\", \"<machine.row_elem>/bin\"]\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "row_elem").?.roles.captured);
+}
+
+test "discover: a data row value's capture carries its own `| default`" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_defaulted | default \\\"/opt\\\">/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "row_defaulted").?;
+    try std.testing.expectEqual(@as(usize, 1), dim.capture_defaults.len);
+    try std.testing.expectEqualStrings("/opt", dim.capture_defaults[0]);
+}
+
+test "discover: a data row capture read by two loops counts the data file as its one source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.bashrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.shared_row>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expectEqual(@as(usize, 1), findDim(d, "shared_row").?.provenance.source_count);
+}
+
+test "discover: a bad fact name in a data row is reported against the data file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.Bad-Row>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "Bad-Row") == null);
+    try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
+    try std.testing.expectEqualStrings("data/tools.toml", d.diagnostics[0].capture_name.path);
+    try std.testing.expectEqualStrings("Bad-Row", d.diagnostics[0].capture_name.name);
+}
+
+test "discover: a data row capture is conditioned on the loop that reads it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for e in \"data/tools.toml\" when profile=work\nv=<e.dir>\n# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_gated>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const cond = findDim(d, "row_gated").?.asking_condition.?;
+    try std.testing.expect(cond.* == .eq);
+    try std.testing.expectEqualStrings("profile", cond.eq.axis);
+    try std.testing.expectEqualStrings("work", cond.eq.value);
+}
+
+test "discover: a data row capture read under two different gates is asked under either" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for e in \"data/tools.toml\" when profile=work\nv=<e.dir>\n# mox: end\n",
+    );
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.bashrc",
+        "# mox: for e in \"data/tools.toml\" when profile=home\nv=<e.dir>\n# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_two_gates>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const cond = findDim(d, "row_two_gates").?.asking_condition.?;
+    try std.testing.expect(cond.* == .or_);
+}
+
+test "discover: a per-file `<base>.d/` data source's row capture is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.zshrc.d/tools.toml", "[[tools]]\ndir = \"<machine.overlay_row>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "overlay_row").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqual(@as(usize, 1), dim.provenance.source_count);
+}
+
+test "discover: a generator loop's data row capture is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/leaves.gen",
+        "# mox: for h in \"data/hosts.toml\" into \"<h.name>.conf\"\nv=<h.dir>\n# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "data/hosts.toml", "[[hosts]]\nname = \"a\"\ndir = \"<machine.gen_row>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "gen_row").?.roles.captured);
+}
+
+test "discover: a loop over an enclosing row's array field reads no file of its own" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.zshrc",
+        "# mox: for e in \"data/tools.toml\"\n" ++
+            "# mox: for d in e.dirs\n" ++
+            "v=<d>\n" ++
+            "# mox: end\n" ++
+            "# mox: end\n",
+    );
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndirs = [\"<machine.elem_dim>/bin\"]\n");
+    // A fragment that merely shares the field reference's spelling is not a
+    // data source: compose resolves `e.dirs` against the enclosing row.
+    try writeFile(io, tmp.dir, "src/.zshrc.d/e.dirs", "[[e]]\ndir = \"<machine.decoy_dim>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "elem_dim") != null);
+    try std.testing.expect(findDim(d, "decoy_dim") == null);
+}
+
+test "discover: a capture in a data file no loop reads is not a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"/bin\"\n");
+    try writeFile(io, tmp.dir, "data/unread.toml", "[[unread]]\ndir = \"<machine.never_read>/bin\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "never_read") == null);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
+}
+
+test "discover: a capture in an array the data file's stem does not name is not a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(
+        io,
+        tmp.dir,
+        "data/tools.toml",
+        "[[tools]]\ndir = \"/bin\"\n\n[[other]]\ndir = \"<machine.other_array>/bin\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "other_array") == null);
+}
+
+test "discover: a data file's comment, key, nested table, and non-row scalar hold no dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/tools.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(
+        io,
+        tmp.dir,
+        "data/tools.toml",
+        "# captures allowed, e.g. <machine.comment_dim>/bin\n" ++
+            "loose = \"<machine.loose_scalar>/bin\"\n" ++
+            "[settings]\n" ++
+            "k = \"<machine.nested_table_dim>/bin\"\n" ++
+            "[[tools]]\n" ++
+            "\"<machine.key_dim>\" = \"v\"\n" ++
+            "dir = \"/bin\"\n" ++
+            "[tools.meta]\n" ++
+            "k = \"<machine.row_nested_dim>/bin\"\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    // None of these four positions is ever interpolated: a comment is dropped
+    // by the TOML parse, a key is looked up rather than emitted, a nested
+    // table is dropped by the row projection, and a non-row scalar reached by
+    // `<data.FILE.KEY>` is spliced verbatim.
+    try std.testing.expect(findDim(d, "comment_dim") == null);
+    try std.testing.expect(findDim(d, "loose_scalar") == null);
+    try std.testing.expect(findDim(d, "nested_table_dim") == null);
+    try std.testing.expect(findDim(d, "key_dim") == null);
+    try std.testing.expect(findDim(d, "row_nested_dim") == null);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
+}
+
+test "discover: an unreadable or malformed data source leaves discovery clean" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.zshrc", "# mox: for e in \"data/gone.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/.bashrc", "# mox: for e in \"data/broken.toml\"\nv=<e.dir>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/broken.toml", "[[broken]]\ndir = \"unterminated\n");
+    try writeFile(io, tmp.dir, "src/.profile", "y = <machine.still_scanned>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "still_scanned") != null);
+    try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
 }
 
 // -- capture positions beyond a `when_gate` body -----------------------------
@@ -3624,4 +4595,201 @@ test "discover: a structurally invalid source tree sets tree_error and still deg
     // apply's own richer walkDiag call owns the per-site message for this
     // file, not discovery.
     try std.testing.expectEqual(@as(usize, 0), d.dimensions.len);
+}
+
+test "discover: a Cat A overlay's plain capture is a dimension, asked when its overlay tuple holds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.toml", "[core]\nname = \"app\"\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/profile=work", "[work]\nvalue = \"<machine.overlay_fact>\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "overlay_fact").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
+}
+
+test "discover: a Cat A overlay's fallback-chain capture is a dimension, not left to resolve past silently" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.toml", "[core]\nname = \"app\"\n");
+    try writeFile(io, tmp.dir, "src/app.toml.d/profile=work", "[work]\nvalue = \"<machine.overlay_fact | env.HOME>\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "overlay_fact").?;
+    try std.testing.expect(dim.roles.captured);
+    // A chain's members carry no interview default: the `| default` rescues an
+    // exhausted chain, not one member.
+    try std.testing.expectEqual(@as(usize, 0), dim.capture_defaults.len);
+    try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
+}
+
+test "discover: a baseless .d/ overlay's capture is a dimension, asked when its overlay tuple holds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No `src/gated.toml`: the `.d/` alone is whole-file axis gating, and the
+    // single matching layer composes verbatim.
+    try writeFile(io, tmp.dir, "src/gated.toml.d/profile=work", "value = \"<machine.gated_overlay_fact>\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "gated_overlay_fact").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
+}
+
+test "discover: a raw-line-merged gitconfig overlay's capture is a dimension" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n  name = me\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/profile=work", "[user]\n  email = <machine.work_email>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "work_email").?;
+    try std.testing.expect(dim.roles.captured);
+    try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
+}
+
+test "discover: a multi-pair overlay tuple conditions its capture on every pair" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n  name = me\n");
+    try writeFile(
+        io,
+        tmp.dir,
+        "src/.gitconfig.d/holt_backend=gdrive+profile=work",
+        "[user]\n  email = <machine.work_email>\n",
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "work_email").?;
+    try std.testing.expectEqualStrings(
+        "holt_backend=gdrive and profile=work",
+        try writeExprToStringForTest(a, dim.asking_condition.?),
+    );
+}
+
+test "discover: an overlay filename's stripped and verbatim tuples are both asked under" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `hostname=host.local` matches either as the whole written value or as
+    // the extension-stripped `host`; compose tries both, so both are asked
+    // under.
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n  name = me\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/hostname=host.local", "[user]\n  email = <machine.host_email>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "host_email").?;
+    try std.testing.expectEqualStrings(
+        "hostname=host or hostname=host.local",
+        try writeExprToStringForTest(a, dim.asking_condition.?),
+    );
+}
+
+test "discover: an overlay filename's stripped and verbatim readings are both observed values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Compose matches `zone=eu.local` as the whole written value first and as
+    // the extension-stripped `eu` second, so the answer that selects it under
+    // either reading is one the interview offers and accepts.
+    try writeFile(io, tmp.dir, "src/.gitconfig", "[user]\n  name = me\n");
+    try writeFile(io, tmp.dir, "src/.gitconfig.d/zone=eu.local", "[user]\n  email = e@eu\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "zone").?;
+    try std.testing.expectEqual(@as(usize, 2), dim.observed_values.len);
+    try std.testing.expectEqualStrings("eu", dim.observed_values[0]);
+    try std.testing.expectEqualStrings("eu.local", dim.observed_values[1]);
+}
+
+test "discover: a region fragment filename's stripped and verbatim readings are both observed values" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/kind.lua", "# mox: from \"zone\"\nlocal M = {}\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/kind.lua.d/zone/eu.local", "M.zone = \"eu\"\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "zone").?;
+    try std.testing.expectEqual(@as(usize, 2), dim.observed_values.len);
+    try std.testing.expectEqualStrings("eu", dim.observed_values[0]);
+    try std.testing.expectEqualStrings("eu.local", dim.observed_values[1]);
+}
+
+test "discover: a Cat B overlay's capture is no dimension, since compose never reads an overlay there" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/hook.sh", "echo base\n");
+    try writeFile(io, tmp.dir, "src/hook.sh.d/profile=work", "echo <machine.never_composed>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "never_composed") == null);
+}
+
+test "discover: a Cat C overlay's capture is no dimension, since compose copies the layer verbatim" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/id.pem", "BASE\n");
+    try writeFile(io, tmp.dir, "src/id.pem.d/profile=work", "<machine.never_interpolated>\n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    try std.testing.expect(findDim(d, "never_interpolated") == null);
 }

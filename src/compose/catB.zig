@@ -157,6 +157,26 @@ fn fragmentOrigin(file: ManagedFile, frag_abs: []const u8, first_line: u32) Orig
     return .{ .fragment = .{ .path = frag_abs, .line = first_line } };
 }
 
+/// Refuse `file` with `err` when its `.d/` holds axis-named overlays, naming
+/// every one of them in `diag`. Both callers have just established that no
+/// layer beside this source could ever be folded in or picked, which the walk
+/// -- which reads no content and so knows no category -- cannot see for
+/// itself.
+fn refuseOverlays(
+    arena: std.mem.Allocator,
+    file: ManagedFile,
+    diag: ?*interp.Diag,
+    err: ComposeError,
+) !void {
+    if (file.overlays.len == 0) return;
+    if (diag) |d| {
+        var keys: std.ArrayList([]const u8) = .empty;
+        for (file.overlays) |o| try keys.append(arena, try source.path.toKey(arena, o.path));
+        d.set(try std.mem.join(arena, ", ", keys.items));
+    }
+    return err;
+}
+
 /// Origin for a directive's literal fallback body: attributed to the whole
 /// base layer (no line-level mapping), so commit reports it as manual rather
 /// than risk mis-editing a directive marker line.
@@ -167,6 +187,18 @@ fn overlayOrigin(file: ManagedFile) Origin {
 
 pub const ComposeError = error{
     NoBase,
+    /// An axis-named `.d/` overlay sits beside a text source. A text file
+    /// composes from one base and the directives written in it: there is no
+    /// structural merge to fold a second layer into, and no whole-layer pick
+    /// to hand it the file, so the overlay could only ever be dropped. Text
+    /// varies per machine through a region directive and its `.d/<region>/`
+    /// fragments, or a `when` gate. The diag names the overlays.
+    OverlayOnTextFile,
+    /// An axis-named `.d/` overlay sits beside a generator source. A
+    /// generator's own path never materializes -- it emits one file per data
+    /// row -- so no layer beside it has anything to compose into, whatever
+    /// the source's category. The diag names the overlays.
+    OverlayOnGenerator,
     DataSourceArrayNotFound,
     RecursionTooDeep,
     UnknownLoopVariable,
@@ -312,6 +344,7 @@ pub fn composeTracked(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
+    try refuseOverlays(arena, file, diag, error.OverlayOnTextFile);
     if (!file.has_base) return error.NoBase;
     const base_raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
     return composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, base_raw, true);
@@ -566,12 +599,14 @@ pub fn composeGenerator(
     // CompletionsOnNonGenerator).
     if (d0.kind == .completions) {
         if (hasContentOutside(base_content, d0.start_line, d0.end_line)) return null;
+        try refuseOverlays(arena, file, diag, error.OverlayOnGenerator);
         return try composeCompletions(arena, io, file, d0.kind.completions, d0.start_line, bindings, diag);
     }
     if (d0.kind != .for_loop) return null;
     const loop = d0.kind.for_loop;
     if (loop.into == null) return null;
     if (hasContentOutside(base_content, d0.start_line, d0.end_line)) return null;
+    try refuseOverlays(arena, file, diag, error.OverlayOnGenerator);
     const template = loop.into.?;
 
     var ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
@@ -1006,18 +1041,8 @@ fn loadGeneratorRows(
     data_source: []const u8,
     diag: ?*interp.Diag,
 ) EmitError!GeneratorRows {
-    const data_path = blk: {
-        if (std.mem.indexOfScalar(u8, data_source, '/') != null) {
-            if (file.private_dir.len > 0) {
-                const priv = try source.path.joinKeyOnto(arena, file.private_dir, data_source);
-                if (fileExists(io, priv)) break :blk priv;
-            }
-            if (file.repo_dir.len == 0) return error.NoRepoRootForSharedData;
-            break :blk try source.path.joinKeyOnto(arena, file.repo_dir, data_source);
-        }
-        const overlay_dir = try std.fmt.allocPrint(arena, "{s}.d", .{file.source_base_abs});
-        break :blk try source.path.joinKeyOnto(arena, overlay_dir, data_source);
-    };
+    const data_path = (try file.dataSourcePath(arena, io, data_source)) orelse
+        return error.NoRepoRootForSharedData;
 
     const arr_map = data_mod.source.loadFile(arena, io, data_path) catch |e| switch (e) {
         error.FileNotFound => {
@@ -1026,7 +1051,7 @@ fn loadGeneratorRows(
         },
         else => return e,
     };
-    const stem = filenameStem(data_source);
+    const stem = data_mod.source.arrayName(data_source);
     // A present-but-empty array (`stem = []`) is a legitimate ZERO rows: the
     // deliberate way to empty a generator so its leaves are pruned. An ABSENT
     // array -- a 0-byte or truncated file, or a mistyped array declaration -- is
@@ -1341,20 +1366,8 @@ fn emitForLoop(
         },
     }
 
-    // File-based data source: a path with `/` is repo-relative (private layer
-    // shadows repo); a bare name is per-file (`<file>.d/<name>`).
-    const data_path = blk: {
-        if (std.mem.indexOfScalar(u8, loop.data_source, '/') != null) {
-            if (file.private_dir.len > 0) {
-                const priv = try source.path.joinKeyOnto(arena, file.private_dir, loop.data_source);
-                if (fileExists(io, priv)) break :blk priv;
-            }
-            if (file.repo_dir.len == 0) return error.NoRepoRootForSharedData;
-            break :blk try source.path.joinKeyOnto(arena, file.repo_dir, loop.data_source);
-        }
-        const overlay_dir = try std.fmt.allocPrint(arena, "{s}.d", .{file.source_base_abs});
-        break :blk try source.path.joinKeyOnto(arena, overlay_dir, loop.data_source);
-    };
+    const data_path = (try file.dataSourcePath(arena, io, loop.data_source)) orelse
+        return error.NoRepoRootForSharedData;
 
     const arr_map = data_mod.source.loadFile(arena, io, data_path) catch |e| switch (e) {
         // Name the data source instead of a bare FileNotFound, so a typo'd
@@ -1365,7 +1378,7 @@ fn emitForLoop(
         },
         else => return e,
     };
-    const stem = filenameStem(loop.data_source);
+    const stem = data_mod.source.arrayName(loop.data_source);
     const records = arr_map.get(stem) orelse {
         if (ctx.diag) |dg| dg.set(data_path);
         return error.DataSourceArrayNotFound;
@@ -1462,11 +1475,6 @@ fn emitLiteralBody(arena: std.mem.Allocator, em: *Emitter, file: ManagedFile, bo
     // secret makes only its own line `.secret` so its cleartext stays out of the
     // cache without redacting the body's other lines.
     try emitSecretAwareBody(em, arena, body, ctx, ctx.machine != null, null, .always_add, .{ .flat = overlayOrigin(file) });
-}
-
-fn fileExists(io: Io, path: []const u8) bool {
-    Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
 }
 
 fn emitFragmentByPath(
@@ -1579,14 +1587,6 @@ fn identForMarker(path: []const u8) []const u8 {
     // table lookup succeeds.
     const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
     return basename[dot..];
-}
-
-/// Stem of a filename: the basename without its trailing extension.
-/// Handles paths (returns the last segment's stem, ignoring directories).
-fn filenameStem(filename: []const u8) []const u8 {
-    const basename = std.fs.path.basename(filename);
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
-    return basename[0..dot];
 }
 
 fn langFromPath(path: []const u8) []const u8 {

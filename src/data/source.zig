@@ -17,6 +17,16 @@ pub fn loadFile(arena: std.mem.Allocator, io: Io, abs_path: []const u8) LoadErro
     return try toml.parse(arena, content);
 }
 
+/// The array-of-tables a data source provides its rows under: the stem of its
+/// filename (`data/git_identities.toml` -> `git_identities`). One definition,
+/// so a consumer that reads the rows and a scanner that inspects them can
+/// never land on different arrays of the same file.
+pub fn arrayName(data_source: []const u8) []const u8 {
+    const basename = std.fs.path.basename(data_source);
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return basename;
+    return basename[0..dot];
+}
+
 pub const ScalarError = error{ NonScalarData, DataFileError } || std.mem.Allocator.Error;
 
 /// Look up a scalar in `data/<file>.toml`, the private layer shadowing the repo
@@ -84,6 +94,13 @@ fn readIfExists(arena: std.mem.Allocator, io: Io, path: []const u8) ScalarError!
         error.OutOfMemory => error.OutOfMemory,
         else => error.DataFileError,
     };
+}
+
+test "arrayName: a repo-relative key, a bare name, and a dotless name all yield the filename stem" {
+    try std.testing.expectEqualStrings("git_identities", arrayName("data/git_identities.toml"));
+    try std.testing.expectEqualStrings("hosts", arrayName("hosts.toml"));
+    try std.testing.expectEqualStrings("hosts", arrayName("nested/dir/hosts.toml"));
+    try std.testing.expectEqualStrings("hosts", arrayName("hosts"));
 }
 
 test "loadFile: error path for missing file" {

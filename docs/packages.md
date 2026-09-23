@@ -864,7 +864,22 @@ same environment a setup script gets: `MOX_REPO`, `MOX_STATE_DIR`,
 which says that a mox already sits above this one. It is read as a yes or no
 -- any value present, `0` included, means one is -- so a plugin cannot clear
 it by setting it, and the number it carries is capped rather than counted
-without end. A mox reached from
+without end.
+
+The environment is what a setup script gets; the fact CONTRACT is not. A
+setup script's `MOX_FACT_*` use is read out of its text, asked for at the
+interview and blocked on when unresolved ([dsl.md](dsl.md#fact-contracts));
+a plugin's is not read at all. A plugin is any executable -- a compiled
+`.exe` as readily as a shell script -- so there is no text mox may rely on
+having, and a contract that held only for the plugins written in a scripting
+language would read as coverage while silently skipping the rest. A fact
+that no `src/` source and no setup script consumes is therefore never asked
+about on a plugin's behalf, and one the repo consumes only behind a gate is
+asked only where that gate holds; either way `MOX_FACT_<NAME>` is simply
+absent from the plugin's environment. A plugin that requires a fact checks
+for it in `available` and exits 1 -- it is the one judge of whether it is
+usable here -- saying why on stderr, which reaches the terminal, or through
+`limitation`. A mox reached from
 inside a plugin discovers no plugin at all and says so as a note, so a plugin
 that calls mox cannot multiply itself; the compiled backends still work
 there. That holds for `status`

@@ -5021,9 +5021,28 @@ test "compose catA: a check line in an overlay of a merged source is inert, not 
     try std.testing.expect(std.mem.indexOf(u8, out, "other = 2") != null);
 }
 
-// -- a gated single layer composes structurally, never through Cat B --
+// -- a held whole-file gate scopes the rest of the file, directives included --
 
-test "compose catA toml: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+/// Compose the single managed file under `<tmp>/src` with `os` and `profile`
+/// bound, or null when it composes to nothing on that machine.
+fn composeUnderOsProfile(
+    a: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    os: []const u8,
+    profile: []const u8,
+) !?[]u8 {
+    const io = std.testing.io;
+    const src_dir = try srcPathAlloc(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", os);
+    try b.put("profile", profile);
+    return mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null);
+}
+
+test "compose catA toml: under a held whole-file gate a region still selects, and a closed gate omits the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5033,21 +5052,12 @@ test "compose catA toml: a gated single layer composes structurally, leaving a d
 
     try writeFile(io, tmp.dir, "src/g.toml", "# mox: when os=macos\n[a]\nx = 1\n# mox: when profile=work\ny = 2\n# mox: end\n");
 
-    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(src_dir);
-    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
-    var b = std.StringHashMap([]const u8).init(a);
-    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
-    try b.put("os", "macos");
-    try b.put("profile", "personal");
-
-    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
-    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when os=macos") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when profile=work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "y = 2") != null);
+    try std.testing.expectEqualStrings("[a]\nx = 1\ny = 2\n", (try composeUnderOsProfile(a, &tmp, "macos", "work")).?);
+    try std.testing.expectEqualStrings("[a]\nx = 1\n", (try composeUnderOsProfile(a, &tmp, "macos", "personal")).?);
+    try std.testing.expect(try composeUnderOsProfile(a, &tmp, "linux", "work") == null);
 }
 
-test "compose catA json: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+test "compose catA json: under a held whole-file gate a region still selects, and a closed gate omits the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5055,23 +5065,14 @@ test "compose catA json: a gated single layer composes structurally, leaving a d
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeFile(io, tmp.dir, "src/g.json", "// mox: when os=macos\n{\n  \"a\": 1,\n  // mox: when profile=work\n  \"b\": 2\n  // mox: end\n}\n");
+    try writeFile(io, tmp.dir, "src/g.json", "// mox: when os=macos\n{\n  \"a\": 1,\n  // mox: when profile=work\n  \"b\": 2,\n  // mox: end\n  \"c\": 3\n}\n");
 
-    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(src_dir);
-    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
-    var b = std.StringHashMap([]const u8).init(a);
-    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
-    try b.put("os", "macos");
-    try b.put("profile", "personal");
-
-    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
-    try std.testing.expect(std.mem.indexOf(u8, out, "// mox: when os=macos") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "// mox: when profile=work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"b\": 2") != null);
+    try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}\n", (try composeUnderOsProfile(a, &tmp, "macos", "work")).?);
+    try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"c\": 3\n}\n", (try composeUnderOsProfile(a, &tmp, "macos", "personal")).?);
+    try std.testing.expect(try composeUnderOsProfile(a, &tmp, "linux", "work") == null);
 }
 
-test "compose catA yaml: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+test "compose catA yaml: under a held whole-file gate a region still selects, and a closed gate omits the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5081,21 +5082,27 @@ test "compose catA yaml: a gated single layer composes structurally, leaving a d
 
     try writeFile(io, tmp.dir, "src/g.yaml", "# mox: when os=macos\na: 1\n# mox: when profile=work\nb: 2\n# mox: end\n");
 
-    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(src_dir);
-    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
-    var b = std.StringHashMap([]const u8).init(a);
-    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
-    try b.put("os", "macos");
-    try b.put("profile", "personal");
-
-    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
-    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when os=macos") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when profile=work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "b: 2") != null);
+    try std.testing.expectEqualStrings("a: 1\nb: 2\n", (try composeUnderOsProfile(a, &tmp, "macos", "work")).?);
+    try std.testing.expectEqualStrings("a: 1\n", (try composeUnderOsProfile(a, &tmp, "macos", "personal")).?);
+    try std.testing.expect(try composeUnderOsProfile(a, &tmp, "linux", "work") == null);
 }
 
-test "compose catA gitconfig: a gated single layer composes structurally, leaving a directive in its body unexecuted" {
+test "compose catA ini: under a held whole-file gate a region still selects, and a closed gate omits the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/g.ini", "# mox: when os=macos\n[a]\nx = 1\n# mox: when profile=work\ny = 2\n# mox: end\n");
+
+    try std.testing.expectEqualStrings("[a]\nx = 1\ny = 2\n", (try composeUnderOsProfile(a, &tmp, "macos", "work")).?);
+    try std.testing.expectEqualStrings("[a]\nx = 1\n", (try composeUnderOsProfile(a, &tmp, "macos", "personal")).?);
+    try std.testing.expect(try composeUnderOsProfile(a, &tmp, "linux", "work") == null);
+}
+
+test "compose catA gitconfig: under a held whole-file gate a region still selects, and a closed gate omits the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5105,18 +5112,9 @@ test "compose catA gitconfig: a gated single layer composes structurally, leavin
 
     try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when os=macos\n[user]\n\temail = a@b.com\n# mox: when profile=work\n\tname = Work\n# mox: end\n");
 
-    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
-    defer std.testing.allocator.free(src_dir);
-    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
-    var b = std.StringHashMap([]const u8).init(a);
-    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
-    try b.put("os", "macos");
-    try b.put("profile", "personal");
-
-    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
-    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when os=macos") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "# mox: when profile=work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "name = Work") != null);
+    try std.testing.expectEqualStrings("[user]\n\temail = a@b.com\n\tname = Work\n", (try composeUnderOsProfile(a, &tmp, "macos", "work")).?);
+    try std.testing.expectEqualStrings("[user]\n\temail = a@b.com\n", (try composeUnderOsProfile(a, &tmp, "macos", "personal")).?);
+    try std.testing.expect(try composeUnderOsProfile(a, &tmp, "linux", "work") == null);
 }
 
 // -- multi-overlay fold order --
@@ -5245,4 +5243,152 @@ test "compose catC: the recorded overlay origin of a base-less file names the so
     try std.testing.expect(!tree.files[0].has_base);
     try std.testing.expectEqualStrings(tree.files[0].source_base_path, prov.items[0].origin.overlay.path);
     try std.testing.expect(prov.items[0].origin.overlay.path.len > 0);
+}
+
+test "compose catB: an axis-named overlay beside a text source is refused, naming it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/hook.sh", "echo base\n");
+    try writeFile(io, tmp.dir, "src/hook.sh.d/os=darwin.sh", "echo darwin\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(
+        error.OverlayOnTextFile,
+        mox.compose.composeFileTracked(a, io, tree.files[0], &b_r, null, null, null, &diag),
+    );
+    try std.testing.expect(std.mem.endsWith(u8, diag.capture().?, "src/hook.sh.d/os=darwin.sh"));
+}
+
+test "compose catB: an overlay that does not match this machine is refused just the same" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/hook.sh", "echo base\n");
+    try writeFile(io, tmp.dir, "src/hook.sh.d/os=darwin.sh", "echo darwin\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "linux");
+
+    try std.testing.expectError(
+        error.OverlayOnTextFile,
+        mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null),
+    );
+}
+
+test "compose catB: a text source with only region fragments beside it still composes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/hook.sh", "# mox: from \"os\"\necho fallback\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/hook.sh.d/os/darwin.sh", "echo darwin\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?;
+    try std.testing.expectEqualStrings("echo darwin\n", out);
+}
+
+test "compose catB: a text source's base-less overlay directory is refused by what is wrong with it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/hook.sh.d/os=darwin.sh", "echo darwin\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    try std.testing.expect(!tree.files[0].has_base);
+    try std.testing.expectError(
+        error.OverlayOnTextFile,
+        mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null),
+    );
+}
+
+test "compose generator: an axis-named overlay beside a text generator source is refused, naming it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "data/rows.toml", "[[rows]]\nname = \"a\"\n");
+    try writeFile(io, tmp.dir, "src/gen.sh", "# mox: for r in \"data/rows.toml\" into \"<r.name>.sh\"\necho <r.name>\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/gen.sh.d/os=darwin.sh", "echo darwin\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    var diag: mox.compose.interp.Diag = .{};
+    try std.testing.expectError(
+        error.OverlayOnGenerator,
+        mox.compose.catB.composeGenerator(a, io, tree.files[0], &b_r, null, null, &diag),
+    );
+    try std.testing.expect(std.mem.endsWith(u8, diag.capture().?, "src/gen.sh.d/os=darwin.sh"));
+}
+
+test "compose generator: an axis-named overlay beside a structured generator source is refused too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "data/rows.toml", "[[rows]]\nname = \"a\"\n");
+    try writeFile(io, tmp.dir, "src/gen.toml", "# mox: for r in \"data/rows.toml\" into \"<r.name>.conf\"\nvalue = \"<r.name>\"\n# mox: end\n");
+    try writeFile(io, tmp.dir, "src/gen.toml.d/os=darwin.toml", "extra = \"x\"\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+
+    try std.testing.expectError(
+        error.OverlayOnGenerator,
+        mox.compose.catB.composeGenerator(a, io, tree.files[0], &b_r, null, null, null),
+    );
 }

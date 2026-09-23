@@ -1485,6 +1485,80 @@ test "apply: a gate-mismatched script's needs are never evaluated -- no block fo
     try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") == null);
 }
 
+test "apply: an ungated script's declared need is named unbound even where the src/ gate that also uses it is closed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    // `op_account` is used in src/ only behind `profile=work`, and this
+    // machine answered `personal` -- but the script declaring it runs
+    // whatever the profile, so the interview must still ask for it.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile=work\nop = <machine.op_account>\n# mox: end\n",
+    });
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"personal\"\n" });
+
+    const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-op{s}", .{script_ext});
+    const content = if (builtin.os.tag == .windows)
+        "# mox: needs op_account\nWrite-Output $env:MOX_FACT_OP_ACCOUNT\n"
+    else
+        "#!/bin/sh\n# mox: needs op_account\necho \"$MOX_FACT_OP_ACCOUNT\" >/dev/null\n";
+    try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unbound facts: op_account") != null);
+    // Non-interactive, so nothing binds it and the script still blocks --
+    // never silently runs without the fact it declared.
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") != null);
+}
+
+test "apply: an ungated script's scanned token is named unbound even where the src/ gate that also uses it is closed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    // The same shape as the declared-need case above, with no `# mox: needs`
+    // head: the token alone is the script's contract, so the fact must still
+    // be offered on a machine whose `profile=work` gate is closed.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/src/.gitconfig",
+        .data = "# mox: when profile=work\nop = <machine.op_account>\n# mox: end\n",
+    });
+    try tmp.dir.createDirPath(io, "home/.config/mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"personal\"\n" });
+
+    const rel = try std.fmt.allocPrint(a, "repo/scripts/pre/00-op{s}", .{script_ext});
+    const content = if (builtin.os.tag == .windows)
+        "Write-Output $env:MOX_FACT_OP_ACCOUNT\n"
+    else
+        "#!/bin/sh\necho \"$MOX_FACT_OP_ACCOUNT\" >/dev/null\n";
+    try writeExecScript(io, tmp.dir, rel, content, try std.fs.path.join(a, &.{ root, rel }));
+
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unbound facts: op_account") != null);
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "blocked") != null);
+}
+
 test "apply: fresh-machine incident replica -- a literal $MOX_FACT_PROFILE token with profile unbound blocks RED, non-interactive" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
