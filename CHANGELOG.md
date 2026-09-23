@@ -378,6 +378,67 @@ All notable changes to mox are documented here. The format follows
   token is matched text, and the projection onto it is one-way, so one
   matching no known fact still blocks its script rather than becoming an
   interview question for a fact that may not exist.
+- Recorded provenance names the source line a composed line actually came
+  from. The leading-block pass takes a structured source's ownership and
+  `check` lines out of the text before it is composed, and a held whole-file
+  gate's own line with them, and the recorded base-line numbers counted the
+  shortened text: every number below a removed line was short by the lines
+  removed above it. `mox commit` routes a live edit by those numbers. A
+  replacement was caught by the text comparison the router makes before
+  writing and became a manual hunk, but an insertion carries no old text to
+  compare against, so it was written a line too early and only the recompose
+  that follows the write caught it -- as "recomposed output still differs from
+  live", a refusal naming nothing the user could act on. A line the pass
+  separates from its neighbour now ends a run of numbering rather than
+  extending it, so the numbers name the lines the file has. The same
+  numbering reaches a structured file carrying an inline `<secret:URI>`,
+  whose lines are recorded one at a time so only the secret's own line is
+  redacted: each of the others claimed to come from line 1, which left every
+  hunk of such a file unroutable.
+- A layer carrying an inline `mox:` directive beside a structurally merged
+  source is refused on every machine, which is what that refusal has always
+  said it is. The scan ran after the composing machine had already decided
+  the file was absent -- its whole-file gate closed, or no overlay of a
+  base-less source matching -- so one repository was refused on one machine
+  and composed nothing, quietly, on another. The scan runs first now. A closed
+  gate's own line is not itself taken for the inline directive it resembles:
+  the gate line comes off the scanned text whether or not the gate holds.
+- A plugin cannot open the recursion guard it runs under by emptying
+  `MOX_PACKAGES_DEPTH`. The marker was read the way a path is read, where an
+  empty value means unset, so `MOX_PACKAGES_DEPTH= mox status` from inside a
+  plugin put that mox at the top of the chain: it discovered the same plugins
+  and ran each of them again, and so did every mox below it, with nothing in
+  mox left to stop the chain -- killing the run at the top did not end it,
+  since each level below leads its own process group. The marker is read for
+  presence now, so an empty value says what `0` and `yes` already said, and
+  the run below is told there is one more mox above it.
+- `--help` sends a reader to `docs/commands.md` for the full contract of
+  every command, which is where the contracts are; it named the README,
+  which is an overview and defers them to that file. Its line on
+  `MOX_PACKAGES_DEPTH` says that an empty value counts like any other.
+- `commit` exits 1 while anything is left undone. A run whose every hunk was
+  reported manual exited 0, though the same state exited 1 under `--dry-run`
+  and 2 under `--abort-on-prompt`, and `mox status` went on reporting the
+  drift that run had left behind. The code answered whether a file had failed
+  to verify rather than whether work remained, so a wholly-manual run passed
+  and adding one routable hunk to it was what turned the 0 into a 1. A manual
+  hunk now reads in a script the way a skipped secret and an untracked package
+  already did, and the documentation no longer tells a script to parse a
+  printed count instead.
+- A first-contact hunk needs a human in every non-interactive mode, and
+  `--dry-run` predicts that refusal rather than the route it is refusing. The
+  report called such a hunk routable and announced the edit it would make,
+  while the `--yes` run it was predicting called the same hunk manual and
+  wrote nothing. The refusal also reached only part of the run: a shared line
+  in a file expressing more than one configuration went to the "where does
+  this belong?" question, whose default `--yes` took unasked, so a `--yes`
+  commit of a file mox had never written could rewrite that file's source
+  unseen. One path now answers for both, so the preview and the run agree by
+  construction.
+- A plugin whose `declare` verb fails is reported in the same words every
+  other backend failure is reported in. `commit` printed the internal error
+  name -- `declare failed: PluginFailed` -- where a sentence for that failure
+  already existed and every sibling call already used it.
 
 ## [0.11.0] - 2026-09-09
 

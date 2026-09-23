@@ -58,8 +58,12 @@ beside the shared list without replacing it.
 | `backend` | Which manager. Per row, or once per file as a top-level default. Must name a registered adapter. |
 | `when` | An axis expression, the same grammar as `# mox: when` -- os, arch, profile, tool, env. Per row, or once per file as a top-level gate on every `[[packages]]` and `[[bootstrap]]` row in it; a row's own `when` narrows the file's (`(file) and (row)`). A `[[blacklist]]` row takes no gate and may not sit in a gated file. |
 
-A refusal names a row by its position in its array, counting from zero -- the
-same numbering `mox commit` uses for a data source's rows.
+A refusal names a `[[packages]]` row by its `name` -- `row "ghostty"` -- as
+soon as the row has one that survives the shape rule below. A row with no
+usable name yet is named by its position in its array, counting from zero
+(`row 0 has no "name"`), and so are the two rows a duplicate refusal cites and
+every `[[bootstrap]]` row; a `[[blacklist]]` refusal carries the position and
+the name both.
 
 Every other key belongs to the backend adapter (below). An unknown key, a
 missing required one, or a wrong type is an error naming the file and the
@@ -738,11 +742,16 @@ one wins.
 A backend name never begins with a dot, so nothing there that does is one:
 an empty `scripts/backends/` can be version-controlled, and shell plugins can
 carry the eol rule that keeps them LF-clean on Windows. What git and an
-editor keep in a tracked directory (`.gitkeep`, `.keep`, `.gitignore`,
-`.gitattributes`, `.editorconfig`) passes without remark; any other dotfile
+editor keep in a tracked directory passes without remark: the placeholders
+that keep an empty one (`.gitkeep`, `.keep`) and the rules that govern it
+(`.gitignore`, `.gitattributes`, `.editorconfig`). So does the OS and editor
+noise mox passes over anywhere in a repo -- `.DS_Store`, an AppleDouble
+`._name`, `Thumbs.db`, `desktop.ini`, a vim swap file (`.swp`, `.swo`), an
+emacs backup or lock (`name~`, `#name#`, `.#name`) -- several of which begin
+with no dot at all and are passed over here all the same. Any other dotfile
 is ignored and said as a note, since that is also how a backend ends up
-hidden by accident, and it must not read as a typo from the manifest's side. A directory there is an error naming the
-path, never "no backend named x".
+hidden by accident, and it must not read as a typo from the manifest's side.
+A directory there is an error naming the path, never "no backend named x".
 
 There is no axis gating (`os=darwin/`) and no private-layer shadowing.
 Whether a backend is usable on this machine is its own `available` verb, and
@@ -827,9 +836,13 @@ backend.
   bound -- or forever, where the bound is disabled.
   Windows has neither process groups nor job control, so there a bound
   reaches the direct process alone and no terminal changes hands.
-  A killed call names the bound it ran under -- `timed out after <ms>ms
-  (MOX_INSTALL_TIMEOUT_MS), killed`, or `(MOX_SCRIPT_TIMEOUT_MS)` for a
-  captured one, or `timed out, killed` where neither was armed. One ended
+  A killed call names the bound it ran under where the command armed one for
+  that call itself: an install, or a bootstrap's installer run, says `timed
+  out after <ms>ms (MOX_INSTALL_TIMEOUT_MS), killed`, and a bootstrap's
+  download -- captured, and bounded like a setup script -- says
+  `(MOX_SCRIPT_TIMEOUT_MS)`. A query verb names no bound: a `list` killed at
+  `MOX_SCRIPT_TIMEOUT_MS` says `timed out, killed`, which is also what a call
+  reports where the bound that could have fired was not armed. One ended
   for want of a terminal says `stopped, and this run has no terminal that
   could resume it; killed`.
 - The shipped backends' own manager calls are bounded the same way, and a
@@ -839,12 +852,18 @@ backend.
   `available` neither succeeds nor exits 1 -- is BROKEN (above), unless no
   row names it, in which case it is a note and its absence changes
   nothing.
-- Output is split on newline and trimmed of `\r` (a PowerShell plugin emits
-  CRLF); an id that is empty, exceeds 256 bytes, or carries whitespace, a
-  control byte or a byte that is not UTF-8 is an error naming the plugin.
-  That is the same rule, in the same bytes, the manifest enforces on a
-  `name`, so a row `declare` writes is a row the next command can read back. That catches a lost line separator across a large
-  set; a fixture test in your repo is the real defence.
+- Output is split on newline, and each line is trimmed of `\r` and of the
+  spaces and tabs around it (a PowerShell plugin emits CRLF, and pads a
+  column). What is left is the id: one that is empty, exceeds 256 bytes, or
+  carries whitespace, a control byte or a byte that is not UTF-8 is an error
+  naming the plugin. That is the class the manifest enforces on a `name`,
+  applied to what the trim left, so `  ripgrep  ` from `list` or `id` is
+  taken as `ripgrep`, where the manifest would refuse those same bytes as a
+  `name`. A `declare` answer is held to the class as written: its `name` is
+  read as TOML, and a padded one is refused, so a row `declare` writes is a
+  row the next command can read back. The shape rule catches a lost line
+  separator across a large set; a fixture test in your repo is the real
+  defence.
 
 `bootstrap` runs only when the manifest declares a `[[bootstrap]]` row for
 the backend and `available` says the manager is absent. mox fetches the
@@ -862,9 +881,14 @@ A plugin runs as you, at the trust `scripts/pre` already has, under the
 same environment a setup script gets: `MOX_REPO`, `MOX_STATE_DIR`,
 `MOX_HOME`, `PATH` and every fact as `MOX_FACT_*`, plus `MOX_PACKAGES_DEPTH`,
 which says that a mox already sits above this one. It is read as a yes or no
--- any value present, `0` included, means one is -- so a plugin cannot clear
-it by setting it, and the number it carries is capped rather than counted
-without end.
+-- any value present, `0` and the empty string included, means one is -- so a
+plugin can neither clear it by setting it nor by emptying it, and the number
+it carries is capped rather than counted without end. What the marker cannot
+survive is being removed: a plugin that unsets it, or calls mox through a
+scrubbed environment (`env -i`), leaves that mox nothing to read and is
+discovered by it again. The environment is the only channel to a child
+process, so a plugin that empties its own is asking for the run below to
+start over.
 
 The environment is what a setup script gets; the fact CONTRACT is not. A
 setup script's `MOX_FACT_*` use is read out of its text, asked for at the
