@@ -86,10 +86,17 @@ pub const max_packages_depth: u32 = 1024;
 
 /// How many mox runs `env` already sits under, in `0` (unset) or
 /// `1...max_packages_depth`. A value mox did not write -- a hand-set marker,
-/// `0` and `yes` alike -- still says "a mox is above this one", which is the
-/// only thing the depth is read for, so any value present is at least one.
+/// `0`, `yes` and the empty string alike -- still says "a mox is above this
+/// one", which is the only thing the depth is read for, so any value present
+/// is at least one. Read through `getAlloc` for exactly that: `get` answers
+/// null for an empty value as well as an absent one, which is right for a path
+/// but would let a plugin clear the guard it runs under by emptying it.
 fn packagesDepth(arena: std.mem.Allocator, env: Env) u32 {
-    const v = env.get(arena, packages_depth_var) orelse return 0;
+    const v = env.getAlloc(arena, packages_depth_var) catch |e| switch (e) {
+        error.EnvironmentVariableMissing => return 0,
+        // Present but unreadable is still present.
+        else => return 1,
+    };
     const parsed = std.fmt.parseInt(u32, v, 10) catch 1;
     return std.math.clamp(parsed, 1, max_packages_depth);
 }
@@ -280,10 +287,10 @@ pub fn renderHelpFooter(w: *std.Io.Writer, prog_name: []const u8) anyerror!void 
         \\  MOX_CHECK_TIMEOUT_MS  Wall-clock bound on check hooks in ms (default: 30000; <= 0 disables)
         \\  MOX_SCRIPT_TIMEOUT_MS  Wall-clock bound on setup scripts and every captured package-manager call in ms (default: 600000; <= 0 disables)
         \\  MOX_INSTALL_TIMEOUT_MS  Wall-clock bound on a package install, or a bootstrap's installer run, in ms (default: 0, no bound; interrupted, then killed 10s later). A bootstrap's download is a captured call, bounded by MOX_SCRIPT_TIMEOUT_MS
-        \\  MOX_PACKAGES_DEPTH  Set in every backend plugin's environment; any value present makes this run discover no plugin, so one that calls mox cannot recurse
+        \\  MOX_PACKAGES_DEPTH  Set in every backend plugin's environment; any value present, the empty string included, makes this run discover no plugin, so one that calls mox cannot recurse
         \\  HOME, USER     Standard POSIX env
         \\
-        \\See the project README for the full design spec.
+        \\See docs/commands.md for the full contract of every command.
         \\
     );
 }
@@ -495,7 +502,7 @@ test "PackageBackends.registry: a not-runnable twin of a built-in leaves the bui
     );
 }
 
-test "packagesDepth: absent is none, and any value set is a mox above this one" {
+test "packagesDepth: absent is none, and any value set -- the empty string included -- is a mox above this one" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -503,8 +510,10 @@ test "packagesDepth: absent is none, and any value set is a mox above this one" 
     var map = std.process.Environ.Map.init(a);
     const env: Env = .{ .map = &map };
     try std.testing.expectEqual(@as(u32, 0), packagesDepth(a, env));
+    // A shell empties a variable as readily as it sets one, so an empty
+    // value is a value like any other here.
     try map.put(packages_depth_var, "");
-    try std.testing.expectEqual(@as(u32, 0), packagesDepth(a, env));
+    try std.testing.expectEqual(@as(u32, 1), packagesDepth(a, env));
     try map.put(packages_depth_var, "1");
     try std.testing.expectEqual(@as(u32, 1), packagesDepth(a, env));
     try map.put(packages_depth_var, "3");
@@ -575,6 +584,57 @@ test "PackageBackends.registry: a mox running under a plugin discovers none, and
         "no plugin is discovered: this mox runs under one (MOX_PACKAGES_DEPTH is set); the built-in backends stay",
         hand_set.notes[0],
     );
+}
+
+test "PackageBackends.registry: a plugin that empties the marker still has the mox it calls discover no plugin" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "repo/scripts/backends");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/scripts/backends/macports", .data = "#!/bin/sh\n" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const state = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        try std.fs.path.join(a, &.{ repo, "scripts", "backends", "macports" }),
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+
+    var out_buf: [64]u8 = undefined;
+    var out_w = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [256]u8 = undefined;
+    var err_w = std.Io.Writer.fixed(&err_buf);
+
+    // `MOX_PACKAGES_DEPTH= mox status` from inside a plugin: the variable is
+    // there, holding nothing. Read as absent, it would put this run at the top
+    // of the chain, so the plugin would be discovered and run again -- and
+    // again at every level below, with nothing left to stop it.
+    var map = std.process.Environ.Map.init(a);
+    try map.put(packages_depth_var, "");
+    const saved = environ_override;
+    environ_override = .{ .map = &map };
+    defer environ_override = saved;
+
+    var pkg: PackageBackends = .{};
+    const reg = try pkg.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    try std.testing.expectEqual(@as(usize, 0), pkg.plugins.len);
+    try std.testing.expect(reg.find("macports") == null);
+    try std.testing.expectEqualStrings(
+        "no plugin is discovered: this mox runs under one (MOX_PACKAGES_DEPTH is set); the built-in backends stay",
+        pkg.notes[0],
+    );
+
+    // And the run below this one is told there are two above it, so emptying
+    // the marker costs the count nothing.
+    var child = std.process.Environ.Map.init(a);
+    try putPackagesDepth(a, &child, .{ .map = &map });
+    try std.testing.expectEqualStrings("2", child.get(packages_depth_var).?);
 }
 
 /// The environment every package backend and plugin runs under, for a
