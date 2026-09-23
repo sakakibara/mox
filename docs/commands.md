@@ -290,7 +290,9 @@ prompt's choices. The per-hunk keys are:
 `--yes` takes the defaults, terminal or not; `--dry-run`, or a non-TTY
 without `--yes`, reports only and exits 1 if edits remain;
 `--abort-on-prompt` is strict CI mode, exiting 2 on the first would-be
-prompt.
+prompt. Every mode exits 1 while anything is left undone -- a hunk
+reported manual, a skipped secret, a package still untracked, a file that
+failed to verify -- so a run that exits 0 leaves no drift behind.
 
 Routing: base lines go to `src/`, fragment lines to their fragment,
 loop-row edits to the data source. Private-origin edits go only to the
@@ -305,11 +307,13 @@ the edit against it. A source that now composes to nothing is the one
 exception: there is no file to route into, so commit reports it and
 leaves the live copy for you to remove or re-fill.
 
-A first-contact hunk always needs a human. `--yes` takes no default for
-one: it is reported as `manual: <path>:<line> first contact, needs
-confirmation`, the source is left untouched, and -- unlike the package
-pass -- the run still exits 0. In a script, read the `N manual` count
-rather than the exit code.
+A first-contact hunk always needs a human. No non-interactive mode takes a
+default for one -- not `--yes`, not a plain non-TTY, and not a
+multi-configuration file's "where does this belong?" route: it is
+reported as `manual: <path>:<line> first contact, needs confirmation`,
+the source is left untouched, and the run exits 1. `--dry-run` reports it
+the same way and counts it the same way, so the preview and the run it
+predicts agree.
 
 A file merged from several layers routes per KEY instead of per line
 (`y` accept, `p` pick a layer, `s` skip): each changed key goes to the

@@ -13,10 +13,12 @@
 //!
 //! On a TTY a routed line/row hunk is confirmed `[y/s]`, an unroutable
 //! hunk `[s/x]`, an interpolated hunk `[f/d/s]`, and a structured key
-//! change `[y/p/s]`; `--yes` takes the defaults; `--dry-run` and a non-TTY
-//! without `--yes` only report (exit 1 when hunks remain);
-//! `--abort-on-prompt` exits 2 for a prompt that would have been needed,
-//! terminal or not. All writes happen after every prompt, so aborting writes
+//! change `[y/p/s]`; `--yes` takes the defaults, except on first contact,
+//! where a baseline mox never wrote leaves no default to take; `--dry-run`
+//! and a non-TTY without `--yes` only report; every mode exits 1 while
+//! anything is left undone; `--abort-on-prompt` exits 2 for a prompt that
+//! would have been needed, terminal or not. All writes happen after every
+//! prompt, so aborting writes
 //! nothing. After a file's sources are edited it is recomposed:
 //! only when the result is byte-identical to the live file, and no
 //! configuration the user did not choose changed, is the applied record
@@ -584,7 +586,7 @@ fn reconcilePackages(
                     try ctx.out.flush();
                     try ctx.err.print(
                         "mox commit: {s} {s}: declare failed: {s}; record the row by hand\n",
-                        .{ b.backend, id, @errorName(e) },
+                        .{ b.backend, id, mox.packages.exec.errorText(e) },
                     );
                     try ctx.err.flush();
                     res.skipped += 1;
@@ -1820,7 +1822,11 @@ pub fn commitImpl(
             .{ pkgs.added, pkgs.blacklisted, pkgs.skipped },
         );
     }
-    return if (mismatch or skipped_secret > 0 or pkgs.pending()) 1 else 0;
+    // A manual hunk is work this run did not do, exactly like a skipped secret
+    // or an untracked package: without it here a wholly-manual file exits 0
+    // while the same state under `--dry-run` exits 1, and while `mox status`
+    // still reports the drift the commit left behind.
+    return if (mismatch or manual_count > 0 or skipped_secret > 0 or pkgs.pending()) 1 else 0;
 }
 
 /// Per-configuration guard outputs for a partial file: each composed text is
@@ -4067,6 +4073,25 @@ fn structValueText(
     return (try commit_struct.displayAt(arena, format, b, path)) orelse "(absent)";
 }
 
+/// Report one first-contact `.line`/`.row` hunk as manual. Every
+/// non-interactive mode takes this same path, which is what makes
+/// `--dry-run`'s "N routable" the count a later `--yes` run reproduces: a
+/// report that modelled the route a terminal would offer would promise work
+/// the run it predicts refuses to do.
+fn firstContactManual(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    hunk: Hunk,
+) !HunkOutcome {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
+    return .cont;
+}
+
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks
 /// produced by a `split` re-enter this same function, so a straddling hunk's
 /// pieces get the identical treatment a top-level hunk would: their own
@@ -4087,9 +4112,9 @@ fn processHunk(
     secret_lines: ?[]const []const u8,
     // True only on the first-contact fallback path (never the stored-baseline
     // or secret-fallback ones): the recomposed baseline this hunk diffs
-    // against was never something mox itself wrote, so a non-interactive
-    // `.line`/`.row` keep must not auto-accept -- another tool's rendering
-    // quirk would slip into source unseen.
+    // against was never something mox itself wrote, so no non-interactive
+    // mode may take a default on a `.line`/`.row` keep -- another tool's
+    // rendering quirk would slip into source unseen.
     first_contact: bool,
 ) !HunkOutcome {
     const route = try routeHunk(cc.arena, cc.io, segments, hunk, file, a_lines, b_lines, cc.m_state);
@@ -4151,6 +4176,7 @@ fn processHunk(
             return .cont;
         },
         .line => |r| {
+            if (first_contact and !cc.interactive) return firstContactManual(cc, ra, file, fidx, hunk);
             ra.routed_count.* += 1;
             // A shared-origin edit in a file whose OWN configuration space has
             // more than one member asks where the edit belongs; everything
@@ -4197,7 +4223,7 @@ fn processHunk(
                 return .cont;
             }
 
-            var accept = !cc.report_mode and !cc.interactive and !first_contact;
+            var accept = !cc.report_mode and !cc.interactive;
             if (cc.report_mode) {
                 ra.pending.* = true;
                 try cc.stdout.print("  would edit {s}\n", .{r.desc});
@@ -4220,16 +4246,6 @@ fn processHunk(
                     .abort_strict => return .abort_strict,
                     .report_only => unreachable,
                 }
-            } else if (first_contact) {
-                // First-contact keep is never a silent keep-all: `--yes` (and
-                // any other non-interactive mode) must not auto-route a hunk
-                // whose baseline was never something mox wrote, exactly like
-                // the `.fact` case below refuses to write a fact without an
-                // explicit human decision.
-                ra.manual_count.* += 1;
-                ra.manual_hunks[fidx] += 1;
-                ra.pending.* = true;
-                try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
             }
             if (accept) {
                 try ra.line_edits.append(cc.arena, r.edit);
@@ -4250,8 +4266,9 @@ fn processHunk(
             return .cont;
         },
         .row => |r| {
+            if (first_contact and !cc.interactive) return firstContactManual(cc, ra, file, fidx, hunk);
             ra.routed_count.* += 1;
-            var accept = !cc.report_mode and !cc.interactive and !first_contact;
+            var accept = !cc.report_mode and !cc.interactive;
             if (cc.report_mode) {
                 ra.pending.* = true;
                 try cc.stdout.print("  would update {s}\n", .{r.desc});
@@ -4269,13 +4286,6 @@ fn processHunk(
                     .abort_strict => return .abort_strict,
                     .report_only => unreachable,
                 }
-            } else if (first_contact) {
-                // Same refusal as the `.line` route above: a loop row's
-                // baseline here was never something mox wrote either.
-                ra.manual_count.* += 1;
-                ra.manual_hunks[fidx] += 1;
-                ra.pending.* = true;
-                try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
             }
             if (accept) {
                 try ra.row_edits.append(cc.arena, r.edit);

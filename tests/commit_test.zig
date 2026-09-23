@@ -232,18 +232,102 @@ test "commit --yes on a first-contact file never silently routes a spurious hunk
 
     // `--yes` reads no input at all -- if this silently auto-accepted, the
     // process would need none, and the spurious hunk would land in source.
-    // Nothing here was routed at all (the only hunk is manual), so this
-    // matches every other wholly-manual fallback test: only the report and
-    // the untouched sources are asserted, not the exit code -- see the
-    // sibling data-interpolated manual tests for the same rule.
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expect(std.mem.indexOf(u8, res.out, "manual") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
 
     // The hunk is a first-contact one, never a silent keep-all: nothing is
     // written to source, and the live file is untouched too.
     try std.testing.expectEqualStrings("export C=3\n", try read(io, a, try h.srcOf(".bashrc")));
     try std.testing.expectEqualStrings("export C=3 \n", try read(io, a, live));
+}
+
+test "commit --yes: a run whose every hunk is manual exits 1, the same code the identical state gets under --dry-run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An interpolated line: manual by design, and nothing else in the file to
+    // route -- so the run commits nothing and leaves the drift standing.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export HOST=<machine.hostname>\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export HOST=", "export HOSTNAME=");
+
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "commit", "--dry-run" })).rc);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "came from a capture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // What the exit code has to agree with: the drift the commit left behind.
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit --dry-run: a first-contact hunk is counted manual, the same way the --yes run counts it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.bashrc", "export C=3\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    // No `mox apply`: a live path mox never wrote, holding a real edit that
+    // would route on any other file.
+    const live = try h.liveOf(".bashrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export C=4\n" });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "0 routable, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings("export C=3\n", try read(io, a, try h.srcOf(".bashrc")));
+}
+
+test "commit --yes: a first-contact hunk in a multi-configuration file is manual, never routed into the shared source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The gated region gives the file a configuration space with more than one
+    // member, so the base-line edit takes the "where does this belong?" route
+    // -- the one path whose default `--yes` would otherwise take unasked.
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export EDITOR=nvim\n" ++
+        "# mox: when os=linux\n" ++
+        "export L=1\n" ++
+        "# mox: end\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    const live = try h.liveOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export EDITOR=vim\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings("export EDITOR=nvim\n" ++
+        "# mox: when os=linux\n" ++
+        "export L=1\n" ++
+        "# mox: end\n", try read(io, a, try h.srcOf(".zshrc")));
 }
 
 test "commit: a first-contact structured file with no matching layer creates one, scoped to this machine, and routes the key into it" {

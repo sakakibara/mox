@@ -1797,7 +1797,7 @@ test "plugin: one that crashes on available is a named error, not an inert backe
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      backend broken: scripts/backends/broken") != null);
 }
 
-test "commit: a plugin whose declare exits 64 is reported by name, and the run does not crash" {
+test "commit: a plugin whose declare exits 64 is reported in the shared human wording, never as a Zig error name" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1822,7 +1822,8 @@ test "commit: a plugin whose declare exits 64 is reported by name, and the run d
     try writeManifest(io, h, a, "n.toml", "backend = \"nodeclare\"\n");
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "nodeclare stray: declare failed: PluginFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "nodeclare stray: declare failed: the plugin exited nonzero, saying why above") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "PluginFailed") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "internal error") == null);
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 }
