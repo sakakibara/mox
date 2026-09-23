@@ -28,6 +28,15 @@ fn isIdentCont(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.' or c == '+';
 }
 
+/// The first identifier or keyword in `src`, as `lex` would split it; empty when
+/// `src` does not start with one.
+pub fn leadingWord(src: []const u8) []const u8 {
+    if (src.len == 0 or !isIdentStart(src[0])) return src[0..0];
+    var i: usize = 1;
+    while (i < src.len and isIdentCont(src[i])) : (i += 1) {}
+    return src[0..i];
+}
+
 pub const LexError = error{
     UnterminatedString,
     UnexpectedCharacter,

@@ -2,10 +2,12 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const scanner = @import("scanner.zig");
 const parser = @import("parser.zig");
+const lexer = @import("lexer.zig");
 
 pub const DriverError = error{
     UnmatchedEndMarker,
     UnclosedRegion,
+    TextAfterEnd,
 } || parser.ParseError || scanner.ScanError;
 
 /// Where a parse error occurred: the 1-based source line and the directive text
@@ -45,10 +47,15 @@ fn parseFileImpl(arena: std.mem.Allocator, src: []const u8, comment_marker: []co
         const args = ev.directive.args;
         const start_line = ev.directive.line_no;
         // Any error raised while parsing this directive (or the region it opens)
-        // points here; record it before unwinding.
+        // points here unless a line inside the region is the one at fault.
+        var err_at: ParseLoc = .{ .line = start_line, .directive = args };
         errdefer if (loc) |l| {
-            l.* = .{ .line = start_line, .directive = args };
+            l.* = err_at;
         };
+
+        if (try classify(args) == .end) {
+            return error.UnmatchedEndMarker;
+        }
 
         // Try line-level first.
         const line_dir = parser.parseLineDirective(arena, args, start_line) catch |err| switch (err) {
@@ -58,10 +65,6 @@ fn parseFileImpl(arena: std.mem.Allocator, src: []const u8, comment_marker: []co
         if (line_dir) |d| {
             try directives.append(arena, d);
             continue;
-        }
-
-        if (isEndMarker(args)) {
-            return error.UnmatchedEndMarker;
         }
 
         const opener = try parser.parseRegionOpener(arena, args, start_line, in_loop);
@@ -83,16 +86,20 @@ fn parseFileImpl(arena: std.mem.Allocator, src: []const u8, comment_marker: []co
                     end_line = c.line_no;
                 },
                 .directive => |d| {
-                    if (isEndMarker(d.args)) {
-                        if (depth == 0) {
-                            end_line = d.line_no;
-                            found_end = true;
-                            break;
-                        }
-                        depth -= 1;
-                    } else if (isRegionOpener(d.args)) {
-                        depth += 1;
+                    err_at = .{ .line = d.line_no, .directive = d.args };
+                    switch (try classify(d.args)) {
+                        .end => {
+                            if (depth == 0) {
+                                end_line = d.line_no;
+                                found_end = true;
+                                break;
+                            }
+                            depth -= 1;
+                        },
+                        .opener => depth += 1,
+                        .other => {},
                     }
+                    err_at = .{ .line = start_line, .directive = args };
                     raw = d.original_line;
                     end_line = d.line_no;
                 },
@@ -162,21 +169,22 @@ fn parseFileImpl(arena: std.mem.Allocator, src: []const u8, comment_marker: []co
     };
 }
 
-fn isEndMarker(args: []const u8) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, args, " \t"), "end");
-}
+pub const DirectiveClass = enum { opener, end, other };
 
-/// True when a directive opens a region (has a body closed by `end`), so it must
-/// be depth-counted while capturing an enclosing region's body. A line directive
-/// (`include`/`secret`) or an `end` returns false.
-fn isRegionOpener(args: []const u8) bool {
-    var e: usize = 0;
-    while (e < args.len and args[e] != ' ' and args[e] != '\t') : (e += 1) {}
-    const verb = args[0..e];
-    inline for (.{ "replace", "append", "prepend", "remove", "from", "when", "for" }) |o| {
-        if (std.mem.eql(u8, verb, o)) return true;
+/// Whether a directive opens a region, closes one, or neither, judged by its
+/// first word exactly as the lexer splits it, so depth counting always agrees
+/// with `parser.parseRegionOpener`. An `end` followed by anything is refused
+/// rather than read as content or as a missing closer.
+pub fn classify(args: []const u8) error{TextAfterEnd}!DirectiveClass {
+    const verb = lexer.leadingWord(args);
+    if (std.mem.eql(u8, verb, "end")) {
+        if (std.mem.trim(u8, args[verb.len..], " \t").len != 0) return error.TextAfterEnd;
+        return .end;
     }
-    return false;
+    inline for (.{ "replace", "append", "prepend", "remove", "from", "when", "for" }) |o| {
+        if (std.mem.eql(u8, verb, o)) return .opener;
+    }
+    return .other;
 }
 
 /// Strip leading whitespace, then the comment marker, then one space, from a loop-body line.
@@ -281,6 +289,39 @@ test "parseFile: when_gate.to_eof distinguishes an EOF gate from a terminated re
     const scoped = try parseFile(fba.allocator(), "# mox: when os=macos\nB\n# mox: end", "#", null);
     try std.testing.expect(scoped.directives[0].kind == .when_gate);
     try std.testing.expect(!scoped.directives[0].kind.when_gate.to_eof);
+}
+
+test "parseFile: an opener with no space after its verb nests like any other" {
+    var allocator_buf: [16384]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const src = "# mox: when os=a\n# mox: when(os=b)\nx\n# mox: end\ny\n# mox: end";
+    const parsed = try parseFile(fba.allocator(), src, "#", null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.directives.len);
+    try std.testing.expectEqual(@as(u32, 6), parsed.directives[0].end_line);
+    try std.testing.expect(!parsed.directives[0].kind.when_gate.to_eof);
+}
+
+test "parseFile: a line after an unspaced inner opener's end stays inside the outer gate" {
+    var allocator_buf: [16384]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    const src = "# mox: when os=a\n# mox: when(os=b)\nx\n# mox: end\ny";
+    const parsed = try parseFile(fba.allocator(), src, "#", null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.directives.len);
+    try std.testing.expect(parsed.directives[0].kind.when_gate.to_eof);
+    try std.testing.expect(std.mem.endsWith(u8, parsed.directives[0].kind.when_gate.body, "\ny"));
+}
+
+test "parseFile: an end carrying other text is refused where it stands" {
+    var allocator_buf: [16384]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buf);
+    var loc: ParseLoc = .{};
+    try std.testing.expectError(error.TextAfterEnd, parseFile(fba.allocator(), "# mox: when os=a\nx\n# mox: end # note\ny", "#", &loc));
+    try std.testing.expectEqual(@as(u32, 3), loc.line);
+    try std.testing.expectEqualStrings("end # note", loc.directive);
+
+    loc = .{};
+    try std.testing.expectError(error.TextAfterEnd, parseFile(fba.allocator(), "x\n# mox: end foo", "#", &loc));
+    try std.testing.expectEqual(@as(u32, 2), loc.line);
 }
 
 test "parseFile: for loop captures body verbatim (compose strips the prefix)" {

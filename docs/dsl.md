@@ -65,7 +65,10 @@ consumed head directive; see File attributes and head directives). The lines
 between opener and `end` are the region's literal fallback body, used when the
 selecting condition is false or no fragment matches. A body is itself a
 template: it may contain nested directives -- a `when` or `for` inside a `for`,
-and so on -- each closed by its own `# mox: end`, matched by depth.
+and so on -- each closed by its own `# mox: end`, matched by depth. A
+directive line counts as an opener or a closer by its first word as the
+parser reads it, so `when(os=darwin)` nests like `when os=darwin`, and an
+`end` followed by anything else is refused on the line it stands on.
 
 | Directive | Effect |
 |---|---|
