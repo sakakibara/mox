@@ -2620,7 +2620,9 @@ fn processStructFile(
 /// Route a set of changed key paths into their source layers: the shared
 /// tail of the whole-file structured flow and the partial per-key flow.
 /// Each change is one prompt item with the full `[y/p/s]`/pick machinery;
-/// accepted edits are deferred to the write phase.
+/// accepted edits are deferred to the write phase. `composed_bytes` is this
+/// machine's output the changes were diffed against, or null when they were
+/// diffed against something else.
 fn routeStructChanges(
     cc: *const ClassCtx,
     ra: *const RunAccum,
@@ -2629,14 +2631,14 @@ fn routeStructChanges(
     space: FileSpace,
     format: commit_struct.Format,
     changes: []const commit_struct.KeyPathChange,
-    composed_bytes: []const u8,
+    composed_bytes: ?[]const u8,
     first_contact: bool,
 ) !HunkOutcome {
     ra.affected[fidx] = true;
-    const composed = commit_struct.parseLayer(cc.arena, format, composed_bytes) catch |e| switch (e) {
+    const composed = if (composed_bytes) |b| commit_struct.parseLayer(cc.arena, format, b) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => null,
-    };
+    } else null;
 
     const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -3605,7 +3607,11 @@ fn processPartialFile(
     // Partial routing verifies over the repo-wide configuration space, like
     // every structured route.
     if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(arena, cc.io, cc.this_bindings, file, repo_dir);
-    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, bytes, false);
+    // The changes were diffed against the owned record, not the fresh
+    // compose, so a key's resolved name from the last apply may be absent
+    // from `bytes`; with no baseline to match, a capture-named container
+    // refuses outright.
+    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, null, false);
 }
 
 /// A partial file's manual (un-routable) outcome. Marks the file affected

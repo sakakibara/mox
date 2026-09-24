@@ -4492,6 +4492,32 @@ test "commit partial: an owned key under a padded ini section header routes" {
     try std.testing.expectEqualStrings("# mox: disown other\n[ s ]\nk = b\n", try read(io, a, try h.srcOf("p.ini")));
 }
 
+test "commit partial: a key named by a capture whose value changed since apply is never written under its old name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "# mox: disown other\n[t]\n\"<machine.profile>\" = \"a\"\nv = \"<machine.profile>-x\"\n";
+    try writeRepo(io, &tmp, "repo/src/p.toml", src);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "facts", "set", "profile", "alpha" })).rc);
+    _ = try h.run(&.{ "mox", "apply", "--defaults" });
+
+    const live = try h.liveOf("p.toml");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "\"alpha\" = \"a\"") != null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "facts", "set", "profile", "beta" })).rc);
+    try editLive(io, a, live, "\"alpha\" = \"a\"", "\"alpha\" = \"b\"");
+    try editLive(io, a, live, "v = \"alpha-x\"", "v = \"alpha-y\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "\"alpha\" = \"b\"") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+    try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf("p.toml")));
+}
+
 test "commit partial: [y] routes an owned-key edit to the base and advances the owned record" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
