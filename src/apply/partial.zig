@@ -98,9 +98,7 @@ pub const AnyValue = union(enum) {
     ini: ini.Value,
 };
 
-fn iniDialect(format: Format) ini.Dialect {
-    return if (format == .gitconfig) ini.Dialect.gitconfig else ini.Dialect.generic;
-}
+const iniDialect = format_mod.iniDialect;
 
 /// The composed owned document: the parse of the composed source text,
 /// queried per declared path. Later folds reuse this as the record and

@@ -5,9 +5,22 @@
 //! answer "is this target structured, and as what" from one table.
 
 const std = @import("std");
+const ini = @import("ini");
 
 /// A structured format with a per-key document model.
 pub const Format = enum { toml, json, yaml, ini, gitconfig };
+
+/// The dialect an INI or gitconfig document is read with wherever mox matches
+/// its sections. The section merge that composes a layered file trims a
+/// section name before matching it, so `[ s ]` and `[s]` are one section;
+/// reading a document any other way would disagree with the merge about
+/// which section, and so which layer, a key is in.
+pub fn iniDialect(format: Format) ini.Dialect {
+    if (format == .gitconfig) return .gitconfig;
+    var d: ini.Dialect = .generic;
+    d.trim_section_names = true;
+    return d;
+}
 
 /// XDG git config files carry no telling extension: `~/.config/git/config`
 /// plus the `.inc` includes git's `[include]`/`[includeIf]` mechanism points

@@ -470,16 +470,7 @@ fn emitDoc(arena: std.mem.Allocator, doc: anytype) ![]const u8 {
 
 pub const formatOfPath = source_format.formatOfPath;
 
-/// The dialect commit reads an INI or gitconfig layer with. The section merge
-/// that composes these files trims a section name before matching it, so
-/// `[ s ]` in one layer is `[s]` in another; reading layers any other way
-/// would attribute a merged key to a layer the merge did not take it from.
-fn iniDialect(format: Format) ini.Dialect {
-    if (format == .gitconfig) return .gitconfig;
-    var d: ini.Dialect = .generic;
-    d.trim_section_names = true;
-    return d;
-}
+const iniDialect = source_format.iniDialect;
 
 /// Parse one layer's bytes into a `Value` tagged by `format`, for the pure
 /// layer-selection walk. INI and gitconfig share ini-zig's `Value`.
