@@ -2930,6 +2930,54 @@ test "commit: the summary counts nothing as committed when the routing was rejec
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
 }
 
+test "commit: a coupled edit to a file that is not committed is rolled back with it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note os=darwin\n");
+    try writeRepo(io, &tmp, "repo/src/.config/x.toml", "# mox: when os=darwin\nkey = \"v\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "os=darwin", "os=linux");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/x.toml"), .data = "[[[not toml\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("# mox: when os=darwin\nkey = \"v\"\n# mox: end\n", try read(io, a, try h.srcOf(".config/x.toml")));
+}
+
+test "commit: a manual-only file that took a coupled edit is not reported committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkatoken\n");
+    try writeRepo(io, &tmp, "repo/src/.config/x.toml", "# mox: when os=darwin\n# quokkatoken\nkey = \"v\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/x.toml"), .data = "[[[not toml\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/x.toml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "x.toml: 1 hunk(s) could not be routed and remain only in the live file; not committed") != null);
+}
+
 test "commit: a coupled token in a symlink target or seed-once body is not rewritten" {
     // The symlink source is materialized live during apply; needs symlink support.
     if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;

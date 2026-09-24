@@ -1273,12 +1273,16 @@ pub fn commitImpl(
         }
     }
 
-    // Pre-write bytes of every source a routed edit will rewrite, grouped by
-    // the file it was routed from. When verification rejects that file's
+    // Pre-write bytes of every source a routed or coupled edit will rewrite,
+    // grouped by the file it was routed from. When verification rejects that file's
     // routing, these restore its sources exactly -- "not committed" must leave
     // nothing behind, including a fragment the synthesis created.
     const routed_orig = try ctx.alloc.alloc([]const Backup, tree.files.len);
     @memset(routed_orig, &.{});
+    // Whether the file's own changes wrote anything, as distinct from a
+    // coupled token update another file's edit made to it.
+    const routed_own = try ctx.alloc.alloc(bool, tree.files.len);
+    @memset(routed_own, false);
     for (tree.files, 0..) |_, fidx| {
         if (!affected[fidx]) continue;
         var bs: std.ArrayList(Backup) = .empty;
@@ -1296,6 +1300,13 @@ pub fn commitImpl(
         for (struct_edits.items, struct_owners.items) |e, owner| {
             if (owner == fidx) try addBackup(ctx.alloc, ctx.io, &bs, e.layer_abs);
         }
+        routed_own[fidx] = bs.items.len > 0;
+        // A coupled token update to this file's own base is a write to it
+        // like any routed one, and must roll back with it.
+        const file = tree.files[fidx];
+        if (file.has_base and file.source_base_abs.len > 0 and
+            (try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs)).len > 0)
+            try addBackup(ctx.alloc, ctx.io, &bs, file.source_base_abs);
         routed_orig[fidx] = try bs.toOwnedSlice(ctx.alloc);
     }
 
@@ -1603,10 +1614,7 @@ pub fn commitImpl(
             // A file whose every change stayed manual or declined wrote
             // nothing, so its source composing to nothing here is how it
             // already stood, not something the routing did.
-            if (routed_orig[fidx].len == 0 and fact_backup[fidx].len == 0 and
-                (try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs)).len == 0 and
-                manual_hunks[fidx] + declined_hunks[fidx] > 0)
-            {
+            if (routed_orig[fidx].len == 0 and fact_backup[fidx].len == 0 and manual_hunks[fidx] + declined_hunks[fidx] > 0) {
                 try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], false);
                 continue;
             }
@@ -1672,16 +1680,17 @@ pub fn commitImpl(
                 // `ra.affected[fidx]` is forced true for a structured file the
                 // instant any key changes (see `processStructFile`'s doc
                 // comment), even when every key ends up manual or declined and
-                // nothing was ever routed. `routed_orig[fidx]` holds a backup
-                // per actually-routed edit owned by this file, so its emptiness
-                // is the real "was anything committed" signal -- distinct from
-                // `explained > 0`, which only says the mismatch is accounted
-                // for. A `[f]` route writes a fact rather than a source, so it
-                // has no `routed_orig` entry and must be counted here too: this
+                // nothing was ever routed. `routed_own[fidx]` says whether any
+                // edit routed from this file wrote a source -- the real "was
+                // anything committed" signal, distinct from `explained > 0`,
+                // which only says the mismatch is accounted for, and from a
+                // coupled token update, which another file's edit made. A
+                // `[f]` route writes a fact rather than a source, so it has no
+                // backup and must be counted here too: this
                 // branch leaves the file un-rolled-back, so `restoreUnkeptFacts`
                 // KEEPS that fact, and reporting "not committed" would deny a
                 // write that stands.
-                const has_routed = routed_orig[fidx].len > 0 or fact_backup[fidx].len > 0;
+                const has_routed = routed_own[fidx] or fact_backup[fidx].len > 0;
                 try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], has_routed);
                 if (has_routed) {
                     try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});

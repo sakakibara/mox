@@ -278,6 +278,11 @@ All notable changes to mox are documented here. The format follows
   declined, and whose source composes to nothing on this machine, was
   reported as broken by the routing and had its sources restored; it is now
   reported as its changes remaining only in the live file.
+- A file `commit` does not commit has a coupled token update to its own
+  source rolled back with the rest. Only sources an edit was routed into
+  were saved for rollback, so a token synced into an edited file stayed
+  written when that file was then refused, even when it left the source
+  composing to nothing.
 - `commit` checks the source around an insertion before routing it. An
   insertion replaces no line, so nothing confirmed that the source still held
   what the hunk was diffed against: after the source changed since the last
