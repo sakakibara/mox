@@ -289,7 +289,8 @@ All notable changes to mox are documented here. The format follows
   `[includeIf "gitdir:<machine.home>/work/"]`. Live holds the resolved name,
   which no source layer defines, so the edit was taken for a new key and
   written into the base under that name; it is now manual as named by an
-  interpolation capture.
+  interpolation capture. A key the user adds beside such a key, which this
+  machine's composed output did not have, is still taken for a new key.
 - A key `commit` routes into a file merged from layers must recompose to its
   live value even when another change in that file stays manual or
   declined. Such a file was excused from matching live as a whole, so a key

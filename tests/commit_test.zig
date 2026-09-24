@@ -965,6 +965,52 @@ test "commit: an ini key under a padded section name routes to the layer the mer
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("s.ini.d/os=darwin.ini")), "k = changed") != null);
 }
 
+test "commit: a new toml key beside one named by a capture routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/s.toml", "\"<machine.os>\" = \"a\"\nsize = 1\n");
+    try writeRepo(io, &tmp, "repo/src/s.toml.d/os=darwin.toml", "size = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("s.toml");
+    try editLive(io, a, live, "size = 2", "size = 2\nfresh = 7");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "fresh = 7") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("s.toml")), "fresh = 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("s.toml")), "<machine.os>") != null);
+}
+
+test "commit: a new gitconfig subsection beside one named by a capture is not refused as capture-named" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "[includeIf \"gitdir:<machine.os>/work/\"]\n\tpath = w\n[user]\n\tname = a\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/os=darwin", "[user]\n\tname = b\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".gitconfig");
+    const before = try read(io, a, live);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = try std.mem.concat(a, u8, &.{ before, "[includeIf \"gitdir:~/oss/\"]\n\tpath = o\n" }) });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "named by an interpolation capture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "write .gitconfig includeif.gitdir:~/oss/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".gitconfig")), "gitdir:<machine.os>/work/") != null);
+}
+
 test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

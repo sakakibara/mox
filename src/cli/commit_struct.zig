@@ -517,6 +517,7 @@ pub fn resolveLayer(
     format: Format,
     layers: []const StructLayer,
     change: KeyPathChange,
+    composed: ?Value,
 ) !Resolution {
     // Every layer that defines the key, most-specific-first.
     var defs: std.ArrayList(usize) = .empty;
@@ -536,7 +537,7 @@ pub fn resolveLayer(
     }
 
     for (layers) |l| {
-        if (keyNamedByCapture(format, l.value, change.path))
+        if (keyNamedByCapture(format, l.value, change.path, composed))
             return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "key is named by an interpolation capture" };
     }
 
@@ -607,9 +608,11 @@ fn iniHas(v: ini.Value, path: []const []const u8) bool {
 /// Whether a segment of `path` may be the resolved name of a key, table or
 /// section that `value` names with a capture: at the first depth where the
 /// segment is not a literal key of its container, that container has a key
-/// whose name holds a capture. Routing there would write this machine's
-/// resolved name into shared source.
-fn keyNamedByCapture(format: Format, value: Value, path: []const []const u8) bool {
+/// whose name holds a capture, and the segment was already there in
+/// `composed`, this machine's composed output -- a segment it lacks is a key
+/// the user added. Routing there would write this machine's resolved name
+/// into shared source. With `composed` unknown, any such container refuses.
+fn keyNamedByCapture(format: Format, value: Value, path: []const []const u8, composed: ?Value) bool {
     for (0..path.len) |d| {
         const literal = switch (format) {
             .toml => if (tomlAt(value.toml, path[0..d])) |c| switch (c) {
@@ -630,6 +633,9 @@ fn keyNamedByCapture(format: Format, value: Value, path: []const []const u8) boo
             } else return false,
         };
         if (literal) continue;
+        if (composed) |c| {
+            if (!definesPath(format, c, path[0 .. d + 1])) return false;
+        }
         return switch (format) {
             .toml => tomlKeysCaptured(tomlAt(value.toml, path[0..d]).?.table),
             .json => jsonKeysCaptured(jsonAt(value.json, path[0..d]).?.object),
@@ -1845,7 +1851,7 @@ test "resolveLayer: changed key won by an overlay targets that overlay" {
     };
     const change: KeyPathChange = .{ .path = &.{"theme"}, .new = .{ .toml = .{ .string = "solarized" } }, .removed = false };
 
-    const res = try resolveLayer(a, .toml, &layers, change);
+    const res = try resolveLayer(a, .toml, &layers, change, null);
     try testing.expectEqual(Resolution.Action.set, res.action);
     try testing.expectEqual(@as(usize, 1), res.target);
     try testing.expectEqual(@as(usize, 2), res.definers.len);
@@ -1866,7 +1872,7 @@ test "resolveLayer: new key with no definer targets the base" {
     };
     const change: KeyPathChange = .{ .path = &.{"newkey"}, .new = .{ .toml = .{ .integer = 1 } }, .removed = false };
 
-    const res = try resolveLayer(a, .toml, &layers, change);
+    const res = try resolveLayer(a, .toml, &layers, change, null);
     try testing.expectEqual(Resolution.Action.set, res.action);
     try testing.expectEqual(@as(usize, 0), res.target);
     try testing.expectEqual(@as(usize, 0), res.definers.len);
@@ -1885,7 +1891,7 @@ test "resolveLayer: single-layer removal targets the sole definer" {
     };
     const change: KeyPathChange = .{ .path = &.{"extra"}, .new = null, .removed = true };
 
-    const res = try resolveLayer(a, .toml, &layers, change);
+    const res = try resolveLayer(a, .toml, &layers, change, null);
     try testing.expectEqual(Resolution.Action.remove, res.action);
     try testing.expectEqual(@as(usize, 1), res.target);
 }
@@ -1903,7 +1909,7 @@ test "resolveLayer: multi-layer removal is skipped" {
     };
     const change: KeyPathChange = .{ .path = &.{"theme"}, .new = null, .removed = true };
 
-    const res = try resolveLayer(a, .toml, &layers, change);
+    const res = try resolveLayer(a, .toml, &layers, change, null);
     try testing.expectEqual(Resolution.Action.skip, res.action);
     try testing.expect(res.skip_reason != null);
 }
@@ -1919,7 +1925,7 @@ test "resolveLayer: an interpolation-derived value is skipped, never routed" {
     };
     const change: KeyPathChange = .{ .path = &.{"email"}, .new = .{ .toml = .{ .string = "me@x.test" } }, .removed = false };
 
-    const res = try resolveLayer(a, .toml, &layers, change);
+    const res = try resolveLayer(a, .toml, &layers, change, null);
     try testing.expectEqual(Resolution.Action.skip, res.action);
 }
 
@@ -1956,7 +1962,7 @@ test "resolveLayer: yaml winner and json winner resolve the most-specific layer"
         .{ .path = "os=darwin.yaml", .is_base = false, .value = .{ .yaml = yov } },
     };
     const ychange: KeyPathChange = .{ .path = &.{"theme"}, .new = .{ .yaml = .{ .string = "solarized" } }, .removed = false };
-    const yres = try resolveLayer(a, .yaml, &ylayers, ychange);
+    const yres = try resolveLayer(a, .yaml, &ylayers, ychange, null);
     try testing.expectEqual(@as(usize, 1), yres.target);
 
     const jbase = try json.parse(a, "{\"theme\":\"light\"}", .{ .dialect = .jsonc });
@@ -1966,7 +1972,7 @@ test "resolveLayer: yaml winner and json winner resolve the most-specific layer"
         .{ .path = "os=darwin.json", .is_base = false, .value = .{ .json = jov } },
     };
     const jchange: KeyPathChange = .{ .path = &.{"theme"}, .new = .{ .json = .{ .string = "solarized" } }, .removed = false };
-    const jres = try resolveLayer(a, .json, &jlayers, jchange);
+    const jres = try resolveLayer(a, .json, &jlayers, jchange, null);
     try testing.expectEqual(@as(usize, 1), jres.target);
 }
 
@@ -1982,7 +1988,7 @@ test "resolveLayer: gitconfig nested key resolves through sections" {
         .{ .path = "os=darwin.gitconfig", .is_base = false, .value = .{ .ini = ov } },
     };
     const change: KeyPathChange = .{ .path = &.{ "user", "name" }, .new = .{ .ini = .{ .string = "picked" } }, .removed = false };
-    const res = try resolveLayer(a, .gitconfig, &layers, change);
+    const res = try resolveLayer(a, .gitconfig, &layers, change, null);
     try testing.expectEqual(@as(usize, 1), res.target);
     try testing.expectEqual(@as(usize, 2), res.definers.len);
 }

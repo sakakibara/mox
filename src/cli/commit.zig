@@ -2614,7 +2614,7 @@ fn processStructFile(
         return .cont;
     }
 
-    return routeStructChanges(cc, ra, file, fidx, space, format, changes, first_contact);
+    return routeStructChanges(cc, ra, file, fidx, space, format, changes, last_content, first_contact);
 }
 
 /// Route a set of changed key paths into their source layers: the shared
@@ -2629,9 +2629,14 @@ fn routeStructChanges(
     space: FileSpace,
     format: commit_struct.Format,
     changes: []const commit_struct.KeyPathChange,
+    composed_bytes: []const u8,
     first_contact: bool,
 ) !HunkOutcome {
     ra.affected[fidx] = true;
+    const composed = commit_struct.parseLayer(cc.arena, format, composed_bytes) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => null,
+    };
 
     const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -2646,7 +2651,7 @@ fn routeStructChanges(
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
 
     for (changes, 0..) |change, ki| {
-        const res = try commit_struct.resolveLayer(cc.arena, format, layers, change);
+        const res = try commit_struct.resolveLayer(cc.arena, format, layers, change, composed);
         if (res.action == .skip) {
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
@@ -3600,7 +3605,7 @@ fn processPartialFile(
     // Partial routing verifies over the repo-wide configuration space, like
     // every structured route.
     if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(arena, cc.io, cc.this_bindings, file, repo_dir);
-    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, false);
+    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, bytes, false);
 }
 
 /// A partial file's manual (un-routable) outcome. Marks the file affected
