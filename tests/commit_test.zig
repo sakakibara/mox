@@ -918,6 +918,53 @@ test "commit: a literal key beside one named by a capture still routes" {
     try std.testing.expect(!std.mem.eql(u8, base, try read(io, a, try h.srcOf("s.toml"))));
 }
 
+test "commit: an ini key under a padded section name is checked in the layer the merge took it from" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "[s]\nk = plain\n";
+    try writeRepo(io, &tmp, "repo/src/s.ini", base);
+    try writeRepo(io, &tmp, "repo/src/s.ini.d/os=darwin.ini", "[ s ]\nk = pre-<machine.os>\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("s.ini");
+    try editLive(io, a, live, "k = pre-darwin", "k = post-darwin");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = post-darwin") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "value is interpolation- or secret-derived") != null);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("s.ini")));
+}
+
+test "commit: an ini key under a padded section name routes to the layer the merge took it from" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/s.ini", "[s]\nk = plain\n");
+    try writeRepo(io, &tmp, "repo/src/s.ini.d/os=darwin.ini", "[ s ]\nk = over\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("s.ini");
+    try editLive(io, a, live, "k = over", "k = changed");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = changed") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[s]\nk = plain\n", try read(io, a, try h.srcOf("s.ini")));
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("s.ini.d/os=darwin.ini")), "k = changed") != null);
+}
+
 test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

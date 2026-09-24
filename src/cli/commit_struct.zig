@@ -92,7 +92,7 @@ pub fn changedKeyPaths(
             try walkYaml(arena, &.{}, live, composed, &out);
         },
         .ini, .gitconfig => {
-            const dialect: ini.Dialect = if (format == .gitconfig) .gitconfig else .generic;
+            const dialect = iniDialect(format);
             const live = try ini.parse(arena, live_bytes, .{ .dialect = dialect });
             const composed = try ini.parse(arena, composed_bytes, .{ .dialect = dialect });
             if (live != .section or composed != .section) return error.NotASection;
@@ -451,7 +451,7 @@ fn applyYamlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPa
 }
 
 fn applyIniLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange, format: Format) ![]const u8 {
-    const dialect: ini.Dialect = if (format == .gitconfig) .gitconfig else .generic;
+    const dialect = iniDialect(format);
     var doc = if (emptyLayer(existing)) try ini.Document.empty(arena, .{ .dialect = dialect }) else try ini.Document.parse(arena, existing.?, .{ .dialect = dialect });
     if (change.removed) try doc.removeSegments(change.path) else try doc.setValueSegments(change.path, change.new.?.ini);
     return emitDoc(arena, &doc);
@@ -470,6 +470,17 @@ fn emitDoc(arena: std.mem.Allocator, doc: anytype) ![]const u8 {
 
 pub const formatOfPath = source_format.formatOfPath;
 
+/// The dialect commit reads an INI or gitconfig layer with. The section merge
+/// that composes these files trims a section name before matching it, so
+/// `[ s ]` in one layer is `[s]` in another; reading layers any other way
+/// would attribute a merged key to a layer the merge did not take it from.
+fn iniDialect(format: Format) ini.Dialect {
+    if (format == .gitconfig) return .gitconfig;
+    var d: ini.Dialect = .generic;
+    d.trim_section_names = true;
+    return d;
+}
+
 /// Parse one layer's bytes into a `Value` tagged by `format`, for the pure
 /// layer-selection walk. INI and gitconfig share ini-zig's `Value`.
 pub fn parseLayer(arena: std.mem.Allocator, format: Format, bytes: []const u8) !Value {
@@ -477,8 +488,7 @@ pub fn parseLayer(arena: std.mem.Allocator, format: Format, bytes: []const u8) !
         .toml => .{ .toml = try toml.parse(arena, bytes, .{}) },
         .json => .{ .json = try json.parse(arena, bytes, .{ .dialect = .jsonc }) },
         .yaml => .{ .yaml = try yaml.parse(arena, bytes, .{}) },
-        .ini => .{ .ini = try ini.parse(arena, bytes, .{ .dialect = .generic }) },
-        .gitconfig => .{ .ini = try ini.parse(arena, bytes, .{ .dialect = .gitconfig }) },
+        .ini, .gitconfig => .{ .ini = try ini.parse(arena, bytes, .{ .dialect = iniDialect(format) }) },
     };
 }
 
