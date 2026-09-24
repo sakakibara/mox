@@ -504,6 +504,83 @@ test "commit: a first-contact structured file with no matching layer creates one
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
 
+test "commit --yes: a first-contact structured file with no matching layer creates nothing, and --dry-run predicts that" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=linux.toml", "theme = \"light\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    const live = try h.liveOf("settings.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "theme = \"dark\"\n" });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "0 routable, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would create") == null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expect(!exists(io, try h.srcOf("settings.toml.d/os=darwin")));
+    try std.testing.expect(!exists(io, try h.srcOf("settings.toml.d/os=darwin.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "no longer compose") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "1 hunk(s) could not be routed and remain only in the live file; not committed") != null);
+}
+
+test "commit --yes: a first-contact structured file with layers routes no key, and --dry-run predicts that" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/settings.toml", "theme = \"light\"\nsize = 1\n");
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=darwin.toml", "size = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    const live = try h.liveOf("settings.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "theme = \"dark\"\nsize = 2\n" });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "0 routable, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would write") == null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqualStrings("theme = \"light\"\nsize = 1\n", try read(io, a, try h.srcOf("settings.toml")));
+    try std.testing.expectEqualStrings("size = 2\n", try read(io, a, try h.srcOf("settings.toml.d/os=darwin.toml")));
+}
+
+test "commit: a first-contact structured file with layers routes a key into source once confirmed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/settings.toml", "theme = \"light\"\nsize = 1\n");
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=darwin.toml", "size = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+
+    const live = try h.liveOf("settings.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "theme = \"dark\"\nsize = 2\n" });
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("settings.toml")), "dark") != null);
+}
+
 test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4340,6 +4417,34 @@ test "commit: symlink-target keep syncs a plain-literal source to the new live t
     try std.testing.expect(std.mem.indexOf(u8, re.out, "unchanged") != null);
 }
 
+test "commit --yes: a symlink mox never wrote keeps no target, and --dry-run predicts that" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSymlinkFixture(io, &tmp, "/tmp/mox-old-target\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    const live = try h.liveOf("mylink");
+    try Io.Dir.cwd().symLink(io, "/tmp/mox-foreign-target", live, .{});
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "0 routable, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would keep") == null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqualStrings("/tmp/mox-old-target\n", try read(io, a, try h.srcOf("mylink")));
+}
+
 test "commit: symlink-target keep does not clobber a capture-bearing source" {
     if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
     const io = std.testing.io;
@@ -4535,6 +4640,37 @@ test "commit: a generator leaf edit that reverse-parses cleanly routes to its da
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
     const re = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), re.rc);
+}
+
+test "commit --yes: a generator leaf mox never wrote routes no row, and --dry-run predicts that" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{ .{ "a", "1" }, .{ "b", "2" } });
+    const h = try setup(a, io, &tmp, .{});
+
+    const leaf_a = try h.liveOf(".config/id-a.inc");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf_a).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_a, .data = "key=99\n" });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "0 routable, 0 coupled, 1 manual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") == null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "first contact, needs confirmation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqualStrings(
+        "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n\n",
+        try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })),
+    );
 }
 
 test "commit: a generator leaf edit that does not match the row template surfaces as the shared template, not a silent route" {

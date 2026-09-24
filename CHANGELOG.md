@@ -265,6 +265,19 @@ All notable changes to mox are documented here. The format follows
   environment and left the rest to be inferred.
 
 ### Fixed
+- No non-interactive `commit` adopts content mox never wrote. A
+  first-contact line already needed a human, but under `--yes` a
+  first-contact file merged from layers had each key routed unasked, one no
+  layer matches on this machine had an overlay created for it, a generator
+  leaf had its row written into the data source, and a symlink had its
+  target kept into the source. Each is now `first contact, needs
+  confirmation`, `--dry-run` says so instead of promising the write, and the
+  run exits 1.
+- `commit` no longer reports "the edited sources no longer compose" for a
+  file it wrote nothing to. A file whose every change stayed manual or
+  declined, and whose source composes to nothing on this machine, was
+  reported as broken by the routing and had its sources restored; it is now
+  reported as its changes remaining only in the live file.
 - `commit` checks the source around an insertion before routing it. An
   insertion replaces no line, so nothing confirmed that the source still held
   what the hunk was diffed against: after the source changed since the last

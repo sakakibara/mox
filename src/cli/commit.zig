@@ -977,7 +977,7 @@ pub fn commitImpl(
             };
             if (gen) |outputs| {
                 const only_leaves = if (scoped_leaves) |*m| m.getPtr(file.live_path) else null;
-                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, &gen_row_edits, &gen_leaf_commits)) {
+                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, context.paths.state_dir, &gen_row_edits, &gen_leaf_commits)) {
                     .cont => {},
                     .abort => {
                         aborted = true;
@@ -1132,7 +1132,7 @@ pub fn commitImpl(
         if (commit_struct.formatOfPath(file.source_base_path)) |sf| {
             if (containsOverlayOrigin(prov.segments)) {
                 spaces[fidx] = try structFileSpace(ctx.alloc, ctx.io, &bindings, file, context.paths.repo_dir);
-                switch (try processStructFile(&cc, &ra, file, fidx, spaces[fidx].?, sf, last_content, live)) {
+                switch (try processStructFile(&cc, &ra, file, fidx, spaces[fidx].?, sf, last_content, live, false)) {
                     .cont => {},
                     .abort => {
                         aborted = true;
@@ -1600,6 +1600,13 @@ pub fn commitImpl(
         // explain that, so it is a bug in the write. Put every source back.
         if (composed == null) {
             mismatch = true;
+            // A file whose every change stayed manual or declined wrote
+            // nothing, so its source composing to nothing here is how it
+            // already stood, not something the routing did.
+            if (routed_orig[fidx].len == 0 and fact_backup[fidx].len == 0 and manual_hunks[fidx] + declined_hunks[fidx] > 0) {
+                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], false);
+                continue;
+            }
             rolled_back[fidx] = true;
             try restoreRouted(ctx.io, routed_orig[fidx]);
             try ctx.err.print(
@@ -1672,48 +1679,7 @@ pub fn commitImpl(
                 // KEEPS that fact, and reporting "not committed" would deny a
                 // write that stands.
                 const has_routed = routed_orig[fidx].len > 0 or fact_backup[fidx].len > 0;
-                if (manual_hunks[fidx] > 0 and declined_hunks[fidx] > 0) {
-                    if (has_routed) {
-                        try ctx.err.print(
-                            "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
-                                "in the live file; the routed edits were committed to the sources -- edit the rest in by hand, " ++
-                                "then run 'mox apply'\n",
-                            .{ file.live_path, manual_hunks[fidx], declined_hunks[fidx] },
-                        );
-                    } else {
-                        try ctx.err.print(
-                            "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
-                                "in the live file; not committed\n",
-                            .{ file.live_path, manual_hunks[fidx], declined_hunks[fidx] },
-                        );
-                    }
-                } else if (manual_hunks[fidx] > 0) {
-                    if (has_routed) {
-                        try ctx.err.print(
-                            "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; " ++
-                                "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n",
-                            .{ file.live_path, manual_hunks[fidx] },
-                        );
-                    } else {
-                        try ctx.err.print(
-                            "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; not committed\n",
-                            .{ file.live_path, manual_hunks[fidx] },
-                        );
-                    }
-                } else {
-                    if (has_routed) {
-                        try ctx.err.print(
-                            "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; " ++
-                                "the routed edits were committed to the sources -- run 'mox apply' to discard them\n",
-                            .{ file.live_path, declined_hunks[fidx] },
-                        );
-                    } else {
-                        try ctx.err.print(
-                            "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; not committed\n",
-                            .{ file.live_path, declined_hunks[fidx] },
-                        );
-                    }
-                }
+                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], has_routed);
                 if (has_routed) {
                     try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                     committed_count += 1;
@@ -2553,6 +2519,7 @@ fn processStructFile(
     format: commit_struct.Format,
     last_content: []const u8,
     live: []const u8,
+    first_contact: bool,
 ) !HunkOutcome {
     // A manual (un-routable) key and a user `[s]` skip are both "explained"
     // mismatches (see `recordStructPlacement`'s doc comment): the file must
@@ -2596,7 +2563,7 @@ fn processStructFile(
         return .cont;
     }
 
-    return routeStructChanges(cc, ra, file, fidx, space, format, changes);
+    return routeStructChanges(cc, ra, file, fidx, space, format, changes, first_contact);
 }
 
 /// Route a set of changed key paths into their source layers: the shared
@@ -2611,6 +2578,7 @@ fn routeStructChanges(
     space: FileSpace,
     format: commit_struct.Format,
     changes: []const commit_struct.KeyPathChange,
+    first_contact: bool,
 ) !HunkOutcome {
     ra.affected[fidx] = true;
 
@@ -2633,6 +2601,10 @@ fn routeStructChanges(
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
             try cc.stdout.print("  manual: {f} {s}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path), res.skip_reason.? });
+            continue;
+        }
+        if (first_contact and !cc.interactive) {
+            try firstContactKeyManual(cc, ra, file, fidx, change);
             continue;
         }
 
@@ -2801,7 +2773,7 @@ fn processFallbackFile(
         if (commit_struct.formatOfPath(file.source_base_path)) |sf| {
             if (containsOverlayOrigin(prov.items)) {
                 spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
-                return processStructFile(cc, ra, file, fidx, spaces[fidx].?, sf, baseline, live);
+                return processStructFile(cc, ra, file, fidx, spaces[fidx].?, sf, baseline, live, kind == .first_contact);
             }
         }
     }
@@ -2905,30 +2877,25 @@ fn createFirstContactOverlay(
 
     ra.affected[fidx] = true;
     if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
+    if (!cc.interactive) {
+        for (changes) |change| try firstContactKeyManual(cc, ra, file, fidx, change);
+        return .cont;
+    }
     const space = spaces[fidx].?;
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
     const overlay_name = std.fs.path.basename(target_path);
 
     for (changes, 0..) |change, ki| {
-        var accept = !cc.report_mode and !cc.interactive;
-        if (cc.report_mode) {
-            ra.pending.* = true;
-            ra.routed_count.* += 1;
-            try cc.stdout.print("  would create {s} for {s} {s}\n", .{ overlay_name, rel, try keyPathLabel(cc.arena, change.path) });
-            continue;
-        }
-        if (cc.interactive) {
-            const label = try std.fmt.allocPrint(cc.arena, "new overlay {s}", .{overlay_name});
-            try printHunkHeader(cc.stdout, cc.sty, rel, "key", ki + 1, changes.len, label);
-            try printKeyChange(cc.arena, cc.sty, cc.stdout, change, label);
-            const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
-            switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
-                .chosen => |i| accept = (i == 0),
-                .abort => return .abort,
-                .abort_strict => return .abort_strict,
-                .report_only => unreachable,
-            }
-        }
+        const label = try std.fmt.allocPrint(cc.arena, "new overlay {s}", .{overlay_name});
+        try printHunkHeader(cc.stdout, cc.sty, rel, "key", ki + 1, changes.len, label);
+        try printKeyChange(cc.arena, cc.sty, cc.stdout, change, label);
+        const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
+        const accept = switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
+            .chosen => |i| i == 0,
+            .abort => return .abort,
+            .abort_strict => return .abort_strict,
+            .report_only => unreachable,
+        };
         if (accept) {
             const edits = [_]StructEdit{.{ .format = format, .layer_abs = target_path, .change = change }};
             if (space.configs.len > 1) {
@@ -2946,7 +2913,6 @@ fn createFirstContactOverlay(
             try ra.struct_edits.append(cc.arena, edits[0]);
             try ra.struct_owners.append(cc.arena, fidx);
             ra.routed_count.* += 1;
-            if (!cc.interactive) try cc.stdout.print("  write {s} {s} -> new overlay {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), overlay_name });
         } else {
             ra.declined_hunks[fidx] += 1;
         }
@@ -3048,6 +3014,16 @@ fn processSymlinkFile(
         return .cont;
     }
 
+    // No recorded target: mox never wrote this link, so no non-interactive
+    // mode adopts its target into the source.
+    if (recorded_target == null and !cc.interactive) {
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        try cc.stdout.print("  manual: {f}: first contact, needs confirmation\n", .{display.of(file.live_path, cc.m_state.home)});
+        return .cont;
+    }
+
     var accept = !cc.report_mode and !cc.interactive;
     if (cc.report_mode) {
         ra.pending.* = true;
@@ -3128,6 +3104,7 @@ fn processGeneratorFile(
     fidx: usize,
     outputs: []const mox.compose.catB.GeneratedFile,
     only_leaves: ?*const std.StringHashMap(void),
+    state_dir: []const u8,
     gen_row_edits: *std.ArrayList(RowEdit),
     gen_leaf_commits: *std.ArrayList(GenLeafCommit),
 ) !HunkOutcome {
@@ -3138,7 +3115,7 @@ fn processGeneratorFile(
             // normalize it the same way before the membership test.
             if (!set.contains(try mox.source.path.toKey(cc.arena, leaf.live_path))) continue;
         }
-        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, gen_row_edits, gen_leaf_commits)) {
+        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, state_dir, gen_row_edits, gen_leaf_commits)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -3149,13 +3126,15 @@ fn processGeneratorFile(
 
 /// Diff one produced leaf's composed baseline against its live file, routing
 /// each hunk. A leaf whose live path is absent was pruned (or never written);
-/// nothing to keep.
+/// nothing to keep. A leaf with no applied record is first contact: mox never
+/// wrote it, so no non-interactive mode routes its rows.
 fn processGeneratorLeaf(
     cc: *const ClassCtx,
     ra: *const RunAccum,
     gen_file: mox.source.tree.ManagedFile,
     fidx: usize,
     leaf: mox.compose.catB.GeneratedFile,
+    state_dir: []const u8,
     gen_row_edits: *std.ArrayList(RowEdit),
     gen_leaf_commits: *std.ArrayList(GenLeafCommit),
 ) !HunkOutcome {
@@ -3164,6 +3143,7 @@ fn processGeneratorLeaf(
         else => return e,
     };
     if (std.mem.eql(u8, live, leaf.content)) return .cont;
+    const first_contact = (try mox.apply.applied.read(cc.arena, cc.io, state_dir, leaf.live_path)) == null;
 
     // A placeholder recompose of this SAME leaf (secrets unresolved, so a
     // `<secret:URI>` capture stays literal `<SECRET:uri>` text) lets a
@@ -3195,7 +3175,7 @@ fn processGeneratorLeaf(
     };
 
     for (hunks, 0..) |hunk, hi| {
-        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, gen_row_edits, gen_leaf_commits)) {
+        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, gen_row_edits, gen_leaf_commits)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -3224,6 +3204,7 @@ fn processGeneratedHunk(
     hunk_no: usize,
     hunk_total: usize,
     secret_lines: ?[]const []const u8,
+    first_contact: bool,
     gen_row_edits: *std.ArrayList(RowEdit),
     gen_leaf_commits: *std.ArrayList(GenLeafCommit),
 ) !HunkOutcome {
@@ -3235,6 +3216,7 @@ fn processGeneratedHunk(
         std.mem.indexOfScalar(u8, leaf.template, '\n') == null)
     {
         if (try reverseTemplate(cc.arena, leaf.template, b_lines[hunk.b_start])) |fields| {
+            if (first_contact and !cc.interactive) return firstContactLeafManual(cc, ra, fidx, leaf, hunk);
             return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, fields, gen_row_edits, gen_leaf_commits);
         }
     }
@@ -3568,7 +3550,7 @@ fn processPartialFile(
     // Partial routing verifies over the repo-wide configuration space, like
     // every structured route.
     if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(arena, cc.io, cc.this_bindings, file, repo_dir);
-    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes);
+    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, false);
 }
 
 /// A partial file's manual (un-routable) outcome. Marks the file affected
@@ -4090,6 +4072,82 @@ fn firstContactManual(
     ra.pending.* = true;
     try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
     return .cont;
+}
+
+/// Name the hunks a file left only in its live copy, and whether the edits
+/// that were routed stand.
+fn reportUnrouted(err: *Io.Writer, live_path: []const u8, manual: usize, declined: usize, has_routed: bool) !void {
+    if (manual > 0 and declined > 0) {
+        if (has_routed) {
+            try err.print(
+                "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
+                    "in the live file; the routed edits were committed to the sources -- edit the rest in by hand, " ++
+                    "then run 'mox apply'\n",
+                .{ live_path, manual, declined },
+            );
+        } else {
+            try err.print(
+                "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
+                    "in the live file; not committed\n",
+                .{ live_path, manual, declined },
+            );
+        }
+    } else if (manual > 0) {
+        if (has_routed) {
+            try err.print(
+                "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; " ++
+                    "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n",
+                .{ live_path, manual },
+            );
+        } else {
+            try err.print(
+                "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; not committed\n",
+                .{ live_path, manual },
+            );
+        }
+    } else {
+        if (has_routed) {
+            try err.print(
+                "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; " ++
+                    "the routed edits were committed to the sources -- run 'mox apply' to discard them\n",
+                .{ live_path, declined },
+            );
+        } else {
+            try err.print(
+                "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; not committed\n",
+                .{ live_path, declined },
+            );
+        }
+    }
+}
+
+/// `firstContactManual` for one hunk of a generator leaf.
+fn firstContactLeafManual(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    fidx: usize,
+    leaf: mox.compose.catB.GeneratedFile,
+    hunk: Hunk,
+) !HunkOutcome {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(leaf.live_path, cc.m_state.home), hunk.a_start + 1 });
+    return .cont;
+}
+
+/// `firstContactManual` for one changed key of a structured file.
+fn firstContactKeyManual(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    change: commit_struct.KeyPathChange,
+) !void {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f} {s}: first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path) });
 }
 
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks

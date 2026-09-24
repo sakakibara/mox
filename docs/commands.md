@@ -307,13 +307,18 @@ the edit against it. A source that now composes to nothing is the one
 exception: there is no file to route into, so commit reports it and
 leaves the live copy for you to remove or re-fill.
 
-A first-contact hunk always needs a human. No non-interactive mode takes a
-default for one -- not `--yes`, not a plain non-TTY, and not a
+A first-contact change always needs a human: content mox never wrote to
+its live path -- a file, a generator leaf, or a symlink with no applied
+record -- is never adopted into the repo unasked. No non-interactive mode
+takes a default for one -- not `--yes`, not a plain non-TTY, and not a
 multi-configuration file's "where does this belong?" route: it is
-reported as `manual: <path>:<line> first contact, needs confirmation`,
-the source is left untouched, and the run exits 1. `--dry-run` reports it
-the same way and counts it the same way, so the preview and the run it
-predicts agree.
+reported as `manual: <path>:<line> first contact, needs confirmation` (a
+key of a file merged from layers as `manual: <path> <key>: ...`, a symlink
+as `manual: <path>: ...`), the source is left untouched, and the run exits
+1; `--abort-on-prompt` exits 2 as for any prompt. `--dry-run` reports and
+counts it the same way, so the preview and the run it predicts agree. A
+first-contact file that no layer matches on this machine gets a new
+overlay only for the keys you confirm.
 
 A file merged from several layers routes per KEY instead of per line
 (`y` accept, `p` pick a layer, `s` skip): each changed key goes to the
