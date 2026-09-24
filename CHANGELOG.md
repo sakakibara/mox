@@ -265,6 +265,15 @@ All notable changes to mox are documented here. The format follows
   environment and left the rest to be inferred.
 
 ### Fixed
+- `commit` checks the source around an insertion before routing it. An
+  insertion replaces no line, so nothing confirmed that the source still held
+  what the hunk was diffed against: after the source changed since the last
+  apply, the new lines were placed at a stale position and only the
+  recompose check that follows rejected the file, as "recomposed output
+  still differs from live" with no hunk counted manual. The lines on either
+  side of the insertion within its span must now match the source, a
+  captured value matching its template, or the hunk is manual with its
+  reason.
 - Region nesting is counted by each directive's first word as the parser
   reads it. An opener written with no space after its verb, such as
   `when(os=darwin)`, parsed as a region but was not counted as nesting, so

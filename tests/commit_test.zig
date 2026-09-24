@@ -172,6 +172,146 @@ test "commit: a stored-baseline edit still refuses when the source changed since
     try std.testing.expectEqualStrings("export A=1\nexport B=22\nexport C=3\n", try read(io, a, live));
 }
 
+test "commit: an insertion refuses when the source line it follows moved since apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport B=2\nexport C=3\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const src_path = try h.srcOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = "export Z=0\nexport A=1\nexport B=2\nexport C=3\n" });
+
+    const live = try h.liveOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export A=1\nexport B=2\nexport N=1\nexport C=3\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "source no longer matches recorded provenance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqualStrings("export Z=0\nexport A=1\nexport B=2\nexport C=3\n", try read(io, a, src_path));
+    try std.testing.expectEqualStrings("export A=1\nexport B=2\nexport N=1\nexport C=3\n", try read(io, a, live));
+}
+
+test "commit: an insertion at the top refuses when the source line it precedes moved since apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport B=2\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const src_path = try h.srcOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = "export Z=0\nexport A=1\nexport B=2\n" });
+
+    const live = try h.liveOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export N=1\nexport A=1\nexport B=2\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "source no longer matches recorded provenance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqualStrings("export Z=0\nexport A=1\nexport B=2\n", try read(io, a, src_path));
+    try std.testing.expectEqualStrings("export N=1\nexport A=1\nexport B=2\n", try read(io, a, live));
+}
+
+test "commit: an insertion refuses when only the line it follows still matches a moved source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "a=1\n\nb=2\n\nc=3\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const src_path = try h.srcOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = "z=0\n\na=1\n\nb=2\n\nc=3\n" });
+
+    const live = try h.liveOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a=1\n\nb=2\n\nn=1\nc=3\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "source no longer matches recorded provenance") != null);
+    try std.testing.expectEqualStrings("z=0\n\na=1\n\nb=2\n\nc=3\n", try read(io, a, src_path));
+}
+
+test "commit: an insertion after an interpolated fragment line routes into the fragment" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myrc", "# top\n# mox: include \"extra.sh\"\n# bottom\n");
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", "alias x=1\nexport P=<machine.profile | default \"work\">\nalias y=2\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".myrc");
+    try editLive(io, a, live, "alias y=2", "export NEW=1\nalias y=2");
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "commit", "--yes" })).rc);
+    try std.testing.expectEqualStrings(
+        "alias x=1\nexport P=<machine.profile | default \"work\">\nexport NEW=1\nalias y=2\n",
+        try read(io, a, try h.srcOf(".myrc.d/extra.sh")),
+    );
+}
+
+test "commit: an insertion after an interpolated line of a structured base routes into it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/settings.toml", "a = 1\nprofile = \"<machine.profile | default \"work\">\"\nb = 2\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("settings.toml");
+    try editLive(io, a, live, "b = 2", "c = 3\nb = 2");
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "commit", "--yes" })).rc);
+    try std.testing.expectEqualStrings(
+        "a = 1\nprofile = \"<machine.profile | default \"work\">\"\nc = 3\nb = 2\n",
+        try read(io, a, try h.srcOf("settings.toml")),
+    );
+}
+
+test "commit: an insertion at the top of an unchanged source lands first" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport B=2\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "export N=1\nexport A=1\nexport B=2\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("export N=1\nexport A=1\nexport B=2\n", try read(io, a, try h.srcOf(".zshrc")));
+}
+
 test "commit: a first-contact file's real edit routes into source preserving an adjacent capture, and a spurious hunk is skippable" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

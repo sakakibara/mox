@@ -2710,7 +2710,7 @@ const FallbackKind = union(enum) {
 /// source fresh (resolving secrets, matching overlays) to build one, instead
 /// of reading the applied-content cache the stored-baseline path uses. This
 /// is a FALLBACK, used only here -- the stored `last_content` path above
-/// (and its `sourceLinesMatch` guard, which refuses a hunk whose source moved
+/// (and its `sourceStillHolds` guard, which refuses a hunk whose source moved
 /// on since the last apply) is untouched and still the one every edited
 /// managed file with a stored baseline goes through.
 ///
@@ -2721,7 +2721,7 @@ const FallbackKind = union(enum) {
 /// composition's cleartext is never cached; the hash lets a mismatch (the
 /// source changed since the apply, or the record is stale) be told apart
 /// from a genuine live edit before the recompose is trusted as a baseline --
-/// the same protection `sourceLinesMatch` gives the stored path, applied here
+/// the same protection `sourceStillHolds` gives the stored path, applied here
 /// because there is no stored baseline to check the recompose against
 /// directly.
 fn processFallbackFile(
@@ -4380,7 +4380,7 @@ fn routeHunk(
     switch (seg.origin) {
         .base => |o| {
             const start = (o.line - 1) + (hunk.a_start - seg.out_start);
-            if (!try sourceLinesMatch(arena, io, file.source_base_abs, start, old_lines))
+            if (!try sourceStillHolds(arena, io, file.source_base_abs, seg, hunk, a_lines, start))
                 return .{ .manual = "source no longer matches recorded provenance" };
             // A private-ONLY whole file composes as `.base` (it is a base file
             // of the private tree), so the provenance tag alone cannot flag it;
@@ -4390,7 +4390,7 @@ fn routeHunk(
         },
         .fragment => |o| {
             const start = (o.line - 1) + (hunk.a_start - seg.out_start);
-            if (!try sourceLinesMatch(arena, io, o.path, start, old_lines))
+            if (!try sourceStillHolds(arena, io, o.path, seg, hunk, a_lines, start))
                 return .{ .manual = "source no longer matches recorded provenance" };
             // A region fragment is already axis-gated; an include/append/prepend
             // fragment is universal, so its edit is shared and gets classified.
@@ -4398,7 +4398,7 @@ fn routeHunk(
         },
         .private => |o| {
             const start = (o.line - 1) + (hunk.a_start - seg.out_start);
-            if (!try sourceLinesMatch(arena, io, o.path, start, old_lines))
+            if (!try sourceStillHolds(arena, io, o.path, seg, hunk, a_lines, start))
                 return .{ .manual = "source no longer matches recorded provenance" };
             return lineRoute(arena, o.path, o.path, start, hunk.a_len, new_lines, false, true);
         },
@@ -4554,12 +4554,43 @@ fn splitHunk(arena: std.mem.Allocator, segments: []const Segment, hunk: Hunk) ![
     return out.toOwnedSlice(arena);
 }
 
-/// Confirm the source file at `path` still holds `expected` verbatim at line
-/// index `start` (0-based). Guards the 1:1 assumption behind offset routing:
-/// a fragment line rewritten by `<machine.X>` interpolation, or any residual
-/// provenance mis-mapping, fails this check so the hunk downgrades to manual
-/// rather than silently overwriting the wrong source line. A pure insertion
-/// (`expected.len == 0`) has nothing to verify.
+/// Confirm, before routing, that the source file at `path` still holds what
+/// the hunk was diffed against, with the hunk's source position at line index
+/// `start` (0-based). An edit checks the lines it replaces verbatim. An
+/// insertion replaces nothing, so it checks its neighbours within its span --
+/// the line it follows and the line it precedes, each that the span holds --
+/// matching a neighbour against its source line's capture frame, since an
+/// insertion never writes a neighbour and so cannot bake an expanded value in.
+/// A hunk that fails is manual. The recompose check after writing still
+/// catches a mis-routing this cannot see; this names the cause and keeps the
+/// source untouched rather than rolling it back.
+fn sourceStillHolds(
+    arena: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    seg: Segment,
+    hunk: Hunk,
+    a_lines: []const []const u8,
+    start: u32,
+) !bool {
+    if (hunk.a_len > 0)
+        return sourceLinesMatch(arena, io, path, start, a_lines[hunk.a_start .. hunk.a_start + hunk.a_len]);
+    if (hunk.a_start > a_lines.len) return false;
+    const follows = hunk.a_start > seg.out_start;
+    const precedes = hunk.a_start < seg.out_start + seg.out_len and hunk.a_start < a_lines.len;
+    if (!follows and !precedes) return false;
+    const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch return false;
+    const src_lines = try mox.diff.lines.splitLines(arena, content);
+    if (follows and !try anchorHolds(arena, src_lines, start - 1, a_lines[hunk.a_start - 1])) return false;
+    if (precedes and !try anchorHolds(arena, src_lines, start, a_lines[hunk.a_start])) return false;
+    return true;
+}
+
+fn anchorHolds(arena: std.mem.Allocator, src_lines: []const []const u8, idx: u32, composed: []const u8) !bool {
+    if (idx >= src_lines.len) return false;
+    return (try matchCaptures(arena, src_lines[idx], composed)) != null;
+}
+
 fn sourceLinesMatch(
     arena: std.mem.Allocator,
     io: Io,
@@ -4567,7 +4598,7 @@ fn sourceLinesMatch(
     start: u32,
     expected: []const []const u8,
 ) !bool {
-    if (expected.len == 0) return true;
+    std.debug.assert(expected.len > 0);
     const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch return false;
     const lines = try mox.diff.lines.splitLines(arena, content);
     if (@as(usize, start) + expected.len > lines.len) return false;
