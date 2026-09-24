@@ -1603,7 +1603,10 @@ pub fn commitImpl(
             // A file whose every change stayed manual or declined wrote
             // nothing, so its source composing to nothing here is how it
             // already stood, not something the routing did.
-            if (routed_orig[fidx].len == 0 and fact_backup[fidx].len == 0 and manual_hunks[fidx] + declined_hunks[fidx] > 0) {
+            if (routed_orig[fidx].len == 0 and fact_backup[fidx].len == 0 and
+                (try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs)).len == 0 and
+                manual_hunks[fidx] + declined_hunks[fidx] > 0)
+            {
                 try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], false);
                 continue;
             }
@@ -3242,11 +3245,10 @@ fn processGeneratedHunk(
 }
 
 /// Accept (or prompt for) a leaf hunk that reverse-parsed cleanly to a
-/// data-source row edit, and collect it. `[y/s]` on a terminal, `--yes`
-/// (and any other non-interactive, non-report mode) auto-accepts -- this
-/// leaf's baseline IS something mox composed and wrote, unlike a
-/// first-contact file, so there is no rendering-ambiguity reason to demand a
-/// human confirm here.
+/// data-source row edit, and collect it. `[y/s]` on a terminal; `--yes` (and
+/// any other non-interactive, non-report mode) auto-accepts. A first-contact
+/// leaf never reaches here unless a human is answering: `processGeneratedHunk`
+/// reports it manual first.
 fn acceptGeneratedRow(
     cc: *const ClassCtx,
     ra: *const RunAccum,
