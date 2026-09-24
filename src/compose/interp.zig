@@ -198,14 +198,18 @@ pub fn containsCapture(template: []const u8) bool {
             i = open + 1;
             continue;
         };
-        const inner = template[open + 1 .. close];
-        if (std.mem.startsWith(u8, inner, "secret:")) return true;
-        // A fallback chain resolves whenever any member does.
-        if (capture.isChain(inner)) return true;
-        if (capture.hasNamespace(inner)) return true;
+        if (expandsOutsideLoop(template[open + 1 .. close])) return true;
         i = close + 1;
     }
     return false;
+}
+
+/// Whether the body of a `<...>` capture is one this module expands outside
+/// any loop or record scope: a secret, a fallback chain (which resolves
+/// whenever any member does), or a namespaced field. Any other body passes
+/// through as literal text.
+pub fn expandsOutsideLoop(inner: []const u8) bool {
+    return std.mem.startsWith(u8, inner, "secret:") or capture.isChain(inner) or capture.hasNamespace(inner);
 }
 
 /// Check a template for forbidden patterns. Returns nothing on success. The

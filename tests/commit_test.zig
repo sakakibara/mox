@@ -243,8 +243,53 @@ test "commit: an insertion refuses when only the line it follows still matches a
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a=1\n\nb=2\n\nn=1\nc=3\n" });
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "source no longer matches recorded provenance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 1 manual") != null);
     try std.testing.expectEqualStrings("z=0\n\na=1\n\nb=2\n\nc=3\n", try read(io, a, src_path));
+}
+
+test "commit: an insertion between lines of literal tags routes, both neighbours unchanged" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.pagerc", "<a><b>\nfoo\n</b></a>\nnnoremap <C-h><C-w>h\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".pagerc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "<a><b>\nbar\nfoo\n</b></a>\nbaz\nnnoremap <C-h><C-w>h\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("<a><b>\nbar\nfoo\n</b></a>\nbaz\nnnoremap <C-h><C-w>h\n", try read(io, a, try h.srcOf(".pagerc")));
+}
+
+test "commit: an insertion after a line whose capture default holds a > routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myrc", "# top\n# mox: include \"extra.sh\"\n");
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", "alias x=1\nexport P=\"<machine.nosuchfield | default \"a>b\">\"\nalias y=2\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".myrc");
+    try editLive(io, a, live, "alias y=2", "export NEW=1\nalias y=2");
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "commit", "--yes" })).rc);
+    try std.testing.expectEqualStrings(
+        "alias x=1\nexport P=\"<machine.nosuchfield | default \"a>b\">\"\nexport NEW=1\nalias y=2\n",
+        try read(io, a, try h.srcOf(".myrc.d/extra.sh")),
+    );
 }
 
 test "commit: an insertion after an interpolated fragment line routes into the fragment" {

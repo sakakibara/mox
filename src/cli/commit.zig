@@ -4646,7 +4646,42 @@ fn sourceStillHolds(
 
 fn anchorHolds(arena: std.mem.Allocator, src_lines: []const []const u8, idx: u32, composed: []const u8) !bool {
     if (idx >= src_lines.len) return false;
-    return (try matchCaptures(arena, src_lines[idx], composed)) != null;
+    return composesTo(arena, src_lines[idx], composed);
+}
+
+/// Whether source line `template` could compose to `line` outside any loop:
+/// equal, or equal once each capture compose expands there is allowed to
+/// stand for any text. Captures are found exactly as compose finds them, so
+/// any other `<...>` is literal text that must match. Adjacent captures have
+/// no literal between them to anchor the split, so they only match exactly.
+fn composesTo(arena: std.mem.Allocator, template: []const u8, line: []const u8) !bool {
+    if (std.mem.eql(u8, template, line)) return true;
+    var literals: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    var lit_start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, template, i, '<')) |open| {
+        const close = mox.compose.capture.closeIndex(template, open) orelse break;
+        if (mox.compose.interp.expandsOutsideLoop(template[open + 1 .. close])) {
+            try literals.append(arena, template[lit_start..open]);
+            lit_start = close + 1;
+        }
+        i = close + 1;
+    }
+    if (literals.items.len == 0) return false;
+    try literals.append(arena, template[lit_start..]);
+
+    const first = literals.items[0];
+    const last = literals.items[literals.items.len - 1];
+    if (line.len < first.len + last.len) return false;
+    if (!std.mem.startsWith(u8, line, first) or !std.mem.endsWith(u8, line, last)) return false;
+    var pos = first.len;
+    const end = line.len - last.len;
+    for (literals.items[1 .. literals.items.len - 1]) |lit| {
+        if (lit.len == 0) return false;
+        const at = std.mem.indexOfPos(u8, line[0..end], pos, lit) orelse return false;
+        pos = at + lit.len;
+    }
+    return pos <= end;
 }
 
 fn sourceLinesMatch(
@@ -6038,4 +6073,20 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
     );
 
     try testing.expect(std.mem.indexOf(u8, err_aw.writer.buffered(), path) != null);
+}
+
+test "composesTo: literal tags must match exactly, expanded captures stand for any text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expect(try composesTo(a, "</b></a>", "</b></a>"));
+    try std.testing.expect(!try composesTo(a, "<br>", "anything"));
+    try std.testing.expect(try composesTo(a, "export P=<machine.profile>", "export P=work"));
+    try std.testing.expect(!try composesTo(a, "export P=<machine.profile>", "export Q=work"));
+    try std.testing.expect(try composesTo(a, "<C-h> <machine.key>;", "<C-h> x;"));
+    try std.testing.expect(!try composesTo(a, "<C-h> <machine.key>;", "<C-j> x;"));
+    try std.testing.expect(try composesTo(a, "p=\"<machine.x | default \"a>b\">\"", "p=\"a>b\""));
+    try std.testing.expect(try composesTo(a, "<env.A>-<env.B>", "1-2"));
+    try std.testing.expect(!try composesTo(a, "<env.A><env.B>", "12"));
+    try std.testing.expect(!try composesTo(a, "ab<env.A>ba", "aba"));
 }
