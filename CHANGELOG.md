@@ -296,6 +296,12 @@ All notable changes to mox are documented here. The format follows
   capture was written into the source under its resolved name, and the file
   was reported committed. Any routed key that does not recompose to its live
   value now rolls the file back.
+- A coupled token update reaches a source gated off this machine. Such a
+  source composes to nothing here, before the update as after, but that was
+  taken for the update breaking it, and a sync counted as universal only if
+  it changed every other configuration, including those the file does not
+  exist in. The rename was refused, so a token never synced into a file
+  gated to another machine.
 - A file `commit` does not commit has a coupled token update to its own
   source rolled back with the rest. Only sources an edit was routed into
   were saved for rollback, so a token synced into an edited file stayed

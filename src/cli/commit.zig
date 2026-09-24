@@ -1262,13 +1262,13 @@ pub fn commitImpl(
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
         // A token sync is legitimate only when universal: if it changes
-        // every sibling configuration, allow them all; a strict subset stays
-        // disallowed so verification aborts it.
+        // every sibling configuration the file exists in, allow them all; a
+        // strict subset stays disallowed so verification aborts it. A sibling
+        // where the file composes to nothing before and after cannot change.
         if (space.configs.len > 1) {
-            const imp = try simulateCouplingImpact(&cc, file, file.source_base_abs, file_edits, space.configs);
-            const n_other = space.configs.len - 1;
-            if (imp.affected.len >= n_other) {
-                for (imp.affected) |label| try allowed[fidx].put(label, {});
+            const sim = try simulateCouplingImpact(&cc, file, file.source_base_abs, file_edits, space.configs);
+            if (sim.impact.affected.len >= sim.present_siblings) {
+                for (sim.impact.affected) |label| try allowed[fidx].put(label, {});
             }
         }
     }
@@ -1308,6 +1308,17 @@ pub fn commitImpl(
             (try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs)).len > 0)
             try addBackup(ctx.alloc, ctx.io, &bs, file.source_base_abs);
         routed_orig[fidx] = try bs.toOwnedSlice(ctx.alloc);
+    }
+
+    // Whether each coupling target composed to nothing on this machine before
+    // anything was written: a source gated off here composes to nothing after
+    // a coupled update too, and that is not the update's doing.
+    const null_before = try ctx.alloc.alloc(bool, tree.files.len);
+    @memset(null_before, false);
+    for (tree.files, 0..) |file, fidx| {
+        if (!coupling_only[fidx]) continue;
+        const before = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, null) catch continue;
+        null_before[fidx] = before == null;
     }
 
     // Fact edits routed from each file, pre-write (`old_value` was captured
@@ -1564,7 +1575,7 @@ pub fn commitImpl(
             // The live file was not user-edited, so recompose need not equal
             // live; verify only that the source still composes and that the
             // sync does not diverge a configuration the user did not choose.
-            if (composed == null) {
+            if (composed == null and !null_before[fidx]) {
                 try ctx.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, m_state.home)});
                 mismatch = true;
                 rolled_back[fidx] = true;
@@ -2201,7 +2212,7 @@ fn simulateCouplingImpact(
     path: []const u8,
     file_edits: []const CouplingEdit,
     configs: []const Configuration,
-) !impact.Impact {
+) !CouplingImpact {
     const arena = cc.arena;
     const io = cc.io;
     const original = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes));
@@ -2220,8 +2231,19 @@ fn simulateCouplingImpact(
     };
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original });
 
-    return impact.impact(arena, configs, before, after);
+    var present: usize = 0;
+    for (configs, before.per_config, after.per_config) |c, b, a| {
+        if (!c.is_this_machine and (b != .absent or a != .absent)) present += 1;
+    }
+    return .{ .impact = try impact.impact(arena, configs, before, after), .present_siblings = present };
 }
+
+/// A coupled update's `impact`, and how many configurations other than this
+/// machine's the file exists in before or after it.
+const CouplingImpact = struct {
+    impact: impact.Impact,
+    present_siblings: usize,
+};
 
 /// Roll a rejected coupling edit back to the source's pre-write bytes.
 fn restoreCouplingTarget(io: Io, path: []const u8, original: ?[]const u8) !void {
