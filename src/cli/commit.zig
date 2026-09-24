@@ -4661,22 +4661,18 @@ fn anchorHolds(arena: std.mem.Allocator, src_lines: []const []const u8, idx: u32
 }
 
 /// Whether source line `template` could compose to `line` outside any loop:
-/// equal, or equal once each capture compose expands there is allowed to
-/// stand for any text. Captures are found exactly as compose finds them, so
-/// any other `<...>` is literal text that must match. Adjacent captures have
-/// no literal between them to anchor the split, so they only match exactly.
+/// equal, or equal once each capture compose expands there stands for any
+/// text. Captures are found by `interp.CapturesOutsideLoop`, so any other
+/// `<...>` is literal text that must match. Adjacent captures have no literal
+/// between them to anchor the split, so they only match exactly.
 fn composesTo(arena: std.mem.Allocator, template: []const u8, line: []const u8) !bool {
     if (std.mem.eql(u8, template, line)) return true;
     var literals: std.ArrayList([]const u8) = .empty;
-    var i: usize = 0;
     var lit_start: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, template, i, '<')) |open| {
-        const close = mox.compose.capture.closeIndex(template, open) orelse break;
-        if (mox.compose.interp.expandsOutsideLoop(template[open + 1 .. close])) {
-            try literals.append(arena, template[lit_start..open]);
-            lit_start = close + 1;
-        }
-        i = close + 1;
+    var it: mox.compose.interp.CapturesOutsideLoop = .{ .template = template };
+    while (it.next()) |span| {
+        try literals.append(arena, template[lit_start..span.open]);
+        lit_start = span.close + 1;
     }
     if (literals.items.len == 0) return false;
     try literals.append(arena, template[lit_start..]);
@@ -6100,4 +6096,10 @@ test "composesTo: literal tags must match exactly, expanded captures stand for a
     try std.testing.expect(try composesTo(a, "<env.A>-<env.B>", "1-2"));
     try std.testing.expect(!try composesTo(a, "<env.A><env.B>", "12"));
     try std.testing.expect(!try composesTo(a, "ab<env.A>ba", "aba"));
+    try std.testing.expect(try composesTo(a, "id = Me <<machine.os>>", "id = Me <darwin>"));
+    try std.testing.expect(try composesTo(a, "if a<b; echo <machine.os>", "if a<b; echo darwin"));
+    try std.testing.expect(!try composesTo(a, "echo <foo | default \"x\">", "echo hi"));
+    try std.testing.expect(!try composesTo(a, "a <b | c> d", "a Z d"));
+    try std.testing.expect(!try composesTo(a, "a <env.X | b> d", "a Z d"));
+    try std.testing.expect(try composesTo(a, "a <env.X | machine.y> d", "a Z d"));
 }

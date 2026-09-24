@@ -283,6 +283,13 @@ All notable changes to mox are documented here. The format follows
   were saved for rollback, so a token synced into an edited file stayed
   written when that file was then refused, even when it left the source
   composing to nothing.
+- `commit` finds every capture compose could expand in a value of a file
+  merged from layers, including one inside a literal `<...>`. A value such
+  as `Me <<machine.email>>` was taken for plain text, so an edit to it wrote
+  the resolved value into the source and the capture was lost; it is now
+  manual as interpolation-derived. A `<name | default "x">`, which compose
+  leaves as text, is no longer taken for a capture, so an edit to such a
+  value routes.
 - `commit` checks the source around an insertion before routing it. An
   insertion replaces no line, so nothing confirmed that the source still held
   what the hunk was diffed against: after the source changed since the last

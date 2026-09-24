@@ -626,6 +626,75 @@ test "commit: a first-contact structured file with layers routes a key into sour
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("settings.toml")), "dark") != null);
 }
 
+test "commit: a layered key whose value holds a capture inside a literal <...> is not routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "name = \"Me <<machine.os>>\"\nsize = 1\n";
+    try writeRepo(io, &tmp, "repo/src/settings.toml", base);
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=darwin.toml", "size = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("settings.toml");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "Me <darwin>") != null);
+    try editLive(io, a, live, "Me <darwin>", "Me <home>");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("settings.toml")));
+}
+
+test "commit: a layered value whose serialized form expands a capture past a literal chain is not routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "name = \"<a | b | default \\\"1> <machine.os>\\\">\"\nsize = 1\n";
+    try writeRepo(io, &tmp, "repo/src/settings.toml", base);
+    try writeRepo(io, &tmp, "repo/src/settings.toml.d/os=darwin.toml", "size = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("settings.toml");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "1> darwin") != null);
+    try editLive(io, a, live, "1> darwin", "9> darwin");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("settings.toml")));
+}
+
+test "commit: a layered gitconfig value holding a defaulted capture is not routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "[user]\n\temail = <machine.os | default \"x\">\n\tname = a\n";
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", base);
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/os=darwin", "[user]\n\tname = b\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".gitconfig");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "email = darwin") != null);
+    try editLive(io, a, live, "email = darwin", "email = linux");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".gitconfig")));
+}
+
 test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

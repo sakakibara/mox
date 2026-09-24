@@ -186,31 +186,73 @@ fn unescapeSecretUri(arena: std.mem.Allocator, raw: []const u8) std.mem.Allocato
     return try buf.toOwnedSlice(arena);
 }
 
-/// Whether `template` holds a capture this module would EXPAND. `Sho
+/// Whether `template` may hold a capture this module would EXPAND. `Sho
 /// <me@example.com>` holds none: a bare name resolves only in template mode
 /// (against a record), and against a loop scope, neither of which a structural
 /// compose has. Callers use this to refuse routing an edit back into source
 /// text that interpolates, which would bake a resolved fact or secret.
+///
+/// Callers pass a structured value in parsed form, while compose expands the
+/// layer's text, which a format may escape or quote differently -- moving
+/// where a capture closes or whether its `| default "` marker survives. So
+/// this ignores closes and markers: any `<` followed, past leading blanks, by
+/// `secret:` or a namespace head counts. Every capture compose expands starts
+/// that way, and neither escaping nor unquoting touches a `<` or the letters
+/// after it. It may count text compose leaves literal; it never misses one.
 pub fn containsCapture(template: []const u8) bool {
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, template, i, '<')) |open| {
-        const close = capture.closeIndex(template, open) orelse {
-            i = open + 1;
-            continue;
-        };
-        if (expandsOutsideLoop(template[open + 1 .. close])) return true;
-        i = close + 1;
+        const rest = std.mem.trimStart(u8, template[open + 1 ..], " \t");
+        if (std.mem.startsWith(u8, rest, "secret:") or capture.hasNamespace(rest)) return true;
+        i = open + 1;
     }
     return false;
 }
 
-/// Whether the body of a `<...>` capture is one this module expands outside
-/// any loop or record scope: a secret, a fallback chain (which resolves
-/// whenever any member does), or a namespaced field. Any other body passes
-/// through as literal text.
-pub fn expandsOutsideLoop(inner: []const u8) bool {
-    return std.mem.startsWith(u8, inner, "secret:") or capture.isChain(inner) or capture.hasNamespace(inner);
-}
+/// The spans (`<` through `>`) of the captures this module expands in
+/// `template` outside any loop or record scope, in order, found the way the
+/// expansion finds them: a secret, a namespaced field (its `| default "..."`
+/// split off), or a fallback chain whose every member is namespaced. A chain
+/// with a bare member is literal as a whole; any other `<` is a literal byte
+/// and the scan resumes after it, so a capture inside a literal `<...>` is
+/// still found.
+pub const CapturesOutsideLoop = struct {
+    template: []const u8,
+    i: usize = 0,
+
+    pub const Span = struct { open: usize, close: usize };
+
+    pub fn next(self: *CapturesOutsideLoop) ?Span {
+        const t = self.template;
+        while (std.mem.indexOfScalarPos(u8, t, self.i, '<')) |open| {
+            const close = capture.closeIndex(t, open) orelse {
+                self.i = open + 1;
+                continue;
+            };
+            const raw = t[open + 1 .. close];
+            if (std.mem.startsWith(u8, raw, "secret:")) {
+                self.i = close + 1;
+                return .{ .open = open, .close = close };
+            }
+            const field = capture.splitDefault(raw).field;
+            if (capture.isChain(field)) {
+                self.i = close + 1;
+                var members = capture.members(field);
+                const every = while (members.next()) |m| {
+                    if (!capture.hasNamespace(m)) break false;
+                } else true;
+                if (every) return .{ .open = open, .close = close };
+                continue;
+            }
+            if (capture.hasNamespace(field)) {
+                self.i = close + 1;
+                return .{ .open = open, .close = close };
+            }
+            self.i = open + 1;
+        }
+        return null;
+    }
+};
 
 /// Check a template for forbidden patterns. Returns nothing on success. The
 /// duplicate-capture set is arena-owned, so it stays unbounded regardless of
@@ -1315,4 +1357,17 @@ test "unescapeSecretUri: only '\\>' and '\\\\' decode; other bytes are verbatim"
     // No escapable backslash -> the input slice is returned unchanged.
     const plain = "op://vault/item/field";
     try std.testing.expect((try unescapeSecretUri(a, plain)).ptr == plain.ptr);
+}
+
+test "containsCapture: finds every capture compose could expand, whatever quoting or escaping moved" {
+    try std.testing.expect(containsCapture("id = Me <<machine.email>>"));
+    try std.testing.expect(containsCapture("x <secret:env:A> y"));
+    try std.testing.expect(containsCapture("<env.A | machine.b>"));
+    try std.testing.expect(!containsCapture("<foo | default \"x\">"));
+    try std.testing.expect(!containsCapture("<a | b>"));
+    try std.testing.expect(!containsCapture("Sho <me@example.com>"));
+    try std.testing.expect(containsCapture("<a | b | default \"1> <machine.os>\">"));
+    try std.testing.expect(containsCapture("<machine.os | default x>"));
+    try std.testing.expect(containsCapture("<secret:cmd:printf hi\\>"));
+    try std.testing.expect(containsCapture("< machine.os | env.X>"));
 }
