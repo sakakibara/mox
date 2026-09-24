@@ -4564,6 +4564,27 @@ test "commit partial: a new owned key beside one named by a capture routes" {
     try std.testing.expect(std.mem.indexOf(u8, src, "<machine.os>") != null);
 }
 
+test "commit partial: an owned ini section declared with its padding routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/p.ini", "# mox: own \" s \"\n[ s ]\nk = a\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("p.ini");
+    try editLive(io, a, live, "k = a", "k = b");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = b") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("# mox: own \" s \"\n[ s ]\nk = b\n", try read(io, a, try h.srcOf("p.ini")));
+}
+
 test "commit partial: [y] routes an owned-key edit to the base and advances the owned record" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

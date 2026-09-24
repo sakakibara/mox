@@ -11,15 +11,11 @@ const ini = @import("ini");
 pub const Format = enum { toml, json, yaml, ini, gitconfig };
 
 /// The dialect an INI or gitconfig document is read with wherever mox matches
-/// its sections. The section merge that composes a layered file trims a
-/// section name before matching it, so `[ s ]` and `[s]` are one section;
-/// reading a document any other way would disagree with the merge about
-/// which section, and so which layer, a key is in.
+/// its sections and keys. The section merge that composes a layered file
+/// matches headers by the same dialect, so every reader agrees on which
+/// section, and so which layer, a key is in.
 pub fn iniDialect(format: Format) ini.Dialect {
-    if (format == .gitconfig) return .gitconfig;
-    var d: ini.Dialect = .generic;
-    d.trim_section_names = true;
-    return d;
+    return if (format == .gitconfig) .gitconfig else .generic;
 }
 
 /// XDG git config files carry no telling extension: `~/.config/git/config`

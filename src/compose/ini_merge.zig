@@ -75,7 +75,7 @@ pub fn merge(arena: std.mem.Allocator, base_src: []const u8, overlay_src: []cons
                 skipping_continuation = false;
                 if (current) |s| try emitUnconsumed(arena, &out, s);
                 try flushBlanks(arena, &out, &held_blanks);
-                const ident = sectionIdent(arena, line) catch |e| switch (e) {
+                const ident = sectionIdent(arena, line, d) catch |e| switch (e) {
                     error.MalformedHeader => {
                         // Not something we can match against; pass through and
                         // stop attributing keys to any overlay section.
@@ -191,7 +191,7 @@ fn scan(arena: std.mem.Allocator, src: []const u8, d: ini.Dialect) !Overlay {
             .blank, .comment => open_entry = null,
             .section_header => {
                 open_entry = null;
-                const ident = sectionIdent(arena, line) catch |e| switch (e) {
+                const ident = sectionIdent(arena, line, d) catch |e| switch (e) {
                     error.MalformedHeader => return error.MalformedOverlayHeader,
                     else => return e,
                 };
@@ -218,12 +218,12 @@ fn scan(arena: std.mem.Allocator, src: []const u8, d: ini.Dialect) !Overlay {
     return overlay;
 }
 
-/// Section identity: case-folded name, `\x00`, verbatim subsection (when the
-/// header has a quoted subsection). Both sides of a merge run through this,
-/// so any consistent normalization matches. `[a.b]`-style dotted headers keep
-/// the dots in the folded name, which matches git's case-insensitive reading
-/// of the legacy form.
-fn sectionIdent(arena: std.mem.Allocator, header_line: []const u8) ![]const u8 {
+/// Identity of a section header as the dialect reads it: the name trimmed
+/// only where the dialect trims, split from a quoted subsection only where it
+/// has subsections (the subsection kept verbatim), and case-folded where it
+/// folds. Every layer's headers run through this, so two headers are one
+/// section exactly when the dialect's parser would say so.
+fn sectionIdent(arena: std.mem.Allocator, header_line: []const u8, d: ini.Dialect) ![]const u8 {
     const line = std.mem.trim(u8, trimEol(header_line), " \t");
     if (line.len < 2 or line[0] != '[') return error.MalformedHeader;
     const close = std.mem.lastIndexOfScalar(u8, line, ']') orelse return error.MalformedHeader;
@@ -232,14 +232,13 @@ fn sectionIdent(arena: std.mem.Allocator, header_line: []const u8) ![]const u8 {
     var ident: std.ArrayList(u8) = .empty;
     errdefer ident.deinit(arena);
 
-    if (std.mem.indexOfScalar(u8, inner, '"')) |q| {
-        const name = std.mem.trim(u8, inner[0..q], " \t");
-        const rest = inner[q..];
-        for (name) |c| try ident.append(arena, std.ascii.toLower(c));
+    const quote = if (d.subsections == .none) null else std.mem.indexOfScalar(u8, inner, '"');
+    const name_raw = if (quote) |q| inner[0..q] else inner;
+    const name = if (d.trim_section_names or quote != null) std.mem.trim(u8, name_raw, " \t") else name_raw;
+    for (name) |c| try ident.append(arena, if (d.case_insensitive_sections) std.ascii.toLower(c) else c);
+    if (quote) |q| {
         try ident.append(arena, 0);
-        try ident.appendSlice(arena, std.mem.trim(u8, rest, " \t"));
-    } else {
-        for (std.mem.trim(u8, inner, " \t")) |c| try ident.append(arena, std.ascii.toLower(c));
+        try ident.appendSlice(arena, std.mem.trim(u8, inner[q..], " \t"));
     }
     return ident.toOwnedSlice(arena);
 }
@@ -493,4 +492,26 @@ test "merge: CRLF base round-trips as CRLF" {
         "[user]\r\n\tname = Ada\r\n\temail = work@example.com\r\n",
         merged,
     );
+}
+
+test "merge: a generic section name keeps its padding and quotes, as the dialect reads it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const padded = try merge(arena.allocator(), "[s]\nk=1\n", "[ s ]\nk=2\n", .generic);
+    try std.testing.expectEqualStrings("[s]\nk=1\n\n[ s ]\nk=2\n", padded);
+
+    const quoted = try merge(arena.allocator(), "[foo \"Bar\"]\nk=1\n", "[FOO \"bar\"]\nk=2\n", .generic);
+    try std.testing.expectEqualStrings("[foo \"Bar\"]\nk=2\n", quoted);
+
+    const cased = try merge(arena.allocator(), "[S]\nk=1\n", "[s]\nk=2\n", .generic);
+    try std.testing.expectEqualStrings("[S]\nk=2\n", cased);
+}
+
+test "merge: a gitconfig section name is trimmed and its subsection kept verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const merged = try merge(arena.allocator(), "[core]\n\tk = 1\n[url \"A\"]\n\tx = 1\n", "[ core ]\n\tk = 2\n[url \"a\"]\n\tx = 2\n", .gitconfig);
+    try std.testing.expectEqualStrings("[core]\n\tk = 2\n[url \"A\"]\n\tx = 1\n\n[url \"a\"]\n\tx = 2\n", merged);
 }
