@@ -1011,6 +1011,28 @@ test "commit: a new gitconfig subsection beside one named by a capture is not re
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".gitconfig")), "gitdir:<machine.os>/work/") != null);
 }
 
+test "commit: a key another layer defines literally routes beside a capture-named key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "[includeIf \"gitdir:<machine.os>/work/\"]\n\tpath = w\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/os=darwin", "[includeIf \"gitdir:~/oss/\"]\n\tpath = o\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".gitconfig");
+    try editLive(io, a, live, "path = o", "path = o2");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "path = o2") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".gitconfig.d/os=darwin")), "path = o2") != null);
+}
+
 test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

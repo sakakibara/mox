@@ -536,10 +536,8 @@ pub fn resolveLayer(
         return .{ .action = .remove, .target = definers[0], .definers = definers, .skip_reason = null };
     }
 
-    for (layers) |l| {
-        if (keyNamedByCapture(format, l.value, change.path, composed))
-            return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "key is named by an interpolation capture" };
-    }
+    if (keyNamedByCapture(format, layers, change.path, composed))
+        return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "key is named by an interpolation capture" };
 
     if (definers.len == 0)
         return .{ .action = .set, .target = 0, .definers = definers, .skip_reason = null };
@@ -606,48 +604,83 @@ fn iniHas(v: ini.Value, path: []const []const u8) bool {
 }
 
 /// Whether a segment of `path` may be the resolved name of a key, table or
-/// section that `value` names with a capture: at the first depth where the
-/// segment is not a literal key of its container, that container has a key
-/// whose name holds a capture, and the segment was already there in
-/// `composed`, this machine's composed output -- a segment it lacks is a key
-/// the user added. Routing there would write this machine's resolved name
-/// into shared source. With `composed` unknown, any such container refuses.
-fn keyNamedByCapture(format: Format, value: Value, path: []const []const u8, composed: ?Value) bool {
+/// section that a layer names with a capture: at the first depth where no
+/// layer has the segment as a literal key of its container, some layer's
+/// container there has a key whose name holds a capture, and the segment was
+/// already there in `composed`, this machine's composed output the change was
+/// diffed against -- a segment it lacks is a key the user added. Routing there
+/// would write this machine's resolved name into shared source. With
+/// `composed` unknown, any such container refuses.
+fn keyNamedByCapture(format: Format, layers: []const StructLayer, path: []const []const u8, composed: ?Value) bool {
     for (0..path.len) |d| {
-        const literal = switch (format) {
-            .toml => if (tomlAt(value.toml, path[0..d])) |c| switch (c) {
-                .table => |t| t.get(path[d]) != null,
-                else => return false,
-            } else return false,
-            .json => if (jsonAt(value.json, path[0..d])) |c| switch (c) {
-                .object => |o| o.get(path[d]) != null,
-                else => return false,
-            } else return false,
-            .yaml => if (yamlAt(value.yaml, path[0..d])) |c| switch (c) {
-                .map => |m| yaml.Value.mapGet(m, path[d]) != null,
-                else => return false,
-            } else return false,
-            .ini, .gitconfig => if (iniAt(value.ini, path[0..d])) |c| switch (c) {
-                .section => |sec| sec.findValue(path[d]) != null,
-                else => return false,
-            } else return false,
-        };
+        var literal = false;
+        var any_container = false;
+        for (layers) |l| {
+            const has = containerHas(format, l.value, path[0..d], path[d]) orelse continue;
+            any_container = true;
+            if (has) literal = true;
+        }
         if (literal) continue;
+        if (!any_container) return false;
         if (composed) |c| {
             if (!definesPath(format, c, path[0 .. d + 1])) return false;
         }
-        return switch (format) {
-            .toml => tomlKeysCaptured(tomlAt(value.toml, path[0..d]).?.table),
-            .json => jsonKeysCaptured(jsonAt(value.json, path[0..d]).?.object),
-            .yaml => for (yamlAt(value.yaml, path[0..d]).?.map) |e| {
-                if (yamlCapture(e.key)) break true;
-            } else false,
-            .ini, .gitconfig => for (iniAt(value.ini, path[0..d]).?.section.entries) |e| {
-                if (hasCapture(e.key)) break true;
-            } else false,
-        };
+        for (layers) |l| {
+            if (containerKeysCaptured(format, l.value, path[0..d])) return true;
+        }
+        return false;
     }
     return false;
+}
+
+/// Whether the container at `prefix` in `value` has `key` literally, or null
+/// when there is no container there.
+fn containerHas(format: Format, value: Value, prefix: []const []const u8, key: []const u8) ?bool {
+    return switch (format) {
+        .toml => if (tomlAt(value.toml, prefix)) |c| switch (c) {
+            .table => |t| t.get(key) != null,
+            else => null,
+        } else null,
+        .json => if (jsonAt(value.json, prefix)) |c| switch (c) {
+            .object => |o| o.get(key) != null,
+            else => null,
+        } else null,
+        .yaml => if (yamlAt(value.yaml, prefix)) |c| switch (c) {
+            .map => |m| yaml.Value.mapGet(m, key) != null,
+            else => null,
+        } else null,
+        .ini, .gitconfig => if (iniAt(value.ini, prefix)) |c| switch (c) {
+            .section => |sec| sec.findValue(key) != null,
+            else => null,
+        } else null,
+    };
+}
+
+/// Whether the container at `prefix` in `value` has a key whose name holds a
+/// capture.
+fn containerKeysCaptured(format: Format, value: Value, prefix: []const []const u8) bool {
+    return switch (format) {
+        .toml => if (tomlAt(value.toml, prefix)) |c| switch (c) {
+            .table => |t| tomlKeysCaptured(t),
+            else => false,
+        } else false,
+        .json => if (jsonAt(value.json, prefix)) |c| switch (c) {
+            .object => |o| jsonKeysCaptured(o),
+            else => false,
+        } else false,
+        .yaml => if (yamlAt(value.yaml, prefix)) |c| switch (c) {
+            .map => |m| for (m) |e| {
+                if (yamlCapture(e.key)) break true;
+            } else false,
+            else => false,
+        } else false,
+        .ini, .gitconfig => if (iniAt(value.ini, prefix)) |c| switch (c) {
+            .section => |sec| for (sec.entries) |e| {
+                if (hasCapture(e.key)) break true;
+            } else false,
+            else => false,
+        } else false,
+    };
 }
 
 fn tomlKeysCaptured(t: anytype) bool {
