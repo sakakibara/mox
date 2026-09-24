@@ -3430,6 +3430,7 @@ test "commit: a coupled token update that breaks a source where it exists is ref
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "coupled token update would leave configuration os=linux unable to compose; not committed") != null);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.toml")));
 }
 

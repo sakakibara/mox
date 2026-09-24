@@ -1598,10 +1598,7 @@ pub fn commitImpl(
                 after_per = pc.per;
             }
             if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
-                try ctx.err.print(
-                    "mox commit: {s}: coupled token update would change configuration {s}, which you did not choose to affect; not committed\n",
-                    .{ file.source_base_abs, configs[vi].label },
-                );
+                try reportViolation(ctx.err, file.source_base_abs, "coupled token update", configs[vi].label, after_per[vi].isUncomposable());
                 mismatch = true;
                 rolled_back[fidx] = true;
                 try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
@@ -1682,10 +1679,7 @@ pub fn commitImpl(
                 if (candidates.firstViolation(configs, baseline[fidx], after_mixed, &allowed[fidx])) |vi| {
                     rolled_back[fidx] = true;
                     try restoreRouted(ctx.io, routed_orig[fidx]);
-                    try ctx.err.print(
-                        "mox commit: {s}: routing would change configuration {s}, which you did not choose to affect; not committed\n",
-                        .{ file.live_path, configs[vi].label },
-                    );
+                    try reportViolation(ctx.err, file.live_path, "routing", configs[vi].label, after_mixed[vi].isUncomposable());
                     continue;
                 }
                 // Excused from matching live as a whole, each key routed from
@@ -1762,10 +1756,7 @@ pub fn commitImpl(
             mismatch = true;
             rolled_back[fidx] = true;
             try restoreRouted(ctx.io, routed_orig[fidx]);
-            try ctx.err.print(
-                "mox commit: {s}: routing would change configuration {s}, which you did not choose to affect; not committed\n",
-                .{ file.live_path, configs[vi].label },
-            );
+            try reportViolation(ctx.err, file.live_path, "routing", configs[vi].label, after_per[vi].isUncomposable());
             continue;
         }
         if (file.own_paths.len > 0) {
@@ -4171,6 +4162,16 @@ fn pathsNest(a: []const []const u8, b: []const []const u8) bool {
         if (!std.mem.eql(u8, x, y)) return false;
     }
     return true;
+}
+
+/// Report the configuration a write may not change: one it would leave unable
+/// to compose, or one the user did not choose to affect.
+fn reportViolation(err: *Io.Writer, path: []const u8, what: []const u8, label: []const u8, uncomposable: bool) !void {
+    if (uncomposable) {
+        try err.print("mox commit: {s}: {s} would leave configuration {s} unable to compose; not committed\n", .{ path, what, label });
+    } else {
+        try err.print("mox commit: {s}: {s} would change configuration {s}, which you did not choose to affect; not committed\n", .{ path, what, label });
+    }
 }
 
 /// Name the hunks a file left only in its live copy, and whether the edits
