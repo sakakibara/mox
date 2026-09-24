@@ -278,12 +278,14 @@ All notable changes to mox are documented here. The format follows
   declined, and whose source composes to nothing on this machine, was
   reported as broken by the routing and had its sources restored; it is now
   reported as its changes remaining only in the live file.
-- An `.ini` file is read everywhere with the section names the merge uses.
-  The merge trims a section name, so `[ s ]` in an overlay replaces keys of
-  `[s]` in the base, but commit read the two as different sections: an edit
-  to a key the overlay supplied went to the base, and a capture in the
-  overlay's value was never seen. A partially owned `.ini` file's declared
-  paths likewise match a section by its trimmed name.
+- `commit` and partial ownership trim an `.ini` section name as the merge
+  does. The merge reads `[ s ]` in an overlay as `[s]` and replaces the
+  base's keys, but commit read the two as different sections: an edit to a
+  key the overlay supplied went to the base, and a capture in the overlay's
+  value was never seen. A partially owned `.ini` file's declared paths
+  likewise match a section by its trimmed name; one whose owned record an
+  earlier release wrote under the untrimmed name reports that section once
+  as not defined by any layer, then records it under the trimmed name.
 - `commit` refuses an edit under a key, table or section of a file merged
   from layers whose name holds a capture, such as
   `[includeIf "gitdir:<machine.home>/work/"]`. Live holds the resolved name,
