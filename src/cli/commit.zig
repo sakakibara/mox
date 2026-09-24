@@ -2605,15 +2605,18 @@ fn processStructFile(
         return .cont;
     }
 
-    return routeStructChanges(cc, ra, file, fidx, space, format, changes, last_content, first_contact);
+    const composed: ?commit_struct.Baseline = if (commit_struct.parseLayer(cc.arena, format, last_content)) |v| .{ .value = v } else |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => null,
+    };
+    return routeStructChanges(cc, ra, file, fidx, space, format, changes, composed, first_contact);
 }
 
 /// Route a set of changed key paths into their source layers: the shared
 /// tail of the whole-file structured flow and the partial per-key flow.
 /// Each change is one prompt item with the full `[y/p/s]`/pick machinery;
-/// accepted edits are deferred to the write phase. `composed_bytes` is this
-/// machine's output the changes were diffed against, or null when they were
-/// diffed against something else.
+/// accepted edits are deferred to the write phase. `baseline` is what the
+/// changes were diffed against, or null when it is unknown.
 fn routeStructChanges(
     cc: *const ClassCtx,
     ra: *const RunAccum,
@@ -2622,14 +2625,10 @@ fn routeStructChanges(
     space: FileSpace,
     format: commit_struct.Format,
     changes: []const commit_struct.KeyPathChange,
-    composed_bytes: ?[]const u8,
+    baseline: ?commit_struct.Baseline,
     first_contact: bool,
 ) !HunkOutcome {
     ra.affected[fidx] = true;
-    const composed = if (composed_bytes) |b| commit_struct.parseLayer(cc.arena, format, b) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        else => null,
-    } else null;
 
     const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -2644,7 +2643,7 @@ fn routeStructChanges(
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
 
     for (changes, 0..) |change, ki| {
-        const res = try commit_struct.resolveLayer(cc.arena, format, layers, change, composed);
+        const res = try commit_struct.resolveLayer(cc.arena, format, layers, change, baseline);
         if (res.action == .skip) {
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
@@ -3599,10 +3598,13 @@ fn processPartialFile(
     // every structured route.
     if (spaces[fidx] == null) spaces[fidx] = try structFileSpace(arena, cc.io, cc.this_bindings, file, repo_dir);
     // The changes were diffed against the owned record, not the fresh
-    // compose, so a key's resolved name from the last apply may be absent
-    // from `bytes`; with no baseline to match, a capture-named container
-    // refuses outright.
-    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, null, false);
+    // compose, so the record is the baseline a key's resolved name is looked
+    // up in.
+    const record_baseline: ?commit_struct.Baseline = if (mox.apply.canonical.parseTree(arena, last_blob_text)) |t| .{ .record = t } else |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Malformed => null,
+    };
+    return routeStructChanges(cc, ra, file, fidx, spaces[fidx].?, format, diffres.changes, record_baseline, false);
 }
 
 /// A partial file's manual (un-routable) outcome. Marks the file affected

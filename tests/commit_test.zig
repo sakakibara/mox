@@ -4541,6 +4541,29 @@ test "commit partial: a key named by a capture whose value changed since apply i
     try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf("p.toml")));
 }
 
+test "commit partial: a new owned key beside one named by a capture routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui\n[tui]\n\"<machine.os>\" = 1\ntheme = \"light\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("app.toml");
+    try editLive(io, a, live, "theme = \"light\"", "theme = \"light\"\nfont = 2");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "font = 2") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    const src = try read(io, a, try h.srcOf("app.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "font = 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "<machine.os>") != null);
+}
+
 test "commit partial: [y] routes an owned-key edit to the base and advances the owned record" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

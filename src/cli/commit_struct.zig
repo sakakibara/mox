@@ -517,7 +517,7 @@ pub fn resolveLayer(
     format: Format,
     layers: []const StructLayer,
     change: KeyPathChange,
-    composed: ?Value,
+    baseline: ?Baseline,
 ) !Resolution {
     // Every layer that defines the key, most-specific-first.
     var defs: std.ArrayList(usize) = .empty;
@@ -536,7 +536,7 @@ pub fn resolveLayer(
         return .{ .action = .remove, .target = definers[0], .definers = definers, .skip_reason = null };
     }
 
-    if (keyNamedByCapture(format, layers, change.path, composed))
+    if (keyNamedByCapture(format, layers, change.path, baseline))
         return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "key is named by an interpolation capture" };
 
     if (definers.len == 0)
@@ -607,11 +607,11 @@ fn iniHas(v: ini.Value, path: []const []const u8) bool {
 /// section that a layer names with a capture: at the first depth where no
 /// layer has the segment as a literal key of its container, some layer's
 /// container there has a key whose name holds a capture, and the segment was
-/// already there in `composed`, this machine's composed output the change was
-/// diffed against -- a segment it lacks is a key the user added. Routing there
-/// would write this machine's resolved name into shared source. With
-/// `composed` unknown, any such container refuses.
-fn keyNamedByCapture(format: Format, layers: []const StructLayer, path: []const []const u8, composed: ?Value) bool {
+/// already there in `baseline`, what the change was diffed against -- a
+/// segment it lacks is a key the user added. Routing there would write this
+/// machine's resolved name into shared source. With `baseline` unknown, any
+/// such container refuses.
+fn keyNamedByCapture(format: Format, layers: []const StructLayer, path: []const []const u8, baseline: ?Baseline) bool {
     for (0..path.len) |d| {
         var literal = false;
         var any_container = false;
@@ -622,8 +622,8 @@ fn keyNamedByCapture(format: Format, layers: []const StructLayer, path: []const 
         }
         if (literal) continue;
         if (!any_container) return false;
-        if (composed) |c| {
-            if (!definesPath(format, c, path[0 .. d + 1])) return false;
+        if (baseline) |b| {
+            if (!b.has(format, path[0 .. d + 1])) return false;
         }
         for (layers) |l| {
             if (containerKeysCaptured(format, l.value, path[0..d])) return true;
@@ -632,6 +632,24 @@ fn keyNamedByCapture(format: Format, layers: []const StructLayer, path: []const 
     }
     return false;
 }
+
+/// What a structured change was diffed against on this machine: a whole
+/// file's composed output, or a partial file's canonical owned record.
+pub const Baseline = union(enum) {
+    value: Value,
+    record: canonical.Node,
+
+    fn has(self: Baseline, format: Format, path: []const []const u8) bool {
+        switch (self) {
+            .value => |v| return definesPath(format, v, path),
+            .record => |root| {
+                var node = root;
+                for (path) |seg| node = node.find(seg) orelse return false;
+                return true;
+            },
+        }
+    }
+};
 
 /// Whether the container at `prefix` in `value` has `key` literally, or null
 /// when there is no container there.
