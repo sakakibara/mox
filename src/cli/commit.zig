@@ -2233,13 +2233,17 @@ fn simulateCouplingImpact(
 
     var present: usize = 0;
     for (configs, before.per_config, after.per_config) |c, b, a| {
-        if (!c.is_this_machine and (b != .absent or a != .absent)) present += 1;
+        if (c.is_this_machine) continue;
+        if (b == .absent and a == .absent) continue;
+        if (b.isUncomposable() and a.isUncomposable()) continue;
+        present += 1;
     }
     return .{ .impact = try impact.impact(arena, configs, before, after), .present_siblings = present };
 }
 
 /// A coupled update's `impact`, and how many configurations other than this
-/// machine's the file exists in before or after it.
+/// machine's it could change: those the file exists in before or after it,
+/// less those it cannot compose in either way.
 const CouplingImpact = struct {
     impact: impact.Impact,
     present_siblings: usize,

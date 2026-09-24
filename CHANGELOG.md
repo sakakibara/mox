@@ -296,6 +296,11 @@ All notable changes to mox are documented here. The format follows
   capture was written into the source under its resolved name, and the file
   was reported committed. Any routed key that does not recompose to its live
   value now rolls the file back.
+- `commit` refuses an edit that leaves the file unable to compose in any
+  configuration that composed it before, including one the edit was allowed
+  to change. The check for an allowed configuration stopped at whether it
+  was allowed, so a coupled token update that made a source unparseable on
+  other machines was committed.
 - A coupled token update reaches a source gated off this machine. Such a
   source composes to nothing here, before the update as after, but that was
   taken for the update breaking it, and a sync counted as universal only if

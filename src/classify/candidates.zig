@@ -96,11 +96,14 @@ pub fn firstViolation(
 ) ?usize {
     for (configs, 0..) |cfg, i| {
         if (cfg.is_this_machine) continue;
+        // Becoming unable to compose IS this edit's doing, and blocks even in
+        // a configuration the user chose to affect: no choice covers breaking
+        // it.
+        if (after[i].isUncomposable() and !baseline[i].isUncomposable()) return i;
         if (allowed.contains(cfg.label)) continue;
         // A configuration already unable to compose before the edit stays the
         // repo's pre-existing problem: it is reported separately, and blocking
         // on it would make every other file uncommittable until it is fixed.
-        // Becoming unable to compose IS this edit's doing, and does block.
         if (baseline[i].isUncomposable() and after[i].isUncomposable()) continue;
         if (impact.changedOut(baseline[i], after[i])) return i;
     }

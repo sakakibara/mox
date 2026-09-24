@@ -3363,6 +3363,30 @@ test "commit: a coupled token update that changes only some configurations a fil
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.conf")));
 }
 
+test "commit: a coupled token update that breaks a source where it exists is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkatoken\n");
+    const gated = "# mox: when os=linux\nquokkatoken = 1\nwombattoken = 2\n";
+    try writeRepo(io, &tmp, "repo/src/.config/x.toml", gated);
+    try writeRepo(io, &tmp, "repo/src/.config/x.toml.d/os=linux.toml", "z = 1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.toml")));
+}
+
 test "commit: a coupled token in a symlink target or seed-once body is not rewritten" {
     // The symlink source is materialized live during apply; needs symlink support.
     if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
