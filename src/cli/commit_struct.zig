@@ -534,6 +534,11 @@ pub fn resolveLayer(
         return .{ .action = .remove, .target = definers[0], .definers = definers, .skip_reason = null };
     }
 
+    for (layers) |l| {
+        if (keyNamedByCapture(format, l.value, change.path))
+            return .{ .action = .skip, .target = 0, .definers = definers, .skip_reason = "key is named by an interpolation capture" };
+    }
+
     if (definers.len == 0)
         return .{ .action = .set, .target = 0, .definers = definers, .skip_reason = null };
 
@@ -596,6 +601,62 @@ fn iniHas(v: ini.Value, path: []const []const u8) bool {
     if (v != .section) return false;
     const child = v.section.findValue(path[0]) orelse return false;
     return iniHas(child, path[1..]);
+}
+
+/// Whether a segment of `path` may be the resolved name of a key, table or
+/// section that `value` names with a capture: at the first depth where the
+/// segment is not a literal key of its container, that container has a key
+/// whose name holds a capture. Routing there would write this machine's
+/// resolved name into shared source.
+fn keyNamedByCapture(format: Format, value: Value, path: []const []const u8) bool {
+    for (0..path.len) |d| {
+        const literal = switch (format) {
+            .toml => if (tomlAt(value.toml, path[0..d])) |c| switch (c) {
+                .table => |t| t.get(path[d]) != null,
+                else => return false,
+            } else return false,
+            .json => if (jsonAt(value.json, path[0..d])) |c| switch (c) {
+                .object => |o| o.get(path[d]) != null,
+                else => return false,
+            } else return false,
+            .yaml => if (yamlAt(value.yaml, path[0..d])) |c| switch (c) {
+                .map => |m| yaml.Value.mapGet(m, path[d]) != null,
+                else => return false,
+            } else return false,
+            .ini, .gitconfig => if (iniAt(value.ini, path[0..d])) |c| switch (c) {
+                .section => |sec| sec.findValue(path[d]) != null,
+                else => return false,
+            } else return false,
+        };
+        if (literal) continue;
+        return switch (format) {
+            .toml => tomlKeysCaptured(tomlAt(value.toml, path[0..d]).?.table),
+            .json => jsonKeysCaptured(jsonAt(value.json, path[0..d]).?.object),
+            .yaml => for (yamlAt(value.yaml, path[0..d]).?.map) |e| {
+                if (yamlCapture(e.key)) break true;
+            } else false,
+            .ini, .gitconfig => for (iniAt(value.ini, path[0..d]).?.section.entries) |e| {
+                if (hasCapture(e.key)) break true;
+            } else false,
+        };
+    }
+    return false;
+}
+
+fn tomlKeysCaptured(t: anytype) bool {
+    var it = t.iterator();
+    while (it.next()) |kv| {
+        if (hasCapture(kv.key_ptr.*)) return true;
+    }
+    return false;
+}
+
+fn jsonKeysCaptured(o: anytype) bool {
+    var it = o.iterator();
+    while (it.next()) |kv| {
+        if (hasCapture(kv.key_ptr.*)) return true;
+    }
+    return false;
 }
 
 /// Whether the value `path` names in `value` carries an interpolation capture

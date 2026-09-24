@@ -278,6 +278,12 @@ All notable changes to mox are documented here. The format follows
   declined, and whose source composes to nothing on this machine, was
   reported as broken by the routing and had its sources restored; it is now
   reported as its changes remaining only in the live file.
+- `commit` refuses an edit under a key, table or section of a file merged
+  from layers whose name holds a capture, such as
+  `[includeIf "gitdir:<machine.home>/work/"]`. Live holds the resolved name,
+  which no source layer defines, so the edit was taken for a new key and
+  written into the base under that name; it is now manual as named by an
+  interpolation capture.
 - A key `commit` routes into a file merged from layers must recompose to its
   live value even when another change in that file stays manual or
   declined. Such a file was excused from matching live as a whole, so a key
