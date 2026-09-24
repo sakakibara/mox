@@ -695,6 +695,110 @@ test "commit: a layered gitconfig value holding a defaulted capture is not route
     try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".gitconfig")));
 }
 
+test "commit: a layered toml key named by a capture is never written under its resolved name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "\"<machine.os>\" = \"a\"\nm = \"<machine.os>\"\nsize = 1\n";
+    try writeRepo(io, &tmp, "repo/src/s.toml", base);
+    try writeRepo(io, &tmp, "repo/src/s.toml.d/os=darwin.toml", "size = 2\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("s.toml");
+    try editLive(io, a, live, "\"darwin\" = \"a\"", "\"darwin\" = \"b\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "\"darwin\" = \"b\"") != null);
+    try editLive(io, a, live, "m = \"darwin\"", "m = \"linux\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "m = \"linux\"") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("s.toml")));
+}
+
+test "commit: a layered toml table named by a capture is never written under its resolved name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "size = 1\n";
+    try writeRepo(io, &tmp, "repo/src/s.toml", base);
+    try writeRepo(io, &tmp, "repo/src/s.toml.d/os=darwin.toml", "m = \"<machine.os>\"\n\n[\"<machine.os>\"]\nk = \"a\"\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("s.toml");
+    try editLive(io, a, live, "k = \"a\"", "k = \"b\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = \"b\"") != null);
+    try editLive(io, a, live, "m = \"darwin\"", "m = \"linux\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "m = \"linux\"") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("s.toml")));
+}
+
+test "commit: a layered gitconfig subsection named by a capture is never written under its resolved name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "[url \"<machine.os>\"]\n\tinsteadOf = x\n[user]\n\temail = <machine.os>\n\tname = a\n";
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", base);
+    try writeRepo(io, &tmp, "repo/src/.gitconfig.d/os=darwin", "[user]\n\tname = b\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".gitconfig");
+    try editLive(io, a, live, "insteadOf = x", "insteadOf = y");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "insteadOf = y") != null);
+    try editLive(io, a, live, "email = darwin", "email = linux");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "email = linux") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".gitconfig")));
+}
+
+test "commit: a layered ini key is checked in the layer the merge took it from" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "[s]\nk = plain\nm = <machine.os>\n";
+    try writeRepo(io, &tmp, "repo/src/s.ini", base);
+    try writeRepo(io, &tmp, "repo/src/s.ini.d/os=darwin.ini", "[ s ]\nk = pre-<machine.os>\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("s.ini");
+    try editLive(io, a, live, "k = pre-darwin", "k = post-darwin");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "k = post-darwin") != null);
+    try editLive(io, a, live, "m = darwin", "m = linux");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "m = linux") != null);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ") == null);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("s.ini")));
+}
+
 test "commit: a first-contact structured file whose live copy cannot be parsed is a manual outcome at exit 1" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

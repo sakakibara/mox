@@ -1677,6 +1677,19 @@ pub fn commitImpl(
                     );
                     continue;
                 }
+                // Excused from matching live as a whole, each key routed from
+                // this file must still recompose to its live value: a route
+                // that landed anywhere else has baked text the recompose does
+                // not reproduce.
+                if (try unmatchedRoutedKey(ctx.alloc, struct_edits.items, struct_owners.items, fidx, composed.?, live)) |path| {
+                    rolled_back[fidx] = true;
+                    try restoreRouted(ctx.io, routed_orig[fidx]);
+                    try ctx.err.print(
+                        "mox commit: {s}: routed key {s} does not recompose to its live value; not committed\n",
+                        .{ file.live_path, try keyPathLabel(ctx.alloc, path) },
+                    );
+                    continue;
+                }
                 // `ra.affected[fidx]` is forced true for a structured file the
                 // instant any key changes (see `processStructFile`'s doc
                 // comment), even when every key ends up manual or declined and
@@ -4083,6 +4096,44 @@ fn firstContactManual(
     ra.pending.* = true;
     try cc.stdout.print("  manual: {f}:{d} first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1 });
     return .cont;
+}
+
+/// The path of the first key routed from file `fidx` whose value differs
+/// between `composed` and `live`, or that either side cannot be parsed to
+/// compare -- a difference at the key, inside it, or at any table enclosing
+/// it -- or null when every one recomposes to its live value.
+fn unmatchedRoutedKey(
+    arena: std.mem.Allocator,
+    edits: []const StructEdit,
+    owners: []const usize,
+    fidx: usize,
+    composed: []const u8,
+    live: []const u8,
+) !?[]const []const u8 {
+    var diffs: ?[]const commit_struct.KeyPathChange = null;
+    for (edits, owners) |e, owner| {
+        if (owner != fidx) continue;
+        const d = diffs orelse blk: {
+            const got = commit_struct.changedKeyPaths(arena, e.format, live, composed) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return e.change.path,
+            };
+            diffs = got;
+            break :blk got;
+        };
+        for (d) |c| {
+            if (pathsNest(c.path, e.change.path)) return e.change.path;
+        }
+    }
+    return null;
+}
+
+fn pathsNest(a: []const []const u8, b: []const []const u8) bool {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
 }
 
 /// Name the hunks a file left only in its live copy, and whether the edits

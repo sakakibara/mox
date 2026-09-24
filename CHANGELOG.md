@@ -278,6 +278,13 @@ All notable changes to mox are documented here. The format follows
   declined, and whose source composes to nothing on this machine, was
   reported as broken by the routing and had its sources restored; it is now
   reported as its changes remaining only in the live file.
+- A key `commit` routes into a file merged from layers must recompose to its
+  live value even when another change in that file stays manual or
+  declined. Such a file was excused from matching live as a whole, so a key
+  routed to the wrong place was never checked: a table or key named by a
+  capture was written into the source under its resolved name, and the file
+  was reported committed. Any routed key that does not recompose to its live
+  value now rolls the file back.
 - A file `commit` does not commit has a coupled token update to its own
   source rolled back with the rest. Only sources an edit was routed into
   were saved for rollback, so a token synced into an edited file stayed
