@@ -281,6 +281,17 @@ pub fn build(b: *std.Build) void {
     const commit_tests = b.addTest(.{ .root_module = commit_tests_mod });
     test_step.dependOn(&b.addRunArtifact(commit_tests).step);
 
+    // Commit golden-transcript tests at tests/commit_golden_test.zig.
+    const commit_golden_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/commit_golden_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    commit_golden_tests_mod.addImport("mox", lib_mod);
+    const commit_golden_tests = b.addTest(.{ .root_module = commit_golden_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(commit_golden_tests).step);
+
     // DSL rejection tests at tests/dsl_rejection_test.zig.
     const dsl_rejection_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/dsl_rejection_test.zig"),
