@@ -19,12 +19,24 @@
 //! anything is left undone; `--abort-on-prompt` exits 2 for a prompt that
 //! would have been needed, terminal or not. All writes happen after every
 //! prompt, so aborting writes
-//! nothing. After a file's sources are edited it is recomposed:
-//! only when the result is byte-identical to the live file, and no
-//! configuration the user did not choose changed, is the applied record
-//! advanced. A file that fails either check is not committed, and "not
-//! committed" means every source it wrote is restored -- including a fragment
-//! and region directory a narrowing synthesized.
+//! nothing. After the sources are written, every unit -- a routed file, the
+//! target of a coupled update, a generator leaf, a symlink -- is verified. A
+//! unit's applied record advances only when its recompose equals live by its
+//! own equality -- exact bytes for a whole file, the canonical owned form for
+//! a partial file, the target for a symlink, the content for a leaf -- and no
+//! configuration the user did not choose changed. A coupling-only target is
+//! never compared with live: it must still compose and change no
+//! configuration the user did not choose, and it records nothing. A unit that
+//! fails a check is not committed. A unit not committed has every path
+//! holding one of its own edits restored to its pre-run bytes -- including a
+//! fragment and region directory a narrowing synthesized -- unless that edit
+//! is also owned by a passing unit. A unit fails in turn when a path holding
+//! one of its own edits is restored because another unit failed, or when it
+//! no longer verifies once a fact it reads is reverted because the unit that
+//! routed it failed; this settles until no unit fails anew. A coupled update
+//! never fails the units whose rename produced it: when its path is restored
+//! it is reported undone. One that changes nothing its target's own edit did
+//! not already write is no edit, and is never undone.
 //!
 //! A manual hunk, and a hunk the user skips, are differences the recompose
 //! is EXPECTED to keep: skip is `s` in the per-hunk `[y/s]` prompt
@@ -37,9 +49,11 @@
 //! record does not advance (the rest is still real drift), and the report
 //! says what is left. A hunk the tool could not route to the candidate the
 //! user picked (no automatic path, a hazard) is not something the user asked
-//! for, and still rolls the whole file's routing back.
+//! for: its unit is not committed whatever else holds, a coupling target
+//! included.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
@@ -51,6 +65,7 @@ const style = @import("style.zig");
 const mox = @import("../root.zig");
 const commit_struct = @import("commit_struct.zig");
 const edit_mod = @import("edit.zig");
+const toml_statements = mox.data.toml_statements;
 
 const Io = std.Io;
 const Segment = mox.provenance.map.Segment;
@@ -77,11 +92,14 @@ const LineEdit = struct {
 };
 
 /// A field update to one row of a TOML data source (loop origin).
+/// `template` is the loop line the hunk was routed through, empty for a
+/// generator leaf; it is not part of the edit's identity.
 const RowEdit = struct {
     data_source: []const u8,
     stem: []const u8,
     row: u32,
     fields: []const Field,
+    template: []const u8 = "",
 };
 
 /// A pending literal sync of a symlink source's recorded target to the live
@@ -104,10 +122,18 @@ const GenLeafCommit = struct {
     leaf_live_path: []const u8,
 };
 
+/// The generator row edits accepted this run, each with the index in
+/// `leaves` of the leaf it was routed from.
+const LeafRowEdits = struct {
+    row_edits: std.ArrayList(RowEdit) = .empty,
+    row_leaves: std.ArrayList(usize) = .empty,
+    leaves: std.ArrayList(GenLeafCommit) = .empty,
+};
+
 /// A pending structured key-path edit to one source layer of a Cat-A file.
 /// Planned via `commit_struct.layerBytes` and written in the write phase
 /// (deferred like every other route, so abort writes nothing); its `layer_abs`
-/// is journaled for rollback.
+/// is journaled so it can be restored.
 const StructEdit = struct {
     format: commit_struct.Format,
     layer_abs: []const u8,
@@ -276,16 +302,16 @@ const Claims = struct {
 /// Pre-write bytes of one source path a routed edit will rewrite. `content` is
 /// null when the path did not exist yet (a synthesized fragment), and
 /// `created_dir` is the topmost directory the write has to create for it, so a
-/// rollback can also remove the region directories the synthesis created.
+/// restore can also remove the directories the write created.
 const Backup = struct {
     path: []const u8,
     content: ?[]const u8,
     created_dir: ?[]const u8,
 };
 
-/// Pre-run state of every source path the write phase writes, one entry per
-/// path, recorded before the first write. A rejected unit is put back by
-/// restoring the paths its edits wrote.
+/// Pre-run state of every source path the write phase writes, and of the
+/// facts file when a fact is routed, one entry per path, recorded before the
+/// first write.
 const Journal = struct {
     entries: std.StringHashMap(Backup),
 
@@ -302,36 +328,195 @@ const Journal = struct {
         try j.entries.put(path, .{ .path = path, .content = content, .created_dir = mox.classify.synth.missingAncestor(io, path) });
     }
 
-    fn restore(j: *const Journal, io: Io, paths: []const []const u8) !void {
-        for (paths) |p| try restoreRouted(io, &.{j.entries.get(p).?});
+    /// Put `path` back to its pre-run bytes. A path that did not exist is
+    /// deleted, and then each directory its write created, innermost first,
+    /// only while it is empty.
+    fn restore(j: *const Journal, io: Io, path: []const u8) !void {
+        const b = j.entries.get(path).?;
+        if (b.content) |bytes| return Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+        Io.Dir.cwd().deleteFile(io, path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+        const top = b.created_dir orelse return;
+        var dir = std.fs.path.dirname(path);
+        while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+            Io.Dir.cwd().deleteDir(io, d) catch return;
+            if (std.mem.eql(u8, d, top)) return;
+        }
     }
 };
 
-/// Journal `path` and add it to `list` once.
-fn addPath(arena: std.mem.Allocator, journal: *Journal, io: Io, list: *std.ArrayList([]const u8), path: []const u8) !void {
-    for (list.items) |p| {
-        if (std.mem.eql(u8, p, path)) return;
+/// `path` by the file it names, so two spellings of one file are one path: an
+/// existing path as the OS resolves it (symlinks, `.` and `..`, the on-disk
+/// spelling on a case-insensitive file system); an absent one as its nearest
+/// existing ancestor's real path joined with the rest. A path the OS cannot
+/// resolve for another reason stays as given.
+fn canonicalPath(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
+    var ancestor = path;
+    while (true) {
+        if (Io.Dir.cwd().realPathFileAlloc(io, ancestor, arena)) |real| {
+            if (ancestor.len == path.len) return real;
+            var rest = path[ancestor.len..];
+            while (rest.len > 0 and std.fs.path.isSep(rest[0])) rest = rest[1..];
+            return std.fs.path.resolve(arena, &.{ real, rest });
+        } else |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.FileNotFound, error.NotDir => ancestor = std.fs.path.dirname(ancestor) orelse return path,
+            else => return path,
+        }
     }
-    try journal.record(arena, io, path);
-    try list.append(arena, path);
 }
 
-/// Who a planned edit is restored with: a managed file by index, or the
-/// symlink or generator batch, each of which the verify loops restore whole.
-const Owner = union(enum) {
-    file: usize,
-    symlinks,
-    generators,
+/// What makes two paths one file: its device and inode, or on Windows its
+/// volume serial number and 128-bit file id. Every hard link to a file has it.
+const FileIdentity = struct { device: u64, inode: u128 };
+
+/// The identity of the existing file at `path`, or null when it cannot be
+/// read for any reason (an absent file, a refused open, no call the system
+/// allows); the caller then keys the file by its canonical real path. POSIX
+/// reads it without opening the file, so a FIFO never blocks.
+fn fileIdentity(io: Io, path: []const u8) ?FileIdentity {
+    switch (builtin.os.tag) {
+        .windows => {
+            const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+            defer file.close(io);
+            return windowsFileId(file.handle) orelse windowsIndexIdentity(io, file);
+        },
+        .linux => {
+            const linux = std.os.linux;
+            const z = std.posix.toPosixPath(path) catch return null;
+            var stx: linux.Statx = undefined;
+            switch (linux.errno(linux.statx(linux.AT.FDCWD, &z, 0, .{ .INO = true }, &stx))) {
+                .SUCCESS => return .{ .device = (@as(u64, stx.dev_major) << 32) | stx.dev_minor, .inode = stx.ino },
+                // statx refused by a seccomp filter or missing from the kernel.
+                .NOSYS, .PERM => return linuxStatIdentity(&z),
+                else => return null,
+            }
+        },
+        else => {
+            const z = std.posix.toPosixPath(path) catch return null;
+            var st: std.c.Stat = undefined;
+            if (std.c.fstatat(std.c.AT.FDCWD, &z, &st, 0) != 0) return null;
+            const dev = st.dev;
+            const device: u64 = if (@typeInfo(@TypeOf(dev)).int.signedness == .signed) @bitCast(@as(i64, dev)) else dev;
+            return .{ .device = device, .inode = st.ino };
+        },
+    }
+}
+
+/// FILE_ID_INFORMATION: the volume serial number and the 128-bit file id
+/// ReFS needs, which NTFS fills from its 64-bit index.
+const WindowsFileIdInfo = extern struct {
+    VolumeSerialNumber: u64,
+    FileId: [16]u8,
 };
 
-/// One planned edit and every owner that produced it. Identical edits are
-/// collected once, their owners unioned.
+/// A file's identity from its 128-bit id, or null when the file system does
+/// not report one (FAT and some network redirectors).
+fn windowsFileId(handle: std.os.windows.HANDLE) ?FileIdentity {
+    const windows = std.os.windows;
+    var info: WindowsFileIdInfo = undefined;
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    if (windows.ntdll.NtQueryInformationFile(handle, &iosb, &info, @sizeOf(WindowsFileIdInfo), .Id) != .SUCCESS) return null;
+    return .{ .device = info.VolumeSerialNumber, .inode = std.mem.readInt(u128, &info.FileId, .little) };
+}
+
+/// A file's identity from its volume's 32-bit serial number and its 64-bit
+/// index, where no 128-bit id is available.
+fn windowsIndexIdentity(io: Io, file: Io.File) ?FileIdentity {
+    const windows = std.os.windows;
+    const st = file.stat(io) catch return null;
+    const Info = windows.FILE.FS_VOLUME_INFORMATION;
+    // The volume label follows the fixed fields; only the serial number is
+    // wanted, so a label that does not fit is fine.
+    var buf: [@sizeOf(Info) + 64]u8 align(@alignOf(Info)) = undefined;
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    switch (windows.ntdll.NtQueryVolumeInformationFile(file.handle, &iosb, &buf, buf.len, .Volume)) {
+        .SUCCESS, .BUFFER_OVERFLOW => {},
+        else => return null,
+    }
+    const info: *const Info = @ptrCast(&buf);
+    return .{ .device = info.VolumeSerialNumber, .inode = @as(u64, @bitCast(st.inode)) };
+}
+
+/// A file's identity from `fstatat`, in the device numbering statx uses.
+/// Only 64-bit targets whose kernel `struct stat` opens with the 64-bit
+/// `st_dev` and `st_ino` are read; elsewhere the caller keys by path.
+fn linuxStatIdentity(z: [*:0]const u8) ?FileIdentity {
+    const linux = std.os.linux;
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64, .aarch64_be, .riscv64, .loongarch64, .powerpc64, .powerpc64le, .s390x => {},
+        else => return null,
+    }
+    // Larger than any of those targets' `struct stat`.
+    var buf: [256]u8 align(8) = undefined;
+    const rc = linux.syscall4(.fstatat64, @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))), @intFromPtr(z), @intFromPtr(&buf), 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const words: *const [2]u64 = @ptrCast(&buf);
+    return .{ .device = linuxDevice(words[0]), .inode = words[1] };
+}
+
+/// A `dev_t` as the major and minor numbers statx reports, each in its own
+/// 32-bit half.
+fn linuxDevice(dev: u64) u64 {
+    const major: u32 = @truncate(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(u64, 0xfff)));
+    const minor: u32 = @truncate((dev & 0xff) | ((dev >> 12) & ~@as(u64, 0xff)));
+    return (@as(u64, major) << 32) | minor;
+}
+
+/// Canonical source paths, each with the spelling it was first reached by,
+/// which is how messages name it. An existing file is one path whatever
+/// hard link reaches it: the real path first seen for its identity.
+const PathIds = struct {
+    arena: std.mem.Allocator,
+    io: Io,
+    spelling: std.StringHashMap([]const u8),
+    by_identity: std.AutoHashMap(FileIdentity, []const u8),
+
+    fn init(arena: std.mem.Allocator, io: Io) PathIds {
+        return .{ .arena = arena, .io = io, .spelling = .init(arena), .by_identity = .init(arena) };
+    }
+
+    /// `path`'s canonical path, without recording how it was spelled.
+    fn canonical(ids: *PathIds, path: []const u8) ![]const u8 {
+        const real = try canonicalPath(ids.arena, ids.io, path);
+        const id = fileIdentity(ids.io, real) orelse return real;
+        const gop = try ids.by_identity.getOrPut(id);
+        if (!gop.found_existing) gop.value_ptr.* = real;
+        return gop.value_ptr.*;
+    }
+
+    fn of(ids: *PathIds, path: []const u8) ![]const u8 {
+        const canonical_path = try ids.canonical(path);
+        const gop = try ids.spelling.getOrPut(canonical_path);
+        if (!gop.found_existing) gop.value_ptr.* = path;
+        return canonical_path;
+    }
+
+    fn shown(ids: *const PathIds, path: []const u8) []const u8 {
+        return ids.spelling.get(path) orelse path;
+    }
+};
+
+/// What is verified and recorded on its own: a managed file by index (routed,
+/// or the target of a coupled update only), an accepted symlink target sync,
+/// or a generator leaf with an accepted row edit, each by its index in its
+/// own list.
+const Unit = union(enum) {
+    file: usize,
+    symlink: usize,
+    leaf: usize,
+};
+
+/// One planned edit and every unit whose change produced it. Identical edits
+/// are collected once, their owners unioned.
 fn Owned(comptime T: type) type {
     return struct {
         edit: T,
-        owners: std.ArrayList(Owner),
+        owners: std.ArrayList(Unit),
 
-        fn ownedBy(o: @This(), owner: Owner) bool {
+        fn ownedBy(o: @This(), owner: Unit) bool {
             for (o.owners.items) |x| {
                 if (std.meta.eql(x, owner)) return true;
             }
@@ -345,7 +530,7 @@ fn addOwned(
     arena: std.mem.Allocator,
     list: *std.ArrayList(Owned(T)),
     edit: T,
-    owners: []const Owner,
+    owners: []const Unit,
     comptime eql: fn (T, T) bool,
 ) !void {
     const slot = for (list.items) |*o| {
@@ -1023,16 +1208,15 @@ pub fn commitImpl(
     var synth_plans: std.ArrayList(SynthDecision) = .empty;
     var struct_edits: std.ArrayList(StructEdit) = .empty;
     // Symlink-target and generator-leaf keep bypass the whole-file
-    // affected[]/spaces[] machinery below entirely: a symlink's source and a
+    // affected[]/spaces[] machinery below: a symlink's source and a
     // generator's data source do not compose the way an ordinary managed file
     // does (composing a generator's own directive file the normal way is an
     // error, and a symlink's live path is not readable as a regular file's
-    // content), so both get their own small, self-contained write+verify pass.
+    // content), so each accepted sync and each leaf is a unit of its own.
     var sym_syncs: std.ArrayList(SymSync) = .empty;
-    var gen_row_edits: std.ArrayList(RowEdit) = .empty;
-    var gen_leaf_commits: std.ArrayList(GenLeafCommit) = .empty;
-    // Index of the managed file each pending edit was routed from, so a file
-    // whose routing verification fails can restore exactly the sources it wrote.
+    var generated: LeafRowEdits = .{};
+    // Index of the managed file each pending edit was routed from: the unit
+    // that owns it.
     var line_owners: std.ArrayList(usize) = .empty;
     var row_owners: std.ArrayList(usize) = .empty;
     var fact_owners: std.ArrayList(usize) = .empty;
@@ -1057,8 +1241,9 @@ pub fn commitImpl(
     // designed outcome. A file with either cannot recompose to live no matter
     // how well its other hunks routed, and that is expected. `unrouted_hunks`
     // counts hunks the TOOL could not route to the candidate the user picked (no
-    // automatic path, a hazard) -- not something the user asked for, so it does
-    // NOT explain a mismatch away. The diagnostics name whichever caused it.
+    // automatic path, a hazard) -- not something the user asked for, so a file
+    // with one is not committed whatever else holds. The diagnostics name
+    // whichever caused it.
     const manual_hunks = try ctx.alloc.alloc(usize, tree.files.len);
     @memset(manual_hunks, 0);
     const declined_hunks = try ctx.alloc.alloc(usize, tree.files.len);
@@ -1118,7 +1303,7 @@ pub fn commitImpl(
             };
             if (gen) |outputs| {
                 const only_leaves = if (scoped_leaves) |*m| m.getPtr(file.live_path) else null;
-                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, context.paths.state_dir, &gen_row_edits, &gen_leaf_commits)) {
+                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, context.paths.state_dir, &generated)) {
                     .cont => {},
                     .abort => {
                         aborted = true;
@@ -1322,17 +1507,22 @@ pub fn commitImpl(
     }
 
     const coupling_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, "coupling" });
+    // Source paths by the file they name; see the canonicalization below.
+    var ids: PathIds = .init(ctx.alloc, ctx.io);
     const protected = try protectedSourceSet(ctx.alloc, tree.files);
+    const bases = try managedBases(ctx.alloc, tree.files);
+    // Whether routed renames are offered to other sources; see F-coupling.
+    const couples = scoped_live == null and line_edits.items.len > 0;
+    const accepted: AcceptedTexts = if (couples)
+        try acceptedTexts(ctx.alloc, ctx.io, &ids, tree.files, line_edits.items, row_edits.items, row_owners.items, &generated, synth_plans.items)
+    else
+        .init(ctx.alloc, &ids);
 
     if (report_mode) {
         // Report the coupling updates a real commit would offer for the routed
         // renames, honoring declines. Nothing is written; each pending update
-        // counts toward the "edits remain" exit code. A path-scoped commit
-        // routes only the named files and must not reach out to other sources.
-        const coupled = if (scoped_live == null and line_edits.items.len > 0)
-            try reportCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, &protected, ctx.out)
-        else
-            0;
+        // counts toward the "edits remain" exit code.
+        const coupled = if (couples) try reportCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, &accepted, bases, &protected, ctx.out, ctx.err) else 0;
         if (coupled > 0) pending = true;
         if (pkgs.pending()) pending = true;
         if (routed_count == 0 and manual_count == 0 and coupled == 0 and skipped_secret == 0 and !pkgs.pending()) {
@@ -1357,20 +1547,16 @@ pub fn commitImpl(
     // path-scoped commit routes only the named files and must not reach out to
     // couple other sources, so the whole pass is skipped when scoped.
     var coupling_edits: []const CouplingEdit = &.{};
-    if (scoped_live == null and line_edits.items.len > 0) {
-        const cres = try resolveCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, &protected, ask_mode, input, ctx.out);
+    var coupling_origins: []const usize = &.{};
+    if (couples) {
+        const cres = try resolveCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, line_owners.items, &accepted, bases, &protected, ask_mode, input, ctx.out, ctx.err);
         if (cres.abort) aborted = true;
         if (cres.abort_strict) strict_abort = true;
         // A q-abort (or strict-mode prompt) must persist nothing: the decline
         // list is saved only when the command did not abort.
         if (cres.save_declines) try mox.coupling.store.saveDeclines(ctx.alloc, ctx.io, coupling_dir, &cres.declines);
-        // A symlink target string or a seed-once body must never be rewritten by
-        // a coupling sync: symlinks and seed files are user-owned after creation
-        // and are never edit sources, so a token they happen to share must not be
-        // synced into them. The coupling graph may still index them, so drop any
-        // edit that lands on one before the write pass (mirrors the direct
-        // routing loop's is_symlink/create_once skips).
-        coupling_edits = try dropProtectedCouplingEdits(ctx.alloc, cres.edits, tree.files);
+        coupling_edits = cres.edits;
+        coupling_origins = cres.origins;
     }
 
     if (strict_abort) {
@@ -1382,194 +1568,158 @@ pub fn commitImpl(
         return 1;
     }
 
-    // Coupling edits touch OTHER managed sources whose live files the user did
-    // not edit. They must be verified like routed edits (design section 5 step
-    // 3: recompose-verify over EVERY touched file), but with two differences:
-    // their recompose need not equal live (apply refreshes it), and a failure
-    // restores the source rather than leaving it edited. Mark each such file,
-    // journal its bytes for rollback, and record which configurations a
-    // universal token sync may change so a subset divergence is caught.
+    // Every edit's path by the file it names, so the journal, the plan, the
+    // restores and the ownership rule see two spellings of one file as one
+    // path. A coupled update's target is found by the path it was offered
+    // for, which is a managed file's base as the tree spells it.
+    for (line_edits.items) |*e| e.path = try ids.of(e.path);
+    for (row_edits.items) |*e| e.data_source = try ids.of(e.data_source);
+    for (generated.row_edits.items) |*e| e.data_source = try ids.of(e.data_source);
+    for (sym_syncs.items) |*e| e.source_abs = try ids.of(e.source_abs);
+    for (synth_plans.items) |*sd| {
+        sd.base_abs = try ids.of(sd.base_abs);
+        sd.plan.fragment_path = try ids.of(sd.plan.fragment_path);
+    }
+    for (struct_edits.items) |*e| e.layer_abs = try ids.of(e.layer_abs);
+    // Each coupled update's targets, by its canonical path, and back: every
+    // managed file whose base is that file, however it is linked.
+    var coupling_targets = std.StringHashMap([]const usize).init(ctx.alloc);
+    const target_path = try ctx.alloc.alloc(?[]const u8, tree.files.len);
+    @memset(target_path, null);
+    if (coupling_edits.len > 0) {
+        const canonical = try ctx.alloc.alloc(CouplingEdit, coupling_edits.len);
+        const coupled_paths = try ctx.alloc.alloc([]const u8, coupling_edits.len);
+        for (coupling_edits, canonical, coupled_paths) |e, *c, *p| {
+            c.* = .{ .path = try ids.of(e.path), .old = e.old, .new = e.new };
+            p.* = c.path;
+        }
+        coupling_edits = canonical;
+        for (tree.files, target_path) |f, *tp| {
+            if (!f.has_base or f.source_base_abs.len == 0) continue;
+            const base = try ids.canonical(f.source_base_abs);
+            if (isOneOf(base, coupled_paths)) tp.* = base;
+        }
+        for (coupled_paths) |path| {
+            const gop = try coupling_targets.getOrPut(path);
+            if (gop.found_existing) continue;
+            var targets: std.ArrayList(usize) = .empty;
+            for (target_path, 0..) |tp, fidx| {
+                if (tp != null and std.mem.eql(u8, tp.?, path)) try targets.append(ctx.alloc, fidx);
+            }
+            gop.value_ptr.* = targets.items;
+        }
+    }
+
+    // Coupling edits rewrite other managed sources. Each target is composed
+    // with the accepted renames alone, in every configuration, before anything
+    // is planned: renames that leave it unable to compose on this machine, or
+    // whose source cannot be read or transiently written, are dropped and
+    // reported undone. A target that routed nothing of its own is
+    // a unit of its own: its recompose need not equal live (apply refreshes
+    // it), but its source must still compose and the sync must not diverge a
+    // configuration the user did not choose, so the configurations a universal
+    // token sync changes are allowed and a subset divergence is caught.
     var journal: Journal = .init(ctx.alloc);
     const coupling_only = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(coupling_only, false);
+    const coupling_into = try ctx.alloc.alloc(bool, tree.files.len);
+    @memset(coupling_into, false);
+    const coupling_baseline = try ctx.alloc.alloc([]const impact.ConfigOutput, tree.files.len);
+    // Why each target's simulation failed, if it did.
+    const sim_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
+    @memset(sim_failed, null);
+    var dropped_paths: std.ArrayList([]const u8) = .empty;
     for (tree.files, 0..) |file, fidx| {
-        if (affected[fidx]) continue;
-        if (!file.has_base or file.source_base_abs.len == 0) continue;
-        const file_edits = try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs);
-        if (file_edits.len == 0) continue;
-        coupling_only[fidx] = true;
-        try journal.record(ctx.alloc, ctx.io, file.source_base_abs);
+        const path = target_path[fidx] orelse continue;
+        const file_edits = try couplingEditsForPath(ctx.alloc, coupling_edits, path);
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
-        // A token sync is legitimate only when universal: if it changes
-        // every sibling configuration the file exists in, allow them all; a
-        // strict subset stays disallowed so verification aborts it. A sibling
-        // where the file composes to nothing before and after cannot change.
-        if (space.configs.len > 1) {
-            const sim = try simulateCouplingImpact(&cc, file, file.source_base_abs, file_edits, space.configs);
-            if (sim.impact.affected.len >= sim.present_siblings) {
-                for (sim.impact.affected) |label| try allowed[fidx].put(label, {});
-            }
+        const sim = switch (try simulateCouplingImpact(&cc, file, file.source_base_abs, file_edits, space.configs)) {
+            .uncomposable, .unwritable => |e, tag| {
+                const what = if (tag == .uncomposable) "recompose failed: " else "";
+                sim_failed[fidx] = try std.fmt.allocPrint(ctx.alloc, "{s}{s}", .{ what, @errorName(e) });
+                if (!isOneOf(path, dropped_paths.items)) try dropped_paths.append(ctx.alloc, path);
+                continue;
+            },
+            .impact => |sim| sim,
+        };
+        coupling_into[fidx] = true;
+        if (affected[fidx]) continue;
+        coupling_only[fidx] = true;
+        coupling_baseline[fidx] = sim.before;
+        // A sibling where the file composes to nothing before and after
+        // cannot change.
+        if (sim.impact.affected.len >= sim.present_siblings) {
+            for (sim.impact.affected) |label| try allowed[fidx].put(label, {});
         }
     }
+    const coupling_dropped = try droppedCouplingLines(ctx.alloc, tree.files, target_path, sim_failed, dropped_paths.items, m_state.home);
+    if (dropped_paths.items.len > 0) {
+        var kept_edits: std.ArrayList(CouplingEdit) = .empty;
+        var kept_origins: std.ArrayList(usize) = .empty;
+        for (coupling_edits, coupling_origins) |e, origin| {
+            if (isOneOf(e.path, dropped_paths.items)) continue;
+            try kept_edits.append(ctx.alloc, e);
+            try kept_origins.append(ctx.alloc, origin);
+        }
+        coupling_edits = kept_edits.items;
+        coupling_origins = kept_origins.items;
+    }
 
-    // Every planned edit with the owners that produced it; identical edits
-    // are one. A coupled token update is owned by the file whose base it
-    // rewrites, when that file is routed or coupling-only: a write to it like
-    // any routed one, it rolls back with it.
+    // Every planned edit with the units that produced it; identical edits
+    // are one. A coupled update is owned by the files whose line edits
+    // produced its rename; the file whose base it rewrites is its target.
     var planned_lines: std.ArrayList(Owned(LineEdit)) = .empty;
     for (line_edits.items, line_owners.items) |e, owner| try addOwned(LineEdit, ctx.alloc, &planned_lines, e, &.{.{ .file = owner }}, lineEditEql);
+    // Loop and generator-leaf row writes are one list, so an identical write
+    // from a loop file and a leaf is one edit owned by both.
     var planned_rows: std.ArrayList(Owned(RowEdit)) = .empty;
     for (row_edits.items, row_owners.items) |e, owner| try addOwned(RowEdit, ctx.alloc, &planned_rows, e, &.{.{ .file = owner }}, rowEditEql);
+    for (generated.row_edits.items, generated.row_leaves.items) |e, li| try addOwned(RowEdit, ctx.alloc, &planned_rows, e, &.{.{ .leaf = li }}, rowEditEql);
     var planned_structs: std.ArrayList(Owned(StructEdit)) = .empty;
     for (struct_edits.items, struct_owners.items) |e, owner| try addOwned(StructEdit, ctx.alloc, &planned_structs, e, &.{.{ .file = owner }}, structEditEql);
     var planned_couplings: std.ArrayList(Owned(CouplingEdit)) = .empty;
-    for (coupling_edits) |e| {
-        var owners: std.ArrayList(Owner) = .empty;
-        for (tree.files, 0..) |file, fidx| {
-            if (!affected[fidx] and !coupling_only[fidx]) continue;
-            if (!file.has_base or !std.mem.eql(u8, file.source_base_abs, e.path)) continue;
-            try owners.append(ctx.alloc, .{ .file = fidx });
-        }
-        try addOwned(CouplingEdit, ctx.alloc, &planned_couplings, e, owners.items, couplingEditEql);
-    }
-
-    // The source paths each file's edits write, journaled before any write.
-    // When verification rejects that file, restoring them from the journal
-    // puts its sources back exactly -- "not committed" must leave nothing
-    // behind, including a fragment the synthesis created.
-    const owned_paths = try ctx.alloc.alloc([]const []const u8, tree.files.len);
-    @memset(owned_paths, &.{});
-    // Whether the file's own changes wrote anything, as distinct from a
-    // coupled token update another file's edit made to it.
-    const routed_own = try ctx.alloc.alloc(bool, tree.files.len);
-    @memset(routed_own, false);
-    for (tree.files, 0..) |_, fidx| {
-        if (!affected[fidx]) continue;
-        const owner: Owner = .{ .file = fidx };
-        var ps: std.ArrayList([]const u8) = .empty;
-        for (planned_lines.items) |o| {
-            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.path);
-        }
-        for (planned_rows.items) |o| {
-            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.data_source);
-        }
-        for (synth_plans.items, synth_owners.items) |sd, o| {
-            if (o != fidx) continue;
-            try addPath(ctx.alloc, &journal, ctx.io, &ps, sd.base_abs);
-            try addPath(ctx.alloc, &journal, ctx.io, &ps, sd.plan.fragment_path);
-        }
-        for (planned_structs.items) |o| {
-            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.layer_abs);
-        }
-        routed_own[fidx] = ps.items.len > 0;
-        for (planned_couplings.items) |o| {
-            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.path);
-        }
-        owned_paths[fidx] = try ps.toOwnedSlice(ctx.alloc);
-    }
-    for (tree.files, 0..) |_, fidx| {
-        if (!coupling_only[fidx]) continue;
-        var ps: std.ArrayList([]const u8) = .empty;
-        for (planned_couplings.items) |o| {
-            if (o.ownedBy(.{ .file = fidx })) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.path);
-        }
-        owned_paths[fidx] = try ps.toOwnedSlice(ctx.alloc);
-    }
-
-    // Whether each coupling target composed to nothing on this machine before
-    // anything was written: a source gated off here composes to nothing after
-    // a coupled update too, and that is not the update's doing.
-    const null_before = try ctx.alloc.alloc(bool, tree.files.len);
-    @memset(null_before, false);
-    for (tree.files, 0..) |file, fidx| {
-        if (!coupling_only[fidx]) continue;
-        const before = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, null) catch continue;
-        null_before[fidx] = before == null;
-    }
-
-    // Fact edits routed from each file, pre-write (`old_value` was captured
-    // at classification time, before any write this run), collected per file
-    // like `owned_paths`. A rejected file's entries here are candidates for
-    // restoration, not restored outright: `restoreUnkeptFacts`, run once every
-    // file's outcome is known, is what decides whether a given fact actually
-    // goes back.
-    const fact_backup = try ctx.alloc.alloc([]const FactEdit, tree.files.len);
-    @memset(fact_backup, &.{});
-    for (tree.files, 0..) |_, fidx| {
-        if (!affected[fidx]) continue;
-        var fb: std.ArrayList(FactEdit) = .empty;
-        for (fact_edits.items, fact_owners.items) |e, owner| {
-            if (owner == fidx) try fb.append(ctx.alloc, e);
-        }
-        fact_backup[fidx] = try fb.toOwnedSlice(ctx.alloc);
-    }
-
-    // Baseline: each touched file's per-configuration compose BEFORE writing,
-    // so verification can prove routing changed only the configurations the
-    // user chose. Each file's configuration space was built once, from its
-    // own source, when it was first classified above.
-    const baseline = try ctx.alloc.alloc([]const impact.ConfigOutput, tree.files.len);
-    for (tree.files, 0..) |file, fidx| {
-        if (!affected[fidx] and !coupling_only[fidx]) continue;
-        const space = spaces[fidx].?;
-        baseline[fidx] = (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets)).per_config;
-        // A partial file's per-configuration snapshot is the CANONICAL OWNED
-        // serialization of that configuration's compose, so the guard compares
-        // owned content, never text layout. Pre-existing own-declaration
-        // violations are ignored here; only the post-write pass acts on them.
-        if (file.own_paths.len > 0) {
-            baseline[fidx] = (try partialPerConfig(ctx.alloc, space.configs, baseline[fidx], file)).per;
-        }
-        // A sibling configuration whose source will not compose cannot be
-        // verified against. Name it, the file, and why -- the guard then holds
-        // it harmless (it was already broken) instead of the run dying on a
-        // bare error that identifies neither the file nor the layer.
-        for (space.configs, baseline[fidx]) |cfg, out| {
-            if (out != .uncomposable) continue;
-            try ctx.err.print(
-                "mox commit: {s}: configuration {s} does not compose ({s}); it cannot be verified -- fix that layer, then re-run\n",
-                .{ file.live_path, cfg.label, out.uncomposable },
-            );
-        }
-    }
-
-    // Symlink-target and generator-leaf keep are OUTSIDE the affected[]/
-    // spaces[] machinery above (see their write+verify pass below): each is
-    // restored as one batch, so every symlink source a sync rewrites and every
-    // data source a generator row edit rewrites belongs to its batch's path
-    // set, journaled at the same point the files' paths are.
-    // Syncs are not merged: a later sync to one source overwrites an earlier.
+    for (coupling_edits, coupling_origins) |e, origin| try addOwned(CouplingEdit, ctx.alloc, &planned_couplings, e, &.{.{ .file = origin }}, couplingEditEql);
+    // Syncs are not merged: each symlink's sync writes its own source.
     var planned_syms: std.ArrayList(Owned(SymSync)) = .empty;
-    for (sym_syncs.items) |e| {
-        var owners: std.ArrayList(Owner) = .empty;
-        try owners.append(ctx.alloc, .symlinks);
+    for (sym_syncs.items, 0..) |e, i| {
+        var owners: std.ArrayList(Unit) = .empty;
+        try owners.append(ctx.alloc, .{ .symlink = i });
         try planned_syms.append(ctx.alloc, .{ .edit = e, .owners = owners });
     }
-    var planned_gen_rows: std.ArrayList(Owned(RowEdit)) = .empty;
-    for (gen_row_edits.items) |e| try addOwned(RowEdit, ctx.alloc, &planned_gen_rows, e, &.{.generators}, rowEditEql);
-    var sym_paths: std.ArrayList([]const u8) = .empty;
-    for (planned_syms.items) |o| {
-        if (o.ownedBy(.symlinks)) try addPath(ctx.alloc, &journal, ctx.io, &sym_paths, o.edit.source_abs);
-    }
-    var gen_paths: std.ArrayList([]const u8) = .empty;
-    for (planned_gen_rows.items) |o| {
-        if (o.ownedBy(.generators)) try addPath(ctx.alloc, &journal, ctx.io, &gen_paths, o.edit.data_source);
-    }
-    // A path no owner restores is still written, so it is journaled too.
+
+    // Whether a file's own changes wrote anything (a source or a fact), as
+    // distinct from a coupled update another file's edit made to it.
+    const wrote_own = try ctx.alloc.alloc(bool, tree.files.len);
+    @memset(wrote_own, false);
+    for (planned_lines.items) |o| for (o.owners.items) |u| {
+        wrote_own[u.file] = true;
+    };
+    for (planned_rows.items) |o| for (o.owners.items) |u| switch (u) {
+        .file => |i| wrote_own[i] = true,
+        else => {},
+    };
+    for (planned_structs.items) |o| for (o.owners.items) |u| {
+        wrote_own[u.file] = true;
+    };
+    for (synth_owners.items) |owner| wrote_own[owner] = true;
+    for (fact_owners.items) |owner| wrote_own[owner] = true;
+
+    // Every written path, journaled before any write.
     for (planned_lines.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.path);
     for (planned_rows.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.data_source);
+    for (planned_syms.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.source_abs);
     for (synth_plans.items) |sd| {
         try journal.record(ctx.alloc, ctx.io, sd.base_abs);
         try journal.record(ctx.alloc, ctx.io, sd.plan.fragment_path);
     }
-    for (planned_couplings.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.path);
     for (planned_structs.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.layer_abs);
+    if (fact_edits.items.len > 0) try journal.record(ctx.alloc, ctx.io, context.paths.facts_path);
 
     // Plan: every prompt is done, so each written path's final bytes are
     // computed in memory from its journaled pre-run bytes, threading its
-    // edits in write order: line splices, loop rows, symlink targets,
-    // generator rows, narrowings, coupling renames, struct keys.
+    // edits in write order: line splices, row writes, symlink targets,
+    // narrowings, coupling renames, struct keys.
     //
     // A narrowing's region block is a line SPLICE of the base like any other
     // edit, so a base with narrowings takes its ordinary line edits and every
@@ -1590,7 +1740,6 @@ pub fn commitImpl(
     }
     try planRowEdits(ctx.alloc, &plan, planned_rows.items);
     for (planned_syms.items) |o| try plan.set(ctx.alloc, o.edit.source_abs, try std.fmt.allocPrint(ctx.alloc, "{s}\n", .{o.edit.new_target}));
-    try planRowEdits(ctx.alloc, &plan, planned_gen_rows.items);
     for (synth_bases) |base_abs| {
         var splices: std.ArrayList(LineEdit) = .empty;
         for (planned_lines.items) |o| {
@@ -1610,22 +1759,94 @@ pub fn commitImpl(
             if (std.mem.eql(u8, sd.base_abs, base_abs)) try plan.set(ctx.alloc, sd.plan.fragment_path, sd.plan.fragment_content);
         }
     }
+
+    // A coupled update that changes nothing in its path's bytes as planned so
+    // far (the target's own edit already made it) is not an edit: it has no
+    // owners, is journaled and written by nothing, and is never undone.
+    for (planned_couplings.items) |*o| {
+        const path = o.edit.path;
+        const bytes: ?[]const u8 = plan.get(path) orelse if (journal.entries.get(path)) |b|
+            b.content
+        else
+            Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.alloc, .limited(max_file_bytes)) catch null;
+        if (bytes) |b| {
+            if (std.mem.eql(u8, b, try replaceTokens(ctx.alloc, b, &.{o.edit}))) {
+                o.owners.clearRetainingCapacity();
+                continue;
+            }
+        }
+        try journal.record(ctx.alloc, ctx.io, path);
+    }
+    // A file no update reaches, or only no-op ones (its renames dropped
+    // before planning included), is no coupling target.
+    for (target_path, coupling_into, coupling_only) |tp, *into, *only| {
+        const path = tp orelse continue;
+        const reached = for (planned_couplings.items) |o| {
+            if (o.owners.items.len > 0 and std.mem.eql(u8, o.edit.path, path)) break true;
+        } else false;
+        if (reached) continue;
+        into.* = false;
+        only.* = false;
+    }
+
+    // Whether each coupling target composed to nothing on this machine before
+    // anything was written: a source gated off here composes to nothing after
+    // a coupled update too, and that is not the update's doing.
+    const null_before = try ctx.alloc.alloc(bool, tree.files.len);
+    @memset(null_before, false);
+    for (tree.files, 0..) |file, fidx| {
+        if (!coupling_into[fidx]) continue;
+        const before = impact.composeAsApply(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets) catch continue;
+        null_before[fidx] = before == null;
+    }
+
+    // Baseline: each touched file's per-configuration compose BEFORE writing,
+    // so verification can prove routing changed only the configurations the
+    // user chose. Each file's configuration space was built once, from its
+    // own source, when it was first classified above.
+    const baseline = try ctx.alloc.alloc([]const impact.ConfigOutput, tree.files.len);
+    for (tree.files, 0..) |file, fidx| {
+        if (!affected[fidx] and !coupling_only[fidx]) continue;
+        const space = spaces[fidx].?;
+        baseline[fidx] = if (coupling_only[fidx])
+            coupling_baseline[fidx]
+        else
+            (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets)).per_config;
+        // A partial file's per-configuration snapshot is the CANONICAL OWNED
+        // serialization of that configuration's compose, so the guard compares
+        // owned content, never text layout. Pre-existing own-declaration
+        // violations are ignored here; only the post-write pass acts on them.
+        if (file.own_paths.len > 0) {
+            baseline[fidx] = (try partialPerConfig(ctx.alloc, space.configs, baseline[fidx], file)).per;
+        }
+        // A sibling configuration whose source will not compose cannot be
+        // verified against. Name it, the file, and why -- the guard then holds
+        // it harmless (it was already broken) instead of the run dying on a
+        // bare error that identifies neither the file nor the layer.
+        for (space.configs, baseline[fidx]) |cfg, out| {
+            if (out != .uncomposable) continue;
+            try ctx.err.print(
+                "mox commit: {s}: configuration {s} does not compose ({s}); it cannot be verified -- fix that layer, then re-run\n",
+                .{ file.live_path, cfg.label, out.uncomposable },
+            );
+        }
+    }
+
+    // Every rename into one path is applied in one pass over its tokens, so
+    // one rename never renames another's result.
     var coupled: std.ArrayList([]const u8) = .empty;
     for (planned_couplings.items) |o| {
         const path = o.edit.path;
-        if (isOneOf(path, coupled.items)) continue;
+        if (o.owners.items.len == 0 or isOneOf(path, coupled.items)) continue;
         try coupled.append(ctx.alloc, path);
-        var content = try plan.bytesOf(ctx.alloc, path);
+        var renames: std.ArrayList(CouplingEdit) = .empty;
         for (planned_couplings.items) |fo| {
-            if (std.mem.eql(u8, fo.edit.path, path)) content = try replaceToken(ctx.alloc, content, fo.edit.old, fo.edit.new);
+            if (fo.owners.items.len > 0 and std.mem.eql(u8, fo.edit.path, path)) try renames.append(ctx.alloc, fo.edit);
         }
-        try plan.set(ctx.alloc, path, content);
+        try plan.set(ctx.alloc, path, try replaceTokens(ctx.alloc, try plan.bytesOf(ctx.alloc, path), renames.items));
     }
-    // A layer that refuses its key fails only the files that edit was routed
-    // from: their remaining keys are abandoned and the verify loop below
-    // restores their sources from the journal. Letting the error propagate
-    // out of `run` instead would leave every other file's routing unwritten
-    // and its applied record never advanced.
+    // A layer that refuses its key fails the files that edit was routed from,
+    // and the edit is left out; settling below restores their sources.
     //
     // A backstop, not the usual path: `recordStructPlacement` simulates each
     // placement by applying it for real and restoring, so a layer that will not
@@ -1673,8 +1894,8 @@ pub fn commitImpl(
     try applyFactEdits(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items);
     // A fact write changes what `<machine.X>` interpolation resolves to for
     // EVERY file recomposed below, this routed file included: re-capture so
-    // the recompose-verify step sees the new value instead of the one this
-    // run started with.
+    // verification sees the new value instead of the one this run started
+    // with.
     if (fact_edits.items.len > 0) {
         m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
         bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -1683,348 +1904,341 @@ pub fn commitImpl(
         try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
     }
 
-    // Rewalk so region synthesis (new fragments/regions) is reflected when the
-    // edited files are recomposed and verified.
-    const base_tree2 = try mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home);
-    const tree2 = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree2, context.paths.private_dir, m_state.home);
+    // Verify every unit against the disk as it now stands. Rewalk first so
+    // region synthesis (new fragments/regions) is reflected.
+    var v: Verifier = .{
+        .arena = ctx.alloc,
+        .io = ctx.io,
+        .err = ctx.err,
+        .files = tree.files,
+        .tree_now = try walkMerged(ctx.alloc, ctx.io, src_dir, context.paths.private_dir, m_state.home),
+        .m_state = &m_state,
+        .resolver = &axis_resolver,
+        .secrets = secrets,
+        .spaces = spaces,
+        .baseline = baseline,
+        .allowed = allowed,
+        .coupling_only = coupling_only,
+        .coupling_into = coupling_into,
+        .null_before = null_before,
+        .wrote_own = wrote_own,
+        .manual_hunks = manual_hunks,
+        .declined_hunks = declined_hunks,
+        .unrouted_hunks = unrouted_hunks,
+        .struct_failed = struct_failed,
+        .struct_edits = struct_edits.items,
+        .struct_owners = struct_owners.items,
+        .sym_syncs = sym_syncs.items,
+        .leaves = generated.leaves.items,
+        .file_unit = try ctx.alloc.alloc(bool, tree.files.len),
+        .file_failed = try ctx.alloc.alloc(bool, tree.files.len),
+        .sym_failed = try ctx.alloc.alloc(bool, sym_syncs.items.len),
+        .leaf_failed = try ctx.alloc.alloc(bool, generated.leaves.items.len),
+        .file_reason = try ctx.alloc.alloc([]const u8, tree.files.len),
+        .file_res = try ctx.alloc.alloc(FileResult, tree.files.len),
+        .leaf_res = try ctx.alloc.alloc(LeafResult, generated.leaves.items.len),
+    };
+    for (v.file_unit, affected, coupling_only) |*u, r, c| u.* = r or c;
+    @memset(v.file_failed, false);
+    @memset(v.sym_failed, false);
+    @memset(v.leaf_failed, false);
+    @memset(v.file_reason, "");
+    @memset(v.file_res, .{});
+    @memset(v.leaf_res, .{});
+    // Each planned coupled update's undone lines, one per target, once its
+    // path is restored.
+    const coupling_undone = try ctx.alloc.alloc(?[]const []const u8, planned_couplings.items.len);
+    @memset(coupling_undone, null);
+    const undone_by: UndoneBy = .{
+        .couplings = planned_couplings.items,
+        .targets = &coupling_targets,
+        .unrouted = unrouted_hunks,
+    };
+    // Each coupling target failing its first verification whose own line
+    // was held back for its coupled update's undone line.
+    const quiet_fail = try ctx.alloc.alloc(bool, tree.files.len);
+    @memset(quiet_fail, false);
+    for (try v.verifyPassing()) |f| {
+        if (undone_by.reports(f.unit)) {
+            quiet_fail[f.unit.file] = true;
+        } else {
+            try ctx.err.writeAll(f.diag);
+        }
+    }
 
+    // Settle. An edit none of whose owners passes, or a coupled update whose
+    // target fails, is dead: the path it wrote is restored whole, and every
+    // unit owning a non-coupling edit to that path fails with it. Facts no
+    // passing unit routed are reverted. Every unit still passing is then
+    // verified again, since it may read what was restored; repeat until a
+    // round fails nothing new.
+    const writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_rows.items, planned_structs.items, synth_plans.items, synth_owners.items, planned_syms.items);
+    // Each restored path, with the unit whose failure restored it.
+    var restore_cause = std.StringHashMap(Unit).init(ctx.alloc);
+    // Each journaled path already back at its pre-run bytes.
+    var at_pre_run = std.StringHashMap(void).init(ctx.alloc);
+    var reverted = std.StringHashMap(void).init(ctx.alloc);
+    while (true) {
+        var batch: std.ArrayList([]const u8) = .empty;
+        for (writes) |w| try markDead(ctx.alloc, &v, &batch, &restore_cause, w.path, w.owners);
+        for (planned_couplings.items) |o| {
+            if (o.owners.items.len == 0) continue;
+            if (failedTarget(&v, coupling_targets.get(o.edit.path).?)) |target| {
+                try markDead(ctx.alloc, &v, &batch, &restore_cause, o.edit.path, &.{.{ .file = target }});
+            } else {
+                try markDead(ctx.alloc, &v, &batch, &restore_cause, o.edit.path, o.owners.items);
+            }
+        }
+        // Each coupled update into a path restored now is undone, for the
+        // cause that holds at this point.
+        for (planned_couplings.items, coupling_undone) |o, *undone| {
+            if (o.owners.items.len == 0 or undone.* != null or !isOneOf(o.edit.path, batch.items)) continue;
+            const targets = coupling_targets.get(o.edit.path).?;
+            const failed_target = failedTarget(&v, targets);
+            var lines: std.ArrayList([]const u8) = .empty;
+            for (targets) |target| {
+                const t_live = display.of(tree.files[target].live_path, m_state.home);
+                // A failed target's reason is given here only when its own
+                // line was held back for it; a target with routed edits of its
+                // own is named as not committed too. A target that passed
+                // lost the update to the one that failed.
+                try lines.append(ctx.alloc, if (v.file_failed[target] and !quiet_fail[target])
+                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was not committed", .{ t_live, t_live })
+                else if (v.file_failed[target])
+                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} could not take it ({s}){s}", .{
+                        t_live,
+                        t_live,
+                        v.file_reason[target],
+                        if (wrote_own[target]) try std.fmt.allocPrint(ctx.alloc, "; {f} not committed", .{t_live}) else "",
+                    })
+                else if (failed_target) |ft|
+                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was not committed", .{ t_live, display.of(tree.files[ft].live_path, m_state.home) })
+                else if (v.allFailed(o.owners.items))
+                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was not committed", .{ t_live, display.of(v.unitLive(o.owners.items[0]), m_state.home) })
+                else
+                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was restored because {f} was not committed", .{
+                        t_live,
+                        display.of(ids.shown(o.edit.path), m_state.home),
+                        display.of(v.unitLive(restore_cause.get(o.edit.path).?), m_state.home),
+                    }));
+            }
+            undone.* = lines.items;
+        }
+
+        // Every restore due is attempted, even after one fails.
+        var any_deleted = false;
+        var failures: std.ArrayList(RestoreFailure) = .empty;
+        for (batch.items) |p| {
+            journal.restore(ctx.io, p) catch |e| {
+                try failures.append(ctx.alloc, .{ .path = p, .cause = e });
+                continue;
+            };
+            try at_pre_run.put(p, {});
+            if (journal.entries.get(p).?.content == null) any_deleted = true;
+        }
+        // A unit owning a non-coupling edit to a restored path fails with it.
+        // After a failed restore nothing is recorded, so no line is printed,
+        // but the facts due this round are still settled.
+        var new_fail = false;
+        for (batch.items) |p| {
+            const cause = restore_cause.get(p).?;
+            for (writes) |w| {
+                if (!std.mem.eql(u8, w.path, p)) continue;
+                for (w.owners) |u| {
+                    if (v.failed(u)) continue;
+                    const reason = try std.fmt.allocPrint(ctx.alloc, "{f} was restored because {f} was not committed", .{
+                        display.of(ids.shown(p), m_state.home),
+                        display.of(v.unitLive(cause), m_state.home),
+                    });
+                    if (failures.items.len == 0) try printNotCommitted(ctx.err, v.unitLive(u), reason, m_state.home);
+                    v.fail(u, reason);
+                    new_fail = true;
+                }
+            }
+        }
+
+        // Facts: with no passing unit routing any fact, the facts file goes
+        // back to its pre-run bytes; otherwise each fact no passing unit
+        // routed is reverted by name.
+        var fact_causes: std.ArrayList([]const u8) = .empty;
+        var fact_names: std.ArrayList([]const u8) = .empty;
+        if (fact_edits.items.len > 0 and !at_pre_run.contains(context.paths.facts_path)) {
+            const any_kept = for (fact_edits.items) |fe| {
+                if (factKept(&v, fact_edits.items, fact_owners.items, fe.name)) break true;
+            } else false;
+            for (fact_edits.items, 0..) |fe, fi| {
+                if (reverted.contains(fe.name) or factKept(&v, fact_edits.items, fact_owners.items, fe.name)) continue;
+                try reverted.put(fe.name, {});
+                if (any_kept) {
+                    revertFact(ctx.alloc, ctx.io, context.paths.facts_path, fe) catch |e| {
+                        try failures.append(ctx.alloc, .{ .path = context.paths.facts_path, .cause = e });
+                        break;
+                    };
+                }
+                try fact_names.append(ctx.alloc, fe.name);
+                try fact_causes.append(ctx.alloc, try std.fmt.allocPrint(ctx.alloc, "fact {s} was reverted because {f} was not committed", .{
+                    fe.name,
+                    display.of(tree.files[fact_owners.items[fi]].live_path, m_state.home),
+                }));
+            }
+            if (!any_kept) restored: {
+                journal.restore(ctx.io, context.paths.facts_path) catch |e| {
+                    try failures.append(ctx.alloc, .{ .path = context.paths.facts_path, .cause = e });
+                    break :restored;
+                };
+                try at_pre_run.put(context.paths.facts_path, {});
+            }
+        }
+        if (failures.items.len > 0) {
+            try saveRecovery(ctx, &journal, &ids, &at_pre_run, failures.items, m_state.home);
+            return 2;
+        }
+        const fact_changed = fact_causes.items.len > 0;
+
+        if (any_deleted) v.tree_now = try walkMerged(ctx.alloc, ctx.io, src_dir, context.paths.private_dir, m_state.home);
+        // What facts resolved to before this round's reverts, to tell a unit
+        // the reverts failed from one that failed for a restored path.
+        var prev_state = m_state;
+        var prev_bindings = bindings;
+        var prev_live = prev_state.liveResolver(&prev_bindings);
+        const prev_resolver: mox.dsl.resolver.Resolver = .{ .live = &prev_live };
+        if (fact_changed) {
+            m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
+            bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+            live_ctx = m_state.liveResolver(&bindings);
+            try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
+        }
+        // A unit failing now prints one line: the reverted facts it reads,
+        // when it passes under the facts as they were before this round's
+        // reverts, or else its own diagnostic. A coupling target failing
+        // here failed for what settling undid, so its own line prints too.
+        if (batch.items.len > 0 or fact_changed) {
+            for (try v.verifyPassing()) |f| {
+                new_fail = true;
+                if (fact_changed and try v.passesUnder(f.unit, &prev_state, &prev_resolver)) {
+                    // Compose tracks no fact reads, so a fact counts as read
+                    // when reverting it alone, from the facts before this
+                    // round, fails the unit. When no single revert does, every
+                    // one reverted this round is named.
+                    var read: std.ArrayList([]const u8) = .empty;
+                    if (fact_names.items.len > 1) for (fact_names.items, fact_causes.items) |name, cause| {
+                        var one = try withFactOf(ctx.alloc, prev_state, name, m_state);
+                        var one_bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, one);
+                        try mox.machine.bindings.seedStaticMultiValue(&one_bindings, repo_ax, axis_resolver);
+                        var one_live = one.liveResolver(&one_bindings);
+                        const one_resolver: mox.dsl.resolver.Resolver = .{ .live = &one_live };
+                        if (!try v.passesUnder(f.unit, &one, &one_resolver)) try read.append(ctx.alloc, cause);
+                    };
+                    const reason = try std.mem.join(ctx.alloc, "; ", if (read.items.len > 0) read.items else fact_causes.items);
+                    try printNotCommitted(ctx.err, v.unitLive(f.unit), reason, m_state.home);
+                    v.fail(f.unit, reason);
+                } else {
+                    try ctx.err.writeAll(f.diag);
+                }
+            }
+        }
+        if (!new_fail) break;
+    }
+
+    // Record every unit still passing, in order: symlinks, generator leaves,
+    // then files by index. No source is written from here on.
     var mismatch = false;
     var committed_count: usize = 0;
-
-    // Symlink-target syncs verify by recomposing the (unchanged) source and
-    // confirming it reproduces exactly the live target it was set to -- no
-    // rewalk needed, since a literal sync never creates or removes a source.
-    for (sym_syncs.items) |s| {
-        const file = findByLive(tree, s.live_path) orelse continue;
-        var vprov: std.ArrayList(Segment) = .empty;
-        const recomposed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &vprov, null) catch null;
-        const ok = if (recomposed) |bytes|
-            mox.apply.applied.sameSymlinkTarget(std.mem.trim(u8, bytes, " \t\r\n"), s.new_target)
-        else
-            false;
-        if (!ok) {
+    for (sym_syncs.items, v.sym_failed) |s, failed| {
+        if (failed) {
             mismatch = true;
-            try journal.restore(ctx.io, sym_paths.items);
-            try ctx.err.print("mox commit: {f}: recomposed symlink target does not match; not committed\n", .{display.of(s.live_path, m_state.home)});
             continue;
         }
         try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target);
         try ctx.out.print("  committed {f}\n", .{display.of(s.live_path, m_state.home)});
         committed_count += 1;
     }
-
-    // Generator leaf row edits verify by re-expanding each touched generator
-    // and confirming every touched leaf reproduces live exactly. Verified as
-    // one all-or-nothing batch (not per generator): a data source shared by
-    // two leaves in the same run must not advance one leaf's applied record
-    // while restoring the file underneath it because a sibling leaf failed.
-    if (gen_leaf_commits.items.len > 0) {
-        const ok = try ctx.alloc.alloc(bool, gen_leaf_commits.items.len);
-        const live_now = try ctx.alloc.alloc(?[]const u8, gen_leaf_commits.items.len);
-        const leaf_prov = try ctx.alloc.alloc(?[]const Segment, gen_leaf_commits.items.len);
-        const leaf_secret = try ctx.alloc.alloc(bool, gen_leaf_commits.items.len);
-        var any_failed = false;
-        // One re-expansion per distinct generator this run touched, reused
-        // across every leaf it produced that was routed.
-        var gen_cache: std.AutoHashMap(usize, ?[]const mox.compose.catB.GeneratedFile) = .init(ctx.alloc);
-        for (gen_leaf_commits.items, 0..) |gc, i| {
-            const outputs = blk: {
-                if (gen_cache.get(gc.fidx)) |cached| break :blk cached;
-                var vdiag: mox.compose.interp.Diag = .{};
-                const out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, gc.gen_file, &axis_resolver, &m_state, secrets, &vdiag) catch null;
-                try gen_cache.put(gc.fidx, out);
-                break :blk out;
-            };
-            const leaf = findGeneratedByLive(outputs, gc.leaf_live_path);
-            const now = Io.Dir.cwd().readFileAlloc(ctx.io, gc.leaf_live_path, ctx.alloc, .limited(max_file_bytes)) catch null;
-            if (leaf != null and now != null and std.mem.eql(u8, leaf.?.content, now.?)) {
-                ok[i] = true;
-                live_now[i] = now;
-                leaf_prov[i] = leaf.?.prov;
-                leaf_secret[i] = leaf.?.contains_secret;
-            } else {
-                ok[i] = false;
-                any_failed = true;
-            }
-        }
-
-        if (any_failed) {
+    for (generated.leaves.items, v.leaf_failed, v.leaf_res) |gc, failed, r| {
+        if (failed) {
             mismatch = true;
-            try journal.restore(ctx.io, gen_paths.items);
-            for (gen_leaf_commits.items, 0..) |gc, i| {
-                if (ok[i]) {
-                    try ctx.err.print(
-                        "mox commit: {s}: not committed (a sibling leaf from the same generator failed to verify; its data source was restored)\n",
-                        .{gc.leaf_live_path},
-                    );
-                } else {
-                    try ctx.err.print("mox commit: {f}: recomposed generator output does not match; not committed\n", .{display.of(gc.leaf_live_path, m_state.home)});
-                }
-            }
-        } else {
-            for (gen_leaf_commits.items, 0..) |gc, i| {
-                try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, live_now[i].?);
-                if (!leaf_secret[i]) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, live_now[i].?);
-                try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, leaf_prov[i].?);
-                try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
-                committed_count += 1;
-            }
+            continue;
         }
+        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
+        if (!r.secret) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
+        try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.prov);
+        try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
+        committed_count += 1;
     }
-
-    // A file whose sources were put back: what it wrote is gone, so neither it
-    // nor any coupled update to it counts as committed.
-    const rolled_back = try ctx.alloc.alloc(bool, tree.files.len);
-    @memset(rolled_back, false);
     for (tree.files, 0..) |file, fidx| {
-        const is_routed = affected[fidx];
-        const is_coupling = coupling_only[fidx];
-        if (!is_routed and !is_coupling) continue;
-        if (struct_failed[fidx]) |ename| {
-            try ctx.err.print(
-                "mox commit: {s}: a source layer rejected the edit ({s}); not committed\n",
-                .{ file.live_path, ename },
-            );
+        if (!v.file_unit[fidx]) continue;
+        if (v.file_failed[fidx]) {
             mismatch = true;
-            rolled_back[fidx] = true;
-            try journal.restore(ctx.io, owned_paths[fidx]);
             continue;
         }
-        const configs = spaces[fidx].?.configs;
-        const file2 = findByLive(tree2, file.live_path) orelse file;
-        var prov2: std.ArrayList(Segment) = .empty;
-        const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file2, &axis_resolver, &m_state, secrets, &prov2, null) catch |e| {
-            try ctx.err.print("mox commit: {f}: recompose failed; not committed: {s}\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
-            mismatch = true;
-            rolled_back[fidx] = true;
-            try journal.restore(ctx.io, owned_paths[fidx]);
-            continue;
-        };
-
-        if (is_coupling) {
-            // The live file was not user-edited, so recompose need not equal
-            // live; verify only that the source still composes and that the
-            // sync does not diverge a configuration the user did not choose.
-            if (composed == null and !null_before[fidx]) {
-                try ctx.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, m_state.home)});
-                mismatch = true;
-                rolled_back[fidx] = true;
-                try journal.restore(ctx.io, owned_paths[fidx]);
-                continue;
-            }
-            var after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
-            if (file.own_paths.len > 0) {
-                const pc = try partialPerConfig(ctx.alloc, configs, after_per, file);
-                if (pc.violation) |v| {
-                    try ctx.err.print(
-                        "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
-                        .{ file.live_path, v.label, v.leaf },
-                    );
-                    mismatch = true;
-                    rolled_back[fidx] = true;
-                    try journal.restore(ctx.io, owned_paths[fidx]);
-                    continue;
-                }
-                after_per = pc.per;
-            }
-            if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
-                try reportViolation(ctx.err, file.source_base_abs, "coupled token update", configs[vi].label, after_per[vi].isUncomposable());
-                mismatch = true;
-                rolled_back[fidx] = true;
-                try journal.restore(ctx.io, owned_paths[fidx]);
-                continue;
-            }
-            // Synced safely; the applied record advances at the next apply.
-            continue;
-        }
-
-        // Kind guard: a live path that became a special inode mid-commit reads
-        // as empty (a mismatch, so the routing is rolled back) without the
-        // blocking open a FIFO would force.
-        const live = switch (mox.apply.write.guardLiveRead(ctx.io, file.live_path)) {
-            .special => "",
-            .readable, .absent => Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch "",
-        };
-        // The routing made the source uncomposable: nothing about the edit can
-        // explain that, so it is a bug in the write. Put every source back.
-        if (composed == null) {
-            mismatch = true;
+        // A coupling-only target synced safely; its applied record advances
+        // at the next apply.
+        if (coupling_only[fidx]) continue;
+        const r = v.file_res[fidx];
+        switch (r.check) {
             // A file whose every change stayed manual or declined wrote
             // nothing, so its source composing to nothing here is how it
             // already stood, not something the routing did.
-            if (owned_paths[fidx].len == 0 and fact_backup[fidx].len == 0 and manual_hunks[fidx] + declined_hunks[fidx] > 0) {
+            .composes_to_nothing => {
+                mismatch = true;
                 try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], false);
-                continue;
-            }
-            rolled_back[fidx] = true;
-            try journal.restore(ctx.io, owned_paths[fidx]);
-            try ctx.err.print(
-                "mox commit: {s}: the edited sources no longer compose; not committed\n",
-                .{file.live_path},
-            );
-            continue;
-        }
-        // A partial file's this-machine identity check is canonical: the
-        // extracted live-owned document must equal the recomposed owned
-        // document byte-wise in canonical form. The live remainder belongs to
-        // the program and never participates.
-        const live_matches = if (file.own_paths.len == 0)
-            std.mem.eql(u8, composed.?, live)
-        else
-            partialLiveMatches(ctx.alloc, file, composed.?, live);
-        if (!live_matches) {
-            mismatch = true;
-            // A manual hunk and a hunk the user deliberately declined (`n`) or
-            // skipped (`s`) are both DESIGNED outcomes -- the first has no safe
-            // route at all, the second is the user choosing not to commit it
-            // this run -- and either stays only in the live file, so the
-            // recompose is EXPECTED to still differ. Rolling the file back for
-            // that would make the most ordinary mixed edit (one hunk committed,
-            // one left alone) uncommittable forever. The routed hunks stand;
-            // the applied record does not advance, so the rest still shows as
-            // drift.
-            const explained = manual_hunks[fidx] + declined_hunks[fidx];
-            if (explained > 0) {
-                // An explained mismatch excuses the file from matching live --
-                // it does NOT excuse it from the cross-configuration check. The
-                // routed edits still stand, so a sibling they change that the
-                // user never chose to affect must roll the file back here just
-                // as it would on the exact-match path below. Skipping it would
-                // disable the backstop for every mixed edit, which is precisely
-                // where a routing bug hides.
-                var after_mixed = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
-                if (file.own_paths.len > 0) {
-                    const pc = try partialPerConfig(ctx.alloc, configs, after_mixed, file);
-                    if (pc.violation) |v| {
-                        rolled_back[fidx] = true;
-                        try journal.restore(ctx.io, owned_paths[fidx]);
-                        try ctx.err.print(
-                            "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
-                            .{ file.live_path, v.label, v.leaf },
-                        );
-                        continue;
-                    }
-                    after_mixed = pc.per;
-                }
-                if (candidates.firstViolation(configs, baseline[fidx], after_mixed, &allowed[fidx])) |vi| {
-                    rolled_back[fidx] = true;
-                    try journal.restore(ctx.io, owned_paths[fidx]);
-                    try reportViolation(ctx.err, file.live_path, "routing", configs[vi].label, after_mixed[vi].isUncomposable());
-                    continue;
-                }
-                // Excused from matching live as a whole, each key routed from
-                // this file must still recompose to its live value: a route
-                // that landed anywhere else has baked text the recompose does
-                // not reproduce.
-                if (try unmatchedRoutedKey(ctx.alloc, struct_edits.items, struct_owners.items, fidx, composed.?, live)) |path| {
-                    rolled_back[fidx] = true;
-                    try journal.restore(ctx.io, owned_paths[fidx]);
-                    try ctx.err.print(
-                        "mox commit: {s}: routed key {s} does not recompose to its live value; not committed\n",
-                        .{ file.live_path, try keyPathLabel(ctx.alloc, path) },
-                    );
-                    continue;
-                }
-                // `ra.affected[fidx]` is forced true for a structured file the
-                // instant any key changes (see `processStructFile`'s doc
-                // comment), even when every key ends up manual or declined and
-                // nothing was ever routed. `routed_own[fidx]` says whether any
-                // edit routed from this file wrote a source -- the real "was
-                // anything committed" signal, distinct from `explained > 0`,
-                // which only says the mismatch is accounted for, and from a
-                // coupled token update, which another file's edit made. A
-                // `[f]` route writes a fact rather than a source, so it has no
-                // backup and must be counted here too: this
-                // branch leaves the file un-rolled-back, so `restoreUnkeptFacts`
-                // KEEPS that fact, and reporting "not committed" would deny a
-                // write that stands.
-                const has_routed = routed_own[fidx] or fact_backup[fidx].len > 0;
-                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], has_routed);
-                if (has_routed) {
+            },
+            // The held hunks stay only in live, so the applied record does
+            // not advance; the routed edits stand. A `[f]` route writes a
+            // fact rather than a source, and it counts as routed here too.
+            .held => {
+                mismatch = true;
+                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], wrote_own[fidx]);
+                if (wrote_own[fidx]) {
                     try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                     committed_count += 1;
                 }
-                continue;
-            }
-            // Nothing explains the difference away: either a narrowing the tool
-            // could not honor is missing from the sources, or the routing
-            // itself is wrong. Either way this file is not committed, and "not
-            // committed" leaves nothing behind.
-            rolled_back[fidx] = true;
-            try journal.restore(ctx.io, owned_paths[fidx]);
-            if (unrouted_hunks[fidx] > 0) {
-                try ctx.err.print(
-                    "mox commit: {s}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
-                    .{ file.live_path, unrouted_hunks[fidx] },
-                );
-            } else {
-                try ctx.err.print(
-                    "mox commit: {s}: recomposed output still differs from live; not committed\n",
-                    .{file.live_path},
-                );
-            }
-            continue;
+            },
+            .exact => {
+                if (file.own_paths.len > 0) {
+                    // The OWNED record advances; whole-file records never
+                    // exist for a partial target, and partial files persist
+                    // no line provenance.
+                    try advanceOwnedRecord(ctx, file, r.composed, r.prov);
+                } else {
+                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
+                    // Never cache the cleartext of a secret-bearing composition.
+                    if (!mox.provenance.map.hasSecret(r.prov)) {
+                        try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
+                    }
+                    try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.prov);
+                }
+                try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
+                committed_count += 1;
+            },
         }
-        // No classification choice may silently change another configuration:
-        // every sibling must recompose to its prior output unless allowed.
-        var after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
-        if (file.own_paths.len > 0) {
-            const pc = try partialPerConfig(ctx.alloc, configs, after_per, file);
-            if (pc.violation) |v| {
-                mismatch = true;
-                rolled_back[fidx] = true;
-                try journal.restore(ctx.io, owned_paths[fidx]);
-                try ctx.err.print(
-                    "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
-                    .{ file.live_path, v.label, v.leaf },
-                );
-                continue;
-            }
-            after_per = pc.per;
-        }
-        if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
+    }
+    for (coupling_dropped) |m| {
+        mismatch = true;
+        try ctx.err.print("mox commit: {s}\n", .{m});
+    }
+    // An undone line is printed once, however many renames it covers.
+    var undone_said = std.StringHashMap(void).init(ctx.alloc);
+    for (coupling_undone) |lines| {
+        for (lines orelse continue) |m| {
             mismatch = true;
-            rolled_back[fidx] = true;
-            try journal.restore(ctx.io, owned_paths[fidx]);
-            try reportViolation(ctx.err, file.live_path, "routing", configs[vi].label, after_per[vi].isUncomposable());
-            continue;
+            if ((try undone_said.getOrPut(m)).found_existing) continue;
+            try ctx.err.print("mox commit: {s}\n", .{m});
         }
-        if (file.own_paths.len > 0) {
-            // The OWNED record advances; whole-file records never exist for a
-            // partial target, and partial files persist no line provenance.
-            try advanceOwnedRecord(ctx, file, composed.?, prov2.items);
-        } else {
-            try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, live);
-            // Never cache the cleartext of a secret-bearing composition.
-            if (!mox.provenance.map.hasSecret(prov2.items)) {
-                try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, live);
-            }
-            try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, prov2.items);
-        }
-        try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
-        committed_count += 1;
     }
 
-    // Every file's outcome is final now: restore whichever routed facts no
-    // committed file still depends on. Doing this here, rather than inline as
-    // each file was rejected above, is what lets a fact two files route to the
-    // same value survive a sibling's unrelated rejection.
-    try restoreUnkeptFacts(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items, fact_owners.items, fact_backup, rolled_back);
-
-    // Re-index the coupling graph from the post-write sources so a later
-    // commit sees the current token layout. A failure never undoes the
-    // commit that already succeeded, but must not be silent: a stale graph
-    // means a later rename prompts forever for a file that no longer needs it.
-    mox.coupling.store.saveGraph(ctx.alloc, ctx.io, coupling_dir, &(try buildCouplingGraph(ctx.alloc, ctx.io, tree2))) catch |e| {
+    // Re-index the coupling graph from the final sources so a later commit
+    // sees the current token layout. A failure never undoes the commit that
+    // already succeeded, but must not be silent: a stale graph means a later
+    // rename prompts forever for a file that no longer needs it.
+    mox.coupling.store.saveGraph(ctx.alloc, ctx.io, coupling_dir, &(try buildCouplingGraph(ctx.alloc, ctx.io, v.tree_now))) catch |e| {
         try ctx.err.print("mox commit: coupling graph not updated: {s}\n", .{@errorName(e)});
     };
 
-    // The counts are what SURVIVED verification, never what was attempted: a
-    // rejected file was rolled back, so nothing of it -- neither its own routing
-    // nor a coupled update to its source -- was committed.
+    // The counts are what SURVIVED settling, never what was attempted: an
+    // accepted coupled update whose path was restored was not committed.
     var coupled_count: usize = 0;
     for (coupling_edits) |ce| {
-        if (!targetRolledBack(tree, rolled_back, ce.path)) coupled_count += 1;
+        if (!restore_cause.contains(ce.path)) coupled_count += 1;
     }
     if (skipped_secret > 0) {
         try ctx.out.print(
@@ -2157,20 +2371,635 @@ fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed
     });
 }
 
-/// True when `path` is the base source of a file whose write was rolled back,
-/// so a coupled update written into it is gone again.
-fn targetRolledBack(tree: mox.source.tree.ManagedTree, rolled_back: []const bool, path: []const u8) bool {
-    for (tree.files, 0..) |f, i| {
-        if (!f.has_base or f.source_base_abs.len == 0) continue;
-        if (std.mem.eql(u8, f.source_base_abs, path)) return rolled_back[i];
+/// How a routed file that passes verification stands: its recompose equals
+/// live; it differs from live only by the hunks it holds (manual or
+/// declined); or it holds a hunk and its source composes to nothing here,
+/// while it wrote nothing of its own and no coupled update was written into a
+/// source of it that composed to something before the write.
+const FileCheck = enum { exact, held, composes_to_nothing };
+
+/// What a passing routed file's last verification saw, for its record.
+const FileResult = struct {
+    check: FileCheck = .exact,
+    composed: []const u8 = "",
+    live: []const u8 = "",
+    prov: []const Segment = &.{},
+};
+
+/// What a passing leaf's last verification saw, for its record.
+const LeafResult = struct {
+    live: []const u8 = "",
+    prov: []const Segment = &.{},
+    secret: bool = false,
+};
+
+/// Every unit's verification against the disk as it stands, and its outcome.
+/// Verifying writes nothing and prints only the diagnostic of a unit that
+/// fails. A failed unit stays failed: `verifyPassing` skips it, and
+/// `passesUnder` checks it again only on a copy, changing nothing.
+const Verifier = struct {
+    arena: std.mem.Allocator,
+    io: Io,
+    err: *Io.Writer,
+    /// Indexed like every per-file array below.
+    files: []const mox.source.tree.ManagedFile,
+    /// The source tree as it now stands: walked after the write, and again
+    /// after a restore deletes a path.
+    tree_now: mox.source.tree.ManagedTree,
+    m_state: *const mox.machine.state.MachineState,
+    resolver: *const mox.dsl.resolver.Resolver,
+    secrets: mox.compose.catB.SecretCtx,
+    spaces: []const ?FileSpace,
+    baseline: []const []const impact.ConfigOutput,
+    allowed: []const std.StringHashMap(void),
+    coupling_only: []const bool,
+    coupling_into: []const bool,
+    null_before: []const bool,
+    wrote_own: []const bool,
+    manual_hunks: []const usize,
+    declined_hunks: []const usize,
+    unrouted_hunks: []const usize,
+    struct_failed: []const ?[]const u8,
+    struct_edits: []const StructEdit,
+    struct_owners: []const usize,
+    sym_syncs: []const SymSync,
+    leaves: []const GenLeafCommit,
+
+    /// Which files are units: routed, or the target of a coupled update.
+    file_unit: []bool,
+    file_failed: []bool,
+    sym_failed: []bool,
+    leaf_failed: []bool,
+    /// Why a failed file was not committed, for a coupled update into it.
+    file_reason: [][]const u8,
+    file_res: []FileResult,
+    leaf_res: []LeafResult,
+
+    fn failed(v: *const Verifier, u: Unit) bool {
+        return switch (u) {
+            .file => |i| v.file_failed[i],
+            .symlink => |i| v.sym_failed[i],
+            .leaf => |i| v.leaf_failed[i],
+        };
+    }
+
+    fn allFailed(v: *const Verifier, owners: []const Unit) bool {
+        for (owners) |u| {
+            if (!v.failed(u)) return false;
+        }
+        return owners.len > 0;
+    }
+
+    fn fail(v: *Verifier, u: Unit, reason: []const u8) void {
+        switch (u) {
+            .file => |i| {
+                v.file_failed[i] = true;
+                v.file_reason[i] = reason;
+            },
+            .symlink => |i| v.sym_failed[i] = true,
+            .leaf => |i| v.leaf_failed[i] = true,
+        }
+    }
+
+    fn unitLive(v: *const Verifier, u: Unit) []const u8 {
+        return switch (u) {
+            .file => |i| v.files[i].live_path,
+            .symlink => |i| v.sym_syncs[i].live_path,
+            .leaf => |i| v.leaves[i].leaf_live_path,
+        };
+    }
+
+    /// Whether failed unit `u` passes against the disk as it stands with
+    /// facts resolved from `m_state`. Records, prints and fails nothing.
+    fn passesUnder(v: *const Verifier, u: Unit, m_state: *const mox.machine.state.MachineState, resolver: *const mox.dsl.resolver.Resolver) !bool {
+        var discard_buf: [256]u8 = undefined;
+        var discard: Io.Writer.Discarding = .init(&discard_buf);
+        var p = v.*;
+        p.err = &discard.writer;
+        p.m_state = m_state;
+        p.resolver = resolver;
+        p.file_failed = try v.arena.dupe(bool, v.file_failed);
+        p.sym_failed = try v.arena.dupe(bool, v.sym_failed);
+        p.leaf_failed = try v.arena.dupe(bool, v.leaf_failed);
+        p.file_reason = try v.arena.dupe([]const u8, v.file_reason);
+        p.file_res = try v.arena.dupe(FileResult, v.file_res);
+        p.leaf_res = try v.arena.dupe(LeafResult, v.leaf_res);
+        return switch (u) {
+            .file => |i| p.verifyFile(i),
+            .symlink => |i| p.verifySymlink(i),
+            .leaf => |i| blk: {
+                var gen_cache: std.AutoHashMap(usize, ?[]const mox.compose.catB.GeneratedFile) = .init(v.arena);
+                break :blk p.verifyLeaf(i, &gen_cache);
+            },
+        };
+    }
+
+    /// A unit that failed verification, and the diagnostic it would print.
+    const Failure = struct { unit: Unit, diag: []const u8 };
+
+    /// Verify every unit still passing, holding back each failure's
+    /// diagnostic for the caller to print or replace.
+    fn verifyPassing(v: *Verifier) ![]const Failure {
+        var out: std.ArrayList(Failure) = .empty;
+        const err = v.err;
+        defer v.err = err;
+        // One re-expansion per generator per pass, shared by its leaves.
+        var gen_cache: std.AutoHashMap(usize, ?[]const mox.compose.catB.GeneratedFile) = .init(v.arena);
+        for (v.sym_failed, 0..) |f, i| {
+            if (f) continue;
+            var diag: Io.Writer.Allocating = .init(v.arena);
+            v.err = &diag.writer;
+            if (!try v.verifySymlink(i)) try out.append(v.arena, .{ .unit = .{ .symlink = i }, .diag = diag.written() });
+        }
+        for (v.leaf_failed, 0..) |f, i| {
+            if (f) continue;
+            var diag: Io.Writer.Allocating = .init(v.arena);
+            v.err = &diag.writer;
+            if (!try v.verifyLeaf(i, &gen_cache)) try out.append(v.arena, .{ .unit = .{ .leaf = i }, .diag = diag.written() });
+        }
+        for (v.file_unit, v.file_failed, 0..) |unit, f, fidx| {
+            if (!unit or f) continue;
+            var diag: Io.Writer.Allocating = .init(v.arena);
+            v.err = &diag.writer;
+            if (!try v.verifyFile(fidx)) try out.append(v.arena, .{ .unit = .{ .file = fidx }, .diag = diag.written() });
+        }
+        return out.toOwnedSlice(v.arena);
+    }
+
+    /// A symlink sync passes when its source recomposes to exactly the live
+    /// target it was set to.
+    fn verifySymlink(v: *Verifier, i: usize) !bool {
+        const s = v.sym_syncs[i];
+        const file = findByLive(v.tree_now, s.live_path) orelse findByLive(.{ .files = v.files }, s.live_path);
+        const ok = if (file) |f| blk: {
+            const recomposed = mox.compose.composeFileTracked(v.arena, v.io, f, v.resolver, v.m_state, v.secrets, null, null) catch null;
+            const bytes = recomposed orelse break :blk false;
+            break :blk mox.apply.applied.sameSymlinkTarget(std.mem.trim(u8, bytes, " \t\r\n"), s.new_target);
+        } else false;
+        if (ok) return true;
+        try v.err.print("mox commit: {f}: recomposed symlink target does not match; not committed\n", .{display.of(s.live_path, v.m_state.home)});
+        v.fail(.{ .symlink = i }, "");
+        return false;
+    }
+
+    /// A leaf passes when its generator, re-expanded, reproduces it exactly
+    /// as it is live.
+    fn verifyLeaf(v: *Verifier, i: usize, gen_cache: *std.AutoHashMap(usize, ?[]const mox.compose.catB.GeneratedFile)) !bool {
+        const gc = v.leaves[i];
+        const outputs = gen_cache.get(gc.fidx) orelse blk: {
+            const gen_file = findByLive(v.tree_now, gc.gen_file.live_path) orelse gc.gen_file;
+            var vdiag: mox.compose.interp.Diag = .{};
+            const out = mox.compose.catB.composeGenerator(v.arena, v.io, gen_file, v.resolver, v.m_state, v.secrets, &vdiag) catch null;
+            try gen_cache.put(gc.fidx, out);
+            break :blk out;
+        };
+        const produced = findGeneratedByLive(outputs, gc.leaf_live_path);
+        const now = Io.Dir.cwd().readFileAlloc(v.io, gc.leaf_live_path, v.arena, .limited(max_file_bytes)) catch null;
+        if (produced != null and now != null and std.mem.eql(u8, produced.?.content, now.?)) {
+            v.leaf_res[i] = .{ .live = now.?, .prov = produced.?.prov, .secret = produced.?.contains_secret };
+            return true;
+        }
+        try v.err.print("mox commit: {f}: recomposed generator output does not match; not committed\n", .{display.of(gc.leaf_live_path, v.m_state.home)});
+        v.fail(.{ .leaf = i }, "");
+        return false;
+    }
+
+    fn failFile(v: *Verifier, fidx: usize, reason: []const u8) bool {
+        v.fail(.{ .file = fidx }, reason);
+        return false;
+    }
+
+    /// A routed file passes when its recompose equals live, or differs only
+    /// by the hunks it holds, and no configuration the user did not choose
+    /// changed. A coupling-only target passes when its source still composes
+    /// and the sync changed no configuration the user did not choose; a
+    /// generator source also needs every leaf routed from it this run to
+    /// pass. A file with an unrouted hunk never passes.
+    fn verifyFile(v: *Verifier, fidx: usize) !bool {
+        const arena = v.arena;
+        const file = v.files[fidx];
+        const home = v.m_state.home;
+        // A hunk the tool could not route to the candidate the user picked is
+        // not something the user asked for: whatever else holds, the unit is
+        // not committed.
+        if (v.unrouted_hunks[fidx] > 0) return v.leftUncommitted(fidx);
+        if (v.struct_failed[fidx]) |ename| {
+            try v.err.print("mox commit: {s}: a source layer rejected the edit ({s}); not committed\n", .{ file.live_path, ename });
+            return v.failFile(fidx, try std.fmt.allocPrint(arena, "a source layer rejected the edit ({s})", .{ename}));
+        }
+        const configs = v.spaces[fidx].?.configs;
+        const file2 = findByLive(v.tree_now, file.live_path) orelse file;
+
+        if (v.coupling_only[fidx]) {
+            const composed = impact.composeAsApply(arena, v.io, file2, v.resolver, v.m_state, v.secrets) catch |e|
+                return v.recomposeFailed(fidx, e);
+            if (composed == null and !v.null_before[fidx]) {
+                try v.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, home)});
+                return v.failFile(fidx, "the source no longer composes");
+            }
+            // A generator's own units are its leaves: an update into it
+            // stands only while every leaf routed this run does.
+            for (v.leaves, v.leaf_failed) |gc, leaf_failed| {
+                if (gc.fidx != fidx or !leaf_failed) continue;
+                return v.failFile(fidx, try std.fmt.allocPrint(arena, "{f} was not committed", .{display.of(gc.leaf_live_path, home)}));
+            }
+            return v.configsHold(fidx, file2, configs, file.source_base_abs, "coupled token update");
+        }
+
+        var prov2: std.ArrayList(Segment) = .empty;
+        const composed = mox.compose.composeFileTracked(arena, v.io, file2, v.resolver, v.m_state, v.secrets, &prov2, null) catch |e|
+            return v.recomposeFailed(fidx, e);
+
+        const live = v.readLive(fidx);
+        const held = v.manual_hunks[fidx] + v.declined_hunks[fidx];
+        const composed_bytes = composed orelse {
+            // Composing to nothing is the routing's doing when the file's own
+            // edits were written, or a coupled update was written into a
+            // source that composed to something before.
+            const blamed = v.wrote_own[fidx] or (v.coupling_into[fidx] and !v.null_before[fidx]);
+            if (!blamed and held > 0) {
+                v.file_res[fidx] = .{ .check = .composes_to_nothing };
+                return true;
+            }
+            try v.err.print("mox commit: {s}: the edited sources no longer compose; not committed\n", .{file.live_path});
+            return v.failFile(fidx, "its sources no longer compose");
+        };
+        // A partial file's this-machine identity check is canonical: the
+        // extracted live-owned document must equal the recomposed owned
+        // document byte-wise in canonical form. The live remainder belongs to
+        // the program and never participates.
+        if (!v.matchesLive(fidx, composed_bytes, live)) {
+            // A manual hunk and a hunk the user deliberately declined (`n`) or
+            // skipped (`s`) are both DESIGNED outcomes -- the first has no safe
+            // route at all, the second is the user choosing not to commit it
+            // this run -- and either stays only in the live file, so the
+            // recompose is EXPECTED to still differ. Rolling the file back for
+            // that would make the most ordinary mixed edit (one hunk committed,
+            // one left alone) uncommittable forever. The routed hunks stand;
+            // the applied record does not advance, so the rest still shows as
+            // drift.
+            if (held == 0) {
+                try v.err.print("mox commit: {s}: recomposed output still differs from live; not committed\n", .{file.live_path});
+                return v.failFile(fidx, "its recomposed output differs from live");
+            }
+            // An explained mismatch excuses the file from matching live -- it
+            // does NOT excuse it from the cross-configuration check. The
+            // routed edits still stand, so a sibling they change that the
+            // user never chose to affect fails the file here just as it
+            // would on the exact-match path below.
+            if (!try v.configsHold(fidx, file2, configs, file.live_path, "routing")) return false;
+            // Excused from matching live as a whole, each key routed from
+            // this file must still recompose to its live value: a route that
+            // landed anywhere else has baked text the recompose does not
+            // reproduce.
+            if (try unmatchedRoutedKey(arena, v.struct_edits, v.struct_owners, fidx, composed_bytes, live)) |path| {
+                const label = try keyPathLabel(arena, path);
+                try v.err.print("mox commit: {s}: routed key {s} does not recompose to its live value; not committed\n", .{ file.live_path, label });
+                return v.failFile(fidx, try std.fmt.allocPrint(arena, "routed key {s} does not recompose to its live value", .{label}));
+            }
+            v.file_res[fidx] = .{ .check = .held };
+            return true;
+        }
+        // No classification choice may silently change another configuration:
+        // every sibling must recompose to its prior output unless allowed.
+        if (!try v.configsHold(fidx, file2, configs, file.live_path, "routing")) return false;
+        v.file_res[fidx] = .{ .check = .exact, .composed = composed_bytes, .live = live, .prov = prov2.items };
+        return true;
+    }
+
+    /// Fail a file whose sources no longer compose.
+    fn recomposeFailed(v: *Verifier, fidx: usize, e: anyerror) !bool {
+        try v.err.print("mox commit: {f}: recompose failed; not committed: {s}\n", .{ display.of(v.files[fidx].live_path, v.m_state.home), @errorName(e) });
+        return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "recompose failed: {s}", .{@errorName(e)}));
+    }
+
+    /// Fail a unit with unrouted hunks, saying whether its recompose still
+    /// differs from live.
+    fn leftUncommitted(v: *Verifier, fidx: usize) !bool {
+        const file = v.files[fidx];
+        const file2 = findByLive(v.tree_now, file.live_path) orelse file;
+        const composed = mox.compose.composeFileTracked(v.arena, v.io, file2, v.resolver, v.m_state, v.secrets, null, null) catch null;
+        const n = v.unrouted_hunks[fidx];
+        if (composed != null and v.matchesLive(fidx, composed.?, v.readLive(fidx))) {
+            try v.err.print("mox commit: {s}: {d} hunk(s) were left uncommitted; not committed\n", .{ file.live_path, n });
+        } else {
+            try v.err.print(
+                "mox commit: {s}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
+                .{ file.live_path, n },
+            );
+        }
+        return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "{d} hunk(s) were left uncommitted", .{n}));
+    }
+
+    /// The file's live bytes. Kind guard: a live path that became a special
+    /// inode mid-commit reads as empty (a mismatch) without the blocking open
+    /// a FIFO would force.
+    fn readLive(v: *const Verifier, fidx: usize) []const u8 {
+        const path = v.files[fidx].live_path;
+        return switch (mox.apply.write.guardLiveRead(v.io, path)) {
+            .special => "",
+            .readable, .absent => Io.Dir.cwd().readFileAlloc(v.io, path, v.arena, .limited(max_file_bytes)) catch "",
+        };
+    }
+
+    /// Unit equality for a file: exact bytes, or the canonical owned form
+    /// for a partial file.
+    fn matchesLive(v: *const Verifier, fidx: usize, composed: []const u8, live: []const u8) bool {
+        const file = v.files[fidx];
+        if (file.own_paths.len == 0) return std.mem.eql(u8, composed, live);
+        return partialLiveMatches(v.arena, file, composed, live);
+    }
+
+    /// The cross-configuration check: every configuration recomposes to its
+    /// prior output unless the user chose to affect it, and a partial file
+    /// defines no leaf outside its declared own paths.
+    fn configsHold(v: *Verifier, fidx: usize, file2: mox.source.tree.ManagedFile, configs: []const Configuration, name: []const u8, what: []const u8) !bool {
+        const file = v.files[fidx];
+        var after_per = (try impact.snapshot(v.arena, v.io, file2, configs, v.m_state, v.secrets)).per_config;
+        if (file.own_paths.len > 0) {
+            const pc = try partialPerConfig(v.arena, configs, after_per, file);
+            if (pc.violation) |viol| {
+                try v.err.print(
+                    "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
+                    .{ file.live_path, viol.label, viol.leaf },
+                );
+                return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "configuration {s}: composed leaf {s} is outside the declared own paths", .{ viol.label, viol.leaf }));
+            }
+            after_per = pc.per;
+        }
+        if (candidates.firstViolation(configs, v.baseline[fidx], after_per, &v.allowed[fidx])) |vi| {
+            const uncomposable = after_per[vi].isUncomposable();
+            try reportViolation(v.err, name, what, configs[vi].label, uncomposable);
+            const reason = if (uncomposable)
+                try std.fmt.allocPrint(v.arena, "configuration {s} would be unable to compose", .{configs[vi].label})
+            else
+                try std.fmt.allocPrint(v.arena, "configuration {s} would change", .{configs[vi].label});
+            return v.failFile(fidx, reason);
+        }
+        return true;
+    }
+};
+
+/// The first of a coupled update's targets that failed.
+fn failedTarget(v: *const Verifier, targets: []const usize) ?usize {
+    for (targets) |t| {
+        if (v.file_failed[t]) return t;
+    }
+    return null;
+}
+
+/// Names a unit not committed for `reason`, something other than its own
+/// verification, and how to commit it on its own.
+fn printNotCommitted(err: *Io.Writer, unit_live: []const u8, reason: []const u8, home: []const u8) !void {
+    const live = display.of(unit_live, home);
+    try err.print("mox commit: {f}: not committed: {s}; commit it on its own with 'mox commit {f}'\n", .{ live, reason, live });
+}
+
+/// Which units failing their first verification a coupled-update undone
+/// line reports: a coupling target of an update, since settling undoes it
+/// next with the target's own reason. Its unrouted hunks are still named on
+/// their own line, as for any unit. A no-op update, owned by nothing, is
+/// never undone.
+const UndoneBy = struct {
+    couplings: []const Owned(CouplingEdit),
+    targets: *const std.StringHashMap([]const usize),
+    unrouted: []const usize,
+
+    fn reports(u: UndoneBy, unit: Unit) bool {
+        const fidx = switch (unit) {
+            .file => |i| i,
+            else => return false,
+        };
+        if (u.unrouted[fidx] > 0) return false;
+        for (u.couplings) |o| {
+            if (o.owners.items.len > 0 and std.mem.indexOfScalar(usize, u.targets.get(o.edit.path).?, fidx) != null) return true;
+        }
+        return false;
+    }
+};
+
+/// One planned write to a source path and the units that own it: every
+/// planned edit other than coupled updates, as settling sees it.
+const OwnedWrite = struct {
+    path: []const u8,
+    owners: []const Unit,
+};
+
+fn ownedWrites(
+    arena: std.mem.Allocator,
+    lines: []const Owned(LineEdit),
+    rows: []const Owned(RowEdit),
+    structs: []const Owned(StructEdit),
+    synths: []const SynthDecision,
+    synth_owners: []const usize,
+    syms: []const Owned(SymSync),
+) ![]const OwnedWrite {
+    var out: std.ArrayList(OwnedWrite) = .empty;
+    for (lines) |o| try out.append(arena, .{ .path = o.edit.path, .owners = o.owners.items });
+    for (rows) |o| try out.append(arena, .{ .path = o.edit.data_source, .owners = o.owners.items });
+    for (syms) |o| try out.append(arena, .{ .path = o.edit.source_abs, .owners = o.owners.items });
+    for (synths, synth_owners) |sd, owner| {
+        const owners = try arena.dupe(Unit, &.{.{ .file = owner }});
+        try out.append(arena, .{ .path = sd.base_abs, .owners = owners });
+        try out.append(arena, .{ .path = sd.plan.fragment_path, .owners = owners });
+    }
+    for (structs) |o| try out.append(arena, .{ .path = o.edit.layer_abs, .owners = o.owners.items });
+    return out.toOwnedSlice(arena);
+}
+
+/// Add `path` to this round's restores when the edit to it that `owners`
+/// produced is dead, naming the first owner as the unit whose failure
+/// restored it. A path already restored is not restored again.
+fn markDead(
+    arena: std.mem.Allocator,
+    v: *const Verifier,
+    batch: *std.ArrayList([]const u8),
+    restore_cause: *std.StringHashMap(Unit),
+    path: []const u8,
+    owners: []const Unit,
+) !void {
+    if (!v.allFailed(owners)) return;
+    const gop = try restore_cause.getOrPut(path);
+    if (gop.found_existing) return;
+    gop.value_ptr.* = owners[0];
+    try batch.append(arena, path);
+}
+
+const RestoreFailure = struct {
+    path: []const u8,
+    cause: anyerror,
+};
+
+/// After a restore did not succeed: name each failure, then copy the pre-run
+/// bytes of every journaled path not yet put back that still differs from
+/// them, or cannot be read -- the facts file included -- into a fresh
+/// `<state>/commit-recovery/<timestamp>[-N]/`, named by root (`repo/<path>`,
+/// `private/<path>`, `facts`, or `other/<N>` for a path under neither), and
+/// name each such path, as one that still holds this run's edits, with its
+/// copy. A path that did not exist before is named for deletion instead; a
+/// copy that cannot be written is printed to stderr in full.
+fn saveRecovery(
+    ctx: *app.Ctx,
+    journal: *const Journal,
+    ids: *const PathIds,
+    at_pre_run: *const std.StringHashMap(void),
+    failures: []const RestoreFailure,
+    home: []const u8,
+) !void {
+    const paths = ctx.context.?.paths;
+    try ctx.out.flush();
+    for (failures) |f| try ctx.err.print("mox commit: could not restore {f} ({s})\n", .{ display.of(ids.shown(f.path), home), @errorName(f.cause) });
+    try ctx.err.writeAll("mox commit: nothing was recorded; each path below still holds this run's edits\n");
+
+    var pending: std.ArrayList([]const u8) = .empty;
+    var it = journal.entries.iterator();
+    while (it.next()) |entry| {
+        const p = entry.key_ptr.*;
+        if (at_pre_run.contains(p)) continue;
+        const now: PathNow = if (Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.alloc, .limited(max_file_bytes))) |bytes|
+            .{ .bytes = bytes }
+        else |e| switch (e) {
+            error.FileNotFound => .absent,
+            error.OutOfMemory => return e,
+            else => .unreadable,
+        };
+        if (!atPreRun(entry.value_ptr.content, now)) try pending.append(ctx.alloc, p);
+    }
+    std.mem.sort([]const u8, pending.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    const root = try std.fs.path.join(ctx.alloc, &.{ paths.state_dir, "commit-recovery" });
+    const roots: RecoveryRoots = .{
+        .repo = try canonicalPath(ctx.alloc, ctx.io, paths.repo_dir),
+        .private = if (paths.private_dir.len == 0) "" else try canonicalPath(ctx.alloc, ctx.io, paths.private_dir),
+        .facts = paths.facts_path,
+    };
+    var dir: ?[]const u8 = null;
+    var others: usize = 0;
+    for (pending.items) |p| {
+        const name = recoveryName(p, roots) orelse blk: {
+            others += 1;
+            break :blk RecoveryName{ .root = "other", .rel = try std.fmt.allocPrint(ctx.alloc, "{d}", .{others}) };
+        };
+        // A path outside both roots is named by its full canonical path.
+        const shown = if (std.mem.eql(u8, name.root, "other")) display.of(p, "") else display.of(ids.shown(p), home);
+        const bytes = journal.entries.get(p).?.content orelse {
+            try ctx.err.print("mox commit: {f} did not exist before this commit; delete it to restore it\n", .{shown});
+            continue;
+        };
+        const copy: ?[]const u8 = blk: {
+            if (dir == null) dir = freshRecoveryDir(ctx.alloc, ctx.io, root) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => break :blk null,
+            };
+            const dest = if (name.rel.len == 0)
+                try std.fs.path.join(ctx.alloc, &.{ dir.?, name.root })
+            else
+                try std.fs.path.join(ctx.alloc, &.{ dir.?, name.root, name.rel });
+            if (std.fs.path.dirname(dest)) |parent| Io.Dir.cwd().createDirPath(ctx.io, parent) catch break :blk null;
+            Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = dest, .data = bytes }) catch break :blk null;
+            break :blk dest;
+        };
+        if (copy) |c| {
+            try ctx.err.print("mox commit: {f}: its pre-run bytes are saved in {f}\n", .{ shown, display.of(c, home) });
+        } else {
+            try ctx.err.print("mox commit: {f}: its pre-run bytes could not be saved; they follow in full:\n{s}", .{ shown, bytes });
+            if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try ctx.err.writeAll("\n");
+        }
+    }
+    try ctx.err.flush();
+}
+
+/// What a journaled path holds when a recovery copy is considered.
+const PathNow = union(enum) { absent, bytes: []const u8, unreadable };
+
+/// Whether a path is known to hold its pre-run state `before` (null: it did
+/// not exist). A path that cannot be read is not known to.
+fn atPreRun(before: ?[]const u8, now: PathNow) bool {
+    return switch (now) {
+        .unreadable => false,
+        .absent => before == null,
+        .bytes => |bytes| if (before) |b| std.mem.eql(u8, bytes, b) else false,
+    };
+}
+
+/// A recovery directory under `root` that did not exist before: the UTC
+/// timestamp, with a `-N` suffix when that one is taken.
+fn freshRecoveryDir(arena: std.mem.Allocator, io: Io, root: []const u8) ![]const u8 {
+    try Io.Dir.cwd().createDirPath(io, root);
+    const base = mox.apply.snapshot.idNow(io);
+    var n: usize = 1;
+    while (true) : (n += 1) {
+        const name = if (n == 1) try arena.dupe(u8, &base) else try std.fmt.allocPrint(arena, "{s}-{d}", .{ &base, n });
+        const path = try std.fs.path.join(arena, &.{ root, name });
+        Io.Dir.cwd().createDir(io, path, .default_dir) catch |e| switch (e) {
+            error.PathAlreadyExists => continue,
+            else => return e,
+        };
+        return path;
+    }
+}
+
+/// The roots a recovery copy is named by, the repo and private layer
+/// canonical like every journaled path.
+const RecoveryRoots = struct { repo: []const u8, private: []const u8, facts: []const u8 };
+
+const RecoveryName = struct { root: []const u8, rel: []const u8 };
+
+/// Where the recovery copy of canonical path `path` goes, by the root it
+/// lives under, or null for a path under neither root or one whose relative
+/// form would leave its root.
+fn recoveryName(path: []const u8, roots: RecoveryRoots) ?RecoveryName {
+    if (std.mem.eql(u8, path, roots.facts)) return .{ .root = "facts", .rel = "" };
+    for ([_]struct { root: []const u8, dir: []const u8 }{
+        .{ .root = "private", .dir = roots.private },
+        .{ .root = "repo", .dir = roots.repo },
+    }) |r| {
+        if (r.dir.len == 0 or !mox.source.path.isUnderDir(path, r.dir) or path.len == r.dir.len) continue;
+        const rel = std.mem.trimStart(u8, path[r.dir.len..], "/\\");
+        var it = std.mem.tokenizeAny(u8, rel, "/\\");
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "..")) return null;
+        }
+        return .{ .root = r.root, .rel = rel };
+    }
+    return null;
+}
+
+/// Whether a passing unit routed fact `name`.
+fn factKept(v: *const Verifier, edits: []const FactEdit, owners: []const usize, name: []const u8) bool {
+    for (edits, owners) |e, owner| {
+        if (std.mem.eql(u8, e.name, name) and !v.file_failed[owner]) return true;
     }
     return false;
+}
+
+/// Put one routed fact back to its value before this run: rewritten, or
+/// removed when it was unset.
+fn revertFact(arena: std.mem.Allocator, io: Io, facts_path: []const u8, e: FactEdit) !void {
+    if (e.old_value) |value| {
+        try mox.machine.interview.persist(arena, io, facts_path, &.{.{ .name = e.name, .value = value }});
+    } else {
+        try mox.machine.interview.remove(arena, io, facts_path, e.name);
+    }
+}
+
+/// The merged source tree as it stands on disk.
+fn walkMerged(arena: std.mem.Allocator, io: Io, src_dir: []const u8, private_dir: []const u8, home: []const u8) !mox.source.tree.ManagedTree {
+    const base_tree = try mox.source.tree.walk(arena, io, src_dir, home);
+    return mox.private.layer.merge(arena, io, base_tree, private_dir, home);
 }
 
 /// Outcome of F-coupling resolution over the routed edits.
 const CouplingOutcome = struct {
     /// Updates to apply to other managed sources in the write pass.
     edits: []const CouplingEdit,
+    /// Index-aligned with `edits`: the file whose line edit produced each
+    /// update's rename.
+    origins: []const usize,
     /// The (possibly amended) decline list.
     declines: mox.coupling.decline.DeclineList,
     /// True only when a decline was recorded AND the command did not abort. A
@@ -2179,6 +3008,14 @@ const CouplingOutcome = struct {
     save_declines: bool,
     abort: bool = false,
     abort_strict: bool = false,
+};
+
+/// One coupled update a routed rename could make: `origin` is the file whose
+/// line edit, into `origin_path`, produced the rename, when owners were given.
+const CouplingCandidate = struct {
+    edit: CouplingEdit,
+    origin: ?usize,
+    origin_path: []const u8,
 };
 
 /// For each routed rename, find other managed sources still holding the old
@@ -2190,70 +3027,60 @@ fn resolveCoupling(
     io: Io,
     coupling_dir: []const u8,
     line_edits: []const LineEdit,
+    line_owners: []const usize,
+    accepted: *const AcceptedTexts,
+    bases: []const []const u8,
     protected: *const std.StringHashMap(void),
     ask_mode: prompt.Mode,
     input: *Io.Reader,
     stdout: *Io.Writer,
+    err: *Io.Writer,
 ) !CouplingOutcome {
     var edits: std.ArrayList(CouplingEdit) = .empty;
+    var origins: std.ArrayList(usize) = .empty;
     var graph = try mox.coupling.store.loadGraph(arena, io, coupling_dir);
     var declines = try mox.coupling.store.loadDeclines(arena, io, coupling_dir);
     var declines_changed = false;
     var aborted = false;
     var strict = false;
 
-    coupling: for (line_edits) |e| {
-        // A private-layer edit must never sync a token into the shared repo:
-        // the graph is rebuilt over the merged tree and does index private-only
-        // files, so `e.private` (set from the edit's source LOCATION, not its
-        // provenance tag) is what keeps a private rename out of shared sources.
-        if (e.private) continue;
-        const rename = (try detectRename(arena, io, e)) orelse continue;
-        const occs = graph.lookup(rename.old) orelse continue;
-        var seen = std.StringHashMap(void).init(arena);
-        for (occs) |o| {
-            if (std.mem.eql(u8, o.file_id, e.path)) continue;
-            // A symlink target / seed-once body is never token-synced, so it is
-            // never prompted, announced, or counted here (its write is filtered
-            // out separately as a safety net for a stale graph).
-            if (protected.contains(o.file_id)) continue;
-            if ((try seen.getOrPut(o.file_id)).found_existing) continue;
-            if (declines.isPairDeclined(rename.old, e.path, o.file_id)) continue;
-            const content = Io.Dir.cwd().readFileAlloc(io, o.file_id, arena, .limited(max_file_bytes)) catch continue;
-            if (std.mem.indexOf(u8, content, rename.old) == null) continue;
-
-            const q = try std.fmt.allocPrint(arena, "  \"{s}\" -> \"{s}\": also in {s}. Update? [Y/n/d/D/q] ", .{ rename.old, rename.new, o.file_id });
-            switch (try prompt.ask(ask_mode, &yndd_choices, 0, q, input, stdout)) {
-                .chosen => |i| switch (i) {
-                    0 => {
-                        try edits.append(arena, .{ .path = o.file_id, .old = rename.old, .new = rename.new });
-                        try stdout.print("  update {s}: \"{s}\" -> \"{s}\"\n", .{ o.file_id, rename.old, rename.new });
-                    },
-                    1 => {},
-                    2 => {
-                        try declines.declinePair(rename.old, e.path, o.file_id);
-                        declines_changed = true;
-                    },
-                    else => {
-                        try declines.declineGlobal(rename.old);
-                        declines_changed = true;
-                    },
+    const cands = try couplingCandidates(arena, io, &graph, &declines, line_edits, line_owners, accepted, bases, protected, stdout, err);
+    for (cands) |c| {
+        // An earlier answer in this run may have declined this pair.
+        if (declines.isPairDeclined(c.edit.old, c.origin_path, c.edit.path)) continue;
+        const q = try std.fmt.allocPrint(arena, "  \"{s}\" -> \"{s}\": also in {s}. Update? [Y/n/d/D/q] ", .{ c.edit.old, c.edit.new, c.edit.path });
+        switch (try prompt.ask(ask_mode, &yndd_choices, 0, q, input, stdout)) {
+            .chosen => |i| switch (i) {
+                0 => {
+                    try edits.append(arena, c.edit);
+                    try origins.append(arena, c.origin.?);
+                    try stdout.print("  update {s}: \"{s}\" -> \"{s}\"\n", .{ c.edit.path, c.edit.old, c.edit.new });
                 },
-                .abort => {
-                    aborted = true;
-                    break :coupling;
+                1 => {},
+                2 => {
+                    try declines.declinePair(c.edit.old, c.origin_path, c.edit.path);
+                    declines_changed = true;
                 },
-                .abort_strict => {
-                    strict = true;
-                    break :coupling;
+                else => {
+                    try declines.declineGlobal(c.edit.old);
+                    declines_changed = true;
                 },
-                .report_only => {},
-            }
+            },
+            .abort => {
+                aborted = true;
+                break;
+            },
+            .abort_strict => {
+                strict = true;
+                break;
+            },
+            .report_only => {},
         }
     }
 
     return .{
         .edits = try edits.toOwnedSlice(arena),
+        .origins = try origins.toOwnedSlice(arena),
         .declines = declines,
         .save_declines = declines_changed and !aborted and !strict,
         .abort = aborted,
@@ -2269,34 +3096,407 @@ fn reportCoupling(
     io: Io,
     coupling_dir: []const u8,
     line_edits: []const LineEdit,
+    accepted: *const AcceptedTexts,
+    bases: []const []const u8,
     protected: *const std.StringHashMap(void),
     stdout: *Io.Writer,
+    err: *Io.Writer,
 ) !usize {
     var graph = try mox.coupling.store.loadGraph(arena, io, coupling_dir);
     var declines = try mox.coupling.store.loadDeclines(arena, io, coupling_dir);
-    var count: usize = 0;
+    const cands = try couplingCandidates(arena, io, &graph, &declines, line_edits, null, accepted, bases, protected, stdout, err);
+    for (cands) |c| try stdout.print("  would update {s}: \"{s}\" -> \"{s}\"\n", .{ c.edit.path, c.edit.old, c.edit.new });
+    return cands.len;
+}
 
-    for (line_edits) |e| {
-        // Private edits never couple into the shared repo (see resolveCoupling).
+/// Every coupled update the routed renames could make, in prompt order, each
+/// with the file its rename came from when `line_owners` is given.
+/// Dropped with a warning, before any prompt: an update into a path that is
+/// no managed file's base (a stale graph entry); every update of a token that
+/// this run renames to two different names; and an update into a path an
+/// accepted edit already writes new text holding the old token into, which
+/// the rename would rewrite.
+fn couplingCandidates(
+    arena: std.mem.Allocator,
+    io: Io,
+    graph: *const mox.coupling.graph.Graph,
+    declines: *const mox.coupling.decline.DeclineList,
+    line_edits: []const LineEdit,
+    line_owners: ?[]const usize,
+    accepted: *const AcceptedTexts,
+    bases: []const []const u8,
+    protected: *const std.StringHashMap(void),
+    stdout: *Io.Writer,
+    err: *Io.Writer,
+) ![]const CouplingCandidate {
+    var found: std.ArrayList(CouplingCandidate) = .empty;
+    var renames: std.ArrayList(Rename) = .empty;
+    var stale = std.StringHashMap(void).init(arena);
+    // The graph may spell a file otherwise than the tree (MOX_REPO through a
+    // symlink, hard links), so files are compared by identity. An update is
+    // offered for the file's first base in tree order, and a decline under
+    // any spelling of it applies.
+    const ids = accepted.ids;
+    var base_of = std.StringHashMap([]const u8).init(arena);
+    var spellings = std.StringHashMap(std.ArrayList([]const u8)).init(arena);
+    for (bases) |b| {
+        const id = try ids.canonical(b);
+        const first = try base_of.getOrPut(id);
+        if (!first.found_existing) first.value_ptr.* = b;
+        const all = try spellings.getOrPut(id);
+        if (!all.found_existing) all.value_ptr.* = .empty;
+        try all.value_ptr.append(arena, b);
+    }
+    var protected_ids = std.StringHashMap(void).init(arena);
+    var pit = protected.keyIterator();
+    while (pit.next()) |p| try protected_ids.put(try ids.canonical(p.*), {});
+    for (line_edits, 0..) |e, ei| {
+        const owner: ?usize = if (line_owners) |o| o[ei] else null;
+        // A private-layer edit must never sync a token into the shared repo:
+        // the graph is rebuilt over the merged tree and does index private-only
+        // files, so `e.private` (set from the edit's source LOCATION, not its
+        // provenance tag) is what keeps a private rename out of shared sources.
         if (e.private) continue;
         const rename = (try detectRename(arena, io, e)) orelse continue;
+        try renames.append(arena, rename);
         const occs = graph.lookup(rename.old) orelse continue;
+        const origin_id = try ids.canonical(e.path);
         var seen = std.StringHashMap(void).init(arena);
         for (occs) |o| {
-            if (std.mem.eql(u8, o.file_id, e.path)) continue;
+            const id = try ids.canonical(o.file_id);
+            if (std.mem.eql(u8, id, origin_id)) continue;
             // A symlink target / seed-once body is never token-synced, so it is
-            // never prompted, announced, or counted here (its write is filtered
-            // out separately as a safety net for a stale graph).
-            if (protected.contains(o.file_id)) continue;
-            if ((try seen.getOrPut(o.file_id)).found_existing) continue;
+            // never prompted, announced, or counted here.
+            if (protected_ids.contains(id)) continue;
+            if ((try seen.getOrPut(id)).found_existing) continue;
+            const base = base_of.get(id);
             if (declines.isPairDeclined(rename.old, e.path, o.file_id)) continue;
+            const declined = if (spellings.get(id)) |all| for (all.items) |b| {
+                if (declines.isPairDeclined(rename.old, e.path, b)) break true;
+            } else false else false;
+            if (declined) continue;
             const content = Io.Dir.cwd().readFileAlloc(io, o.file_id, arena, .limited(max_file_bytes)) catch continue;
             if (std.mem.indexOf(u8, content, rename.old) == null) continue;
-            try stdout.print("  would update {s}: \"{s}\" -> \"{s}\"\n", .{ o.file_id, rename.old, rename.new });
-            count += 1;
+            const path = base orelse {
+                if (!(try stale.getOrPut(id)).found_existing) {
+                    try warnCoupling(stdout, err, "mox commit: coupling: {s} is no managed file's source; not updating it\n", .{o.file_id});
+                }
+                continue;
+            };
+            try found.append(arena, .{ .edit = .{ .path = path, .old = rename.old, .new = rename.new }, .origin = owner, .origin_path = e.path });
         }
     }
-    return count;
+
+    var conflicted = std.StringHashMap(bool).init(arena);
+    for (renames.items, 0..) |r, i| {
+        for (renames.items[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, r.old, other.old) and !std.mem.eql(u8, r.new, other.new)) try conflicted.put(r.old, false);
+        }
+    }
+    var warned = std.StringHashMap(void).init(arena);
+    var out: std.ArrayList(CouplingCandidate) = .empty;
+    for (found.items) |c| {
+        if (conflicted.getPtr(c.edit.old)) |said| {
+            if (!said.*) {
+                try warnCoupling(stdout, err, "mox commit: coupling: \"{s}\" is renamed to different names in this commit; not updating it anywhere else\n", .{c.edit.old});
+                said.* = true;
+            }
+            continue;
+        }
+        if (try acceptedHoldsToken(arena, accepted, c.edit.path, c.edit.old, c.edit.new)) {
+            const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ c.edit.path, c.edit.old });
+            if (!(try warned.getOrPut(key)).found_existing) {
+                try warnCoupling(stdout, err, "mox commit: coupling: an edit routed into {s} keeps \"{s}\"; not renaming it there\n", .{ c.edit.path, c.edit.old });
+            }
+            continue;
+        }
+        try out.append(arena, c);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn warnCoupling(stdout: *Io.Writer, err: *Io.Writer, comptime fmt: []const u8, args: anytype) !void {
+    // In program order on the terminal: the warning before the prompts.
+    try stdout.flush();
+    try err.print(fmt, args);
+    try err.flush();
+}
+
+/// The new text each edit accepted this run writes, by the canonical path it
+/// writes: a line edit's new lines; a narrowing's region block and fragment;
+/// for a row write, its row's header key path and each assignment statement
+/// of its row, as planned, keyed by the assignment's key and carrying the row
+/// fields the routed template, the loop's `where` and a leaf's `into` path
+/// read.
+const AcceptedTexts = struct {
+    ids: *PathIds,
+    by_path: std.StringHashMap(std.ArrayList(Accepted)),
+
+    fn init(arena: std.mem.Allocator, ids: *PathIds) AcceptedTexts {
+        return .{ .ids = ids, .by_path = .init(arena) };
+    }
+};
+
+/// One accepted text. With a `key`, it is a row's assignment statement and
+/// counts only when that key, before or after a rename, names one of `fields`.
+const Accepted = struct {
+    text: []const u8,
+    key: ?[]const u8 = null,
+    fields: []const []const u8 = &.{},
+};
+
+fn acceptedTexts(
+    arena: std.mem.Allocator,
+    io: Io,
+    ids: *PathIds,
+    files: []const mox.source.tree.ManagedFile,
+    lines: []const LineEdit,
+    rows: []const RowEdit,
+    row_owners: []const usize,
+    gen: *const LeafRowEdits,
+    synths: []const SynthDecision,
+) !AcceptedTexts {
+    var m: AcceptedTexts = .init(arena, ids);
+    for (lines) |e| try addAccepted(arena, &m, try ids.canonical(e.path), .{ .text = try std.mem.join(arena, "\n", e.new_lines) });
+    // Each data source as its row writes leave it, in the order the plan
+    // applies them.
+    var planned = std.StringHashMap([]const u8).init(arena);
+    for ([_][]const RowEdit{ rows, gen.row_edits.items }) |list| for (list) |e| {
+        const gop = try planned.getOrPut(try ids.canonical(e.data_source));
+        if (!gop.found_existing) {
+            gop.value_ptr.* = Io.Dir.cwd().readFileAlloc(io, e.data_source, arena, .limited(max_file_bytes)) catch "";
+        }
+        gop.value_ptr.* = try updateTomlRow(arena, gop.value_ptr.*, e.stem, e.row, e.fields);
+    };
+    for (rows, row_owners) |e, owner| {
+        const path = try ids.canonical(e.data_source);
+        const content = planned.get(path).?;
+        const reads = try rowReadFields(arena, io, files[owner], e.data_source, e.template);
+        try addRowStatements(arena, &m, path, e, content, try storedValueFields(arena, reads, e, content));
+    }
+    for (gen.row_edits.items, gen.row_leaves.items) |e, li| {
+        const path = try ids.canonical(e.data_source);
+        const content = planned.get(path).?;
+        const reads = try rowReadFields(arena, io, gen.leaves.items[li].gen_file, e.data_source, null);
+        try addRowStatements(arena, &m, path, e, content, try storedValueFields(arena, reads, e, content));
+    }
+    for (synths) |sd| {
+        try addAccepted(arena, &m, try ids.canonical(sd.base_abs), .{ .text = try std.mem.join(arena, "\n", sd.plan.base_lines) });
+        try addAccepted(arena, &m, try ids.canonical(sd.plan.fragment_path), .{ .text = sd.plan.fragment_content });
+    }
+    return m;
+}
+
+fn addAccepted(arena: std.mem.Allocator, m: *AcceptedTexts, path: []const u8, a: Accepted) !void {
+    const gop = try m.by_path.getOrPut(path);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(arena, a);
+}
+
+/// Whether an edit accepted into `path` writes `old` as a complete token
+/// where a rename of it to `new` would change what the edit wrote.
+fn acceptedHoldsToken(arena: std.mem.Allocator, accepted: *const AcceptedTexts, path: []const u8, old: []const u8, new: []const u8) !bool {
+    const texts = accepted.by_path.get(try accepted.ids.canonical(path)) orelse return false;
+    for (texts.items) |t| {
+        if (t.key) |key| {
+            const renamed = try replaceTokens(arena, key, &.{.{ .path = path, .old = old, .new = new }});
+            if (!isOneOf(key, t.fields) and !isOneOf(renamed, t.fields)) continue;
+        }
+        if (containsToken(try mox.coupling.tokens.extract(arena, t.text), old)) return true;
+    }
+    return false;
+}
+
+/// Add, under `path`, the key path of the target row's `[[stem]]` header in
+/// `content` and each assignment statement of the table it opens, keyed by
+/// its key's first segment: its key and its value, never a comment.
+fn addRowStatements(arena: std.mem.Allocator, m: *AcceptedTexts, path: []const u8, e: RowEdit, content: []const u8, fields: []const []const u8) !void {
+    const stmts = toml_statements.scan(arena, content) catch |err| switch (err) {
+        // Too deep to tell statements apart: every token of it counts.
+        error.NestingTooDeep => return addAccepted(arena, m, path, .{ .text = content }),
+        error.OutOfMemory => return err,
+    };
+    const row = toml_statements.arrayTableRow(stmts, e.stem, e.row) orelse return;
+    try addAccepted(arena, m, path, .{ .text = row.header.key_span.of(content) });
+    for (row.body) |st| {
+        const text = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ st.key_span.of(content), try st.valueText(arena, content) });
+        try addAccepted(arena, m, path, .{ .text = text, .key = st.key[0], .fields = fields });
+    }
+}
+
+/// The row fields the loops over one data source read. Each loop's
+/// `expanded` fields are those its body or `into` path reads through a
+/// capture whose stored value the expander resolves once more under
+/// `variable`.
+const RowReads = struct {
+    fields: []const []const u8,
+    loops: []const LoopReads,
+
+    const LoopReads = struct { variable: []const u8, expanded: []const []const u8 };
+};
+
+/// The row fields a loop over `data_path` in `file` reads: every capture of
+/// its body naming a field of the loop variable (defaults and chains
+/// included) or a bare field, its `where` predicate's field references, and
+/// its `into` path's captures. `template`, when given, picks the loop whose
+/// body it is; when no loop of the file's base matches, its own captures
+/// under the `entry` variable are taken.
+fn rowReadFields(arena: std.mem.Allocator, io: Io, file: mox.source.tree.ManagedFile, data_path: []const u8, template: ?[]const u8) !RowReads {
+    var names: std.ArrayList([]const u8) = .empty;
+    var loops: std.ArrayList(RowReads.LoopReads) = .empty;
+    var matched = false;
+    scan: {
+        const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch break :scan;
+        const marker = mox.dsl.comment.markerForFile(file.source_base_path, content) orelse break :scan;
+        const parsed = mox.dsl.driver.parseFile(arena, content, marker, null) catch break :scan;
+        for (parsed.directives) |d| {
+            const fl = switch (d.kind) {
+                .for_loop => |fl| fl,
+                else => continue,
+            };
+            const path = (try file.dataSourcePath(arena, io, fl.data_source)) orelse continue;
+            if (!std.mem.eql(u8, path, data_path)) continue;
+            if (template) |t| {
+                var stripped: std.ArrayList(u8) = .empty;
+                var body_lines = std.mem.splitScalar(u8, fl.body_template, '\n');
+                var first = true;
+                while (body_lines.next()) |bl| {
+                    if (!first) try stripped.append(arena, '\n');
+                    first = false;
+                    try stripped.appendSlice(arena, mox.dsl.driver.stripLoopBodyPrefix(bl, marker));
+                }
+                if (!std.mem.eql(u8, stripped.items, t)) continue;
+            }
+            matched = true;
+            try appendCaptureFields(arena, &names, fl.body_template, fl.variable);
+            if (fl.where) |w| try appendWhereFields(arena, &names, w, fl.variable);
+            if (fl.into) |into| try appendCaptureFields(arena, &names, into, fl.variable);
+            var expanded: std.ArrayList([]const u8) = .empty;
+            try appendExpandedFields(arena, &expanded, fl.body_template, fl.variable);
+            if (fl.into) |into| try appendExpandedFields(arena, &expanded, into, fl.variable);
+            try loops.append(arena, .{ .variable = fl.variable, .expanded = try expanded.toOwnedSlice(arena) });
+        }
+    }
+    if (!matched) {
+        if (template) |t| {
+            try appendCaptureFields(arena, &names, t, "entry");
+            var expanded: std.ArrayList([]const u8) = .empty;
+            try appendExpandedFields(arena, &expanded, t, "entry");
+            try loops.append(arena, .{ .variable = "entry", .expanded = try expanded.toOwnedSlice(arena) });
+        }
+    }
+    return .{ .fields = try names.toOwnedSlice(arena), .loops = try loops.toOwnedSlice(arena) };
+}
+
+/// The row fields whose stored values `interp.expandTrackedImpl` expands
+/// again when it renders `text`: a single-member capture, with or without a
+/// default, naming `variable.<field>` or `entry.<field>`. A chain member and
+/// a bare field splice their stored values verbatim.
+fn appendExpandedFields(arena: std.mem.Allocator, names: *std.ArrayList([]const u8), text: []const u8, variable: []const u8) !void {
+    const capture = mox.compose.capture;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '<')) |open| {
+        const close = capture.closeIndex(text, open) orelse break;
+        i = close + 1;
+        const inner = capture.splitDefault(text[open + 1 .. close]).field;
+        if (capture.isChain(inner)) continue;
+        for ([_][]const u8{ variable, "entry" }) |head| {
+            if (inner.len <= head.len + 1 or !std.mem.startsWith(u8, inner, head) or inner[head.len] != '.') continue;
+            if (isFieldName(inner[head.len + 1 ..])) try names.append(arena, inner[head.len + 1 ..]);
+            break;
+        }
+    }
+}
+
+/// Every field `reads` names, plus each row field a capture in any form
+/// reads inside the stored value, in `content`, of an expanded field of `e`'s
+/// target row: the one level the expander resolves a row value. A `content`
+/// that does not parse fails to compose anyway, so it adds nothing.
+fn storedValueFields(arena: std.mem.Allocator, reads: RowReads, e: RowEdit, content: []const u8) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(arena, reads.fields);
+    const record: ?mox.data.toml.Record = blk: {
+        const rows = mox.data.toml.parse(arena, content) catch break :blk null;
+        const list = rows.get(e.stem) orelse break :blk null;
+        break :blk if (e.row < list.len) list[e.row] else null;
+    };
+    for (reads.loops) |loop| {
+        const r = record orelse continue;
+        for (loop.expanded) |f| {
+            const v = r.get(f) orelse continue;
+            try appendCaptureFields(arena, &names, try v.format(arena), loop.variable);
+        }
+    }
+    return names.toOwnedSlice(arena);
+}
+
+/// The row fields each `<...>` capture of `text` reads, in any capture form:
+/// every member of a chain, with or without a default, naming
+/// `variable.<field>` or `entry.<field>`, or a bare field name. A default is
+/// literal text and reads nothing.
+fn appendCaptureFields(arena: std.mem.Allocator, names: *std.ArrayList([]const u8), text: []const u8, variable: []const u8) !void {
+    const capture = mox.compose.capture;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '<')) |open| {
+        const close = capture.closeIndex(text, open) orelse break;
+        i = close + 1;
+        var members = capture.members(capture.splitDefault(text[open + 1 .. close]).field);
+        while (members.next()) |member| {
+            const field = fieldOfRef(member, variable) orelse fieldOfRef(member, "entry") orelse
+                (if (isFieldName(member)) member else null);
+            if (field) |f| try names.append(arena, f);
+        }
+    }
+}
+
+/// The row fields a `where` predicate reads through `variable`.
+fn appendWhereFields(arena: std.mem.Allocator, names: *std.ArrayList([]const u8), expr: *const mox.dsl.ast.RowExpr, variable: []const u8) !void {
+    const ref: []const u8 = switch (expr.*) {
+        .present => |r| r,
+        .has => |h| h.ref,
+        .eq => |e| e.ref,
+        .axis_with_field => |a| a.field_ref,
+        .bound => |r| r,
+        .not => |inner| return appendWhereFields(arena, names, inner, variable),
+        .and_ => |b| {
+            try appendWhereFields(arena, names, b.left, variable);
+            return appendWhereFields(arena, names, b.right, variable);
+        },
+        .or_ => |b| {
+            try appendWhereFields(arena, names, b.left, variable);
+            return appendWhereFields(arena, names, b.right, variable);
+        },
+    };
+    if (fieldOfRef(ref, variable)) |f| try names.append(arena, f);
+}
+
+/// The field `ref` names when it reads `variable.<field>`.
+fn fieldOfRef(ref: []const u8, variable: []const u8) ?[]const u8 {
+    if (ref.len <= variable.len + 1 or !std.mem.startsWith(u8, ref, variable) or ref[variable.len] != '.') return null;
+    const rest = ref[variable.len + 1 ..];
+    var end: usize = 0;
+    while (end < rest.len and isFieldChar(rest[end])) end += 1;
+    return if (end == 0) null else rest[0..end];
+}
+
+fn isFieldName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!isFieldChar(c)) return false;
+    return true;
+}
+
+fn isFieldChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+}
+
+/// Absolute base source path of every managed file, in tree order: what a
+/// coupled update may rewrite.
+fn managedBases(arena: std.mem.Allocator, files: []const mox.source.tree.ManagedFile) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (files) |f| {
+        if (f.has_base and f.source_base_abs.len > 0) try out.append(arena, f.source_base_abs);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Detect a single-token rename in a line edit: the token present in the old
@@ -2340,24 +3540,26 @@ fn containsToken(toks: []const []const u8, tok: []const u8) bool {
     return false;
 }
 
-/// Replace only the occurrences of `old` in `content` that are themselves
-/// complete tokens: bounded by a non-token char or a string edge, matching how
-/// `coupling/tokens.zig` extracts tokens (a token is a maximal run of token
-/// chars). An occurrence embedded in a longer token is left intact, so renaming
+/// Replace every occurrence in `content` of a rename's old token that is
+/// itself a complete token -- bounded by a non-token char or a string edge,
+/// matching how `coupling/tokens.zig` extracts tokens (a token is a maximal run
+/// of token chars) -- with that rename's new token, in one pass: a replacement
+/// is never matched again, so `a -> b` beside `b -> c` never turns `a` into
+/// `c`. An occurrence embedded in a longer token is left intact, so renaming
 /// one token never corrupts a superstring of it. Returns arena-owned bytes.
-fn replaceToken(arena: std.mem.Allocator, content: []const u8, old: []const u8, new: []const u8) ![]u8 {
-    if (old.len == 0) return arena.dupe(u8, content);
+fn replaceTokens(arena: std.mem.Allocator, content: []const u8, renames: []const CouplingEdit) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
-    while (i < content.len) {
-        if (std.mem.startsWith(u8, content[i..], old)) {
-            const before_ok = i == 0 or !mox.coupling.tokens.isTokenChar(content[i - 1]);
-            const after = i + old.len;
-            const after_ok = after >= content.len or !mox.coupling.tokens.isTokenChar(content[after]);
-            if (before_ok and after_ok) {
-                try out.appendSlice(arena, new);
+    scan: while (i < content.len) {
+        const before_ok = i == 0 or !mox.coupling.tokens.isTokenChar(content[i - 1]);
+        if (before_ok) {
+            for (renames) |r| {
+                if (r.old.len == 0 or !std.mem.startsWith(u8, content[i..], r.old)) continue;
+                const after = i + r.old.len;
+                if (after < content.len and mox.coupling.tokens.isTokenChar(content[after])) continue;
+                try out.appendSlice(arena, r.new);
                 i = after;
-                continue;
+                continue :scan;
             }
         }
         try out.append(arena, content[i]);
@@ -2366,9 +3568,6 @@ fn replaceToken(arena: std.mem.Allocator, content: []const u8, old: []const u8, 
     return out.toOwnedSlice(arena);
 }
 
-/// Drop coupling edits that would rewrite a symlink target or a seed-once
-/// source. Those files are user-owned and never edit sources, so a shared token
-/// must not be synced into them even when the coupling graph indexes them.
 /// Source files that must never receive a coupling token sync: a symlink
 /// source's content is a link target, a seed-once source's is a one-time seed.
 /// Keyed by absolute source path (the coupling graph's file id).
@@ -2382,17 +3581,6 @@ fn protectedSourceSet(arena: std.mem.Allocator, files: []const mox.source.tree.M
     return protected;
 }
 
-fn dropProtectedCouplingEdits(arena: std.mem.Allocator, edits: []const CouplingEdit, files: []const mox.source.tree.ManagedFile) ![]const CouplingEdit {
-    var protected = try protectedSourceSet(arena, files);
-    if (protected.count() == 0) return edits;
-    var out: std.ArrayList(CouplingEdit) = .empty;
-    for (edits) |e| {
-        if (protected.contains(e.path)) continue;
-        try out.append(arena, e);
-    }
-    return out.toOwnedSlice(arena);
-}
-
 /// Coupling edits targeting `path`, in order. Grouped so a target file's
 /// combined token sync can be simulated and applied as a unit.
 fn couplingEditsForPath(arena: std.mem.Allocator, edits: []const CouplingEdit, path: []const u8) ![]const CouplingEdit {
@@ -2403,33 +3591,73 @@ fn couplingEditsForPath(arena: std.mem.Allocator, edits: []const CouplingEdit, p
     return out.toOwnedSlice(arena);
 }
 
+/// The undone line of every target of a path whose renames are removed
+/// before planning, in file order: a target whose own simulation failed
+/// gives its own reason; any other names the first target of its path that
+/// failed.
+fn droppedCouplingLines(
+    arena: std.mem.Allocator,
+    files: []const mox.source.tree.ManagedFile,
+    target_path: []const ?[]const u8,
+    sim_failed: []const ?[]const u8,
+    dropped: []const []const u8,
+    home: []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (files, target_path, sim_failed) |f, tp, why| {
+        const path = tp orelse continue;
+        if (!isOneOf(path, dropped)) continue;
+        const first = for (target_path, sim_failed, 0..) |other, other_why, i| {
+            if (other != null and other_why != null and std.mem.eql(u8, other.?, path)) break i;
+        } else unreachable;
+        try out.append(arena, try std.fmt.allocPrint(arena, "coupled update to {f} undone: {f} could not take it ({s})", .{
+            display.of(f.live_path, home),
+            display.of(if (why != null) f.live_path else files[first].live_path, home),
+            why orelse sim_failed[first].?,
+        }));
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Impact of a coupling target's token sync: snapshot every configuration's
 /// compose, transiently apply the token replacements to the source, snapshot
-/// again, then restore. The transient write is always reverted.
+/// again, then restore. A compose this machine cannot do, before or after, is
+/// `.uncomposable`; a target that cannot be read or transiently written is
+/// `.unwritable`. Only a failure to revert the transient write is an error.
 fn simulateCouplingImpact(
     cc: *const ClassCtx,
     file: mox.source.tree.ManagedFile,
     path: []const u8,
     file_edits: []const CouplingEdit,
     configs: []const Configuration,
-) !CouplingImpact {
+) !CouplingSim {
     const arena = cc.arena;
     const io = cc.io;
-    const original = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes));
-    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
+    const original = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .unwritable = e },
+    };
+    const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .uncomposable = e },
+    };
 
-    var edited: []const u8 = original;
-    for (file_edits) |ce| edited = try replaceToken(arena, edited, ce.old, ce.new);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = edited });
-    const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch {
-            // A failed diagnostic write must not replace `e`: the snapshot
-            // failure is the error worth reporting.
-            cc.err.print("mox commit: {s}: could not restore the transiently edited source; left edited\n", .{path}) catch {};
-        };
+    const edited = try replaceTokens(arena, original, file_edits);
+    // A failed write may have left part of it behind, so it is reverted too.
+    const written = Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = edited });
+    const after_or = if (written) impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) else |_| undefined;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch |e| {
+        cc.err.print("mox commit: {s}: could not restore the transiently edited source; left edited\n", .{path}) catch {};
+        // A snapshot failure is the error worth reporting over the write's.
+        written catch return e;
+        _ = after_or catch |se| return se;
         return e;
     };
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original });
+    written catch |e| return .{ .unwritable = e };
+    const after = after_or catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .uncomposable = e },
+    };
 
     var present: usize = 0;
     for (configs, before.per_config, after.per_config) |c, b, a| {
@@ -2438,71 +3666,24 @@ fn simulateCouplingImpact(
         if (b.isUncomposable() and a.isUncomposable()) continue;
         present += 1;
     }
-    return .{ .impact = try impact.impact(arena, configs, before, after), .present_siblings = present };
+    return .{ .impact = .{ .impact = try impact.impact(arena, configs, before, after), .present_siblings = present, .before = before.per_config } };
 }
 
-/// A coupled update's `impact`, and how many configurations other than this
-/// machine's it could change: those the file exists in before or after it,
-/// less those it cannot compose in either way.
+const CouplingSim = union(enum) {
+    impact: CouplingImpact,
+    uncomposable: anyerror,
+    unwritable: anyerror,
+};
+
+/// A coupled update's `impact`, how many configurations other than this
+/// machine's it could change -- those the file exists in before or after it,
+/// less those it cannot compose in either way -- and every configuration's
+/// compose before it.
 const CouplingImpact = struct {
     impact: impact.Impact,
     present_siblings: usize,
+    before: []const impact.ConfigOutput,
 };
-
-/// Roll a rejected routing back to its sources' pre-write bytes: a file that
-/// existed regains its exact content, and one the synthesis created is removed
-/// -- along with every directory it created to hold it. Facts are handled
-/// separately, by `restoreUnkeptFacts`, once every file's outcome is known: a
-/// fact's on-disk state is shared by every file that routed to it, so restoring
-/// it here -- the instant THIS file is rejected -- could pull it out from
-/// under a sibling file that routed the same fact and is still committed.
-fn restoreRouted(io: Io, backups: []const Backup) !void {
-    for (backups) |b| {
-        if (b.content) |bytes| {
-            try Io.Dir.cwd().writeFile(io, .{ .sub_path = b.path, .data = bytes });
-            continue;
-        }
-        Io.Dir.cwd().deleteFile(io, b.path) catch {};
-        if (b.created_dir) |d| Io.Dir.cwd().deleteTree(io, d) catch {};
-    }
-}
-
-/// Restore every fact whose write this run must undo: one routed by at least
-/// one rejected file (`fact_backup`/`rolled_back`, index-aligned with
-/// `tree.files`) and by no file that is still committed. A fact's physical
-/// slot in the facts file is shared by every file that routed to it -- a
-/// rejected file's OWN backup would restore it unconditionally, even when a
-/// sibling file that also routed it was verified and kept -- so this runs once,
-/// after every file's outcome is final, and restores each affected name at
-/// most once.
-fn restoreUnkeptFacts(
-    arena: std.mem.Allocator,
-    io: Io,
-    facts_path: []const u8,
-    fact_edits: []const FactEdit,
-    fact_owners: []const usize,
-    fact_backup: []const []const FactEdit,
-    rolled_back: []const bool,
-) !void {
-    var kept_names = std.StringHashMap(void).init(arena);
-    for (fact_edits, fact_owners) |e, owner| {
-        if (!rolled_back[owner]) try kept_names.put(e.name, {});
-    }
-    var restored_names = std.StringHashMap(void).init(arena);
-    for (fact_backup, 0..) |fb, fidx| {
-        if (!rolled_back[fidx]) continue;
-        for (fb) |e| {
-            if (kept_names.contains(e.name)) continue;
-            if (restored_names.contains(e.name)) continue;
-            try restored_names.put(e.name, {});
-            if (e.old_value) |v| {
-                try mox.machine.interview.persist(arena, io, facts_path, &.{.{ .name = e.name, .value = v }});
-            } else {
-                try mox.machine.interview.remove(arena, io, facts_path, e.name);
-            }
-        }
-    }
-}
 
 /// Build a coupling graph over the tree's base source files, keyed by absolute
 /// source path so commit can resolve postings to files it can rewrite.
@@ -3334,8 +4515,7 @@ fn processGeneratorFile(
     outputs: []const mox.compose.catB.GeneratedFile,
     only_leaves: ?*const std.StringHashMap(void),
     state_dir: []const u8,
-    gen_row_edits: *std.ArrayList(RowEdit),
-    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+    gen: *LeafRowEdits,
 ) !HunkOutcome {
     for (outputs) |leaf| {
         if (only_leaves) |set| {
@@ -3344,7 +4524,7 @@ fn processGeneratorFile(
             // normalize it the same way before the membership test.
             if (!set.contains(try mox.source.path.toKey(cc.arena, leaf.live_path))) continue;
         }
-        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, state_dir, gen_row_edits, gen_leaf_commits)) {
+        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, state_dir, gen)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -3364,8 +4544,7 @@ fn processGeneratorLeaf(
     fidx: usize,
     leaf: mox.compose.catB.GeneratedFile,
     state_dir: []const u8,
-    gen_row_edits: *std.ArrayList(RowEdit),
-    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+    gen: *LeafRowEdits,
 ) !HunkOutcome {
     const live = Io.Dir.cwd().readFileAlloc(cc.io, leaf.live_path, cc.arena, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => return .cont,
@@ -3404,7 +4583,7 @@ fn processGeneratorLeaf(
     };
 
     for (hunks, 0..) |hunk, hi| {
-        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, gen_row_edits, gen_leaf_commits)) {
+        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, gen)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -3434,8 +4613,7 @@ fn processGeneratedHunk(
     hunk_total: usize,
     secret_lines: ?[]const []const u8,
     first_contact: bool,
-    gen_row_edits: *std.ArrayList(RowEdit),
-    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+    gen: *LeafRowEdits,
 ) !HunkOutcome {
     if (hunkTouchesSecret(leaf.prov, hunk)) {
         return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, secret_lines, a_lines, b_lines, "came from a secret", true);
@@ -3446,7 +4624,7 @@ fn processGeneratedHunk(
     {
         if (try reverseTemplate(cc.arena, leaf.template, b_lines[hunk.b_start])) |fields| {
             if (first_contact and !cc.interactive) return firstContactLeafManual(cc, ra, fidx, leaf, hunk);
-            return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, fields, gen_row_edits, gen_leaf_commits);
+            return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, fields, gen);
         }
     }
 
@@ -3487,8 +4665,7 @@ fn acceptGeneratedRow(
     a_lines: []const []const u8,
     b_lines: []const []const u8,
     fields: []const Field,
-    gen_row_edits: *std.ArrayList(RowEdit),
-    gen_leaf_commits: *std.ArrayList(GenLeafCommit),
+    gen: *LeafRowEdits,
 ) !HunkOutcome {
     ra.routed_count.* += 1;
     const desc = try std.fmt.allocPrint(cc.arena, "{s} row {d}", .{ leaf.data_source, leaf.row });
@@ -3514,20 +4691,19 @@ fn acceptGeneratedRow(
         }
     }
     if (accept) {
-        try gen_row_edits.append(cc.arena, .{
+        const li = for (gen.leaves.items, 0..) |gc, i| {
+            if (std.mem.eql(u8, gc.leaf_live_path, leaf.live_path)) break i;
+        } else blk: {
+            try gen.leaves.append(cc.arena, .{ .fidx = fidx, .gen_file = gen_file, .leaf_live_path = leaf.live_path });
+            break :blk gen.leaves.items.len - 1;
+        };
+        try gen.row_edits.append(cc.arena, .{
             .data_source = leaf.data_source,
             .stem = mox.data.source.arrayName(leaf.data_source),
             .row = @intCast(leaf.row),
             .fields = fields,
         });
-        var already = false;
-        for (gen_leaf_commits.items) |gc| {
-            if (std.mem.eql(u8, gc.leaf_live_path, leaf.live_path)) {
-                already = true;
-                break;
-            }
-        }
-        if (!already) try gen_leaf_commits.append(cc.arena, .{ .fidx = fidx, .gen_file = gen_file, .leaf_live_path = leaf.live_path });
+        try gen.row_leaves.append(cc.arena, li);
         if (!cc.interactive) try cc.stdout.print("  update {s}\n", .{desc});
     }
     return .cont;
@@ -4755,7 +5931,7 @@ fn routeHunk(
             const stem = try arena.dupe(u8, mox.data.source.arrayName(o.data_source));
             const desc = try std.fmt.allocPrint(arena, "{s} row {d}", .{ o.data_source, row });
             return .{ .row = .{
-                .edit = .{ .data_source = o.data_source, .stem = stem, .row = row, .fields = fields },
+                .edit = .{ .data_source = o.data_source, .stem = stem, .row = row, .fields = fields, .template = o.template },
                 .desc = desc,
             } };
         },
@@ -5297,6 +6473,21 @@ fn withFact(arena: std.mem.Allocator, base: mox.machine.state.MachineState, name
     }
     var out = base;
     out.custom_facts = facts[0..n];
+    return out;
+}
+
+/// `base` with fact `name` as `from` has it: set to its value there, or
+/// removed when `from` does not set it.
+fn withFactOf(arena: std.mem.Allocator, base: mox.machine.state.MachineState, name: []const u8, from: mox.machine.state.MachineState) !mox.machine.state.MachineState {
+    for (from.custom_facts) |f| {
+        if (std.mem.eql(u8, f.name, name)) return withFact(arena, base, name, f.value);
+    }
+    var facts: std.ArrayList(mox.machine.state.Fact) = .empty;
+    for (base.custom_facts) |f| {
+        if (!std.mem.eql(u8, f.name, name)) try facts.append(arena, f);
+    }
+    var out = base;
+    out.custom_facts = facts.items;
     return out;
 }
 
@@ -5852,6 +7043,128 @@ pub const command = app.command(Spec, .{
 
 const testing = std.testing;
 
+test "PathIds: a file whose identity cannot be read is keyed by its path" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "locked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "locked/data.toml", .data = "x = 1\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const locked = try std.fs.path.join(a, &.{ root, "locked" });
+    const path = try std.fs.path.join(a, &.{ locked, "data.toml" });
+    try std.testing.expect(fileIdentity(io, path) != null);
+
+    // A directory that cannot be searched: the file exists, but neither its
+    // real path nor its identity can be read.
+    try Io.Dir.cwd().setFilePermissions(io, locked, Io.File.Permissions.fromMode(0o000), .{});
+    defer Io.Dir.cwd().setFilePermissions(io, locked, Io.File.Permissions.fromMode(0o755), .{}) catch {};
+    // Root searches anything; the fallback is about a refused read.
+    if (fileIdentity(io, path) != null) return error.SkipZigTest;
+    var ids: PathIds = .init(a, io);
+    try std.testing.expectEqualStrings(path, try ids.canonical(path));
+    try std.testing.expectEqualStrings(path, try ids.of(path));
+}
+
+test "linuxDevice: a kernel dev_t splits into statx's major and minor halves" {
+    try std.testing.expectEqual((@as(u64, 8) << 32) | 1, linuxDevice(0x801));
+    // Major 259, minor 300: the minor's high bits sit above the major's.
+    try std.testing.expectEqual((@as(u64, 259) << 32) | 300, linuxDevice(44 | (259 << 8) | (256 << 12)));
+}
+
+test "fileIdentity: the fstatat fallback reads the identity statx does" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    const path = try tmp.dir.realPathFileAlloc(io, "f", a);
+    const z = try std.posix.toPosixPath(path);
+    const via_statx = fileIdentity(io, path) orelse return error.SkipZigTest;
+    try std.testing.expectEqual(via_statx, linuxStatIdentity(&z).?);
+}
+
+test "recoveryName: a path under neither root, or leaving its root, has no rooted name" {
+    const roots: RecoveryRoots = .{ .repo = "/r/repo", .private = "/r/priv", .facts = "/h/facts.toml" };
+    const repo = recoveryName("/r/repo/src/a.toml", roots).?;
+    try std.testing.expectEqualStrings("repo", repo.root);
+    try std.testing.expectEqualStrings("src/a.toml", repo.rel);
+    try std.testing.expectEqualStrings("private", recoveryName("/r/priv/x", roots).?.root);
+    try std.testing.expectEqualStrings("facts", recoveryName("/h/facts.toml", roots).?.root);
+    try std.testing.expect(recoveryName("/r/ext/a.toml", roots) == null);
+    try std.testing.expect(recoveryName("/r/repo/src/../../ext/a.toml", roots) == null);
+    try std.testing.expect(recoveryName("/r/repo", roots) == null);
+}
+
+test "atPreRun: an unreadable path is never taken for its pre-run bytes" {
+    try std.testing.expect(!atPreRun("", .unreadable));
+    try std.testing.expect(!atPreRun(null, .unreadable));
+    try std.testing.expect(atPreRun("", .{ .bytes = "" }));
+    try std.testing.expect(!atPreRun("a", .{ .bytes = "b" }));
+    try std.testing.expect(!atPreRun(null, .{ .bytes = "" }));
+    try std.testing.expect(atPreRun(null, .absent));
+    try std.testing.expect(!atPreRun("", .absent));
+}
+
+test "UndoneBy: a failing coupling target is left to its undone line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var targets = std.StringHashMap([]const usize).init(a);
+    try targets.put("/src/t", &.{0});
+    var owners: std.ArrayList(Unit) = .empty;
+    try owners.append(a, .{ .file = 1 });
+    var couplings = [_]Owned(CouplingEdit){.{ .edit = .{ .path = "/src/t", .old = "x", .new = "y" }, .owners = owners }};
+    var unrouted = [_]usize{ 0, 0 };
+    const u: UndoneBy = .{ .couplings = &couplings, .targets = &targets, .unrouted = &unrouted };
+
+    try std.testing.expect(u.reports(.{ .file = 0 }));
+    try std.testing.expect(!u.reports(.{ .file = 1 }));
+    try std.testing.expect(!u.reports(.{ .symlink = 0 }));
+    unrouted[0] = 1;
+    try std.testing.expect(!u.reports(.{ .file = 0 }));
+    unrouted[0] = 0;
+    couplings[0].owners = .empty;
+    try std.testing.expect(!u.reports(.{ .file = 0 }));
+}
+
+test "canonicalPath: every spelling of a file is one path, and an absent path keeps its tail" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/Data.toml", .data = "" });
+    const real = try std.fs.path.join(a, &.{ root, "src", "Data.toml" });
+
+    try std.testing.expectEqualStrings(real, try canonicalPath(a, io, real));
+    try std.testing.expectEqualStrings(real, try canonicalPath(a, io, try std.fs.path.join(a, &.{ root, "src", ".", "Data.toml" })));
+    try std.testing.expectEqualStrings(real, try canonicalPath(a, io, try std.fs.path.join(a, &.{ root, "src", "..", "src", "Data.toml" })));
+    if (std.Io.File.Permissions.has_executable_bit) {
+        try tmp.dir.symLink(io, "src", "data", .{});
+        try std.testing.expectEqualStrings(real, try canonicalPath(a, io, try std.fs.path.join(a, &.{ root, "data", "Data.toml" })));
+    }
+    // On a case-insensitive file system, the spelling on disk.
+    const folded = try std.fs.path.join(a, &.{ root, "SRC", "data.TOML" });
+    if (Io.Dir.cwd().access(io, folded, .{})) |_| {
+        try std.testing.expectEqualStrings(real, try canonicalPath(a, io, folded));
+    } else |_| {}
+
+    const absent = try std.fs.path.join(a, &.{ root, "src", "new.d", "os", "x" });
+    try std.testing.expectEqualStrings(absent, try canonicalPath(a, io, absent));
+    try std.testing.expectEqualStrings(absent, try canonicalPath(a, io, try std.fs.path.join(a, &.{ root, "src", ".", "new.d", "os", "x" })));
+}
+
 test "legend: the default key never uppercases into a sibling's exact key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5937,12 +7250,12 @@ test "updateTomlRow: changes only the target row's changed field" {
     try testing.expectEqualStrings(expected, out);
 }
 
-test "replaceToken: renames only complete-token occurrences, not superstrings" {
+test "replaceTokens: renames only complete-token occurrences, not superstrings" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // The coupled token appears standalone AND as the prefix of a longer token
     // (`coupledtoken_extra` is one token because `_` is a token char).
-    const got = try replaceToken(arena.allocator(), "value = coupledtoken\nother = coupledtoken_extra\n", "coupledtoken", "newtoken");
+    const got = try replaceTokens(arena.allocator(), "value = coupledtoken\nother = coupledtoken_extra\n", &.{.{ .path = "", .old = "coupledtoken", .new = "newtoken" }});
 
     // Only the standalone token is renamed; the superstring is left intact.
     try testing.expectEqualStrings("value = newtoken\nother = coupledtoken_extra\n", got);
@@ -6027,7 +7340,11 @@ test "resolveCoupling: an occurrence in a protected source is skipped, never off
     var protected = std.StringHashMap(void).init(a);
     try protected.put(protected_src, {});
 
-    const res = try resolveCoupling(a, io, coupling_dir, &.{edit}, &protected, .interactive, &reader, &out_aw.writer);
+    const bases: []const []const u8 = &.{protected_src};
+    var test_ids: PathIds = .init(a, io);
+    const accepted: AcceptedTexts = .init(a, &test_ids);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    const res = try resolveCoupling(a, io, coupling_dir, &.{edit}, &.{0}, &accepted, bases, &protected, .interactive, &reader, &out_aw.writer, &err_aw.writer);
 
     // Skipped before the prompt: no edit, no announcement, no abort. Without
     // the skip, "Y" would have queued an edit for the protected source.
@@ -6065,7 +7382,11 @@ test "resolveCoupling: a private-origin rename never couples into a shared sourc
     var out_aw: Io.Writer.Allocating = .init(a);
     var no_protected = std.StringHashMap(void).init(a);
 
-    const res = try resolveCoupling(a, io, coupling_dir, &.{edit}, &no_protected, .interactive, &reader, &out_aw.writer);
+    const bases: []const []const u8 = &.{shared_src};
+    var test_ids: PathIds = .init(a, io);
+    const accepted: AcceptedTexts = .init(a, &test_ids);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    const res = try resolveCoupling(a, io, coupling_dir, &.{edit}, &.{0}, &accepted, bases, &no_protected, .interactive, &reader, &out_aw.writer, &err_aw.writer);
 
     // Skipped before any prompt: no edit into the shared source, no announcement.
     try testing.expectEqual(@as(usize, 0), res.edits.len);
@@ -6074,7 +7395,7 @@ test "resolveCoupling: a private-origin rename never couples into a shared sourc
     // And the read-only reporter must likewise offer nothing.
     var report_protected = std.StringHashMap(void).init(a);
     var report_aw: Io.Writer.Allocating = .init(a);
-    const reported = try reportCoupling(a, io, coupling_dir, &.{edit}, &report_protected, &report_aw.writer);
+    const reported = try reportCoupling(a, io, coupling_dir, &.{edit}, &accepted, bases, &report_protected, &report_aw.writer, &err_aw.writer);
     try testing.expectEqual(@as(usize, 0), reported);
 }
 
@@ -6203,7 +7524,11 @@ test "resolveCoupling: a q-abort after a decline persists no decline" {
     var out_aw: Io.Writer.Allocating = .init(a);
     var no_protected = std.StringHashMap(void).init(a);
 
-    const res = try resolveCoupling(a, io, coupling_dir, &.{edit}, &no_protected, .interactive, &reader, &out_aw.writer);
+    const bases: []const []const u8 = &.{ other1, other2 };
+    var test_ids: PathIds = .init(a, io);
+    const accepted: AcceptedTexts = .init(a, &test_ids);
+    var err_aw: Io.Writer.Allocating = .init(a);
+    const res = try resolveCoupling(a, io, coupling_dir, &.{edit}, &.{0}, &accepted, bases, &no_protected, .interactive, &reader, &out_aw.writer, &err_aw.writer);
 
     // The user quit at the second prompt: the command aborts.
     try testing.expect(res.abort);
@@ -6218,24 +7543,25 @@ test "resolveCoupling: a q-abort after a decline persists no decline" {
 
 var coupling_restore_fail_target: []const u8 = "";
 var coupling_restore_fail_calls: usize = 0;
+var coupling_restore_fail_on: usize = 0;
 var coupling_restore_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File = undefined;
 
 fn couplingRestoreFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
     if (std.mem.eql(u8, sub_path, coupling_restore_fail_target)) {
         coupling_restore_fail_calls += 1;
-        if (coupling_restore_fail_calls == 2) return error.AccessDenied;
+        if (coupling_restore_fail_calls == coupling_restore_fail_on) return error.AccessDenied;
     }
     return coupling_restore_fail_real(userdata, dir, sub_path, opts);
 }
 
-test "simulateCouplingImpact: a failed post-simulation restore reports the un-restored path" {
-    const io = std.testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+const CouplingSimRun = struct { result: anyerror!CouplingSim, err: []const u8, path: []const u8, fixture: []const u8, now: []const u8 };
 
+/// `simulateCouplingImpact` over a one-file tree whose rename makes this
+/// machine's configuration unable to compose, with the `fail_on`-th create
+/// of the source failing (0: none), reading `read_path` instead of the
+/// source when given.
+fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize, read_path: ?[]const u8) !CouplingSimRun {
+    const io = std.testing.io;
     try tmp.dir.createDirPath(io, "src");
     // The coupled token sits with token-boundary whitespace around it (an
     // adjoining '=' is itself a token char) so the coupling rename actually
@@ -6251,11 +7577,13 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
     const file = tree.files[0];
     const path = file.source_base_abs;
 
-    var bindings = std.StringHashMap([]const u8).init(a);
+    const bindings = try a.create(std.StringHashMap([]const u8));
+    bindings.* = .init(a);
     try bindings.put("profile", "personal");
-    const configs = &[_]Configuration{.{ .label = "", .bindings = bindings, .is_this_machine = true }};
+    const configs = try a.dupe(Configuration, &.{.{ .label = "", .bindings = bindings.*, .is_this_machine = true }});
 
-    const m_state: mox.machine.state.MachineState = .{
+    const m_state = try a.create(mox.machine.state.MachineState);
+    m_state.* = .{
         .os = "linux",
         .arch = "x86_64",
         .hostname = "test",
@@ -6266,49 +7594,96 @@ test "simulateCouplingImpact: a failed post-simulation restore reports the un-re
         .xdg_data_home = "",
         .xdg_state_home = "",
     };
-    var secret_map = std.process.Environ.Map.init(a);
-    var secret_cache = mox.secret.cache.Cache.init(a);
+    const secret_map = try a.create(std.process.Environ.Map);
+    secret_map.* = .init(a);
+    const secret_cache = try a.create(mox.secret.cache.Cache);
+    secret_cache.* = .init(a);
 
-    // Every op but the SECOND create of `path` (the post-failure restore)
-    // forwards to the real io; the first create is the edited-content write
-    // and must land normally.
     coupling_restore_fail_target = path;
     coupling_restore_fail_calls = 0;
+    coupling_restore_fail_on = fail_on;
     coupling_restore_fail_real = io.vtable.dirCreateFile;
-    var vtable = io.vtable.*;
+    const vtable = try a.create(Io.VTable);
+    vtable.* = io.vtable.*;
     vtable.dirCreateFile = couplingRestoreFailingCreateFile;
-    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const faulty: Io = .{ .userdata = io.userdata, .vtable = vtable };
 
-    var out_aw: Io.Writer.Allocating = .init(a);
-    var err_aw: Io.Writer.Allocating = .init(a);
-    var reader = Io.Reader.fixed("");
-    var claims: Claims = .empty;
-    var axis_resolver: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    const out_aw = try a.create(Io.Writer.Allocating);
+    out_aw.* = .init(a);
+    const err_aw = try a.create(Io.Writer.Allocating);
+    err_aw.* = .init(a);
+    const reader = try a.create(Io.Reader);
+    reader.* = Io.Reader.fixed("");
+    const claims = try a.create(Claims);
+    claims.* = .empty;
+    const live = try a.create(mox.dsl.resolver.Resolver.Live);
+    live.* = .{ .bindings = bindings };
+    const axis_resolver = try a.create(mox.dsl.resolver.Resolver);
+    axis_resolver.* = .{ .live = live };
     const cc: ClassCtx = .{
         .arena = a,
         .io = faulty,
-        .this_bindings = &bindings,
-        .resolver = &axis_resolver,
-        .m_state = &m_state,
-        .secrets = .{ .env = mox.env.Env{ .map = &secret_map }, .cache = &secret_cache },
+        .this_bindings = bindings,
+        .resolver = axis_resolver,
+        .m_state = m_state,
+        .secrets = .{ .env = mox.env.Env{ .map = secret_map }, .cache = secret_cache },
         .machine = mox.machine.bindings.firstLabel(m_state.hostname),
         .stdout = &out_aw.writer,
         .err = &err_aw.writer,
-        .input = &reader,
+        .input = reader,
         .ask_mode = .assume_default,
         .report_mode = false,
         .interactive = false,
         .sty = .{ .on = false },
-        .claims = &claims,
+        .claims = claims,
     };
 
     const file_edits = &[_]CouplingEdit{.{ .path = path, .old = "sharedtok", .new = "sharedtok@bad" }};
-    try testing.expectError(
-        error.UnexpectedCharacter,
-        simulateCouplingImpact(&cc, file, path, file_edits, configs),
-    );
+    const result = simulateCouplingImpact(&cc, file, read_path orelse path, file_edits, configs);
+    coupling_restore_fail_target = "";
+    return .{
+        .result = result,
+        .err = err_aw.writer.buffered(),
+        .path = path,
+        .fixture = fixture,
+        .now = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)),
+    };
+}
 
-    try testing.expect(std.mem.indexOf(u8, err_aw.writer.buffered(), path) != null);
+test "simulateCouplingImpact: a failed post-simulation restore reports the un-restored path" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The first create of the source, the edited-content write, lands; the
+    // second, its restore, fails.
+    const r = try runCouplingSim(arena.allocator(), &tmp, 2, null);
+    try testing.expectError(error.UnexpectedCharacter, r.result);
+    try testing.expect(std.mem.indexOf(u8, r.err, r.path) != null);
+}
+
+test "simulateCouplingImpact: a failed transient write is a target that cannot take the rename, reverted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try runCouplingSim(arena.allocator(), &tmp, 1, null);
+    try testing.expectEqual(error.AccessDenied, (try r.result).unwritable);
+    try testing.expectEqualStrings("", r.err);
+    try testing.expectEqualStrings(r.fixture, r.now);
+}
+
+test "simulateCouplingImpact: a target that cannot be read cannot take the rename" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A directory stands in for a source that cannot be read.
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    const r = try runCouplingSim(a, &tmp, 0, try tmp.dir.realPathFileAlloc(std.testing.io, "src", a));
+    try testing.expectEqual(error.IsDir, (try r.result).unwritable);
+    try testing.expectEqualStrings(r.fixture, r.now);
 }
 
 test "composesTo: literal tags must match exactly, expanded captures stand for any text" {

@@ -68,6 +68,7 @@ pub fn snapshot(
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
 ) !Snapshot {
+    var generator: ?bool = null;
     const per = try arena.alloc(ConfigOutput, configs.len);
     for (configs, 0..) |cfg, i| {
         // A sibling configuration reading a source this machine never composes
@@ -75,7 +76,7 @@ pub fn snapshot(
         // not a reason to abandon the caller's whole run, so it is recorded
         // rather than propagated. This machine's own compose still propagates:
         // the caller cannot proceed without it.
-        per[i] = if (composeOrNull(arena, io, file, &cfg.bindings, m_state, secrets)) |out|
+        per[i] = if (composeOrNull(arena, io, file, &generator, &cfg.bindings, m_state, secrets)) |out|
             (if (out) |b| ConfigOutput{ .bytes = b } else ConfigOutput.absent)
         else |e| if (cfg.is_this_machine)
             return e
@@ -83,7 +84,7 @@ pub fn snapshot(
             ConfigOutput{ .uncomposable = @errorName(e) };
     }
     const this_out = for (configs) |cfg| {
-        if (cfg.is_this_machine) break try composeOrNull(arena, io, file, &cfg.bindings, m_state, secrets);
+        if (cfg.is_this_machine) break try composeOrNull(arena, io, file, &generator, &cfg.bindings, m_state, secrets);
     } else null;
     return .{ .per_config = per, .this_machine = this_out };
 }
@@ -96,12 +97,55 @@ fn composeOrNull(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
+    generator: *?bool,
     bindings: *const std.StringHashMap([]const u8),
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
 ) !?[]const u8 {
     const resolver: dsl.resolver.Resolver = .{ .fixed = bindings };
-    return try compose.composeFileTracked(arena, io, file, &resolver, m_state, secrets, null, null);
+    return composeAs(arena, io, file, generator, &resolver, m_state, secrets);
+}
+
+/// Compose `file` the way apply does: a generator to its produced leaves,
+/// each as its live path, a NUL, its length, a NUL and its content, in
+/// output order; any other file to its composed bytes.
+pub fn composeAsApply(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    resolver: *const dsl.resolver.Resolver,
+    m_state: *const MachineState,
+    secrets: ?compose.catB.SecretCtx,
+) !?[]const u8 {
+    var generator: ?bool = null;
+    return composeAs(arena, io, file, &generator, resolver, m_state, secrets);
+}
+
+/// `composeAsApply`, remembering in `generator` whether `file` is a
+/// generator once a compose has told, so a file that is not one is parsed
+/// as one only once across calls.
+fn composeAs(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    generator: *?bool,
+    resolver: *const dsl.resolver.Resolver,
+    m_state: *const MachineState,
+    secrets: ?compose.catB.SecretCtx,
+) !?[]const u8 {
+    if (generator.* != false) {
+        if (try compose.catB.composeGenerator(arena, io, file, resolver, m_state, secrets, null)) |leaves| {
+            generator.* = true;
+            var out: std.ArrayList(u8) = .empty;
+            for (leaves) |leaf| {
+                try out.print(arena, "{s}\x00{d}\x00", .{ leaf.live_path, leaf.content.len });
+                try out.appendSlice(arena, leaf.content);
+            }
+            return try out.toOwnedSlice(arena);
+        }
+        generator.* = false;
+    }
+    return try compose.composeFileTracked(arena, io, file, resolver, m_state, secrets, null, null);
 }
 
 /// Diff before/after snapshots taken around a source edit. A configuration is

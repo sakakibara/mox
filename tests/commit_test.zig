@@ -1620,7 +1620,7 @@ test "commit: a declined coupled token is left unchanged" {
     try std.testing.expectEqualStrings("old@example.com signing\n", try read(io, a, try h.srcOf(".mysigners")));
 }
 
-test "commit: a coupling edit that would diverge an unaffected configuration aborts and restores" {
+test "commit: a coupled update that would diverge an unaffected configuration is undone and its target restored, and its origin commits" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1658,15 +1658,18 @@ test "commit: a coupling edit that would diverge an unaffected configuration abo
     // --yes accepts the coupling propagation into B. Verification must catch
     // that renaming the os=linux case changes a configuration the user never
     // chose to affect (the os=windows case is a sibling too, and does NOT
-    // change, so this is a genuine subset): abort with a diagnostic and
-    // restore B.
+    // change, so this is a genuine subset): the coupled update is undone,
+    // naming the configuration, never a machine id, and B restored.
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    // The diagnostic names the configuration, never a machine id.
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "os=linux") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.gitconfig undone: ~/.gitconfig could not take it (configuration os=linux would change)\n", res.err);
 
     // B's source is byte-identical: the unsafe coupling edit was rolled back.
     try std.testing.expectEqualStrings(b_before, try read(io, a, gitconfig_src));
+    // The origin's own edit does not depend on the coupled update: it stays
+    // committed.
+    try std.testing.expectEqualStrings("email = shared@new.example\n", try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zshrc") != null);
 }
 
 test "commit: dry-run writes neither the routed nor the coupled edit" {
@@ -3456,7 +3459,7 @@ test "commit: a coupled token update that changes only some configurations a fil
     try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "coupled token update would change configuration os=linux") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/x.conf undone: ~/.config/x.conf could not take it (configuration os=linux would change)\n", res.err);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.conf")));
 }
 
@@ -3481,7 +3484,7 @@ test "commit: a coupled token update that breaks a source where it exists is ref
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "coupled token update would leave configuration os=linux unable to compose; not committed") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (configuration os=linux would be unable to compose)\n", res.err);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.toml")));
 }
 
@@ -5615,4 +5618,2323 @@ test "commit: an insertion into a whole-file-gated target lands after the source
 
     const src = try read(io, a, try h.srcOf("app.toml"));
     try std.testing.expectEqualStrings("# mox: when os=darwin\n[a]\nx = 1\ny = 2\n", src);
+}
+
+const os_blocks = "# mox: when os=darwin\nexport BREW=1\n# mox: end\n# mox: when os=linux\nexport APT=1\n# mox: end\n";
+
+fn appliedContent(h: Harness, name: []const u8) !?[]const u8 {
+    return mox.apply.applied.readContent(h.a, h.io, h.state, try h.liveOf(name));
+}
+
+test "commit: a file whose data source is restored for another file's failure is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n";
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\n");
+    // The second loop file also carries a shared line the user sends to the
+    // private layer, which has no automatic route: that file fails.
+    try writeRepo(io, &tmp, "repo/src/.zaliases", "# mox: for entry in \"data/abbrs.toml\"\nexpansion: <entry.expansion>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const abbrs_before = (try appliedContent(h, ".abbrs")).?;
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "git status\n", "git status -sb\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EDITOR=vim", "EDITOR=nvim");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\n4\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // The data source holds its pre-run bytes, so the file whose row edit it
+    // held is not committed, says why, and keeps its applied record.
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.abbrs: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.abbrs'\n", .{
+        try h.liveOf(".zaliases"),
+        try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
+    }), res.err);
+    try std.testing.expectEqualStrings(abbrs_before, (try appliedContent(h, ".abbrs")).?);
+}
+
+test "commit: a file with a held hunk whose routed row lands in a restored data source is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n";
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\nset -g spacer 1\nset -g greeting hello\n");
+    try writeRepo(io, &tmp, "repo/src/.zaliases", "# mox: for entry in \"data/abbrs.toml\"\nexpansion: <entry.expansion>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "greeting hello", "greeting howdy");
+    try editLive(io, a, try h.liveOf(".zaliases"), "git status\n", "git status -sb\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EDITOR=vim", "EDITOR=nvim");
+
+    // .abbrs: route the row, decline the plain line. .zaliases: route the
+    // row, send the shared line to the private layer.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ns\ny\n4\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.abbrs: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.abbrs'\n", .{
+        try h.liveOf(".zaliases"),
+        try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
+    }), res.err);
+}
+
+/// A multi-configuration file whose first line carries `token`, and whose
+/// EDITOR line the tests send to the private layer, so the file fails.
+fn failingRenameSource(a: std.mem.Allocator, token: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "note {s}\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks, .{token});
+}
+
+test "commit: a coupled update from a file that is not committed is undone and not counted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.bshrc", try failingRenameSource(a, "quokkatoken"));
+    try writeRepo(io, &tmp, "repo/src/.tsigners", "quokkatoken signing\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".bshrc"), "quokkatoken", "wombattoken");
+    try editLive(io, a, try h.liveOf(".bshrc"), "EDITOR=vim", "EDITOR=nvim");
+
+    // The rename stays universal, the EDITOR line goes to the private layer
+    // (no automatic route), and the coupled update is accepted.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "1\n4\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings("quokkatoken signing\n", try read(io, a, try h.srcOf(".tsigners")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: coupled update to ~/.tsigners undone: ~/.bshrc was not committed\n", .{try h.liveOf(".bshrc")}), res.err);
+}
+
+test "commit: two origins coupling one target, one not committed, undo both updates and keep the other origin" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note alphatoken1\n");
+    try writeRepo(io, &tmp, "repo/src/.bshrc", try failingRenameSource(a, "quokkatoken"));
+    try writeRepo(io, &tmp, "repo/src/.tsigners", "alphatoken1 quokkatoken\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "alphatoken1", "alphatoken2");
+    try editLive(io, a, try h.liveOf(".bshrc"), "quokkatoken", "wombattoken");
+    try editLive(io, a, try h.liveOf(".bshrc"), "EDITOR=vim", "EDITOR=nvim");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n1\n4\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // The target is back to its pre-run bytes: neither update stands, and
+    // neither is counted. The origin that passed is still committed.
+    try std.testing.expectEqualStrings("alphatoken1 quokkatoken\n", try read(io, a, try h.srcOf(".tsigners")));
+    try std.testing.expectEqualStrings("note alphatoken2\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: coupled update to ~/.tsigners undone: {s} was restored because ~/.bshrc was not committed\n" ++
+        "mox commit: coupled update to ~/.tsigners undone: ~/.bshrc was not committed\n", .{ try h.liveOf(".bshrc"), try h.srcOf(".tsigners") }), res.err);
+}
+
+test "commit: a symlink whose sync fails restores only its own source" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/alink", "/tmp/mox-a-old\n");
+    try writeRepo(io, &tmp, "repo/src/blink", "/tmp/mox-b-old\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"alink\"]\nsymlink = true\n\n[\"blink\"]\nsymlink = true\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    for ([_][2][]const u8{ .{ "alink", "/tmp/mox-a-new" }, .{ "blink", "/tmp/<machine.os>" } }) |l| {
+        const live = try h.liveOf(l[0]);
+        try Io.Dir.cwd().deleteFile(io, live);
+        try Io.Dir.cwd().symLink(io, l[1], live, .{});
+    }
+
+    // blink's new target holds capture syntax, so its source recomposes to a
+    // different target and that sync fails; alink's stands on its own.
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("/tmp/mox-a-new\n", try read(io, a, try h.srcOf("alink")));
+    try std.testing.expectEqualStrings("/tmp/mox-b-old\n", try read(io, a, try h.srcOf("blink")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/alink") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/blink") == null);
+    try std.testing.expectEqualStrings("mox commit: ~/blink: recomposed symlink target does not match; not committed\n", res.err);
+}
+
+test "commit: a generator leaf whose data source is restored for a file's failure is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{ .{ "a", "1" }, .{ "b", "2" } });
+    try writeRepo(io, &tmp, "repo/src/.zloop", "# mox: for entry in \"data/entries.toml\"\nval <entry.slug> <entry.value>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
+    const data_before = try read(io, a, data_path);
+
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=99");
+    try editLive(io, a, try h.liveOf(".zloop"), "val b 2", "val b 7");
+    try editLive(io, a, try h.liveOf(".zloop"), "EDITOR=vim", "EDITOR=nvim");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\n4\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{ try h.liveOf(".zloop"), data_path }), res.err);
+}
+
+test "commit: a coupling graph entry that names no managed source is not written" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "email = old@example.com\n");
+    try writeRepo(io, &tmp, "repo/notes.txt", "old@example.com\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // A stale graph: it still names a path that is no managed file's source.
+    const notes = try std.fs.path.join(a, &.{ h.repo, "notes.txt" });
+    var g = mox.coupling.graph.Graph.init(a);
+    try g.addOccurrence("old@example.com", try h.srcOf(".myenv"), 8, 15);
+    try g.addOccurrence("old@example.com", notes, 0, 15);
+    try mox.coupling.store.saveGraph(a, io, try std.fs.path.join(a, &.{ h.state, "coupling" }), &g);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "old@example.com", "new@example.com");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    try std.testing.expectEqualStrings("old@example.com\n", try read(io, a, notes));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "notes.txt") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} is no managed file's source; not updating it\n", .{notes}), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.myenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+}
+
+test "commit: a file verified under a fact that is then reverted is re-verified and not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const email_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+    try writeRepo(io, &tmp, "repo/src/.pfile", "export SHELL_OK=1\nexport EDITOR=vim\nexport SPACER=1\n" ++ email_line ++ os_blocks);
+    try writeRepo(io, &tmp, "repo/src/.rfile", email_line);
+    const facts_before = "email = \"old@home.com\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+    try editLive(io, a, try h.liveOf(".rfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+
+    // .pfile: EDITOR to the private layer (fails), EMAIL to the fact.
+    // .rfile: EMAIL to the source default, which recomposes to live only
+    // while the fact .pfile routed holds the new value.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "4\nf\nd\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
+    try std.testing.expectEqualStrings(email_line, try read(io, a, try h.srcOf(".rfile")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.rfile") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n", .{try h.liveOf(".pfile")}), res.err);
+}
+
+test "commit: a coupling target failed by a fact revert prints the fact line, and its update as not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const email_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    try writeRepo(io, &tmp, "repo/src/.pfile", "export SHELL_OK=1\nexport EDITOR=vim\nexport SPACER=1\n" ++ email_line ++ os_blocks);
+    try writeRepo(io, &tmp, "repo/src/.rfile", "note wombatnote\n" ++ email_line);
+    const facts_before = "email = \"old@home.com\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // Since the apply, the source went back to the token live still shows
+    // renamed: only .aenv's coupled update makes .rfile match live again.
+    const rfile = "note quokkanote\n" ++ email_line;
+    try writeRepo(io, &tmp, "repo/src/.rfile", rfile);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+    try editLive(io, a, try h.liveOf(".rfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+
+    // .aenv: the rename, coupled into .rfile. .pfile: EDITOR to the private
+    // layer (fails), EMAIL to the fact. .rfile: EMAIL to the source default,
+    // which holds only while the fact .pfile routed does.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\nf\nd\ny\nn\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
+    try std.testing.expectEqualStrings(rfile, try read(io, a, try h.srcOf(".rfile")));
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n" ++
+        "mox commit: coupled update to ~/.rfile undone: ~/.rfile was not committed\n", .{try h.liveOf(".pfile")}), res.err);
+}
+
+var restore_fail_target: []const u8 = "";
+var restore_fail_calls: usize = 0;
+var restore_fail_from: usize = 0;
+var restore_fail_to: usize = std.math.maxInt(usize);
+var restore_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File = undefined;
+
+fn restoreFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+    if (restore_fail_target.len > 0 and namesFailTarget(sub_path)) {
+        restore_fail_calls += 1;
+        if (restore_fail_calls >= restore_fail_from and restore_fail_calls <= restore_fail_to) return error.AccessDenied;
+    }
+    return restore_fail_real(userdata, dir, sub_path, opts);
+}
+
+/// Whether `path` names the file whose creates fail, however it is spelled:
+/// commit writes a source by its real path.
+fn namesFailTarget(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = Io.Dir.cwd().realPathFile(std.testing.io, path, &buf) catch return std.mem.eql(u8, path, restore_fail_target);
+    return std.mem.eql(u8, buf[0..n], restore_fail_target);
+}
+
+/// The recovery directory a failed restore created: the only entry under
+/// `<state>/commit-recovery`.
+fn recoveryDir(h: Harness) ![]const u8 {
+    const root = try std.fs.path.join(h.a, &.{ h.state, "commit-recovery" });
+    var dir = try Io.Dir.cwd().openDir(h.io, root, .{ .iterate = true });
+    defer dir.close(h.io);
+    var it = dir.iterate();
+    const entry = (try it.next(h.io)).?;
+    try std.testing.expect((try it.next(h.io)) == null);
+    return std.fs.path.join(h.a, &.{ root, entry.name });
+}
+
+/// `h` with every create of the existing file `target` from its `from`-th on
+/// failing.
+fn failingCreates(h: Harness, vtable: *Io.VTable, target: []const u8, from: usize) !Harness {
+    return failingCreatesThrough(h, vtable, target, from, std.math.maxInt(usize));
+}
+
+/// `h` with the `from`-th through `to`-th creates of the existing file
+/// `target` failing.
+fn failingCreatesThrough(h: Harness, vtable: *Io.VTable, target: []const u8, from: usize, to: usize) !Harness {
+    restore_fail_target = try Io.Dir.cwd().realPathFileAlloc(h.io, target, h.a);
+    restore_fail_calls = 0;
+    restore_fail_from = from;
+    restore_fail_to = to;
+    restore_fail_real = h.io.vtable.dirCreateFile;
+    vtable.* = h.io.vtable.*;
+    vtable.dirCreateFile = restoreFailingCreateFile;
+    var faulty = h;
+    faulty.io = .{ .userdata = h.io.userdata, .vtable = vtable };
+    return faulty;
+}
+
+test "commit: a restore that fails saves the pre-run bytes, records nothing, and exits 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkatoken\n");
+    const gated = "always\n# mox: when os=linux\n# quokkatoken\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.config/x.conf", gated);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+    const myenv_before = (try appliedContent(h, ".myenv")).?;
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
+
+    // The coupled update into x.conf changes only some of its configurations,
+    // so it is refused and x.conf restored. Writes of x.conf: the impact
+    // simulation's edit and its undo, the write phase, then the restore,
+    // which fails.
+    const target = try h.srcOf(".config/x.conf");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, target, 4);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    // Nothing is recorded.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(myenv_before, (try appliedContent(h, ".myenv")).?);
+
+    // The pre-run bytes of the path that could not be restored are saved in a
+    // fresh recovery directory, named by root, and the path is named with its
+    // copy.
+    const copy = try std.fs.path.join(a, &.{ try recoveryDir(h), "repo", "src", ".config", "x.conf" });
+    try std.testing.expectEqualStrings(gated, try read(io, a, copy));
+    const myenv = try h.srcOf(".myenv");
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n", .{
+        target,
+        target,
+        copy,
+        myenv,
+        try std.fs.path.join(a, &.{ try recoveryDir(h), "repo", "src", ".myenv" }),
+    }), res.err);
+}
+
+test "commit: a restore that fails with no room for a recovery copy prints the pre-run bytes in full" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkatoken\n");
+    const gated = "always\n# mox: when os=linux\n# quokkatoken\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.config/x.conf", gated);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+    // A file where the recovery directory would go: no copy can be written.
+    const recovery = try std.fs.path.join(a, &.{ h.state, "commit-recovery" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = recovery, .data = "" });
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
+
+    // As above: the fourth write of x.conf is its restore, which fails.
+    const target = try h.srcOf(".config/x.conf");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, target, 4);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes could not be saved; they follow in full:\n{s}" ++
+        "mox commit: {s}: its pre-run bytes could not be saved; they follow in full:\nnote quokkatoken\n", .{ target, target, gated, try h.srcOf(".myenv") }), res.err);
+    try std.testing.expectEqualStrings("", try read(io, a, recovery));
+}
+
+test "commit: chained coupling renames apply in one pass over a target's tokens" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note alphatoken\n");
+    try writeRepo(io, &tmp, "repo/src/.benv", "note betatokens\n");
+    try writeRepo(io, &tmp, "repo/src/.cenv", "alphatoken betatokens\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "alphatoken", "betatokens");
+    try editLive(io, a, try h.liveOf(".benv"), "betatokens", "gammatoken");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqualStrings("betatokens gammatoken\n", try read(io, a, try h.srcOf(".cenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 2 coupled") != null);
+}
+
+test "commit: one token renamed two different ways couples neither rename" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note alphatoken\n");
+    try writeRepo(io, &tmp, "repo/src/.benv", "note alphatoken\n");
+    try writeRepo(io, &tmp, "repo/src/.cenv", "alphatoken signing\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "alphatoken", "betatokens");
+    try editLive(io, a, try h.liveOf(".benv"), "alphatoken", "gammatoken");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("alphatoken signing\n", try read(io, a, try h.srcOf(".cenv")));
+    try std.testing.expectEqualStrings("note betatokens\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expectEqualStrings("note gammatoken\n", try read(io, a, try h.srcOf(".benv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupling: \"alphatoken\" is renamed to different names in this commit; not updating it anywhere else\n", res.err);
+}
+
+test "commit: a file with an unrouted hunk beside a manual one is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "export ONE=1\nexport SPACER1=1\nexport TWO=2\nexport SPACER2=1\nexport THREE=3\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.zshrc", src);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "ONE=1", "ONE=11");
+    try editLive(io, a, live, "TWO=2", "TWO=22");
+    try editLive(io, a, live, "THREE=3", "THREE=33");
+
+    // ONE universal, TWO to the private layer (no automatic route), THREE
+    // held as manual.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "1\n4\nm\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zshrc") == null);
+    const left = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n", .{live});
+    try std.testing.expectEqualStrings(left, res.err);
+}
+
+test "commit: a coupling rename is not applied over a line another file routed with the old token" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "email = old@example.com\n");
+    try writeRepo(io, &tmp, "repo/src/.mysigners", "old@example.com signing\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "old@example.com", "new@example.com");
+    try editLive(io, a, try h.liveOf(".mysigners"), "old@example.com signing", "old@example.com signing extra");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("old@example.com signing extra\n", try read(io, a, try h.srcOf(".mysigners")));
+    try std.testing.expectEqualStrings("email = new@example.com\n", try read(io, a, try h.srcOf(".myenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.mysigners") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"old@example.com\"; not renaming it there\n", .{try h.srcOf(".mysigners")}), res.err);
+}
+
+test "commit: a coupling target whose only hunk was left unrouted is not committed and its coupled update is undone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkatoken\n");
+    const target_src = "note quokkatoken\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.tsigners", target_src);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkatoken", "wombattoken");
+    try editLive(io, a, try h.liveOf(".tsigners"), "quokkatoken", "wombattoken");
+
+    // .aenv routes the rename; .tsigners sends the same rename to the
+    // private layer (no automatic route); the coupled update into
+    // .tsigners is accepted.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings(target_src, try read(io, a, try h.srcOf(".tsigners")));
+    try std.testing.expectEqualStrings("note wombattoken\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    // The target's own line names its unrouted hunk, so the undone line
+    // only says it was not committed.
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted; not committed\n" ++
+        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners was not committed\n", .{try h.liveOf(".tsigners")}), res.err);
+}
+
+const shared_abbrs = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n";
+
+test "commit: a restore that fails saves every path the run still has edited, not only the paths due this round" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", shared_abbrs);
+    const x_src = "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\nset -g spacer 1\nset -g greeting hello\n";
+    try writeRepo(io, &tmp, "repo/src/.abbrs", x_src);
+    const y_src = "# mox: for entry in \"data/abbrs.toml\"\nexpansion: <entry.expansion>\n# mox: end\nexport KEEP=1\nexport SPACER=1\nexport MIDDLE=1\nexport EDITOR=vim\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.zaliases", y_src);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const abbrs_before = (try appliedContent(h, ".abbrs")).?;
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "greeting hello", "greeting howdy");
+    try editLive(io, a, try h.liveOf(".zaliases"), "git status\n", "git status -sb\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "SPACER=1", "SPACER=2");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EDITOR=vim", "EDITOR=nvim");
+
+    // .zaliases fails (its EDITOR line goes to the private layer), so the
+    // first round restores its base and the shared data file; the restore
+    // of its base fails. .abbrs would fail only in the next round, for the
+    // restored data file, and its base would be restored then. Writes of
+    // .zaliases: an impact simulation's edit and undo for each of its two
+    // shared hunks, the write phase, then the restore.
+    const y_path = try h.srcOf(".zaliases");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, y_path, 6);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n1\n4\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") == null);
+    try std.testing.expectEqualStrings(abbrs_before, (try appliedContent(h, ".abbrs")).?);
+
+    // .abbrs's base still holds this run's edit, so its pre-run bytes are
+    // saved beside those of the base that could not be restored; the data
+    // file was restored and needs no copy.
+    const dir = try recoveryDir(h);
+    const x_path = try h.srcOf(".abbrs");
+    try std.testing.expect(!std.mem.eql(u8, x_src, try read(io, a, x_path)));
+    const x_copy = try std.fs.path.join(a, &.{ dir, "repo", "src", ".abbrs" });
+    try std.testing.expectEqualStrings(x_src, try read(io, a, x_copy));
+    try std.testing.expectEqualStrings(y_src, try read(io, a, try std.fs.path.join(a, &.{ dir, "repo", "src", ".zaliases" })));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ dir, "repo", "data", "abbrs.toml" })));
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    const y_copy = try std.fs.path.join(a, &.{ dir, "repo", "src", ".zaliases" });
+    const want = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n", .{ try h.liveOf(".zaliases"), y_path, x_path, x_copy, y_path, y_copy });
+    try std.testing.expectEqualStrings(want, res.err);
+}
+
+test "commit: a restore that fails names a path the run created and still restores the facts file due that round" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", shared_abbrs);
+    const x_src = "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\nexport KEEP=1\nexport PAGER=less\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.abbrs", x_src);
+    const email_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+    const y_src = "# mox: for entry in \"data/abbrs.toml\"\nexpansion: <entry.expansion>\n# mox: end\nexport KEEP=1\nexport SPACER=1\nexport MIDDLE=1\nexport EDITOR=vim\nexport MIDDLE2=1\n" ++ email_line ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.zaliases", y_src);
+    const facts_before = "email = \"old@home.com\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "PAGER=less", "PAGER=more");
+    try editLive(io, a, try h.liveOf(".zaliases"), "git status\n", "git status -sb\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "SPACER=1", "SPACER=2");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+
+    // .abbrs narrows its PAGER line to this machine's os, creating a
+    // fragment. .zaliases routes its email to the fact and fails for its
+    // EDITOR line; the restore of its base fails, and the facts file due in
+    // the same round is still put back. Its sixth write is that restore, as
+    // above.
+    const y_path = try h.srcOf(".zaliases");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, y_path, 6);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n2\ny\n1\n4\nf\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") == null);
+
+    const dir = try recoveryDir(h);
+    try std.testing.expectEqualStrings(x_src, try read(io, a, try std.fs.path.join(a, &.{ dir, "repo", "src", ".abbrs" })));
+    try std.testing.expectEqualStrings(y_src, try read(io, a, try std.fs.path.join(a, &.{ dir, "repo", "src", ".zaliases" })));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ dir, "facts" })));
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
+
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
+    const frag = try h.srcOf(try std.fmt.allocPrint(a, ".abbrs.d/os/{s}", .{m_state.os}));
+    try std.testing.expect(exists(io, frag));
+    const want = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
+        "mox commit: {s} did not exist before this commit; delete it to restore it\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n", .{
+        try h.liveOf(".zaliases"),
+        y_path,
+        try h.srcOf(".abbrs"),
+        try std.fs.path.join(a, &.{ dir, "repo", "src", ".abbrs" }),
+        frag,
+        y_path,
+        try std.fs.path.join(a, &.{ dir, "repo", "src", ".zaliases" }),
+    });
+    try std.testing.expectEqualStrings(want, res.err);
+}
+
+test "commit: a restore that fails still reverts by name the facts due that round" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.afile", "export PAGER=<machine.pager | default \"less\">\n");
+    const p_src = "export SHELL_OK=1\nexport SPACER=1\nexport MIDDLE=1\nexport EDITOR=vim\nexport MIDDLE2=1\nexport EMAIL=<machine.email | default \"nobody@example.com\">\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.pfile", p_src);
+    const facts_before = "email = \"old@home.com\"\npager = \"less\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try editLive(io, a, try h.liveOf(".afile"), "PAGER=less", "PAGER=more");
+    try editLive(io, a, try h.liveOf(".pfile"), "SPACER=1", "SPACER=2");
+    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+
+    // .afile routes its pager to the fact and passes. .pfile routes SPACER
+    // universally, EDITOR to the private layer (fails) and its email to the
+    // fact; the restore of its base, its sixth write, fails, and its email
+    // is still reverted by name.
+    const p_path = try h.srcOf(".pfile");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, p_path, 6);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n1\n4\nf\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") == null);
+
+    const facts_now = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts_now, "old@home.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, facts_now, "new@home.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, facts_now, "pager = \"more\"") != null);
+    const dir = try recoveryDir(h);
+    const facts_copy = try std.fs.path.join(a, &.{ dir, "facts" });
+    const p_copy = try std.fs.path.join(a, &.{ dir, "repo", "src", ".pfile" });
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, facts_copy));
+    try std.testing.expectEqualStrings(p_src, try read(io, a, p_copy));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: ~/.config/mox/facts.toml: its pre-run bytes are saved in {s}\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n", .{ try h.liveOf(".pfile"), p_path, facts_copy, p_path, p_copy }), res.err);
+}
+
+test "commit: a coupling rename into a data row field a loop template reads through a default is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\nquokkanote = \"listing\"\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key> <entry.quokkanote | default \"none\">\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll listing", "abbr lll listing");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nquokkanote = \"listing\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
+}
+
+/// A generator over data/entries.toml whose leaves also render the email
+/// fact, a loop file with `loop_body` over the same source, and a file that
+/// routes a new email to the fact but fails: the fact is then reverted, and
+/// an edited leaf no longer reproduces.
+fn writeLeafAndLoopFixture(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, loop_body: []const u8) !void {
+    try writeRepo(io, tmp, "repo/data/entries.toml", "[[entries]]\nslug = \"a\"\nvalue = \"1\"\nlabel = \"x\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\nlabel = \"y\"\n");
+    try writeRepo(io, tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> <machine.email | default \"nobody@example.com\">\n# mox: end\n");
+    try writeRepo(io, tmp, "repo/src/.zloop", try std.fmt.allocPrint(a, "# mox: for entry in \"data/entries.toml\"\n{s}\n# mox: end\n", .{loop_body}));
+    try writeRepo(io, tmp, "repo/src/.pfile", "export EDITOR=vim\nexport SPACER=1\nexport EMAIL=<machine.email | default \"nobody@example.com\">\n" ++ os_blocks);
+    try writeRepo(io, tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
+}
+
+/// The leaf's value and the email edited; .pfile's EDITOR line sent to the
+/// private layer and its email routed to the fact.
+fn editLeafAndFact(io: Io, a: std.mem.Allocator, h: Harness) !void {
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 old@home.com", "key=99 new@home.com");
+    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+}
+
+test "commit: a row write a loop file and a failing leaf both made stays under the loop file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeLeafAndLoopFixture(io, a, &tmp, "val <entry.value>");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
+
+    try editLeafAndFact(io, a, h);
+    try editLive(io, a, try h.liveOf(".zloop"), "val 1", "val 99");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\nf\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    // The leaf fails once the fact is reverted, but the row write is also the
+    // loop file's, which passes: the data file keeps it.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, data_path), "value = \"99\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zloop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{try h.liveOf(".pfile")}), res.err);
+}
+
+test "commit: a failing leaf restores a loop file's data source and the loop file is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The loop file renders a field the leaf's row write leaves alone.
+    try writeLeafAndLoopFixture(io, a, &tmp, "tag <entry.label>");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
+    const data_before = try read(io, a, data_path);
+
+    try editLeafAndFact(io, a, h);
+    try editLive(io, a, try h.liveOf(".zloop"), "tag y", "tag w");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\nf\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+
+    try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zloop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n" ++
+        "mox commit: ~/.zloop: not committed: {s} was restored because ~/.config/id-a.inc was not committed; commit it on its own with 'mox commit ~/.zloop'\n", .{ try h.liveOf(".pfile"), data_path }), res.err);
+}
+
+test "commit: a coupling rename into a data row field read through another field's stored value is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\na = \"<b>/bin\"\nb = \"quokkanote\"\nc = \"listing\"\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.a | default \"none\"> <entry.c>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr quokkanote/bin listing", "abbr quokkanote/bin detail");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\na = \"<b>/bin\"\nb = \"quokkanote\"\nc = \"detail\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
+}
+
+test "commit: a coupling rename into a data row field only a bare capture's stored value names is applied" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\na = \"<b>/bin\"\nb = \"quokkanote\"\nc = \"listing\"\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <a | default \"none\"> <entry.c>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr <b>/bin listing", "abbr <b>/bin detail");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\na = \"<b>/bin\"\nb = \"wombatnote\"\nc = \"detail\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a coupling rename that only touches comments in a routed data row is applied" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]  # quokkanote\nkey = \"ll\"\na = \"x\"  # quokkanote\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key> <entry.a | default \"none\">\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll x", "abbr lll x");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]  # wombatnote\nkey = \"lll\"\na = \"x\"  # wombatnote\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a coupled update into a generator source is verified through its leaves" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/entries.toml", "[[entries]]\nslug = \"a\"\n\n[[entries]]\nslug = \"b\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.slug> quokkanote\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqualStrings("# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.slug> wombatnote\n# mox: end\n", try read(io, a, try h.srcOf(".config/gen.inc")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
+}
+
+test "commit: a coupled update into a generator source that fails a routed leaf is undone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gen_src = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> quokkanote\n# mox: end\n";
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", gen_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 quokkanote", "key=99 quokkanote");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data/entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
+    try std.testing.expectEqualStrings("mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n" ++
+        "mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc could not take it (~/.config/id-a.inc was not committed)\n", res.err);
+}
+
+test "commit: a coupled update that changes nothing in a generator source leaves a failing leaf's line the only one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The generator holds the old token only inside a longer one, so the
+    // rename into it changes nothing. It renders under os=linux too, which
+    // the routed rows change: were it verified as a coupling target, that
+    // configuration changing would fail it with a line of its own.
+    const gen_src = "# mox: for entry in \"data/entries.toml\" when os=darwin or os=linux into \"id-<entry.slug>.inc\"\nkey=<entry.value> quokkanotes\n# mox: end\n";
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", gen_src);
+    try writeRepo(io, &tmp, "repo/src/.zloop", "# mox: for entry in \"data/entries.toml\"\nval <entry.slug> <entry.value>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    var g = mox.coupling.graph.Graph.init(a);
+    try g.addOccurrence("quokkanote", try h.srcOf(".aenv"), 5, 15);
+    try g.addOccurrence("quokkanote", try h.srcOf(".config/gen.inc"), 0, 10);
+    try mox.coupling.store.saveGraph(a, io, try std.fs.path.join(a, &.{ h.state, "coupling" }), &g);
+
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 ", "key=99 ");
+    try editLive(io, a, try h.liveOf(".zloop"), "val b 2", "val b 7");
+    try editLive(io, a, try h.liveOf(".zloop"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    // .zloop sends its EDITOR line to the private layer and fails, so the
+    // data source is restored and the leaf, which routed a row into it, is
+    // not committed.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n4\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{
+        try h.liveOf(".zloop"),
+        try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }),
+    }), res.err);
+}
+
+test "commit: a coupled update into a generator source whose leaf fails only in settling is undone as not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The token is only in a default no row renders, so the update leaves
+    // the leaves as they are live.
+    const gen_src = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> <entry.note | default \"quokkanote\">\n# mox: end\n";
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\nnote = \"x\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\nnote = \"y\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", gen_src);
+    try writeRepo(io, &tmp, "repo/src/.zloop", "# mox: for entry in \"data/entries.toml\"\nval <entry.slug> <entry.value>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 ", "key=99 ");
+    try editLive(io, a, try h.liveOf(".zloop"), "val b 2", "val b 7");
+    try editLive(io, a, try h.liveOf(".zloop"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    // The generator passes its first verification. .zloop fails, the data
+    // source is restored, the leaf fails with it, and the generator then
+    // fails its re-verification through the leaf: it was not committed.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n4\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n" ++
+        "mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc was not committed\n", .{
+        try h.liveOf(".zloop"),
+        try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }),
+    }), res.err);
+}
+
+test "commit: a coupled update that changes nothing leaves its file out of verification" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // .tloop holds the old token only inside a longer one, so the rename
+    // into it changes nothing; the row .abbrs routes changes .tloop's linux
+    // configuration, which a coupling target could not take.
+    const data = "[[abbrs]]\nkey = \"ll\"\n";
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\n");
+    const tloop = "note quokkanotes\n# mox: when os=linux\n# mox: for entry in \"data/abbrs.toml\"\nkey <entry.key>\n# mox: end\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.tloop", tloop);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    var g = mox.coupling.graph.Graph.init(a);
+    try g.addOccurrence("quokkanote", try h.srcOf(".aenv"), 5, 15);
+    try g.addOccurrence("quokkanote", try h.srcOf(".tloop"), 5, 15);
+    try mox.coupling.store.saveGraph(a, io, try std.fs.path.join(a, &.{ h.state, "coupling" }), &g);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll", "key: lll");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqualStrings(tloop, try read(io, a, try h.srcOf(".tloop")));
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled, 0 manual") != null);
+}
+
+test "commit: a coupled update into a generator source with several configurations is simulated as a generator" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gen_src = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.slug> quokkanote\n# mox: when os=linux\nlinux only\n# mox: end\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", "[[entries]]\nslug = \"a\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", gen_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf(".config/gen.inc")), "wombatnote") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
+}
+
+test "commit: a coupled update that leaves its target uncomposable in simulation is undone, not an abort" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zshrc = "export Q=<machine.quokkanote>\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.zshrc", zshrc);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note machine.quokkanote\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "quokkanote = \"somevalue\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "machine.quokkanote", "machine.wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(zshrc, try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expectEqualStrings("note machine.wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n", res.err);
+}
+
+test "commit: a coupled update that leaves a generator target uncomposable in simulation is undone, not an abort" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gen_src = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<machine.quokkanote>\n# mox: when os=linux\nlinux only\n# mox: end\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", "[[entries]]\nslug = \"a\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", gen_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note machine.quokkanote\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "quokkanote = \"somevalue\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "machine.quokkanote", "machine.wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc could not take it (recompose failed: UnknownMachineField)\n", res.err);
+}
+
+/// A loop file reading the managed data file src/abbrs.toml through
+/// `data_spec`, a symlink when `through_link`; the loop file ends in `tail`.
+/// The loop's first row and abbrs.toml's own live copy are both edited.
+fn writeSpelledDataFixture(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, data_spec: []const u8, through_link: bool, tail: []const u8) !Harness {
+    try writeRepo(io, tmp, "repo/src/abbrs.toml", shared_abbrs);
+    try writeRepo(io, tmp, "repo/src/.abbrs", try std.fmt.allocPrint(a, "# mox: for entry in \"{s}\"\nkey: <entry.key>\n# mox: end\n{s}", .{ data_spec, tail }));
+    if (through_link) {
+        try tmp.dir.createDirPath(io, "repo/data");
+        try tmp.dir.symLink(io, "../src/abbrs.toml", "repo/data/abbrs.toml", .{});
+    }
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "key = \"ll\"", "key = \"lll\"");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "\"git status\"", "\"git status -sb\"");
+    return h;
+}
+
+/// Both files commit: the row write and abbrs.toml's own line edits land in
+/// one planned write of the one file.
+fn expectSpelledDataCommits(io: Io, a: std.mem.Allocator, h: Harness) !void {
+    try editLive(io, a, try h.liveOf(".abbrs"), "greeting hello", "greeting howdy");
+    // .abbrs: route the row, decline the literal line. abbrs.toml: both lines.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ns\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(
+        "[[abbrs]]\nkey = \"lll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\n",
+        try read(io, a, try h.srcOf("abbrs.toml")),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were declined and remain only in the live file; the routed edits were committed to the sources -- run 'mox apply' to discard them\n", .{try h.liveOf(".abbrs")}), res.err);
+}
+
+/// The loop file fails for its EDITOR line, sent to the private layer, so
+/// its row write is dead and abbrs.toml, owning edits to the same file under
+/// another spelling, is not committed either.
+fn expectSpelledDataFailsTogether(io: Io, a: std.mem.Allocator, h: Harness) !void {
+    try editLive(io, a, try h.liveOf(".abbrs"), "EDITOR=vim", "EDITOR=nvim");
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try h.liveOf(".abbrs"), try h.srcOf("abbrs.toml") }), res.err);
+}
+
+const spelled_fail_tail = "export SPACER=1\nexport EDITOR=vim\n" ++ os_blocks;
+
+test "commit: a data source reached through a symlink and the file's own line edits are one write" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try writeSpelledDataFixture(io, a, &tmp, "data/abbrs.toml", true, "set -g greeting hello\n");
+    try expectSpelledDataCommits(io, a, h);
+}
+
+test "commit: a data source spelled with ./ and the file's own line edits are one write" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try writeSpelledDataFixture(io, a, &tmp, "src/./abbrs.toml", false, "set -g greeting hello\n");
+    try expectSpelledDataCommits(io, a, h);
+}
+
+test "commit: a failing loop file restores a data source reached through a symlink under the file's own line edits" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try writeSpelledDataFixture(io, a, &tmp, "data/abbrs.toml", true, spelled_fail_tail);
+    try expectSpelledDataFailsTogether(io, a, h);
+}
+
+test "commit: a failing loop file restores a data source spelled with ./ under the file's own line edits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try writeSpelledDataFixture(io, a, &tmp, "src/./abbrs.toml", false, spelled_fail_tail);
+    try expectSpelledDataFailsTogether(io, a, h);
+}
+
+test "commit: a coupled update that leaves a single-configuration target uncomposable is undone before planning, reported once" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zshrc = "export Q=<machine.quokkanote>\n";
+    try writeRepo(io, &tmp, "repo/src/.zshrc", zshrc);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note machine.quokkanote\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "quokkanote = \"somevalue\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "machine.quokkanote", "machine.wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(zshrc, try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(
+        "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n",
+        res.err,
+    );
+}
+
+test "commit: a coupled update that leaves a routed target uncomposable is undone and the target's own edit commits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=alpha\nexport Q=<machine.quokkanote>\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note machine.quokkanote\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "quokkanote = \"somevalue\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "machine.quokkanote", "machine.wombatnote");
+    try editLive(io, a, try h.liveOf(".zshrc"), "A=alpha", "A=alpha gamma");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("export A=alpha gamma\nexport Q=<machine.quokkanote>\n", try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(
+        "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n",
+        res.err,
+    );
+}
+
+test "commit: a coupling rename into a routed row field after a multi-line string holding a header line is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\ndesc = \"\"\"\n[x]\n\"\"\"\na = \"quokkanote\"\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key> <entry.a>\n# mox: end\nset -g spacer 1\nset -g greeting hello\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll quokkanote", "abbr lll quokkanote");
+    try editLive(io, a, try h.liveOf(".abbrs"), "greeting hello", "greeting howdy");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    // .abbrs: route the row, decline the literal line; .aenv: route the
+    // rename; accept any coupled update offered.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ns\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\ndesc = \"\"\"\n[x]\n\"\"\"\na = \"quokkanote\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n" ++
+        "mox commit: {s}: 1 hunk(s) were declined and remain only in the live file; the routed edits were committed to the sources -- run 'mox apply' to discard them\n", .{ try h.srcOf("abbrs.toml"), try h.liveOf(".abbrs") }), res.err);
+}
+
+test "commit: a coupling rename into a data row field a loop's where reads is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", "[[abbrs]]\nkey = \"ll\"\nquokkanote = \"yes\"\n");
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\" where entry.quokkanote\nabbr <entry.key>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll", "abbr lll");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nquokkanote = \"yes\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
+}
+
+test "commit: a coupling rename into a data row field a generator's into path reads is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/entries.toml", "[[entries]]\nquokkanote = \"a\"\nvalue = \"1\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"src/entries.toml\" into \"id-<entry.quokkanote>.inc\"\nkey=<entry.value>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=99");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[entries]]\nquokkanote = \"a\"\nvalue = \"99\"\n", try read(io, a, try h.srcOf("entries.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("entries.toml")}), res.err);
+}
+
+test "commit: a data source hard-linked to a managed file is one path with that file's own edits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", shared_abbrs);
+    try tmp.dir.createDirPath(io, "repo/data");
+    try Io.Dir.hardLink(tmp.dir, "repo/src/abbrs.toml", tmp.dir, "repo/data/abbrs.toml", io, .{});
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\n" ++ spelled_fail_tail);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "key = \"ll\"", "key = \"lll\"");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "\"git status\"", "\"git status -sb\"");
+
+    // .abbrs: route the row, send EDITOR to the private layer, which leaves
+    // it unrouted. abbrs.toml: route its first line, decline the second.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ny\ns\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try h.liveOf(".abbrs"), try h.srcOf("abbrs.toml") }), res.err);
+}
+
+test "commit: every managed file hard-linked to a coupled update's path is verified as its target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const linked = "note quokkanote\nexport A=1\n";
+    try writeRepo(io, &tmp, "repo/src/.ha", linked);
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+    try editLive(io, a, try h.liveOf(".hb"), "A=1", "A=2");
+
+    // .hb's live copy keeps the old token, so .hb cannot take the update
+    // into the file it shares with .ha, and .ha loses it too.
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(linked, try read(io, a, try h.srcOf(".ha")));
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.ha undone: ~/.hb was not committed\n" ++
+        "mox commit: coupled update to ~/.hb undone: ~/.hb could not take it (its recomposed output differs from live); ~/.hb not committed\n", res.err);
+}
+
+test "commit: a coupled update whose simulation fails for one hard-linked target is undone for every target before planning" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const linked = "note quokkanote\nexport A=1\n";
+    try writeRepo(io, &tmp, "repo/src/.ha", linked);
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    // .ha's simulation writes the file through its own name and passes;
+    // .hb's, through .hb, fails at its first write.
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreatesThrough(h, &vtable, try h.srcOf(".hb"), 1, 1);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(linked, try read(io, a, try h.srcOf(".ha")));
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.ha undone: ~/.hb could not take it (AccessDenied)\n" ++
+        "mox commit: coupled update to ~/.hb undone: ~/.hb could not take it (AccessDenied)\n", res.err);
+}
+
+test "commit: a restore that fails for a data source outside the repo copies it under other/" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "ext/abbrs.toml", shared_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/../../ext/abbrs.toml\"\nkey: <entry.key>\n# mox: end\n" ++ spelled_fail_tail);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "EDITOR=vim", "EDITOR=nvim");
+
+    // The row write lands, the unrouted EDITOR line fails the file, and the
+    // restore of the data source fails.
+    const data = try std.fs.path.join(a, &.{ h.root, "ext", "abbrs.toml" });
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, data, 4);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    // The copy is other/1, the only entry of the recovery directory, and the
+    // path is named in full.
+    const recovery = try recoveryDir(h);
+    var names: std.ArrayList([]const u8) = .empty;
+    var walker = try (try Io.Dir.cwd().openDir(io, recovery, .{ .iterate = true })).walk(a);
+    while (try walker.next(io)) |entry| try names.append(a, try a.dupe(u8, entry.path));
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    const copy = try std.fs.path.join(a, &.{ recovery, "other", "1" });
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, copy));
+    const real = try Io.Dir.cwd().realPathFileAlloc(io, data, a);
+    // The failed restore names the path as the loop header spells it.
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n", .{
+        try h.liveOf(".abbrs"),
+        try std.fs.path.join(a, &.{ h.repo, "src", "../../ext/abbrs.toml" }),
+        real,
+        copy,
+    }), res.err);
+}
+
+test "commit: a file failed by reverted facts names only the reverted facts it reads" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const email_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+    const nick_line = "export NICK=<machine.nick | default \"nobody\">\n";
+    try writeRepo(io, &tmp, "repo/src/.pfile", "export SHELL_OK=1\nexport EDITOR=vim\nexport SPACER=1\n" ++ email_line ++ "export SPACER2=1\n" ++ nick_line ++ os_blocks);
+    try writeRepo(io, &tmp, "repo/src/.rfile", email_line);
+    const facts_before = "email = \"old@home.com\"\nnick = \"oldnick\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+    try editLive(io, a, try h.liveOf(".pfile"), "NICK=oldnick", "NICK=newnick");
+    try editLive(io, a, try h.liveOf(".rfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+
+    // .pfile: EDITOR to the private layer (fails), EMAIL and NICK to their
+    // facts, both reverted in one round. .rfile reads only email.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "4\nf\nf\nd\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n", .{try h.liveOf(".pfile")}), res.err);
+}
+
+/// Two files renaming one token each, both coupled into ~/.tsigners, whose
+/// own routed edit then leaves its recompose differing from live.
+fn writeTwoRenamesIntoTargetFixture(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, two: bool) !Harness {
+    try writeRepo(io, tmp, "repo/src/.aenv", "note alphatoken1\n");
+    try writeRepo(io, tmp, "repo/src/.benv", "note quokkatoken\n");
+    try writeRepo(io, tmp, "repo/src/.tsigners", "alphatoken1 quokkatoken\nfoo=1\n");
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+    try editLive(io, a, try h.liveOf(".aenv"), "alphatoken1", "alphatoken2");
+    if (two) try editLive(io, a, try h.liveOf(".benv"), "quokkatoken", "wombattoken");
+    try editLive(io, a, try h.liveOf(".tsigners"), "foo=1", "foo=2");
+    return h;
+}
+
+test "commit: two coupled updates into one failing target are one undone line and its only line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try writeTwoRenamesIntoTargetFixture(io, a, &tmp, true);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("alphatoken1 quokkatoken\nfoo=1\n", try read(io, a, try h.srcOf(".tsigners")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(
+        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (its recomposed output differs from live); ~/.tsigners not committed\n",
+        res.err,
+    );
+}
+
+test "commit: a coupling target whose recompose differs from live is named only by its undone line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try writeTwoRenamesIntoTargetFixture(io, a, &tmp, false);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.tsigners") == null);
+    try std.testing.expectEqualStrings(
+        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (its recomposed output differs from live); ~/.tsigners not committed\n",
+        res.err,
+    );
+}
+
+test "commit: a generator leaf over a data source reached through a symlink and the data file's own edit are one write" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/entries.toml", "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value>\n# mox: end\n");
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.symLink(io, "../src/entries.toml", "repo/data/entries.toml", .{});
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The data file's live copy holds the leaf's row edit too, as a line
+    // edit of its own, and one more line edit.
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=99");
+    try editLive(io, a, try h.liveOf("entries.toml"), "value = \"1\"", "value = \"99\"");
+    try editLive(io, a, try h.liveOf("entries.toml"), "value = \"2\"", "value = \"7\"");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqualStrings(
+        "[[entries]]\nslug = \"a\"\nvalue = \"99\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"7\"\n",
+        try read(io, a, try h.srcOf("entries.toml")),
+    );
+    try std.testing.expect(isSymlink(io, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/entries.toml") != null);
+}
+
+test "commit: with MOX_REPO spelled through a symlink, a coupling rename and a row write into one data file are one write" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", "[[abbrs]]\nkey = \"ll\"\nnote = \"quokkanote\"\n");
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    try tmp.dir.symLink(io, "repo", "repolink", .{ .is_directory = true });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repolink" });
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_REPO", .value = link }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll", "abbr lll");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nnote = \"wombatnote\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled") != null);
+}
+
+test "commit: with MOX_REPO spelled through a symlink and a coupling graph under the real repo, a rename couples its target and not its origin" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkanote\n");
+    try writeRepo(io, &tmp, "repo/src/.mysigners", "quokkanote signing\n");
+    try tmp.dir.symLink(io, "repo", "repolink", .{ .is_directory = true });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repolink" });
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_REPO", .value = link }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    // The graph is keyed by the repo's real path; the commit walks the link.
+    const real_env = try a.create(std.process.Environ.Map);
+    real_env.* = try h.env.map.clone(a);
+    try real_env.put("MOX_REPO", h.repo);
+    var real = h;
+    real.env = .{ .map = real_env };
+    try std.testing.expectEqual(@as(u8, 0), (try real.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".myenv")));
+    try std.testing.expectEqualStrings("wombatnote signing\n", try read(io, a, try h.srcOf(".mysigners")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
+}
+
+test "commit: with MOX_REPO spelled through a symlink and a coupling graph under the real repo, a seed-once body is not coupled" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkanote\n");
+    try writeRepo(io, &tmp, "repo/src/seed.local", "note quokkanote\n");
+    try tmp.dir.symLink(io, "repo", "repolink", .{ .is_directory = true });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repolink" });
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_REPO", .value = link }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    // The graph, keyed by the repo's real path, indexes seed.local while it
+    // is plain; it is marked seed-once afterwards.
+    const real_env = try a.create(std.process.Environ.Map);
+    real_env.* = try h.env.map.clone(a);
+    try real_env.put("MOX_REPO", h.repo);
+    var real = h;
+    real.env = .{ .map = real_env };
+    try std.testing.expectEqual(@as(u8, 0), (try real.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"seed.local\"]\nseed_once = true\n");
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".myenv")));
+    try std.testing.expectEqualStrings("note quokkanote\n", try read(io, a, try h.srcOf("seed.local")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "seed.local") == null);
+}
+
+test "commit: with MOX_REPO spelled through a symlink, a coupling decline recorded under the graph's real path applies" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkanote\n");
+    try writeRepo(io, &tmp, "repo/src/.other", "quokkanote signing\n");
+    try tmp.dir.symLink(io, "repo", "repolink", .{ .is_directory = true });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repolink" });
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_REPO", .value = link }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    const real_env = try a.create(std.process.Environ.Map);
+    real_env.* = try h.env.map.clone(a);
+    try real_env.put("MOX_REPO", h.repo);
+    var real = h;
+    real.env = .{ .map = real_env };
+    try std.testing.expectEqual(@as(u8, 0), (try real.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+    // Recorded with the target as the graph spells it, as older builds did.
+    const coupling_dir = try std.fs.path.join(a, &.{ h.state, "coupling" });
+    var declines = try mox.coupling.store.loadDeclines(a, io, coupling_dir);
+    try declines.declinePair("quokkanote", try std.fs.path.join(a, &.{ link, "src", ".myenv" }), try h.srcOf(".other"));
+    try mox.coupling.store.saveDeclines(a, io, coupling_dir, &declines);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkanote", "wombatnote");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("quokkanote signing\n", try read(io, a, try h.srcOf(".other")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "Update?") == null);
+}
+
+test "commit: a coupled update into hard-linked bases is offered once" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.ha", "note quokkanote\n");
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".ha")));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.out, "  update "));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try std.fmt.allocPrint(a, "  update {s}: ", .{try h.srcOf(".ha")})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
+}
+
+test "commit: a coupling decline recorded for one hard-linked base applies to the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.ha", "note quokkanote\n");
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+    const coupling_dir = try std.fs.path.join(a, &.{ h.state, "coupling" });
+    var declines = try mox.coupling.store.loadDeclines(a, io, coupling_dir);
+    try declines.declinePair("quokkanote", try h.srcOf(".aenv"), try h.srcOf(".hb"));
+    try mox.coupling.store.saveDeclines(a, io, coupling_dir, &declines);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n");
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("note quokkanote\n", try read(io, a, try h.srcOf(".ha")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "Update?") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+}
+
+test "commit: a coupling rename that only touches a comment inside a routed row's multi-line array is applied" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", "[[abbrs]]\nkey = \"ll\"\ntags = [\n  \"x\",  # quokkanote\n  # quokkanote\n]\n");
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\" where entry.tags has \"x\"\nabbr <entry.key>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll", "abbr lll");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\ntags = [\n  \"x\",  # wombatnote\n  # wombatnote\n]\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a coupling rename into a base whose narrowing keeps the old token in its region block is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zshrc = "export SHELL_OK=1\nset editor quokkanote\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.zshrc", zshrc);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+    try editLive(io, a, try h.liveOf(".zshrc"), "editor quokkanote", "editor nano");
+
+    // .aenv's rename routes; .zshrc's editor line narrows to this machine's
+    // os, so the base keeps the original line in its region block.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n2\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expect(std.mem.indexOf(u8, src, "# mox: replace from \"os\"\nset editor quokkanote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf(".zshrc")}), res.err);
+}
+
+test "commit: a coupled update into a routed target whose live copy keeps the old token is undone with the target's reason" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/t.toml", "quokkakey = 1\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkakey\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkakey", "wombatkey");
+    try editLive(io, a, try h.liveOf(".config/t.toml"), "quokkakey = 1\n", "quokkakey = 1\nwombatkey = 2\n");
+
+    // The target's own edit keeps quokkakey live, so with the rename its
+    // recompose no longer matches live.
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("quokkakey = 1\n", try read(io, a, try h.srcOf(".config/t.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (its recomposed output differs from live); ~/.config/t.toml not committed\n", res.err);
+}
+
+test "commit: a coupled update its target's own edit already made is not undone when its origin is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const myenv = "email = old@example.com\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.myenv", myenv);
+    try writeRepo(io, &tmp, "repo/src/.mysigners", "old@example.com signing\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "old@example.com", "new@example.com");
+    try editLive(io, a, try h.liveOf(".myenv"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".mysigners"), "old@example.com", "new@example.com");
+
+    // .myenv: the rename stays universal, the EDITOR line goes to the
+    // private layer (no automatic route). .mysigners routes the same rename
+    // by hand. Both coupled updates are accepted; each changes nothing its
+    // target's own edit did not already write.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "1\n4\ny\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(myenv, try read(io, a, try h.srcOf(".myenv")));
+    try std.testing.expectEqualStrings("new@example.com signing\n", try read(io, a, try h.srcOf(".mysigners")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.mysigners") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.myenv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n", .{try h.liveOf(".myenv")}), res.err);
+}
+
+test "commit: a coupled update its target's own edit already made survives its origin's restore for another file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", shared_abbrs);
+    const abbrs = "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\nset -g spacer 1\nnote quokkatok\n";
+    try writeRepo(io, &tmp, "repo/src/.abbrs", abbrs);
+    try writeRepo(io, &tmp, "repo/src/.onote", "note quokkatok\n");
+    try writeRepo(io, &tmp, "repo/src/.zaliases", "# mox: for entry in \"data/abbrs.toml\"\nexpansion: <entry.expansion>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "quokkatok", "wombattok");
+    try editLive(io, a, try h.liveOf(".onote"), "quokkatok", "wombattok");
+    try editLive(io, a, try h.liveOf(".zaliases"), "git status\n", "git status -sb\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EDITOR=vim", "EDITOR=nvim");
+
+    // .zaliases sends its EDITOR line to the private layer and fails, so the
+    // shared data file is restored and .abbrs, which routed a row into it,
+    // is not committed. Both renames are accepted as coupled updates; each
+    // changes nothing its target's own edit did not already write.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\ny\n4\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(abbrs, try read(io, a, try h.srcOf(".abbrs")));
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    try std.testing.expectEqualStrings("note wombattok\n", try read(io, a, try h.srcOf(".onote")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.onote") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.abbrs: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.abbrs'\n", .{
+        try h.liveOf(".zaliases"),
+        try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
+    }), res.err);
+}
+
+test "commit: a coupled update whose transient simulation write fails is undone before planning, not an abort" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myenv", "note quokkatoken\n");
+    try writeRepo(io, &tmp, "repo/src/.tsigners", "quokkatoken signing\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
+
+    // The first write of .tsigners is the simulation's transient edit.
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreatesThrough(h, &vtable, try h.srcOf(".tsigners"), 1, 1);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("quokkatoken signing\n", try read(io, a, try h.srcOf(".tsigners")));
+    try std.testing.expectEqualStrings("note wombattoken\n", try read(io, a, try h.srcOf(".myenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.myenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (AccessDenied)\n", res.err);
+}
+
+test "commit: a coupling rename of a routed row's key into a field the loop template reads is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The template reads wombatnote, which the row does not hold yet: the
+    // rename would make the row's quokkanote the field it renders.
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", "[[abbrs]]\nkey = \"ll\"\nquokkanote = \"listing\"\n");
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key> <entry.wombatnote | default \"x\">\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll x", "abbr lll x");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nquokkanote = \"listing\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
+}
+
+test "commit: a file failed in a round that reverts a fact, by a restored path and no fact, prints its own diagnostic" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const email_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+    try writeRepo(io, &tmp, "repo/src/.pfile", "export SHELL_OK=1\nnote quokkanote\nexport SPACER=1\nexport EDITOR=vim\nexport SPACER2=1\n" ++ email_line ++ os_blocks);
+    const loop = "# mox: for entry in \"data/t.toml\"\nkey: <entry.key>\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.tloop", "note wombatnote\n" ++ loop);
+    try writeRepo(io, &tmp, "repo/data/t.toml", "[[t]]\nkey = \"a\"\n");
+    const facts_before = "email = \"old@home.com\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // Since the apply, the source went back to the token live still shows
+    // renamed: only .pfile's coupled update makes .tloop match live again.
+    const tloop_src = "note quokkanote\n" ++ loop;
+    try writeRepo(io, &tmp, "repo/src/.tloop", tloop_src);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".pfile"), "quokkanote", "wombatnote");
+    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+    try editLive(io, a, try h.liveOf(".tloop"), "key: a", "key: b");
+
+    // .pfile: the rename universal, EDITOR to the private layer (fails),
+    // EMAIL to the fact. .tloop routes its row; the coupled update into it
+    // is accepted. When .pfile fails, one round restores .tloop's source and
+    // reverts the fact; .tloop reads no fact, so it names its own failure.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "1\n4\nf\ny\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
+    try std.testing.expectEqualStrings(tloop_src, try read(io, a, try h.srcOf(".tloop")));
+    try std.testing.expectEqualStrings("[[t]]\nkey = \"a\"\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "t.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: {s}: recomposed output still differs from live; not committed\n" ++
+        "mox commit: coupled update to ~/.tloop undone: ~/.pfile was not committed\n", .{ try h.liveOf(".pfile"), try h.liveOf(".tloop") }), res.err);
+}
+
+test "commit: a coupled update that fails only together with the target's own routed edit is undone with the target's reason" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const t_src = "export SHELL_OK=1\nexport A=1\n# mox: when os=linux\nnote quokkakey\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.tconf", t_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkakey\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkakey", "wombatkey");
+    try editLive(io, a, try h.liveOf(".tconf"), "A=1", "A=2");
+
+    // The rename changes only os=linux, where .tconf's own edit does not
+    // reach. Alone it would pass, as a sync of every other configuration the
+    // file has; beside the target's own edit, which chose this machine only,
+    // os=linux changing is what the user did not choose.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n2\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(t_src, try read(io, a, try h.srcOf(".tconf")));
+    try std.testing.expect(!exists(io, try h.srcOf(".tconf.d")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.tconf undone: ~/.tconf could not take it (configuration os=linux would change); ~/.tconf not committed\n", res.err);
+}
+
+test "commit: with MOX_REPO spelled through a symlink under home, a fragment the run created is named under the repo" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const x_src = "export SHELL_OK=1\nexport PAGER=less\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.xfile", x_src);
+    const z_src = "export KEEP=1\nexport SPACER=1\nexport MIDDLE=1\nexport EDITOR=vim\n" ++ os_blocks;
+    try writeRepo(io, &tmp, "repo/src/.zfile", z_src);
+    try tmp.dir.createDirPath(io, "home");
+    try tmp.dir.symLink(io, "../repo", "home/dots", .{ .is_directory = true });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const link = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "home", "dots" });
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_REPO", .value = link }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try editLive(io, a, try h.liveOf(".xfile"), "PAGER=less", "PAGER=more");
+    try editLive(io, a, try h.liveOf(".zfile"), "SPACER=1", "SPACER=2");
+    try editLive(io, a, try h.liveOf(".zfile"), "EDITOR=vim", "EDITOR=nvim");
+
+    // .xfile narrows its PAGER line to this machine's os, creating a
+    // fragment under the repo as MOX_REPO spells it. .zfile fails for its
+    // EDITOR line, and the restore of its base, its sixth write, fails.
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, try h.srcOf(".zfile"), 6);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "2\n1\n4\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    const m_state = try mox.machine.state.capture(a, io, h.env, h.repo, "");
+    try std.testing.expect(exists(io, try h.srcOf(try std.fmt.allocPrint(a, ".xfile.d/os/{s}", .{m_state.os}))));
+    const dir = try recoveryDir(h);
+    const x_copy = try std.fs.path.join(a, &.{ dir, "repo", "src", ".xfile" });
+    const z_copy = try std.fs.path.join(a, &.{ dir, "repo", "src", ".zfile" });
+    try std.testing.expectEqualStrings(x_src, try read(io, a, x_copy));
+    try std.testing.expectEqualStrings(z_src, try read(io, a, z_copy));
+    // Every path is named as MOX_REPO spells it, the fragment the run
+    // created included: it is keyed under the canonical repo root.
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: could not restore ~/dots/src/.zfile (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: ~/dots/src/.xfile: its pre-run bytes are saved in {s}\n" ++
+        "mox commit: ~/dots/src/.xfile.d/os/{s} did not exist before this commit; delete it to restore it\n" ++
+        "mox commit: ~/dots/src/.zfile: its pre-run bytes are saved in {s}\n", .{ try h.liveOf(".zfile"), x_copy, m_state.os, z_copy }), res.err);
+}
+
+test "commit: a coupling target failed by a restored data source it wrote is named by its own line, and its update as not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", shared_abbrs);
+    const loop = "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.tloop", "note wombatnote\n" ++ loop);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    try writeRepo(io, &tmp, "repo/src/.zaliases", "# mox: for entry in \"data/abbrs.toml\"\nexpansion: <entry.expansion>\n# mox: end\nexport SPACER=1\nexport EDITOR=vim\n" ++ os_blocks);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // Since the apply, the source went back to the token live still shows
+    // renamed: only .aenv's coupled update makes .tloop match live again.
+    const tloop_src = "note quokkanote\n" ++ loop;
+    try writeRepo(io, &tmp, "repo/src/.tloop", tloop_src);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+    try editLive(io, a, try h.liveOf(".tloop"), "key: ll\n", "key: lll\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "git status\n", "git status -sb\n");
+    try editLive(io, a, try h.liveOf(".zaliases"), "EDITOR=vim", "EDITOR=nvim");
+
+    // .zaliases sends its EDITOR line to the private layer and fails, so the
+    // data file is restored and .tloop, which routed a row into it, is not
+    // committed; its line says why, so its coupled update is undone as
+    // not committed.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n4\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(tloop_src, try read(io, a, try h.srcOf(".tloop")));
+    try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.tloop: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.tloop'\n" ++
+        "mox commit: coupled update to ~/.tloop undone: ~/.tloop was not committed\n", .{
+        try h.liveOf(".zaliases"),
+        try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
+    }), res.err);
 }
