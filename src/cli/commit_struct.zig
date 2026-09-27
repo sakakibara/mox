@@ -420,16 +420,40 @@ pub fn applyToLayer(
         error.FileNotFound => null,
         else => return e,
     };
-    const out = switch (format) {
+    const out = try layerBytes(arena, format, existing, change);
+    // A layer routed to for the first time (a fresh overlay a placement
+    // creates) has no parent directory yet.
+    if (std.fs.path.dirname(layer_abs)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_abs, .data = out });
+}
+
+/// The bytes `applyToLayer` writes for `change` over a layer holding
+/// `existing` (null when the layer is absent), without touching disk.
+pub fn layerBytes(arena: std.mem.Allocator, format: Format, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    if (change.path.len == 0) return error.EmptyPath;
+    return switch (format) {
         .toml => try applyTomlLayer(arena, existing, change),
         .json => try applyJsonLayer(arena, existing, change),
         .yaml => try applyYamlLayer(arena, existing, change),
         .ini, .gitconfig => try applyIniLayer(arena, existing, change, format),
     };
-    // A layer routed to for the first time (a fresh overlay a placement
-    // creates) has no parent directory yet.
-    if (std.fs.path.dirname(layer_abs)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_abs, .data = out });
+}
+
+/// Whether two changes write the same thing: the same key path, and the same
+/// removal or the same new value.
+pub fn changeEql(a: KeyPathChange, b: KeyPathChange) bool {
+    if (a.removed != b.removed) return false;
+    if (a.path.len != b.path.len) return false;
+    for (a.path, b.path) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    const av = a.new orelse return b.new == null;
+    const bv = b.new orelse return false;
+    if (@as(std.meta.Tag(Value), av) != @as(std.meta.Tag(Value), bv)) return false;
+    return switch (av) {
+        .toml => |v| v.eql(bv.toml),
+        .json => |v| jsonEql(v, bv.json),
+        .yaml => |v| v.eql(bv.yaml),
+        .ini => |v| iniEql(v, bv.ini),
+    };
 }
 
 fn applyTomlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {

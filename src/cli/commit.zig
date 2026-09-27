@@ -105,9 +105,9 @@ const GenLeafCommit = struct {
 };
 
 /// A pending structured key-path edit to one source layer of a Cat-A file.
-/// Applied via `commit_struct.applyToLayer` in the write phase (deferred like
-/// every other route, so abort writes nothing); its `layer_abs` is backed up in
-/// `routed_orig` for rollback.
+/// Planned via `commit_struct.layerBytes` and written in the write phase
+/// (deferred like every other route, so abort writes nothing); its `layer_abs`
+/// is journaled for rollback.
 const StructEdit = struct {
     format: commit_struct.Format,
     layer_abs: []const u8,
@@ -281,6 +281,147 @@ const Backup = struct {
     path: []const u8,
     content: ?[]const u8,
     created_dir: ?[]const u8,
+};
+
+/// Pre-run state of every source path the write phase writes, one entry per
+/// path, recorded before the first write. A rejected unit is put back by
+/// restoring the paths its edits wrote.
+const Journal = struct {
+    entries: std.StringHashMap(Backup),
+
+    fn init(arena: std.mem.Allocator) Journal {
+        return .{ .entries = .init(arena) };
+    }
+
+    fn record(j: *Journal, arena: std.mem.Allocator, io: Io, path: []const u8) !void {
+        if (j.entries.contains(path)) return;
+        const content: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => return e,
+        };
+        try j.entries.put(path, .{ .path = path, .content = content, .created_dir = mox.classify.synth.missingAncestor(io, path) });
+    }
+
+    fn restore(j: *const Journal, io: Io, paths: []const []const u8) !void {
+        for (paths) |p| try restoreRouted(io, &.{j.entries.get(p).?});
+    }
+};
+
+/// Journal `path` and add it to `list` once.
+fn addPath(arena: std.mem.Allocator, journal: *Journal, io: Io, list: *std.ArrayList([]const u8), path: []const u8) !void {
+    for (list.items) |p| {
+        if (std.mem.eql(u8, p, path)) return;
+    }
+    try journal.record(arena, io, path);
+    try list.append(arena, path);
+}
+
+/// Who a planned edit is restored with: a managed file by index, or the
+/// symlink or generator batch, each of which the verify loops restore whole.
+const Owner = union(enum) {
+    file: usize,
+    symlinks,
+    generators,
+};
+
+/// One planned edit and every owner that produced it. Identical edits are
+/// collected once, their owners unioned.
+fn Owned(comptime T: type) type {
+    return struct {
+        edit: T,
+        owners: std.ArrayList(Owner),
+
+        fn ownedBy(o: @This(), owner: Owner) bool {
+            for (o.owners.items) |x| {
+                if (std.meta.eql(x, owner)) return true;
+            }
+            return false;
+        }
+    };
+}
+
+fn addOwned(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    list: *std.ArrayList(Owned(T)),
+    edit: T,
+    owners: []const Owner,
+    comptime eql: fn (T, T) bool,
+) !void {
+    const slot = for (list.items) |*o| {
+        if (eql(o.edit, edit)) break o;
+    } else blk: {
+        try list.append(arena, .{ .edit = edit, .owners = .empty });
+        break :blk &list.items[list.items.len - 1];
+    };
+    for (owners) |owner| {
+        if (!slot.ownedBy(owner)) try slot.owners.append(arena, owner);
+    }
+}
+
+fn lineEditEql(a: LineEdit, b: LineEdit) bool {
+    if (!std.mem.eql(u8, a.path, b.path) or a.start != b.start or a.del != b.del) return false;
+    if (a.new_lines.len != b.new_lines.len) return false;
+    for (a.new_lines, b.new_lines) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+fn rowEditEql(a: RowEdit, b: RowEdit) bool {
+    if (!std.mem.eql(u8, a.data_source, b.data_source) or !std.mem.eql(u8, a.stem, b.stem) or a.row != b.row) return false;
+    if (a.fields.len != b.fields.len) return false;
+    for (a.fields, b.fields) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.value, y.value)) return false;
+    }
+    return true;
+}
+
+fn couplingEditEql(a: CouplingEdit, b: CouplingEdit) bool {
+    return std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.old, b.old) and std.mem.eql(u8, a.new, b.new);
+}
+
+fn structEditEql(a: StructEdit, b: StructEdit) bool {
+    return a.format == b.format and std.mem.eql(u8, a.layer_abs, b.layer_abs) and commit_struct.changeEql(a.change, b.change);
+}
+
+/// One source path's bytes as the plan leaves it: null while it is absent.
+/// `make_parent` marks a path a struct edit writes, whose directory may not
+/// exist yet.
+const PlannedPath = struct {
+    path: []const u8,
+    bytes: ?[]const u8,
+    make_parent: bool = false,
+};
+
+/// Every written path's final bytes, in the order today's write sequence
+/// first touches each, threaded from its journaled pre-run bytes.
+const WritePlan = struct {
+    paths: std.ArrayList(PlannedPath),
+    journal: *const Journal,
+
+    fn slot(p: *WritePlan, arena: std.mem.Allocator, path: []const u8) !*PlannedPath {
+        for (p.paths.items) |*pp| {
+            if (std.mem.eql(u8, pp.path, path)) return pp;
+        }
+        try p.paths.append(arena, .{ .path = path, .bytes = p.journal.entries.get(path).?.content });
+        return &p.paths.items[p.paths.items.len - 1];
+    }
+
+    /// The path's current planned bytes; an absent path fails the way
+    /// reading it from disk would.
+    fn bytesOf(p: *WritePlan, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return (try p.slot(arena, path)).bytes orelse error.FileNotFound;
+    }
+
+    fn set(p: *WritePlan, arena: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+        (try p.slot(arena, path)).bytes = bytes;
+    }
+
+    fn get(p: *const WritePlan, path: []const u8) ?[]const u8 {
+        for (p.paths.items) |pp| {
+            if (std.mem.eql(u8, pp.path, path)) return pp.bytes;
+        }
+        return null;
+    }
 };
 
 /// Result of classifying one shared-origin hunk.
@@ -1246,19 +1387,18 @@ pub fn commitImpl(
     // 3: recompose-verify over EVERY touched file), but with two differences:
     // their recompose need not equal live (apply refreshes it), and a failure
     // restores the source rather than leaving it edited. Mark each such file,
-    // snapshot its bytes for rollback, and record which configurations a
+    // journal its bytes for rollback, and record which configurations a
     // universal token sync may change so a subset divergence is caught.
+    var journal: Journal = .init(ctx.alloc);
     const coupling_only = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(coupling_only, false);
-    const coupling_orig = try ctx.alloc.alloc(?[]const u8, tree.files.len);
-    @memset(coupling_orig, null);
     for (tree.files, 0..) |file, fidx| {
         if (affected[fidx]) continue;
         if (!file.has_base or file.source_base_abs.len == 0) continue;
         const file_edits = try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs);
         if (file_edits.len == 0) continue;
         coupling_only[fidx] = true;
-        coupling_orig[fidx] = try Io.Dir.cwd().readFileAlloc(ctx.io, file.source_base_abs, ctx.alloc, .limited(max_file_bytes));
+        try journal.record(ctx.alloc, ctx.io, file.source_base_abs);
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
         // A token sync is legitimate only when universal: if it changes
@@ -1273,41 +1413,68 @@ pub fn commitImpl(
         }
     }
 
-    // Pre-write bytes of every source a routed or coupled edit will rewrite,
-    // grouped by the file it was routed from. When verification rejects that file's
-    // routing, these restore its sources exactly -- "not committed" must leave
-    // nothing behind, including a fragment the synthesis created.
-    const routed_orig = try ctx.alloc.alloc([]const Backup, tree.files.len);
-    @memset(routed_orig, &.{});
+    // Every planned edit with the owners that produced it; identical edits
+    // are one. A coupled token update is owned by the file whose base it
+    // rewrites, when that file is routed or coupling-only: a write to it like
+    // any routed one, it rolls back with it.
+    var planned_lines: std.ArrayList(Owned(LineEdit)) = .empty;
+    for (line_edits.items, line_owners.items) |e, owner| try addOwned(LineEdit, ctx.alloc, &planned_lines, e, &.{.{ .file = owner }}, lineEditEql);
+    var planned_rows: std.ArrayList(Owned(RowEdit)) = .empty;
+    for (row_edits.items, row_owners.items) |e, owner| try addOwned(RowEdit, ctx.alloc, &planned_rows, e, &.{.{ .file = owner }}, rowEditEql);
+    var planned_structs: std.ArrayList(Owned(StructEdit)) = .empty;
+    for (struct_edits.items, struct_owners.items) |e, owner| try addOwned(StructEdit, ctx.alloc, &planned_structs, e, &.{.{ .file = owner }}, structEditEql);
+    var planned_couplings: std.ArrayList(Owned(CouplingEdit)) = .empty;
+    for (coupling_edits) |e| {
+        var owners: std.ArrayList(Owner) = .empty;
+        for (tree.files, 0..) |file, fidx| {
+            if (!affected[fidx] and !coupling_only[fidx]) continue;
+            if (!file.has_base or !std.mem.eql(u8, file.source_base_abs, e.path)) continue;
+            try owners.append(ctx.alloc, .{ .file = fidx });
+        }
+        try addOwned(CouplingEdit, ctx.alloc, &planned_couplings, e, owners.items, couplingEditEql);
+    }
+
+    // The source paths each file's edits write, journaled before any write.
+    // When verification rejects that file, restoring them from the journal
+    // puts its sources back exactly -- "not committed" must leave nothing
+    // behind, including a fragment the synthesis created.
+    const owned_paths = try ctx.alloc.alloc([]const []const u8, tree.files.len);
+    @memset(owned_paths, &.{});
     // Whether the file's own changes wrote anything, as distinct from a
     // coupled token update another file's edit made to it.
     const routed_own = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(routed_own, false);
     for (tree.files, 0..) |_, fidx| {
         if (!affected[fidx]) continue;
-        var bs: std.ArrayList(Backup) = .empty;
-        for (line_edits.items, line_owners.items) |e, owner| {
-            if (owner == fidx) try addBackup(ctx.alloc, ctx.io, &bs, e.path);
+        const owner: Owner = .{ .file = fidx };
+        var ps: std.ArrayList([]const u8) = .empty;
+        for (planned_lines.items) |o| {
+            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.path);
         }
-        for (row_edits.items, row_owners.items) |e, owner| {
-            if (owner == fidx) try addBackup(ctx.alloc, ctx.io, &bs, e.data_source);
+        for (planned_rows.items) |o| {
+            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.data_source);
         }
-        for (synth_plans.items, synth_owners.items) |sd, owner| {
-            if (owner != fidx) continue;
-            try addBackup(ctx.alloc, ctx.io, &bs, sd.base_abs);
-            try addBackup(ctx.alloc, ctx.io, &bs, sd.plan.fragment_path);
+        for (synth_plans.items, synth_owners.items) |sd, o| {
+            if (o != fidx) continue;
+            try addPath(ctx.alloc, &journal, ctx.io, &ps, sd.base_abs);
+            try addPath(ctx.alloc, &journal, ctx.io, &ps, sd.plan.fragment_path);
         }
-        for (struct_edits.items, struct_owners.items) |e, owner| {
-            if (owner == fidx) try addBackup(ctx.alloc, ctx.io, &bs, e.layer_abs);
+        for (planned_structs.items) |o| {
+            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.layer_abs);
         }
-        routed_own[fidx] = bs.items.len > 0;
-        // A coupled token update to this file's own base is a write to it
-        // like any routed one, and must roll back with it.
-        const file = tree.files[fidx];
-        if (file.has_base and file.source_base_abs.len > 0 and
-            (try couplingEditsForPath(ctx.alloc, coupling_edits, file.source_base_abs)).len > 0)
-            try addBackup(ctx.alloc, ctx.io, &bs, file.source_base_abs);
-        routed_orig[fidx] = try bs.toOwnedSlice(ctx.alloc);
+        routed_own[fidx] = ps.items.len > 0;
+        for (planned_couplings.items) |o| {
+            if (o.ownedBy(owner)) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.path);
+        }
+        owned_paths[fidx] = try ps.toOwnedSlice(ctx.alloc);
+    }
+    for (tree.files, 0..) |_, fidx| {
+        if (!coupling_only[fidx]) continue;
+        var ps: std.ArrayList([]const u8) = .empty;
+        for (planned_couplings.items) |o| {
+            if (o.ownedBy(.{ .file = fidx })) try addPath(ctx.alloc, &journal, ctx.io, &ps, o.edit.path);
+        }
+        owned_paths[fidx] = try ps.toOwnedSlice(ctx.alloc);
     }
 
     // Whether each coupling target composed to nothing on this machine before
@@ -1323,7 +1490,7 @@ pub fn commitImpl(
 
     // Fact edits routed from each file, pre-write (`old_value` was captured
     // at classification time, before any write this run), collected per file
-    // like `routed_orig`. A rejected file's entries here are candidates for
+    // like `owned_paths`. A rejected file's entries here are candidates for
     // restoration, not restored outright: `restoreUnkeptFacts`, run once every
     // file's outcome is known, is what decides whether a given fact actually
     // goes back.
@@ -1368,39 +1535,69 @@ pub fn commitImpl(
     }
 
     // Symlink-target and generator-leaf keep are OUTSIDE the affected[]/
-    // spaces[] machinery above (see their write+verify pass below), so their
-    // pre-write backups are collected separately here, at the same point
-    // `routed_orig` is: one entry per distinct source a sync will rewrite, one
-    // per distinct data source a generator row edit will rewrite. `addBackup`
-    // dedupes by path, so multiple leaves of one generator sharing a data
-    // source back it up exactly once.
-    var sym_backup: std.ArrayList(Backup) = .empty;
-    for (sym_syncs.items) |s| try addBackup(ctx.alloc, ctx.io, &sym_backup, s.source_abs);
-    var gen_data_backup: std.ArrayList(Backup) = .empty;
-    for (gen_row_edits.items) |e| try addBackup(ctx.alloc, ctx.io, &gen_data_backup, e.data_source);
+    // spaces[] machinery above (see their write+verify pass below): each is
+    // restored as one batch, so every symlink source a sync rewrites and every
+    // data source a generator row edit rewrites belongs to its batch's path
+    // set, journaled at the same point the files' paths are.
+    // Syncs are not merged: a later sync to one source overwrites an earlier.
+    var planned_syms: std.ArrayList(Owned(SymSync)) = .empty;
+    for (sym_syncs.items) |e| {
+        var owners: std.ArrayList(Owner) = .empty;
+        try owners.append(ctx.alloc, .symlinks);
+        try planned_syms.append(ctx.alloc, .{ .edit = e, .owners = owners });
+    }
+    var planned_gen_rows: std.ArrayList(Owned(RowEdit)) = .empty;
+    for (gen_row_edits.items) |e| try addOwned(RowEdit, ctx.alloc, &planned_gen_rows, e, &.{.generators}, rowEditEql);
+    var sym_paths: std.ArrayList([]const u8) = .empty;
+    for (planned_syms.items) |o| {
+        if (o.ownedBy(.symlinks)) try addPath(ctx.alloc, &journal, ctx.io, &sym_paths, o.edit.source_abs);
+    }
+    var gen_paths: std.ArrayList([]const u8) = .empty;
+    for (planned_gen_rows.items) |o| {
+        if (o.ownedBy(.generators)) try addPath(ctx.alloc, &journal, ctx.io, &gen_paths, o.edit.data_source);
+    }
+    // A path no owner restores is still written, so it is journaled too.
+    for (planned_lines.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.path);
+    for (planned_rows.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.data_source);
+    for (synth_plans.items) |sd| {
+        try journal.record(ctx.alloc, ctx.io, sd.base_abs);
+        try journal.record(ctx.alloc, ctx.io, sd.plan.fragment_path);
+    }
+    for (planned_couplings.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.path);
+    for (planned_structs.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.layer_abs);
 
-    // Write phase: every prompt is done, so applying now honors the
-    // abort-writes-nothing contract.
+    // Plan: every prompt is done, so each written path's final bytes are
+    // computed in memory from its journaled pre-run bytes, threading its
+    // edits in write order: line splices, loop rows, symlink targets,
+    // generator rows, narrowings, coupling renames, struct keys.
     //
     // A narrowing's region block is a line SPLICE of the base like any other
-    // edit, so a base with narrowings is written once, from its CURRENT bytes,
-    // with its ordinary line edits and every region block spliced in together.
-    // A universal hunk and a narrowed hunk in one file therefore both land, and
-    // neither reverts the other.
+    // edit, so a base with narrowings takes its ordinary line edits and every
+    // region block together, in one splice. A universal hunk and a narrowed
+    // hunk in one file therefore both land, and neither reverts the other.
+    var plan: WritePlan = .{ .paths = .empty, .journal = &journal };
     const synth_bases = try synthBases(ctx.alloc, synth_plans.items);
-    try applyLineEdits(ctx.alloc, ctx.io, try lineEditsExcluding(ctx.alloc, line_edits.items, synth_bases));
-    try applyRowEdits(ctx.alloc, ctx.io, row_edits.items);
-    try applySymlinkSyncs(ctx.alloc, ctx.io, sym_syncs.items);
-    try applyRowEdits(ctx.alloc, ctx.io, gen_row_edits.items);
+    var spliced: std.ArrayList([]const u8) = .empty;
+    for (planned_lines.items) |o| {
+        const path = o.edit.path;
+        if (isOneOf(path, synth_bases) or isOneOf(path, spliced.items)) continue;
+        try spliced.append(ctx.alloc, path);
+        var file_edits: std.ArrayList(LineEdit) = .empty;
+        for (planned_lines.items) |fe| {
+            if (std.mem.eql(u8, fe.edit.path, path)) try file_edits.append(ctx.alloc, fe.edit);
+        }
+        try plan.set(ctx.alloc, path, try splicedContent(ctx.alloc, try plan.bytesOf(ctx.alloc, path), file_edits.items));
+    }
+    try planRowEdits(ctx.alloc, &plan, planned_rows.items);
+    for (planned_syms.items) |o| try plan.set(ctx.alloc, o.edit.source_abs, try std.fmt.allocPrint(ctx.alloc, "{s}\n", .{o.edit.new_target}));
+    try planRowEdits(ctx.alloc, &plan, planned_gen_rows.items);
     for (synth_bases) |base_abs| {
         var splices: std.ArrayList(LineEdit) = .empty;
-        for (line_edits.items) |e| {
-            if (std.mem.eql(u8, e.path, base_abs)) try splices.append(ctx.alloc, e);
+        for (planned_lines.items) |o| {
+            if (std.mem.eql(u8, o.edit.path, base_abs)) try splices.append(ctx.alloc, o.edit);
         }
-        var plans: std.ArrayList(mox.classify.synth.Plan) = .empty;
         for (synth_plans.items) |sd| {
             if (!std.mem.eql(u8, sd.base_abs, base_abs)) continue;
-            try plans.append(ctx.alloc, sd.plan);
             try splices.append(ctx.alloc, .{
                 .path = base_abs,
                 .start = sd.plan.start,
@@ -1408,20 +1605,27 @@ pub fn commitImpl(
                 .new_lines = sd.plan.base_lines,
             });
         }
-        const base_content = try splicedContent(ctx.alloc, ctx.io, base_abs, splices.items);
-        try mox.classify.synth.materialize(ctx.alloc, ctx.io, base_abs, base_content, plans.items, ctx.err);
+        try plan.set(ctx.alloc, base_abs, try splicedContent(ctx.alloc, try plan.bytesOf(ctx.alloc, base_abs), splices.items));
+        for (synth_plans.items) |sd| {
+            if (std.mem.eql(u8, sd.base_abs, base_abs)) try plan.set(ctx.alloc, sd.plan.fragment_path, sd.plan.fragment_content);
+        }
     }
-    try applyCouplingEdits(ctx.alloc, ctx.io, coupling_edits);
-    // Struct edits touch source layers, independent of facts; sequential
-    // applyToLayer calls on the same layer accumulate correctly because each
-    // re-reads the file.
-    //
-    // A layer that rejects its edit fails only the file that edit was routed
-    // from: the file's remaining edits are abandoned and the verify loop below
-    // restores its sources from `routed_orig`. Letting the error propagate out
-    // of `run` instead would strand every write this phase already made -- this
-    // file's earlier keys and every unrelated file's -- unverified and with the
-    // applied record never advanced.
+    var coupled: std.ArrayList([]const u8) = .empty;
+    for (planned_couplings.items) |o| {
+        const path = o.edit.path;
+        if (isOneOf(path, coupled.items)) continue;
+        try coupled.append(ctx.alloc, path);
+        var content = try plan.bytesOf(ctx.alloc, path);
+        for (planned_couplings.items) |fo| {
+            if (std.mem.eql(u8, fo.edit.path, path)) content = try replaceToken(ctx.alloc, content, fo.edit.old, fo.edit.new);
+        }
+        try plan.set(ctx.alloc, path, content);
+    }
+    // A layer that refuses its key fails only the files that edit was routed
+    // from: their remaining keys are abandoned and the verify loop below
+    // restores their sources from the journal. Letting the error propagate
+    // out of `run` instead would leave every other file's routing unwritten
+    // and its applied record never advanced.
     //
     // A backstop, not the usual path: `recordStructPlacement` simulates each
     // placement by applying it for real and restoring, so a layer that will not
@@ -1430,11 +1634,41 @@ pub fn commitImpl(
     // trigger deterministically.
     const struct_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
     @memset(struct_failed, null);
-    for (struct_edits.items, struct_owners.items) |e, owner| {
-        if (struct_failed[owner] != null) continue;
-        commit_struct.applyToLayer(ctx.alloc, ctx.io, e.format, e.layer_abs, e.change) catch |err| {
-            struct_failed[owner] = @errorName(err);
+    for (planned_structs.items) |o| {
+        const live_owner = for (o.owners.items) |owner| {
+            if (struct_failed[owner.file] == null) break true;
+        } else false;
+        if (!live_owner) continue;
+        const pp = try plan.slot(ctx.alloc, o.edit.layer_abs);
+        pp.make_parent = true;
+        pp.bytes = commit_struct.layerBytes(ctx.alloc, o.edit.format, pp.bytes, o.edit.change) catch |err| {
+            for (o.owners.items) |owner| {
+                if (struct_failed[owner.file] == null) struct_failed[owner.file] = @errorName(err);
+            }
+            continue;
         };
+    }
+
+    // Write phase: each planned path once. A base with narrowings is written
+    // by `synth.materialize`, together with the fragments it creates.
+    for (plan.paths.items) |pp| {
+        if (isOneOf(pp.path, synth_bases)) {
+            var plans: std.ArrayList(mox.classify.synth.Plan) = .empty;
+            for (synth_plans.items) |sd| {
+                if (!std.mem.eql(u8, sd.base_abs, pp.path)) continue;
+                var fp = sd.plan;
+                fp.fragment_content = plan.get(fp.fragment_path).?;
+                try plans.append(ctx.alloc, fp);
+            }
+            try mox.classify.synth.materialize(ctx.alloc, ctx.io, pp.path, pp.bytes.?, plans.items, ctx.err);
+            continue;
+        }
+        if (isSynthFragment(pp.path, synth_plans.items)) continue;
+        const bytes = pp.bytes orelse continue;
+        if (pp.make_parent) {
+            if (std.fs.path.dirname(pp.path)) |parent| try Io.Dir.cwd().createDirPath(ctx.io, parent);
+        }
+        try Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = pp.path, .data = bytes });
     }
     try applyFactEdits(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items);
     // A fact write changes what `<machine.X>` interpolation resolves to for
@@ -1470,7 +1704,7 @@ pub fn commitImpl(
             false;
         if (!ok) {
             mismatch = true;
-            try restoreRouted(ctx.io, sym_backup.items);
+            try journal.restore(ctx.io, sym_paths.items);
             try ctx.err.print("mox commit: {f}: recomposed symlink target does not match; not committed\n", .{display.of(s.live_path, m_state.home)});
             continue;
         }
@@ -1516,7 +1750,7 @@ pub fn commitImpl(
 
         if (any_failed) {
             mismatch = true;
-            try restoreRouted(ctx.io, gen_data_backup.items);
+            try journal.restore(ctx.io, gen_paths.items);
             for (gen_leaf_commits.items, 0..) |gc, i| {
                 if (ok[i]) {
                     try ctx.err.print(
@@ -1553,7 +1787,7 @@ pub fn commitImpl(
             );
             mismatch = true;
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try journal.restore(ctx.io, owned_paths[fidx]);
             continue;
         }
         const configs = spaces[fidx].?.configs;
@@ -1563,11 +1797,7 @@ pub fn commitImpl(
             try ctx.err.print("mox commit: {f}: recompose failed; not committed: {s}\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
             mismatch = true;
             rolled_back[fidx] = true;
-            if (is_coupling) {
-                try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
-            } else {
-                try restoreRouted(ctx.io, routed_orig[fidx]);
-            }
+            try journal.restore(ctx.io, owned_paths[fidx]);
             continue;
         };
 
@@ -1579,7 +1809,7 @@ pub fn commitImpl(
                 try ctx.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, m_state.home)});
                 mismatch = true;
                 rolled_back[fidx] = true;
-                try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
+                try journal.restore(ctx.io, owned_paths[fidx]);
                 continue;
             }
             var after_per = (try impact.snapshot(ctx.alloc, ctx.io, file2, configs, &m_state, secrets)).per_config;
@@ -1592,7 +1822,7 @@ pub fn commitImpl(
                     );
                     mismatch = true;
                     rolled_back[fidx] = true;
-                    try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
+                    try journal.restore(ctx.io, owned_paths[fidx]);
                     continue;
                 }
                 after_per = pc.per;
@@ -1601,7 +1831,7 @@ pub fn commitImpl(
                 try reportViolation(ctx.err, file.source_base_abs, "coupled token update", configs[vi].label, after_per[vi].isUncomposable());
                 mismatch = true;
                 rolled_back[fidx] = true;
-                try restoreCouplingTarget(ctx.io, file.source_base_abs, coupling_orig[fidx]);
+                try journal.restore(ctx.io, owned_paths[fidx]);
                 continue;
             }
             // Synced safely; the applied record advances at the next apply.
@@ -1622,12 +1852,12 @@ pub fn commitImpl(
             // A file whose every change stayed manual or declined wrote
             // nothing, so its source composing to nothing here is how it
             // already stood, not something the routing did.
-            if (routed_orig[fidx].len == 0 and fact_backup[fidx].len == 0 and manual_hunks[fidx] + declined_hunks[fidx] > 0) {
+            if (owned_paths[fidx].len == 0 and fact_backup[fidx].len == 0 and manual_hunks[fidx] + declined_hunks[fidx] > 0) {
                 try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], false);
                 continue;
             }
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try journal.restore(ctx.io, owned_paths[fidx]);
             try ctx.err.print(
                 "mox commit: {s}: the edited sources no longer compose; not committed\n",
                 .{file.live_path},
@@ -1667,7 +1897,7 @@ pub fn commitImpl(
                     const pc = try partialPerConfig(ctx.alloc, configs, after_mixed, file);
                     if (pc.violation) |v| {
                         rolled_back[fidx] = true;
-                        try restoreRouted(ctx.io, routed_orig[fidx]);
+                        try journal.restore(ctx.io, owned_paths[fidx]);
                         try ctx.err.print(
                             "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
                             .{ file.live_path, v.label, v.leaf },
@@ -1678,7 +1908,7 @@ pub fn commitImpl(
                 }
                 if (candidates.firstViolation(configs, baseline[fidx], after_mixed, &allowed[fidx])) |vi| {
                     rolled_back[fidx] = true;
-                    try restoreRouted(ctx.io, routed_orig[fidx]);
+                    try journal.restore(ctx.io, owned_paths[fidx]);
                     try reportViolation(ctx.err, file.live_path, "routing", configs[vi].label, after_mixed[vi].isUncomposable());
                     continue;
                 }
@@ -1688,7 +1918,7 @@ pub fn commitImpl(
                 // not reproduce.
                 if (try unmatchedRoutedKey(ctx.alloc, struct_edits.items, struct_owners.items, fidx, composed.?, live)) |path| {
                     rolled_back[fidx] = true;
-                    try restoreRouted(ctx.io, routed_orig[fidx]);
+                    try journal.restore(ctx.io, owned_paths[fidx]);
                     try ctx.err.print(
                         "mox commit: {s}: routed key {s} does not recompose to its live value; not committed\n",
                         .{ file.live_path, try keyPathLabel(ctx.alloc, path) },
@@ -1721,7 +1951,7 @@ pub fn commitImpl(
             // itself is wrong. Either way this file is not committed, and "not
             // committed" leaves nothing behind.
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try journal.restore(ctx.io, owned_paths[fidx]);
             if (unrouted_hunks[fidx] > 0) {
                 try ctx.err.print(
                     "mox commit: {s}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
@@ -1743,7 +1973,7 @@ pub fn commitImpl(
             if (pc.violation) |v| {
                 mismatch = true;
                 rolled_back[fidx] = true;
-                try restoreRouted(ctx.io, routed_orig[fidx]);
+                try journal.restore(ctx.io, owned_paths[fidx]);
                 try ctx.err.print(
                     "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
                     .{ file.live_path, v.label, v.leaf },
@@ -1755,7 +1985,7 @@ pub fn commitImpl(
         if (candidates.firstViolation(configs, baseline[fidx], after_per, &allowed[fidx])) |vi| {
             mismatch = true;
             rolled_back[fidx] = true;
-            try restoreRouted(ctx.io, routed_orig[fidx]);
+            try journal.restore(ctx.io, owned_paths[fidx]);
             try reportViolation(ctx.err, file.live_path, "routing", configs[vi].label, after_per[vi].isUncomposable());
             continue;
         }
@@ -2110,27 +2340,6 @@ fn containsToken(toks: []const []const u8, tok: []const u8) bool {
     return false;
 }
 
-/// Apply coupling edits: in each target file, replace every occurrence of the
-/// old token with the new one. Grouped so a file is rewritten once.
-fn applyCouplingEdits(arena: std.mem.Allocator, io: Io, edits: []const CouplingEdit) !void {
-    var done: std.ArrayList([]const u8) = .empty;
-    for (edits) |e| {
-        var seen = false;
-        for (done.items) |p| {
-            if (std.mem.eql(u8, p, e.path)) seen = true;
-        }
-        if (seen) continue;
-        try done.append(arena, e.path);
-
-        var content = try Io.Dir.cwd().readFileAlloc(io, e.path, arena, .limited(max_file_bytes));
-        for (edits) |fe| {
-            if (!std.mem.eql(u8, fe.path, e.path)) continue;
-            content = try replaceToken(arena, content, fe.old, fe.new);
-        }
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = e.path, .data = content });
-    }
-}
-
 /// Replace only the occurrences of `old` in `content` that are themselves
 /// complete tokens: bounded by a non-token char or a string edge, matching how
 /// `coupling/tokens.zig` extracts tokens (a token is a maximal run of token
@@ -2239,24 +2448,6 @@ const CouplingImpact = struct {
     impact: impact.Impact,
     present_siblings: usize,
 };
-
-/// Roll a rejected coupling edit back to the source's pre-write bytes.
-fn restoreCouplingTarget(io: Io, path: []const u8, original: ?[]const u8) !void {
-    const bytes = original orelse return;
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
-}
-
-/// Record `path`'s pre-write state once, so a rejected routing can restore it.
-fn addBackup(arena: std.mem.Allocator, io: Io, list: *std.ArrayList(Backup), path: []const u8) !void {
-    for (list.items) |b| {
-        if (std.mem.eql(u8, b.path, path)) return;
-    }
-    const content: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
-        error.FileNotFound => null,
-        else => return e,
-    };
-    try list.append(arena, .{ .path = path, .content = content, .created_dir = mox.classify.synth.missingAncestor(io, path) });
-}
 
 /// Roll a rejected routing back to its sources' pre-write bytes: a file that
 /// existed regains its exact content, and one the synthesis created is removed
@@ -3127,16 +3318,6 @@ fn hasInterpolated(segments: []const Segment) bool {
 /// machine's target over structure another configuration depends on.
 fn isPlainLiteralTarget(segments: []const Segment) bool {
     return segments.len == 1 and segments[0].origin == .base;
-}
-
-/// Write every accepted symlink-target sync, one whole-file replace per
-/// source. Deferred to the write phase like every other route, so aborting
-/// mid-prompt still writes nothing.
-fn applySymlinkSyncs(arena: std.mem.Allocator, io: Io, syncs: []const SymSync) !void {
-    for (syncs) |s| {
-        const data = try std.fmt.allocPrint(arena, "{s}\n", .{s.new_target});
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = s.source_abs, .data = data });
-    }
 }
 
 /// A generator (`for ... into`, or `completions`) has no single live path of
@@ -5120,7 +5301,7 @@ fn withFact(arena: std.mem.Allocator, base: mox.machine.state.MachineState, name
 }
 
 /// Apply one line edit to `content` in memory, preserving its trailing-newline
-/// shape. Mirrors `applyLineEdits` for a single splice.
+/// shape. Mirrors `splicedContent` for a single splice.
 fn editedContent(arena: std.mem.Allocator, content: []const u8, edit: LineEdit) ![]u8 {
     const had_trailing_nl = content.len > 0 and content[content.len - 1] == '\n';
     var lines: std.ArrayList([]const u8) = .empty;
@@ -5313,36 +5494,10 @@ fn spliceDefault(arena: std.mem.Allocator, template: []const u8, inner: []const 
     return out.toOwnedSlice(arena);
 }
 
-/// Apply all line edits, grouped by physical file, so a file is rewritten once
-/// with every edit that targets it.
-fn applyLineEdits(arena: std.mem.Allocator, io: Io, edits: []const LineEdit) !void {
-    var done: std.ArrayList([]const u8) = .empty;
-    for (edits) |e| {
-        var seen = false;
-        for (done.items) |p| {
-            if (std.mem.eql(u8, p, e.path)) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) continue;
-        try done.append(arena, e.path);
-
-        var file_edits: std.ArrayList(LineEdit) = .empty;
-        for (edits) |fe| {
-            if (std.mem.eql(u8, fe.path, e.path)) try file_edits.append(arena, fe);
-        }
-        const content = try splicedContent(arena, io, e.path, file_edits.items);
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = e.path, .data = content });
-    }
-}
-
-/// `path`'s CURRENT bytes with every splice in `edits` applied. Each splice
-/// indexes the file's pre-write lines, so they are applied high-index-first: an
-/// earlier splice never shifts a later one's range. The trailing-newline shape
-/// is preserved.
-fn splicedContent(arena: std.mem.Allocator, io: Io, path: []const u8, edits: []const LineEdit) ![]const u8 {
-    const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes));
+/// `content` with every splice in `edits` applied. Each splice indexes the
+/// pre-write lines, so they are applied high-index-first: an earlier splice
+/// never shifts a later one's range. The trailing-newline shape is preserved.
+fn splicedContent(arena: std.mem.Allocator, content: []const u8, edits: []const LineEdit) ![]const u8 {
     const had_trailing_nl = content.len > 0 and content[content.len - 1] == '\n';
 
     var lines: std.ArrayList([]const u8) = .empty;
@@ -5378,45 +5533,40 @@ fn synthBases(arena: std.mem.Allocator, plans: []const SynthDecision) ![]const [
     return out.toOwnedSlice(arena);
 }
 
-/// The line edits that do NOT target one of `paths`. A base with narrowings is
-/// written by `synth.materialize` instead, in one pass with its region blocks.
-fn lineEditsExcluding(arena: std.mem.Allocator, edits: []const LineEdit, paths: []const []const u8) ![]const LineEdit {
-    var out: std.ArrayList(LineEdit) = .empty;
-    for (edits) |e| {
-        var excluded = false;
-        for (paths) |p| {
-            if (std.mem.eql(u8, p, e.path)) excluded = true;
-        }
-        if (!excluded) try out.append(arena, e);
+fn isOneOf(path: []const u8, paths: []const []const u8) bool {
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, path)) return true;
     }
-    return out.toOwnedSlice(arena);
+    return false;
+}
+
+fn isSynthFragment(path: []const u8, plans: []const SynthDecision) bool {
+    for (plans) |sd| {
+        if (std.mem.eql(u8, sd.plan.fragment_path, path)) return true;
+    }
+    return false;
 }
 
 fn cmpEditDesc(_: void, a: LineEdit, b: LineEdit) bool {
     return a.start > b.start;
 }
 
-/// Apply all row edits, grouped by data source, rewriting each changed
+/// Plan all row edits, grouped by data source, rewriting each changed
 /// `key = value` line in place.
-fn applyRowEdits(arena: std.mem.Allocator, io: Io, edits: []const RowEdit) !void {
+fn planRowEdits(arena: std.mem.Allocator, plan: *WritePlan, edits: []const Owned(RowEdit)) !void {
     var done: std.ArrayList([]const u8) = .empty;
-    for (edits) |e| {
-        var seen = false;
-        for (done.items) |p| {
-            if (std.mem.eql(u8, p, e.data_source)) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) continue;
+    for (edits) |o| {
+        const e = o.edit;
+        if (isOneOf(e.data_source, done.items)) continue;
         try done.append(arena, e.data_source);
 
-        var content = try Io.Dir.cwd().readFileAlloc(io, e.data_source, arena, .limited(max_file_bytes));
-        for (edits) |re| {
+        var content = try plan.bytesOf(arena, e.data_source);
+        for (edits) |ro| {
+            const re = ro.edit;
             if (!std.mem.eql(u8, re.data_source, e.data_source)) continue;
             content = try updateTomlRow(arena, content, re.stem, re.row, re.fields);
         }
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = e.data_source, .data = content });
+        try plan.set(arena, e.data_source, content);
     }
 }
 
@@ -5787,26 +5937,14 @@ test "updateTomlRow: changes only the target row's changed field" {
     try testing.expectEqualStrings(expected, out);
 }
 
-test "applyCouplingEdits: renames only complete-token occurrences, not superstrings" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+test "replaceToken: renames only complete-token occurrences, not superstrings" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    const target = try std.fs.path.join(a, &.{ base, "target" });
     // The coupled token appears standalone AND as the prefix of a longer token
     // (`coupledtoken_extra` is one token because `_` is a token char).
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = target, .data = "value = coupledtoken\nother = coupledtoken_extra\n" });
-
-    const edits = [_]CouplingEdit{.{ .path = target, .old = "coupledtoken", .new = "newtoken" }};
-    try applyCouplingEdits(a, io, &edits);
+    const got = try replaceToken(arena.allocator(), "value = coupledtoken\nother = coupledtoken_extra\n", "coupledtoken", "newtoken");
 
     // Only the standalone token is renamed; the superstring is left intact.
-    const got = try Io.Dir.cwd().readFileAlloc(io, target, a, .limited(max_file_bytes));
     try testing.expectEqualStrings("value = newtoken\nother = coupledtoken_extra\n", got);
 }
 

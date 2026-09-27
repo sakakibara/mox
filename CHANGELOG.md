@@ -265,6 +265,10 @@ All notable changes to mox are documented here. The format follows
   environment and left the rest to be inferred.
 
 ### Fixed
+- `commit` applies an identical edit once. A fragment included twice in a
+  file and edited the same way in both places produced two identical
+  edits, both applied, so a deleted line took the next one with it and the
+  file failed as "recomposed output still differs from live".
 - No non-interactive `commit` adopts content mox never wrote. A
   first-contact line already needed a human, but under `--yes` a
   first-contact file merged from layers had each key routed unasked, one no

@@ -1208,6 +1208,35 @@ test "commit: fragment edit routes to the fragment file" {
     try std.testing.expectEqualStrings("# top\n# mox: include \"extra.sh\"\n# bottom\n", base);
 }
 
+test "commit: a fragment included twice and edited identically in both places lands once and commits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myrc", "# top\n# mox: include \"extra.sh\"\n# mid\n# mox: include \"extra.sh\"\n# bottom\n");
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", "alias x=1\nalias y=2\nalias z=3\n");
+    const h = try setup(a, io, &tmp, .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".myrc");
+    try editLive(io, a, live, "alias x=1\n", "");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+
+    const frag = try read(io, a, try h.srcOf(".myrc.d/extra.sh"));
+    try std.testing.expectEqualStrings("alias y=2\nalias z=3\n", frag);
+    const base = try read(io, a, try h.srcOf(".myrc"));
+    try std.testing.expectEqualStrings("# top\n# mox: include \"extra.sh\"\n# mid\n# mox: include \"extra.sh\"\n# bottom\n", base);
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
 test "commit: edit to a line after a stripped pacifier routes to the right fragment line" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
