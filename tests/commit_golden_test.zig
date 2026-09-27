@@ -1062,3 +1062,219 @@ test "commit golden: a managed data file row edited through its loop and directl
     ;
     try expectGolden(a, io, h, res, &.{}, want);
 }
+
+test "commit golden: a partial file and a symlink committed in one run" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSymlinkFixture(io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own tui.keymap.global\n[tui.keymap.global]\nsubmit = \"enter\"\n");
+    const h = try setup(a, io, &tmp);
+    try applied(h);
+    const live = try h.liveOf("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "# program header\nmodel = \"gpt\"\n\n[tui.keymap.global]\nsubmit = \"enter\"\n\n[state]\ncount = 42\n" });
+    try applied(h);
+    try editLive(io, a, live, "submit = \"enter\"", "submit = \"ctrl-enter\"");
+    try relink(io, h, "mylink", "/tmp/mox-new-target");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    const want =
+        \\rc 0
+        \\--- stdout
+        \\  write app.toml tui.keymap.global.submit -> src/app.toml
+        \\  write src/mylink -> new symlink target /tmp/mox-new-target
+        \\  committed ~/mylink
+        \\  committed ~/app.toml
+        \\
+        \\mox commit: 2 routed, 0 coupled, 0 manual
+        \\--- stderr
+        \\--- repo
+        \\.mox/
+        \\== .mox/attributes.toml
+        \\["mylink"]
+        \\symlink = true
+        \\src/
+        \\== src/app.toml
+        \\# mox: own tui.keymap.global
+        \\[tui.keymap.global]
+        \\submit = "ctrl-enter"
+        \\== src/mylink
+        \\/tmp/mox-new-target
+        \\--- state
+        \\applied-owned/
+        \\applied-owned/{~/app.toml} c761451269f8dda9
+        \\applied-symlink/
+        \\applied-symlink/{~/mylink} f6c2be7f999ec9b8
+        \\coupling/
+        \\coupling/graph.json 353b9360c0adad2a
+        \\
+    ;
+    try expectGolden(a, io, h, res, &.{}, want);
+}
+
+test "commit golden: a loop row field edited beside a multi-line string holding a bracketed line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.tools", "# mox: for entry in \"data/tools.toml\"\ntool <entry.name>=\"<entry.cmd>\"\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/tools.toml", "[[tools]]\nname = \"rg\"\ndesc = \"\"\"\n[docs](https://x) see\n\"\"\"\ncmd = \"rg --smart-case\"\n\n[[tools]]\nname = \"fd\"\ncmd = \"fd --hidden\"\n");
+    const h = try setup(a, io, &tmp);
+    try applied(h);
+    try editLive(io, a, try h.liveOf(".tools"), "rg --smart-case", "rg --smart-case --hidden");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    const want =
+        \\rc 0
+        \\--- stdout
+        \\  update <ROOT>/repo/data/tools.toml row 0
+        \\  committed ~/.tools
+        \\
+        \\mox commit: 1 routed, 0 coupled, 0 manual
+        \\--- stderr
+        \\--- repo
+        \\data/
+        \\== data/tools.toml
+        \\[[tools]]
+        \\name = "rg"
+        \\desc = """
+        \\[docs](https://x) see
+        \\"""
+        \\cmd = "rg --smart-case --hidden"
+        \\
+        \\[[tools]]
+        \\name = "fd"
+        \\cmd = "fd --hidden"
+        \\src/
+        \\== src/.tools
+        \\# mox: for entry in "data/tools.toml"
+        \\tool <entry.name>="<entry.cmd>"
+        \\# mox: end
+        \\--- state
+        \\applied/
+        \\applied-content/
+        \\applied-content/{~/.tools} 599c3cd5917ae432
+        \\applied/{~/.tools} f157d9a8036dc152
+        \\coupling/
+        \\coupling/graph.json 353b9360c0adad2a
+        \\provenance/
+        \\provenance/{~/.tools} 50f0c6bdcb6b589f
+        \\
+    ;
+    try expectGolden(a, io, h, res, &.{}, want);
+}
+
+test "commit golden: one file with two loops over one data source, one loop line edited" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.hosts", "# mox: for entry in \"data/abbrs.toml\"\nhost <entry.key>\n# mox: end\n# mox: for entry in \"data/abbrs.toml\"\nalias <entry.expansion>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", abbrs_data);
+    const h = try setup(a, io, &tmp);
+    try applied(h);
+    try editLive(io, a, try h.liveOf(".hosts"), "alias git status\n", "alias git status -sb\n");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    const want =
+        \\rc 0
+        \\--- stdout
+        \\  update <ROOT>/repo/data/abbrs.toml row 1
+        \\  committed ~/.hosts
+        \\
+        \\mox commit: 1 routed, 0 coupled, 0 manual
+        \\--- stderr
+        \\--- repo
+        \\data/
+        \\== data/abbrs.toml
+        \\[[abbrs]]
+        \\key = "ll"
+        \\expansion = "ls -l"
+        \\
+        \\[[abbrs]]
+        \\key = "gs"
+        \\expansion = "git status -sb"
+        \\src/
+        \\== src/.hosts
+        \\# mox: for entry in "data/abbrs.toml"
+        \\host <entry.key>
+        \\# mox: end
+        \\# mox: for entry in "data/abbrs.toml"
+        \\alias <entry.expansion>
+        \\# mox: end
+        \\--- state
+        \\applied/
+        \\applied-content/
+        \\applied-content/{~/.hosts} da58489fa57654f3
+        \\applied/{~/.hosts} f4dfafc67243ea17
+        \\coupling/
+        \\coupling/graph.json 353b9360c0adad2a
+        \\provenance/
+        \\provenance/{~/.hosts} 0cb34f6197657b9c
+        \\
+    ;
+    try expectGolden(a, io, h, res, &.{}, want);
+}
+
+test "commit golden: a bare field capture under a loop variable not named entry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for h in \"data/abbrs.toml\"\nabbr <key>=\"<expansion>\"\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", abbrs_data);
+    const h = try setup(a, io, &tmp);
+    try applied(h);
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    const want =
+        \\rc 0
+        \\--- stdout
+        \\  update <ROOT>/repo/data/abbrs.toml row 1
+        \\  committed ~/.abbrs
+        \\
+        \\mox commit: 1 routed, 0 coupled, 0 manual
+        \\--- stderr
+        \\--- repo
+        \\data/
+        \\== data/abbrs.toml
+        \\[[abbrs]]
+        \\key = "ll"
+        \\expansion = "ls -l"
+        \\
+        \\[[abbrs]]
+        \\key = "gs"
+        \\expansion = "git status -sb"
+        \\src/
+        \\== src/.abbrs
+        \\# mox: for h in "data/abbrs.toml"
+        \\abbr <key>="<expansion>"
+        \\# mox: end
+        \\--- state
+        \\applied/
+        \\applied-content/
+        \\applied-content/{~/.abbrs} 759912bfca82a599
+        \\applied/{~/.abbrs} f4890857d20b2cd7
+        \\coupling/
+        \\coupling/graph.json 353b9360c0adad2a
+        \\provenance/
+        \\provenance/{~/.abbrs} c7296b38c1ab9bf9
+        \\
+    ;
+    try expectGolden(a, io, h, res, &.{}, want);
+}
