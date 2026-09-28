@@ -204,9 +204,9 @@ pub fn schemaLeftoverNotice(arena: std.mem.Allocator, io: Io, repo_dir: []const 
 
 /// Capture a snapshot of the current machine state.
 ///
-/// Reads OS/arch from the build (overridable via `MOX_OS`/`MOX_ARCH`, so the
-/// os/arch axes are injectable), hostname from the OS, identity and named
-/// paths from `environ`, and probes tool availability against `$PATH` plus
+/// Reads OS/arch from the build and hostname from the OS (overridable via
+/// `MOX_OS`/`MOX_ARCH`/`MOX_HOSTNAME`, so those axes are injectable), identity
+/// and named paths from `environ`, and probes tool availability against `$PATH` plus
 /// this repo's `data/paths.toml` registry. `repo_dir`/`private_dir` locate
 /// the repo's `data/facts.toml` (derived facts) and `data/paths.toml`
 /// (probe-widening registry); pass `""` for either when no repo is in scope
@@ -249,7 +249,7 @@ pub fn captureWith(
     // name comes from the environment there, as the username and home do.
     var hostname_buf: [if (builtin.os.tag == .windows) 0 else std.posix.HOST_NAME_MAX]u8 = undefined;
     var hostname_fallback = false;
-    const hostname_slice: []const u8 = if (builtin.os.tag == .windows)
+    const hostname_slice: []const u8 = envOr(arena, environ, "MOX_HOSTNAME") orelse if (builtin.os.tag == .windows)
         (envOr(arena, environ, "COMPUTERNAME") orelse blk: {
             hostname_fallback = true;
             break :blk "unknown";
@@ -427,6 +427,20 @@ test "capture: USER and USERNAME unset falls back to \"unknown\" and flags usern
     // or COMPUTERNAME seeded above on Windows); only the flag is asserted
     // false here, since forcing a real hostname-lookup failure needs no
     // portable seam.
+    try std.testing.expect(!m.hostname_fallback);
+}
+
+test "capture: MOX_HOSTNAME stands in for the machine's own hostname" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = EnvironMap.init(a);
+    try map.put("HOME", "/home/whoever");
+    try map.put("COMPUTERNAME", "testhost");
+    try map.put("MOX_HOSTNAME", "pinned.example.test");
+
+    const m = try capture(a, std.testing.io, Environ{ .map = &map }, "", "");
+    try std.testing.expectEqualStrings("pinned.example.test", m.hostname);
     try std.testing.expect(!m.hostname_fallback);
 }
 

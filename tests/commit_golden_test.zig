@@ -10,14 +10,19 @@ const Harness = testutil.Harness;
 const repo_exclusions = [_][]const u8{".git"};
 const state_exclusions = [_][]const u8{"bin"};
 
+// A transcript holds what a capture renders and digests of state that
+// records it, so the hostname is pinned like os and arch. Dotted, so the
+// machine label is a different string from the hostname it comes from.
+const hostname_env = [_]testutil.EnvPair{.{ .name = "MOX_HOSTNAME", .value = "golden-host.example.test" }};
+
 fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !Harness {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    return testutil.setup(a, io, tmp, .{ .os = "darwin", .arch = "aarch64" });
+    return setupEnv(a, io, tmp, &.{});
 }
 
 fn setupEnv(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, extra_env: []const testutil.EnvPair) !Harness {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    return testutil.setup(a, io, tmp, .{ .os = "darwin", .arch = "aarch64", .extra_env = extra_env });
+    const env = try std.mem.concat(a, testutil.EnvPair, &.{ &hostname_env, extra_env });
+    return testutil.setup(a, io, tmp, .{ .os = "darwin", .arch = "aarch64", .extra_env = env });
 }
 
 fn writeRepo(io: Io, tmp: *std.testing.TmpDir, sub: []const u8, content: []const u8) !void {
@@ -731,7 +736,7 @@ test "commit golden: a routed hunk beside a manual hunk in one file" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/.zshrc} b7c91210a67218b5
-        \\applied/{~/.zshrc} c9313a9d96988ea9
+        \\applied/{~/.zshrc} f6939892ddff9ddc
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
