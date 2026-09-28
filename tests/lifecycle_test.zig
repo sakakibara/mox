@@ -3321,7 +3321,7 @@ test "status and diff: a FIFO at a live path is an ERROR line, never opened" {
     try std.testing.expect(std.mem.indexOf(u8, df.out, "healthy.conf") != null);
 }
 
-test "commit: a FIFO at a recorded live path is skipped, never opened" {
+test "commit: a FIFO at a recorded live path is manual, never opened, and exits 1" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3341,11 +3341,76 @@ test "commit: a FIFO at a recorded live path is skipped, never opened" {
     var guard = try FifoGuard.start(a, io, live);
     defer guard.stop(io);
 
-    const r = try h.run(&.{ "mox", "commit" });
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "skipped (not a regular file)") != null);
+    const manual = try std.fmt.allocPrint(a, "  manual: ~{c}.zshrc (not a regular file)\n", .{std.fs.path.sep});
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\nmox commit: 0 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual}), dry.out);
+    try std.testing.expectEqualStrings("", dry.err);
+    const r = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\nmox commit: 0 routed, 0 coupled, 1 manual\n", .{manual}), r.out);
+    try std.testing.expectEqualStrings("", r.err);
     // The source is untouched.
     try std.testing.expectEqualStrings("ok\n", try read(io, a, try h.srcOf(".zshrc")));
+}
+
+test "commit: a FIFO at a recorded generator leaf is manual, never opened, and exits 1" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/entries.toml", "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("id-a.inc");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, live), 0o644));
+    var guard = try FifoGuard.start(a, io, live);
+    defer guard.stop(io);
+
+    const r = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "  manual: ~{c}id-a.inc (not a regular file)\n\nmox commit: 0 routed, 0 coupled, 1 manual\n", .{std.fs.path.sep}), r.out);
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqualStrings("[[entries]]\nslug = \"a\"\nvalue = \"1\"\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+}
+
+test "commit: a FIFO at a recorded symlink path is manual, never opened, and exits 1" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no FIFOs
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/mylink", "/tmp/mox-old-target\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"mylink\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf("mylink");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, live), 0o644));
+    var guard = try FifoGuard.start(a, io, live);
+    defer guard.stop(io);
+
+    const manual = try std.fmt.allocPrint(a, "  manual: ~{c}mylink (not a regular file)\n", .{std.fs.path.sep});
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\nmox commit: 0 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual}), dry.out);
+    try std.testing.expectEqualStrings("", dry.err);
+    const r = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\nmox commit: 0 routed, 0 coupled, 1 manual\n", .{manual}), r.out);
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqualStrings("/tmp/mox-old-target\n", try read(io, a, try h.srcOf("mylink")));
 }
 
 test "doctor: an attributes entry no managed target derives is an advisory" {

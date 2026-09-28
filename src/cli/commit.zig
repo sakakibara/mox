@@ -56,6 +56,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
 const app = @import("app.zig");
+const paths_mod = @import("paths.zig");
 const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const prompt = @import("prompt.zig");
@@ -221,6 +222,8 @@ const ClassCtx = struct {
     sty: style.Style,
     /// What the narrowings accepted earlier in this run will create.
     claims: *Claims,
+    /// Where a failed simulation revert saves its recovery copies.
+    paths: paths_mod.Paths,
 };
 
 /// Mutable per-run tallies and output collectors the per-hunk pipeline
@@ -246,6 +249,9 @@ const RunAccum = struct {
     manual_count: *usize,
     routed_count: *usize,
     pending: *bool,
+    /// Accepted so far, for threading a struct placement as the plan will.
+    sym_syncs: *const std.ArrayList(SymSync),
+    generated: *const LeafRowEdits,
 };
 
 /// What the caller of `processHunk` does next: keep going, or unwind the
@@ -345,11 +351,76 @@ const Journal = struct {
         const top = b.created_dir orelse return;
         var dir = std.fs.path.dirname(path);
         while (dir) |d| : (dir = std.fs.path.dirname(d)) {
-            Io.Dir.cwd().deleteDir(io, d) catch return;
+            Io.Dir.cwd().deleteDir(io, d) catch |e| switch (e) {
+                // Holding something else, or already gone: not the write's.
+                error.DirNotEmpty, error.FileNotFound => return,
+                else => return e,
+            };
             if (std.mem.eql(u8, d, top)) return;
         }
     }
 };
+
+/// The scope of one transient simulation write: each path it writes is
+/// journaled before the write and put back after it by the journal's restore
+/// rules, so a path that did not exist leaves no directory behind. A restore
+/// that fails stops the run: every other one is still made, each failure is
+/// named, and the pre-run bytes are saved as a failed settle saves them.
+const SimJournal = struct {
+    journal: Journal,
+    ids: PathIds,
+
+    fn init(cc: *const ClassCtx) SimJournal {
+        return .{ .journal = .init(cc.arena), .ids = .init(cc.arena, cc.io) };
+    }
+
+    /// Journal `path` before its first transient write; its pre-run bytes,
+    /// or null when it does not exist.
+    fn record(s: *SimJournal, cc: *const ClassCtx, path: []const u8) !?[]const u8 {
+        const canonical = try s.ids.of(path);
+        try s.journal.record(cc.arena, cc.io, canonical);
+        return s.journal.entries.get(canonical).?.content;
+    }
+
+    /// Put every journaled path back; `error.SimulationNotRestored` once one
+    /// could not be, after its report.
+    fn restore(s: *SimJournal, cc: *const ClassCtx) !void {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var it = s.journal.entries.keyIterator();
+        while (it.next()) |p| try paths.append(cc.arena, p.*);
+        std.mem.sort([]const u8, paths.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        var failures: std.ArrayList(RestoreFailure) = .empty;
+        var at_pre_run = std.StringHashMap(void).init(cc.arena);
+        for (paths.items) |p| {
+            s.journal.restore(cc.io, p) catch |e| {
+                try failures.append(cc.arena, .{ .path = p, .cause = e });
+                continue;
+            };
+            try at_pre_run.put(p, {});
+        }
+        if (failures.items.len == 0) return;
+        try saveRecovery(recoveryOf(cc), &s.journal, &s.ids, &at_pre_run, failures.items, cc.m_state.home);
+        return error.SimulationNotRestored;
+    }
+
+    /// Stop the run after a transient write to `path` failed with `cause`:
+    /// name it, and put every journaled path back as a failed write phase
+    /// does. Always an error: `error.SimulationWriteFailed` once reported.
+    fn stopAfterWrite(s: *SimJournal, cc: *const ClassCtx, path: []const u8, cause: anyerror) anyerror {
+        try cc.stdout.flush();
+        try cc.err.print("mox commit: could not write {f} ({s})\n", .{ display.of(path, cc.m_state.home), @errorName(cause) });
+        try restoreJournal(recoveryOf(cc), &s.journal, &s.ids, cc.m_state.home);
+        return error.SimulationWriteFailed;
+    }
+};
+
+fn recoveryOf(cc: *const ClassCtx) RecoveryCtx {
+    return .{ .alloc = cc.arena, .io = cc.io, .out = cc.stdout, .err = cc.err, .paths = cc.paths };
+}
 
 /// `path` by the file it names, so two spellings of one file are one path: an
 /// existing path as the OS resolves it (symlinks, `.` and `..`, the on-disk
@@ -1007,6 +1078,31 @@ pub fn commitImpl(
     color: style.ColorFlag,
     paths: []const []const u8,
 ) anyerror!u8 {
+    var package_rows: usize = 0;
+    return commitRun(ctx, dry_run, yes, abort_on_prompt, color, paths, &package_rows) catch |e| {
+        switch (e) {
+            // A simulation's transient write failed or could not be
+            // reverted; its report is already printed.
+            error.SimulationNotRestored, error.SimulationWriteFailed => {},
+            else => try ctx.err.print("mox: error: {s}\n", .{@errorName(e)}),
+        }
+        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{package_rows});
+        try ctx.err.flush();
+        return 2;
+    };
+}
+
+/// `commitImpl`'s run; `package_rows` is set to the package rows recorded
+/// once they are.
+fn commitRun(
+    ctx: *app.Ctx,
+    dry_run: bool,
+    yes: bool,
+    abort_on_prompt: bool,
+    color: style.ColorFlag,
+    paths: []const []const u8,
+    package_rows: *usize,
+) anyerror!u8 {
     const context = ctx.context.?;
     const sty = style.Style{ .on = style.enabled(
         tty.isInteractive(1),
@@ -1182,6 +1278,8 @@ pub fn commitImpl(
         return 1;
     }
 
+    package_rows.* = pkgs.added + pkgs.blacklisted;
+
     var claims: Claims = .empty;
 
     const cc: ClassCtx = .{
@@ -1200,6 +1298,7 @@ pub fn commitImpl(
         .interactive = interactive,
         .sty = sty,
         .claims = &claims,
+        .paths = context.paths,
     };
 
     var line_edits: std.ArrayList(LineEdit) = .empty;
@@ -1277,9 +1376,17 @@ pub fn commitImpl(
         .manual_count = &manual_count,
         .routed_count = &routed_count,
         .pending = &pending,
+        .sym_syncs = &sym_syncs,
+        .generated = &generated,
     };
 
+    // Each file's routes, so a dry run can take back those of a file the
+    // plan would fail.
+    const file_routed = try ctx.alloc.alloc(usize, tree.files.len);
+    @memset(file_routed, 0);
     files: for (tree.files, 0..) |file, fidx| {
+        const routed_before = routed_count;
+        defer file_routed[fidx] += routed_count - routed_before;
         if (scoped_live) |set| {
             if (!set.contains(file.live_path)) continue;
         }
@@ -1287,6 +1394,7 @@ pub fn commitImpl(
         // can be routed; skip it with the diagnosis and keep committing.
         if (file.head_error.len > 0) {
             try ctx.err.print("mox commit: {f}: skipped ({s})\n", .{ display.of(file.live_path, m_state.home), file.head_error });
+            if (try editedSinceRecord(ctx.alloc, ctx.io, context.paths.state_dir, file)) pending = true;
             continue;
         }
 
@@ -1299,6 +1407,7 @@ pub fn commitImpl(
             var gdiag: mox.compose.interp.Diag = .{};
             const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &gdiag) catch |e| {
                 try ctx.err.print("mox commit: {f}: generator failed to re-expand: {s}\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
+                pending = true;
                 continue;
             };
             if (gen) |outputs| {
@@ -1358,7 +1467,7 @@ pub fn commitImpl(
         // Kind guard BEFORE the open: a FIFO here would block the read and
         // brick the whole commit.
         if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
-            try ctx.err.print("mox commit: {f}: skipped (not a regular file)\n", .{display.of(file.live_path, m_state.home)});
+            try reportSpecial(&cc, &ra, file.live_path, fidx, recorded != null);
             continue;
         }
         const live = Io.Dir.cwd().readFileAlloc(ctx.io, file.live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -1449,6 +1558,10 @@ pub fn commitImpl(
             },
             else => return e,
         };
+        if (hunks.len == 0) {
+            try finalNewlineManual(&cc, &ra, file.live_path, fidx);
+            continue;
+        }
 
         // A Cat-A file that merged overlays routes by key path over the
         // REPO-WIDE configuration space (a fall-through machine another file's
@@ -1500,6 +1613,7 @@ pub fn commitImpl(
 
     if (strict_abort) {
         try ctx.err.writeAll("mox commit: --abort-on-prompt: a prompt was required; nothing written\n");
+        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
         return 2;
     }
     if (aborted) {
@@ -1519,29 +1633,6 @@ pub fn commitImpl(
     else
         .init(ctx.alloc, &ids);
 
-    if (report_mode) {
-        // Report the coupling updates a real commit would offer for the routed
-        // renames, honoring declines. Nothing is written; each pending update
-        // counts toward the "edits remain" exit code.
-        const coupled = if (couples) try reportCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, &accepted, bases, &protected, ctx.out, ctx.err) else 0;
-        if (coupled > 0) pending = true;
-        if (pkgs.pending()) pending = true;
-        if (routed_count == 0 and manual_count == 0 and coupled == 0 and skipped_secret == 0 and !pkgs.pending()) {
-            try ctx.out.writeAll("mox commit: nothing to commit\n");
-        } else if (skipped_secret > 0) {
-            try ctx.out.print(
-                "\nmox commit: {d} routable, {d} coupled, {d} manual, {d} skipped (report only; run without --dry-run on a terminal to apply)\n",
-                .{ routed_count, coupled, manual_count, skipped_secret },
-            );
-        } else {
-            try ctx.out.print(
-                "\nmox commit: {d} routable, {d} coupled, {d} manual (report only; run without --dry-run on a terminal to apply)\n",
-                .{ routed_count, coupled, manual_count },
-            );
-        }
-        return if (pending) 1 else 0;
-    }
-
     // F-coupling: a token a routed edit changed may live in other managed
     // sources; offer to update them in the same write pass. Runs after routing
     // (final edits known) and before any write (abort still writes nothing). A
@@ -1550,7 +1641,7 @@ pub fn commitImpl(
     var coupling_edits: []const CouplingEdit = &.{};
     var coupling_origins: []const usize = &.{};
     if (couples) {
-        const cres = try resolveCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, line_owners.items, &accepted, bases, &protected, ask_mode, input, ctx.out, ctx.err);
+        const cres = try resolveCoupling(ctx.alloc, ctx.io, coupling_dir, line_edits.items, line_owners.items, &accepted, bases, &protected, if (report_mode) .report_only else ask_mode, input, ctx.out, ctx.err);
         if (cres.abort) aborted = true;
         if (cres.abort_strict) strict_abort = true;
         // A q-abort (or strict-mode prompt) must persist nothing: the decline
@@ -1562,6 +1653,7 @@ pub fn commitImpl(
 
     if (strict_abort) {
         try ctx.err.writeAll("mox commit: --abort-on-prompt: a prompt was required; nothing written\n");
+        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
         return 2;
     }
     if (aborted) {
@@ -1569,23 +1661,16 @@ pub fn commitImpl(
         return 1;
     }
 
-    // Every edit's path by the file it names, so the journal, the plan, the
-    // restores and the ownership rule see two spellings of one file as one
-    // path. A coupled update's target is found by the path it was offered
-    // for, which is a managed file's base as the tree spells it.
-    for (line_edits.items) |*e| e.path = try ids.of(e.path);
-    for ([_][]RowEdit{ row_edits.items, generated.row_edits.items }) |list| for (list) |*e| {
-        e.data_source = try ids.of(e.data_source);
-        const splices = try ctx.alloc.dupe(LineEdit, e.splices);
-        for (splices) |*sp| sp.path = e.data_source;
-        e.splices = splices;
-    };
-    for (sym_syncs.items) |*e| e.source_abs = try ids.of(e.source_abs);
-    for (synth_plans.items) |*sd| {
-        sd.base_abs = try ids.of(sd.base_abs);
-        sd.plan.fragment_path = try ids.of(sd.plan.fragment_path);
-    }
-    for (struct_edits.items) |*e| e.layer_abs = try ids.of(e.layer_abs);
+    // A coupled update's target is found by the path it was offered for,
+    // which is a managed file's base as the tree spells it.
+    try canonicalizeRouted(ctx.alloc, &ids, .{
+        .lines = line_edits.items,
+        .rows = row_edits.items,
+        .leaf_rows = generated.row_edits.items,
+        .syms = sym_syncs.items,
+        .synths = synth_plans.items,
+        .structs = struct_edits.items,
+    });
     // Each coupled update's targets, by its canonical path, and back: every
     // managed file whose base is that file, however it is linked.
     var coupling_targets = std.StringHashMap([]const usize).init(ctx.alloc);
@@ -1674,28 +1759,20 @@ pub fn commitImpl(
     // Every planned edit with the units that produced it; identical edits
     // are one. A coupled update is owned by the files whose line edits
     // produced its rename; the file whose base it rewrites is its target.
-    // A row write is its field splices, planned with the line splices, so an
-    // identical write from two loops, a loop and a leaf, or a loop and the
-    // data file's own line edit is one edit owned by both.
-    var planned_lines: std.ArrayList(Owned(LineEdit)) = .empty;
-    for (line_edits.items, line_owners.items) |e, owner| try addOwned(LineEdit, ctx.alloc, &planned_lines, e, &.{.{ .file = owner }}, lineEditEql);
-    for (row_edits.items, row_owners.items) |e, owner| for (e.splices) |sp| {
-        try addOwned(LineEdit, ctx.alloc, &planned_lines, sp, &.{.{ .file = owner }}, lineEditEql);
+    const routed: Routed = .{
+        .lines = line_edits.items,
+        .rows = row_edits.items,
+        .leaf_rows = generated.row_edits.items,
+        .syms = sym_syncs.items,
+        .synths = synth_plans.items,
+        .structs = struct_edits.items,
     };
-    for (generated.row_edits.items, generated.row_leaves.items) |e, li| for (e.splices) |sp| {
-        try addOwned(LineEdit, ctx.alloc, &planned_lines, sp, &.{.{ .leaf = li }}, lineEditEql);
-    };
-    var planned_structs: std.ArrayList(Owned(StructEdit)) = .empty;
-    for (struct_edits.items, struct_owners.items) |e, owner| try addOwned(StructEdit, ctx.alloc, &planned_structs, e, &.{.{ .file = owner }}, structEditEql);
+    const planned = try collectPlanned(ctx.alloc, routed, line_owners.items, row_owners.items, generated.row_leaves.items, struct_owners.items);
+    const planned_lines = planned.lines;
+    const planned_structs = planned.structs;
+    const planned_syms = planned.syms;
     var planned_couplings: std.ArrayList(Owned(CouplingEdit)) = .empty;
     for (coupling_edits, coupling_origins) |e, origin| try addOwned(CouplingEdit, ctx.alloc, &planned_couplings, e, &.{.{ .file = origin }}, couplingEditEql);
-    // Syncs are not merged: each symlink's sync writes its own source.
-    var planned_syms: std.ArrayList(Owned(SymSync)) = .empty;
-    for (sym_syncs.items, 0..) |e, i| {
-        var owners: std.ArrayList(Unit) = .empty;
-        try owners.append(ctx.alloc, .{ .symlink = i });
-        try planned_syms.append(ctx.alloc, .{ .edit = e, .owners = owners });
-    }
 
     // Whether a file's own changes wrote anything (a source or a fact), as
     // distinct from a coupled update another file's edit made to it.
@@ -1712,60 +1789,16 @@ pub fn commitImpl(
     for (fact_owners.items) |owner| wrote_own[owner] = true;
 
     // Every written path, journaled before any write.
-    var to_journal: std.ArrayList([]const u8) = .empty;
-    for (planned_lines.items) |o| try to_journal.append(ctx.alloc, o.edit.path);
-    for (planned_syms.items) |o| try to_journal.append(ctx.alloc, o.edit.source_abs);
-    for (synth_plans.items) |sd| try to_journal.appendSlice(ctx.alloc, &.{ sd.base_abs, sd.plan.fragment_path });
-    for (planned_structs.items) |o| try to_journal.append(ctx.alloc, o.edit.layer_abs);
-    if (fact_edits.items.len > 0) try to_journal.append(ctx.alloc, context.paths.facts_path);
-    for (to_journal.items) |path| journal.record(ctx.alloc, ctx.io, path) catch |e|
-        return stopUnreadable(ctx, display.of(ids.shown(path), m_state.home), e, pkgs.added + pkgs.blacklisted);
+    var unreadable: []const u8 = "";
+    journalPlanned(ctx.alloc, ctx.io, &journal, planned, synth_plans.items, if (fact_edits.items.len > 0) context.paths.facts_path else null, &unreadable) catch |e|
+        return stopUnreadable(ctx, display.of(ids.shown(unreadable), m_state.home), e, pkgs.added + pkgs.blacklisted);
 
     // Plan: every prompt is done, so each written path's final bytes are
     // computed in memory from its journaled pre-run bytes, threading its
     // edits in write order: line splices and row writes in one pass, symlink
     // targets, narrowings, coupling renames, struct keys.
-    //
-    // A narrowing's region block is a line SPLICE of the base like any other
-    // edit, so a base with narrowings takes its ordinary line edits and every
-    // region block together, in one splice. A universal hunk and a narrowed
-    // hunk in one file therefore both land, and neither reverts the other.
     var plan: WritePlan = .{ .paths = .empty, .journal = &journal };
-    const synth_bases = try synthBases(ctx.alloc, synth_plans.items);
-    var spliced: std.ArrayList([]const u8) = .empty;
-    for (planned_lines.items) |o| {
-        const path = o.edit.path;
-        if (isOneOf(path, synth_bases) or isOneOf(path, spliced.items)) continue;
-        try spliced.append(ctx.alloc, path);
-        var file_edits: std.ArrayList(LineEdit) = .empty;
-        for (planned_lines.items) |fe| {
-            if (std.mem.eql(u8, fe.edit.path, path)) try file_edits.append(ctx.alloc, fe.edit);
-        }
-        try plan.set(ctx.alloc, path, try splicedContent(ctx.alloc, try plan.bytesOf(ctx.alloc, path), file_edits.items));
-    }
-    for (planned_syms.items) |o| try plan.set(ctx.alloc, o.edit.source_abs, try std.fmt.allocPrint(ctx.alloc, "{s}\n", .{o.edit.new_target}));
-    for (synth_bases) |base_abs| {
-        var splices: std.ArrayList(LineEdit) = .empty;
-        for (planned_lines.items) |o| {
-            if (std.mem.eql(u8, o.edit.path, base_abs)) try splices.append(ctx.alloc, o.edit);
-        }
-        for (synth_plans.items) |sd| {
-            if (!std.mem.eql(u8, sd.base_abs, base_abs)) continue;
-            try splices.append(ctx.alloc, .{
-                .path = base_abs,
-                .start = sd.plan.start,
-                .del = sd.plan.del,
-                .new_lines = sd.plan.base_lines,
-            });
-        }
-        try plan.set(ctx.alloc, base_abs, try splicedContent(ctx.alloc, try plan.bytesOf(ctx.alloc, base_abs), splices.items));
-        for (synth_plans.items) |sd| {
-            if (!std.mem.eql(u8, sd.base_abs, base_abs)) continue;
-            const fragment = try plan.slot(ctx.alloc, sd.plan.fragment_path);
-            fragment.bytes = sd.plan.fragment_content;
-            fragment.make_parent = true;
-        }
-    }
+    try planBeforeRenames(ctx.alloc, &plan, planned, synth_plans.items);
 
     // A coupled update that changes nothing in its path's bytes as planned so
     // far (the target's own edit already made it) is not an edit: it has no
@@ -1813,8 +1846,16 @@ pub fn commitImpl(
     // user chose. Each file's configuration space was built once, from its
     // own source, when it was first classified above.
     const baseline = try ctx.alloc.alloc([]const impact.ConfigOutput, tree.files.len);
+    @memset(baseline, &.{});
+    // A dry run collects its routes without marking the files they come from
+    // affected; those are the files `--yes` would snapshot.
+    const snapshotted = try ctx.alloc.dupe(bool, affected);
+    if (report_mode) {
+        for (line_owners.items) |owner| snapshotted[owner] = true;
+        for (row_owners.items) |owner| snapshotted[owner] = true;
+    }
     for (tree.files, 0..) |file, fidx| {
-        if (!affected[fidx] and !coupling_only[fidx]) continue;
+        if (!snapshotted[fidx] and !coupling_only[fidx]) continue;
         const space = spaces[fidx].?;
         baseline[fidx] = if (coupling_only[fidx])
             coupling_baseline[fidx]
@@ -1855,58 +1896,18 @@ pub fn commitImpl(
     }
     // A layer that refuses its key fails the files that edit was routed from,
     // and the edit is left out; settling below restores their sources.
-    //
-    // A backstop, not the usual path: `recordStructPlacement` simulates each
-    // placement by applying it for real and restoring, so a layer that will not
-    // take the edit is normally caught at prompt time and reported per key.
-    // Reaching here means the source changed under the run, which no test can
-    // trigger deterministically.
     const struct_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
     @memset(struct_failed, null);
-    for (planned_structs.items) |o| {
-        const live_owner = for (o.owners.items) |owner| {
-            if (struct_failed[owner.file] == null) break true;
-        } else false;
-        if (!live_owner) continue;
-        const pp = try plan.slot(ctx.alloc, o.edit.layer_abs);
-        pp.make_parent = true;
-        pp.bytes = commit_struct.layerBytes(ctx.alloc, o.edit.format, pp.bytes, o.edit.change) catch |err| {
-            for (o.owners.items) |owner| {
-                if (struct_failed[owner.file] == null) struct_failed[owner.file] = @errorName(err);
-            }
-            continue;
-        };
-    }
+    try planStructs(ctx.alloc, &plan, planned_structs.items, struct_failed);
 
-    var writing: []const u8 = "";
-    writePlan(ctx, &plan, context.paths.facts_path, fact_edits.items, &writing) catch |e| {
-        try ctx.out.flush();
-        try ctx.err.print("mox commit: could not write {f} ({s})\n", .{ display.of(ids.shown(writing), m_state.home), @errorName(e) });
-        try restoreJournal(ctx, &journal, &ids, m_state.home);
-        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
-        try ctx.err.flush();
-        return 2;
-    };
-    // A fact write changes what `<machine.X>` interpolation resolves to for
-    // EVERY file recomposed below, this routed file included: re-capture so
-    // verification sees the new value instead of the one this run started
-    // with.
-    if (fact_edits.items.len > 0) {
-        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
-        bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-        live_ctx = m_state.liveResolver(&bindings);
-        // The fresh `bindings` map above starts unseeded again.
-        try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
-    }
-
-    // Verify every unit against the disk as it now stands. Rewalk first so
-    // region synthesis (new fragments/regions) is reflected.
+    // The units, and settling's bookkeeping, shared by the write and the dry
+    // run.
     var v: Verifier = .{
         .arena = ctx.alloc,
         .io = ctx.io,
         .err = ctx.err,
         .files = tree.files,
-        .tree_now = try walkMerged(ctx.alloc, ctx.io, src_dir, context.paths.private_dir, m_state.home),
+        .tree_now = tree,
         .m_state = &m_state,
         .resolver = &axis_resolver,
         .secrets = secrets,
@@ -1933,17 +1934,13 @@ pub fn commitImpl(
         .file_res = try ctx.alloc.alloc(FileResult, tree.files.len),
         .leaf_res = try ctx.alloc.alloc(LeafResult, generated.leaves.items.len),
     };
-    for (v.file_unit, affected, coupling_only) |*u, r, c| u.* = r or c;
+    for (v.file_unit, snapshotted, coupling_only) |*u, r, c| u.* = r or c;
     @memset(v.file_failed, false);
     @memset(v.sym_failed, false);
     @memset(v.leaf_failed, false);
     @memset(v.file_reason, "");
     @memset(v.file_res, .{});
     @memset(v.leaf_res, .{});
-    // Each planned coupled update's undone lines, one per target, once its
-    // path is restored.
-    const coupling_undone = try ctx.alloc.alloc(?[]const []const u8, planned_couplings.items.len);
-    @memset(coupling_undone, null);
     const undone_by: UndoneBy = .{
         .couplings = planned_couplings.items,
         .targets = &coupling_targets,
@@ -1953,6 +1950,106 @@ pub fn commitImpl(
     // was held back for its coupled update's undone line.
     const quiet_fail = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(quiet_fail, false);
+    var settle: Settle = .{
+        .arena = ctx.alloc,
+        .v = &v,
+        .writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_structs.items, synth_plans.items, synth_owners.items, planned_syms.items),
+        .couplings = planned_couplings.items,
+        .targets = &coupling_targets,
+        .ids = &ids,
+        .home = m_state.home,
+        .quiet_fail = quiet_fail,
+        .restore_cause = .init(ctx.alloc),
+        .undone = try ctx.alloc.alloc(?[]const []const u8, planned_couplings.items.len),
+    };
+    @memset(settle.undone, null);
+
+    // A dry run settles what the plan alone decides -- a layer that refused a
+    // key, and every unit and coupled update that fails with it by the
+    // ownership rule -- and stops before the first write.
+    if (report_mode) {
+        // The first verification's failures the plan decides: a unit whose
+        // key a layer refused. A dry run takes no candidate choice, so no unit
+        // has an unrouted hunk.
+        for (struct_failed, 0..) |why, fidx| {
+            if (why == null) continue;
+            if (undone_by.reports(.{ .file = fidx })) {
+                var discard_buf: [256]u8 = undefined;
+                var discard: Io.Writer.Discarding = .init(&discard_buf);
+                v.err = &discard.writer;
+                _ = try v.refuseFile(fidx);
+                v.err = ctx.err;
+                quiet_fail[fidx] = true;
+            } else {
+                _ = try v.refuseFile(fidx);
+            }
+        }
+        while (true) {
+            var batch: std.ArrayList([]const u8) = .empty;
+            try settle.markRound(&batch);
+            if (!try settle.failOwners(batch.items, ctx.err)) break;
+        }
+        // What `--yes` records when every other unit verifies: each file
+        // unit it commits, naming the hunks a file leaves in live, and each
+        // symlink and leaf.
+        var units: usize = 0;
+        for (tree.files, 0..) |file, fidx| {
+            if (file.is_symlink and file_routed[fidx] > 0) units += 1;
+            if (!v.file_unit[fidx] or v.file_failed[fidx] or coupling_only[fidx]) continue;
+            if (manual_hunks[fidx] + declined_hunks[fidx] > 0) {
+                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], wrote_own[fidx]);
+                if (wrote_own[fidx]) units += 1;
+            } else {
+                units += 1;
+            }
+        }
+        for (v.leaf_failed) |f| {
+            if (!f) units += 1;
+        }
+        if (try printCouplingUndone(ctx.alloc, ctx.err, coupling_dropped, settle.undone)) pending = true;
+        const coupled_count = coupledCount(coupling_edits, &settle.restore_cause);
+        if (coupled_count > 0) pending = true;
+        if (pkgs.pending()) pending = true;
+        if (routed_count == 0 and manual_count == 0 and coupled_count == 0 and skipped_secret == 0 and !pkgs.pending()) {
+            try ctx.out.writeAll("mox commit: nothing to commit\n");
+        } else if (skipped_secret > 0) {
+            try ctx.out.print(
+                "\nmox commit: {d} routable, {d} coupled, {d} manual, {d} skipped (report only; run without --dry-run on a terminal to apply)\n",
+                .{ units, coupled_count, manual_count, skipped_secret },
+            );
+        } else {
+            try ctx.out.print(
+                "\nmox commit: {d} routable, {d} coupled, {d} manual (report only; run without --dry-run on a terminal to apply)\n",
+                .{ units, coupled_count, manual_count },
+            );
+        }
+        return if (pending) 1 else 0;
+    }
+
+    var writing: []const u8 = "";
+    writePlan(ctx, &plan, context.paths.facts_path, fact_edits.items, &writing) catch |e| {
+        try ctx.out.flush();
+        try ctx.err.print("mox commit: could not write {f} ({s})\n", .{ display.of(ids.shown(writing), m_state.home), @errorName(e) });
+        try restoreJournal(.of(ctx), &journal, &ids, m_state.home);
+        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+        try ctx.err.flush();
+        return 2;
+    };
+    // A fact write changes what `<machine.X>` interpolation resolves to for
+    // EVERY file recomposed below, this routed file included: re-capture so
+    // verification sees the new value instead of the one this run started
+    // with.
+    if (fact_edits.items.len > 0) {
+        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
+        bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
+        live_ctx = m_state.liveResolver(&bindings);
+        // The fresh `bindings` map above starts unseeded again.
+        try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
+    }
+
+    // Verify every unit against the disk as it now stands. Rewalk first so
+    // region synthesis (new fragments/regions) is reflected.
+    v.tree_now = try walkMerged(ctx.alloc, ctx.io, src_dir, context.paths.private_dir, m_state.home);
     for (try v.verifyPassing()) |f| {
         if (undone_by.reports(f.unit)) {
             quiet_fail[f.unit.file] = true;
@@ -1967,58 +2064,12 @@ pub fn commitImpl(
     // passing unit routed are reverted. Every unit still passing is then
     // verified again, since it may read what was restored; repeat until a
     // round fails nothing new.
-    const writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_structs.items, synth_plans.items, synth_owners.items, planned_syms.items);
-    // Each restored path, with the unit whose failure restored it.
-    var restore_cause = std.StringHashMap(Unit).init(ctx.alloc);
     // Each journaled path already back at its pre-run bytes.
     var at_pre_run = std.StringHashMap(void).init(ctx.alloc);
     var reverted = std.StringHashMap(void).init(ctx.alloc);
     while (true) {
         var batch: std.ArrayList([]const u8) = .empty;
-        for (writes) |w| try markDead(ctx.alloc, &v, &batch, &restore_cause, w.path, w.owners);
-        for (planned_couplings.items) |o| {
-            if (o.owners.items.len == 0) continue;
-            if (failedTarget(&v, coupling_targets.get(o.edit.path).?)) |target| {
-                try markDead(ctx.alloc, &v, &batch, &restore_cause, o.edit.path, &.{.{ .file = target }});
-            } else {
-                try markDead(ctx.alloc, &v, &batch, &restore_cause, o.edit.path, o.owners.items);
-            }
-        }
-        // Each coupled update into a path restored now is undone, for the
-        // cause that holds at this point.
-        for (planned_couplings.items, coupling_undone) |o, *undone| {
-            if (o.owners.items.len == 0 or undone.* != null or !isOneOf(o.edit.path, batch.items)) continue;
-            const targets = coupling_targets.get(o.edit.path).?;
-            const failed_target = failedTarget(&v, targets);
-            var lines: std.ArrayList([]const u8) = .empty;
-            for (targets) |target| {
-                const t_live = display.of(tree.files[target].live_path, m_state.home);
-                // A failed target's reason is given here only when its own
-                // line was held back for it; a target with routed edits of its
-                // own is named as not committed too. A target that passed
-                // lost the update to the one that failed.
-                try lines.append(ctx.alloc, if (v.file_failed[target] and !quiet_fail[target])
-                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was not committed", .{ t_live, t_live })
-                else if (v.file_failed[target])
-                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} could not take it ({s}){s}", .{
-                        t_live,
-                        t_live,
-                        v.file_reason[target],
-                        if (wrote_own[target]) try std.fmt.allocPrint(ctx.alloc, "; {f} not committed", .{t_live}) else "",
-                    })
-                else if (failed_target) |ft|
-                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was not committed", .{ t_live, display.of(tree.files[ft].live_path, m_state.home) })
-                else if (v.allFailed(o.owners.items))
-                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was not committed", .{ t_live, display.of(v.unitLive(o.owners.items[0]), m_state.home) })
-                else
-                    try std.fmt.allocPrint(ctx.alloc, "coupled update to {f} undone: {f} was restored because {f} was not committed", .{
-                        t_live,
-                        display.of(ids.shown(o.edit.path), m_state.home),
-                        display.of(v.unitLive(restore_cause.get(o.edit.path).?), m_state.home),
-                    }));
-            }
-            undone.* = lines.items;
-        }
+        try settle.markRound(&batch);
 
         // Every restore due is attempted, even after one fails.
         var any_deleted = false;
@@ -2034,23 +2085,7 @@ pub fn commitImpl(
         // A unit owning a non-coupling edit to a restored path fails with it.
         // After a failed restore nothing is recorded, so no line is printed,
         // but the facts due this round are still settled.
-        var new_fail = false;
-        for (batch.items) |p| {
-            const cause = restore_cause.get(p).?;
-            for (writes) |w| {
-                if (!std.mem.eql(u8, w.path, p)) continue;
-                for (w.owners) |u| {
-                    if (v.failed(u)) continue;
-                    const reason = try std.fmt.allocPrint(ctx.alloc, "{f} was restored because {f} was not committed", .{
-                        display.of(ids.shown(p), m_state.home),
-                        display.of(v.unitLive(cause), m_state.home),
-                    });
-                    if (failures.items.len == 0) try printNotCommitted(ctx.err, v.unitLive(u), reason, m_state.home);
-                    v.fail(u, reason);
-                    new_fail = true;
-                }
-            }
-        }
+        var new_fail = try settle.failOwners(batch.items, if (failures.items.len == 0) ctx.err else null);
 
         // Facts: with no passing unit routing any fact, the facts file goes
         // back to its pre-run bytes; otherwise each fact no passing unit
@@ -2085,7 +2120,9 @@ pub fn commitImpl(
             }
         }
         if (failures.items.len > 0) {
-            try saveRecovery(ctx, &journal, &ids, &at_pre_run, failures.items, m_state.home);
+            try saveRecovery(.of(ctx), &journal, &ids, &at_pre_run, failures.items, m_state.home);
+            try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+            try ctx.err.flush();
             return 2;
         }
         const fact_changed = fact_causes.items.len > 0;
@@ -2207,19 +2244,15 @@ pub fn commitImpl(
             },
         }
     }
-    for (coupling_dropped) |m| {
-        mismatch = true;
-        try ctx.err.print("mox commit: {s}\n", .{m});
+    // A file with drift whose every hunk was declined or left unrouted is
+    // not recorded; it is left undone unless another unit's route made its
+    // recompose equal live.
+    for (tree.files, 0..) |_, fidx| {
+        if (declined_hunks[fidx] + unrouted_hunks[fidx] == 0 or v.file_failed[fidx]) continue;
+        if (v.file_unit[fidx] and !coupling_only[fidx]) continue;
+        if (try v.stillDiffers(fidx, context.paths.state_dir)) mismatch = true;
     }
-    // An undone line is printed once, however many renames it covers.
-    var undone_said = std.StringHashMap(void).init(ctx.alloc);
-    for (coupling_undone) |lines| {
-        for (lines orelse continue) |m| {
-            mismatch = true;
-            if ((try undone_said.getOrPut(m)).found_existing) continue;
-            try ctx.err.print("mox commit: {s}\n", .{m});
-        }
-    }
+    if (try printCouplingUndone(ctx.alloc, ctx.err, coupling_dropped, settle.undone)) mismatch = true;
 
     // Re-index the coupling graph from the final sources so a later commit
     // sees the current token layout. A failure never undoes the commit that
@@ -2231,10 +2264,7 @@ pub fn commitImpl(
 
     // The counts are what SURVIVED settling, never what was attempted: an
     // accepted coupled update whose path was restored was not committed.
-    var coupled_count: usize = 0;
-    for (coupling_edits) |ce| {
-        if (!restore_cause.contains(ce.path)) coupled_count += 1;
-    }
+    const coupled_count = coupledCount(coupling_edits, &settle.restore_cause);
     if (skipped_secret > 0) {
         try ctx.out.print(
             "\nmox commit: {d} routed, {d} coupled, {d} manual, {d} skipped\n",
@@ -2254,11 +2284,11 @@ pub fn commitImpl(
             .{ pkgs.added, pkgs.blacklisted, pkgs.skipped },
         );
     }
-    // A manual hunk is work this run did not do, exactly like a skipped secret
-    // or an untracked package: without it here a wholly-manual file exits 0
-    // while the same state under `--dry-run` exits 1, and while `mox status`
-    // still reports the drift the commit left behind.
-    return if (mismatch or manual_count > 0 or skipped_secret > 0 or pkgs.pending()) 1 else 0;
+    // A manual hunk is work this run did not do, exactly like a skipped secret,
+    // an unexamined edit or an untracked package: without it here a
+    // wholly-manual file exits 0 while the same state under `--dry-run` exits
+    // 1, and while `mox status` still reports the drift the commit left behind.
+    return if (mismatch or pending or manual_count > 0 or skipped_secret > 0 or pkgs.pending()) 1 else 0;
 }
 
 /// Per-configuration guard outputs for a partial file: each composed text is
@@ -2559,6 +2589,40 @@ const Verifier = struct {
         return false;
     }
 
+    /// Whether a file that is no recorded unit still differs from its
+    /// recompose by unit equality: for a generator, any leaf edited since its
+    /// record that its expansion does not reproduce.
+    fn stillDiffers(v: *Verifier, fidx: usize, state_dir: []const u8) !bool {
+        const file = findByLive(v.tree_now, v.files[fidx].live_path) orelse v.files[fidx];
+        var gdiag: mox.compose.interp.Diag = .{};
+        const gen = mox.compose.catB.composeGenerator(v.arena, v.io, file, v.resolver, v.m_state, v.secrets, &gdiag) catch return true;
+        if (gen) |outputs| {
+            for (outputs) |leaf| {
+                if (mox.apply.write.guardLiveRead(v.io, leaf.live_path) != .readable) continue;
+                const live = Io.Dir.cwd().readFileAlloc(v.io, leaf.live_path, v.arena, .limited(max_file_bytes)) catch continue;
+                if (std.mem.eql(u8, live, leaf.content)) continue;
+                const recorded = try mox.apply.applied.read(v.arena, v.io, state_dir, leaf.live_path);
+                if (recorded != null and std.mem.eql(u8, &recorded.?, &mox.apply.applied.contentHashHex(live))) continue;
+                return true;
+            }
+            return false;
+        }
+        const composed = (mox.compose.composeFileTracked(v.arena, v.io, file, v.resolver, v.m_state, v.secrets, null, null) catch return true) orelse return true;
+        if (file.is_symlink) {
+            const site = mox.apply.applied.inspectSymSite(v.io, v.arena, file.live_path);
+            if (site != .symlink) return true;
+            return !mox.apply.applied.sameSymlinkTarget(std.mem.trim(u8, composed, " \t\r\n"), site.symlink);
+        }
+        return !v.matchesLive(fidx, composed, v.readLive(fidx));
+    }
+
+    /// Fail a file whose key a layer refused when planned.
+    fn refuseFile(v: *Verifier, fidx: usize) !bool {
+        const ename = v.struct_failed[fidx].?;
+        try v.err.print("mox commit: {s}: a source layer rejected the edit ({s}); not committed\n", .{ v.files[fidx].live_path, ename });
+        return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "a source layer rejected the edit ({s})", .{ename}));
+    }
+
     fn failFile(v: *Verifier, fidx: usize, reason: []const u8) bool {
         v.fail(.{ .file = fidx }, reason);
         return false;
@@ -2579,10 +2643,7 @@ const Verifier = struct {
         // not something the user asked for: whatever else holds, the unit is
         // not committed.
         if (v.unrouted_hunks[fidx] > 0) return v.leftUncommitted(fidx);
-        if (v.struct_failed[fidx]) |ename| {
-            try v.err.print("mox commit: {s}: a source layer rejected the edit ({s}); not committed\n", .{ file.live_path, ename });
-            return v.failFile(fidx, try std.fmt.allocPrint(arena, "a source layer rejected the edit ({s})", .{ename}));
-        }
+        if (v.struct_failed[fidx] != null) return v.refuseFile(fidx);
         const configs = v.spaces[fidx].?.configs;
         const file2 = findByLive(v.tree_now, file.live_path) orelse file;
 
@@ -2795,6 +2856,125 @@ fn ownedWrites(
     return out.toOwnedSlice(arena);
 }
 
+/// Settling's decisions over the units' failures so far, shared by the
+/// write and the dry run: which paths are dead and why, and each coupled
+/// update's undone lines.
+const Settle = struct {
+    arena: std.mem.Allocator,
+    v: *Verifier,
+    writes: []const OwnedWrite,
+    couplings: []const Owned(CouplingEdit),
+    targets: *const std.StringHashMap([]const usize),
+    ids: *const PathIds,
+    home: []const u8,
+    quiet_fail: []const bool,
+    /// Each restored path, with the unit whose failure restored it.
+    restore_cause: std.StringHashMap(Unit),
+    /// Per coupled update, its undone lines, one per target, once its path
+    /// is restored.
+    undone: []?[]const []const u8,
+
+    /// This round's dead paths into `batch`: an edit none of whose owners
+    /// passes, or a coupled update whose target fails. Each coupled update
+    /// into one of them is undone, for the cause that holds now.
+    fn markRound(s: *Settle, batch: *std.ArrayList([]const u8)) !void {
+        const v = s.v;
+        for (s.writes) |w| try markDead(s.arena, v, batch, &s.restore_cause, w.path, w.owners);
+        for (s.couplings) |o| {
+            if (o.owners.items.len == 0) continue;
+            if (failedTarget(v, s.targets.get(o.edit.path).?)) |target| {
+                try markDead(s.arena, v, batch, &s.restore_cause, o.edit.path, &.{.{ .file = target }});
+            } else {
+                try markDead(s.arena, v, batch, &s.restore_cause, o.edit.path, o.owners.items);
+            }
+        }
+        for (s.couplings, s.undone) |o, *undone| {
+            if (o.owners.items.len == 0 or undone.* != null or !isOneOf(o.edit.path, batch.items)) continue;
+            const targets = s.targets.get(o.edit.path).?;
+            const failed_target = failedTarget(v, targets);
+            var lines: std.ArrayList([]const u8) = .empty;
+            for (targets) |target| {
+                const t_live = display.of(v.files[target].live_path, s.home);
+                // A failed target's reason is given here only when its own
+                // line was held back for it; a target with routed edits of its
+                // own is named as not committed too. A target that passed
+                // lost the update to the one that failed.
+                try lines.append(s.arena, if (v.file_failed[target] and !s.quiet_fail[target])
+                    try std.fmt.allocPrint(s.arena, "coupled update to {f} undone: {f} was not committed", .{ t_live, t_live })
+                else if (v.file_failed[target])
+                    try std.fmt.allocPrint(s.arena, "coupled update to {f} undone: {f} could not take it ({s}){s}", .{
+                        t_live,
+                        t_live,
+                        v.file_reason[target],
+                        if (v.wrote_own[target]) try std.fmt.allocPrint(s.arena, "; {f} not committed", .{t_live}) else "",
+                    })
+                else if (failed_target) |ft|
+                    try std.fmt.allocPrint(s.arena, "coupled update to {f} undone: {f} was not committed", .{ t_live, display.of(v.files[ft].live_path, s.home) })
+                else if (v.allFailed(o.owners.items))
+                    try std.fmt.allocPrint(s.arena, "coupled update to {f} undone: {f} was not committed", .{ t_live, display.of(v.unitLive(o.owners.items[0]), s.home) })
+                else
+                    try std.fmt.allocPrint(s.arena, "coupled update to {f} undone: {f} was restored because {f} was not committed", .{
+                        t_live,
+                        display.of(s.ids.shown(o.edit.path), s.home),
+                        display.of(v.unitLive(s.restore_cause.get(o.edit.path).?), s.home),
+                    }));
+            }
+            undone.* = lines.items;
+        }
+    }
+
+    /// Fail each passing unit owning a non-coupling edit to a path in
+    /// `batch`, printing its line to `err` when given. Whether any failed.
+    fn failOwners(s: *Settle, batch: []const []const u8, err: ?*Io.Writer) !bool {
+        var new_fail = false;
+        for (batch) |p| {
+            const cause = s.restore_cause.get(p).?;
+            for (s.writes) |w| {
+                if (!std.mem.eql(u8, w.path, p)) continue;
+                for (w.owners) |u| {
+                    if (s.v.failed(u)) continue;
+                    const reason = try std.fmt.allocPrint(s.arena, "{f} was restored because {f} was not committed", .{
+                        display.of(s.ids.shown(p), s.home),
+                        display.of(s.v.unitLive(cause), s.home),
+                    });
+                    if (err) |e| try printNotCommitted(e, s.v.unitLive(u), reason, s.home);
+                    s.v.fail(u, reason);
+                    new_fail = true;
+                }
+            }
+        }
+        return new_fail;
+    }
+};
+
+/// Print each coupled update dropped before planning, then each undone line
+/// once, however many renames it covers. Whether any was printed.
+fn printCouplingUndone(arena: std.mem.Allocator, err: *Io.Writer, dropped: []const []const u8, undone: []const ?[]const []const u8) !bool {
+    var any = false;
+    for (dropped) |m| {
+        any = true;
+        try err.print("mox commit: {s}\n", .{m});
+    }
+    var said = std.StringHashMap(void).init(arena);
+    for (undone) |lines| {
+        for (lines orelse continue) |m| {
+            any = true;
+            if ((try said.getOrPut(m)).found_existing) continue;
+            try err.print("mox commit: {s}\n", .{m});
+        }
+    }
+    return any;
+}
+
+/// The accepted coupled updates whose path settling did not restore.
+fn coupledCount(edits: []const CouplingEdit, restore_cause: *const std.StringHashMap(Unit)) usize {
+    var n: usize = 0;
+    for (edits) |e| {
+        if (!restore_cause.contains(e.path)) n += 1;
+    }
+    return n;
+}
+
 /// Add `path` to this round's restores when the edit to it that `owners`
 /// produced is dead, naming the first owner as the unit whose failure
 /// restored it. A path already restored is not restored again.
@@ -2846,7 +3026,7 @@ fn stopUnreadable(ctx: *app.Ctx, shown: display.Path, cause: anyerror, package_r
 /// After a failed write: put every journaled path that no longer holds its
 /// pre-run bytes back, and name each. When a restore fails, every one due is
 /// still attempted and `saveRecovery` takes over.
-fn restoreJournal(ctx: *app.Ctx, journal: *const Journal, ids: *const PathIds, home: []const u8) !void {
+fn restoreJournal(ctx: RecoveryCtx, journal: *const Journal, ids: *const PathIds, home: []const u8) !void {
     var due: std.ArrayList([]const u8) = .empty;
     var failures: std.ArrayList(RestoreFailure) = .empty;
     var at_pre_run = std.StringHashMap(void).init(ctx.alloc);
@@ -2903,14 +3083,14 @@ const RestoreFailure = struct {
 /// copy. A path that did not exist before is named for deletion instead; a
 /// copy that cannot be written is printed to stderr in full.
 fn saveRecovery(
-    ctx: *app.Ctx,
+    ctx: RecoveryCtx,
     journal: *const Journal,
     ids: *const PathIds,
     at_pre_run: *const std.StringHashMap(void),
     failures: []const RestoreFailure,
     home: []const u8,
 ) !void {
-    const paths = ctx.context.?.paths;
+    const paths = ctx.paths;
     try ctx.out.flush();
     for (failures) |f| try ctx.err.print("mox commit: could not restore {f} ({s})\n", .{ display.of(ids.shown(f.path), home), @errorName(f.cause) });
     try ctx.err.writeAll("mox commit: nothing was recorded; each path below still holds this run's edits\n");
@@ -2976,6 +3156,19 @@ fn saveRecovery(
     }
     try ctx.err.flush();
 }
+
+/// Where a failed restore is reported and its recovery copies go.
+const RecoveryCtx = struct {
+    alloc: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    err: *Io.Writer,
+    paths: paths_mod.Paths,
+
+    fn of(ctx: *const app.Ctx) RecoveryCtx {
+        return .{ .alloc = ctx.alloc, .io = ctx.io, .out = ctx.out, .err = ctx.err, .paths = ctx.context.?.paths };
+    }
+};
 
 /// What a journaled path holds when a recovery copy is considered.
 const PathNow = union(enum) { absent, bytes: []const u8, unreadable };
@@ -3138,7 +3331,13 @@ fn resolveCoupling(
                 strict = true;
                 break;
             },
-            .report_only => {},
+            // A dry run takes every offered update, as `--yes` does, and
+            // says so.
+            .report_only => {
+                try edits.append(arena, c.edit);
+                try origins.append(arena, c.origin.?);
+                try stdout.print("  would update {s}: \"{s}\" -> \"{s}\"\n", .{ c.edit.path, c.edit.old, c.edit.new });
+            },
         }
     }
 
@@ -3150,27 +3349,6 @@ fn resolveCoupling(
         .abort = aborted,
         .abort_strict = strict,
     };
-}
-
-/// Report-only counterpart of `resolveCoupling`: count and print the coupling
-/// updates a real commit would offer for the routed renames, honoring declines.
-/// Prompts nothing and writes nothing (report / non-TTY / dry-run mode).
-fn reportCoupling(
-    arena: std.mem.Allocator,
-    io: Io,
-    coupling_dir: []const u8,
-    line_edits: []const LineEdit,
-    accepted: *const AcceptedTexts,
-    bases: []const []const u8,
-    protected: *const std.StringHashMap(void),
-    stdout: *Io.Writer,
-    err: *Io.Writer,
-) !usize {
-    var graph = try mox.coupling.store.loadGraph(arena, io, coupling_dir);
-    var declines = try mox.coupling.store.loadDeclines(arena, io, coupling_dir);
-    const cands = try couplingCandidates(arena, io, &graph, &declines, line_edits, null, accepted, bases, protected, stdout, err);
-    for (cands) |c| try stdout.print("  would update {s}: \"{s}\" -> \"{s}\"\n", .{ c.edit.path, c.edit.old, c.edit.new });
-    return cands.len;
 }
 
 /// Every coupled update the routed renames could make, in prompt order, each
@@ -3686,7 +3864,8 @@ fn droppedCouplingLines(
 /// compose, transiently apply the token replacements to the source, snapshot
 /// again, then restore. A compose this machine cannot do, before or after, is
 /// `.uncomposable`; a target that cannot be read or transiently written is
-/// `.unwritable`. Only a failure to revert the transient write is an error.
+/// `.unwritable`. Only a failure to revert the transient write is an error,
+/// `error.SimulationNotRestored`, after its report.
 fn simulateCouplingImpact(
     cc: *const ClassCtx,
     file: mox.source.tree.ManagedFile,
@@ -3696,10 +3875,12 @@ fn simulateCouplingImpact(
 ) !CouplingSim {
     const arena = cc.arena;
     const io = cc.io;
-    const original = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+    var sim: SimJournal = .init(cc);
+    const recorded = sim.record(cc, path) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => return .{ .unwritable = e },
     };
+    const original = recorded orelse return .{ .unwritable = error.FileNotFound };
     const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => return .{ .uncomposable = e },
@@ -3709,13 +3890,7 @@ fn simulateCouplingImpact(
     // A failed write may have left part of it behind, so it is reverted too.
     const written = Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = edited });
     const after_or = if (written) impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) else |_| undefined;
-    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch |e| {
-        cc.err.print("mox commit: {s}: could not restore the transiently edited source; left edited\n", .{path}) catch {};
-        // A snapshot failure is the error worth reporting over the write's.
-        written catch return e;
-        _ = after_or catch |se| return se;
-        return e;
-    };
+    try sim.restore(cc);
     written catch |e| return .{ .unwritable = e };
     const after = after_or catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -3870,20 +4045,10 @@ fn structLayers(
     return out.toOwnedSlice(arena);
 }
 
-/// Restore a layer file to `original` (its pre-simulation bytes), or delete it
-/// when it did not exist before. Used to revert `simulateStructImpact`'s
-/// transient write.
-fn restoreLayerBytes(io: Io, path: []const u8, original: ?[]const u8) !void {
-    if (original) |bytes| {
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
-    } else {
-        Io.Dir.cwd().deleteFile(io, path) catch {};
-    }
-}
-
 /// One placement's full effect over the REPO-WIDE `configs`: transiently apply
 /// every edit in `edits` (the write at the chosen layer plus its surgical
-/// override deletions), snapshot each configuration's compose before and after,
+/// override deletions) over each layer as the plan holds it before them
+/// (`threadedLayers`), snapshot each configuration's compose before and after,
 /// then restore every touched layer to its pre-simulation bytes -- so the tree
 /// is byte-identical afterward. Returns the changed configuration labels and
 /// both snapshots (the pick confirm renders the key's before/after value from
@@ -3892,6 +4057,7 @@ fn restoreLayerBytes(io: Io, path: []const u8, original: ?[]const u8) !void {
 /// reaches beyond the plain `[y]`.
 fn simulateStructImpact(
     cc: *const ClassCtx,
+    ra: *const RunAccum,
     file: mox.source.tree.ManagedFile,
     edits: []const StructEdit,
     configs: []const Configuration,
@@ -3899,57 +4065,47 @@ fn simulateStructImpact(
     const arena = cc.arena;
     const io = cc.io;
 
-    // Each DISTINCT touched layer's pre-simulation bytes, captured once (null
-    // when the layer did not exist: a fresh overlay the placement creates).
-    // Several edits may touch one layer, so restore keys on the path, not on
-    // the edit.
-    var origs: std.StringHashMap(?[]const u8) = .init(arena);
-    for (edits) |e| {
-        if (origs.contains(e.layer_abs)) continue;
-        const cur: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, e.layer_abs, arena, .limited(max_file_bytes)) catch |er| switch (er) {
-            error.FileNotFound => null,
-            else => return er,
-        };
-        try origs.put(e.layer_abs, cur);
-    }
-
-    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
-
     // A layer refusing the edit is a routing outcome, reported to the user. Any
     // other failure -- a snapshot, a read, a restore -- is a real error and
     // must stay one: conflating them would blame the chosen layer for, say, an
     // unparseable sibling overlay it has nothing to do with.
-    var rejected = false;
-    for (edits) |e| {
-        commit_struct.applyToLayer(arena, io, e.format, e.layer_abs, e.change) catch {
-            rejected = true;
-            break;
-        };
-    }
-    var err: ?anyerror = null;
-    const after = if (!rejected)
-        impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |er| blk: {
-            err = er;
-            break :blk before;
-        }
-    else
-        before;
+    const layers = (try threadedLayers(cc, ra, edits)) orelse return .rejected;
 
-    // Restore every touched layer even on error, so a failed simulation never
-    // leaves a partial write behind. One restore failing must not abandon the
-    // rest: finish the sweep, then report the first failure.
-    var it = origs.iterator();
-    while (it.next()) |kv| {
-        restoreLayerBytes(io, kv.key_ptr.*, kv.value_ptr.*) catch |er| {
-            if (err == null) err = er;
-        };
-    }
+    // Each touched layer, journaled once: a fresh overlay the placement
+    // creates is deleted again, with any directory its write made.
+    var sim: SimJournal = .init(cc);
+    const pre = try arena.alloc(?[]const u8, layers.len);
+    for (layers, pre) |l, *p| p.* = try sim.record(cc, l.path);
 
-    if (err) |er| return er;
-    if (rejected) return .rejected;
+    // Every configuration is composed with each layer as the plan holds it
+    // just before this placement, then just after.
+    for (layers, pre) |l, p| {
+        const bytes = l.before orelse continue;
+        if (p != null and std.mem.eql(u8, p.?, bytes)) continue;
+        writeLayer(io, l.path, bytes) catch |e| return sim.stopAfterWrite(cc, l.path, e);
+    }
+    const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
+        try sim.restore(cc);
+        return e;
+    };
+    for (layers) |l| {
+        writeLayer(io, l.path, l.after) catch |e| return sim.stopAfterWrite(cc, l.path, e);
+    }
+    const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
+        try sim.restore(cc);
+        return e;
+    };
+    try sim.restore(cc);
 
     const imp = try impact.impact(arena, configs, before, after);
     return .{ .ok = .{ .affected = imp.affected, .before = before, .after = after } };
+}
+
+/// Write a struct layer, making its directory first: a placement may create
+/// a fresh overlay.
+fn writeLayer(io: Io, path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
 /// Per-key-change diff lines for the prompt/report: the key path and its
@@ -4093,11 +4249,17 @@ fn routeStructChanges(
 
         const winner_label = try structRouteLabel(cc.arena, file, layers, res, change);
 
+        // Report mode places the key exactly as `--yes` would, so it predicts
+        // every refusal; the placement is collected, never written.
         if (cc.report_mode) {
-            ra.pending.* = true;
-            ra.routed_count.* += 1;
-            try cc.stdout.print("  would write {s} {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path) });
-            try printKeyChange(cc.arena, cc.sty, cc.stdout, change, winner_label);
+            switch (try recordStructPlacement(cc, ra, file, fidx, space, format, layers, res, res.target, change)) {
+                .placed => {
+                    ra.pending.* = true;
+                    try cc.stdout.print("  would write {s} {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path) });
+                    try printKeyChange(cc.arena, cc.sty, cc.stdout, change, winner_label);
+                },
+                .unroutable => try reportUnholdable(cc, ra, file, fidx, layers[res.target], change),
+            }
             continue;
         }
 
@@ -4115,7 +4277,7 @@ fn routeStructChanges(
                     // `.abort_strict` (real `q`/strict-abort inside the pick
                     // sub-menus) must quit the run exactly like everywhere
                     // else, not be swallowed as a per-key decline.
-                    1 => switch (try pickLayer(cc, file, format, layers, res, change, space.configs)) {
+                    1 => switch (try pickLayer(cc, ra, file, format, layers, res, change, space.configs)) {
                         .picked => |idx| chosen = idx,
                         .skip => chosen = null,
                         .abort => return .abort,
@@ -4133,21 +4295,126 @@ fn routeStructChanges(
             switch (try recordStructPlacement(cc, ra, file, fidx, space, format, layers, res, chosen_idx, change)) {
                 .placed => if (!cc.interactive)
                     try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) }),
-                .unroutable => {
-                    ra.manual_count.* += 1;
-                    ra.manual_hunks[fidx] += 1;
-                    ra.pending.* = true;
-                    try cc.stdout.print(
-                        "  manual: {s} {s}: {s} cannot hold this key\n",
-                        .{ file.live_path, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) },
-                    );
-                },
+                .unroutable => try reportUnholdable(cc, ra, file, fidx, layers[chosen_idx], change),
             }
         } else {
             ra.declined_hunks[fidx] += 1;
         }
     }
     return .cont;
+}
+
+/// A key whose placement the chosen layer refused: manual.
+fn reportUnholdable(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    layer: commit_struct.StructLayer,
+    change: commit_struct.KeyPathChange,
+) !void {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print(
+        "  manual: {s} {s}: {s} cannot hold this key\n",
+        .{ file.live_path, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layer) },
+    );
+}
+
+/// Whether every layer `edits` writes takes its edit, as the plan will
+/// apply it, whatever the file's configuration count.
+fn placementHolds(cc: *const ClassCtx, ra: *const RunAccum, edits: []const StructEdit) !bool {
+    return try threadedLayers(cc, ra, edits) != null;
+}
+
+/// One layer a placement writes: its path as the placement names it, and
+/// its bytes as the plan holds them before and after the placement (null:
+/// absent).
+const ThreadedLayer = struct { path: []const u8, before: ?[]const u8, after: []const u8 };
+
+/// The layers `edits` write, threaded exactly as the plan threads them: by
+/// canonical path, from each layer's bytes after the plan's stages before
+/// the struct stage over what was routed so far, then every struct edit
+/// accepted before, identical ones once, then `edits`. Null when a layer
+/// refuses an edit.
+fn threadedLayers(cc: *const ClassCtx, ra: *const RunAccum, edits: []const StructEdit) !?[]const ThreadedLayer {
+    const arena = cc.arena;
+    var ids: PathIds = .init(arena, cc.io);
+    var lines: std.ArrayList(LineEdit) = .empty;
+    for (ra.line_edits.items) |e| {
+        var c = e;
+        c.path = try ids.canonical(e.path);
+        try lines.append(arena, c);
+    }
+    for ([_][]const RowEdit{ ra.row_edits.items, ra.generated.row_edits.items }) |list| for (list) |e| {
+        const path = try ids.canonical(e.data_source);
+        for (e.splices) |sp| {
+            var c = sp;
+            c.path = path;
+            try lines.append(arena, c);
+        }
+    };
+    var syms: std.ArrayList(SymSync) = .empty;
+    for (ra.sym_syncs.items) |e| {
+        var c = e;
+        c.source_abs = try ids.canonical(e.source_abs);
+        try syms.append(arena, c);
+    }
+    var synths: std.ArrayList(SynthDecision) = .empty;
+    for (ra.synth_plans.items) |sd| {
+        var c = sd;
+        c.base_abs = try ids.canonical(sd.base_abs);
+        c.plan.fragment_path = try ids.canonical(sd.plan.fragment_path);
+        try synths.append(arena, c);
+    }
+    var structs: std.ArrayList(StructEdit) = .empty;
+    for (ra.struct_edits.items) |e| {
+        var c = e;
+        c.layer_abs = try ids.canonical(e.layer_abs);
+        if (!isStructOneOf(c, structs.items)) try structs.append(arena, c);
+    }
+    const prior = structs.items.len;
+    for (edits) |e| {
+        var c = e;
+        c.layer_abs = try ids.canonical(e.layer_abs);
+        if (!isStructOneOf(c, structs.items)) try structs.append(arena, c);
+    }
+
+    var out: std.ArrayList(ThreadedLayer) = .empty;
+    var done: std.ArrayList([]const u8) = .empty;
+    for (edits) |e| {
+        const layer = try ids.canonical(e.layer_abs);
+        if (isOneOf(layer, done.items)) continue;
+        try done.append(arena, layer);
+        const pre: ?[]const u8 = Io.Dir.cwd().readFileAlloc(cc.io, layer, arena, .limited(max_file_bytes)) catch |er| switch (er) {
+            error.FileNotFound => null,
+            else => return er,
+        };
+        var bytes = plannedBeforeRenames(arena, layer, pre, lines.items, syms.items, synths.items) catch |er| switch (er) {
+            error.OutOfMemory => return er,
+            else => return null,
+        };
+        var before: ?[]const u8 = null;
+        for (structs.items, 0..) |se, i| {
+            if (i == prior) before = bytes;
+            if (!std.mem.eql(u8, se.layer_abs, layer)) continue;
+            bytes = commit_struct.layerBytes(arena, se.format, bytes, se.change) catch |er| switch (er) {
+                error.OutOfMemory => return er,
+                else => return null,
+            };
+        }
+        if (prior == structs.items.len) before = bytes;
+        try out.append(arena, .{ .path = e.layer_abs, .before = before, .after = bytes.? });
+    }
+    return out.items;
+}
+
+fn isStructOneOf(e: StructEdit, list: []const StructEdit) bool {
+    for (list) |x| {
+        if (structEditEql(x, e)) return true;
+    }
+    return false;
 }
 
 /// Why `processFallbackFile` has no stored `last_content` to diff against:
@@ -4218,11 +4485,16 @@ fn processFallbackFile(
     // first-contact structured file with zero matching layers is exactly the
     // second case: create one instead of silently doing nothing.
     const baseline = composed orelse {
-        if (kind == .first_contact) {
-            if (commit_struct.formatOfPath(file.source_base_path)) |format| {
+        switch (kind) {
+            .first_contact => if (commit_struct.formatOfPath(file.source_base_path)) |format| {
                 const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch &.{};
                 if (layers.len == 0) return createFirstContactOverlay(cc, ra, file, fidx, spaces, format, live, repo_dir);
-            }
+            },
+            // Edited since its record, as the hash check above found.
+            .secret => {
+                try cc.err.print("mox commit: {f}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{display.of(file.live_path, cc.m_state.home)});
+                ra.pending.* = true;
+            },
         }
         return .cont;
     };
@@ -4285,6 +4557,10 @@ fn processFallbackFile(
         },
         else => return e,
     };
+    if (hunks.len == 0) {
+        try finalNewlineManual(cc, ra, file.live_path, fidx);
+        return .cont;
+    }
 
     if (spaces[fidx] == null) spaces[fidx] = try fileSpace(cc.arena, cc.io, cc.this_bindings, file);
     const space = spaces[fidx].?;
@@ -4382,18 +4658,22 @@ fn createFirstContactOverlay(
         };
         if (accept) {
             const edits = [_]StructEdit{.{ .format = format, .layer_abs = target_path, .change = change }};
-            if (space.configs.len > 1) {
-                switch (try simulateStructImpact(cc, file, &edits, space.configs)) {
-                    .ok => |imp| for (imp.affected) |l| try ra.allowed[fidx].put(l, {}),
-                    .rejected => {
-                        ra.manual_count.* += 1;
-                        ra.manual_hunks[fidx] += 1;
-                        ra.pending.* = true;
-                        try cc.stdout.print("  manual: {f} {s}: the new overlay cannot hold this key\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path) });
-                        continue;
-                    },
-                }
-            }
+            const sim: ?StructSim = if (!try placementHolds(cc, ra, &edits))
+                .rejected
+            else if (space.configs.len > 1)
+                try simulateStructImpact(cc, ra, file, &edits, space.configs)
+            else
+                null;
+            if (sim) |outcome| switch (outcome) {
+                .ok => |imp| for (imp.affected) |l| try ra.allowed[fidx].put(l, {}),
+                .rejected => {
+                    ra.manual_count.* += 1;
+                    ra.manual_hunks[fidx] += 1;
+                    ra.pending.* = true;
+                    try cc.stdout.print("  manual: {f} {s}: the new overlay cannot hold this key\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path) });
+                    continue;
+                },
+            };
             try ra.struct_edits.append(cc.arena, edits[0]);
             try ra.struct_owners.append(cc.arena, fidx);
             ra.routed_count.* += 1;
@@ -4436,13 +4716,24 @@ fn processSymlinkFile(
     sym_syncs: *std.ArrayList(SymSync),
 ) !HunkOutcome {
     const site = mox.apply.applied.inspectSymSite(cc.io, cc.arena, file.live_path);
+    const recorded_target = try mox.apply.applied.readSymlink(cc.arena, cc.io, state_dir, file.live_path);
     // A directory, a plain file, or an absent path where a symlink belongs is
     // not something `keep` can route (no target string to compare against) --
-    // `mox apply --overwrite` is the resolution for those, not commit.
-    if (site != .symlink) return .cont;
+    // `mox apply --overwrite` is the resolution for those, not commit. Where
+    // mox recorded a link, the replacement is drift left undone.
+    if (site != .symlink) {
+        if (recorded_target == null or site == .absent) return .cont;
+        if (mox.apply.write.guardLiveRead(cc.io, file.live_path) == .special) {
+            try reportSpecial(cc, ra, file.live_path, fidx, true);
+            return .cont;
+        }
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        try cc.stdout.print("  manual: {f} (not a symlink)\n", .{display.of(file.live_path, cc.m_state.home)});
+        return .cont;
+    }
     const live_target = site.symlink;
-
-    const recorded_target = try mox.apply.applied.readSymlink(cc.arena, cc.io, state_dir, file.live_path);
 
     var prov: std.ArrayList(Segment) = .empty;
     const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
@@ -4610,6 +4901,11 @@ fn processGeneratorLeaf(
     state_dir: []const u8,
     gen: *LeafRowEdits,
 ) !HunkOutcome {
+    // Kind guard BEFORE the open: a FIFO here would block the read.
+    if (mox.apply.write.guardLiveRead(cc.io, leaf.live_path) == .special) {
+        try reportSpecial(cc, ra, leaf.live_path, fidx, (try mox.apply.applied.read(cc.arena, cc.io, state_dir, leaf.live_path)) != null);
+        return .cont;
+    }
     const live = Io.Dir.cwd().readFileAlloc(cc.io, leaf.live_path, cc.arena, .limited(max_file_bytes)) catch |e| switch (e) {
         error.FileNotFound => return .cont,
         else => return e,
@@ -4654,6 +4950,10 @@ fn processGeneratorLeaf(
         },
         else => return e,
     };
+    if (hunks.len == 0) {
+        try finalNewlineManual(cc, ra, leaf.live_path, fidx);
+        return .cont;
+    }
 
     for (hunks, 0..) |hunk, hi| {
         switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, stale, gen)) {
@@ -5315,14 +5615,10 @@ fn recordStructPlacement(
     change: commit_struct.KeyPathChange,
 ) !enum { placed, unroutable } {
     const edits = try structPickEdits(cc.arena, format, layers, res.definers, chosen_idx, change);
+    if (!try placementHolds(cc, ra, edits)) return .unroutable;
 
     if (space.configs.len > 1) {
-        // The simulation applies the real edits and restores every layer it
-        // touched, so a layer that will not accept the edit is caught HERE,
-        // before anything is written for keeps. Reporting it as un-routable
-        // beats letting it reach the write phase, where the whole file rolls
-        // back for one bad key.
-        const imp = switch (try simulateStructImpact(cc, file, edits, space.configs)) {
+        const imp = switch (try simulateStructImpact(cc, ra, file, edits, space.configs)) {
             .ok => |i| i,
             .rejected => return .unroutable,
         };
@@ -5418,6 +5714,7 @@ const PickOutcome = union(enum) {
 /// with the key's before/after value and take one confirm.
 fn pickLayer(
     cc: *const ClassCtx,
+    ra: *const RunAccum,
     file: mox.source.tree.ManagedFile,
     format: commit_struct.Format,
     layers: []const commit_struct.StructLayer,
@@ -5502,11 +5799,11 @@ fn pickLayer(
     // A layer that refuses the edit has no blast radius to confirm; the
     // placement is recorded anyway so `recordStructPlacement` reports the
     // refusal through the one path that reports it.
-    const winner_imp = switch (try simulateStructImpact(cc, file, winner_edits, configs)) {
+    const winner_imp = switch (try simulateStructImpact(cc, ra, file, winner_edits, configs)) {
         .ok => |i| i,
         .rejected => return .{ .picked = picked },
     };
-    const pick_imp = switch (try simulateStructImpact(cc, file, pick_edits, configs)) {
+    const pick_imp = switch (try simulateStructImpact(cc, ra, file, pick_edits, configs)) {
         .ok => |i| i,
         .rejected => return .{ .picked = picked },
     };
@@ -5641,6 +5938,57 @@ fn reportViolation(err: *Io.Writer, path: []const u8, what: []const u8, label: [
     } else {
         try err.print("mox commit: {s}: {s} would change configuration {s}, which you did not choose to affect; not committed\n", .{ path, what, label });
     }
+}
+
+/// A special inode at a live path is never opened: manual where mox recorded
+/// what it wrote there, skipped where it never wrote.
+fn reportSpecial(cc: *const ClassCtx, ra: *const RunAccum, live_path: []const u8, fidx: usize, recorded: bool) !void {
+    if (!recorded) return cc.err.print("mox commit: {f}: skipped (not a regular file)\n", .{display.of(live_path, cc.m_state.home)});
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f} (not a regular file)\n", .{display.of(live_path, cc.m_state.home)});
+}
+
+/// A live file whose lines equal its baseline's differs only in its final
+/// newline, which no hunk carries: manual.
+fn finalNewlineManual(cc: *const ClassCtx, ra: *const RunAccum, live_path: []const u8, fidx: usize) !void {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f}: final newline differs\n", .{display.of(live_path, cc.m_state.home)});
+}
+
+/// Whether the live file at a path mox recorded no longer holds what was
+/// recorded there: a special inode, content whose hash differs, or for an
+/// owned record an owned form that differs or cannot be extracted.
+fn editedSinceRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, file: mox.source.tree.ManagedFile) !bool {
+    const live_path = file.live_path;
+    const recorded = try mox.apply.applied.read(arena, io, state_dir, live_path);
+    const owned = if (recorded == null) (try mox.apply.applied.readOwned(arena, io, state_dir, live_path)) orelse return false else null;
+    switch (mox.apply.write.guardLiveRead(io, live_path)) {
+        .special => return true,
+        .absent => return false,
+        .readable => {},
+    }
+    const live = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return e,
+    };
+    if (recorded) |hash| return !std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(live));
+    const rec = owned.?;
+    const format = commit_struct.formatOfPath(file.source_base_path) orelse return true;
+    const doc = mox.apply.partial.OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.OwnedUnparseable => return true,
+    };
+    const paths = try mox.apply.owned.parseRawPaths(arena, rec.own_paths);
+    const canonical = switch (rec.mode) {
+        .own => try mox.apply.canonical.canonicalOwned(arena, &doc, paths),
+        .disown => try mox.apply.canonical.canonicalComplement(arena, &doc, paths),
+    };
+    if (rec.secret) return rec.canonical_hash == null or !std.mem.eql(u8, &rec.canonical_hash.?, &mox.apply.applied.contentHashHex(canonical));
+    return !std.mem.eql(u8, rec.canonical.?, canonical);
 }
 
 /// Name the hunks a file left only in its live copy, and whether the edits
@@ -6498,40 +6846,34 @@ fn configsMatchingAxis(arena: std.mem.Allocator, configs: []const Configuration,
 /// The transient write is always reverted, so the abort-writes-nothing contract
 /// holds.
 fn simulateImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: LineEdit, configs: []const Configuration) !impact.Impact {
-    const arena = cc.arena;
-    const io = cc.io;
-    const original = try Io.Dir.cwd().readFileAlloc(io, edit.path, arena, .limited(max_file_bytes));
-    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
+    var sim: SimJournal = .init(cc);
+    const original = (try sim.record(cc, edit.path)) orelse return error.FileNotFound;
+    return simulateWrite(cc, &sim, file, edit.path, try editedContent(cc.arena, original, edit), configs);
+}
 
-    const edited = try editedContent(arena, original, edit);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.path, .data = edited });
-    const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.path, .data = original }) catch {};
+/// Every configuration's compose before and after `path`, journaled in
+/// `sim`, transiently holds `edited`; the write is reverted whatever fails.
+fn simulateWrite(cc: *const ClassCtx, sim: *SimJournal, file: mox.source.tree.ManagedFile, path: []const u8, edited: []const u8, configs: []const Configuration) !impact.Impact {
+    const before = try impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets);
+    Io.Dir.cwd().writeFile(cc.io, .{ .sub_path = path, .data = edited }) catch |e| {
+        try sim.restore(cc);
         return e;
     };
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.path, .data = original });
-
-    return impact.impact(arena, configs, before, after);
+    const after = impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets) catch |e| {
+        try sim.restore(cc);
+        return e;
+    };
+    try sim.restore(cc);
+    return impact.impact(cc.arena, configs, before, after);
 }
 
 /// Run impact analysis for one loop-row edit: snapshot every configuration's
 /// compose, transiently rewrite the row in its data source, snapshot again, then
 /// restore. The transient write is always reverted.
 fn simulateRowImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: RowEdit, configs: []const Configuration) !impact.Impact {
-    const arena = cc.arena;
-    const io = cc.io;
-    const original = try Io.Dir.cwd().readFileAlloc(io, edit.data_source, arena, .limited(max_file_bytes));
-    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
-
-    const edited = try splicedContent(arena, original, edit.splices);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.data_source, .data = edited });
-    const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.data_source, .data = original }) catch {};
-        return e;
-    };
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.data_source, .data = original });
-
-    return impact.impact(arena, configs, before, after);
+    var sim: SimJournal = .init(cc);
+    const original = (try sim.record(cc, edit.data_source)) orelse return error.FileNotFound;
+    return simulateWrite(cc, &sim, file, edit.data_source, try splicedContent(cc.arena, original, edit.splices), configs);
 }
 
 /// Run impact analysis for a fact edit: snapshot every configuration's
@@ -7399,6 +7741,191 @@ fn splicedContent(arena: std.mem.Allocator, content: []const u8, edits: []const 
     return out.toOwnedSlice(arena);
 }
 
+/// A path's bytes after the plan's stages before coupling renames and
+/// struct keys, from `pre` (null: absent): its line splices (row writes
+/// included) and narrowing regions in one pass, identical ones once, then a
+/// symlink target, then a narrowing's fragment.
+fn plannedBeforeRenames(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    pre: ?[]const u8,
+    lines: []const LineEdit,
+    syms: []const SymSync,
+    synths: []const SynthDecision,
+) !?[]const u8 {
+    var splices: std.ArrayList(LineEdit) = .empty;
+    for (lines) |e| {
+        if (!std.mem.eql(u8, e.path, path)) continue;
+        const seen = for (splices.items) |x| {
+            if (sameSplice(x, e)) break true;
+        } else false;
+        if (!seen) try splices.append(arena, e);
+    }
+    for (synths) |sd| {
+        if (!std.mem.eql(u8, sd.base_abs, path)) continue;
+        try splices.append(arena, .{ .path = path, .start = sd.plan.start, .del = sd.plan.del, .new_lines = sd.plan.base_lines });
+    }
+    var bytes = pre;
+    if (splices.items.len > 0) bytes = try splicedContent(arena, bytes orelse return error.FileNotFound, splices.items);
+    for (syms) |e| {
+        if (std.mem.eql(u8, e.source_abs, path)) bytes = try std.fmt.allocPrint(arena, "{s}\n", .{e.new_target});
+    }
+    for (synths) |sd| {
+        if (std.mem.eql(u8, sd.plan.fragment_path, path)) bytes = sd.plan.fragment_content;
+    }
+    return bytes;
+}
+
+/// The edits routing collected, by kind.
+const Routed = struct {
+    lines: []LineEdit,
+    rows: []RowEdit,
+    leaf_rows: []RowEdit,
+    syms: []SymSync,
+    synths: []SynthDecision,
+    structs: []StructEdit,
+};
+
+/// Every routed edit's path by the file it names, in place, so the journal,
+/// the plan, the restores and the ownership rule see two spellings of one
+/// file as one path.
+fn canonicalizeRouted(arena: std.mem.Allocator, ids: *PathIds, r: Routed) !void {
+    for (r.lines) |*e| e.path = try ids.of(e.path);
+    for ([_][]RowEdit{ r.rows, r.leaf_rows }) |list| for (list) |*e| {
+        e.data_source = try ids.of(e.data_source);
+        const splices = try arena.dupe(LineEdit, e.splices);
+        for (splices) |*sp| sp.path = e.data_source;
+        e.splices = splices;
+    };
+    for (r.syms) |*e| e.source_abs = try ids.of(e.source_abs);
+    for (r.synths) |*sd| {
+        sd.base_abs = try ids.of(sd.base_abs);
+        sd.plan.fragment_path = try ids.of(sd.plan.fragment_path);
+    }
+    for (r.structs) |*e| e.layer_abs = try ids.of(e.layer_abs);
+}
+
+/// Every planned edit but coupled updates, with the units that produced it.
+const PlannedEdits = struct {
+    lines: std.ArrayList(Owned(LineEdit)),
+    structs: std.ArrayList(Owned(StructEdit)),
+    syms: std.ArrayList(Owned(SymSync)),
+};
+
+/// Identical edits are one, their owners unioned. A row write is its field
+/// splices, planned with the line splices, so an identical write from two
+/// loops, a loop and a leaf, or a loop and the data file's own line edit is
+/// one edit owned by both. Syncs are not merged: each symlink's sync writes
+/// its own source.
+fn collectPlanned(
+    arena: std.mem.Allocator,
+    r: Routed,
+    line_owners: []const usize,
+    row_owners: []const usize,
+    row_leaves: []const usize,
+    struct_owners: []const usize,
+) !PlannedEdits {
+    var out: PlannedEdits = .{ .lines = .empty, .structs = .empty, .syms = .empty };
+    for (r.lines, line_owners) |e, owner| try addOwned(LineEdit, arena, &out.lines, e, &.{.{ .file = owner }}, lineEditEql);
+    for (r.rows, row_owners) |e, owner| for (e.splices) |sp| {
+        try addOwned(LineEdit, arena, &out.lines, sp, &.{.{ .file = owner }}, lineEditEql);
+    };
+    for (r.leaf_rows, row_leaves) |e, li| for (e.splices) |sp| {
+        try addOwned(LineEdit, arena, &out.lines, sp, &.{.{ .leaf = li }}, lineEditEql);
+    };
+    for (r.structs, struct_owners) |e, owner| try addOwned(StructEdit, arena, &out.structs, e, &.{.{ .file = owner }}, structEditEql);
+    for (r.syms, 0..) |e, i| {
+        var owners: std.ArrayList(Unit) = .empty;
+        try owners.append(arena, .{ .symlink = i });
+        try out.syms.append(arena, .{ .edit = e, .owners = owners });
+    }
+    return out;
+}
+
+/// Journal every path `planned` and the narrowings write, and `facts_path`
+/// when set; `unreadable` names the path an error is for.
+fn journalPlanned(
+    arena: std.mem.Allocator,
+    io: Io,
+    journal: *Journal,
+    planned: PlannedEdits,
+    synths: []const SynthDecision,
+    facts_path: ?[]const u8,
+    unreadable: *[]const u8,
+) !void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (planned.lines.items) |o| try paths.append(arena, o.edit.path);
+    for (planned.syms.items) |o| try paths.append(arena, o.edit.source_abs);
+    for (synths) |sd| try paths.appendSlice(arena, &.{ sd.base_abs, sd.plan.fragment_path });
+    for (planned.structs.items) |o| try paths.append(arena, o.edit.layer_abs);
+    if (facts_path) |f| try paths.append(arena, f);
+    for (paths.items) |path| {
+        unreadable.* = path;
+        try journal.record(arena, io, path);
+    }
+}
+
+/// The plan's stages before coupling renames, into `plan`: each path the
+/// line splices, symlink syncs and narrowings write, in the order the write
+/// phase takes them -- line-spliced paths, then symlink sources, then each
+/// narrowed base with its fragments.
+///
+/// A narrowing's region block is a line SPLICE of the base like any other
+/// edit, so a base with narrowings takes its ordinary line edits and every
+/// region block together, in one splice. A universal hunk and a narrowed
+/// hunk in one file therefore both land, and neither reverts the other.
+fn planBeforeRenames(arena: std.mem.Allocator, plan: *WritePlan, planned: PlannedEdits, synths: []const SynthDecision) !void {
+    const synth_bases = try synthBases(arena, synths);
+    var early: std.ArrayList([]const u8) = .empty;
+    for (planned.lines.items) |o| {
+        if (!isOneOf(o.edit.path, synth_bases)) try early.append(arena, o.edit.path);
+    }
+    for (planned.syms.items) |o| try early.append(arena, o.edit.source_abs);
+    for (synth_bases) |base_abs| {
+        try early.append(arena, base_abs);
+        for (synths) |sd| {
+            if (std.mem.eql(u8, sd.base_abs, base_abs)) try early.append(arena, sd.plan.fragment_path);
+        }
+    }
+    var lines: std.ArrayList(LineEdit) = .empty;
+    for (planned.lines.items) |o| try lines.append(arena, o.edit);
+    var syms: std.ArrayList(SymSync) = .empty;
+    for (planned.syms.items) |o| try syms.append(arena, o.edit);
+    for (early.items) |path| {
+        if (plan.get(path) != null) continue;
+        const pp = try plan.slot(arena, path);
+        pp.bytes = try plannedBeforeRenames(arena, path, pp.bytes, lines.items, syms.items, synths);
+        for (synths) |sd| {
+            if (std.mem.eql(u8, sd.plan.fragment_path, path)) pp.make_parent = true;
+        }
+    }
+}
+
+/// The plan's struct stage: each struct edit a live owner still routes,
+/// applied over its layer as planned so far. A layer refusing one fails its
+/// owners in `failed`, naming the refusal, and the edit is left out.
+///
+/// `placementHolds` checks each placement at routing, over the edits routed
+/// before it, so a refusal first reachable here takes an edit routed after
+/// it into its layer, a coupling rename planned into the layer, or the
+/// source changing under the run.
+fn planStructs(arena: std.mem.Allocator, plan: *WritePlan, structs: []const Owned(StructEdit), failed: []?[]const u8) !void {
+    for (structs) |o| {
+        const live_owner = for (o.owners.items) |owner| {
+            if (failed[owner.file] == null) break true;
+        } else false;
+        if (!live_owner) continue;
+        const pp = try plan.slot(arena, o.edit.layer_abs);
+        pp.make_parent = true;
+        pp.bytes = commit_struct.layerBytes(arena, o.edit.format, pp.bytes, o.edit.change) catch |err| {
+            for (o.owners.items) |owner| {
+                if (failed[owner.file] == null) failed[owner.file] = @errorName(err);
+            }
+            continue;
+        };
+    }
+}
+
 /// The distinct base files the accepted narrowings rewrite, in order.
 fn synthBases(arena: std.mem.Allocator, plans: []const SynthDecision) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
@@ -8032,11 +8559,12 @@ test "resolveCoupling: a private-origin rename never couples into a shared sourc
     try testing.expectEqual(@as(usize, 0), res.edits.len);
     try testing.expect(!res.abort);
     try testing.expect(std.mem.indexOf(u8, out_aw.written(), "update") == null);
-    // And the read-only reporter must likewise offer nothing.
+    // And a dry run, which takes every offered update, must likewise offer
+    // nothing.
     var report_protected = std.StringHashMap(void).init(a);
     var report_aw: Io.Writer.Allocating = .init(a);
-    const reported = try reportCoupling(a, io, coupling_dir, &.{edit}, &accepted, bases, &report_protected, &report_aw.writer, &err_aw.writer);
-    try testing.expectEqual(@as(usize, 0), reported);
+    const reported = try resolveCoupling(a, io, coupling_dir, &.{edit}, &.{0}, &accepted, bases, &report_protected, .report_only, &reader, &report_aw.writer, &err_aw.writer);
+    try testing.expectEqual(@as(usize, 0), reported.edits.len);
 }
 
 test "routeHunk: a private-only base file's edit is flagged private by location" {
@@ -8170,6 +8698,7 @@ fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.
         .interactive = false,
         .sty = .{ .on = false },
         .claims = claims,
+        .paths = .{ .home = m_state.home, .home_named = true, .repo_dir = "", .state_dir = "", .private_dir = "", .triggers_path = "", .snapshots_dir = "", .facts_path = "" },
     };
     return cc;
 }
@@ -8235,7 +8764,7 @@ fn couplingRestoreFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path
     return coupling_restore_fail_real(userdata, dir, sub_path, opts);
 }
 
-const CouplingSimRun = struct { result: anyerror!CouplingSim, err: []const u8, path: []const u8, fixture: []const u8, now: []const u8 };
+const CouplingSimRun = struct { result: anyerror!CouplingSim, err: []const u8, path: []const u8, fixture: []const u8, now: []const u8, root: []const u8 };
 
 /// `simulateCouplingImpact` over a one-file tree whose rename makes this
 /// machine's configuration unable to compose, with the `fail_on`-th create
@@ -8250,8 +8779,8 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
     // lexer rejects for every configuration -- including this machine's own.
     const fixture = "common\n# mox: when profile= sharedtok\ngated\n# mox: end\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "src/.zshrc", .data = fixture });
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const src_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "src" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const src_dir = try std.fs.path.join(a, &.{ root, "src" });
 
     const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
     try testing.expectEqual(@as(usize, 1), tree.files.len);
@@ -8317,6 +8846,16 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
         .interactive = false,
         .sty = .{ .on = false },
         .claims = claims,
+        .paths = .{
+            .home = "/home/me",
+            .home_named = true,
+            .repo_dir = root,
+            .state_dir = try std.fs.path.join(a, &.{ root, "state" }),
+            .private_dir = "",
+            .triggers_path = "",
+            .snapshots_dir = "",
+            .facts_path = "",
+        },
     };
 
     const file_edits = &[_]CouplingEdit{.{ .path = path, .old = "sharedtok", .new = "sharedtok@bad" }};
@@ -8328,19 +8867,29 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
         .path = path,
         .fixture = fixture,
         .now = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)),
+        .root = root,
     };
 }
 
-test "simulateCouplingImpact: a failed post-simulation restore reports the un-restored path" {
+test "simulateCouplingImpact: a failed post-simulation restore saves the pre-run bytes and stops the run" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
+    const a = arena.allocator();
     // The first create of the source, the edited-content write, lands; the
     // second, its restore, fails.
-    const r = try runCouplingSim(arena.allocator(), &tmp, 2, null);
-    try testing.expectError(error.UnexpectedCharacter, r.result);
-    try testing.expect(std.mem.indexOf(u8, r.err, r.path) != null);
+    const r = try runCouplingSim(a, &tmp, 2, null);
+    try testing.expectError(error.SimulationNotRestored, r.result);
+    const recovery = try std.fs.path.join(a, &.{ r.root, "state", "commit-recovery" });
+    var dir = try Io.Dir.cwd().openDir(testing.io, recovery, .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    const copy = try std.fs.path.join(a, &.{ recovery, (try it.next(testing.io)).?.name, "repo", "src", ".zshrc" });
+    try testing.expectEqualStrings(r.fixture, try Io.Dir.cwd().readFileAlloc(testing.io, copy, a, .limited(1 << 20)));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n", .{ r.path, r.path, copy }), r.err);
 }
 
 test "simulateCouplingImpact: a failed transient write is a target that cannot take the rename, reverted" {
