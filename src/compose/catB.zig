@@ -39,9 +39,10 @@ const Emitter = struct {
 /// its trailing newline, and attribute provenance PER LINE -- `.secret` only
 /// when this line resolved an inline secret or holds its placeholder (so diffs
 /// and snapshots redact just that line, never the whole file, and a placeholder
-/// compose attributes lines as a resolving one does), `.interpolated` when machine interp
-/// otherwise rewrote it, else `.base`. Both the directive loop and the
-/// directiveless passthrough go through here so their provenance matches.
+/// compose attributes lines as a resolving one does), `.interpolated` when
+/// machine interp otherwise rewrote it, else `.base`. Both the directive loop
+/// and the directiveless passthrough go through here so their provenance
+/// matches.
 fn emitBaseLine(em: *Emitter, arena: std.mem.Allocator, line: []const u8, line_no: u32, machine_present: bool, ctx: interp.Ctx) !void {
     var line_has_secret = false;
     var line_has_placeholder = false;

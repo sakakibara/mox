@@ -1,10 +1,11 @@
-//! Bounded exhaustive check of `mox commit`'s realignment (D7a). Small
-//! layouts of base lines, an included repo fragment, a private-layer region
-//! and loops are applied; every edit of up to K user operations is written
-//! over the live file, and the real `mox commit` runs over it. What it leaves
-//! in the sources is compared with a minimum-operation oracle: the edit's
-//! interpretations with the fewest operations, a line insertion, deletion or
-//! replacement one operation and a whole-row insertion or deletion one.
+//! Bounded exhaustive check of how `mox commit` realigns a file with a loop
+//! or with lines from more than one source. Small layouts of base lines, an
+//! included repo fragment, a private-layer region and loops are applied;
+//! every edit of up to K user operations is written over the live file, and
+//! the real `mox commit` runs over it. What it leaves in the sources is
+//! compared with a minimum-operation oracle: the edit's interpretations with
+//! the fewest operations, a line insertion, deletion or replacement one
+//! operation and a whole-row insertion or deletion one.
 //!
 //! `zig build test` runs a sample; `zig build test-realign` runs every edit
 //! of the full sweep, best with `-Doptimize=ReleaseFast` and split across

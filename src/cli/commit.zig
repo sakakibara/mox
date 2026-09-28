@@ -5,11 +5,12 @@
 //! at apply time, to the source that produced it: a base line to `src/`, a
 //! fragment line to its fragment, a private-layer line to the private file
 //! (never repo `src/`), a loop row to the fields of its data row. A file
-//! merged from layers routes per key, a symlink by its target. Secret,
-//! interpolated and first-contact hunks, a hunk spanning several origins
-//! that is not split, and a row edit that cannot be told apart from another
-//! reading of the diff, are manual. Two routed edits that overlap and differ
-//! are never both written: the later is manual.
+//! merged from layers routes per key, a symlink by its target. Secret and
+//! interpolated hunks, a hunk spanning several origins that is not split,
+//! and a row edit that cannot be told apart from another reading of the
+//! diff, are manual; a first-contact hunk is routed only when confirmed at
+//! an interactive prompt. Two routed edits that overlap and differ are
+//! never both written: the later is manual.
 //!
 //! Prompts come first; package rows are the only writes made at a prompt.
 //! Every other edit is planned in memory from a journal of the pre-run bytes
@@ -19,21 +20,22 @@
 //! form for a partial file, the target, the leaf content) or differ only by
 //! its manual and declined hunks, and no configuration the user did not
 //! choose may change. A file receiving only a coupled rename must still
-//! compose and change no such configuration, and is never recorded. A unit that fails is not committed, and
-//! every path holding an edit no passing unit owns is restored from the
-//! journal; a unit owning an edit to a restored path, or reading a fact
-//! reverted for a failed unit, fails in turn, until no unit fails anew. A
-//! coupled rename never fails its origin: it is reported undone. Records are
-//! written only after settling, and only for a unit whose recompose equals
-//! live. A write or restore that fails restores what it can, saves the
-//! pre-run bytes of the rest under the state directory, records nothing, and
-//! exits 2.
+//! compose and change no such configuration, and is never recorded. A unit
+//! that fails is not committed, and every path holding an edit no passing
+//! unit owns is restored from the journal; a unit owning an edit to a
+//! restored path, or reading a fact reverted for a failed unit, fails in
+//! turn, until no unit fails anew. A coupled rename never fails its origin:
+//! it is reported undone. Records are written only after settling, and only
+//! for a unit whose recompose equals live. A write or restore that fails
+//! restores what it can, saves the pre-run bytes of the rest under the state
+//! directory, records nothing, and exits 2.
 //!
-//! `--dry-run` runs the same routing, checks and plan without writing, so it
-//! reports what `--yes` would do. The exit code is 1 while anything is left
-//! undone -- a manual, declined or unrouted hunk, a unit not committed, a
-//! skipped file -- and 2 when a prompt is reached under `--abort-on-prompt`
-//! or a source cannot be read, written or restored.
+//! `--dry-run` runs the same routing, checks and plan, making only the
+//! temporary check writes it restores, so it reports what `--yes` would do.
+//! The exit code is 1 while anything is left undone -- a manual, declined or
+//! unrouted hunk, a unit not committed, a skipped file -- and 2 when a
+//! prompt is reached under `--abort-on-prompt` or a source cannot be read,
+//! written or restored.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -402,20 +404,10 @@ const SimJournal = struct {
         var paths: std.ArrayList([]const u8) = .empty;
         var it = s.journal.entries.keyIterator();
         while (it.next()) |p| try paths.append(cc.arena, p.*);
-        std.mem.sort([]const u8, paths.items, {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
-            }
-        }.lt);
+        sortPaths(paths.items);
         var failures: std.ArrayList(RestoreFailure) = .empty;
         var at_pre_run = std.StringHashMap(void).init(cc.arena);
-        for (paths.items) |p| {
-            s.journal.restore(cc.io, p) catch |e| {
-                try failures.append(cc.arena, .{ .path = p, .cause = e });
-                continue;
-            };
-            try at_pre_run.put(p, {});
-        }
+        try restorePaths(cc.arena, cc.io, &s.journal, paths.items, &at_pre_run, &failures);
         if (failures.items.len == 0) return;
         try saveRecovery(recoveryOf(cc), &s.journal, &s.ids, &at_pre_run, failures.items, cc.m_state.home);
         return error.SimulationNotRestored;
@@ -886,7 +878,7 @@ const struct_choices = [_]prompt.Choice{
     .{ .key = "s", .label = "skip", .help = "skip -- leave the key in the live file only" },
 };
 
-/// F-coupling prompt: `y` updates the other consumer, `d` declines this
+/// Coupled-rename prompt: `y` updates the other consumer, `d` declines this
 /// (token, file-pair), `D` declines the token everywhere.
 const yndd_choices = [_]prompt.Choice{
     .{ .key = "y", .label = "yes" },
@@ -1774,18 +1766,18 @@ fn commitRun(
     var ids: PathIds = .init(ctx.alloc, ctx.io);
     const protected = try protectedSourceSet(ctx.alloc, tree.files);
     const bases = try managedBases(ctx.alloc, tree.files);
-    // Whether routed renames are offered to other sources; see F-coupling.
+    // Whether routed renames are offered to other sources.
     const couples = scoped_live == null and line_edits.items.len > 0;
     const accepted: AcceptedTexts = if (couples)
         try acceptedTexts(ctx.alloc, ctx.io, &ids, tree.files, line_edits.items, row_edits.items, row_owners.items, &generated, synth_plans.items)
     else
         .init(ctx.alloc, &ids);
 
-    // F-coupling: a token a routed edit changed may live in other managed
-    // sources; offer to update them in the same write pass. Runs after routing
-    // (final edits known) and before any write (abort still writes nothing). A
-    // path-scoped commit routes only the named files and must not reach out to
-    // couple other sources, so the whole pass is skipped when scoped.
+    // A token a routed edit changed may live in other managed sources; offer
+    // to update them in the same write pass. Runs after routing (final edits
+    // known) and before any write (abort still writes nothing). A path-scoped
+    // commit routes only the named files and must not reach out to couple
+    // other sources, so the whole pass is skipped when scoped.
     var coupling_edits: []const CouplingEdit = &.{};
     var coupling_origins: []const usize = &.{};
     if (couples) {
@@ -2134,7 +2126,7 @@ fn commitRun(
     var settle: Settle = .{
         .arena = ctx.alloc,
         .v = &v,
-        .writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_structs.items, synth_plans.items, synth_owners.items, planned_syms.items),
+        .writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_structs.items, struct_applied.items, synth_plans.items, synth_owners.items, planned_syms.items),
         .couplings = planned_couplings.items,
         .targets = &coupling_targets,
         .ids = &ids,
@@ -2224,13 +2216,7 @@ fn commitRun(
     // EVERY file recomposed below, this routed file included: re-capture so
     // verification sees the new value instead of the one this run started
     // with.
-    if (fact_edits.items.len > 0) {
-        m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
-        bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-        live_ctx = m_state.liveResolver(&bindings);
-        // The fresh `bindings` map above starts unseeded again.
-        try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
-    }
+    if (fact_edits.items.len > 0) try recaptureMachine(ctx, &m_state, &bindings, &live_ctx, repo_ax, axis_resolver);
 
     // Verify every unit against the disk as it now stands. Rewalk first so
     // region synthesis (new fragments/regions) is reflected.
@@ -2319,12 +2305,7 @@ fn commitRun(
         var prev_bindings = bindings;
         var prev_live = prev_state.liveResolver(&prev_bindings);
         const prev_resolver: mox.dsl.resolver.Resolver = .{ .live = &prev_live };
-        if (fact_changed) {
-            m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
-            bindings = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
-            live_ctx = m_state.liveResolver(&bindings);
-            try mox.machine.bindings.seedStaticMultiValue(&bindings, repo_ax, axis_resolver);
-        }
+        if (fact_changed) try recaptureMachine(ctx, &m_state, &bindings, &live_ctx, repo_ax, axis_resolver);
         // A unit failing now prints one line: the reverted facts it reads,
         // when it passes under the facts as they were before this round's
         // reverts, or else its own diagnostic. A coupling target failing
@@ -3025,7 +3006,10 @@ const UndoneBy = struct {
 };
 
 /// One planned write to a source path and the units that own it: every
-/// planned edit other than coupled updates, as settling sees it.
+/// planned edit other than coupled updates, as settling sees it. A struct
+/// edit is one only when the plan applied it (its index in
+/// `struct_applied`); one a layer refused, or skipped with its owners
+/// already failed, is not in the path's bytes and does not make it dead.
 const OwnedWrite = struct {
     path: []const u8,
     owners: []const Unit,
@@ -3035,6 +3019,7 @@ fn ownedWrites(
     arena: std.mem.Allocator,
     lines: []const Owned(LineEdit),
     structs: []const Owned(StructEdit),
+    struct_applied: []const usize,
     synths: []const SynthDecision,
     synth_owners: []const usize,
     syms: []const Owned(SymSync),
@@ -3047,7 +3032,7 @@ fn ownedWrites(
         try out.append(arena, .{ .path = sd.base_abs, .owners = owners });
         try out.append(arena, .{ .path = sd.plan.fragment_path, .owners = owners });
     }
-    for (structs) |o| try out.append(arena, .{ .path = o.edit.layer_abs, .owners = o.owners.items });
+    for (struct_applied) |i| try out.append(arena, .{ .path = structs[i].edit.layer_abs, .owners = structs[i].owners.items });
     return out.toOwnedSlice(arena);
 }
 
@@ -3188,6 +3173,25 @@ fn markDead(
     try batch.append(arena, path);
 }
 
+/// Re-capture machine state after the facts file changed, rebuilding
+/// `bindings` and the resolver context `live_ctx` from it; the fresh
+/// bindings are seeded with the repo's static multi-value axes again through
+/// `axis_resolver`, which reads `live_ctx`.
+fn recaptureMachine(
+    ctx: *app.Ctx,
+    m_state: *mox.machine.state.MachineState,
+    bindings: *std.StringHashMap([]const u8),
+    live_ctx: *mox.dsl.resolver.Resolver.Live,
+    repo_ax: mox.source.axes.Axes,
+    axis_resolver: mox.dsl.resolver.Resolver,
+) !void {
+    const context = ctx.context.?;
+    m_state.* = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
+    bindings.* = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state.*);
+    live_ctx.* = m_state.liveResolver(bindings);
+    try mox.machine.bindings.seedStaticMultiValue(bindings, repo_ax, axis_resolver);
+}
+
 /// Write phase: each planned path once, then the facts file as planned, if
 /// it is. `writing` names the path being written when an error returns.
 fn writePlan(
@@ -3230,14 +3234,7 @@ fn restoreJournal(ctx: RecoveryCtx, journal: *const Journal, ids: *const PathIds
     var it = journal.entries.iterator();
     while (it.next()) |entry| {
         const p = entry.key_ptr.*;
-        const now: PathNow = if (Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.alloc, .limited(max_file_bytes))) |bytes|
-            .{ .bytes = bytes }
-        else |e| switch (e) {
-            error.FileNotFound => .absent,
-            error.OutOfMemory => return e,
-            else => .unreadable,
-        };
-        if (atPreRun(entry.value_ptr.content, now)) {
+        if (atPreRun(entry.value_ptr.content, try pathNow(ctx.alloc, ctx.io, p))) {
             // An absent path may still have had its directories made.
             if (entry.value_ptr.created_dir != null) journal.restore(ctx.io, p) catch |e| {
                 try failures.append(ctx.alloc, .{ .path = p, .cause = e });
@@ -3248,18 +3245,8 @@ fn restoreJournal(ctx: RecoveryCtx, journal: *const Journal, ids: *const PathIds
             try due.append(ctx.alloc, p);
         }
     }
-    std.mem.sort([]const u8, due.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
-    for (due.items) |p| {
-        journal.restore(ctx.io, p) catch |e| {
-            try failures.append(ctx.alloc, .{ .path = p, .cause = e });
-            continue;
-        };
-        try at_pre_run.put(p, {});
-    }
+    sortPaths(due.items);
+    try restorePaths(ctx.alloc, ctx.io, journal, due.items, &at_pre_run, &failures);
     if (failures.items.len > 0) return saveRecovery(ctx, journal, ids, &at_pre_run, failures.items, home);
     if (due.items.len == 0) return ctx.err.writeAll("mox commit: nothing was recorded\n");
     try ctx.err.writeAll("mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n");
@@ -3270,6 +3257,33 @@ const RestoreFailure = struct {
     path: []const u8,
     cause: anyerror,
 };
+
+/// Restore each of `paths` from `journal`, in order, adding each one put
+/// back to `at_pre_run` and each one that could not be to `failures`.
+fn restorePaths(
+    arena: std.mem.Allocator,
+    io: Io,
+    journal: *const Journal,
+    paths: []const []const u8,
+    at_pre_run: *std.StringHashMap(void),
+    failures: *std.ArrayList(RestoreFailure),
+) !void {
+    for (paths) |p| {
+        journal.restore(io, p) catch |e| {
+            try failures.append(arena, .{ .path = p, .cause = e });
+            continue;
+        };
+        try at_pre_run.put(p, {});
+    }
+}
+
+fn sortPaths(paths: [][]const u8) void {
+    std.mem.sort([]const u8, paths, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+}
 
 /// After a restore did not succeed: name each failure, then copy the pre-run
 /// bytes of every journaled path not yet put back that still differs from
@@ -3297,20 +3311,9 @@ fn saveRecovery(
     while (it.next()) |entry| {
         const p = entry.key_ptr.*;
         if (at_pre_run.contains(p)) continue;
-        const now: PathNow = if (Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.alloc, .limited(max_file_bytes))) |bytes|
-            .{ .bytes = bytes }
-        else |e| switch (e) {
-            error.FileNotFound => .absent,
-            error.OutOfMemory => return e,
-            else => .unreadable,
-        };
-        if (!atPreRun(entry.value_ptr.content, now)) try pending.append(ctx.alloc, p);
+        if (!atPreRun(entry.value_ptr.content, try pathNow(ctx.alloc, ctx.io, p))) try pending.append(ctx.alloc, p);
     }
-    std.mem.sort([]const u8, pending.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
+    sortPaths(pending.items);
 
     const root = try std.fs.path.join(ctx.alloc, &.{ paths.state_dir, "commit-recovery" });
     const roots: RecoveryRoots = .{
@@ -3369,6 +3372,16 @@ const RecoveryCtx = struct {
 
 /// What a journaled path holds when a recovery copy is considered.
 const PathNow = union(enum) { absent, bytes: []const u8, unreadable };
+
+fn pathNow(arena: std.mem.Allocator, io: Io, path: []const u8) !PathNow {
+    return if (Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes))) |bytes|
+        .{ .bytes = bytes }
+    else |e| switch (e) {
+        error.FileNotFound => .absent,
+        error.OutOfMemory => e,
+        else => .unreadable,
+    };
+}
 
 /// Whether a path is known to hold its pre-run state `before` (null: it did
 /// not exist). A path that cannot be read is not known to.
@@ -3447,7 +3460,7 @@ fn walkMerged(arena: std.mem.Allocator, io: Io, src_dir: []const u8, private_dir
     return mox.private.layer.merge(arena, io, base_tree, private_dir, home);
 }
 
-/// Outcome of F-coupling resolution over the routed edits.
+/// Outcome of coupled-rename resolution over the routed edits.
 const CouplingOutcome = struct {
     /// Updates to apply to other managed sources in the write pass.
     edits: []const CouplingEdit,
@@ -6614,8 +6627,9 @@ fn processHunk(
 }
 
 /// Route and process every change of a file. A file in realignment scope
-/// (D7a) is processed block by block, each block routed before any is
-/// processed so a held block holds the rest; any other file hunk by hunk.
+/// (see `realignScope`) is processed block by block, each block routed
+/// before any is processed so a held block holds the rest; any other file
+/// hunk by hunk.
 fn processFileHunks(
     cc: *const ClassCtx,
     ra: *const RunAccum,
@@ -6647,7 +6661,8 @@ fn processFileHunks(
     var held = false;
     for (al.blocks, plans) |blk, *plan| {
         plan.* = try planBlock(cc, lf, fits, blk);
-        // A row write refused as a conflict holds the file as D7 refusals do.
+        // A row write refused as a conflict holds the file, as a row write
+        // refused for any other reason does.
         if (plan.route == .row) {
             plan.route = try unlessConflicting(cc, ra, plan.route);
             plan.holds = plan.holds or plan.route == .manual;
@@ -6788,9 +6803,9 @@ fn patternFits(pattern: []const u8, line: []const u8) bool {
 /// it holds every other block of its file.
 const BlockPlan = struct { route: Route, split: bool, holds: bool };
 
-/// Route one block: through its row (D7) when its baseline lies in one loop
-/// row; manual when any line of it fits a loop of the file; otherwise by the
-/// segment covering it.
+/// Route one block: through its loop row, as a write of that row's changed
+/// fields, when its baseline lies in one loop row; manual when any line of it
+/// fits a loop of the file; otherwise by the segment covering it.
 fn planBlock(cc: *const ClassCtx, lf: *LoopFile, fits: LoopFits, blk: Hunk) !BlockPlan {
     const cover = mox.provenance.map.covering(lf.segments, blk.a_start, blk.a_len);
     if (blk.a_len > 0) {
@@ -7393,13 +7408,11 @@ fn simulateImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: 
 }
 
 /// Every configuration's compose before and after `path`, journaled in
-/// `sim`, transiently holds `edited`; the write is reverted whatever fails.
+/// `sim`, transiently holds `edited`; the write is reverted whatever fails,
+/// and a write that fails stops the run.
 fn simulateWrite(cc: *const ClassCtx, sim: *SimJournal, file: mox.source.tree.ManagedFile, path: []const u8, edited: []const u8, configs: []const Configuration) !impact.Impact {
     const before = try impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets);
-    Io.Dir.cwd().writeFile(cc.io, .{ .sub_path = path, .data = edited }) catch |e| {
-        try sim.restore(cc);
-        return e;
-    };
+    Io.Dir.cwd().writeFile(cc.io, .{ .sub_path = path, .data = edited }) catch |e| return sim.stopAfterWrite(cc, path, e);
     const after = impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets) catch |e| {
         try sim.restore(cc);
         return e;
@@ -7608,7 +7621,8 @@ const LoopFile = struct {
     segments: []const Segment,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
-    /// Set for a file in realignment scope (D7a) that is not too large.
+    /// Set for a file in realignment scope (see `realignScope`) that is not
+    /// too large.
     alignment: ?Alignment = null,
     /// A source realignment reads could not be read.
     unreadable: bool = false,
@@ -8590,7 +8604,7 @@ fn planStructs(arena: std.mem.Allocator, plan: *WritePlan, structs: []const Owne
     }
 }
 
-/// D2's plan backstop: each path a row, struct or fact edit writes, parsed
+/// The plan check: each path a row, struct or fact edit writes, parsed
 /// as planned, must hold every such edit's value at its key, equal a
 /// reference -- its pre-run bytes with only its line splices, narrowing
 /// regions and coupling renames -- outside those keys, and render every row
@@ -9118,7 +9132,7 @@ pub const command = app.command(Spec, .{
     .name = "commit",
     .usage = "mox commit [--flags] [<paths...>]",
     .summary = "Route live-file edits back into their sources",
-    .details = "Prompts [y/s] per hunk, [y/p/s] per key of a file merged from layers (accept the winning layer, pick another, skip), and [Y/n/d/D/q] to carry a changed token into other sources that hold it; --yes takes the defaults, --dry-run reports what --yes would do and writes nothing (exit 1 if edits remain), --abort-on-prompt exits 2 at the first prompt. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region). Every edit is planned and checked before anything is written; a file that fails verification is not committed and its sources are restored, failing with it every file whose edit shared a restored source, and nothing is recorded until all are settled. Exits 1 while anything is left undone. Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely.",
+    .details = "Prompts [y/s] per hunk, [y/p/s] per key of a file merged from layers (accept the winning layer, pick another, skip), and [Y/n/d/D/q] to carry a changed token into other sources that hold it; --yes takes the defaults, --dry-run reports what --yes would do, making only temporary check writes it restores (exit 1 if edits remain), --abort-on-prompt exits 2 at the first prompt. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region). Every edit is planned and checked before anything is written; a file that fails verification is not committed and its sources are restored, failing with it every file whose edit shared a restored source, and nothing is recorded until all are settled. Exits 1 while anything is left undone. Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -9184,6 +9198,58 @@ test "recoveryName: a path under neither root, or leaving its root, has no roote
     try std.testing.expect(recoveryName("/r/repo", roots) == null);
 }
 
+test "Backstop: a row write whose header line no longer opens its row does not hold its row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/src/abbrs.toml";
+    const pre = "[[abbrs]]\nkey = \"ll\"\n\n[[abbrs]]\nkey = \"gs\"\n";
+    var journal: Journal = .init(a);
+    try journal.entries.put(path, .{ .path = path, .content = pre, .created_dir = null });
+    var plan: WritePlan = .{ .paths = .empty, .journal = &journal };
+    try plan.paths.append(a, .{ .path = path, .bytes = "[[abbrs]]\nkey = \"ll\"\n\n[[other]]\nkey = \"gss\"\n" });
+    var cc: ClassCtx = undefined;
+    cc.arena = a;
+    var row: RowEdit = undefined;
+    row.data_source = path;
+    row.stem = "abbrs";
+    row.header = 3;
+    var b: Backstop = undefined;
+    b.cc = &cc;
+    b.plan = &plan;
+    b.journal = &journal;
+    b.planned = .{ .lines = .empty, .structs = .empty, .syms = .empty };
+    b.lines = &.{};
+    b.synths = &.{};
+    b.rows = &.{row};
+    b.leaf_rows = &.{};
+    try std.testing.expectEqualStrings("does not hold its row", (try b.rowPathFault(path)).?);
+}
+
+test "freshRecoveryDir: a taken timestamp gets the next free -N suffix" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "commit-recovery" });
+
+    // Retried while the second turns over between taking the names and the
+    // call, which would leave nothing taken.
+    for (0..5) |_| {
+        const base = mox.apply.snapshot.idNow(io);
+        for ([_][]const u8{ "", "-2" }) |suffix| {
+            try Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ root, std.fs.path.sep_str, &base, suffix }));
+        }
+        const got = try freshRecoveryDir(a, io, root);
+        if (!std.mem.eql(u8, &mox.apply.snapshot.idNow(io), &base)) continue;
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}{s}{s}-3", .{ root, std.fs.path.sep_str, &base }), got);
+        return;
+    }
+    return error.ClockKeptTurningOver;
+}
+
 test "atPreRun: an unreadable path is never taken for its pre-run bytes" {
     try std.testing.expect(!atPreRun("", .unreadable));
     try std.testing.expect(!atPreRun(null, .unreadable));
@@ -9214,6 +9280,58 @@ test "UndoneBy: a failing coupling target is left to its undone line" {
     unrouted[0] = 0;
     couplings[0].owners = .empty;
     try std.testing.expect(!u.reports(.{ .file = 0 }));
+}
+
+test "Settle: a key edit a layer refused leaves another unit's key edit to that layer as written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const layer = "/src/app.toml";
+    var plan: WritePlan = .{ .paths = .empty, .journal = undefined };
+    try plan.paths.append(a, .{ .path = layer, .bytes = "a = 1\nb = 1\n" });
+
+    // File 0's edit has no key path, which the layer refuses; file 1 removes
+    // `b`, which it takes.
+    var structs: [2]Owned(StructEdit) = undefined;
+    for (&structs, [_][]const []const u8{ &.{}, &.{"b"} }, 0..) |*o, path, i| {
+        o.* = .{ .edit = .{ .format = .toml, .layer_abs = layer, .change = .{ .path = path, .new = null, .removed = true } }, .owners = .empty };
+        try o.owners.append(a, .{ .file = i });
+    }
+    var failed = [_]?[]const u8{ null, null };
+    var before: std.StringHashMap(?[]const u8) = .init(a);
+    var applied: std.ArrayList(usize) = .empty;
+    try planStructs(a, &plan, &structs, &failed, &before, &applied);
+    try std.testing.expectEqualStrings("a source layer rejected the edit (EmptyPath)", failed[0].?);
+    try std.testing.expect(failed[1] == null);
+    try std.testing.expectEqualStrings("a = 1\n", plan.get(layer).?);
+
+    var v: Verifier = undefined;
+    v.file_failed = try a.dupe(bool, &.{ true, false });
+    v.sym_failed = &.{};
+    v.leaf_failed = &.{};
+    var targets = std.StringHashMap([]const usize).init(a);
+    var ids: PathIds = .init(a, std.testing.io);
+    var s: Settle = .{
+        .arena = a,
+        .v = &v,
+        .writes = try ownedWrites(a, &.{}, &structs, applied.items, &.{}, &.{}, &.{}),
+        .couplings = &.{},
+        .targets = &targets,
+        .ids = &ids,
+        .home = "",
+        .quiet_fail = &.{ false, false },
+        .restore_cause = .init(a),
+        .undone = &.{},
+    };
+    var batch: std.ArrayList([]const u8) = .empty;
+    try s.markRound(&batch);
+    try std.testing.expectEqual(@as(usize, 0), batch.items.len);
+
+    // Once file 1 fails too, its applied edit is dead and the layer restored.
+    v.file_failed[1] = true;
+    try s.markRound(&batch);
+    try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+    try std.testing.expectEqualStrings(layer, batch.items[0]);
 }
 
 test "canonicalPath: every spelling of a file is one path, and an absent path keeps its tail" {

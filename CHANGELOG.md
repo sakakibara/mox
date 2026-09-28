@@ -267,8 +267,6 @@ All notable changes to mox are documented here. The format follows
   it writes: an edit to a YAML value that anchors aliases elsewhere fails.
 - `commit` leaves manual an edit that adds new `<...>` text to a string
   field carried by a bare capture.
-- `commit` leaves manual a loop line whose edit splits into row fields more
-  than one way, where the leftmost split used to be taken.
 - `commit` leaves a row edit manual when the loop's rows up to the edited one
   differ from the last apply (a row changed, added or dropped, the template
   changed, the data source shadowed by the private layer) or the edited
@@ -281,7 +279,9 @@ All notable changes to mox are documented here. The format follows
   that could move a line between the private layer and the repo holds every
   non-row change, a row edit is manual when the row renders elsewhere in
   the file unchanged, and a file whose line counts multiply past 2^24 holds
-  every change.
+  every change. Coupled renames are found in each routed region as merged,
+  and a region mixing private-layer and repo lines is never offered for a
+  split.
 - `commit` refuses a key edit to a file merged from layers together with any
   line, row or fact edit to the same file (a `d` default rewrite included,
   hard links too), even on other lines, and two `d` default rewrites of one
@@ -294,7 +294,8 @@ All notable changes to mox are documented here. The format follows
   every captured field as `key = "value"`.
 - A unit owning an edit to a source restored because another unit failed,
   and a unit with an unrouted hunk, are not committed. Declined-only files,
-  final-newline differences and every file `commit` skips exit 1.
+  final-newline differences and every file `commit` skips with an edit
+  exit 1.
 - `commit` shows a live path as `~/...` in the messages that printed it
   absolute: failed verification, unrouted hunks, hunks left only in the
   live file, the notice before a narrowing prompt, a key no layer can hold,
@@ -341,7 +342,7 @@ All notable changes to mox are documented here. The format follows
   routed to the wrong place was never checked: a table or key named by a
   capture was written into the source under its resolved name, and the file
   was reported committed. Any routed key that does not recompose to its live
-  value now rolls the file back.
+  value now restores the file's sources.
 - `commit` refuses an edit that leaves the file unable to compose in any
   configuration that composed it before, including one the edit was allowed
   to change. The check for an allowed configuration stopped at whether it
@@ -354,8 +355,8 @@ All notable changes to mox are documented here. The format follows
   exist in. The rename was refused, so a token never synced into a file
   gated to another machine.
 - A file `commit` does not commit has a coupled token update to its own
-  source rolled back with the rest. Only sources an edit was routed into
-  were saved for rollback, so a token synced into an edited file stayed
+  source undone with the rest. Only sources an edit was routed into were
+  saved to be restored, so a token synced into an edited file stayed
   written when that file was then refused, even when it left the source
   composing to nothing.
 - `commit` finds every capture compose could expand in a value of a file
@@ -644,12 +645,14 @@ All notable changes to mox are documented here. The format follows
   the preview instead of failing at write. The preview runs the same row
   checks, conflicts, coupled renames and parse-back as `--yes`, and reports
   the same manual, not-committed and undone lines.
-- `commit` exits 1 when a file is left undone for any reason: its source
-  yields no file here (a secret-bearing file included, now reported like
-  any other), every hunk was declined, it differs only in its final newline
-  (reported `manual: <path>: final newline differs`), a generator fails to
-  re-expand, or a recorded path holds a special file (reported `manual:
-  <path> (not a regular file)`) or a head declaration that cannot be read.
+- `commit` exits 1 when a file is left undone: its source yields no file
+  here (a secret-bearing file included, now reported like any other), every
+  hunk was declined, it differs only in its final newline (reported
+  `manual: <path>: final newline differs`), a generator fails to re-expand,
+  a recorded path holds a special file (reported `manual: <path> (not a
+  regular file)`), or a file skipped for a head declaration that cannot be
+  read was edited since it was last recorded. A special file at a path
+  never recorded is skipped with exit 0.
 
 ## [0.11.0] - 2026-09-09
 

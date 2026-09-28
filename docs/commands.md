@@ -561,8 +561,10 @@ created is named `<path> did not exist before this commit; delete it to
 restore it`, and a copy that cannot be written is printed in full
 instead. Copy each file back over its path, or delete the created ones,
 before running commit again. Temporary writes commit makes to check a
-route, under `--dry-run` too, are restored the same way. Every exit 2
-ends by saying how many package rows were already recorded.
+route, under `--dry-run` too, are restored the same way; one that fails
+for a key placement, a line or a row is reported `could not write <path>
+(<error>)` and stops the run, exit 2. Every exit 2 ends by saying how many
+package rows were already recorded.
 
 ### Preview
 
@@ -603,8 +605,11 @@ packages entirely.
   secret; a package still untracked. The same holds in every mode.
 - **2**: a source could not be read before writing, a write or restore
   failed (sources restored or copied as above, nothing recorded), a
-  temporary check write failed or could not be reverted, or
-  `--abort-on-prompt` reached a prompt.
+  temporary check write for a key placement, a line or a row failed, any
+  temporary check write could not be reverted, or `--abort-on-prompt`
+  reached a prompt. A temporary check write for a coupled rename that
+  fails undoes that rename (`coupled update to <path> undone: <path> could
+  not take it (<error>)`) and is not an exit 2.
 
 ## diff
 

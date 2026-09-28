@@ -338,8 +338,8 @@ pub fn expand(
 /// Result of an expansion: the arena-owned bytes, whether a `<secret:URI>`
 /// capture actually RESOLVED a secret into them (false when there was none, or
 /// when a null `ctx.secrets` turned it into a placeholder), and whether one was
-/// left as its placeholder. Callers that record provenance mark a span with
-/// either `.secret`: a resolved secret's cleartext is kept out of the
+/// left as its placeholder. Callers that record provenance mark a span `.secret`
+/// when either is set: a resolved secret's cleartext is kept out of the
 /// applied-content cache and snapshots, and a placeholder compose attributes
 /// lines as a resolving one does.
 pub const Expansion = struct {
