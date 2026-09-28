@@ -6864,7 +6864,7 @@ test "commit: one key removal made through two hard-linked files is one edit and
     const a = arena.allocator();
 
     try writeRepo(io, &tmp, "repo/src/a.toml", "# mox: own srv\n[srv]\nx = 1\ny = 2\n");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/a.toml", tmp.dir, "repo/src/b.toml", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/a.toml", "repo/src/b.toml");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf("a.toml"), "x = 1\n", "");
@@ -6989,7 +6989,7 @@ fn hardLinkedLayerEdits(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, 
     try writeRepo(io, tmp, try std.fmt.allocPrint(a, "repo/src/{s}", .{rc_name}), "export X=1\n# mox: include \"extra.toml\"\n");
     try writeRepo(io, tmp, "repo/src/app.toml", "# mox: own srv\n[srv]\na = 1\n");
     try tmp.dir.createDirPath(io, try std.fmt.allocPrint(a, "repo/src/{s}.d", .{rc_name}));
-    try Io.Dir.hardLink(tmp.dir, "repo/src/app.toml", tmp.dir, try std.fmt.allocPrint(a, "repo/src/{s}.d/extra.toml", .{rc_name}), io, .{});
+    try testutil.hardLink(a, io, tmp, "repo/src/app.toml", try std.fmt.allocPrint(a, "repo/src/{s}.d/extra.toml", .{rc_name}));
     const h = try setup(a, io, tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf(rc_name), "[srv]\na = 1", "srv.a = 1");
@@ -8376,7 +8376,7 @@ test "commit: a data source hard-linked to a managed file is one path with that 
 
     try writeRepo(io, &tmp, "repo/src/abbrs.toml", shared_abbrs);
     try tmp.dir.createDirPath(io, "repo/data");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/abbrs.toml", tmp.dir, "repo/data/abbrs.toml", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/abbrs.toml", "repo/data/abbrs.toml");
     try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nkey: <entry.key>\n# mox: end\n" ++ spelled_fail_tail);
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -8407,7 +8407,7 @@ test "commit: every managed file hard-linked to a coupled update's path is verif
 
     const linked = "note quokkanote\nexport A=1\n";
     try writeRepo(io, &tmp, "repo/src/.ha", linked);
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.ha", "repo/src/.hb");
     try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -8438,7 +8438,7 @@ test "commit: a coupled update whose simulation fails for one hard-linked target
 
     const linked = "note quokkanote\nexport A=1\n";
     try writeRepo(io, &tmp, "repo/src/.ha", linked);
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.ha", "repo/src/.hb");
     try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -8502,7 +8502,7 @@ test "commit: a restore that fails for a data source outside the repo copies it 
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: 0 package row(s) already recorded\n", .{
         try shownLive(a, ".abbrs"),
-        try std.fs.path.join(a, &.{ h.repo, "src", "../../ext/abbrs.toml" }),
+        try std.fs.path.join(a, &.{ h.repo, "src", "..", "..", "ext", "abbrs.toml" }),
         real,
         copy,
     }), res.err);
@@ -8776,7 +8776,7 @@ test "commit: a coupled update into hard-linked bases is offered once" {
     const a = arena.allocator();
 
     try writeRepo(io, &tmp, "repo/src/.ha", "note quokkanote\n");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.ha", "repo/src/.hb");
     try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -8803,7 +8803,7 @@ test "commit: a coupling decline recorded for one hard-linked base applies to th
     const a = arena.allocator();
 
     try writeRepo(io, &tmp, "repo/src/.ha", "note quokkanote\n");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.ha", tmp.dir, "repo/src/.hb", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.ha", "repo/src/.hb");
     try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -10504,7 +10504,7 @@ test "commit: overlapping line splices from two files into one source are refuse
 
     const src = "export A=1\nexport B=1\nexport C=1\n";
     try writeRepo(io, &tmp, "repo/src/.a", src);
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.a", tmp.dir, "repo/src/.b", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.a", "repo/src/.b");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf(".a"), "export B=1\nexport C=1\n", "export B=2\nexport C=2\n");
@@ -10572,7 +10572,7 @@ test "commit: a line edit beside a narrowing of the same source line is refused 
     const a = arena.allocator();
 
     try writeSharedBaseFixture(io, &tmp);
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.zshrc", tmp.dir, "repo/src/.zshrc2", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.zshrc", "repo/src/.zshrc2");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf(".zshrc"), "export EDITOR=vim", "export EDITOR=nvim");
@@ -10603,7 +10603,7 @@ test "commit: a narrowing of a source line another file's same edit was routed t
     const a = arena.allocator();
 
     try writeSharedBaseFixture(io, &tmp);
-    try Io.Dir.hardLink(tmp.dir, "repo/src/.zshrc", tmp.dir, "repo/src/.zshrc2", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/.zshrc", "repo/src/.zshrc2");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf(".zshrc"), "export EDITOR=vim", "export EDITOR=nvim");
@@ -10773,7 +10773,7 @@ test "commit: two symlinks of one source retargeted differently are refused at r
     const a = arena.allocator();
 
     try writeRepo(io, &tmp, "repo/src/alink", "/tmp/mox-old\n");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/alink", tmp.dir, "repo/src/blink", io, .{});
+    try testutil.hardLink(a, io, &tmp, "repo/src/alink", "repo/src/blink");
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"alink\"]\nsymlink = true\n\n[\"blink\"]\nsymlink = true\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -10918,7 +10918,7 @@ test "commit: a leaf row write the plan refuses is not committed, and --dry-run 
 fn keyBesideDefault(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, text: []const u8, input: []const u8) !struct { h: Harness, res: testutil.RunResult } {
     try writeRepo(io, tmp, "repo/src/app.toml", "# e <machine.email | default \"nobody@example.com\">\n[srv]\nx = 1\n");
     try writeRepo(io, tmp, "repo/src/app.toml.d/os=darwin.toml", "[srv]\ny = 2\n");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/app.toml", tmp.dir, try std.fs.path.join(a, &.{ "repo", "src", text }), io, .{});
+    try testutil.hardLink(a, io, tmp, "repo/src/app.toml", try std.fs.path.join(a, &.{ "repo", "src", text }));
     const h = try setup(a, io, tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf("app.toml"), "x = 1", "x = 5");

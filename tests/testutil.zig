@@ -3,6 +3,7 @@
 //! argv through mox's cli-zig dispatcher, capturing stdout/stderr/exit code.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mox = @import("mox");
 
 const Io = std.Io;
@@ -113,6 +114,30 @@ pub fn containsAnywhere(a: std.mem.Allocator, io: Io, root: []const u8, needle: 
     }
     return false;
 }
+
+/// A second name `new` for the file at `old`, both relative to `tmp`. std's
+/// `Io.Dir.hardLink` answers OperationUnsupported on Windows, whose file
+/// systems link all the same, so there the link is made by CreateHardLinkW.
+pub fn hardLink(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, old: []const u8, new: []const u8) !void {
+    if (builtin.os.tag != .windows) return Io.Dir.hardLink(tmp.dir, old, tmp.dir, new, io, .{});
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const old_w = try std.unicode.wtf8ToWtf16LeAllocZ(a, try windowsPath(a, base, old));
+    const new_w = try std.unicode.wtf8ToWtf16LeAllocZ(a, try windowsPath(a, base, new));
+    if (!CreateHardLinkW(new_w, old_w, null).toBool()) return error.HardLinkFailed;
+}
+
+fn windowsPath(a: std.mem.Allocator, base: []const u8, sub: []const u8) ![]const u8 {
+    const joined = try std.fs.path.join(a, &.{ base, sub });
+    std.mem.replaceScalar(u8, joined, '/', '\\');
+    return joined;
+}
+
+extern "kernel32" fn CreateHardLinkW(
+    lpFileName: [*:0]const u16,
+    lpExistingFileName: [*:0]const u16,
+    lpSecurityAttributes: ?*anyopaque,
+) callconv(.winapi) std.os.windows.BOOL;
 
 pub const EnvPair = struct { name: []const u8, value: []const u8 };
 

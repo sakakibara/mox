@@ -348,7 +348,10 @@ const Journal = struct {
     fn record(j: *Journal, arena: std.mem.Allocator, io: Io, path: []const u8) !void {
         if (j.entries.contains(path)) return;
         const content: ?[]const u8 = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_file_bytes)) catch |e| switch (e) {
-            error.FileNotFound => null,
+            error.FileNotFound => blk: {
+                try requireDirAncestor(io, path);
+                break :blk null;
+            },
             else => return e,
         };
         try j.entries.put(path, .{ .path = path, .content = content, .created_dir = mox.classify.synth.missingAncestor(io, path) });
@@ -376,6 +379,21 @@ const Journal = struct {
         }
     }
 };
+
+/// `error.NotDir` when the nearest existing ancestor of the absent `path` is
+/// not a directory, so no write can create it. POSIX says so when the path is
+/// read; Windows answers that read as not found.
+fn requireDirAncestor(io: Io, path: []const u8) !void {
+    var dir = std.fs.path.dirname(path);
+    while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+        const st = Io.Dir.cwd().statFile(io, d, .{}) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return,
+        };
+        if (st.kind != .directory) return error.NotDir;
+        return;
+    }
+}
 
 /// The scope of one transient simulation write: each path it writes is
 /// journaled before the write and put back after it by the journal's restore
@@ -9169,6 +9187,23 @@ test "linuxDevice: a kernel dev_t splits into statx's major and minor halves" {
     try std.testing.expectEqual((@as(u64, 8) << 32) | 1, linuxDevice(0x801));
     // Major 259, minor 300: the minor's high bits sit above the major's.
     try std.testing.expectEqual((@as(u64, 259) << 32) | 300, linuxDevice(44 | (259 << 8) | (256 << 12)));
+}
+
+test "Journal: an absent path under a regular file is unreadable on every platform" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var j: Journal = .init(a);
+    try std.testing.expectError(error.NotDir, j.record(a, io, try std.fs.path.join(a, &.{ base, "f", "sub", "leaf" })));
+    try std.testing.expectError(error.NotDir, requireDirAncestor(io, try std.fs.path.join(a, &.{ base, "f", "sub", "leaf" })));
+    const absent = try std.fs.path.join(a, &.{ base, "d", "sub", "leaf" });
+    try j.record(a, io, absent);
+    try std.testing.expectEqual(@as(?[]const u8, null), j.entries.get(absent).?.content);
 }
 
 test "fileIdentity: the fstatat fallback reads the identity statx does" {

@@ -1622,6 +1622,8 @@ test "install: a search that cannot run stops the install rather than refusing e
 
 test "install: a record that cannot be written is said, not reported as a failed install" {
     const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1636,13 +1638,13 @@ test "install: a record that cannot be written is said, not reported as a failed
         .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
-    var z: Zypper = .{
-        .runner = fake.runner(),
-        // A path no directory can be made at: `ledger.add` fails on it.
-        .ledger = .{ .io = io, .dir = "/dev/null/nowhere/packages", .backend = "zypper" },
-        .force_elevate = true,
-        .err = &w.writer,
-    };
+    // Under a regular file no directory can be made, on every platform:
+    // `ledger.add` fails on it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "blocker", .data = "" });
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+    const cwd = try std.process.currentPathAlloc(io, a);
+    z.ledger.dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "blocker", "packages" });
+    z.err = &w.writer;
 
     try z.backend().install(a, &.{rowOf("bat", &.{})});
     try testing.expect(std.mem.startsWith(u8, w.written(), "mox: zypper: the install landed, but its record could not be written ("));
