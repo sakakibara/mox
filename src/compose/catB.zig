@@ -1403,9 +1403,21 @@ fn emitForLoop(
     };
     const rows_attributed = !nest.in_for and !nested;
     var site: ?u32 = null;
+    var site_list: ?*std.ArrayList(interp.LoopSite) = null;
     if (ctx.diag) |dg| if (dg.loops) |sites| {
         site = @intCast(sites.items.len);
-        try sites.append(arena, .{ .data_source = data_path, .template = stripped, .variable = loop.variable, .where = loop.where, .attributed = rows_attributed });
+        site_list = sites;
+        // A nested body's template is its whole body, so every line it may
+        // render is known to commit's realignment.
+        const template = if (nested) try stripBody(arena, loop.body_template, nest.marker) else stripped;
+        try sites.append(arena, .{
+            .data_source = data_path,
+            .template = template,
+            .variable = loop.variable,
+            .where = loop.where,
+            .attributed = rows_attributed,
+            .template_lines = try contentLines(arena, loop.body_template, nest.marker, nested, stripped),
+        });
     };
 
     // Per-row `where` skips non-matching records. A row expands its template
@@ -1422,6 +1434,7 @@ fn emitForLoop(
         if (loop.where) |w| {
             if (!try evalRow(arena, w, scope, bindings, ctx.diag)) continue;
         }
+        const row_start = em.buf.items.len;
         if (nested) {
             const inner: Nest = .{ .marker = nest.marker, .record = record_ptr, .in_for = true, .depth = nest.depth + 1 };
             try emitParsedBody(arena, io, em, file, bindings, ctx2, secrets, loop.body_template, parsed_body, inner);
@@ -1432,7 +1445,28 @@ fn emitForLoop(
                 .{ .loop = .{ .data_source = data_path, .row = @intCast(row_idx), .template = stripped, .variable = loop.variable, .site = site } };
             try emitSecretAwareBody(em, arena, stripped, ctx2, true, record_ptr, .always_add, .{ .flat = origin });
         }
+        if (site_list) |sites| {
+            const n: u32 = @intCast(std.mem.count(u8, em.buf.items[row_start..], "\n"));
+            const s = &sites.items[site.?];
+            s.row_lines = @max(s.row_lines, n);
+        }
     }
+}
+
+/// The lines one row of a loop renders when no value holds a newline: the
+/// template's lines, or a nested body's content lines (an upper bound, since
+/// a gate may drop some). Zero when the body cannot be scanned.
+fn contentLines(arena: std.mem.Allocator, body: []const u8, marker: []const u8, nested: bool, stripped: []const u8) !u32 {
+    if (!nested) return @intCast(std.mem.count(u8, stripped, "\n") + 1);
+    const events = dsl.scanner.scan(arena, body, marker) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return 0,
+    };
+    var n: u32 = 0;
+    for (events) |ev| {
+        if (ev == .content) n += 1;
+    }
+    return n;
 }
 
 /// Walk a pre-parsed region body, emitting content lines and recursing into

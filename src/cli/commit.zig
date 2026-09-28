@@ -1591,23 +1591,21 @@ fn commitRun(
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
 
-        var lf: LoopFile = .{ .file = file, .stored = true, .segments = prov.segments, .a_lines = a_lines, .b_lines = b_lines, .hunks = hunks };
-        for (hunks, 0..) |hunk, hi| {
-            // The stored-baseline path never carries a `.secret` segment (its
-            // cleartext is never cached in the first place, so a secret-
-            // bearing file never reaches here with a `last_content` to diff
-            // against); `null` is inert.
-            switch (try processHunk(&cc, &ra, file, fidx, space, prov.segments, a_lines, b_lines, hunk, hi + 1, hunks.len, null, false, &lf)) {
-                .cont => {},
-                .abort => {
-                    aborted = true;
-                    break :files;
-                },
-                .abort_strict => {
-                    strict_abort = true;
-                    break :files;
-                },
-            }
+        var lf: LoopFile = .{ .file = file, .stored = true, .segments = prov.segments, .a_lines = a_lines, .b_lines = b_lines };
+        // The stored-baseline path never carries a `.secret` segment (its
+        // cleartext is never cached in the first place, so a secret-bearing
+        // file never reaches here with a `last_content` to diff against);
+        // `null` is inert.
+        switch (try processFileHunks(&cc, &ra, file, fidx, space, hunks, null, false, &lf)) {
+            .cont => {},
+            .abort => {
+                aborted = true;
+                break :files;
+            },
+            .abort_strict => {
+                strict_abort = true;
+                break :files;
+            },
         }
     }
 
@@ -4570,15 +4568,8 @@ fn processFallbackFile(
     // already confirms `[y/s]` on a terminal -- a rendering difference from
     // another tool (whitespace, trailing newline, key order) shows up as a
     // spurious hunk the user skips there, exactly like any other hunk.
-    var lf: LoopFile = .{ .file = file, .stored = false, .segments = prov.items, .a_lines = a_lines, .b_lines = b_lines, .hunks = hunks };
-    for (hunks, 0..) |hunk, hi| {
-        switch (try processHunk(cc, ra, file, fidx, space, prov.items, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, kind == .first_contact, &lf)) {
-            .cont => {},
-            .abort => return .abort,
-            .abort_strict => return .abort_strict,
-        }
-    }
-    return .cont;
+    var lf: LoopFile = .{ .file = file, .stored = false, .segments = prov.items, .a_lines = a_lines, .b_lines = b_lines };
+    return processFileHunks(cc, ra, file, fidx, space, hunks, secret_lines, kind == .first_contact, &lf);
 }
 
 /// A first-contact structured file for which NO layer -- not even a base --
@@ -6092,8 +6083,13 @@ fn processHunk(
     // rendering quirk would slip into source unseen.
     first_contact: bool,
     lf: *LoopFile,
+    /// The route realignment decided for this block, or null to route the
+    /// hunk here.
+    given: ?Route,
+    /// Whether an interactive run may offer to split it.
+    can_split: bool,
 ) !HunkOutcome {
-    const route = try routeHunk(cc, lf, hunk);
+    const route = given orelse try routeHunk(cc, lf, hunk);
     switch (route) {
         .manual => |reason| {
             // A hunk covering (or straddling into) a `.secret` segment's
@@ -6103,7 +6099,10 @@ fn processHunk(
             // display shows only the new live value and, when it can be
             // recovered from a placeholder recompose, the store URI.
             const touches_secret = hunkTouchesSecret(segments, hunk);
-            if (!cc.interactive) {
+            // A straddle realignment may not split is reported as `--yes`
+            // reports it: its prompt could offer only a skip.
+            const unsplit = !can_split and (try splitHunk(cc.arena, segments, hunk)).len > 1;
+            if (!cc.interactive or unsplit) {
                 ra.manual_count.* += 1;
                 ra.manual_hunks[fidx] += 1;
                 ra.pending.* = true;
@@ -6139,7 +6138,7 @@ fn processHunk(
                             try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1, reason });
                         } else {
                             for (subs) |sub| {
-                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total, secret_lines, first_contact, lf);
+                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total, secret_lines, first_contact, lf, null, true);
                                 if (outcome != .cont) return outcome;
                             }
                         }
@@ -6339,6 +6338,270 @@ fn processHunk(
             return .cont;
         },
     }
+}
+
+/// Route and process every change of a file. A file in realignment scope
+/// (D7a) is processed block by block, each block routed before any is
+/// processed so a held block holds the rest; any other file hunk by hunk.
+fn processFileHunks(
+    cc: *const ClassCtx,
+    ra: *const RunAccum,
+    file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    space: FileSpace,
+    hunks: []const Hunk,
+    secret_lines: ?[]const []const u8,
+    first_contact: bool,
+    lf: *LoopFile,
+) !HunkOutcome {
+    if (!try realignScope(cc, lf)) {
+        for (hunks, 0..) |hunk, hi| {
+            const outcome = try processHunk(cc, ra, file, fidx, space, lf.segments, lf.a_lines, lf.b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, lf, null, true);
+            if (outcome != .cont) return outcome;
+        }
+        return .cont;
+    }
+    lf.alignment = try alignLines(cc.arena, lf.a_lines, lf.b_lines);
+    const al = lf.alignment orelse {
+        for (hunks, 0..) |hunk, hi| {
+            const outcome = try processHunk(cc, ra, file, fidx, space, lf.segments, lf.a_lines, lf.b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, lf, .{ .manual = "file too large to align its lines" }, false);
+            if (outcome != .cont) return outcome;
+        }
+        return .cont;
+    };
+    const fits = try loopFits(cc, lf);
+    const plans = try cc.arena.alloc(BlockPlan, al.blocks.len);
+    var held = false;
+    for (al.blocks, plans) |blk, *plan| {
+        plan.* = try planBlock(cc, lf, fits, blk);
+        held = held or plan.holds;
+    }
+    if (held) holdBlocks(plans, "held beside an edited loop row");
+    if (linesMayMove(lf, al.blocks)) holdBlocks(plans, "lines may move between the private layer and the repo");
+    for (al.blocks, plans, 0..) |blk, plan, bi| {
+        const outcome = try processHunk(cc, ra, file, fidx, space, lf.segments, lf.a_lines, lf.b_lines, blk, bi + 1, al.blocks.len, secret_lines, first_contact, lf, plan.route, plan.split);
+        if (outcome != .cont) return outcome;
+    }
+    return .cont;
+}
+
+/// Whether realignment applies to a file: its routing provenance is anything
+/// other than one base segment, or its source holds a loop directive.
+fn realignScope(cc: *const ClassCtx, lf: *LoopFile) !bool {
+    if (lf.segments.len != 1 or lf.segments[0].origin != .base) return true;
+    const file = lf.file;
+    if (!file.has_base or file.source_base_abs.len == 0) return false;
+    const content = Io.Dir.cwd().readFileAlloc(cc.io, file.source_base_abs, cc.arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            lf.unreadable = true;
+            return true;
+        },
+    };
+    const marker = mox.dsl.comment.markerForFile(file.source_base_path, content) orelse return false;
+    const events = mox.dsl.scanner.scan(cc.arena, content, marker) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        // Too long to be a directive the parser accepts, loop or not.
+        error.DirectiveTooLong => return true,
+    };
+    for (events) |ev| switch (ev) {
+        .directive => |d| if (std.mem.eql(u8, mox.dsl.lexer.leadingWord(d.args), "for")) return true,
+        .content => {},
+    };
+    return false;
+}
+
+/// The template lines of every loop of a file, each a pattern whose
+/// captures match any text; `every` when some row renders a template line
+/// as more than one line, so any line may be part of a row.
+const LoopFits = struct {
+    patterns: []const []const u8,
+    every: bool,
+
+    fn anyFits(f: LoopFits, lines: []const []const u8) bool {
+        for (lines) |line| {
+            if (f.every) return true;
+            for (f.patterns) |p| {
+                if (patternFits(p, line)) return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// Loops come from the fresh compose (every loop it reaches, rows or none)
+/// and from the recorded segments. Every line fits when a row renders more
+/// lines than its template, counted over all its output lines, or when the
+/// sources do not compose or cannot be read.
+fn loopFits(cc: *const ClassCtx, lf: *LoopFile) !LoopFits {
+    const arena = cc.arena;
+    var patterns: std.ArrayList([]const u8) = .empty;
+    var every = lf.unreadable;
+    if (try lf.freshCompose(cc)) |fresh| {
+        for (fresh.sites) |site| {
+            try appendTemplateLines(arena, &patterns, site.template);
+            if (site.row_lines > site.template_lines) every = true;
+        }
+    } else every = true;
+    for (lf.segments, 0..) |sg, k| {
+        const o = switch (sg.origin) {
+            .loop => |o| o,
+            else => continue,
+        };
+        try appendTemplateLines(arena, &patterns, o.template);
+        var span: u32 = sg.out_len;
+        var first = k;
+        while (first > 0) : (first -= 1) {
+            const prev = lf.segments[first - 1];
+            if (!sameRowTemplate(prev, o.data_source, o.row, o.template) or prev.out_start + prev.out_len != lf.segments[first].out_start) break;
+            span += prev.out_len;
+        }
+        if (span > templateLineCount(o.template)) every = true;
+    }
+    return .{ .patterns = try patterns.toOwnedSlice(arena), .every = every };
+}
+
+fn appendTemplateLines(arena: std.mem.Allocator, patterns: *std.ArrayList([]const u8), template: []const u8) !void {
+    var it = std.mem.splitScalar(u8, template, '\n');
+    while (it.next()) |line| try patterns.append(arena, line);
+}
+
+fn templateLineCount(template: []const u8) u32 {
+    return @intCast(std.mem.count(u8, template, "\n") + 1);
+}
+
+/// Whether `line` matches a template line's literals in order, each capture
+/// the compose grammar's close index recognizes standing for any text.
+fn patternFits(pattern: []const u8, line: []const u8) bool {
+    var literals: [64][]const u8 = undefined;
+    var n: usize = 0;
+    var lit_start: usize = 0;
+    var i: usize = 0;
+    while (i < pattern.len) {
+        if (pattern[i] == '<') {
+            if (mox.compose.capture.closeIndex(pattern, i)) |close| {
+                // Past this many captures the line is taken to fit.
+                if (n + 1 >= literals.len) return true;
+                literals[n] = pattern[lit_start..i];
+                n += 1;
+                i = close + 1;
+                lit_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if (n == 0) return std.mem.eql(u8, pattern, line);
+    literals[n] = pattern[lit_start..];
+    const first = literals[0];
+    const last = literals[n];
+    if (line.len < first.len + last.len) return false;
+    if (!std.mem.startsWith(u8, line, first) or !std.mem.endsWith(u8, line, last)) return false;
+    var pos = first.len;
+    const end = line.len - last.len;
+    for (literals[1..n]) |lit| {
+        const at = std.mem.indexOfPos(u8, line[0..end], pos, lit) orelse return false;
+        pos = at + lit.len;
+    }
+    return true;
+}
+
+/// A block's route, whether an interactive run may split it, and whether
+/// it holds every other block of its file.
+const BlockPlan = struct { route: Route, split: bool, holds: bool };
+
+/// Route one block: through its row (D7) when its baseline lies in one loop
+/// row; manual when any line of it fits a loop of the file; otherwise by the
+/// segment covering it.
+fn planBlock(cc: *const ClassCtx, lf: *LoopFile, fits: LoopFits, blk: Hunk) !BlockPlan {
+    const cover = mox.provenance.map.covering(lf.segments, blk.a_start, blk.a_len);
+    if (blk.a_len > 0) {
+        if (cover) |seg| if (seg.origin == .loop) {
+            const r = try loopRoute(cc, lf, seg, blk);
+            return .{ .route = r, .split = false, .holds = r == .manual };
+        };
+    }
+    if (fits.anyFits(lf.a_lines[blk.a_start .. blk.a_start + blk.a_len]) or fits.anyFits(lf.b_lines[blk.b_start .. blk.b_start + blk.b_len]))
+        return .{ .route = .{ .manual = "may be an edited loop row" }, .split = false, .holds = true };
+    const r = try routeHunk(cc, lf, blk);
+    const by_loop = if (cover) |seg| seg.origin == .loop else false;
+    const sides = involvedSides(lf, blk);
+    return .{
+        .route = r,
+        .split = r == .manual and cover == null and !(sides.private and sides.repo),
+        .holds = r == .manual and by_loop,
+    };
+}
+
+/// Make every block that is not a routed row write manual with `reason`,
+/// and none of them splittable.
+fn holdBlocks(plans: []BlockPlan, reason: []const u8) void {
+    for (plans) |*plan| {
+        switch (plan.route) {
+            .row => continue,
+            .manual => {},
+            else => plan.route = .{ .manual = reason },
+        }
+        plan.split = false;
+    }
+}
+
+const Sides = struct { private: bool = false, repo: bool = false };
+
+/// Which side a segment's lines come from; a loop row or a secret line is
+/// neither.
+fn segmentSides(file: mox.source.tree.ManagedFile, sg: Segment) Sides {
+    const path = switch (sg.origin) {
+        .private => return .{ .private = true },
+        .loop, .secret => return .{},
+        .base, .interpolated => file.source_base_abs,
+        .fragment => |o| o.path,
+        .overlay => |o| o.path,
+    };
+    if (mox.source.path.isUnderDir(path, file.private_dir)) return .{ .private = true };
+    return .{ .repo = true };
+}
+
+/// The sides of the segments a block involves: those its baseline range
+/// covers, or for a pure insertion those on both sides of its position.
+fn involvedSides(lf: *const LoopFile, blk: Hunk) Sides {
+    var out: Sides = .{};
+    for (lf.segments) |sg| {
+        const lo = sg.out_start;
+        const hi = sg.out_start + sg.out_len;
+        const hit = if (blk.a_len > 0)
+            lo < blk.a_start + blk.a_len and blk.a_start < hi
+        else
+            (blk.a_start > 0 and lo <= blk.a_start - 1 and blk.a_start - 1 < hi) or (lo <= blk.a_start and blk.a_start < hi);
+        if (!hit) continue;
+        const s = segmentSides(lf.file, sg);
+        out.private = out.private or s.private;
+        out.repo = out.repo or s.repo;
+    }
+    return out;
+}
+
+/// In a file with private-layer and repo segments, whether a block that
+/// removes lines involves one side while a block that adds lines involves
+/// the other.
+fn linesMayMove(lf: *const LoopFile, blocks: []const Hunk) bool {
+    var file_sides: Sides = .{};
+    for (lf.segments) |sg| {
+        const s = segmentSides(lf.file, sg);
+        file_sides.private = file_sides.private or s.private;
+        file_sides.repo = file_sides.repo or s.repo;
+    }
+    if (!file_sides.private or !file_sides.repo) return false;
+    var removes: Sides = .{};
+    var adds: Sides = .{};
+    for (blocks) |blk| {
+        if (blk.a_len == blk.b_len) continue;
+        const s = involvedSides(lf, blk);
+        const into = if (blk.a_len > blk.b_len) &removes else &adds;
+        into.private = into.private or s.private;
+        into.repo = into.repo or s.repo;
+    }
+    return (removes.private and adds.repo) or (removes.repo and adds.private);
 }
 
 /// Map one diff hunk to a source edit, or report why it cannot be routed.
@@ -7056,8 +7319,9 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
 }
 
 /// A file's hunks as loop routing reads them: the baseline and its
-/// provenance, the live lines and the diff, and a compose of the sources as
-/// they stand, secrets as placeholders, made when a loop hunk first needs it.
+/// provenance, the live lines and their realignment, and a compose of the
+/// sources as they stand, secrets as placeholders, made when a loop hunk
+/// first needs it.
 const LoopFile = struct {
     file: mox.source.tree.ManagedFile,
     /// Routed against the baseline the last apply recorded, not a fresh
@@ -7066,7 +7330,10 @@ const LoopFile = struct {
     segments: []const Segment,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
-    hunks: []const Hunk,
+    /// Set for a file in realignment scope (D7a) that is not too large.
+    alignment: ?Alignment = null,
+    /// A source realignment reads could not be read.
+    unreadable: bool = false,
     fresh: ?Fresh = null,
     fresh_tried: bool = false,
 
@@ -7092,22 +7359,20 @@ const LoopFile = struct {
         return lf.fresh;
     }
 
-    /// The live line baseline line `i` stands at: the line the diff matched
-    /// it with, or the line at its offset in a hunk replacing lines one for
-    /// one -- any such hunk with `in_equal`, else only one replacing exactly
-    /// that line. Null otherwise.
+    /// The live line baseline line `i` stands at: the one it is a stable
+    /// anchor for, or the line at its offset in a block replacing lines one
+    /// for one -- any such block with `in_equal`, else only one replacing
+    /// exactly that line. Null otherwise.
     fn liveLineAt(lf: *const LoopFile, i: u32, in_equal: bool) ?[]const u8 {
-        var shift: i64 = 0;
-        for (lf.hunks) |h| {
-            if (i >= h.a_start and i < h.a_start + h.a_len) {
-                if (h.a_len == h.b_len and (in_equal or h.a_len == 1)) return lf.b_lines[h.b_start + (i - h.a_start)];
-                return null;
-            }
-            if (h.a_start + h.a_len <= i) shift += @as(i64, h.b_len) - @as(i64, h.a_len);
+        const al = lf.alignment orelse return null;
+        if (i >= al.anchor.len) return null;
+        if (al.anchor[i]) |j| return lf.b_lines[j];
+        for (al.blocks) |blk| {
+            if (i < blk.a_start or i >= blk.a_start + blk.a_len) continue;
+            if (blk.a_len == blk.b_len and (in_equal or blk.a_len == 1)) return lf.b_lines[blk.b_start + (i - blk.a_start)];
+            return null;
         }
-        const j = @as(i64, i) + shift;
-        if (j < 0 or j >= lf.b_lines.len) return null;
-        return lf.b_lines[@intCast(j)];
+        return null;
     }
 
     /// The live text at every line of baseline segment `seg`, or null when
@@ -7121,6 +7386,97 @@ const LoopFile = struct {
         return try std.mem.join(arena, "\n", lines.items);
     }
 };
+
+/// What every longest common subsequence of a file's baseline and live lines
+/// agrees on: the live line each baseline line is a stable anchor for, and
+/// the regions between consecutive anchors whose two sides differ.
+const Alignment = struct {
+    anchor: []const ?u32,
+    blocks: []const Hunk,
+};
+
+/// Past this many baseline-by-live cells a file is not aligned; the smaller
+/// side is then at most 4096 lines, so 16-bit cells hold any LCS length.
+const max_align_cells: u64 = 1 << 24;
+
+/// The stable anchors and blocks of `a` against `b`, or null past
+/// `max_align_cells`. The backward table is kept whole; the forward one is
+/// built a row at a time.
+fn alignLines(arena: std.mem.Allocator, a: []const []const u8, b: []const []const u8) !?Alignment {
+    const n = a.len;
+    const m = b.len;
+    if (@as(u64, n) * @as(u64, m) > max_align_cells) return null;
+
+    var ids: std.StringHashMap(u32) = .init(arena);
+    const ai = try arena.alloc(u32, n);
+    const bi = try arena.alloc(u32, m);
+    for (a, 0..) |line, k| ai[k] = try internLine(&ids, line);
+    for (b, 0..) |line, k| bi[k] = try internLine(&ids, line);
+
+    const w = m + 1;
+    const back = try std.heap.page_allocator.alloc(u16, (n + 1) * w);
+    defer std.heap.page_allocator.free(back);
+    var i: usize = n + 1;
+    while (i > 0) {
+        i -= 1;
+        var j: usize = m + 1;
+        while (j > 0) {
+            j -= 1;
+            back[i * w + j] = if (i == n or j == m)
+                0
+            else if (ai[i] == bi[j])
+                back[(i + 1) * w + j + 1] + 1
+            else
+                @max(back[(i + 1) * w + j], back[i * w + j + 1]);
+        }
+    }
+    const total: u32 = back[0];
+
+    const anchor = try arena.alloc(?u32, n);
+    var fwd = try arena.alloc(u16, w);
+    var next = try arena.alloc(u16, w);
+    @memset(fwd, 0);
+    for (0..n) |r| {
+        var matches: usize = 0;
+        var at: u32 = 0;
+        var skip: u32 = 0;
+        for (0..w) |j| {
+            skip = @max(skip, @as(u32, fwd[j]) + back[(r + 1) * w + j]);
+            if (j < m and ai[r] == bi[j] and @as(u32, fwd[j]) + 1 + back[(r + 1) * w + j + 1] == total) {
+                matches += 1;
+                at = @intCast(j);
+            }
+        }
+        anchor[r] = if (matches == 1 and skip < total) at else null;
+        next[0] = 0;
+        for (0..m) |j| {
+            next[j + 1] = if (ai[r] == bi[j]) fwd[j] + 1 else @max(fwd[j + 1], next[j]);
+        }
+        std.mem.swap([]u16, &fwd, &next);
+    }
+
+    var blocks: std.ArrayList(Hunk) = .empty;
+    var pa: usize = 0;
+    var pb: usize = 0;
+    for (0..n + 1) |r| {
+        const qb: usize = if (r == n) m else (anchor[r] orelse continue);
+        const sa = a[pa..r];
+        const sb = b[pb..qb];
+        const same = sa.len == sb.len and for (sa, sb) |x, y| {
+            if (!std.mem.eql(u8, x, y)) break false;
+        } else true;
+        if (!same) try blocks.append(arena, .{ .a_start = @intCast(pa), .a_len = @intCast(sa.len), .b_start = @intCast(pb), .b_len = @intCast(sb.len) });
+        pa = r + 1;
+        pb = qb + 1;
+    }
+    return .{ .anchor = anchor, .blocks = try blocks.toOwnedSlice(arena) };
+}
+
+fn internLine(ids: *std.StringHashMap(u32), line: []const u8) !u32 {
+    const got = try ids.getOrPut(line);
+    if (!got.found_existing) got.value_ptr.* = @intCast(ids.count() - 1);
+    return got.value_ptr.*;
+}
 
 /// One `.loop` segment of a loop's block and the text it covers.
 const LoopElem = struct { seg: Segment, text: []const u8 };
@@ -8399,15 +8755,16 @@ test "basicString: escapes backslashes, quotes and control characters" {
     try testing.expectEqualStrings("\"a\\\\b \\\"q\\\" \\t\\u0001\"", try basicString(arena.allocator(), "a\\b \"q\" \t\x01"));
 }
 
-test "LoopFile.liveLineAt: a matched line, a line inside a one-for-one hunk, and none" {
-    const hunks = [_]Hunk{
+test "LoopFile.liveLineAt: a stable anchor, a line inside a one-for-one block, and none" {
+    const blocks = [_]Hunk{
         .{ .a_start = 1, .a_len = 1, .b_start = 1, .b_len = 1 },
         .{ .a_start = 3, .a_len = 0, .b_start = 3, .b_len = 2 },
         .{ .a_start = 4, .a_len = 2, .b_start = 6, .b_len = 2 },
         .{ .a_start = 6, .a_len = 1, .b_start = 8, .b_len = 0 },
     };
+    const anchor = [_]?u32{ 0, null, 2, 5, null, null, null, 8 };
     const b_lines = [_][]const u8{ "l0", "L1", "l2", "i0", "i1", "l3", "L4", "L5", "l7" };
-    const lf: LoopFile = .{ .file = undefined, .stored = true, .segments = &.{}, .a_lines = &.{}, .b_lines = &b_lines, .hunks = &hunks };
+    const lf: LoopFile = .{ .file = undefined, .stored = true, .segments = &.{}, .a_lines = &.{}, .b_lines = &b_lines, .alignment = .{ .anchor = &anchor, .blocks = &blocks } };
     try testing.expectEqualStrings("l0", lf.liveLineAt(0, false).?);
     try testing.expectEqualStrings("L1", lf.liveLineAt(1, false).?);
     try testing.expectEqualStrings("l3", lf.liveLineAt(3, false).?);
@@ -8415,6 +8772,42 @@ test "LoopFile.liveLineAt: a matched line, a line inside a one-for-one hunk, and
     try testing.expectEqualStrings("L5", lf.liveLineAt(5, true).?);
     try testing.expect(lf.liveLineAt(6, true) == null);
     try testing.expectEqualStrings("l7", lf.liveLineAt(7, false).?);
+}
+
+test "alignLines: a line every longest alignment matches alike is an anchor; blocks lie between anchors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const al = (try alignLines(a, &.{ "top", "row b", "host c", "end" }, &.{ "top", "host c", "host c", "end" })).?;
+    try testing.expectEqualSlices(?u32, &.{ 0, null, null, 3 }, al.anchor);
+    try testing.expectEqualSlices(Hunk, &.{.{ .a_start = 1, .a_len = 2, .b_start = 1, .b_len = 2 }}, al.blocks);
+    const plain = (try alignLines(a, &.{ "a", "b", "c" }, &.{ "a", "B", "c" })).?;
+    try testing.expectEqualSlices(?u32, &.{ 0, null, 2 }, plain.anchor);
+    try testing.expectEqualSlices(Hunk, &.{.{ .a_start = 1, .a_len = 1, .b_start = 1, .b_len = 1 }}, plain.blocks);
+    const moved = (try alignLines(a, &.{ "x", "y" }, &.{ "y", "x" })).?;
+    try testing.expectEqualSlices(?u32, &.{ null, null }, moved.anchor);
+    try testing.expectEqualSlices(Hunk, &.{.{ .a_start = 0, .a_len = 2, .b_start = 0, .b_len = 2 }}, moved.blocks);
+}
+
+test "alignLines: past 2^24 cells a file is not aligned" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const big = try a.alloc([]const u8, 4097);
+    @memset(big, "x");
+    try testing.expect((try alignLines(a, big, big[0..4096])) == null);
+    try testing.expect((try alignLines(a, big[0..4096], big[0..4096])) != null);
+}
+
+test "patternFits: literals must match in order, every capture stands for any text" {
+    try testing.expect(patternFits("host <entry.key>", "host a b"));
+    try testing.expect(patternFits("host <entry.key>", "host "));
+    try testing.expect(!patternFits("host <entry.key>", "port 22"));
+    try testing.expect(patternFits("<a>:<b>", "x:y:z"));
+    try testing.expect(!patternFits("<a>:<b>", "xyz"));
+    try testing.expect(patternFits("  Port 22", "  Port 22"));
+    try testing.expect(!patternFits("  Port 22", "  Port 23"));
+    try testing.expect(patternFits("<entry.v>", "anything"));
 }
 
 test "replaceTokens: renames only complete-token occurrences, not superstrings" {
@@ -8609,7 +9002,7 @@ test "routeHunk: a private-only base file's edit is flagged private by location"
         .xdg_data_home = "",
         .xdg_state_home = "",
     };
-    var lf: LoopFile = .{ .file = file, .stored = true, .segments = &segs, .a_lines = &a_lines, .b_lines = &b_lines, .hunks = &.{hunk} };
+    var lf: LoopFile = .{ .file = file, .stored = true, .segments = &segs, .a_lines = &a_lines, .b_lines = &b_lines };
     const route = try routeHunk(try testClassCtx(a, io, &m_state), &lf, hunk);
     try testing.expect(route == .line);
     try testing.expect(route.line.edit.private);
@@ -8657,7 +9050,7 @@ test "routeHunk: a base file in a sibling directory whose name extends the priva
         .xdg_data_home = "",
         .xdg_state_home = "",
     };
-    var lf: LoopFile = .{ .file = file, .stored = true, .segments = &segs, .a_lines = &a_lines, .b_lines = &b_lines, .hunks = &.{hunk} };
+    var lf: LoopFile = .{ .file = file, .stored = true, .segments = &segs, .a_lines = &a_lines, .b_lines = &b_lines };
     const route = try routeHunk(try testClassCtx(a, io, &m_state), &lf, hunk);
     try testing.expect(route == .line);
     try testing.expect(!route.line.edit.private);

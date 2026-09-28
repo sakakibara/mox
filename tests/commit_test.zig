@@ -9236,10 +9236,13 @@ test "commit: a loop row edit is manual when its line is not unique among the lo
     try writeRepo(io, &tmp, "repo/data/hosts.toml", pulled);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".ports"), .data = "port 22\nport 22\nport 2222\nexport SPACER=1\nexport EMAIL=new@home.com\n" });
 
+    // No longest alignment fixes which of the equal rows was edited, so the
+    // rows change as one block, and the held capture line with it.
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(pulled, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.ports:3 data row is not unique in its loop\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.ports:1 may be an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.ports:5 held beside an edited loop row\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -9936,4 +9939,429 @@ test "commit: a row write another loop over the data source renders without a ro
     try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row also renders elsewhere in the file without a position\n") != null);
     try std.testing.expectEqualStrings("", res.err);
+}
+
+const hosts_a = "[[hosts]]\nkey = \"a\"\n";
+const hosts_ab = "[[hosts]]\nkey = \"a\"\n\n[[hosts]]\nkey = \"b\"\n";
+const hosts_loop = "# mox: for entry in \"data/hosts.toml\"\nhost <entry.key>\n# mox: end\n";
+const hosts_block_loop = "# mox: for entry in \"data/hosts.toml\"\nHost <entry.key>\n  Port 22\n# mox: end\n";
+
+const RealignRun = struct { res: testutil.RunResult, src: []const u8, data: []const u8, now_src: []const u8, now_data: []const u8 };
+
+/// Apply `.hosts` from `src` over `data/hosts.toml` holding `data` (and any
+/// `extra` repo files), replace its live copy with `live`, and commit with
+/// `--yes`, or interactively answering `stdin`.
+fn realignCommit(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, src: []const u8, data: []const u8, extra: []const [2][]const u8, live: []const u8, stdin: ?[]const u8) !RealignRun {
+    try writeRepo(io, tmp, "repo/data/hosts.toml", data);
+    try writeRepo(io, tmp, "repo/src/.hosts", src);
+    for (extra) |e| try writeRepo(io, tmp, e[0], e[1]);
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".hosts"), .data = live });
+    const res = if (stdin) |s|
+        try h.runWithInput(&.{ "mox", "commit", "--color=never" }, s)
+    else
+        try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    return .{
+        .res = res,
+        .src = src,
+        .data = data,
+        .now_src = try read(io, a, try h.srcOf(".hosts")),
+        .now_data = try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "hosts.toml" })),
+    };
+}
+
+/// Nothing routed: exit 1, each line in `manual` reported, no source
+/// changed, and nothing on stderr.
+fn expectAllManual(r: RealignRun, manual: []const []const u8) !void {
+    try std.testing.expectEqualStrings(r.src, r.now_src);
+    try std.testing.expectEqualStrings(r.data, r.now_data);
+    try std.testing.expectEqual(@as(u8, 1), r.res.rc);
+    for (manual) |line| {
+        if (std.mem.indexOf(u8, r.res.out, line) == null) {
+            std.debug.print("missing {s} in:\n{s}", .{ line, r.res.out });
+            return error.TestExpectedManualLine;
+        }
+    }
+    var summary: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&summary, "mox commit: 0 routed, 0 coupled, {d} manual\n", .{manual.len});
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, want) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "committed") == null);
+    try std.testing.expectEqualStrings("", r.res.err);
+}
+
+test "commit: a loop row edited to equal a literal past the next row, diffed as a row deletion and a later insertion, is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Row a becomes "host b": the diff deletes row a and inserts "host b"
+    // after the literal, a literal the next apply would render twice.
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ "host b\n", hosts_ab, &.{}, "host b\nhost b\nhost b\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: two literals edited above a loop row, diffed as an insertion and a straddle of a literal and the row, are manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try realignCommit(io, a, &tmp, "host a\nhost a\n" ++ hosts_loop, hosts_a, &.{}, "port 22\nport 22\nhost a\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: two loop rows edited to equal the literal below them, diffed as a straddle of both rows, are manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ "port 22\n", hosts_ab, &.{}, "port 22\nport 22\nport 22\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: a row added above a multi-line template's rows is manual, never literal lines" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try realignCommit(io, a, &tmp, "# hosts\n" ++ hosts_block_loop, hosts_a, &.{}, "# hosts\nHost b\n  Port 22\nHost a\n  Port 22\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+}
+
+test "commit: a refused one-for-one row edit whose text also lands below a literal is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Row b becomes a: the second loop, which renders nothing, now renders
+    // it, so the row write is refused; its "alias a" lands below the literal.
+    const src = hosts_loop ++ "alias a\n# mox: for entry in \"data/hosts.toml\" where entry.key = \"a\"\nalias <entry.key>\n# mox: end\n";
+    const r = try realignCommit(io, a, &tmp, src, "[[hosts]]\nkey = \"b\"\n", &.{}, "host a\nalias a\nalias a\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: an unequal straddle of a literal and a loop row is never offered a split" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Split, the straddle deleted "port 1" and left the row, while the
+    // inserted lines went into the base above "host a".
+    const r = try realignCommit(io, a, &tmp, "host a\nport 1\n" ++ hosts_loop, hosts_a, &.{}, "port 22\nport 22\nhost a\n", "y\nx\ny\ns\n");
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "split") == null);
+}
+
+test "commit: an equal straddle of a literal and a loop row is never offered a split" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Split, the straddle paired the literal "host a" with "host b", written
+    // into the base, where the row was edited.
+    const src = hosts_loop ++ "host a\n# mox: for entry in \"data/hosts.toml\"\nalias <entry.key>\n# mox: end\n";
+    const r = try realignCommit(io, a, &tmp, src, hosts_a, &.{}, "host b\nhost a\nhost b\nalias b\n", "s\nx\ny\ns\n");
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "split") == null);
+}
+
+test "commit: a loop row edited to equal the literal just below it is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ "host c\n", hosts_ab, &.{}, "host a\nhost c\nhost c\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+}
+
+test "commit: a loop row edited to equal the literal just below it, the literal's neighbour edited too, is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ "host c\nport 22\n", hosts_ab, &.{}, "host a\nhost c\nhost c\nport 23\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+}
+
+test "commit: a loop row edit a run of equal literals shifts into a literal insertion and deletion is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The diff inserts "host b" above the loop and deletes the last literal:
+    // both route into the base, the row keeps "a", and the file recomposes.
+    const r = try realignCommit(io, a, &tmp, "host a\nhost a\n" ++ hosts_loop ++ "host a\nhost a\n", hosts_a, &.{}, "host a\nhost a\nhost b\nhost a\nhost a\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: a loop row edited to equal a second loop's row is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const others = "# mox: for entry in \"data/others.toml\"\nhost <entry.key>\n# mox: end\n";
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ others ++ "host b\n", hosts_a, &.{.{ "repo/data/others.toml", "[[others]]\nkey = \"b\"\n" }}, "host b\nhost b\nhost b\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: an unequal straddle whose one-for-one piece would land on a loop row is never offered a split" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Split, the literal "host a" was deleted and the row paired with
+    // "host b", while the realigned "port 22" went into the base.
+    const r = try realignCommit(io, a, &tmp, "host a\n" ++ hosts_loop ++ "port 22\n", hosts_a, &.{}, "host b\nport 22\nport 22\n", "x\ny\ns\ny\n");
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "split") == null);
+}
+
+test "commit: a row added to an empty loop with a multi-line template is manual, never literal lines" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try realignCommit(io, a, &tmp, "# hosts\n" ++ hosts_block_loop, "hosts = []\n", &.{}, "# hosts\nHost a\n  Port 22\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+}
+
+test "commit: a literal edit beside a loop whose where filters out every row is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The diff inserts "host y" at the top and deletes the literal below the
+    // loop, moving it above the loop's directive.
+    const src = "host x\n# mox: for entry in \"data/hosts.toml\" where entry.key = \"z\"\nhost <entry.key>\n# mox: end\nhost x\n";
+    const r = try realignCommit(io, a, &tmp, src, hosts_a, &.{}, "host y\nhost x\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+}
+
+test "commit: a base line edited beside an equal private-layer line is manual, and the private layer keeps its line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "export A=1\n# mox: replace from \"profile\"\nfallback\n# mox: end\n";
+    const private = "export A=1\nexport B=1\n";
+    try writeRepo(io, &tmp, "repo/src/.myrc", base);
+    try writeRepo(io, &tmp, "state/private/.myrc", "top\n");
+    try writeRepo(io, &tmp, "state/private/.myrc.d/profile/personal.myrc", private);
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // The diff pairs the live "export A=1" with the base's line, so the
+    // private layer's copy is deleted and the base keeps the text.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".myrc"), .data = "export A=2\nexport A=1\nexport B=1\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".myrc")));
+    try std.testing.expectEqualStrings(private, try read(io, a, try std.fs.path.join(a, &.{ h.state, "private", ".myrc.d", "profile", "personal.myrc" })));
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:1 hunk straddles origins or is uncovered\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed, 0 coupled, 1 manual\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a base line edited beside an equal shared fragment line is manual, and the fragment keeps its line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "export A=1\n# mox: include \"extra.sh\"\n";
+    const fragment = "export A=1\nexport B=1\n";
+    try writeRepo(io, &tmp, "repo/src/.myrc", base);
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", fragment);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".myrc"), .data = "export A=2\nexport A=1\nexport B=1\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".myrc")));
+    try std.testing.expectEqualStrings(fragment, try read(io, a, try h.srcOf(".myrc.d/extra.sh")));
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:1 hunk straddles origins or is uncovered\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed, 0 coupled, 1 manual\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a literal edit beside a change that may be an edited loop row is held, and a row write beside them routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = hosts_loop ++ "sep 1\nport 22\nsep 2\nhost z\n";
+    const r = try realignCommit(io, a, &tmp, src, hosts_ab, &.{}, "host a\nhost bb\nsep 1\nport 23\nsep 2\nhost y\n", null);
+    try std.testing.expectEqualStrings(src, r.now_src);
+    try std.testing.expectEqualStrings("[[hosts]]\nkey = \"a\"\n\n[[hosts]]\nkey = \"bb\"\n", r.now_data);
+    try std.testing.expectEqual(@as(u8, 1), r.res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "  manual: ~/.hosts:4 held beside an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "  manual: ~/.hosts:6 may be an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "mox commit: 1 routed, 0 coupled, 2 manual\n") != null);
+    const live = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home", ".hosts" });
+    const abs = try std.fs.path.resolve(a, &.{ try std.process.currentPathAlloc(io, a), live });
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 2 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{abs}), r.res.err);
+}
+
+test "commit: a line removed from the repo while one is added to the private layer holds every line change of the file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "a\nb\n# mox: replace from \"profile\"\nfallback\n# mox: end\n";
+    const private = "p1\np2\n";
+    try writeRepo(io, &tmp, "repo/src/.myrc", base);
+    try writeRepo(io, &tmp, "state/private/.myrc", "top\n");
+    try writeRepo(io, &tmp, "state/private/.myrc.d/profile/personal.myrc", private);
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".myrc"), .data = "a\np1\np2\nb\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".myrc")));
+    try std.testing.expectEqualStrings(private, try read(io, a, try std.fs.path.join(a, &.{ h.state, "private", ".myrc.d", "profile", "personal.myrc" })));
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:2 lines may move between the private layer and the repo\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:5 lines may move between the private layer and the repo\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed, 0 coupled, 2 manual\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop file too large to align its lines holds every change" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 4097 lines on each side: one cell past 2^24.
+    var src: std.ArrayList(u8) = .empty;
+    for (0..4096) |k| try src.print(a, "line {d}\n", .{k});
+    try src.appendSlice(a, hosts_loop);
+    var live: std.ArrayList(u8) = .empty;
+    for (0..4096) |k| try live.print(a, "line {d}\n", .{if (k == 7) 70000 else k});
+    try live.appendSlice(a, "host a\n");
+    const r = try realignCommit(io, a, &tmp, src.items, hosts_a, &.{}, live.items, null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:8 file too large to align its lines\n"});
+}
+
+test "commit: --dry-run holds and realigns a file exactly as --yes does" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = hosts_loop ++ "sep 1\nport 22\nsep 2\nhost z\n";
+    try writeRepo(io, &tmp, "repo/data/hosts.toml", hosts_ab);
+    try writeRepo(io, &tmp, "repo/src/.hosts", src);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".hosts"), .data = "host a\nhost bb\nsep 1\nport 23\nsep 2\nhost y\n" });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.hosts:4 held beside an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.hosts:6 may be an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would edit") == null);
+    try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf(".hosts")));
+    try std.testing.expectEqualStrings(hosts_ab, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "hosts.toml" })));
+}
+
+test "commit: a literal edit in a file whose loop row renders a value over several lines is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Row b renders "host b" and "c": a line of any text may be a row's.
+    const data = "[[hosts]]\nkey = \"a\"\n\n[[hosts]]\nkey = \"b\\nc\"\n";
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ "sep\nport 1\n", data, &.{}, "host a\nhost b\nc\nsep\nport 2\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:5 may be an edited loop row\n"});
+}
+
+test "commit: a literal edit shaped like a row of a loop whose body holds a directive is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "# mox: for entry in \"data/hosts.toml\"\n# mox: when os=darwin\nhost <entry.key>\n# mox: end\n# mox: end\nsep\nhost z\n";
+    const r = try realignCommit(io, a, &tmp, src, hosts_a, &.{}, "host a\nsep\nport 1\n", null);
+    try expectAllManual(r, &.{"  manual: ~/.hosts:3 may be an edited loop row\n"});
+}
+
+test "commit: a change whose removed lines alone are shaped like a loop row holds the file's other line changes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The row and the literal below it become one line that fits no loop.
+    const r = try realignCommit(io, a, &tmp, hosts_loop ++ "port 1\nsep\nport 2\n", hosts_a, &.{}, "port 9\nsep\nport 3\n", null);
+    try expectAllManual(r, &.{ "  manual: ~/.hosts:1 may be an edited loop row\n", "  manual: ~/.hosts:4 held beside an edited loop row\n" });
 }

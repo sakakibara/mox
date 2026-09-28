@@ -90,12 +90,17 @@ pub const Diag = struct {
 /// A loop over a data file: the data file as read, the body template, the
 /// loop variable and the `where` predicate. `attributed` when its rows carry
 /// `.loop` provenance: a top-level loop whose body holds no directive.
+/// `row_lines` is the most output lines any row rendered, whatever their
+/// provenance; more than `template_lines` means a value renders a template
+/// line as several lines.
 pub const LoopSite = struct {
     data_source: []const u8,
     template: []const u8,
     variable: []const u8,
     where: ?*const dsl.ast.RowExpr,
     attributed: bool,
+    template_lines: u32,
+    row_lines: u32 = 0,
 };
 
 /// Whether a resolved secret URI came from a dedicated secret manager, so its

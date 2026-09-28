@@ -281,6 +281,26 @@ pub fn build(b: *std.Build) void {
     const commit_tests = b.addTest(.{ .root_module = commit_tests_mod });
     test_step.dependOn(&b.addRunArtifact(commit_tests).step);
 
+    // Commit realignment sweep at tests/commit_realign_test.zig: a sample on
+    // `test`, every edit of the full sweep on `test-realign`.
+    for ([_]bool{ false, true }) |full| {
+        const realign_options = b.addOptions();
+        realign_options.addOption(bool, "full", full);
+        const realign_mod = b.createModule(.{
+            .root_source_file = b.path("tests/commit_realign_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        realign_mod.addImport("mox", lib_mod);
+        realign_mod.addOptions("realign_options", realign_options);
+        const realign_run = b.addRunArtifact(b.addTest(.{ .root_module = realign_mod }));
+        if (full) {
+            b.step("test-realign", "Run the full commit realignment sweep").dependOn(&realign_run.step);
+        } else {
+            test_step.dependOn(&realign_run.step);
+        }
+    }
+
     // Commit golden-transcript tests at tests/commit_golden_test.zig.
     const commit_golden_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/commit_golden_test.zig"),
