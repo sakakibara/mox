@@ -901,7 +901,7 @@ fn bootstrapBackends(
         // Per process, like every other staged file: a second mox in the
         // same state dir must not be able to replace a verified installer
         // between the digest check and the shell that runs it.
-        const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer-{d}", .{ b.backend, mox.packages.exec.processId() });
+        const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer-{d}{s}", .{ b.backend, mox.packages.exec.processId(), backend.installer_extension });
         const path = mox.packages.bootstrap.fetchVerified(
             ctx.alloc,
             ctx.io,
@@ -920,7 +920,11 @@ fn bootstrapBackends(
         // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
-            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()) });
+            const why = if (e == error.BootstrapInstallerFailed and backend.installerExit() != null)
+                try std.fmt.allocPrint(ctx.alloc, "the installer exited {d}", .{backend.installerExit().?})
+            else
+                try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs());
+            try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, why });
             try ctx.err.flush();
             failed += 1;
             try failed_names.append(ctx.alloc, b.backend);

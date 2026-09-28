@@ -103,6 +103,8 @@ pub const Brew = struct {
     /// those and no setting caps the total. Set from the same bound one call
     /// runs under, so the check as a whole costs about what one query may.
     probe_budget_ms: i64 = exec.default_timeout_ms,
+    /// The last bootstrap's installer exit code, when it exited nonzero.
+    installer_exit: ?u8 = null,
 
     pub fn backend(self: *Brew) Backend {
         return .{
@@ -126,7 +128,13 @@ pub const Brew = struct {
         .installUnmarked = installUnmarkedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
+        .installerExit = installerExitImpl,
     };
+
+    fn installerExitImpl(ctx: *anyopaque) ?u8 {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        return self.installer_exit;
+    }
 
     /// Homebrew is not there on a fresh mac, so its own installer puts it
     /// there, from a file mox has already fetched and verified.
@@ -138,9 +146,13 @@ pub const Brew = struct {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         const io = self.io orelse return error.NoBootstrapForBackend;
 
+        self.installer_exit = null;
         const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", installer_path });
         try exec.checkTimedOut(res);
-        if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
+        if (!res.ok) {
+            self.installer_exit = res.code;
+            return bootstrap_mod.Error.BootstrapInstallerFailed;
+        }
 
         for (self.prefixes) |dir| {
             const exe = try std.fs.path.join(arena, &.{ dir, "brew" });

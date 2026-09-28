@@ -23,6 +23,9 @@ pub const Error = error{
     BootstrapDownloadFailed,
     BootstrapDigestMismatch,
     BootstrapInstallerTooLarge,
+    /// The installer ran and exited nonzero; the backend's `installerExit`
+    /// has the code.
+    BootstrapInstallerFailed,
     BootstrapFailed,
 };
 

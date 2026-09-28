@@ -1080,6 +1080,99 @@ test "bootstrap: a manager that is absent is installed from the declared install
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
+test "bootstrap: scoop's installer is staged under the .ps1 name PowerShell's -File requires" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "Write-Output 'installing scoop'\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writeManifest(io, h, a, "windows.toml", try std.fmt.allocPrint(a,
+        \\backend = "scoop"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.ps1"
+        \\sha256 = "{s}"
+        \\
+    , .{hex}));
+
+    // `-File` refuses a script whose name does not end in `.ps1`, before a
+    // line of it runs, so the staged name is what decides whether it runs.
+    const staged = try std.fs.path.join(a, &.{
+        h.state,                                                                                "tmp",
+        try std.fmt.allocPrint(a, "scoop-installer-{d}.ps1", .{mox.packages.exec.processId()}),
+    });
+    const run_installer = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s}", .{staged});
+    const shims = try std.fs.path.join(a, &.{ h.home, "scoop", "shims" });
+    const shim = try std.fs.path.join(a, &.{ shims, "scoop.ps1" });
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = run_installer, .makes_dir = shims, .io = io });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} --version", .{shim}), .stdout = "v0.5.2\n" });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} export", .{shim}), .stdout = "{ \"apps\": [] }" });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping   scoop") != null);
+    try std.testing.expect(fake.called(run_installer));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "bootstrap: an installer that exits nonzero is reported by its exit code" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/bash\nexit 1\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writeManifest(io, h, a, "darwin.toml", try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+    , .{hex}));
+
+    const staged = try std.fs.path.join(a, &.{
+        h.state,                                                                           "tmp",
+        try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
+    });
+    const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = interpreter, .code = 1 });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(fake.called(interpreter));
+    // The installer's own failure is named as such; "did not leave the
+    // manager" is for an installer that succeeded and still left none.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: the installer exited 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "did not leave the manager") == null);
+    try std.testing.expect(r.rc != 0);
+}
+
 test "status: an absent manager apply would bootstrap is not a clean machine" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

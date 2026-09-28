@@ -142,8 +142,9 @@ fn scratchPidOf(name: []const u8) ?u32 {
         if (!std.mem.endsWith(u8, name, shape[1])) continue;
         break name[shape[0].len .. name.len - shape[1].len];
     } else blk: {
-        // A staged installer is `<backend>-installer-<pid>`, and what a
-        // plugin wrote beside it `<backend>-installer-<pid>.bindir`. The
+        // A staged installer is `<backend>-installer-<pid>`, plus the
+        // extension its interpreter needs, and what a plugin wrote beside it
+        // `<backend>-installer-<pid>.bindir`. The
         // backend names itself, so the pid is what follows the marker.
         const marker = "-installer-";
         const at = std.mem.lastIndexOf(u8, name, marker) orelse return null;
@@ -245,6 +246,7 @@ pub fn errorText(e: anyerror) []const u8 {
         error.BootstrapDownloadFailed => "the installer could not be downloaded",
         error.BootstrapDigestMismatch => "the installer that came back is not the one the manifest's sha256 names",
         error.BootstrapInstallerTooLarge => "the installer that came back is larger than mox will run",
+        error.BootstrapInstallerFailed => "the installer exited nonzero, saying why above",
         error.BootstrapFailed => "the installer did not leave the manager on this machine",
 
         else => @errorName(e),
@@ -982,6 +984,13 @@ pub const Fake = struct {
 };
 
 const testing = std.testing;
+
+test "scratchPidOf: a staged installer is named for its pid with or without an extension" {
+    try testing.expectEqual(@as(?u32, 7), scratchPidOf("brew-installer-7"));
+    try testing.expectEqual(@as(?u32, 42), scratchPidOf("scoop-installer-42.ps1"));
+    try testing.expectEqual(@as(?u32, 9), scratchPidOf("fakeports-installer-9.bindir"));
+    try testing.expectEqual(@as(?u32, null), scratchPidOf("scoop-installer-.ps1"));
+}
 
 test "Fake: answers a scripted argv and records the call" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

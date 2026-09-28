@@ -110,6 +110,8 @@ pub const Scoop = struct {
     /// one, so a fresh machine's bootstrap does not print a PowerShell error
     /// about a script that was never going to be there.
     io: ?Io = null,
+    /// The last bootstrap's installer exit code, when it exited nonzero.
+    installer_exit: ?u8 = null,
 
     pub fn backend(self: *Scoop) Backend {
         return .{
@@ -118,6 +120,7 @@ pub const Scoop = struct {
             .vtable = &vtable,
             .limitation = scoop_limitation,
             .install_check = "the apps scoop already has, and the buckets scoop knows where to clone",
+            .installer_extension = ".ps1",
         };
     }
 
@@ -131,7 +134,13 @@ pub const Scoop = struct {
         .installRefused = installRefusedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
+        .installerExit = installerExitImpl,
     };
+
+    fn installerExitImpl(ctx: *anyopaque) ?u8 {
+        const self: *Scoop = @ptrCast(@alignCast(ctx));
+        return self.installer_exit;
+    }
 
     /// scoop installs itself from a PowerShell script mox has already fetched
     /// and verified -- unless it is already here and merely off this run's
@@ -144,9 +153,13 @@ pub const Scoop = struct {
         // installer again over a scoop that is there is refused ("exists and
         // is not empty"), so what is there is adopted instead.
         if (try self.adopt(arena)) |shims| return shims;
+        self.installer_exit = null;
         const res = try exec.runPowerShell(self.runner, arena, &.{installer_path}, null, true);
         try exec.checkTimedOut(res);
-        if (!res.ok) return bootstrap_mod.Error.BootstrapFailed;
+        if (!res.ok) {
+            self.installer_exit = res.code;
+            return bootstrap_mod.Error.BootstrapInstallerFailed;
+        }
         const root = (try self.rootOf(arena)) orelse return null;
         const shims = try std.fs.path.join(arena, &.{ root, "shims" });
         try self.useShim(arena, shims);
@@ -1770,6 +1783,25 @@ test "scoop: a machine with no shim at all is not probed for one" {
     _ = try s.backend().bootstrap(a, "C:\\i.ps1");
     try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
     try testing.expectEqualStrings("pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1", fake.calls.items[0]);
+}
+
+test "scoop: an installer that exits nonzero is named by its code" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const home = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1", .code = 1 },
+    } };
+    var s: Scoop = .{ .runner = fake.runner(), .home = home, .io = io };
+
+    try testing.expectError(bootstrap_mod.Error.BootstrapInstallerFailed, s.backend().bootstrap(a, "C:\\i.ps1"));
+    try testing.expectEqual(@as(?u8, 1), s.backend().installerExit());
 }
 
 test "scoop: without pwsh, the installer and the shim run through powershell" {

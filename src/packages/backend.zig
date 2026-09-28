@@ -349,6 +349,10 @@ pub const Backend = struct {
     /// itself refreshes an index and elevates, which a dry run must not do,
     /// so a row a real apply would refuse is listed as one it would install.
     install_check: ?[]const u8 = null,
+    /// The extension the staged installer is named with, for a bootstrap
+    /// whose interpreter decides by the name: PowerShell's `-File` refuses a
+    /// script that does not end in `.ps1`.
+    installer_extension: []const u8 = "",
 
     /// What probing a manager found. `broken` is a manager that is there but
     /// cannot answer its own version query: reading that as absent would make
@@ -416,6 +420,9 @@ pub const Backend = struct {
         /// Absent for a manager that ships with the OS, which is five of the
         /// seven: there is nothing to install.
         bootstrap: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 = null,
+        /// The exit code of the last `bootstrap`'s installer, when it ran and
+        /// exited nonzero. Absent, or null, when there is none to report.
+        installerExit: ?*const fn (ctx: *anyopaque) ?u8 = null,
         /// What this backend structurally cannot see, asked once of a usable
         /// backend. Absent when the `limitation` field states it, or when there is
         /// nothing to state.
@@ -519,6 +526,11 @@ pub const Backend = struct {
 
     pub fn canBootstrap(self: Backend) bool {
         return self.vtable.bootstrap != null;
+    }
+
+    pub fn installerExit(self: Backend) ?u8 {
+        const f = self.vtable.installerExit orelse return null;
+        return f(self.ctx);
     }
 
     pub fn bootstrap(self: Backend, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
