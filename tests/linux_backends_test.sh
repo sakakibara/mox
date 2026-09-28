@@ -100,7 +100,20 @@ set -eu
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT INT TERM
+# A container runs as root, so on a Linux host what a case wrote under /w
+# belongs to root and the host user cannot unlink it. Every case therefore
+# gets a directory of its own, and the whole tree goes at exit through a
+# container of an image this run already pulled.
+cleanup_image=""
+cleanup() {
+  rm -rf "$work" 2>/dev/null && return 0
+  if [ -n "$cleanup_image" ]; then
+    docker run --rm --network none --platform "$platform" -v "$work:/w" "$cleanup_image" \
+      sh -c 'rm -rf /w/* /w/.[!.]* /w/..?*' >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT INT TERM
 
 passes=0
 fails=0
@@ -146,6 +159,7 @@ pull_image() {
   backend="$2"
   case_dir="$3"
   if docker pull --platform "$platform" "$image" >"$case_dir/pull.txt" 2>&1; then
+    cleanup_image="$image"
     return 0
   fi
   if grep -q "no matching manifest" "$case_dir/pull.txt"; then
@@ -195,8 +209,7 @@ run_case() {
     return
   fi
 
-  case_dir="$work/$backend"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/$backend.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/$backend.toml" <<EOF
@@ -289,8 +302,7 @@ run_brew_case() {
   pkg="$2"
   backend=brew
 
-  case_dir="$work/$backend"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/$backend.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/$backend.toml" <<EOF
@@ -369,8 +381,7 @@ run_remove_suffix_case() {
   image="$1"
   backend="apt remove-suffix"
 
-  case_dir="$work/remove-suffix"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/remove-suffix.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -429,8 +440,7 @@ run_regex_operand_case() {
   image="$1"
   backend="apt regex-operand"
 
-  case_dir="$work/regex-operand"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/regex-operand.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -501,8 +511,7 @@ run_foreign_only_case() {
   foreign="$2"
   backend="apt foreign-only"
 
-  case_dir="$work/foreign-only"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/foreign-only.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<EOF
@@ -580,8 +589,7 @@ run_foreign_only_bare_case() {
   foreign="$2"
   backend="apt foreign-only-bare"
 
-  case_dir="$work/foreign-only-bare"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/foreign-only-bare.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
 
@@ -682,8 +690,7 @@ run_apt_hold_pin_case() {
   image="$1"
   backend="apt hold-pin"
 
-  case_dir="$work/apt-hold-pin"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-hold-pin.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -773,8 +780,7 @@ run_apt_pin_locale_case() {
   image="$1"
   backend="apt pin-locale"
 
-  case_dir="$work/apt-pin-locale"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-pin-locale.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF2'
@@ -843,8 +849,7 @@ run_apt_no_repositories_case() {
   image="$1"
   backend="apt no-repositories"
 
-  case_dir="$work/apt-no-repos"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-no-repos.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -910,8 +915,7 @@ run_apt_arch_desync_case() {
   foreign="$2"
   backend="apt arch-desync"
 
-  case_dir="$work/apt-arch-desync"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-arch-desync.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -1040,8 +1044,7 @@ run_pacman_stale_case() {
   image="$1"
   backend="pacman stale"
 
-  case_dir="$work/pacman-stale"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-stale.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
@@ -1107,8 +1110,7 @@ run_multiarch_case() {
   foreign="$2"
   backend="apt multiarch"
 
-  case_dir="$work/multiarch"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/multiarch.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<EOF
@@ -1175,8 +1177,7 @@ run_provide_name_case() {
   image="$1"
   backend="dnf provide-name"
 
-  case_dir="$work/provide-name"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/provide-name.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/dnf.toml" <<'EOF'
@@ -1233,8 +1234,7 @@ run_apt_native_alias_case() {
   image="$1"
   backend="apt native-alias"
 
-  case_dir="$work/native-alias"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/native-alias.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -1306,8 +1306,7 @@ run_pacman_group_case() {
   image="$1"
   backend="pacman group"
 
-  case_dir="$work/pacman-group"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-group.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
@@ -1394,8 +1393,7 @@ run_pacman_sync_case() {
   image="$1"
   backend="pacman sync"
 
-  case_dir="$work/pacman-sync"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-sync.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   # A group: refused, so every path after the database read is the one
@@ -1496,8 +1494,7 @@ run_apt_local_deb_case() {
   foreign="$2"
   backend="apt local-deb"
 
-  case_dir="$work/apt-local-deb"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-local-deb.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -1606,8 +1603,7 @@ run_apt_virtual_name_case() {
   image="$1"
   backend="apt virtual"
 
-  case_dir="$work/apt-virtual"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-virtual.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -1667,8 +1663,7 @@ run_pacman_partial_db_case() {
   image="$1"
   backend="pacman partial-db"
 
-  case_dir="$work/pacman-partial-db"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-partial-db.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
@@ -1740,8 +1735,7 @@ run_pacman_provision_case() {
   image="$1"
   backend="pacman provision"
 
-  case_dir="$work/pacman-provision"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-provision.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
@@ -1814,8 +1808,7 @@ run_pacman_unknown_name_case() {
   pkg="$2"
   backend="pacman unknown-name"
 
-  case_dir="$work/pacman-unknown-name"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-unknown-name.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -1901,8 +1894,7 @@ run_pacman_upgrade_dependency_case() {
   image="$1"
   backend="pacman upgrade-dependency"
 
-  case_dir="$work/pacman-upgrade-dependency"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-upgrade-dependency.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
@@ -1985,8 +1977,7 @@ run_pacman_sync_search_case() {
   pkg="$2"
   backend="pacman sync-search"
 
-  case_dir="$work/pacman-sync-search"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-sync-search.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -2068,8 +2059,7 @@ run_pacman_empty_repo_case() {
   pkg="$2"
   backend="pacman empty-repo"
 
-  case_dir="$work/pacman-empty-repo"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-empty-repo.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -2131,8 +2121,7 @@ run_zypper_provide_name_case() {
   image="$1"
   backend="zypper provide-name"
 
-  case_dir="$work/zypper-provide-name"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/zypper-provide-name.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/zypper.toml" <<'EOF'
@@ -2192,8 +2181,7 @@ run_zypper_unknown_name_case() {
   pkg="$2"
   backend="zypper unknown-name"
 
-  case_dir="$work/zypper-unknown-name"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/zypper-unknown-name.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF
@@ -2253,8 +2241,7 @@ run_zypper_lock_case() {
   pkg="$2"
   backend="zypper lock"
 
-  case_dir="$work/zypper-lock"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/zypper-lock.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF
@@ -2342,8 +2329,7 @@ run_zypper_locale_case() {
   pkg="$2"
   backend="zypper locale"
 
-  case_dir="$work/zypper-locale"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/zypper-locale.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF2
@@ -2413,8 +2399,7 @@ run_zypper_color_case() {
   pkg="$2"
   backend="zypper color"
 
-  case_dir="$work/zypper-color"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/zypper-color.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/zypper.toml" <<EOF2
@@ -2491,8 +2476,7 @@ run_dependency_case() {
   manager="$2"
   backend="$manager dependency"
 
-  case_dir="$work/$manager-dependency"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/$manager-dependency.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   case "$manager" in
@@ -2696,8 +2680,7 @@ run_dnf_no_repository_case() {
   image="$1"
   backend="dnf no-repository"
 
-  case_dir="$work/dnf-no-repository"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/dnf-no-repository.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/dnf.toml" <<'EOF'
@@ -2795,8 +2778,7 @@ run_apt_held_dependency_case() {
   image="$1"
   backend="apt held-dependency"
 
-  case_dir="$work/apt-held-dependency"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-held-dependency.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -2902,8 +2884,7 @@ run_pacman_no_sync_case() {
   image="$1"
   backend="pacman no-sync"
 
-  case_dir="$work/pacman-no-sync"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-no-sync.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<'EOF'
@@ -2999,12 +2980,7 @@ run_zypper_installed_lock_case() {
   down="${3:-}"
   backend="zypper installed-lock"
 
-  # One directory per image, never one reused: this case writes its manifest
-  # from INSIDE the container, so `data/packages` is empty when the bind
-  # mount is made, and a second mount of a path just deleted and recreated
-  # showed the container an empty tree the host had already filled.
-  case_dir="$work/zypper-installed-lock-$(printf '%s' "$image" | tr '/:.' '---')"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/zypper-installed-lock.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
 
@@ -3102,8 +3078,7 @@ run_pacman_unsatisfiable_case() {
   pkg="$2"
   backend="pacman unsatisfiable"
 
-  case_dir="$work/pacman-unsatisfiable"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-unsatisfiable.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -3195,8 +3170,7 @@ run_pacman_conflict_case() {
   pkg="$2"
   backend="pacman conflict"
 
-  case_dir="$work/pacman-conflict"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-conflict.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -3373,8 +3347,7 @@ run_pacman_umask_case() {
   pkg="$2"
   backend="pacman umask"
 
-  case_dir="$work/pacman-umask"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-umask.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -3451,8 +3424,7 @@ run_pacman_sudo_password_case() {
   pkg="$2"
   backend="pacman sudo-password"
 
-  case_dir="$work/pacman-sudo-password"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-sudo-password.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -3544,8 +3516,7 @@ run_pacman_local_dir_case() {
   pkg="$2"
   backend="pacman local-dir"
 
-  case_dir="$work/pacman-local-dir"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-local-dir.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -3639,8 +3610,7 @@ run_pacman_stale_lock_case() {
   pkg="$2"
   backend="pacman stale-lock"
 
-  case_dir="$work/pacman-stale-lock"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/pacman-stale-lock.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/pacman.toml" <<EOF
@@ -3726,8 +3696,7 @@ run_apt_flat_repo_case() {
     *) other=i386 ;;
   esac
 
-  case_dir="$work/apt-flat-repo"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-flat-repo.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<EOF
@@ -3879,8 +3848,7 @@ run_apt_allnames_case() {
   image="$1"
   backend="apt allnames"
 
-  case_dir="$work/apt-allnames"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-allnames.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -3950,8 +3918,7 @@ run_apt_unpacked_case() {
   image="$1"
   backend="apt unpacked"
 
-  case_dir="$work/apt-unpacked"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/apt-unpacked.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/apt.toml" <<'EOF'
@@ -4039,8 +4006,7 @@ run_dnf_assumeno_case() {
   image="$1"
   backend="dnf assumeno"
 
-  case_dir="$work/dnf-assumeno"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/dnf-assumeno.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/dnf.toml" <<'EOF'
@@ -4145,8 +4111,7 @@ run_dnf_unimported_key_case() {
   pkg="$2"
   backend="dnf unimported-key"
 
-  case_dir="$work/dnf-unimported-key"
-  rm -rf "$case_dir"
+  case_dir="$(mktemp -d "$work/dnf-unimported-key.XXXXXX")"
   mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
   cp "$mox_bin" "$case_dir/mox"
   cat >"$case_dir/repo/data/packages/dnf.toml" <<EOF
