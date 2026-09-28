@@ -5938,6 +5938,8 @@ var restore_fail_from: usize = 0;
 var restore_fail_to: usize = std.math.maxInt(usize);
 var restore_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File = undefined;
 var restore_fail_real_open: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File = undefined;
+/// A second file, by real path, every create of which fails too.
+var create_fail_also: []const u8 = "";
 
 /// Whether this call on `sub_path` is one of the calls on the target that
 /// fail.
@@ -5949,6 +5951,7 @@ fn failsNow(sub_path: []const u8) bool {
 
 fn restoreFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
     if (failsNow(sub_path)) return error.AccessDenied;
+    if (create_fail_also.len > 0 and namesPath(sub_path, create_fail_also)) return error.AccessDenied;
     return restore_fail_real(userdata, dir, sub_path, opts);
 }
 
@@ -5960,9 +5963,14 @@ fn failingOpenFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opt
 /// Whether `path` names the file whose calls fail, however it is spelled:
 /// commit reaches a source by its real path.
 fn namesFailTarget(path: []const u8) bool {
+    return namesPath(path, restore_fail_target);
+}
+
+/// Whether `path` names the file whose real path is `real`.
+fn namesPath(path: []const u8, real: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = Io.Dir.cwd().realPathFile(std.testing.io, path, &buf) catch return std.mem.eql(u8, path, restore_fail_target);
-    return std.mem.eql(u8, buf[0..n], restore_fail_target);
+    const n = Io.Dir.cwd().realPathFile(std.testing.io, path, &buf) catch return std.mem.eql(u8, path, real);
+    return std.mem.eql(u8, buf[0..n], real);
 }
 
 /// The recovery directory a failed restore created: the only entry under
@@ -6099,6 +6107,258 @@ test "commit: a restore that fails with no room for a recovery copy prints the p
         "mox commit: {s}: its pre-run bytes could not be saved; they follow in full:\n{s}" ++
         "mox commit: {s}: its pre-run bytes could not be saved; they follow in full:\nnote quokkatoken\n", .{ target, target, gated, try h.srcOf(".myenv") }), res.err);
     try std.testing.expectEqualStrings("", try read(io, a, recovery));
+}
+
+/// Two plain files, each with a live edit routed to its source, applied and
+/// recorded: `.aenv` and `.benv`.
+fn twoRoutedEdits(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !Harness {
+    try writeRepo(io, tmp, "repo/src/.aenv", "note alphanote\n");
+    try writeRepo(io, tmp, "repo/src/.benv", "note betanote\n");
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".aenv"), "alphanote", "gammanote");
+    try editLive(io, a, try h.liveOf(".benv"), "betanote", "deltanote");
+    return h;
+}
+
+test "commit: a write that fails after earlier writes restores every path, records nothing, and exits 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try twoRoutedEdits(a, io, &tmp);
+    const aenv_before = (try appliedContent(h, ".aenv")).?;
+    const benv_before = (try appliedContent(h, ".benv")).?;
+
+    // .aenv is written first; the write of .benv fails.
+    const benv = try h.srcOf(".benv");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, benv, 1);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expectEqualStrings("note betanote\n", try read(io, a, benv));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(aenv_before, (try appliedContent(h, ".aenv")).?);
+    try std.testing.expectEqualStrings(benv_before, (try appliedContent(h, ".benv")).?);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
+        "mox commit: {s}\n" ++
+        "mox commit: 0 package row(s) already recorded\n", .{ benv, try h.srcOf(".aenv") }), res.err);
+}
+
+test "commit: a write that fails and a restore that fails save the pre-run bytes, record nothing, and exit 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try twoRoutedEdits(a, io, &tmp);
+    const aenv_before = (try appliedContent(h, ".aenv")).?;
+
+    // .aenv's write lands and its restore fails; .benv's write fails.
+    const aenv = try h.srcOf(".aenv");
+    const benv = try h.srcOf(".benv");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, aenv, 2);
+    create_fail_also = try Io.Dir.cwd().realPathFileAlloc(io, benv, a);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    create_fail_also = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqualStrings("note gammanote\n", try read(io, a, aenv));
+    try std.testing.expectEqualStrings("note betanote\n", try read(io, a, benv));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(aenv_before, (try appliedContent(h, ".aenv")).?);
+    const copy = try std.fs.path.join(a, &.{ try recoveryDir(h), "repo", "src", ".aenv" });
+    try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, copy));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
+        "mox commit: could not restore {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
+        "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
+        "mox commit: 0 package row(s) already recorded\n", .{ benv, aenv, aenv, copy }), res.err);
+}
+
+test "commit: a write that fails reports the package rows already recorded, which stay" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try twoRoutedEdits(a, io, &tmp);
+    const manifest = try std.fs.path.join(a, &.{ h.repo, "data", "packages", "darwin.toml" });
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(manifest).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest, .data = "backend = \"brew\"\n" });
+
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    const brew = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list ";
+    try entries.appendSlice(a, &.{
+        .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
+        .{ .argv = brew ++ "--full-name --installed-on-request", .stdout = "htop\n" },
+        .{ .argv = brew ++ "--cask --full-name" },
+        .{ .argv = brew ++ "--formula --full-name", .stdout = "htop\n" },
+    });
+    for ([_][]const u8{ "apt-get", "dnf", "pacman", "scoop", "winget", "zypper" }) |m| {
+        try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} --version", .{m}), .fail = error.FileNotFound });
+    }
+    var fake: mox.packages.exec.Fake = .{ .arena = a, .entries = entries.items };
+    mox.cli.app.package_runner_override = fake.runner();
+    defer mox.cli.app.package_runner_override = null;
+
+    const benv = try h.srcOf(".benv");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, benv, 1);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"htop\"\n", try read(io, a, manifest));
+    try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
+        "mox commit: {s}\n" ++
+        "mox commit: 1 package row(s) already recorded\n", .{ benv, try h.srcOf(".aenv") }), res.err);
+}
+
+test "commit: a narrowing whose fragment write fails restores the base, removes the region directory, and exits 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSharedBaseFixture(io, &tmp);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
+    const before = try treeDigest(io, a, src_dir);
+    const applied_before = (try appliedContent(h, ".zshrc")).?;
+
+    try editLive(io, a, try h.liveOf(".zshrc"), "export EDITOR=vim", "export EDITOR=nvim");
+
+    // Only the fragment's creates fail; it does not exist yet, so it is
+    // matched by the canonical path commit writes it through.
+    const fragment = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(io, src_dir, a), ".zshrc.d", "os", "darwin" });
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, try h.srcOf(".zshrc"), std.math.maxInt(usize));
+    create_fail_also = fragment;
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "2\n");
+    restore_fail_target = "";
+    create_fail_also = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqual(before, try treeDigest(io, a, src_dir));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try h.srcOf(".zshrc.d"), .{}));
+    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
+        "mox commit: {s}\n" ++
+        "mox commit: 0 package row(s) already recorded\n", .{ fragment, try h.srcOf(".zshrc") }), res.err);
+}
+
+test "commit: a first write that fails and changes nothing says only that nothing was recorded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try twoRoutedEdits(a, io, &tmp);
+    const aenv_before = (try appliedContent(h, ".aenv")).?;
+
+    const aenv = try h.srcOf(".aenv");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, aenv, 1);
+    const res = try faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, aenv));
+    try std.testing.expectEqualStrings("note betanote\n", try read(io, a, try h.srcOf(".benv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(aenv_before, (try appliedContent(h, ".aenv")).?);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
+        "mox commit: nothing was recorded\n" ++
+        "mox commit: 0 package row(s) already recorded\n", .{aenv}), res.err);
+}
+
+test "commit: a facts write that fails restores the routed source, leaves the facts, records nothing, and exits 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zshrc = "export EMAIL=<machine.email | default \"nobody@example.com\">\n" ++
+        "export A=1\nexport B=2\n";
+    try writeRepo(io, &tmp, "repo/src/.zshrc", zshrc);
+    const facts_before = "email = \"old@home.com\"\n";
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const applied_before = (try appliedContent(h, ".zshrc")).?;
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export EMAIL=old@home.com", "export EMAIL=new@work.com");
+    try editLive(io, a, live, "export B=2", "export B=22");
+
+    const facts = try h.homePath(".config/mox/facts.toml");
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCreates(h, &vtable, facts, 1);
+    const res = try faulty.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\ny\n");
+    restore_fail_target = "";
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqualStrings(zshrc, try read(io, a, try h.srcOf(".zshrc")));
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, facts));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write ~/.config/mox/facts.toml (AccessDenied)\n" ++
+        "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
+        "mox commit: {s}\n" ++
+        "mox commit: 0 package row(s) already recorded\n", .{try h.srcOf(".zshrc")}), res.err);
+}
+
+test "commit: a path the journal cannot read stops the run before any write" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A regular file where the region directory would go: the fragment path
+    // under it cannot be read.
+    try writeSharedBaseFixture(io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc.d", "not a directory\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
+    const before = try treeDigest(io, a, src_dir);
+    const applied_before = (try appliedContent(h, ".zshrc")).?;
+
+    try editLive(io, a, try h.liveOf(".zshrc"), "export EDITOR=vim", "export EDITOR=nvim");
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "2\n");
+    try std.testing.expectEqual(@as(u8, 2), res.rc);
+
+    try std.testing.expectEqual(before, try treeDigest(io, a, src_dir));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    const fragment = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(io, src_dir, a), ".zshrc.d", "os", "darwin" });
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not read {s} (NotDir)\n" ++
+        "mox commit: 0 package row(s) already recorded\n", .{fragment}), res.err);
 }
 
 test "commit: chained coupling renames apply in one pass over a target's tokens" {

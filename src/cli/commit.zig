@@ -252,7 +252,7 @@ const RunAccum = struct {
 /// whole file loop because the user aborted (plain or strict).
 const HunkOutcome = enum { cont, abort, abort_strict };
 
-/// A region synthesis to materialize after all prompts.
+/// A region synthesis to write after all prompts.
 const SynthDecision = struct {
     plan: mox.classify.synth.Plan,
     base_abs: []const u8,
@@ -569,8 +569,8 @@ fn structEditEql(a: StructEdit, b: StructEdit) bool {
 }
 
 /// One source path's bytes as the plan leaves it: null while it is absent.
-/// `make_parent` marks a path a struct edit writes, whose directory may not
-/// exist yet.
+/// `make_parent` marks a path a struct edit or a narrowing's fragment writes,
+/// whose directory may not exist yet.
 const PlannedPath = struct {
     path: []const u8,
     bytes: ?[]const u8,
@@ -1712,14 +1712,14 @@ pub fn commitImpl(
     for (fact_owners.items) |owner| wrote_own[owner] = true;
 
     // Every written path, journaled before any write.
-    for (planned_lines.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.path);
-    for (planned_syms.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.source_abs);
-    for (synth_plans.items) |sd| {
-        try journal.record(ctx.alloc, ctx.io, sd.base_abs);
-        try journal.record(ctx.alloc, ctx.io, sd.plan.fragment_path);
-    }
-    for (planned_structs.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.layer_abs);
-    if (fact_edits.items.len > 0) try journal.record(ctx.alloc, ctx.io, context.paths.facts_path);
+    var to_journal: std.ArrayList([]const u8) = .empty;
+    for (planned_lines.items) |o| try to_journal.append(ctx.alloc, o.edit.path);
+    for (planned_syms.items) |o| try to_journal.append(ctx.alloc, o.edit.source_abs);
+    for (synth_plans.items) |sd| try to_journal.appendSlice(ctx.alloc, &.{ sd.base_abs, sd.plan.fragment_path });
+    for (planned_structs.items) |o| try to_journal.append(ctx.alloc, o.edit.layer_abs);
+    if (fact_edits.items.len > 0) try to_journal.append(ctx.alloc, context.paths.facts_path);
+    for (to_journal.items) |path| journal.record(ctx.alloc, ctx.io, path) catch |e|
+        return stopUnreadable(ctx, display.of(ids.shown(path), m_state.home), e, pkgs.added + pkgs.blacklisted);
 
     // Plan: every prompt is done, so each written path's final bytes are
     // computed in memory from its journaled pre-run bytes, threading its
@@ -1760,7 +1760,10 @@ pub fn commitImpl(
         }
         try plan.set(ctx.alloc, base_abs, try splicedContent(ctx.alloc, try plan.bytesOf(ctx.alloc, base_abs), splices.items));
         for (synth_plans.items) |sd| {
-            if (std.mem.eql(u8, sd.base_abs, base_abs)) try plan.set(ctx.alloc, sd.plan.fragment_path, sd.plan.fragment_content);
+            if (!std.mem.eql(u8, sd.base_abs, base_abs)) continue;
+            const fragment = try plan.slot(ctx.alloc, sd.plan.fragment_path);
+            fragment.bytes = sd.plan.fragment_content;
+            fragment.make_parent = true;
         }
     }
 
@@ -1779,7 +1782,8 @@ pub fn commitImpl(
                 continue;
             }
         }
-        try journal.record(ctx.alloc, ctx.io, path);
+        journal.record(ctx.alloc, ctx.io, path) catch |e|
+            return stopUnreadable(ctx, display.of(ids.shown(path), m_state.home), e, pkgs.added + pkgs.blacklisted);
     }
     // A file no update reaches, or only no-op ones (its renames dropped
     // before planning included), is no coupling target.
@@ -1874,28 +1878,15 @@ pub fn commitImpl(
         };
     }
 
-    // Write phase: each planned path once. A base with narrowings is written
-    // by `synth.materialize`, together with the fragments it creates.
-    for (plan.paths.items) |pp| {
-        if (isOneOf(pp.path, synth_bases)) {
-            var plans: std.ArrayList(mox.classify.synth.Plan) = .empty;
-            for (synth_plans.items) |sd| {
-                if (!std.mem.eql(u8, sd.base_abs, pp.path)) continue;
-                var fp = sd.plan;
-                fp.fragment_content = plan.get(fp.fragment_path).?;
-                try plans.append(ctx.alloc, fp);
-            }
-            try mox.classify.synth.materialize(ctx.alloc, ctx.io, pp.path, pp.bytes.?, plans.items, ctx.err);
-            continue;
-        }
-        if (isSynthFragment(pp.path, synth_plans.items)) continue;
-        const bytes = pp.bytes orelse continue;
-        if (pp.make_parent) {
-            if (std.fs.path.dirname(pp.path)) |parent| try Io.Dir.cwd().createDirPath(ctx.io, parent);
-        }
-        try Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = pp.path, .data = bytes });
-    }
-    try applyFactEdits(ctx.alloc, ctx.io, context.paths.facts_path, fact_edits.items);
+    var writing: []const u8 = "";
+    writePlan(ctx, &plan, context.paths.facts_path, fact_edits.items, &writing) catch |e| {
+        try ctx.out.flush();
+        try ctx.err.print("mox commit: could not write {f} ({s})\n", .{ display.of(ids.shown(writing), m_state.home), @errorName(e) });
+        try restoreJournal(ctx, &journal, &ids, m_state.home);
+        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+        try ctx.err.flush();
+        return 2;
+    };
     // A fact write changes what `<machine.X>` interpolation resolves to for
     // EVERY file recomposed below, this routed file included: re-capture so
     // verification sees the new value instead of the one this run started
@@ -2820,6 +2811,82 @@ fn markDead(
     if (gop.found_existing) return;
     gop.value_ptr.* = owners[0];
     try batch.append(arena, path);
+}
+
+/// Write phase: each planned path once, then the facts. `writing` names the
+/// path being written when an error returns.
+fn writePlan(
+    ctx: *app.Ctx,
+    plan: *const WritePlan,
+    facts_path: []const u8,
+    fact_edits: []const FactEdit,
+    writing: *[]const u8,
+) !void {
+    for (plan.paths.items) |pp| {
+        writing.* = pp.path;
+        const bytes = pp.bytes orelse continue;
+        if (pp.make_parent) {
+            if (std.fs.path.dirname(pp.path)) |parent| try Io.Dir.cwd().createDirPath(ctx.io, parent);
+        }
+        try Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = pp.path, .data = bytes });
+    }
+    writing.* = facts_path;
+    try applyFactEdits(ctx.alloc, ctx.io, facts_path, fact_edits);
+}
+
+/// Before any write: a path the journal cannot read stops the run.
+fn stopUnreadable(ctx: *app.Ctx, shown: display.Path, cause: anyerror, package_rows: usize) !u8 {
+    try ctx.out.flush();
+    try ctx.err.print("mox commit: could not read {f} ({s})\n", .{ shown, @errorName(cause) });
+    try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{package_rows});
+    try ctx.err.flush();
+    return 2;
+}
+
+/// After a failed write: put every journaled path that no longer holds its
+/// pre-run bytes back, and name each. When a restore fails, every one due is
+/// still attempted and `saveRecovery` takes over.
+fn restoreJournal(ctx: *app.Ctx, journal: *const Journal, ids: *const PathIds, home: []const u8) !void {
+    var due: std.ArrayList([]const u8) = .empty;
+    var failures: std.ArrayList(RestoreFailure) = .empty;
+    var at_pre_run = std.StringHashMap(void).init(ctx.alloc);
+    var it = journal.entries.iterator();
+    while (it.next()) |entry| {
+        const p = entry.key_ptr.*;
+        const now: PathNow = if (Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.alloc, .limited(max_file_bytes))) |bytes|
+            .{ .bytes = bytes }
+        else |e| switch (e) {
+            error.FileNotFound => .absent,
+            error.OutOfMemory => return e,
+            else => .unreadable,
+        };
+        if (atPreRun(entry.value_ptr.content, now)) {
+            // An absent path may still have had its directories made.
+            if (entry.value_ptr.created_dir != null) journal.restore(ctx.io, p) catch |e| {
+                try failures.append(ctx.alloc, .{ .path = p, .cause = e });
+                continue;
+            };
+            try at_pre_run.put(p, {});
+        } else {
+            try due.append(ctx.alloc, p);
+        }
+    }
+    std.mem.sort([]const u8, due.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    for (due.items) |p| {
+        journal.restore(ctx.io, p) catch |e| {
+            try failures.append(ctx.alloc, .{ .path = p, .cause = e });
+            continue;
+        };
+        try at_pre_run.put(p, {});
+    }
+    if (failures.items.len > 0) return saveRecovery(ctx, journal, ids, &at_pre_run, failures.items, home);
+    if (due.items.len == 0) return ctx.err.writeAll("mox commit: nothing was recorded\n");
+    try ctx.err.writeAll("mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n");
+    for (due.items) |p| try ctx.err.print("mox commit: {f}\n", .{display.of(ids.shown(p), home)});
 }
 
 const RestoreFailure = struct {
@@ -7348,13 +7415,6 @@ fn synthBases(arena: std.mem.Allocator, plans: []const SynthDecision) ![]const [
 fn isOneOf(path: []const u8, paths: []const []const u8) bool {
     for (paths) |p| {
         if (std.mem.eql(u8, p, path)) return true;
-    }
-    return false;
-}
-
-fn isSynthFragment(path: []const u8, plans: []const SynthDecision) bool {
-    for (plans) |sd| {
-        if (std.mem.eql(u8, sd.plan.fragment_path, path)) return true;
     }
     return false;
 }
