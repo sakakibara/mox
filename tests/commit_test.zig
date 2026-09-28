@@ -6914,7 +6914,7 @@ fn hardLinkedLayerEdits(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, 
     return h;
 }
 
-test "commit --dry-run: a layer refusal first reachable when planning is predicted as --yes reports it" {
+test "commit --dry-run: a line edit into a layer another file's key was routed to is refused at routing as --yes refuses it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6922,31 +6922,24 @@ test "commit --dry-run: a layer refusal first reachable when planning is predict
     defer arena.deinit();
     const a = arena.allocator();
 
-    // `app.toml` sorts before `zrc`, so its key is routed before the line
-    // edit that makes the layer refuse it.
+    // `app.toml` sorts before `zrc`, so its key is routed first and the line
+    // edit into the same file through `zrc` conflicts with it.
     const h = try hardLinkedLayerEdits(a, io, &tmp, "zrc");
-    const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: a source layer rejected the edit (TomlParseError); not committed\n" ++
-        "mox commit: {s}: not committed: {s} was restored because {s} was not committed; commit it on its own with 'mox commit {s}'\n", .{
-        try h.liveOf("app.toml"),
-        try shownLive(a, "zrc"),
-        try h.srcOf("zrc.d/extra.toml"),
-        try shownLive(a, "app.toml"),
-        try shownLive(a, "zrc"),
-    });
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:3 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "zrc"), try shownLive(a, "app.toml"), try h.srcOf("app.toml") });
 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
-    try std.testing.expectEqualStrings(want_err, dry.err);
-    try std.testing.expect(std.mem.endsWith(u8, dry.out, "\nmox commit: 0 routable, 0 coupled, 0 manual (report only; run without --dry-run on a terminal to apply)\n"));
+    try std.testing.expectEqualStrings("", dry.err);
+    try std.testing.expect(std.mem.endsWith(u8, dry.out, try std.fmt.allocPrint(a, "{s}\nmox commit: 1 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual})));
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expectEqualStrings(want_err, res.err);
-    try std.testing.expect(std.mem.endsWith(u8, res.out, "\nmox commit: 0 routed, 0 coupled, 0 manual\n"));
-    try std.testing.expectEqualStrings("# mox: own srv\n[srv]\na = 1\n", try read(io, a, try h.srcOf("app.toml")));
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expect(std.mem.endsWith(u8, res.out, try std.fmt.allocPrint(a, "{s}  committed {s}\n\nmox commit: 1 routed, 0 coupled, 1 manual\n", .{ manual, try shownLive(a, "app.toml") })));
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("app.toml")), "[srv]\na = 1\n") != null);
 }
 
-test "commit: a key placement is checked over a line edit routed into the same file under another name" {
+test "commit: a key routed into a layer a line edit was routed to under another name is refused at routing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6955,9 +6948,9 @@ test "commit: a key placement is checked over a line edit routed into the same f
     const a = arena.allocator();
 
     // `.myrc` sorts before `app.toml`: its line edit is routed first, and the
-    // key's placement is checked over it.
+    // key into the same file conflicts with it.
     const h = try hardLinkedLayerEdits(a, io, &tmp, ".myrc");
-    const manual = try std.fmt.allocPrint(a, "  manual: {s} srv.b: src/app.toml cannot hold this key\n", .{try h.liveOf("app.toml")});
+    const manual = try std.fmt.allocPrint(a, "  manual: {s} srv.b: conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "app.toml"), try shownLive(a, ".myrc"), try h.srcOf(".myrc.d/extra.toml") });
 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
@@ -7034,40 +7027,41 @@ test "commit --dry-run: a coupled update undone because its origin fails at plan
     defer arena.deinit();
     const a = arena.allocator();
 
-    // As in the plan-refusal fixture, and `zrc` also renames a token `.cenv`
-    // holds: once `zrc` fails with `app.toml`, its coupled update is undone.
-    try writeRepo(io, &tmp, "repo/src/zrc", "note alphatoken\n# mox: include \"extra.toml\"\n");
-    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own srv\n[srv]\na = 1\n");
+    // `.abbrs` writes a row of its own managed data file, whose copy renames
+    // the row's key: the planned row no longer renders the loop's line, so
+    // the plan fails both. `.abbrs` also renames a token `.cenv` holds, and
+    // that coupled update is undone with it.
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "note alphatoken\n# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
     try writeRepo(io, &tmp, "repo/src/.cenv", "alphatoken signing\n");
-    try tmp.dir.createDirPath(io, "repo/src/zrc.d");
-    try Io.Dir.hardLink(tmp.dir, "repo/src/app.toml", tmp.dir, "repo/src/zrc.d/extra.toml", io, .{});
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try testutil.gitTracked(io, a, h.repo);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
-    try editLive(io, a, try h.liveOf("zrc"), "[srv]\na = 1", "srv.a = 1");
-    try editLive(io, a, try h.liveOf("zrc"), "note alphatoken", "note betatokens");
-    try editLive(io, a, try h.liveOf("app.toml"), "a = 1\n", "a = 1\nb = { c = 2 }\n");
+    try editLive(io, a, try h.liveOf(".abbrs"), "note alphatoken", "note betatokens");
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "key = \"gs\"", "key = \"gss\"");
 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
-    const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: a source layer rejected the edit (TomlParseError); not committed\n" ++
-        "mox commit: {s}: not committed: {s} was restored because {s} was not committed; commit it on its own with 'mox commit {s}'\n" ++
+    const data = try h.srcOf("abbrs.toml");
+    const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n" ++
+        "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n" ++
         "mox commit: coupled update to {s} undone: {s} was not committed\n", .{
-        try h.liveOf("app.toml"),
-        try shownLive(a, "zrc"),
-        try h.srcOf("zrc.d/extra.toml"),
-        try shownLive(a, "app.toml"),
-        try shownLive(a, "zrc"),
+        try h.liveOf(".abbrs"),
+        data,
+        try h.liveOf("abbrs.toml"),
+        data,
         try shownLive(a, ".cenv"),
-        try shownLive(a, "zrc"),
+        try shownLive(a, ".abbrs"),
     });
     try std.testing.expectEqualStrings(want_err, res.err);
     try std.testing.expectEqualStrings(want_err, dry.err);
     try std.testing.expect(std.mem.endsWith(u8, res.out, "\nmox commit: 0 routed, 0 coupled, 0 manual\n"));
     try std.testing.expect(std.mem.endsWith(u8, dry.out, "\nmox commit: 0 routable, 0 coupled, 0 manual (report only; run without --dry-run on a terminal to apply)\n"));
+    try std.testing.expectEqualStrings(three_abbrs, try read(io, a, data));
     try std.testing.expectEqualStrings("alphatoken signing\n", try read(io, a, try h.srcOf(".cenv")));
 }
 
@@ -9315,13 +9309,19 @@ test "commit: a row write beside a held edit, in its own managed data file, to a
     try editLive(io, a, try h.liveOf("abbrs.toml"), "note = \"old@home.com\"", "note = \"new@home.com\"");
     try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
 
+    // The planned row renders the renamed key, not the loop's live line, so
+    // the plan refuses the data file for both files editing it.
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
     const data_path = try h.srcOf("abbrs.toml");
     try std.testing.expectEqualStrings(data, try read(io, a, data_path));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try h.liveOf(".abbrs"), data_path }), res.err);
+    const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n" ++
+        "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n", .{ try h.liveOf(".abbrs"), data_path, try h.liveOf("abbrs.toml"), data_path });
+    try std.testing.expectEqualStrings(want_err, res.err);
+    try std.testing.expectEqualStrings(want_err, dry.err);
 }
 
 test "commit: a loop row routes through a loop variable not named entry" {
@@ -10364,4 +10364,408 @@ test "commit: a change whose removed lines alone are shaped like a loop row hold
     // The row and the literal below it become one line that fits no loop.
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "port 1\nsep\nport 2\n", hosts_a, &.{}, "port 9\nsep\nport 3\n", null);
     try expectAllManual(r, &.{ "  manual: ~/.hosts:1 may be an edited loop row\n", "  manual: ~/.hosts:4 held beside an edited loop row\n" });
+}
+
+/// Run `mox commit --dry-run` and then `mox commit --yes` on the same tree:
+/// both exit 1, print `manual` on stdout and `err` on stderr.
+fn dryRunAgrees(h: Harness, manual: []const u8, err: []const u8) !testutil.RunResult {
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, manual) != null);
+    try std.testing.expectEqualStrings(err, dry.err);
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, manual) != null);
+    try std.testing.expectEqualStrings(err, res.err);
+    return res;
+}
+
+test "commit: overlapping line splices from two files into one source are refused at routing, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "export A=1\nexport B=1\nexport C=1\n";
+    try writeRepo(io, &tmp, "repo/src/.a", src);
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.a", tmp.dir, "repo/src/.b", io, .{});
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".a"), "export B=1\nexport C=1\n", "export B=2\nexport C=2\n");
+    try editLive(io, a, try h.liveOf(".b"), "export C=1\n", "export C=3\n");
+
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:3 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".b"), try shownLive(a, ".a"), try h.srcOf(".a") });
+    const res = try dryRunAgrees(h, manual, "");
+    try std.testing.expectEqualStrings("export A=1\nexport B=2\nexport C=2\n", try read(io, a, try h.srcOf(".a")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~" ++ std.fs.path.sep_str ++ ".a\n") != null);
+}
+
+test "commit: a fragment included twice and edited differently in each place routes the first edit and refuses the second" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.myrc", "# top\n# mox: include \"extra.sh\"\n# mid\n# mox: include \"extra.sh\"\n# bottom\n");
+    try writeRepo(io, &tmp, "repo/src/.myrc.d/extra.sh", "alias x=1\nalias y=2\nalias z=3\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try h.liveOf(".myrc"),
+        .data = "# top\nalias x=1\nalias y=5\nalias z=3\n# mid\nalias x=1\nalias y=6\nalias z=3\n# bottom\n",
+    });
+
+    const frag = try h.srcOf(".myrc.d/extra.sh");
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:7 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".myrc"), try shownLive(a, ".myrc"), frag });
+    _ = try dryRunAgrees(h, manual, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; " ++
+        "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try h.liveOf(".myrc")}));
+    try std.testing.expectEqualStrings("alias x=1\nalias y=5\nalias z=3\n", try read(io, a, frag));
+}
+
+test "commit: one data row edited differently through two loop files is refused at routing, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.a", "# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.b", "# mox: for entry in \"data/abbrs.toml\"\nalias <entry.key> '<entry.expansion>'\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".a"), "git status", "git status -sb");
+    try editLive(io, a, try h.liveOf(".b"), "git status", "git status -s");
+
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" });
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:2 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".b"), try shownLive(a, ".a"), data_path });
+    const res = try dryRunAgrees(h, manual, "");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, data_path), "expansion = \"git status -sb\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~" ++ std.fs.path.sep_str ++ ".a\n") != null);
+}
+
+test "commit: a line edit beside a narrowing of the same source line is refused at routing, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSharedBaseFixture(io, &tmp);
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.zshrc", tmp.dir, "repo/src/.zshrc2", io, .{});
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".zshrc"), "export EDITOR=vim", "export EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".zshrc2"), "export EDITOR=vim", "export EDITOR=emacs");
+
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:2 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".zshrc2"), try shownLive(a, ".zshrc"), try h.srcOf(".zshrc") });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, manual) != null);
+
+    // `.zshrc` narrows its line to this machine's os; `.zshrc2`'s edit of the
+    // same line is manual before any prompt but the split one.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "2\ns\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "synthesize os=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, manual) != null);
+    const base = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expect(std.mem.indexOf(u8, base, "export EDITOR=vim\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "emacs") == null);
+}
+
+test "commit: a narrowing of a source line another file's same edit was routed to is refused at routing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeSharedBaseFixture(io, &tmp);
+    try Io.Dir.hardLink(tmp.dir, "repo/src/.zshrc", tmp.dir, "repo/src/.zshrc2", io, .{});
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".zshrc"), "export EDITOR=vim", "export EDITOR=nvim");
+    try editLive(io, a, try h.liveOf(".zshrc2"), "export EDITOR=vim", "export EDITOR=nvim");
+
+    // `.zshrc` keeps its edit universal; `.zshrc2` makes the same edit but
+    // narrows it, which rewrites the same line differently.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "1\n2\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:2 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".zshrc2"), try shownLive(a, ".zshrc"), try h.srcOf(".zshrc") });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, manual) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "synthesize") == null);
+    const base = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expect(std.mem.indexOf(u8, base, "export EDITOR=nvim\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "# mox: replace") == null);
+}
+
+test "commit: a row write and a line edit of its field to another value in the data file's own copy are refused at routing, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "git status", "git st");
+
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:7 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "abbrs.toml"), try shownLive(a, ".abbrs"), try h.srcOf("abbrs.toml") });
+    const res = try dryRunAgrees(h, manual, "");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try h.srcOf("abbrs.toml")), "expansion = \"git status -sb\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~" ++ std.fs.path.sep_str ++ ".abbrs\n") != null);
+}
+
+test "commit: a row write and a key edit to its layered data file are refused at routing, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The row write and the key edit write different lines of the base.
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", three_abbrs ++ "\n[meta]\nnote = \"base\"\nother = \"x\"\n");
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml.d/os=darwin.toml", "[meta]\nnote = \"mac\"\n");
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "other = \"x\"", "other = \"y\"");
+
+    // The key is manual in both modes; `--yes` then also finds the held
+    // file changed in a configuration by the row write, as for any held file.
+    const manual = try std.fmt.allocPrint(a, "  manual: {s} meta.other: conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "abbrs.toml"), try shownLive(a, ".abbrs"), try h.srcOf("abbrs.toml") });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, manual) != null);
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, manual) != null);
+    const now = try read(io, a, try h.srcOf("abbrs.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, now, "expansion = \"git status -sb\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, now, "other = \"x\"\n") != null);
+}
+
+fn shownFacts(a: std.mem.Allocator) ![]const u8 {
+    return shownLive(a, try std.fs.path.join(a, &.{ ".config", "mox", "facts.toml" }));
+}
+
+const fact_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+
+/// `.a` and `.b` each render the email fact; each live copy edits it to its
+/// own value, and an interactive commit answers `stdin`.
+fn twoFactEdits(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, a_value: []const u8, b_value: []const u8, stdin: []const u8) !struct { h: Harness, res: testutil.RunResult } {
+    try writeRepo(io, tmp, "repo/src/.a", fact_line);
+    try writeRepo(io, tmp, "repo/src/.b", "# b\n" ++ fact_line);
+    try writeRepo(io, tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".a"), "old@home.com", a_value);
+    try editLive(io, a, try h.liveOf(".b"), "old@home.com", b_value);
+    return .{ .h = h, .res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, stdin) };
+}
+
+test "commit: two routes setting one fact to different values are refused at routing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try twoFactEdits(a, io, &tmp, "a@work.com", "b@work.com", "f\nf\n");
+    try std.testing.expectEqual(@as(u8, 1), r.res.rc);
+    try std.testing.expectEqualStrings("", r.res.err);
+    const facts = try r.h.homePath(".config/mox/facts.toml");
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:2 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".b"), try shownLive(a, ".a"), try shownFacts(a) });
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, manual) != null);
+    try std.testing.expectEqualStrings("email = \"a@work.com\"\n", try read(io, a, facts));
+}
+
+test "commit: a fact set by one route and its default rewritten to another value by another are refused at routing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try twoFactEdits(a, io, &tmp, "a@work.com", "b@work.com", "f\nd\n");
+    try std.testing.expectEqual(@as(u8, 1), r.res.rc);
+    try std.testing.expectEqualStrings("", r.res.err);
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:2 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".b"), try shownLive(a, ".a"), try shownFacts(a) });
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, manual) != null);
+    try std.testing.expectEqualStrings("# b\n" ++ fact_line, try read(io, a, try r.h.srcOf(".b")));
+}
+
+test "commit: two routes setting one fact to the same value both commit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try twoFactEdits(a, io, &tmp, "a@work.com", "a@work.com", "f\nf\n");
+    try std.testing.expectEqualStrings("", r.res.err);
+    try std.testing.expectEqual(@as(u8, 0), r.res.rc);
+    try std.testing.expectEqualStrings("email = \"a@work.com\"\n", try read(io, a, try r.h.homePath(".config/mox/facts.toml")));
+}
+
+test "commit: a fact write that would change another fact of the facts file is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A line inside `note`'s multi-line value reads as an assignment of
+    // `email`; writing the fact must not drop it.
+    const facts_before = "note = \"\"\"\nemail = \"x\"\n\"\"\"\nemail = \"old@home.com\"\n";
+    try writeRepo(io, &tmp, "repo/src/.a", fact_line);
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", facts_before);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".a"), "old@home.com", "a@work.com");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n");
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    const facts = try h.homePath(".config/mox/facts.toml");
+    try std.testing.expectEqualStrings(facts_before, try read(io, a, facts));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} changes it outside its keys; not committed\n", .{ try h.liveOf(".a"), try shownFacts(a) }), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+}
+
+test "commit: two symlinks of one source retargeted differently are refused at routing, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/alink", "/tmp/mox-old\n");
+    try Io.Dir.hardLink(tmp.dir, "repo/src/alink", tmp.dir, "repo/src/blink", io, .{});
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"alink\"]\nsymlink = true\n\n[\"blink\"]\nsymlink = true\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    for ([_][2][]const u8{ .{ "alink", "/tmp/mox-a" }, .{ "blink", "/tmp/mox-b" } }) |l| {
+        const live = try h.liveOf(l[0]);
+        try Io.Dir.cwd().deleteFile(io, live);
+        try Io.Dir.cwd().symLink(io, l[1], live, .{});
+    }
+
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}: conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "blink"), try shownLive(a, "alink"), try h.srcOf("alink") });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expectEqualStrings("", dry.err);
+    try std.testing.expect(std.mem.endsWith(u8, dry.out, try std.fmt.allocPrint(a, "{s}\nmox commit: 1 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual})));
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, manual) != null);
+    try std.testing.expect(std.mem.endsWith(u8, res.out, "\nmox commit: 1 routed, 0 coupled, 1 manual\n"));
+    try std.testing.expectEqualStrings("/tmp/mox-a\n", try read(io, a, try h.srcOf("alink")));
+}
+
+test "commit: a key edit that changes an alias of its value outside its key path is refused by the plan, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = "base: &b hello\nother: *b\n";
+    try writeRepo(io, &tmp, "repo/src/app.yaml", base);
+    try writeRepo(io, &tmp, "repo/src/app.yaml.d/os=darwin.yaml", "other: x\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf("app.yaml"), "hello", "bye");
+
+    const want = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} changes it outside its keys; not committed\n", .{ try h.liveOf("app.yaml"), try h.srcOf("app.yaml") });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(want, dry.err);
+    try std.testing.expectEqualStrings(want, res.err);
+    try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf("app.yaml")));
+}
+
+test "commit: a row write whose fields a table header inserted into its row takes away is refused by the plan, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+    // The data file's own copy opens a table between the row's header and its
+    // fields, so the planned row holds no `expansion`.
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "[[abbrs]]\nkey = \"gs\"", "[[abbrs]]\n[x]\nkey = \"gs\"");
+
+    const data = try h.srcOf("abbrs.toml");
+    const want = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not hold expansion; not committed\n" ++
+        "mox commit: {s}: the planned edit to {s} does not hold expansion; not committed\n", .{ try h.liveOf(".abbrs"), data, try h.liveOf("abbrs.toml"), data });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(want, dry.err);
+    try std.testing.expectEqualStrings(want, res.err);
+    try std.testing.expectEqualStrings(three_abbrs, try read(io, a, data));
+}
+
+test "commit: a leaf row write the plan refuses is not committed, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n";
+    try writeRepo(io, &tmp, "repo/src/entries.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"src/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value>\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=7");
+    try editLive(io, a, try h.liveOf("entries.toml"), "[[entries]]\nslug = \"a\"", "[[entries]]\n[x]\nslug = \"a\"");
+
+    const src = try h.srcOf("entries.toml");
+    const want = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not hold value; not committed\n" ++
+        "mox commit: {s}: the planned edit to {s} does not hold value; not committed\n", .{
+        try shownLive(a, try std.fs.path.join(a, &.{ ".config", "id-a.inc" })),
+        src,
+        try h.liveOf("entries.toml"),
+        src,
+    });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(want, dry.err);
+    try std.testing.expectEqualStrings(want, res.err);
+    try std.testing.expectEqualStrings(data, try read(io, a, src));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
 }

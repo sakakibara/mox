@@ -755,6 +755,24 @@ pub fn capturedAt(format: Format, value: Value, path: []const []const u8) bool {
     };
 }
 
+/// Whether `value` holds `change`: its new value at its key path, or nothing
+/// there for a removal.
+pub fn holdsChange(format: Format, value: Value, change: KeyPathChange) bool {
+    if (change.removed) return switch (format) {
+        .toml => tomlAt(value.toml, change.path) == null,
+        .json => jsonAt(value.json, change.path) == null,
+        .yaml => yamlAt(value.yaml, change.path) == null,
+        .ini, .gitconfig => iniAt(value.ini, change.path) == null,
+    };
+    const new = change.new orelse return false;
+    return switch (format) {
+        .toml => if (tomlAt(value.toml, change.path)) |v| v.eql(new.toml) else false,
+        .json => if (jsonAt(value.json, change.path)) |v| jsonEql(v, new.json) else false,
+        .yaml => if (yamlAt(value.yaml, change.path)) |v| v.eql(new.yaml) else false,
+        .ini, .gitconfig => if (iniAt(value.ini, change.path)) |v| iniEql(v, new.ini) else false,
+    };
+}
+
 fn tomlAt(v: toml.Value, path: []const []const u8) ?toml.Value {
     if (path.len == 0) return v;
     if (v != .table) return null;

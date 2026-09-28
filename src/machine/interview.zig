@@ -364,7 +364,16 @@ pub fn persist(arena: std.mem.Allocator, io: Io, facts_path: []const u8, answers
         error.FileNotFound => "",
         else => return e,
     };
+    const out = try persistedBytes(arena, existing, answers);
 
+    if (std.fs.path.dirname(facts_path)) |parent| {
+        try Io.Dir.cwd().createDirPath(io, parent);
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = out });
+}
+
+/// The facts file `persist` writes over `existing` for `answers`, unchecked.
+pub fn persistedBytes(arena: std.mem.Allocator, existing: []const u8, answers: []const state_mod.Fact) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, existing, '\n');
     while (lines.next()) |line| {
@@ -385,11 +394,7 @@ pub fn persist(arena: std.mem.Allocator, io: Io, facts_path: []const u8, answers
         };
         try out.appendSlice(arena, "\"\n");
     }
-
-    if (std.fs.path.dirname(facts_path)) |parent| {
-        try Io.Dir.cwd().createDirPath(io, parent);
-    }
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = out.items });
+    return out.toOwnedSlice(arena);
 }
 
 /// Remove `name`'s assignment from the machine-local facts file, leaving

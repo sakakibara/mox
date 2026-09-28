@@ -66,6 +66,7 @@ const style = @import("style.zig");
 const mox = @import("../root.zig");
 const commit_struct = @import("commit_struct.zig");
 const edit_mod = @import("edit.zig");
+const toml = @import("toml");
 const toml_statements = mox.data.toml_statements;
 const interp = mox.compose.interp;
 
@@ -95,7 +96,9 @@ const LineEdit = struct {
 /// leaf: one whole-line splice of the data file per field it changes, over
 /// that field's value. The loop it was routed through -- body template,
 /// variable, `where`, and a leaf's `into` path -- names the row fields it
-/// reads; none of it is part of the write.
+/// reads; none of it is part of the write. `header` is the 0-based line of
+/// the row's `[[stem]]` header in the pre-run bytes; `fields` the values
+/// written, as TOML; `live_line` and `site` the hunk the plan re-renders.
 const RowEdit = struct {
     data_source: []const u8,
     stem: []const u8,
@@ -105,7 +108,15 @@ const RowEdit = struct {
     variable: []const u8,
     where: ?*const mox.dsl.ast.RowExpr,
     into: ?[]const u8 = null,
+    header: u32,
+    fields: []const WrittenField,
+    live_line: []const u8,
+    file: mox.source.tree.ManagedFile,
+    site: RowSite,
 };
+
+/// One field a row write sets, and its new value as TOML text.
+const WrittenField = struct { name: []const u8, value: []const u8 };
 
 /// A pending literal sync of a symlink source's recorded target to the live
 /// target. Only ever built for a plain-literal source (no capture, no
@@ -224,6 +235,19 @@ const ClassCtx = struct {
     claims: *Claims,
     /// Where a failed simulation revert saves its recovery copies.
     paths: paths_mod.Paths,
+    /// Indexed like every per-file array: names a file that owns an edit.
+    files: []const mox.source.tree.ManagedFile,
+    /// Source paths by the file they name, for conflicting routes, and each
+    /// spelling's canonical path once found.
+    ids: *PathIds,
+    canon: *std.StringHashMap([]const u8),
+
+    fn canonicalOf(cc: *const ClassCtx, path: []const u8) ![]const u8 {
+        if (cc.canon.get(path)) |c| return c;
+        const c = try cc.ids.canonical(path);
+        try cc.canon.put(path, c);
+        return c;
+    }
 };
 
 /// Mutable per-run tallies and output collectors the per-hunk pipeline
@@ -237,6 +261,7 @@ const RunAccum = struct {
     row_owners: *std.ArrayList(usize),
     fact_edits: *std.ArrayList(FactEdit),
     fact_owners: *std.ArrayList(usize),
+    fact_defaults: *std.ArrayList(FactDefault),
     synth_plans: *std.ArrayList(SynthDecision),
     synth_owners: *std.ArrayList(usize),
     struct_edits: *std.ArrayList(StructEdit),
@@ -283,6 +308,12 @@ const Claims = struct {
     fn add(c: *Claims, arena: std.mem.Allocator, base_abs: []const u8, name: []const u8, fragment: []const u8) !void {
         try c.regions.append(arena, .{ .base_abs = base_abs, .name = name });
         try c.fragments.append(arena, fragment);
+    }
+
+    /// Take back the last narrowing added, which was not accepted after all.
+    fn dropLast(c: *Claims) void {
+        _ = c.regions.pop();
+        _ = c.fragments.pop();
     }
 
     /// Why narrowing `base_abs` to a `name` region writing `fragment` collides
@@ -637,6 +668,135 @@ fn couplingEditEql(a: CouplingEdit, b: CouplingEdit) bool {
 
 fn structEditEql(a: StructEdit, b: StructEdit) bool {
     return a.format == b.format and std.mem.eql(u8, a.layer_abs, b.layer_abs) and commit_struct.changeEql(a.change, b.change);
+}
+
+/// What one routed edit rewrites, as conflicting routes compare it: a splice
+/// (a line edit, a narrowing's region block, a `[d]` default rewrite), a row
+/// write, a struct key, or a fact value. `path` is the path as routed; a
+/// fact is compared by name, wherever it is written.
+const Footprint = struct {
+    path: []const u8,
+    kind: union(enum) {
+        splice: LineEdit,
+        row: struct { header: u32, splices: []const LineEdit },
+        key: StructEdit,
+        fact: struct { name: []const u8, value: []const u8 },
+        /// A symlink source's new target.
+        sym: []const u8,
+    },
+};
+
+/// A `[d]` rewrite of a fact's default in `path`, owned by file `owner`.
+const FactDefault = struct { name: []const u8, value: []const u8, path: []const u8, owner: usize };
+
+fn rowFootprint(e: RowEdit) Footprint {
+    return .{ .path = e.data_source, .kind = .{ .row = .{ .header = e.header, .splices = e.splices } } };
+}
+
+/// The pre-run lines a splice rewrites: its range, or for an insertion the
+/// line it goes before.
+fn spliceLines(e: LineEdit) struct { lo: u32, hi: u32 } {
+    return .{ .lo = e.start, .hi = e.start + @max(e.del, 1) };
+}
+
+fn splicesOverlap(a: LineEdit, b: LineEdit) bool {
+    if (sameSplice(a, b)) return false;
+    const x = spliceLines(a);
+    const y = spliceLines(b);
+    return x.lo < y.hi and y.lo < x.hi;
+}
+
+fn spliceHolds(e: LineEdit, line: u32) bool {
+    const r = spliceLines(e);
+    return r.lo <= line and line < r.hi;
+}
+
+/// Whether two footprints on one path overlap and differ. A row write's lines
+/// are its field splices and its header; two writes to one row overlap only
+/// on a field they write differently. A struct key overlaps any edit of
+/// another kind, and a key it nests with unless the two are one edit. A
+/// symlink sync overlaps any edit of another kind, and another sync setting
+/// a different target.
+fn footprintsOverlap(a: Footprint, b: Footprint) bool {
+    if (a.kind == .fact or b.kind == .fact) return false;
+    if (a.kind == .sym or b.kind == .sym) {
+        if (a.kind != .sym or b.kind != .sym) return true;
+        return !std.mem.eql(u8, a.kind.sym, b.kind.sym);
+    }
+    switch (a.kind) {
+        .fact, .sym => unreachable,
+        .key => |ka| return switch (b.kind) {
+            .key => |kb| pathsNest(ka.change.path, kb.change.path) and !(ka.format == kb.format and commit_struct.changeEql(ka.change, kb.change)),
+            else => true,
+        },
+        .splice => |sa| return switch (b.kind) {
+            .splice => |sb| splicesOverlap(sa, sb),
+            .row => |rb| rowOverlaps(rb.header, rb.splices, sa),
+            .key => true,
+            .fact, .sym => unreachable,
+        },
+        .row => |ra| return switch (b.kind) {
+            .splice => |sb| rowOverlaps(ra.header, ra.splices, sb),
+            .row => |rb| blk: {
+                for (ra.splices) |x| for (rb.splices) |y| {
+                    if (splicesOverlap(x, y)) break :blk true;
+                };
+                if (ra.header == rb.header) break :blk false;
+                for (ra.splices) |x| if (spliceHolds(x, rb.header)) break :blk true;
+                for (rb.splices) |y| if (spliceHolds(y, ra.header)) break :blk true;
+                break :blk false;
+            },
+            .key => true,
+            .fact, .sym => unreachable,
+        },
+    }
+}
+
+fn rowOverlaps(header: u32, splices: []const LineEdit, s: LineEdit) bool {
+    if (spliceHolds(s, header)) return true;
+    for (splices) |x| {
+        if (splicesOverlap(x, s)) return true;
+    }
+    return false;
+}
+
+/// Why a new edit's footprints are refused: the edit already accepted, from
+/// any unit, that one of them overlaps on the same path, or that sets the
+/// same fact to another value. Null when none does.
+fn conflictOf(cc: *const ClassCtx, ra: *const RunAccum, new: []const Footprint) !?[]const u8 {
+    const Prior = struct { fp: Footprint, unit: []const u8 };
+    var accepted: std.ArrayList(Prior) = .empty;
+    const arena = cc.arena;
+    for (ra.line_edits.items, ra.line_owners.items) |e, o| try accepted.append(arena, .{ .fp = .{ .path = e.path, .kind = .{ .splice = e } }, .unit = cc.files[o].live_path });
+    for (ra.synth_plans.items, ra.synth_owners.items) |sd, o| try accepted.append(arena, .{
+        .fp = .{ .path = sd.base_abs, .kind = .{ .splice = .{ .path = sd.base_abs, .start = sd.plan.start, .del = sd.plan.del, .new_lines = sd.plan.base_lines } } },
+        .unit = cc.files[o].live_path,
+    });
+    for (ra.row_edits.items, ra.row_owners.items) |e, o| try accepted.append(arena, .{ .fp = rowFootprint(e), .unit = cc.files[o].live_path });
+    for (ra.generated.row_edits.items, ra.generated.row_leaves.items) |e, li| try accepted.append(arena, .{ .fp = rowFootprint(e), .unit = ra.generated.leaves.items[li].leaf_live_path });
+    for (ra.struct_edits.items, ra.struct_owners.items) |e, o| try accepted.append(arena, .{ .fp = .{ .path = e.layer_abs, .kind = .{ .key = e } }, .unit = cc.files[o].live_path });
+    for (ra.fact_edits.items, ra.fact_owners.items) |e, o| try accepted.append(arena, .{ .fp = .{ .path = cc.paths.facts_path, .kind = .{ .fact = .{ .name = e.name, .value = e.new_value } } }, .unit = cc.files[o].live_path });
+    for (ra.sym_syncs.items) |e| try accepted.append(arena, .{ .fp = .{ .path = e.source_abs, .kind = .{ .sym = e.new_target } }, .unit = e.live_path });
+    for (ra.fact_defaults.items) |d| try accepted.append(arena, .{ .fp = .{ .path = d.path, .kind = .{ .fact = .{ .name = d.name, .value = d.value } } }, .unit = cc.files[d.owner].live_path });
+
+    for (new) |n| {
+        const n_path = if (n.kind == .fact) "" else try cc.canonicalOf(n.path);
+        for (accepted.items) |acc| {
+            const hit = switch (n.kind) {
+                .fact => |f| switch (acc.fp.kind) {
+                    .fact => |g| std.mem.eql(u8, f.name, g.name) and !std.mem.eql(u8, f.value, g.value),
+                    else => false,
+                },
+                else => acc.fp.kind != .fact and std.mem.eql(u8, n_path, try cc.canonicalOf(acc.fp.path)) and footprintsOverlap(n, acc.fp),
+            };
+            if (!hit) continue;
+            return try std.fmt.allocPrint(arena, "conflicts with the edit routed from {f} to {f}", .{
+                display.of(acc.unit, cc.m_state.home),
+                display.of(acc.fp.path, cc.m_state.home),
+            });
+        }
+    }
+    return null;
 }
 
 /// One source path's bytes as the plan leaves it: null while it is absent.
@@ -1281,6 +1441,8 @@ fn commitRun(
     package_rows.* = pkgs.added + pkgs.blacklisted;
 
     var claims: Claims = .empty;
+    var route_ids: PathIds = .init(ctx.alloc, ctx.io);
+    var route_canon: std.StringHashMap([]const u8) = .init(ctx.alloc);
 
     const cc: ClassCtx = .{
         .arena = ctx.alloc,
@@ -1299,11 +1461,15 @@ fn commitRun(
         .sty = sty,
         .claims = &claims,
         .paths = context.paths,
+        .files = tree.files,
+        .ids = &route_ids,
+        .canon = &route_canon,
     };
 
     var line_edits: std.ArrayList(LineEdit) = .empty;
     var row_edits: std.ArrayList(RowEdit) = .empty;
     var fact_edits: std.ArrayList(FactEdit) = .empty;
+    var fact_defaults: std.ArrayList(FactDefault) = .empty;
     var synth_plans: std.ArrayList(SynthDecision) = .empty;
     var struct_edits: std.ArrayList(StructEdit) = .empty;
     // Symlink-target and generator-leaf keep bypass the whole-file
@@ -1364,6 +1530,7 @@ fn commitRun(
         .row_owners = &row_owners,
         .fact_edits = &fact_edits,
         .fact_owners = &fact_owners,
+        .fact_defaults = &fact_defaults,
         .synth_plans = &synth_plans,
         .synth_owners = &synth_owners,
         .struct_edits = &struct_edits,
@@ -1893,10 +2060,42 @@ fn commitRun(
         try plan.set(ctx.alloc, path, try replaceTokens(ctx.alloc, try plan.bytesOf(ctx.alloc, path), renames.items));
     }
     // A layer that refuses its key fails the files that edit was routed from,
-    // and the edit is left out; settling below restores their sources.
-    const struct_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
-    @memset(struct_failed, null);
-    try planStructs(ctx.alloc, &plan, planned_structs.items, struct_failed);
+    // and the edit is left out; settling below restores their sources. So
+    // does a path the plan backstop refuses, for every unit editing it.
+    const plan_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
+    @memset(plan_failed, null);
+    const leaf_plan_failed = try ctx.alloc.alloc(?[]const u8, generated.leaves.items.len);
+    @memset(leaf_plan_failed, null);
+    var struct_before: std.StringHashMap(?[]const u8) = .init(ctx.alloc);
+    var struct_applied: std.ArrayList(usize) = .empty;
+    try planStructs(ctx.alloc, &plan, planned_structs.items, plan_failed, &struct_before, &struct_applied);
+    var planned_facts: ?[]const u8 = if (fact_edits.items.len > 0)
+        try plannedFacts(ctx.alloc, journal.entries.get(context.paths.facts_path).?.content orelse "", fact_edits.items)
+    else
+        null;
+    var backstop: Backstop = .{
+        .cc = &cc,
+        .plan = &plan,
+        .journal = &journal,
+        .ids = &ids,
+        .planned = planned,
+        .lines = line_edits.items,
+        .rows = row_edits.items,
+        .row_owners = row_owners.items,
+        .leaf_rows = generated.row_edits.items,
+        .row_leaves = generated.row_leaves.items,
+        .synths = synth_plans.items,
+        .synth_owners = synth_owners.items,
+        .couplings = planned_couplings.items,
+        .struct_before = &struct_before,
+        .struct_applied = struct_applied.items,
+        .facts_path = context.paths.facts_path,
+        .fact_edits = fact_edits.items,
+        .fact_owners = fact_owners.items,
+        .file_failed = plan_failed,
+        .leaf_failed = leaf_plan_failed,
+    };
+    try backstop.run(&planned_facts);
 
     // The units, and settling's bookkeeping, shared by the write and the dry
     // run.
@@ -1919,7 +2118,8 @@ fn commitRun(
         .manual_hunks = manual_hunks,
         .declined_hunks = declined_hunks,
         .unrouted_hunks = unrouted_hunks,
-        .struct_failed = struct_failed,
+        .plan_failed = plan_failed,
+        .leaf_plan_failed = leaf_plan_failed,
         .struct_edits = struct_edits.items,
         .struct_owners = struct_owners.items,
         .sym_syncs = sym_syncs.items,
@@ -1967,9 +2167,13 @@ fn commitRun(
     // ownership rule -- and stops before the first write.
     if (report_mode) {
         // The first verification's failures the plan decides: a unit whose
-        // key a layer refused. A dry run takes no candidate choice, so no unit
-        // has an unrouted hunk.
-        for (struct_failed, 0..) |why, fidx| {
+        // key a layer refused, or whose path the backstop refused, in the
+        // order verification takes them. A dry run takes no candidate choice,
+        // so no unit has an unrouted hunk.
+        for (leaf_plan_failed, 0..) |why, li| {
+            if (why != null) _ = try v.refuseLeaf(li);
+        }
+        for (plan_failed, 0..) |why, fidx| {
             if (why == null) continue;
             if (undone_by.reports(.{ .file = fidx })) {
                 var discard_buf: [256]u8 = undefined;
@@ -2025,7 +2229,7 @@ fn commitRun(
     }
 
     var writing: []const u8 = "";
-    writePlan(ctx, &plan, context.paths.facts_path, fact_edits.items, &writing) catch |e| {
+    writePlan(ctx, &plan, context.paths.facts_path, planned_facts, &writing) catch |e| {
         try ctx.out.flush();
         try ctx.err.print("mox commit: could not write {f} ({s})\n", .{ display.of(ids.shown(writing), m_state.home), @errorName(e) });
         try restoreJournal(.of(ctx), &journal, &ids, m_state.home);
@@ -2442,7 +2646,9 @@ const Verifier = struct {
     manual_hunks: []const usize,
     declined_hunks: []const usize,
     unrouted_hunks: []const usize,
-    struct_failed: []const ?[]const u8,
+    /// Why the plan refused a file's or a leaf's edit, if it did.
+    plan_failed: []const ?[]const u8,
+    leaf_plan_failed: []const ?[]const u8,
     struct_edits: []const StructEdit,
     struct_owners: []const usize,
     sym_syncs: []const SymSync,
@@ -2568,6 +2774,7 @@ const Verifier = struct {
     /// A leaf passes when its generator, re-expanded, reproduces it exactly
     /// as it is live.
     fn verifyLeaf(v: *Verifier, i: usize, gen_cache: *std.AutoHashMap(usize, ?[]const mox.compose.catB.GeneratedFile)) !bool {
+        if (v.leaf_plan_failed[i] != null) return v.refuseLeaf(i);
         const gc = v.leaves[i];
         const outputs = gen_cache.get(gc.fidx) orelse blk: {
             const gen_file = findByLive(v.tree_now, gc.gen_file.live_path) orelse gc.gen_file;
@@ -2614,11 +2821,18 @@ const Verifier = struct {
         return !v.matchesLive(fidx, composed, v.readLive(fidx));
     }
 
-    /// Fail a file whose key a layer refused when planned.
+    /// Fail a file whose edit the plan refused.
     fn refuseFile(v: *Verifier, fidx: usize) !bool {
-        const ename = v.struct_failed[fidx].?;
-        try v.err.print("mox commit: {s}: a source layer rejected the edit ({s}); not committed\n", .{ v.files[fidx].live_path, ename });
-        return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "a source layer rejected the edit ({s})", .{ename}));
+        const reason = v.plan_failed[fidx].?;
+        try v.err.print("mox commit: {s}: {s}; not committed\n", .{ v.files[fidx].live_path, reason });
+        return v.failFile(fidx, reason);
+    }
+
+    /// Fail a leaf whose row write the plan refused.
+    fn refuseLeaf(v: *Verifier, i: usize) !bool {
+        try v.err.print("mox commit: {f}: {s}; not committed\n", .{ display.of(v.leaves[i].leaf_live_path, v.m_state.home), v.leaf_plan_failed[i].? });
+        v.fail(.{ .leaf = i }, "");
+        return false;
     }
 
     fn failFile(v: *Verifier, fidx: usize, reason: []const u8) bool {
@@ -2641,7 +2855,7 @@ const Verifier = struct {
         // not something the user asked for: whatever else holds, the unit is
         // not committed.
         if (v.unrouted_hunks[fidx] > 0) return v.leftUncommitted(fidx);
-        if (v.struct_failed[fidx] != null) return v.refuseFile(fidx);
+        if (v.plan_failed[fidx] != null) return v.refuseFile(fidx);
         const configs = v.spaces[fidx].?.configs;
         const file2 = findByLive(v.tree_now, file.live_path) orelse file;
 
@@ -2991,13 +3205,13 @@ fn markDead(
     try batch.append(arena, path);
 }
 
-/// Write phase: each planned path once, then the facts. `writing` names the
-/// path being written when an error returns.
+/// Write phase: each planned path once, then the facts file as planned, if
+/// it is. `writing` names the path being written when an error returns.
 fn writePlan(
     ctx: *app.Ctx,
     plan: *const WritePlan,
     facts_path: []const u8,
-    fact_edits: []const FactEdit,
+    facts: ?[]const u8,
     writing: *[]const u8,
 ) !void {
     for (plan.paths.items) |pp| {
@@ -3009,7 +3223,9 @@ fn writePlan(
         try Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = pp.path, .data = bytes });
     }
     writing.* = facts_path;
-    try applyFactEdits(ctx.alloc, ctx.io, facts_path, fact_edits);
+    const bytes = facts orelse return;
+    if (std.fs.path.dirname(facts_path)) |parent| try Io.Dir.cwd().createDirPath(ctx.io, parent);
+    try Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = facts_path, .data = bytes });
 }
 
 /// Before any write: a path the journal cannot read stops the run.
@@ -4257,6 +4473,7 @@ fn routeStructChanges(
                     try printKeyChange(cc.arena, cc.sty, cc.stdout, change, winner_label);
                 },
                 .unroutable => try reportUnholdable(cc, ra, file, fidx, layers[res.target], change),
+                .conflict => |reason| try keyManual(cc, ra, file, fidx, change, reason),
             }
             continue;
         }
@@ -4294,6 +4511,7 @@ fn routeStructChanges(
                 .placed => if (!cc.interactive)
                     try cc.stdout.print("  write {s} {s} -> {s}\n", .{ rel, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layers[chosen_idx]) }),
                 .unroutable => try reportUnholdable(cc, ra, file, fidx, layers[chosen_idx], change),
+                .conflict => |reason| try keyManual(cc, ra, file, fidx, change, reason),
             }
         } else {
             ra.declined_hunks[fidx] += 1;
@@ -4318,6 +4536,20 @@ fn reportUnholdable(
         "  manual: {s} {s}: {s} cannot hold this key\n",
         .{ file.live_path, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layer) },
     );
+}
+
+/// A key left manual for `reason`.
+fn keyManual(cc: *const ClassCtx, ra: *const RunAccum, file: mox.source.tree.ManagedFile, fidx: usize, change: commit_struct.KeyPathChange, reason: []const u8) !void {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f} {s}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path), reason });
+}
+
+fn keyFootprints(arena: std.mem.Allocator, edits: []const StructEdit) ![]const Footprint {
+    const out = try arena.alloc(Footprint, edits.len);
+    for (edits, out) |e, *fp| fp.* = .{ .path = e.layer_abs, .kind = .{ .key = e } };
+    return out;
 }
 
 /// Whether every layer `edits` writes takes its edit, as the plan will
@@ -4649,6 +4881,10 @@ fn createFirstContactOverlay(
         };
         if (accept) {
             const edits = [_]StructEdit{.{ .format = format, .layer_abs = target_path, .change = change }};
+            if (try conflictOf(cc, ra, try keyFootprints(cc.arena, &edits))) |reason| {
+                try keyManual(cc, ra, file, fidx, change, reason);
+                continue;
+            }
             const sim: ?StructSim = if (!try placementHolds(cc, ra, &edits))
                 .rejected
             else if (space.configs.len > 1)
@@ -4790,11 +5026,25 @@ fn processSymlinkFile(
         return .cont;
     }
 
+    const sync: SymSync = .{
+        .live_path = file.live_path,
+        .source_abs = file.source_base_abs,
+        .new_target = try cc.arena.dupe(u8, live_target),
+    };
+    if (try conflictOf(cc, ra, &.{.{ .path = sync.source_abs, .kind = .{ .sym = sync.new_target } }})) |reason| {
+        ra.manual_count.* += 1;
+        ra.manual_hunks[fidx] += 1;
+        ra.pending.* = true;
+        try cc.stdout.print("  manual: {f}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), reason });
+        return .cont;
+    }
     var accept = !cc.report_mode and !cc.interactive;
     if (cc.report_mode) {
         ra.pending.* = true;
         ra.routed_count.* += 1;
         try cc.stdout.print("  would keep {f}: symlink target -> {s}\n", .{ display.of(file.live_path, cc.m_state.home), live_target });
+        // Collected so later routes see it; never written.
+        try sym_syncs.append(cc.arena, sync);
         return .cont;
     }
     if (cc.interactive) {
@@ -4815,11 +5065,7 @@ fn processSymlinkFile(
     }
     if (accept) {
         ra.routed_count.* += 1;
-        try sym_syncs.append(cc.arena, .{
-            .live_path = file.live_path,
-            .source_abs = file.source_base_abs,
-            .new_target = try cc.arena.dupe(u8, live_target),
-        });
+        try sym_syncs.append(cc.arena, sync);
         if (!cc.interactive) try cc.stdout.print("  write {s} -> new symlink target {s}\n", .{ file.source_base_path, live_target });
     }
     return .cont;
@@ -5003,7 +5249,24 @@ fn processGeneratedHunk(
                 .manual => |reason| return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, reason, false),
                 .write => |w| {
                     if (first_contact and !cc.interactive) return firstContactLeafManual(cc, ra, fidx, leaf, hunk);
-                    return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, w.splices, gen);
+                    const edit: RowEdit = .{
+                        .data_source = leaf.data_source,
+                        .stem = mox.data.source.arrayName(leaf.data_source),
+                        .row = @intCast(leaf.row),
+                        .splices = w.splices,
+                        .template = leaf.template,
+                        .variable = leaf.variable,
+                        .where = leaf.where,
+                        .into = leaf.into,
+                        .header = w.header,
+                        .fields = w.fields,
+                        .live_line = b_lines[hunk.b_start],
+                        .file = gen_file,
+                        .site = site,
+                    };
+                    if (try conflictOf(cc, ra, &.{rowFootprint(edit)})) |reason|
+                        return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, reason, false);
+                    return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, edit, gen);
                 },
             }
         }
@@ -5046,7 +5309,7 @@ fn acceptGeneratedRow(
     hunk_total: usize,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
-    splices: []const LineEdit,
+    edit: RowEdit,
     gen: *LeafRowEdits,
 ) !HunkOutcome {
     ra.routed_count.* += 1;
@@ -5058,7 +5321,7 @@ fn acceptGeneratedRow(
         try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
         // Collected so report mode predicts the coupling updates a real
         // commit would drop over it; never written.
-        try collectLeafRow(cc, gen_file, fidx, leaf, splices, gen);
+        try collectLeafRow(cc, gen_file, fidx, leaf, edit, gen);
         return .cont;
     }
     if (cc.interactive) {
@@ -5076,7 +5339,7 @@ fn acceptGeneratedRow(
         }
     }
     if (accept) {
-        try collectLeafRow(cc, gen_file, fidx, leaf, splices, gen);
+        try collectLeafRow(cc, gen_file, fidx, leaf, edit, gen);
         if (!cc.interactive) try cc.stdout.print("  update {s}\n", .{desc});
     }
     return .cont;
@@ -5088,7 +5351,7 @@ fn collectLeafRow(
     gen_file: mox.source.tree.ManagedFile,
     fidx: usize,
     leaf: mox.compose.catB.GeneratedFile,
-    splices: []const LineEdit,
+    edit: RowEdit,
     gen: *LeafRowEdits,
 ) !void {
     const li = for (gen.leaves.items, 0..) |gc, i| {
@@ -5097,16 +5360,7 @@ fn collectLeafRow(
         try gen.leaves.append(cc.arena, .{ .fidx = fidx, .gen_file = gen_file, .leaf_live_path = leaf.live_path });
         break :blk gen.leaves.items.len - 1;
     };
-    try gen.row_edits.append(cc.arena, .{
-        .data_source = leaf.data_source,
-        .stem = mox.data.source.arrayName(leaf.data_source),
-        .row = @intCast(leaf.row),
-        .splices = splices,
-        .template = leaf.template,
-        .variable = leaf.variable,
-        .where = leaf.where,
-        .into = leaf.into,
-    });
+    try gen.row_edits.append(cc.arena, edit);
     try gen.row_leaves.append(cc.arena, li);
 }
 
@@ -5604,8 +5858,9 @@ fn recordStructPlacement(
     res: commit_struct.Resolution,
     chosen_idx: usize,
     change: commit_struct.KeyPathChange,
-) !enum { placed, unroutable } {
+) !union(enum) { placed, unroutable, conflict: []const u8 } {
     const edits = try structPickEdits(cc.arena, format, layers, res.definers, chosen_idx, change);
+    if (try conflictOf(cc, ra, try keyFootprints(cc.arena, edits))) |reason| return .{ .conflict = reason };
     if (!try placementHolds(cc, ra, edits)) return .unroutable;
 
     if (space.configs.len > 1) {
@@ -6058,6 +6313,27 @@ fn firstContactKeyManual(
     try cc.stdout.print("  manual: {f} {s}: first contact, needs confirmation\n", .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path) });
 }
 
+/// `route`, or manual when the line or row write it names conflicts with an
+/// edit already accepted.
+fn unlessConflicting(cc: *const ClassCtx, ra: *const RunAccum, route: Route) !Route {
+    const fp: Footprint = switch (route) {
+        .line => |r| .{ .path = r.edit.path, .kind = .{ .splice = r.edit } },
+        .row => |r| rowFootprint(r.edit),
+        else => return route,
+    };
+    if (try conflictOf(cc, ra, &.{fp})) |reason| return .{ .manual = reason };
+    return route;
+}
+
+/// A hunk left manual for `reason` after its prompt.
+fn hunkManual(cc: *const ClassCtx, ra: *const RunAccum, file: mox.source.tree.ManagedFile, fidx: usize, hunk: Hunk, reason: []const u8) !HunkOutcome {
+    ra.manual_count.* += 1;
+    ra.manual_hunks[fidx] += 1;
+    ra.pending.* = true;
+    try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1, reason });
+    return .cont;
+}
+
 /// Route, prompt for, and (when accepted) collect one hunk's edit. Sub-hunks
 /// produced by a `split` re-enter this same function, so a straddling hunk's
 /// pieces get the identical treatment a top-level hunk would: their own
@@ -6089,7 +6365,7 @@ fn processHunk(
     /// Whether an interactive run may offer to split it.
     can_split: bool,
 ) !HunkOutcome {
-    const route = given orelse try routeHunk(cc, lf, hunk);
+    const route = try unlessConflicting(cc, ra, given orelse try routeHunk(cc, lf, hunk));
     switch (route) {
         .manual => |reason| {
             // A hunk covering (or straddling into) a `.secret` segment's
@@ -6184,6 +6460,11 @@ fn processHunk(
                         try cc.stdout.print("  edit {s}\n", .{r.desc});
                     },
                     .synth => |sd| {
+                        const region: Footprint = .{ .path = sd.base_abs, .kind = .{ .splice = .{ .path = sd.base_abs, .start = sd.plan.start, .del = sd.plan.del, .new_lines = sd.plan.base_lines } } };
+                        if (try conflictOf(cc, ra, &.{region})) |reason| {
+                            cc.claims.dropLast();
+                            return hunkManual(cc, ra, file, fidx, hunk, reason);
+                        }
                         try ra.synth_plans.append(cc.arena, sd);
                         try ra.synth_owners.append(cc.arena, fidx);
                         ra.affected[fidx] = true;
@@ -6304,6 +6585,8 @@ fn processHunk(
                 .chosen => |i| switch (i) {
                     0 => {
                         // [f]: the fact. Never touches repo src.
+                        const set: Footprint = .{ .path = cc.paths.facts_path, .kind = .{ .fact = .{ .name = r.name, .value = r.new_value } } };
+                        if (try conflictOf(cc, ra, &.{set})) |reason| return hunkManual(cc, ra, file, fidx, hunk, reason);
                         try ra.fact_edits.append(cc.arena, .{ .name = r.name, .new_value = r.new_value, .old_value = r.old_value });
                         try ra.fact_owners.append(cc.arena, fidx);
                         ra.affected[fidx] = true;
@@ -6316,8 +6599,14 @@ fn processHunk(
                     1 => {
                         // [d]: the source's default, via the ordinary LineEdit
                         // machinery (backup, apply, impact simulation).
+                        const rewrite = [_]Footprint{
+                            .{ .path = r.default_edit.path, .kind = .{ .splice = r.default_edit } },
+                            .{ .path = r.default_edit.path, .kind = .{ .fact = .{ .name = r.name, .value = r.new_value } } },
+                        };
+                        if (try conflictOf(cc, ra, &rewrite)) |reason| return hunkManual(cc, ra, file, fidx, hunk, reason);
                         try ra.line_edits.append(cc.arena, r.default_edit);
                         try ra.line_owners.append(cc.arena, fidx);
+                        try ra.fact_defaults.append(cc.arena, .{ .name = r.name, .value = r.new_value, .path = r.default_edit.path, .owner = fidx });
                         ra.affected[fidx] = true;
                         if (space.configs.len > 1) {
                             const imp = try simulateImpact(cc, file, r.default_edit, space.configs);
@@ -6374,6 +6663,11 @@ fn processFileHunks(
     var held = false;
     for (al.blocks, plans) |blk, *plan| {
         plan.* = try planBlock(cc, lf, fits, blk);
+        // A row write refused as a conflict holds the file as D7 refusals do.
+        if (plan.route == .row) {
+            plan.route = try unlessConflicting(cc, ra, plan.route);
+            plan.holds = plan.holds or plan.route == .manual;
+        }
         held = held or plan.holds;
     }
     if (held) holdBlocks(plans, "held beside an edited loop row");
@@ -7560,6 +7854,11 @@ fn loopRoute(cc: *const ClassCtx, lf: *LoopFile, seg: Segment, hunk: Hunk) !Rout
             .template = loop.template,
             .variable = loop.variable,
             .where = loop.where,
+            .header = planned.header,
+            .fields = planned.fields,
+            .live_line = lf.b_lines[hunk.b_start],
+            .file = lf.file,
+            .site = site,
         },
         .desc = desc,
     } };
@@ -7654,7 +7953,12 @@ const RowSite = struct {
 const RowPlan = union(enum) {
     no_match,
     manual: []const u8,
-    write: struct { splices: []const LineEdit, record: *const mox.data.toml.Record },
+    write: struct {
+        splices: []const LineEdit,
+        record: *const mox.data.toml.Record,
+        header: u32,
+        fields: []const WrittenField,
+    },
 };
 
 /// A template split for matching against a live line: literal text, where a
@@ -7958,6 +8262,7 @@ fn planRowWrite(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site: Ro
     };
     const section = toml_statements.arrayTableRow(stmts, stem, site.row) orelse return not_table;
     var splices: std.ArrayList(LineEdit) = .empty;
+    var written_fields: std.ArrayList(WrittenField) = .empty;
     for (fields, split.changed) |f, changed| {
         if (!changed) continue;
         var new: []const u8 = "";
@@ -7992,6 +8297,7 @@ fn planRowWrite(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site: Ro
             else => (try mox.data.toml.canonicalScalar(arena, kind, new)) orelse return .{ .manual = "data value type" },
         };
         try splices.append(arena, try valueSplice(arena, site.data_source, content, st, written));
+        try written_fields.append(arena, .{ .name = f, .value = written });
     }
 
     const after = try splicedContent(arena, content, splices.items);
@@ -7999,23 +8305,36 @@ fn planRowWrite(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site: Ro
         error.OutOfMemory => return e,
         else => null,
     } orelse return .{ .manual = "the edited row does not render the edited line" };
-    const pctx = try rowCtx(arena, cc, file, site.variable, planned);
-    if (!try rowPasses(arena, cc, site.where, pctx.scope)) return .{ .manual = "the edited row is filtered out" };
-    const rendered = interp.expand(arena, site.template, planned, pctx) catch |e| switch (e) {
+    if (try rowRenderRefusal(cc, file, site, planned, live_line)) |reason| return .{ .manual = reason };
+    return .{ .write = .{
+        .splices = try splices.toOwnedSlice(arena),
+        .record = planned,
+        .header = @intCast(std.mem.count(u8, content[0..section.header.span.start], "\n")),
+        .fields = try written_fields.toOwnedSlice(arena),
+    } };
+}
+
+/// Why `record`, rendered through the loop `site` names, does not give
+/// `live_line` (and, for a leaf, its own path), or null when it does.
+fn rowRenderRefusal(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site: RowSite, record: *const mox.data.toml.Record, live_line: []const u8) !?[]const u8 {
+    const arena = cc.arena;
+    const pctx = try rowCtx(arena, cc, file, site.variable, record);
+    if (!try rowPasses(arena, cc, site.where, pctx.scope)) return "the edited row is filtered out";
+    const rendered = interp.expand(arena, site.template, record, pctx) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return .{ .manual = "the edited row does not render the edited line" },
+        else => return "the edited row does not render the edited line",
     };
-    if (!std.mem.eql(u8, rendered, live_line)) return .{ .manual = "the edited row does not render the edited line" };
+    if (!std.mem.eql(u8, rendered, live_line)) return "the edited row does not render the edited line";
     if (site.leaf) |leaf| {
-        const moved = RowPlan{ .manual = "the edited row moves the leaf" };
-        const into = interp.expand(arena, leaf.into, planned, pctx) catch |e| switch (e) {
+        const moved = "the edited row moves the leaf";
+        const into = interp.expand(arena, leaf.into, record, pctx) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => return moved,
         };
         const path = try mox.source.path.joinKeyOnto(arena, leaf.dir, into);
         if (!std.mem.eql(u8, try mox.source.path.toKey(arena, path), try mox.source.path.toKey(arena, leaf.live_path))) return moved;
     }
-    return .{ .write = .{ .splices = try splices.toOwnedSlice(arena), .record = planned } };
+    return null;
 }
 
 /// Row `row` of the `[[stem]]` array `content` holds, as a loop reads it, or
@@ -8265,20 +8584,324 @@ fn planBeforeRenames(arena: std.mem.Allocator, plan: *WritePlan, planned: Planne
 /// before it, so a refusal first reachable here takes an edit routed after
 /// it into its layer, a coupling rename planned into the layer, or the
 /// source changing under the run.
-fn planStructs(arena: std.mem.Allocator, plan: *WritePlan, structs: []const Owned(StructEdit), failed: []?[]const u8) !void {
-    for (structs) |o| {
+/// `before` gets each layer's bytes as the stage found them, and `applied`
+/// the index of each edit it applied.
+fn planStructs(arena: std.mem.Allocator, plan: *WritePlan, structs: []const Owned(StructEdit), failed: []?[]const u8, before: *std.StringHashMap(?[]const u8), applied: *std.ArrayList(usize)) !void {
+    for (structs, 0..) |o, i| {
         const live_owner = for (o.owners.items) |owner| {
             if (failed[owner.file] == null) break true;
         } else false;
         if (!live_owner) continue;
         const pp = try plan.slot(arena, o.edit.layer_abs);
         pp.make_parent = true;
+        const gop = try before.getOrPut(o.edit.layer_abs);
+        if (!gop.found_existing) gop.value_ptr.* = pp.bytes;
         pp.bytes = commit_struct.layerBytes(arena, o.edit.format, pp.bytes, o.edit.change) catch |err| {
             for (o.owners.items) |owner| {
-                if (failed[owner.file] == null) failed[owner.file] = @errorName(err);
+                if (failed[owner.file] == null) failed[owner.file] = try std.fmt.allocPrint(arena, "a source layer rejected the edit ({s})", .{@errorName(err)});
             }
             continue;
         };
+        try applied.append(arena, i);
+    }
+}
+
+/// D2's plan backstop: each path a row, struct or fact edit writes, parsed
+/// as planned, must hold every such edit's value at its key, equal a
+/// reference -- its pre-run bytes with only its line splices, narrowing
+/// regions and coupling renames -- outside those keys, and render every row
+/// write's hunk as it was routed. A path that does not fails the owners of
+/// its non-coupling edits, naming why, and is left at its pre-run bytes; the
+/// facts file is then not written.
+const Backstop = struct {
+    cc: *const ClassCtx,
+    plan: *WritePlan,
+    journal: *const Journal,
+    ids: *const PathIds,
+    planned: PlannedEdits,
+    /// Every line splice routed, `[d]` rewrites included; row splices not.
+    lines: []const LineEdit,
+    rows: []const RowEdit,
+    row_owners: []const usize,
+    leaf_rows: []const RowEdit,
+    row_leaves: []const usize,
+    synths: []const SynthDecision,
+    synth_owners: []const usize,
+    couplings: []const Owned(CouplingEdit),
+    struct_before: *const std.StringHashMap(?[]const u8),
+    /// The struct edits the plan applied, by index in `planned.structs`.
+    struct_applied: []const usize,
+    facts_path: []const u8,
+    fact_edits: []const FactEdit,
+    fact_owners: []const usize,
+    file_failed: []?[]const u8,
+    leaf_failed: []?[]const u8,
+
+    fn run(b: *Backstop, facts: *?[]const u8) !void {
+        const arena = b.cc.arena;
+        var done: std.ArrayList([]const u8) = .empty;
+        for ([_][]const RowEdit{ b.rows, b.leaf_rows }) |list| for (list) |e| {
+            if (isOneOf(e.data_source, done.items)) continue;
+            try done.append(arena, e.data_source);
+            if (try b.rowPathFault(e.data_source)) |why| try b.refuse(e.data_source, why);
+        };
+        for (b.planned.structs.items) |o| {
+            const path = o.edit.layer_abs;
+            if (isOneOf(path, done.items) or !b.struct_before.contains(path)) continue;
+            try done.append(arena, path);
+            if (try b.structPathFault(path)) |why| try b.refuse(path, why);
+        }
+        const planned_facts = facts.* orelse return;
+        if (try b.factsFault(planned_facts)) |why| {
+            const reason = try std.fmt.allocPrint(arena, "the planned edit to {f} {s}", .{ display.of(b.facts_path, b.cc.m_state.home), why });
+            for (b.fact_owners) |o| {
+                if (b.file_failed[o] == null) b.file_failed[o] = reason;
+            }
+            facts.* = null;
+        }
+    }
+
+    /// Fail every owner of a non-coupling edit to `path` and leave the path
+    /// at its pre-run bytes.
+    fn refuse(b: *Backstop, path: []const u8, why: []const u8) !void {
+        const arena = b.cc.arena;
+        const reason = try std.fmt.allocPrint(arena, "the planned edit to {f} {s}", .{ display.of(b.ids.shown(path), b.cc.m_state.home), why });
+        for (b.planned.lines.items) |o| {
+            if (std.mem.eql(u8, o.edit.path, path)) b.failOwners(o.owners.items, reason);
+        }
+        for (b.planned.structs.items) |o| {
+            if (std.mem.eql(u8, o.edit.layer_abs, path)) b.failOwners(o.owners.items, reason);
+        }
+        for (b.synths, b.synth_owners) |sd, owner| {
+            if (std.mem.eql(u8, sd.base_abs, path) and b.file_failed[owner] == null) b.file_failed[owner] = reason;
+        }
+        (try b.plan.slot(arena, path)).bytes = b.journal.entries.get(path).?.content;
+    }
+
+    fn failOwners(b: *Backstop, owners: []const Unit, reason: []const u8) void {
+        for (owners) |u| switch (u) {
+            .file => |i| if (b.file_failed[i] == null) {
+                b.file_failed[i] = reason;
+            },
+            .leaf => |i| if (b.leaf_failed[i] == null) {
+                b.leaf_failed[i] = reason;
+            },
+            .symlink => {},
+        };
+    }
+
+    fn rowPathFault(b: *Backstop, path: []const u8) !?[]const u8 {
+        const arena = b.cc.arena;
+        const planned = b.plan.get(path) orelse return "does not parse";
+        const pre = b.journal.entries.get(path).?.content orelse return "does not parse";
+        const doc = toml.parse(arena, planned, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return "does not parse",
+        };
+        const stmts = toml_statements.scan(arena, planned) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.NestingTooDeep => return "does not parse",
+        };
+
+        var all: std.ArrayList(LineEdit) = .empty;
+        for (b.planned.lines.items) |o| {
+            if (std.mem.eql(u8, o.edit.path, path)) try all.append(arena, o.edit);
+        }
+        var reference: std.ArrayList(LineEdit) = .empty;
+        for (b.lines) |e| {
+            if (!std.mem.eql(u8, e.path, path)) continue;
+            const seen = for (reference.items) |x| {
+                if (sameSplice(x, e)) break true;
+            } else false;
+            if (!seen) try reference.append(arena, e);
+        }
+        for (b.synths) |sd| {
+            if (!std.mem.eql(u8, sd.base_abs, path)) continue;
+            const region: LineEdit = .{ .path = path, .start = sd.plan.start, .del = sd.plan.del, .new_lines = sd.plan.base_lines };
+            try all.append(arena, region);
+            try reference.append(arena, region);
+        }
+
+        var keyed: std.ArrayList([]const []const u8) = .empty;
+        for ([_][]const RowEdit{ b.rows, b.leaf_rows }) |list| for (list) |e| {
+            if (!std.mem.eql(u8, e.data_source, path)) continue;
+            const header = mapLine(e.header, all.items) orelse return "does not hold its row";
+            const ordinal = rowOrdinal(planned, stmts, e.stem, header) orelse return "does not hold its row";
+            const row = rowTable(doc, e.stem, ordinal) orelse return "does not hold its row";
+            const index = try std.fmt.allocPrint(arena, "{d}", .{ordinal});
+            for (e.fields) |f| {
+                const want = try tomlScalar(arena, f.value) orelse return "does not hold its row";
+                const got = row.get(f.name) orelse return try std.fmt.allocPrint(arena, "does not hold {s}", .{f.name});
+                if (!got.eql(want)) return try std.fmt.allocPrint(arena, "does not hold {s}", .{f.name});
+                try keyed.append(arena, try arena.dupe([]const u8, &.{ e.stem, index, f.name }));
+            }
+            const record = rowRecord(arena, planned, e.stem, @intCast(ordinal)) catch |er| switch (er) {
+                error.OutOfMemory => return er,
+                else => return "does not parse",
+            } orelse return "does not hold its row";
+            if (try rowRenderRefusal(b.cc, e.file, e.site, record, e.live_line) != null) return "does not render the edited line";
+        };
+
+        var ref_bytes = try splicedContent(arena, pre, reference.items);
+        var renames: std.ArrayList(CouplingEdit) = .empty;
+        for (b.couplings) |o| {
+            if (o.owners.items.len > 0 and std.mem.eql(u8, o.edit.path, path)) try renames.append(arena, o.edit);
+        }
+        if (renames.items.len > 0) ref_bytes = try replaceTokens(arena, ref_bytes, renames.items);
+        const ref = toml.parse(arena, ref_bytes, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return "changes it outside its keys",
+        };
+        if (!tomlEqlOutside(ref, doc, &.{}, keyed.items)) return "changes it outside its keys";
+        return null;
+    }
+
+    fn structPathFault(b: *Backstop, path: []const u8) !?[]const u8 {
+        const arena = b.cc.arena;
+        const planned = b.plan.get(path) orelse return "does not parse";
+        var format: ?commit_struct.Format = null;
+        var keys: std.ArrayList([]const []const u8) = .empty;
+        for (b.struct_applied) |i| {
+            const o = b.planned.structs.items[i];
+            if (!std.mem.eql(u8, o.edit.layer_abs, path)) continue;
+            format = o.edit.format;
+            try keys.append(arena, o.edit.change.path);
+        }
+        const fmt = format orelse return null;
+        const doc = commit_struct.parseLayer(arena, fmt, planned) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return "does not parse",
+        };
+        for (b.struct_applied) |i| {
+            const o = b.planned.structs.items[i];
+            if (!std.mem.eql(u8, o.edit.layer_abs, path)) continue;
+            if (!commit_struct.holdsChange(fmt, doc, o.edit.change))
+                return try std.fmt.allocPrint(arena, "does not hold {s}", .{try keyPathLabel(arena, o.edit.change.path)});
+        }
+        const before = b.struct_before.get(path).? orelse emptyDocText(fmt);
+        const changes = commit_struct.changedKeyPaths(arena, fmt, before, planned) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return "changes it outside its keys",
+        };
+        for (changes) |c| {
+            const inside = for (keys.items) |k| {
+                if (pathsNest(c.path, k)) break true;
+            } else false;
+            if (!inside) return "changes it outside its keys";
+        }
+        return null;
+    }
+
+    fn factsFault(b: *Backstop, planned: []const u8) !?[]const u8 {
+        const arena = b.cc.arena;
+        const pre = b.journal.entries.get(b.facts_path).?.content orelse "";
+        const doc = toml.parse(arena, planned, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return "does not parse",
+        };
+        const ref = toml.parse(arena, pre, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return "changes it outside its keys",
+        };
+        var keyed: std.ArrayList([]const []const u8) = .empty;
+        for (b.fact_edits) |e| {
+            const got = if (doc == .table) doc.table.get(e.name) else null;
+            if (got == null or got.? != .string or !std.mem.eql(u8, got.?.string, e.new_value))
+                return try std.fmt.allocPrint(arena, "does not hold {s}", .{e.name});
+            try keyed.append(arena, try arena.dupe([]const u8, &.{e.name}));
+        }
+        if (!tomlEqlOutside(ref, doc, &.{}, keyed.items)) return "changes it outside its keys";
+        return null;
+    }
+};
+
+/// Line `line` of the pre-run bytes once `splices` are applied, or null
+/// when one of them rewrites it.
+fn mapLine(line: u32, splices: []const LineEdit) ?u32 {
+    var at: i64 = line;
+    for (splices, 0..) |s, i| {
+        const dup = for (splices[0..i]) |x| {
+            if (sameSplice(x, s)) break true;
+        } else false;
+        if (dup) continue;
+        if (s.del > 0 and s.start <= line and line < s.start + s.del) return null;
+        if (s.start + s.del <= line) at += @as(i64, @intCast(s.new_lines.len)) - @as(i64, s.del);
+    }
+    return @intCast(at);
+}
+
+/// Which `[[stem]]` row of `stmts` has its header on `line`.
+fn rowOrdinal(src: []const u8, stmts: []const toml_statements.Statement, stem: []const u8, line: u32) ?usize {
+    var ordinal: usize = 0;
+    for (stmts) |st| {
+        if (st.kind != .array_table or st.key.len != 1 or !std.mem.eql(u8, st.key[0], stem)) continue;
+        if (std.mem.count(u8, src[0..st.span.start], "\n") == line) return ordinal;
+        ordinal += 1;
+    }
+    return null;
+}
+
+fn rowTable(doc: toml.Value, stem: []const u8, ordinal: usize) ?toml.Value.Table {
+    if (doc != .table) return null;
+    const rows = doc.table.get(stem) orelse return null;
+    if (rows != .array or ordinal >= rows.array.items.len) return null;
+    const row = rows.array.items[ordinal];
+    return if (row == .table) row.table else null;
+}
+
+/// A TOML value written as `text`, or null when it does not parse as one.
+fn tomlScalar(arena: std.mem.Allocator, text: []const u8) !?toml.Value {
+    const doc = toml.parse(arena, try std.fmt.allocPrint(arena, "v = {s}\n", .{text}), .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return null,
+    };
+    return doc.table.get("v");
+}
+
+/// Whether `a` and `b` are equal everywhere but at and under the `keyed`
+/// paths, an array element addressed by its index in decimal. An absent
+/// value beside a table reads as an empty table.
+fn tomlEqlOutside(a: ?toml.Value, b: ?toml.Value, prefix: []const []const u8, keyed: []const []const []const u8) bool {
+    var below = false;
+    for (keyed) |k| {
+        if (!pathsNest(k, prefix)) continue;
+        if (k.len <= prefix.len) return true;
+        below = true;
+    }
+    if (!below) {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.eql(b.?);
+    }
+    const present = a orelse b orelse return true;
+    if (a != null and b != null and @as(std.meta.Tag(toml.Value), a.?) != @as(std.meta.Tag(toml.Value), b.?)) return false;
+    var buf: [64][]const u8 = undefined;
+    if (prefix.len >= buf.len) return false;
+    @memcpy(buf[0..prefix.len], prefix);
+    const child = buf[0 .. prefix.len + 1];
+    switch (present) {
+        .table => {
+            for ([_]?toml.Value{ a, b }) |side| {
+                const t = (side orelse continue).table;
+                var it = t.iterator();
+                while (it.next()) |entry| {
+                    child[prefix.len] = entry.key_ptr.*;
+                    const x = if (a) |v| v.table.get(entry.key_ptr.*) else null;
+                    const y = if (b) |v| v.table.get(entry.key_ptr.*) else null;
+                    if (!tomlEqlOutside(x, y, child, keyed)) return false;
+                }
+            }
+            return true;
+        },
+        .array => {
+            if (a == null or b == null or a.?.array.items.len != b.?.array.items.len) return false;
+            var index_buf: [20]u8 = undefined;
+            for (a.?.array.items, b.?.array.items, 0..) |x, y, i| {
+                child[prefix.len] = std.fmt.bufPrint(&index_buf, "{d}", .{i}) catch return false;
+                if (!tomlEqlOutside(x, y, child, keyed)) return false;
+            }
+            return true;
+        },
+        else => return a != null and b != null and a.?.eql(b.?),
     }
 }
 
@@ -8306,12 +8929,10 @@ fn cmpEditDesc(_: void, a: LineEdit, b: LineEdit) bool {
     return a.start > b.start;
 }
 
-/// Write every routed fact edit to the machine-local facts file in one pass,
-/// deduping by name (last edit in `edits` wins) so a batch never asks
-/// `persist` to assign the same key twice. This is the `[f]` write path: it
-/// touches only `facts_path`, never repo `src`.
-fn applyFactEdits(arena: std.mem.Allocator, io: Io, facts_path: []const u8, edits: []const FactEdit) !void {
-    if (edits.len == 0) return;
+/// The machine-local facts file over `pre` with every routed fact edit, one
+/// assignment per name. This is the `[f]` write path: it touches only the
+/// facts file, never repo `src`.
+fn plannedFacts(arena: std.mem.Allocator, pre: []const u8, edits: []const FactEdit) ![]const u8 {
     var answers: std.ArrayList(mox.machine.state.Fact) = .empty;
     outer: for (edits, 0..) |e, i| {
         for (edits[i + 1 ..]) |later| {
@@ -8319,7 +8940,7 @@ fn applyFactEdits(arena: std.mem.Allocator, io: Io, facts_path: []const u8, edit
         }
         try answers.append(arena, .{ .name = e.name, .value = e.new_value });
     }
-    try mox.machine.interview.persist(arena, io, facts_path, answers.items);
+    return mox.machine.interview.persistedBytes(arena, pre, answers.items);
 }
 
 /// True when any `.secret`-origin segment overlaps the hunk's a-range. This
@@ -9092,8 +9713,23 @@ fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.
         .sty = .{ .on = false },
         .claims = claims,
         .paths = .{ .home = m_state.home, .home_named = true, .repo_dir = "", .state_dir = "", .private_dir = "", .triggers_path = "", .snapshots_dir = "", .facts_path = "" },
+        .files = &.{},
+        .ids = try testPathIds(a, io),
+        .canon = try testCanon(a),
     };
     return cc;
+}
+
+fn testPathIds(a: std.mem.Allocator, io: Io) !*PathIds {
+    const ids = try a.create(PathIds);
+    ids.* = .init(a, io);
+    return ids;
+}
+
+fn testCanon(a: std.mem.Allocator) !*std.StringHashMap([]const u8) {
+    const canon = try a.create(std.StringHashMap([]const u8));
+    canon.* = .init(a);
+    return canon;
 }
 
 test "resolveCoupling: a q-abort after a decline persists no decline" {
@@ -9249,6 +9885,9 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
             .snapshots_dir = "",
             .facts_path = "",
         },
+        .files = &.{},
+        .ids = try testPathIds(a, io),
+        .canon = try testCanon(a),
     };
 
     const file_edits = &[_]CouplingEdit{.{ .path = path, .old = "sharedtok", .new = "sharedtok@bad" }};
@@ -9329,4 +9968,79 @@ test "composesTo: literal tags must match exactly, expanded captures stand for a
     try std.testing.expect(!try composesTo(a, "a <b | c> d", "a Z d"));
     try std.testing.expect(!try composesTo(a, "a <env.X | b> d", "a Z d"));
     try std.testing.expect(try composesTo(a, "a <env.X | machine.y> d", "a Z d"));
+}
+
+fn testSplice(start: u32, del: u32, new_lines: []const []const u8) LineEdit {
+    return .{ .path = "/d.toml", .start = start, .del = del, .new_lines = new_lines };
+}
+
+fn testRow(header: u32, splices: []const LineEdit) Footprint {
+    return .{ .path = "/d.toml", .kind = .{ .row = .{ .header = header, .splices = splices } } };
+}
+
+fn testLine(e: LineEdit) Footprint {
+    return .{ .path = "/d.toml", .kind = .{ .splice = e } };
+}
+
+test "footprintsOverlap: splices overlap on the lines they rewrite, an insertion on the line it precedes" {
+    try testing.expect(footprintsOverlap(testLine(testSplice(2, 2, &.{"x"})), testLine(testSplice(3, 1, &.{"y"}))));
+    try testing.expect(!footprintsOverlap(testLine(testSplice(2, 1, &.{"x"})), testLine(testSplice(3, 1, &.{"y"}))));
+    try testing.expect(footprintsOverlap(testLine(testSplice(3, 0, &.{"x"})), testLine(testSplice(3, 1, &.{"y"}))));
+    try testing.expect(!footprintsOverlap(testLine(testSplice(3, 0, &.{"x"})), testLine(testSplice(2, 1, &.{"y"}))));
+    try testing.expect(footprintsOverlap(testLine(testSplice(3, 0, &.{"x"})), testLine(testSplice(3, 0, &.{"y"}))));
+    try testing.expect(!footprintsOverlap(testLine(testSplice(3, 1, &.{"x"})), testLine(testSplice(3, 1, &.{"x"}))));
+}
+
+test "footprintsOverlap: two writes to one row overlap only on a field they write differently" {
+    const a_x = [_]LineEdit{testSplice(1, 1, &.{"a = \"x\""})};
+    const a_y = [_]LineEdit{testSplice(1, 1, &.{"a = \"y\""})};
+    const b_x = [_]LineEdit{testSplice(2, 1, &.{"b = \"x\""})};
+    try testing.expect(!footprintsOverlap(testRow(0, &a_x), testRow(0, &b_x)));
+    try testing.expect(!footprintsOverlap(testRow(0, &a_x), testRow(0, &a_x)));
+    try testing.expect(footprintsOverlap(testRow(0, &a_x), testRow(0, &a_y)));
+    // A line edit of the row's header or of a field it writes differently.
+    try testing.expect(footprintsOverlap(testRow(0, &a_x), testLine(testSplice(0, 1, &.{"[[t]]"}))));
+    try testing.expect(footprintsOverlap(testRow(0, &a_x), testLine(testSplice(1, 1, &.{"a = \"z\""}))));
+    try testing.expect(!footprintsOverlap(testRow(0, &a_x), testLine(testSplice(1, 1, &.{"a = \"x\""}))));
+    try testing.expect(!footprintsOverlap(testRow(0, &a_x), testLine(testSplice(2, 1, &.{"b = 1"}))));
+}
+
+test "footprintsOverlap: a key overlaps any other kind, and a key it nests with unless the same edit" {
+    const key = struct {
+        fn of(path: []const []const u8, removed: bool) Footprint {
+            return .{ .path = "/d.toml", .kind = .{ .key = .{ .format = .toml, .layer_abs = "/d.toml", .change = .{ .path = path, .new = null, .removed = removed } } } };
+        }
+    }.of;
+    try testing.expect(footprintsOverlap(key(&.{ "a", "b" }, true), testLine(testSplice(9, 1, &.{"z"}))));
+    try testing.expect(footprintsOverlap(key(&.{"a"}, true), key(&.{ "a", "b" }, true)));
+    try testing.expect(!footprintsOverlap(key(&.{ "a", "b" }, true), key(&.{ "a", "c" }, true)));
+    try testing.expect(!footprintsOverlap(key(&.{ "a", "b" }, true), key(&.{ "a", "b" }, true)));
+}
+
+test "mapLine: a line moves with the splices above it and is lost to one that rewrites it" {
+    const splices = [_]LineEdit{ testSplice(0, 0, &.{ "x", "y" }), testSplice(2, 3, &.{"z"}), testSplice(8, 1, &.{"w"}) };
+    try testing.expectEqual(@as(?u32, 7), mapLine(7, &splices));
+    try testing.expectEqual(@as(?u32, 2), mapLine(0, &splices));
+    try testing.expectEqual(@as(?u32, null), mapLine(3, &splices));
+    // One splice listed twice applies once.
+    const twice = [_]LineEdit{ testSplice(0, 0, &.{"x"}), testSplice(0, 0, &.{"x"}) };
+    try testing.expectEqual(@as(?u32, 5), mapLine(4, &twice));
+}
+
+test "tomlEqlOutside: a difference counts only outside the keyed paths" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const before = try toml.parse(a, "[[t]]\nk = \"a\"\nv = \"1\"\n\n[[t]]\nk = \"b\"\nv = \"2\"\n\n[m]\nx = 1\n", .{});
+    const field = try toml.parse(a, "[[t]]\nk = \"a\"\nv = \"1\"\n\n[[t]]\nk = \"b\"\nv = \"3\"\n\n[m]\nx = 1\n", .{});
+    const other = try toml.parse(a, "[[t]]\nk = \"a\"\nv = \"1\"\n\n[[t]]\nk = \"b\"\nv = \"3\"\n\n[m]\nx = 2\n", .{});
+    const added = try toml.parse(a, "[[t]]\nk = \"a\"\nv = \"1\"\n\n[[t]]\nk = \"b\"\nv = \"2\"\n\n[m]\nx = 1\n[n]\ny = 1\n", .{});
+    const keyed = [_][]const []const u8{&.{ "t", "1", "v" }};
+    try testing.expect(tomlEqlOutside(before, field, &.{}, &keyed));
+    try testing.expect(!tomlEqlOutside(before, other, &.{}, &keyed));
+    try testing.expect(!tomlEqlOutside(before, field, &.{}, &.{}));
+    try testing.expect(!tomlEqlOutside(before, added, &.{}, &keyed));
+    // A key added under a table that did not exist.
+    const nested = [_][]const []const u8{&.{ "n", "y" }};
+    try testing.expect(tomlEqlOutside(before, added, &.{}, &nested));
 }
