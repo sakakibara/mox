@@ -71,6 +71,10 @@ pub const Diag = struct {
     /// this answers "did a secret reach the output", which is the question
     /// export's cleartext-consent gate has to ask.
     resolved_secret: bool = false,
+    /// When set, every loop over a data file that compose reaches is
+    /// appended here in the order it is reached; a row's `.loop` provenance
+    /// names its loop by index into this list.
+    loops: ?*std.ArrayList(LoopSite) = null,
 
     pub fn set(self: *Diag, text: []const u8) void {
         const n = @min(text.len, self.buf.len);
@@ -81,6 +85,17 @@ pub const Diag = struct {
     pub fn capture(self: *const Diag) ?[]const u8 {
         return if (self.len == 0) null else self.buf[0..self.len];
     }
+};
+
+/// A loop over a data file: the data file as read, the body template, the
+/// loop variable and the `where` predicate. `attributed` when its rows carry
+/// `.loop` provenance: a top-level loop whose body holds no directive.
+pub const LoopSite = struct {
+    data_source: []const u8,
+    template: []const u8,
+    variable: []const u8,
+    where: ?*const dsl.ast.RowExpr,
+    attributed: bool,
 };
 
 /// Whether a resolved secret URI came from a dedicated secret manager, so its
@@ -315,15 +330,23 @@ pub fn expand(
     return (try expandTracked(arena, template, record_opt, ctx)).bytes;
 }
 
-/// Result of an expansion: the arena-owned bytes, plus whether a `<secret:URI>`
+/// Result of an expansion: the arena-owned bytes, whether a `<secret:URI>`
 /// capture actually RESOLVED a secret into them (false when there was none, or
-/// when a null `ctx.secrets` turned it into a placeholder). Callers that record
-/// provenance use `secret` to mark the emitted span `.secret`, so its resolved
-/// cleartext is kept out of the applied-content cache and snapshots.
-pub const Expansion = struct { bytes: []u8, secret: bool };
+/// when a null `ctx.secrets` turned it into a placeholder), and whether one was
+/// left as its placeholder. Callers that record provenance mark a span with
+/// either `.secret`: a resolved secret's cleartext is kept out of the
+/// applied-content cache and snapshots, and a placeholder compose attributes
+/// lines as a resolving one does.
+pub const Expansion = struct {
+    bytes: []u8,
+    secret: bool,
+    /// A `<secret:URI>` capture was left as its `<SECRET:uri>` placeholder
+    /// because no secrets context was given.
+    placeholder: bool = false,
+};
 
-/// `expand` with the secret-resolution signal. See `expand` for the capture
-/// contract; the only addition is the returned `secret` flag.
+/// `expand` with the secret signals. See `expand` for the capture contract;
+/// the only additions are the returned `secret` and `placeholder` flags.
 pub fn expandTracked(
     arena: std.mem.Allocator,
     template: []const u8,
@@ -352,6 +375,7 @@ fn expandTrackedImpl(
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
     var secret_seen = false;
+    var placeholder_seen = false;
 
     var i: usize = 0;
     while (i < template.len) {
@@ -369,7 +393,7 @@ fn expandTrackedImpl(
             // placeholder with no secrets context. The URI is verbatim to `>`,
             // so it is never default- or chain-split.
             if (std.mem.startsWith(u8, inner_raw, "secret:")) {
-                try appendSecret(arena, &out, ctx, inner_raw["secret:".len..], &secret_seen);
+                try appendSecret(arena, &out, ctx, inner_raw["secret:".len..], &secret_seen, &placeholder_seen);
                 i = close + 1;
                 continue;
             }
@@ -415,6 +439,7 @@ fn expandTrackedImpl(
                         const nested = try expandTrackedImpl(arena, v, record_opt, ctx, false);
                         try out.appendSlice(arena, nested.bytes);
                         if (nested.secret) secret_seen = true;
+                        if (nested.placeholder) placeholder_seen = true;
                     } else {
                         try out.appendSlice(arena, v);
                     }
@@ -462,6 +487,7 @@ fn expandTrackedImpl(
                         const nested = try expandTrackedImpl(arena, formatted, record_opt, ctx, false);
                         try out.appendSlice(arena, nested.bytes);
                         if (nested.secret) secret_seen = true;
+                        if (nested.placeholder) placeholder_seen = true;
                     } else {
                         try out.appendSlice(arena, formatted);
                     }
@@ -543,7 +569,7 @@ fn expandTrackedImpl(
         i += 1;
     }
 
-    return .{ .bytes = try out.toOwnedSlice(arena), .secret = secret_seen };
+    return .{ .bytes = try out.toOwnedSlice(arena), .secret = secret_seen, .placeholder = placeholder_seen };
 }
 
 /// Splice a `<secret:URI>` capture. With a secrets context, resolve through the
@@ -557,6 +583,7 @@ fn appendSecret(
     ctx: Ctx,
     uri_str: []const u8,
     secret_seen: *bool,
+    placeholder_seen: *bool,
 ) InterpError!void {
     if (ctx.secrets) |sc| {
         const io = ctx.io orelse return error.SecretRefWithoutContext;
@@ -582,6 +609,7 @@ fn appendSecret(
         try out.appendSlice(arena, "<SECRET:");
         try out.appendSlice(arena, uri_str);
         try out.append(arena, '>');
+        placeholder_seen.* = true;
     }
 }
 

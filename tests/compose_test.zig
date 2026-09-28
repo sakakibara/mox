@@ -5633,3 +5633,53 @@ test "provenance: a secret-bearing structural pass-through numbers the lines aro
     try std.testing.expectEqual(@as(u32, 4), prov.items[2].origin.base.line);
     try std.testing.expectEqual(@as(u32, 1), prov.items[2].out_len);
 }
+
+test "provenance: a placeholder compose attributes a loop row's secret line as a resolving one does, and names each loop" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(io, tmp.dir, "data/ids.toml", "[[ids]]\nname = \"a\"\n[[ids]]\nname = \"b\"\n");
+    try writeFile(io, tmp.dir, "src/.ids", "# mox: for h in \"data/ids.toml\" where h.name = \"a\"\n" ++
+        "# id <h.name>\n" ++
+        "# key <secret:env:MOX_TEST_SECRET>\n" ++
+        "# mox: end\n" ++
+        "# mox: for entry in \"data/ids.toml\"\n" ++
+        "# mox: when os=darwin\n" ++
+        "# nested <entry.name>\n" ++
+        "# mox: end\n" ++
+        "# mox: end\n");
+
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "darwin");
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    const m_state = dataTestMachine();
+
+    var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
+    var sites: std.ArrayList(mox.compose.interp.LoopSite) = .empty;
+    var diag: mox.compose.interp.Diag = .{ .loops = &sites };
+    const out = (try mox.compose.catB.composeTracked(a, io, tree.files[0], &bindings_r, &m_state, null, &prov, &diag)).?;
+    try std.testing.expectEqualStrings("id a\nkey <SECRET:env:MOX_TEST_SECRET>\nnested a\nnested b\n", out);
+
+    try std.testing.expectEqual(@as(usize, 2), sites.items.len);
+    try std.testing.expectEqualStrings("h", sites.items[0].variable);
+    try std.testing.expect(sites.items[0].where != null);
+    try std.testing.expect(sites.items[0].attributed);
+    try std.testing.expectEqualStrings("entry", sites.items[1].variable);
+    try std.testing.expect(!sites.items[1].attributed);
+
+    try std.testing.expect(prov.items[0].origin == .loop);
+    try std.testing.expectEqual(@as(u32, 1), prov.items[0].out_len);
+    try std.testing.expectEqualStrings("h", prov.items[0].origin.loop.variable);
+    try std.testing.expectEqual(@as(?u32, 0), prov.items[0].origin.loop.site);
+    try std.testing.expect(prov.items[1].origin == .secret);
+    try std.testing.expect(prov.items[2].origin != .loop);
+}

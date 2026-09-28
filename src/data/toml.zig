@@ -115,6 +115,52 @@ pub fn scalarText(arena: std.mem.Allocator, tv: toml.Value) ParseError!?[]const 
     };
 }
 
+/// The type of one TOML value as written after a key's `=`.
+pub const Kind = enum { string, integer, float, boolean, datetime, date, time, array, table };
+
+/// The parsed value `text` writes, one TOML value as it stands after a
+/// key's `=`, or null when it is not one.
+pub fn parseValue(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?toml.Value {
+    const doc_text = try std.fmt.allocPrint(arena, "v = {s}\n", .{text});
+    const doc = toml.parse(arena, doc_text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (doc != .table) return null;
+    return doc.table.get("v");
+}
+
+pub fn kindOf(v: toml.Value) Kind {
+    return switch (v) {
+        .string => .string,
+        .integer => .integer,
+        .float => .float,
+        .boolean => .boolean,
+        .datetime => .datetime,
+        .date => .date,
+        .time => .time,
+        .array => .array,
+        .table => .table,
+    };
+}
+
+/// `text` when it is the canonical scalar text, as a loop renders it, of a
+/// bare TOML value of `kind`; null when it parses as another type, or not at
+/// all, or renders differently.
+pub fn canonicalScalar(arena: std.mem.Allocator, kind: Kind, text: []const u8) error{OutOfMemory}!?[]const u8 {
+    switch (kind) {
+        .string, .array, .table => return null,
+        else => {},
+    }
+    const v = (try parseValue(arena, text)) orelse return null;
+    if (kindOf(v) != kind) return null;
+    const rendered = (scalarText(arena, v) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    }) orelse return null;
+    return if (std.mem.eql(u8, rendered, text)) text else null;
+}
+
 fn formatTime(arena: std.mem.Allocator, t: toml.Time) ParseError![]const u8 {
     if (t.nanos == 0)
         return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ t.hour, t.minute, t.second });
@@ -269,4 +315,30 @@ test "parse: unterminated string errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.TomlParseError, parse(arena.allocator(), "[[entries]]\nname = \"unterminated\n"));
+}
+
+test "canonicalScalar: a scalar's own canonical text only, of its own type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("2222", (try canonicalScalar(a, .integer, "2222")).?);
+    try std.testing.expect(try canonicalScalar(a, .integer, "0x10") == null);
+    try std.testing.expect(try canonicalScalar(a, .integer, "007") == null);
+    try std.testing.expect(try canonicalScalar(a, .integer, "many") == null);
+    try std.testing.expect(try canonicalScalar(a, .integer, "1.5") == null);
+    try std.testing.expectEqualStrings("1.5", (try canonicalScalar(a, .float, "1.5")).?);
+    try std.testing.expectEqualStrings("false", (try canonicalScalar(a, .boolean, "false")).?);
+    try std.testing.expectEqualStrings("2024-01-02", (try canonicalScalar(a, .date, "2024-01-02")).?);
+    try std.testing.expect(try canonicalScalar(a, .string, "x") == null);
+}
+
+test "parseValue: one value as written, every type, or null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(Kind.string, kindOf((try parseValue(a, "'lit'")).?));
+    try std.testing.expectEqual(Kind.string, kindOf((try parseValue(a, "\"\"\"\nx\n\"\"\"")).?));
+    try std.testing.expectEqual(Kind.array, kindOf((try parseValue(a, "[1, 2]")).?));
+    try std.testing.expectEqual(Kind.table, kindOf((try parseValue(a, "{ a = 1 }")).?));
+    try std.testing.expect(try parseValue(a, "\"open") == null);
 }

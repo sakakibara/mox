@@ -66,6 +66,7 @@ const mox = @import("../root.zig");
 const commit_struct = @import("commit_struct.zig");
 const edit_mod = @import("edit.zig");
 const toml_statements = mox.data.toml_statements;
+const interp = mox.compose.interp;
 
 const Io = std.Io;
 const Segment = mox.provenance.map.Segment;
@@ -76,8 +77,6 @@ const config_space = mox.classify.config_space;
 const Configuration = config_space.Configuration;
 
 const max_file_bytes: usize = 64 * 1024 * 1024;
-
-const Field = struct { name: []const u8, value: []const u8 };
 
 /// A line-level edit to one physical source file (base / fragment / private).
 /// `private` marks an edit routed to a private-layer source: the coupling graph
@@ -91,15 +90,20 @@ const LineEdit = struct {
     private: bool = false,
 };
 
-/// A field update to one row of a TOML data source (loop origin).
-/// `template` is the loop line the hunk was routed through, empty for a
-/// generator leaf; it is not part of the edit's identity.
+/// A write of one row of a TOML data source, from a loop or a generator
+/// leaf: one whole-line splice of the data file per field it changes, over
+/// that field's value. The loop it was routed through -- body template,
+/// variable, `where`, and a leaf's `into` path -- names the row fields it
+/// reads; none of it is part of the write.
 const RowEdit = struct {
     data_source: []const u8,
     stem: []const u8,
     row: u32,
-    fields: []const Field,
-    template: []const u8 = "",
+    splices: []const LineEdit,
+    template: []const u8,
+    variable: []const u8,
+    where: ?*const mox.dsl.ast.RowExpr,
+    into: ?[]const u8 = null,
 };
 
 /// A pending literal sync of a symlink source's recorded target to the live
@@ -545,18 +549,14 @@ fn addOwned(
 }
 
 fn lineEditEql(a: LineEdit, b: LineEdit) bool {
-    if (!std.mem.eql(u8, a.path, b.path) or a.start != b.start or a.del != b.del) return false;
-    if (a.new_lines.len != b.new_lines.len) return false;
-    for (a.new_lines, b.new_lines) |x, y| if (!std.mem.eql(u8, x, y)) return false;
-    return true;
+    return std.mem.eql(u8, a.path, b.path) and sameSplice(a, b);
 }
 
-fn rowEditEql(a: RowEdit, b: RowEdit) bool {
-    if (!std.mem.eql(u8, a.data_source, b.data_source) or !std.mem.eql(u8, a.stem, b.stem) or a.row != b.row) return false;
-    if (a.fields.len != b.fields.len) return false;
-    for (a.fields, b.fields) |x, y| {
-        if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.value, y.value)) return false;
-    }
+/// Whether two splices replace the same lines with the same lines.
+fn sameSplice(a: LineEdit, b: LineEdit) bool {
+    if (a.start != b.start or a.del != b.del) return false;
+    if (a.new_lines.len != b.new_lines.len) return false;
+    for (a.new_lines, b.new_lines) |x, y| if (!std.mem.eql(u8, x, y)) return false;
     return true;
 }
 
@@ -1478,12 +1478,13 @@ pub fn commitImpl(
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
 
+        var lf: LoopFile = .{ .file = file, .stored = true, .segments = prov.segments, .a_lines = a_lines, .b_lines = b_lines, .hunks = hunks };
         for (hunks, 0..) |hunk, hi| {
             // The stored-baseline path never carries a `.secret` segment (its
             // cleartext is never cached in the first place, so a secret-
             // bearing file never reaches here with a `last_content` to diff
             // against); `null` is inert.
-            switch (try processHunk(&cc, &ra, file, fidx, space, prov.segments, a_lines, b_lines, hunk, hi + 1, hunks.len, null, false)) {
+            switch (try processHunk(&cc, &ra, file, fidx, space, prov.segments, a_lines, b_lines, hunk, hi + 1, hunks.len, null, false, &lf)) {
                 .cont => {},
                 .abort => {
                     aborted = true;
@@ -1573,8 +1574,12 @@ pub fn commitImpl(
     // path. A coupled update's target is found by the path it was offered
     // for, which is a managed file's base as the tree spells it.
     for (line_edits.items) |*e| e.path = try ids.of(e.path);
-    for (row_edits.items) |*e| e.data_source = try ids.of(e.data_source);
-    for (generated.row_edits.items) |*e| e.data_source = try ids.of(e.data_source);
+    for ([_][]RowEdit{ row_edits.items, generated.row_edits.items }) |list| for (list) |*e| {
+        e.data_source = try ids.of(e.data_source);
+        const splices = try ctx.alloc.dupe(LineEdit, e.splices);
+        for (splices) |*sp| sp.path = e.data_source;
+        e.splices = splices;
+    };
     for (sym_syncs.items) |*e| e.source_abs = try ids.of(e.source_abs);
     for (synth_plans.items) |*sd| {
         sd.base_abs = try ids.of(sd.base_abs);
@@ -1669,13 +1674,17 @@ pub fn commitImpl(
     // Every planned edit with the units that produced it; identical edits
     // are one. A coupled update is owned by the files whose line edits
     // produced its rename; the file whose base it rewrites is its target.
+    // A row write is its field splices, planned with the line splices, so an
+    // identical write from two loops, a loop and a leaf, or a loop and the
+    // data file's own line edit is one edit owned by both.
     var planned_lines: std.ArrayList(Owned(LineEdit)) = .empty;
     for (line_edits.items, line_owners.items) |e, owner| try addOwned(LineEdit, ctx.alloc, &planned_lines, e, &.{.{ .file = owner }}, lineEditEql);
-    // Loop and generator-leaf row writes are one list, so an identical write
-    // from a loop file and a leaf is one edit owned by both.
-    var planned_rows: std.ArrayList(Owned(RowEdit)) = .empty;
-    for (row_edits.items, row_owners.items) |e, owner| try addOwned(RowEdit, ctx.alloc, &planned_rows, e, &.{.{ .file = owner }}, rowEditEql);
-    for (generated.row_edits.items, generated.row_leaves.items) |e, li| try addOwned(RowEdit, ctx.alloc, &planned_rows, e, &.{.{ .leaf = li }}, rowEditEql);
+    for (row_edits.items, row_owners.items) |e, owner| for (e.splices) |sp| {
+        try addOwned(LineEdit, ctx.alloc, &planned_lines, sp, &.{.{ .file = owner }}, lineEditEql);
+    };
+    for (generated.row_edits.items, generated.row_leaves.items) |e, li| for (e.splices) |sp| {
+        try addOwned(LineEdit, ctx.alloc, &planned_lines, sp, &.{.{ .leaf = li }}, lineEditEql);
+    };
     var planned_structs: std.ArrayList(Owned(StructEdit)) = .empty;
     for (struct_edits.items, struct_owners.items) |e, owner| try addOwned(StructEdit, ctx.alloc, &planned_structs, e, &.{.{ .file = owner }}, structEditEql);
     var planned_couplings: std.ArrayList(Owned(CouplingEdit)) = .empty;
@@ -1692,10 +1701,7 @@ pub fn commitImpl(
     // distinct from a coupled update another file's edit made to it.
     const wrote_own = try ctx.alloc.alloc(bool, tree.files.len);
     @memset(wrote_own, false);
-    for (planned_lines.items) |o| for (o.owners.items) |u| {
-        wrote_own[u.file] = true;
-    };
-    for (planned_rows.items) |o| for (o.owners.items) |u| switch (u) {
+    for (planned_lines.items) |o| for (o.owners.items) |u| switch (u) {
         .file => |i| wrote_own[i] = true,
         else => {},
     };
@@ -1707,7 +1713,6 @@ pub fn commitImpl(
 
     // Every written path, journaled before any write.
     for (planned_lines.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.path);
-    for (planned_rows.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.data_source);
     for (planned_syms.items) |o| try journal.record(ctx.alloc, ctx.io, o.edit.source_abs);
     for (synth_plans.items) |sd| {
         try journal.record(ctx.alloc, ctx.io, sd.base_abs);
@@ -1718,8 +1723,8 @@ pub fn commitImpl(
 
     // Plan: every prompt is done, so each written path's final bytes are
     // computed in memory from its journaled pre-run bytes, threading its
-    // edits in write order: line splices, row writes, symlink targets,
-    // narrowings, coupling renames, struct keys.
+    // edits in write order: line splices and row writes in one pass, symlink
+    // targets, narrowings, coupling renames, struct keys.
     //
     // A narrowing's region block is a line SPLICE of the base like any other
     // edit, so a base with narrowings takes its ordinary line edits and every
@@ -1738,7 +1743,6 @@ pub fn commitImpl(
         }
         try plan.set(ctx.alloc, path, try splicedContent(ctx.alloc, try plan.bytesOf(ctx.alloc, path), file_edits.items));
     }
-    try planRowEdits(ctx.alloc, &plan, planned_rows.items);
     for (planned_syms.items) |o| try plan.set(ctx.alloc, o.edit.source_abs, try std.fmt.allocPrint(ctx.alloc, "{s}\n", .{o.edit.new_target}));
     for (synth_bases) |base_abs| {
         var splices: std.ArrayList(LineEdit) = .empty;
@@ -1972,7 +1976,7 @@ pub fn commitImpl(
     // passing unit routed are reverted. Every unit still passing is then
     // verified again, since it may read what was restored; repeat until a
     // round fails nothing new.
-    const writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_rows.items, planned_structs.items, synth_plans.items, synth_owners.items, planned_syms.items);
+    const writes = try ownedWrites(ctx.alloc, planned_lines.items, planned_structs.items, synth_plans.items, synth_owners.items, planned_syms.items);
     // Each restored path, with the unit whose failure restored it.
     var restore_cause = std.StringHashMap(Unit).init(ctx.alloc);
     // Each journaled path already back at its pre-run bytes.
@@ -2573,8 +2577,9 @@ const Verifier = struct {
     /// by the hunks it holds, and no configuration the user did not choose
     /// changed. A coupling-only target passes when its source still composes
     /// and the sync changed no configuration the user did not choose; a
-    /// generator source also needs every leaf routed from it this run to
-    /// pass. A file with an unrouted hunk never passes.
+    /// generator source is composed as its leaves, and never has a leaf
+    /// routed this run, since no rename reaches one that does. A file with an
+    /// unrouted hunk never passes.
     fn verifyFile(v: *Verifier, fidx: usize) !bool {
         const arena = v.arena;
         const file = v.files[fidx];
@@ -2596,12 +2601,6 @@ const Verifier = struct {
             if (composed == null and !v.null_before[fidx]) {
                 try v.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, home)});
                 return v.failFile(fidx, "the source no longer composes");
-            }
-            // A generator's own units are its leaves: an update into it
-            // stands only while every leaf routed this run does.
-            for (v.leaves, v.leaf_failed) |gc, leaf_failed| {
-                if (gc.fidx != fidx or !leaf_failed) continue;
-                return v.failFile(fidx, try std.fmt.allocPrint(arena, "{f} was not committed", .{display.of(gc.leaf_live_path, home)}));
             }
             return v.configsHold(fidx, file2, configs, file.source_base_abs, "coupled token update");
         }
@@ -2788,7 +2787,6 @@ const OwnedWrite = struct {
 fn ownedWrites(
     arena: std.mem.Allocator,
     lines: []const Owned(LineEdit),
-    rows: []const Owned(RowEdit),
     structs: []const Owned(StructEdit),
     synths: []const SynthDecision,
     synth_owners: []const usize,
@@ -2796,7 +2794,6 @@ fn ownedWrites(
 ) ![]const OwnedWrite {
     var out: std.ArrayList(OwnedWrite) = .empty;
     for (lines) |o| try out.append(arena, .{ .path = o.edit.path, .owners = o.owners.items });
-    for (rows) |o| try out.append(arena, .{ .path = o.edit.data_source, .owners = o.owners.items });
     for (syms) |o| try out.append(arena, .{ .path = o.edit.source_abs, .owners = o.owners.items });
     for (synths, synth_owners) |sd, owner| {
         const owners = try arena.dupe(Unit, &.{.{ .file = owner }});
@@ -3203,11 +3200,12 @@ fn couplingCandidates(
             }
             continue;
         }
-        if (try acceptedHoldsToken(arena, accepted, c.edit.path, c.edit.old, c.edit.new)) {
+        if (try acceptedHolder(arena, accepted, c.edit.path, c.edit.old, c.edit.new)) |holder| {
             const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ c.edit.path, c.edit.old });
-            if (!(try warned.getOrPut(key)).found_existing) {
-                try warnCoupling(stdout, err, "mox commit: coupling: an edit routed into {s} keeps \"{s}\"; not renaming it there\n", .{ c.edit.path, c.edit.old });
-            }
+            if (!(try warned.getOrPut(key)).found_existing) switch (holder) {
+                .edit => try warnCoupling(stdout, err, "mox commit: coupling: an edit routed into {s} keeps \"{s}\"; not renaming it there\n", .{ c.edit.path, c.edit.old }),
+                .directive => try warnCoupling(stdout, err, "mox commit: coupling: {s} holds \"{s}\" in a loop a row write was routed through; not renaming it there\n", .{ c.edit.path, c.edit.old }),
+            };
             continue;
         }
         try out.append(arena, c);
@@ -3227,7 +3225,8 @@ fn warnCoupling(stdout: *Io.Writer, err: *Io.Writer, comptime fmt: []const u8, a
 /// for a row write, its row's header key path and each assignment statement
 /// of its row, as planned, keyed by the assignment's key and carrying the row
 /// fields the routed template, the loop's `where` and a leaf's `into` path
-/// read.
+/// read. Under the path holding the loop or generator a row write was routed
+/// through: its directive lines and the routed template.
 const AcceptedTexts = struct {
     ids: *PathIds,
     by_path: std.StringHashMap(std.ArrayList(Accepted)),
@@ -3239,10 +3238,13 @@ const AcceptedTexts = struct {
 
 /// One accepted text. With a `key`, it is a row's assignment statement and
 /// counts only when that key, before or after a rename, names one of `fields`.
+/// A `directive` text is what a routed row write was checked against, not
+/// text an edit writes.
 const Accepted = struct {
     text: []const u8,
     key: ?[]const u8 = null,
     fields: []const []const u8 = &.{},
+    directive: bool = false,
 };
 
 fn acceptedTexts(
@@ -3258,27 +3260,40 @@ fn acceptedTexts(
 ) !AcceptedTexts {
     var m: AcceptedTexts = .init(arena, ids);
     for (lines) |e| try addAccepted(arena, &m, try ids.canonical(e.path), .{ .text = try std.mem.join(arena, "\n", e.new_lines) });
-    // Each data source as its row writes leave it, in the order the plan
-    // applies them.
-    var planned = std.StringHashMap([]const u8).init(arena);
+    // Each data source as its row writes leave it: every distinct splice in
+    // one pass over its pre-run bytes, as the plan applies them.
+    var splices = std.StringHashMap(std.ArrayList(LineEdit)).init(arena);
+    var pre_run = std.StringHashMap([]const u8).init(arena);
     for ([_][]const RowEdit{ rows, gen.row_edits.items }) |list| for (list) |e| {
-        const gop = try planned.getOrPut(try ids.canonical(e.data_source));
+        const path = try ids.canonical(e.data_source);
+        const gop = try splices.getOrPut(path);
         if (!gop.found_existing) {
-            gop.value_ptr.* = Io.Dir.cwd().readFileAlloc(io, e.data_source, arena, .limited(max_file_bytes)) catch "";
+            gop.value_ptr.* = .empty;
+            try pre_run.put(path, Io.Dir.cwd().readFileAlloc(io, e.data_source, arena, .limited(max_file_bytes)) catch "");
         }
-        gop.value_ptr.* = try updateTomlRow(arena, gop.value_ptr.*, e.stem, e.row, e.fields);
+        for (e.splices) |sp| {
+            const seen = for (gop.value_ptr.items) |x| {
+                if (sameSplice(x, sp)) break true;
+            } else false;
+            if (!seen) try gop.value_ptr.append(arena, sp);
+        }
     };
+    var planned = std.StringHashMap([]const u8).init(arena);
+    var it = splices.iterator();
+    while (it.next()) |entry| {
+        try planned.put(entry.key_ptr.*, try splicedContent(arena, pre_run.get(entry.key_ptr.*).?, entry.value_ptr.items));
+    }
     for (rows, row_owners) |e, owner| {
         const path = try ids.canonical(e.data_source);
         const content = planned.get(path).?;
-        const reads = try rowReadFields(arena, io, files[owner], e.data_source, e.template);
-        try addRowStatements(arena, &m, path, e, content, try storedValueFields(arena, reads, e, content));
+        try addRowStatements(arena, &m, path, e, content, try storedValueFields(arena, try rowReads(arena, e), e, content));
+        try addDirectiveTexts(arena, io, &m, files[owner], e.template);
     }
     for (gen.row_edits.items, gen.row_leaves.items) |e, li| {
         const path = try ids.canonical(e.data_source);
         const content = planned.get(path).?;
-        const reads = try rowReadFields(arena, io, gen.leaves.items[li].gen_file, e.data_source, null);
-        try addRowStatements(arena, &m, path, e, content, try storedValueFields(arena, reads, e, content));
+        try addRowStatements(arena, &m, path, e, content, try storedValueFields(arena, try rowReads(arena, e), e, content));
+        try addDirectiveTexts(arena, io, &m, gen.leaves.items[li].gen_file, e.template);
     }
     for (synths) |sd| {
         try addAccepted(arena, &m, try ids.canonical(sd.base_abs), .{ .text = try std.mem.join(arena, "\n", sd.plan.base_lines) });
@@ -3293,18 +3308,43 @@ fn addAccepted(arena: std.mem.Allocator, m: *AcceptedTexts, path: []const u8, a:
     try gop.value_ptr.append(arena, a);
 }
 
-/// Whether an edit accepted into `path` writes `old` as a complete token
-/// where a rename of it to `new` would change what the edit wrote.
-fn acceptedHoldsToken(arena: std.mem.Allocator, accepted: *const AcceptedTexts, path: []const u8, old: []const u8, new: []const u8) !bool {
-    const texts = accepted.by_path.get(try accepted.ids.canonical(path)) orelse return false;
+/// What in `path` a rename of `old` to `new` would change under an accepted
+/// edit: a text an edit writes holding `old` as a complete token, or else
+/// the directive lines or template a routed row write was checked against
+/// holding it. Null when neither does.
+fn acceptedHolder(arena: std.mem.Allocator, accepted: *const AcceptedTexts, path: []const u8, old: []const u8, new: []const u8) !?enum { edit, directive } {
+    const texts = accepted.by_path.get(try accepted.ids.canonical(path)) orelse return null;
+    var in_directive = false;
     for (texts.items) |t| {
         if (t.key) |key| {
             const renamed = try replaceTokens(arena, key, &.{.{ .path = path, .old = old, .new = new }});
             if (!isOneOf(key, t.fields) and !isOneOf(renamed, t.fields)) continue;
         }
-        if (containsToken(try mox.coupling.tokens.extract(arena, t.text), old)) return true;
+        if (!containsToken(try mox.coupling.tokens.extract(arena, t.text), old)) continue;
+        if (!t.directive) return .edit;
+        in_directive = true;
     }
-    return false;
+    return if (in_directive) .directive else null;
+}
+
+/// Add, under the canonical path of `file`'s base, every `# mox:` directive
+/// line of it and the routed `template`: what a row write routed through a
+/// loop or generator there was checked against.
+fn addDirectiveTexts(arena: std.mem.Allocator, io: Io, m: *AcceptedTexts, file: mox.source.tree.ManagedFile, template: []const u8) !void {
+    if (!file.has_base or file.source_base_abs.len == 0) return;
+    const path = try m.ids.canonical(file.source_base_abs);
+    try addAccepted(arena, m, path, .{ .text = template, .directive = true });
+    const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch return;
+    const marker = mox.dsl.comment.markerForFile(file.source_base_path, content) orelse return;
+    const events = mox.dsl.scanner.scan(arena, content, marker) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        // Too long to be a directive the parser accepts: every token counts.
+        error.DirectiveTooLong => return addAccepted(arena, m, path, .{ .text = content, .directive = true }),
+    };
+    for (events) |ev| switch (ev) {
+        .directive => |d| try addAccepted(arena, m, path, .{ .text = d.original_line, .directive = true }),
+        .content => {},
+    };
 }
 
 /// Add, under `path`, the key path of the target row's `[[stem]]` header in
@@ -3324,68 +3364,28 @@ fn addRowStatements(arena: std.mem.Allocator, m: *AcceptedTexts, path: []const u
     }
 }
 
-/// The row fields the loops over one data source read. Each loop's
-/// `expanded` fields are those its body or `into` path reads through a
-/// capture whose stored value the expander resolves once more under
-/// `variable`.
+/// The row fields a loop reads. `expanded` are those its body or `into`
+/// path reads through a capture whose stored value the expander resolves
+/// once more under `variable`.
 const RowReads = struct {
     fields: []const []const u8,
-    loops: []const LoopReads,
-
-    const LoopReads = struct { variable: []const u8, expanded: []const []const u8 };
+    variable: []const u8,
+    expanded: []const []const u8,
 };
 
-/// The row fields a loop over `data_path` in `file` reads: every capture of
-/// its body naming a field of the loop variable (defaults and chains
-/// included) or a bare field, its `where` predicate's field references, and
-/// its `into` path's captures. `template`, when given, picks the loop whose
-/// body it is; when no loop of the file's base matches, its own captures
-/// under the `entry` variable are taken.
-fn rowReadFields(arena: std.mem.Allocator, io: Io, file: mox.source.tree.ManagedFile, data_path: []const u8, template: ?[]const u8) !RowReads {
+/// The row fields the loop a row write was routed through reads: every
+/// capture of its template naming a field of the loop variable (defaults and
+/// chains included) or a bare field, its `where` predicate's field
+/// references, and a leaf's `into` path's captures.
+fn rowReads(arena: std.mem.Allocator, e: RowEdit) !RowReads {
     var names: std.ArrayList([]const u8) = .empty;
-    var loops: std.ArrayList(RowReads.LoopReads) = .empty;
-    var matched = false;
-    scan: {
-        const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch break :scan;
-        const marker = mox.dsl.comment.markerForFile(file.source_base_path, content) orelse break :scan;
-        const parsed = mox.dsl.driver.parseFile(arena, content, marker, null) catch break :scan;
-        for (parsed.directives) |d| {
-            const fl = switch (d.kind) {
-                .for_loop => |fl| fl,
-                else => continue,
-            };
-            const path = (try file.dataSourcePath(arena, io, fl.data_source)) orelse continue;
-            if (!std.mem.eql(u8, path, data_path)) continue;
-            if (template) |t| {
-                var stripped: std.ArrayList(u8) = .empty;
-                var body_lines = std.mem.splitScalar(u8, fl.body_template, '\n');
-                var first = true;
-                while (body_lines.next()) |bl| {
-                    if (!first) try stripped.append(arena, '\n');
-                    first = false;
-                    try stripped.appendSlice(arena, mox.dsl.driver.stripLoopBodyPrefix(bl, marker));
-                }
-                if (!std.mem.eql(u8, stripped.items, t)) continue;
-            }
-            matched = true;
-            try appendCaptureFields(arena, &names, fl.body_template, fl.variable);
-            if (fl.where) |w| try appendWhereFields(arena, &names, w, fl.variable);
-            if (fl.into) |into| try appendCaptureFields(arena, &names, into, fl.variable);
-            var expanded: std.ArrayList([]const u8) = .empty;
-            try appendExpandedFields(arena, &expanded, fl.body_template, fl.variable);
-            if (fl.into) |into| try appendExpandedFields(arena, &expanded, into, fl.variable);
-            try loops.append(arena, .{ .variable = fl.variable, .expanded = try expanded.toOwnedSlice(arena) });
-        }
-    }
-    if (!matched) {
-        if (template) |t| {
-            try appendCaptureFields(arena, &names, t, "entry");
-            var expanded: std.ArrayList([]const u8) = .empty;
-            try appendExpandedFields(arena, &expanded, t, "entry");
-            try loops.append(arena, .{ .variable = "entry", .expanded = try expanded.toOwnedSlice(arena) });
-        }
-    }
-    return .{ .fields = try names.toOwnedSlice(arena), .loops = try loops.toOwnedSlice(arena) };
+    try appendCaptureFields(arena, &names, e.template, e.variable);
+    if (e.where) |w| try appendWhereFields(arena, &names, w, e.variable);
+    if (e.into) |into| try appendCaptureFields(arena, &names, into, e.variable);
+    var expanded: std.ArrayList([]const u8) = .empty;
+    try appendExpandedFields(arena, &expanded, e.template, e.variable);
+    if (e.into) |into| try appendExpandedFields(arena, &expanded, into, e.variable);
+    return .{ .fields = names.items, .variable = e.variable, .expanded = expanded.items };
 }
 
 /// The row fields whose stored values `interp.expandTrackedImpl` expands
@@ -3415,17 +3415,13 @@ fn appendExpandedFields(arena: std.mem.Allocator, names: *std.ArrayList([]const 
 fn storedValueFields(arena: std.mem.Allocator, reads: RowReads, e: RowEdit, content: []const u8) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     try names.appendSlice(arena, reads.fields);
-    const record: ?mox.data.toml.Record = blk: {
-        const rows = mox.data.toml.parse(arena, content) catch break :blk null;
-        const list = rows.get(e.stem) orelse break :blk null;
-        break :blk if (e.row < list.len) list[e.row] else null;
-    };
-    for (reads.loops) |loop| {
-        const r = record orelse continue;
-        for (loop.expanded) |f| {
-            const v = r.get(f) orelse continue;
-            try appendCaptureFields(arena, &names, try v.format(arena), loop.variable);
-        }
+    const record = rowRecord(arena, content, e.stem, e.row) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    } orelse return names.toOwnedSlice(arena);
+    for (reads.expanded) |f| {
+        const v = record.get(f) orelse continue;
+        try appendCaptureFields(arena, &names, try v.format(arena), reads.variable);
     }
     return names.toOwnedSlice(arena);
 }
@@ -4231,8 +4227,9 @@ fn processFallbackFile(
     // already confirms `[y/s]` on a terminal -- a rendering difference from
     // another tool (whitespace, trailing newline, key order) shows up as a
     // spurious hunk the user skips there, exactly like any other hunk.
+    var lf: LoopFile = .{ .file = file, .stored = false, .segments = prov.items, .a_lines = a_lines, .b_lines = b_lines, .hunks = hunks };
     for (hunks, 0..) |hunk, hi| {
-        switch (try processHunk(cc, ra, file, fidx, space, prov.items, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, kind == .first_contact)) {
+        switch (try processHunk(cc, ra, file, fidx, space, prov.items, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, kind == .first_contact, &lf)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -4551,7 +4548,16 @@ fn processGeneratorLeaf(
         else => return e,
     };
     if (std.mem.eql(u8, live, leaf.content)) return .cont;
-    const first_contact = (try mox.apply.applied.read(cc.arena, cc.io, state_dir, leaf.live_path)) == null;
+    const recorded = try mox.apply.applied.read(cc.arena, cc.io, state_dir, leaf.live_path);
+    const first_contact = recorded == null;
+    // Live as the last apply wrote it has no drift, whatever the data now
+    // renders; edited over a data row that changed since, no hunk is that
+    // row's.
+    var stale = false;
+    if (recorded) |hash| {
+        if (std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(live))) return .cont;
+        stale = leaf.data_source.len > 0 and !std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(leaf.content));
+    }
 
     // A placeholder recompose of this SAME leaf (secrets unresolved, so a
     // `<secret:URI>` capture stays literal `<SECRET:uri>` text) lets a
@@ -4583,7 +4589,7 @@ fn processGeneratorLeaf(
     };
 
     for (hunks, 0..) |hunk, hi| {
-        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, gen)) {
+        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, stale, gen)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -4593,9 +4599,11 @@ fn processGeneratorLeaf(
 }
 
 /// Route one hunk of a generator leaf: a secret line is never routed (shown
-/// safely, never written); a single-line change that a reverse-parse of the
-/// row's own template fully explains routes to that DATA-SOURCE ROW; anything
-/// else -- a multi-line change, a nested (directive-bearing) leaf body with no
+/// safely, never written); nor is any hunk of a leaf edited over a row that
+/// changed since the last apply, or of a leaf whose row renders several
+/// lines. A single-line change the row's own template splits into row fields
+/// routes to that DATA-SOURCE ROW when the row checks hold; anything else --
+/// a multi-line change, a nested (directive-bearing) leaf body with no
 /// tracked template, or a live edit the template cannot explain as a field
 /// substitution -- comes from the generator's SHARED TEMPLATE, which every
 /// leaf this generator produces shares, so it is surfaced and never silently
@@ -4613,18 +4621,33 @@ fn processGeneratedHunk(
     hunk_total: usize,
     secret_lines: ?[]const []const u8,
     first_contact: bool,
+    stale: bool,
     gen: *LeafRowEdits,
 ) !HunkOutcome {
     if (hunkTouchesSecret(leaf.prov, hunk)) {
         return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, secret_lines, a_lines, b_lines, "came from a secret", true);
     }
+    if (stale) return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, "data row no longer matches what the last apply wrote", false);
 
-    if (hunk.a_len == 1 and hunk.b_len == 1 and leaf.template.len > 0 and
-        std.mem.indexOfScalar(u8, leaf.template, '\n') == null)
-    {
-        if (try reverseTemplate(cc.arena, leaf.template, b_lines[hunk.b_start])) |fields| {
-            if (first_contact and !cc.interactive) return firstContactLeafManual(cc, ra, fidx, leaf, hunk);
-            return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, fields, gen);
+    if (leaf.template.len > 0) {
+        if (a_lines.len > 1) return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, "data row spans several lines", false);
+        if (hunk.a_len == 1 and hunk.b_len == 1) {
+            const site: RowSite = .{
+                .data_source = leaf.data_source,
+                .row = @intCast(leaf.row),
+                .template = leaf.template,
+                .variable = leaf.variable,
+                .where = leaf.where,
+                .leaf = .{ .into = leaf.into, .dir = std.fs.path.dirname(gen_file.live_path) orelse gen_file.live_path, .live_path = leaf.live_path },
+            };
+            switch (try planRowWrite(cc, gen_file, site, b_lines[hunk.b_start])) {
+                .no_match => {},
+                .manual => |reason| return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, reason, false),
+                .write => |w| {
+                    if (first_contact and !cc.interactive) return firstContactLeafManual(cc, ra, fidx, leaf, hunk);
+                    return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, w.splices, gen);
+                },
+            }
         }
     }
 
@@ -4648,9 +4671,10 @@ fn processGeneratedHunk(
     );
 }
 
-/// Accept (or prompt for) a leaf hunk that reverse-parsed cleanly to a
-/// data-source row edit, and collect it. `[y/s]` on a terminal; `--yes` (and
-/// any other non-interactive, non-report mode) auto-accepts. A first-contact
+/// Accept (or prompt for) a leaf hunk routed to a data-source row write, and
+/// collect it; report mode collects it too, never to be written. `[y/s]` on
+/// a terminal; `--yes` (and any other non-interactive, non-report mode)
+/// auto-accepts. A first-contact
 /// leaf never reaches here unless a human is answering: `processGeneratedHunk`
 /// reports it manual first.
 fn acceptGeneratedRow(
@@ -4664,7 +4688,7 @@ fn acceptGeneratedRow(
     hunk_total: usize,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
-    fields: []const Field,
+    splices: []const LineEdit,
     gen: *LeafRowEdits,
 ) !HunkOutcome {
     ra.routed_count.* += 1;
@@ -4674,6 +4698,9 @@ fn acceptGeneratedRow(
         ra.pending.* = true;
         try cc.stdout.print("  would update {s}\n", .{desc});
         try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+        // Collected so report mode predicts the coupling updates a real
+        // commit would drop over it; never written.
+        try collectLeafRow(cc, gen_file, fidx, leaf, splices, gen);
         return .cont;
     }
     if (cc.interactive) {
@@ -4691,22 +4718,38 @@ fn acceptGeneratedRow(
         }
     }
     if (accept) {
-        const li = for (gen.leaves.items, 0..) |gc, i| {
-            if (std.mem.eql(u8, gc.leaf_live_path, leaf.live_path)) break i;
-        } else blk: {
-            try gen.leaves.append(cc.arena, .{ .fidx = fidx, .gen_file = gen_file, .leaf_live_path = leaf.live_path });
-            break :blk gen.leaves.items.len - 1;
-        };
-        try gen.row_edits.append(cc.arena, .{
-            .data_source = leaf.data_source,
-            .stem = mox.data.source.arrayName(leaf.data_source),
-            .row = @intCast(leaf.row),
-            .fields = fields,
-        });
-        try gen.row_leaves.append(cc.arena, li);
+        try collectLeafRow(cc, gen_file, fidx, leaf, splices, gen);
         if (!cc.interactive) try cc.stdout.print("  update {s}\n", .{desc});
     }
     return .cont;
+}
+
+/// Collect a leaf's row write, with the leaf it was routed from.
+fn collectLeafRow(
+    cc: *const ClassCtx,
+    gen_file: mox.source.tree.ManagedFile,
+    fidx: usize,
+    leaf: mox.compose.catB.GeneratedFile,
+    splices: []const LineEdit,
+    gen: *LeafRowEdits,
+) !void {
+    const li = for (gen.leaves.items, 0..) |gc, i| {
+        if (std.mem.eql(u8, gc.leaf_live_path, leaf.live_path)) break i;
+    } else blk: {
+        try gen.leaves.append(cc.arena, .{ .fidx = fidx, .gen_file = gen_file, .leaf_live_path = leaf.live_path });
+        break :blk gen.leaves.items.len - 1;
+    };
+    try gen.row_edits.append(cc.arena, .{
+        .data_source = leaf.data_source,
+        .stem = mox.data.source.arrayName(leaf.data_source),
+        .row = @intCast(leaf.row),
+        .splices = splices,
+        .template = leaf.template,
+        .variable = leaf.variable,
+        .where = leaf.where,
+        .into = leaf.into,
+    });
+    try gen.row_leaves.append(cc.arena, li);
 }
 
 /// Report one generator-leaf hunk as manual: same `[s/x]` shape as
@@ -5633,8 +5676,9 @@ fn processHunk(
     // mode may take a default on a `.line`/`.row` keep -- another tool's
     // rendering quirk would slip into source unseen.
     first_contact: bool,
+    lf: *LoopFile,
 ) !HunkOutcome {
-    const route = try routeHunk(cc.arena, cc.io, segments, hunk, file, a_lines, b_lines, cc.m_state);
+    const route = try routeHunk(cc, lf, hunk);
     switch (route) {
         .manual => |reason| {
             // A hunk covering (or straddling into) a `.secret` segment's
@@ -5680,7 +5724,7 @@ fn processHunk(
                             try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(file.live_path, cc.m_state.home), hunk.a_start + 1, reason });
                         } else {
                             for (subs) |sub| {
-                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total, secret_lines, first_contact);
+                                const outcome = try processHunk(cc, ra, file, fidx, space, segments, a_lines, b_lines, sub, hunk_no, hunk_total, secret_lines, first_contact, lf);
                                 if (outcome != .cont) return outcome;
                             }
                         }
@@ -5790,6 +5834,10 @@ fn processHunk(
                 ra.pending.* = true;
                 try cc.stdout.print("  would update {s}\n", .{r.desc});
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                // Collected so report mode predicts the coupling updates a
+                // real commit would drop over it; never written.
+                try ra.row_edits.append(cc.arena, r.edit);
+                try ra.row_owners.append(cc.arena, fidx);
             } else if (cc.interactive) {
                 try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
                 try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
@@ -5879,17 +5927,13 @@ fn processHunk(
 }
 
 /// Map one diff hunk to a source edit, or report why it cannot be routed.
-fn routeHunk(
-    arena: std.mem.Allocator,
-    io: Io,
-    segments: []const Segment,
-    hunk: Hunk,
-    file: mox.source.tree.ManagedFile,
-    a_lines: []const []const u8,
-    b_lines: []const []const u8,
-    m_state: *const mox.machine.state.MachineState,
-) !Route {
-    const seg = mox.provenance.map.covering(segments, hunk.a_start, hunk.a_len) orelse
+fn routeHunk(cc: *const ClassCtx, lf: *LoopFile, hunk: Hunk) !Route {
+    const arena = cc.arena;
+    const io = cc.io;
+    const file = lf.file;
+    const a_lines = lf.a_lines;
+    const b_lines = lf.b_lines;
+    const seg = mox.provenance.map.covering(lf.segments, hunk.a_start, hunk.a_len) orelse
         return .{ .manual = "hunk straddles origins or is uncovered" };
     const new_lines = b_lines[hunk.b_start .. hunk.b_start + hunk.b_len];
     const old_lines = a_lines[hunk.a_start .. hunk.a_start + hunk.a_len];
@@ -5919,28 +5963,13 @@ fn routeHunk(
                 return .{ .manual = "source no longer matches recorded provenance" };
             return lineRoute(arena, o.path, o.path, start, hunk.a_len, new_lines, false, true);
         },
-        .loop => |o| {
-            if (std.mem.indexOfScalar(u8, o.template, '\n') != null)
-                return .{ .manual = "multi-line loop template" };
-            if (hunk.a_len != 1 or hunk.b_len != 1)
-                return .{ .manual = "loop row insertion or deletion" };
-            const row = o.row + (hunk.a_start - seg.out_start);
-            const fields = reverseTemplate(arena, o.template, new_lines[0]) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-            } orelse return .{ .manual = "live line does not match loop template" };
-            const stem = try arena.dupe(u8, mox.data.source.arrayName(o.data_source));
-            const desc = try std.fmt.allocPrint(arena, "{s} row {d}", .{ o.data_source, row });
-            return .{ .row = .{
-                .edit = .{ .data_source = o.data_source, .stem = stem, .row = row, .fields = fields, .template = o.template },
-                .desc = desc,
-            } };
-        },
+        .loop => return loopRoute(cc, lf, seg, hunk),
         .secret => return .{ .manual = "came from a secret" },
         .interpolated => |o| {
             if (hunk.a_len != 1 or hunk.b_len != 1)
                 return .{ .manual = "came from a capture" };
             const start = (o.origin_line - 1) + (hunk.a_start - seg.out_start);
-            return interpolatedRoute(arena, io, file, start, old_lines[0], new_lines[0], m_state);
+            return interpolatedRoute(arena, io, file, start, old_lines[0], new_lines[0], cc.m_state);
         },
         .overlay => return .{ .manual = "came from a structural merge" },
     }
@@ -6427,7 +6456,7 @@ fn simulateRowImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edi
     const original = try Io.Dir.cwd().readFileAlloc(io, edit.data_source, arena, .limited(max_file_bytes));
     const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
 
-    const edited = try updateTomlRow(arena, original, edit.stem, edit.row, edit.fields);
+    const edited = try splicedContent(arena, original, edit.splices);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.data_source, .data = edited });
     const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
         Io.Dir.cwd().writeFile(io, .{ .sub_path = edit.data_source, .data = original }) catch {};
@@ -6617,28 +6646,620 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
     return caps;
 }
 
-/// Parse `line` against a single-line loop `template`, returning the field
-/// updates for its `<entry.X>` / bare captures, or null when the line does not
-/// match the template's literal frame. Captures against `<machine.X>` /
-/// `<env.X>` are skipped (their value is machine-derived, not row data).
-fn reverseTemplate(arena: std.mem.Allocator, template: []const u8, line: []const u8) !?[]const Field {
-    const raw = (try matchCaptures(arena, template, line)) orelse return null;
-    var fields: std.ArrayList(Field) = .empty;
-    for (raw) |c| {
-        const field = captureField(c.name) orelse continue;
-        try fields.append(arena, .{ .name = field, .value = c.value });
+/// A file's hunks as loop routing reads them: the baseline and its
+/// provenance, the live lines and the diff, and a compose of the sources as
+/// they stand, secrets as placeholders, made when a loop hunk first needs it.
+const LoopFile = struct {
+    file: mox.source.tree.ManagedFile,
+    /// Routed against the baseline the last apply recorded, not a fresh
+    /// compose: a row index there may be stale.
+    stored: bool,
+    segments: []const Segment,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+    hunks: []const Hunk,
+    fresh: ?Fresh = null,
+    fresh_tried: bool = false,
+
+    const Fresh = struct {
+        lines: []const []const u8,
+        segments: []const Segment,
+        sites: []const mox.compose.interp.LoopSite,
+    };
+
+    /// The fresh compose, or null when the sources do not compose here.
+    fn freshCompose(lf: *LoopFile, cc: *const ClassCtx) !?Fresh {
+        if (lf.fresh_tried) return lf.fresh;
+        lf.fresh_tried = true;
+        var prov: std.ArrayList(Segment) = .empty;
+        var sites: std.ArrayList(mox.compose.interp.LoopSite) = .empty;
+        var diag: mox.compose.interp.Diag = .{ .loops = &sites };
+        const composed = mox.compose.composeFileTracked(cc.arena, cc.io, lf.file, cc.resolver, cc.m_state, null, &prov, &diag) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return null,
+        };
+        const bytes = composed orelse return null;
+        lf.fresh = .{ .lines = try mox.diff.lines.splitLines(cc.arena, bytes), .segments = prov.items, .sites = sites.items };
+        return lf.fresh;
     }
-    return try fields.toOwnedSlice(arena);
+
+    /// The live line baseline line `i` stands at: the line the diff matched
+    /// it with, or the line at its offset in a hunk replacing lines one for
+    /// one -- any such hunk with `in_equal`, else only one replacing exactly
+    /// that line. Null otherwise.
+    fn liveLineAt(lf: *const LoopFile, i: u32, in_equal: bool) ?[]const u8 {
+        var shift: i64 = 0;
+        for (lf.hunks) |h| {
+            if (i >= h.a_start and i < h.a_start + h.a_len) {
+                if (h.a_len == h.b_len and (in_equal or h.a_len == 1)) return lf.b_lines[h.b_start + (i - h.a_start)];
+                return null;
+            }
+            if (h.a_start + h.a_len <= i) shift += @as(i64, h.b_len) - @as(i64, h.a_len);
+        }
+        const j = @as(i64, i) + shift;
+        if (j < 0 or j >= lf.b_lines.len) return null;
+        return lf.b_lines[@intCast(j)];
+    }
+
+    /// The live text at every line of baseline segment `seg`, or null when
+    /// a line of it has no live line (`liveLineAt`).
+    fn liveText(lf: *const LoopFile, arena: std.mem.Allocator, seg: Segment, in_equal: bool) !?[]const u8 {
+        var lines: std.ArrayList([]const u8) = .empty;
+        var j: u32 = 0;
+        while (j < seg.out_len) : (j += 1) {
+            try lines.append(arena, lf.liveLineAt(seg.out_start + j, in_equal) orelse return null);
+        }
+        return try std.mem.join(arena, "\n", lines.items);
+    }
+};
+
+/// One `.loop` segment of a loop's block and the text it covers.
+const LoopElem = struct { seg: Segment, text: []const u8 };
+
+/// Every `.loop` segment of `segments` over `data_source` with `template`,
+/// in output order, with the text of `lines` it covers.
+fn loopBlock(arena: std.mem.Allocator, segments: []const Segment, lines: []const []const u8, data_source: []const u8, template: []const u8) ![]const LoopElem {
+    var out: std.ArrayList(LoopElem) = .empty;
+    for (segments) |sg| {
+        const o = switch (sg.origin) {
+            .loop => |o| o,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, o.data_source, data_source) or !std.mem.eql(u8, o.template, template)) continue;
+        const end = @min(sg.out_start + sg.out_len, lines.len);
+        const start = @min(sg.out_start, end);
+        try out.append(arena, .{ .seg = sg, .text = try std.mem.join(arena, "\n", lines[start..end]) });
+    }
+    return out.toOwnedSlice(arena);
 }
 
-/// Field name a capture maps to in the data row, or null when the capture is
-/// machine-derived (`machine.`/`env.`) and thus not row data.
-fn captureField(name: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, name, "entry.")) return name[6..];
-    if (std.mem.startsWith(u8, name, "machine.")) return null;
-    if (std.mem.startsWith(u8, name, "env.")) return null;
-    if (std.mem.indexOf(u8, name, " | ") != null) return null;
-    return name;
+fn uniqueIn(block: []const LoopElem, text: []const u8) bool {
+    var n: usize = 0;
+    for (block) |e| {
+        if (std.mem.eql(u8, e.text, text)) n += 1;
+    }
+    return n == 1;
+}
+
+/// Route a hunk covered by a loop row: to the covering segment's own row,
+/// when the loop block up to it still renders what the last apply wrote, the
+/// row's line is unique in its block, the live line splits into one changed
+/// field set, every changed field can be written in its own type, and the
+/// row as written renders the live line wherever the file renders it.
+fn loopRoute(cc: *const ClassCtx, lf: *LoopFile, seg: Segment, hunk: Hunk) !Route {
+    const arena = cc.arena;
+    const o = seg.origin.loop;
+    if (seg.out_len > 1) return .{ .manual = "data row spans several lines" };
+    if (std.mem.indexOfScalar(u8, o.template, '\n') != null) return .{ .manual = "multi-line loop template" };
+    if (hunk.a_len != 1 or hunk.b_len != 1) return .{ .manual = "loop row insertion or deletion" };
+    const stale: Route = .{ .manual = "data row no longer matches what the last apply wrote" };
+    const fresh = (try lf.freshCompose(cc)) orelse return stale;
+    const recorded = try loopBlock(arena, lf.segments, lf.a_lines, o.data_source, o.template);
+    const now = try loopBlock(arena, fresh.segments, fresh.lines, o.data_source, o.template);
+    const k = for (recorded, 0..) |e, i| {
+        if (e.seg.out_start == seg.out_start) break i;
+    } else return stale;
+    if (now.len <= k) return stale;
+    if (lf.stored) {
+        for (recorded[0 .. k + 1], now[0 .. k + 1], 0..) |r, n, i| {
+            if (r.seg.origin.loop.row != n.seg.origin.loop.row) return stale;
+            if (std.mem.eql(u8, r.text, n.text)) continue;
+            // Already in the source and live, as after a commit beside a held
+            // hunk; the covering row itself is re-offered against a source
+            // that moved on, so it stays manual.
+            if (i < k) {
+                if (try lf.liveText(arena, r.seg, true)) |t| {
+                    if (std.mem.eql(u8, t, n.text)) continue;
+                }
+            }
+            return stale;
+        }
+        if (!uniqueIn(recorded, recorded[k].text) or !uniqueIn(now, now[k].text)) return .{ .manual = "data row is not unique in its loop" };
+    }
+    const fo = now[k].seg.origin.loop;
+    const loop = fresh.sites[fo.site orelse return stale];
+    const site: RowSite = .{ .data_source = fo.data_source, .row = fo.row, .template = loop.template, .variable = loop.variable, .where = loop.where };
+    const planned = switch (try planRowWrite(cc, lf.file, site, lf.b_lines[hunk.b_start])) {
+        .no_match => return .{ .manual = "live line does not match loop template" },
+        .manual => |reason| return .{ .manual = reason },
+        .write => |w| w,
+    };
+    if (try elsewhereRefusal(cc, lf, fresh, site, planned.record)) |reason| return .{ .manual = reason };
+    const desc = try std.fmt.allocPrint(arena, "{s} row {d}", .{ fo.data_source, fo.row });
+    return .{ .row = .{
+        .edit = .{
+            .data_source = fo.data_source,
+            .stem = mox.data.source.arrayName(fo.data_source),
+            .row = fo.row,
+            .splices = planned.splices,
+            .template = loop.template,
+            .variable = loop.variable,
+            .where = loop.where,
+        },
+        .desc = desc,
+    } };
+}
+
+/// Why rendering the row as `planned` writes it through every loop of the
+/// file over its data source would not reproduce live, or null when it
+/// would: a rendering appearing or disappearing, one with no position, or
+/// one that does not equal the live line at its position.
+fn elsewhereRefusal(cc: *const ClassCtx, lf: *const LoopFile, fresh: LoopFile.Fresh, site: RowSite, planned: *const mox.data.toml.Record) !?[]const u8 {
+    const arena = cc.arena;
+    const differently = "data row would render differently elsewhere in the file";
+    const unplaced = "data row also renders elsewhere in the file without a position";
+    for (fresh.sites, 0..) |loop, si| {
+        if (!std.mem.eql(u8, loop.data_source, site.data_source)) continue;
+        // Its rendering of the row has no position of its own.
+        if (!loop.attributed) return unplaced;
+        const ctx = rowCtx(arena, cc, lf.file, loop.variable, planned) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+        };
+        const in_planned = try rowPasses(arena, cc, loop.where, ctx.scope);
+        var rendering: ?Segment = null;
+        var count: usize = 0;
+        for (fresh.segments) |sg| {
+            const o = switch (sg.origin) {
+                .loop => |o| o,
+                else => continue,
+            };
+            if (o.site != @as(?u32, @intCast(si)) or o.row != site.row) continue;
+            rendering = sg;
+            count += 1;
+        }
+        if (in_planned != (count > 0)) return differently;
+        if (!in_planned) continue;
+        // A rendering a secret line splits has no single position.
+        if (count != 1) return unplaced;
+        const text = interp.expand(arena, loop.template, planned, ctx) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            // A rendering that fails to expand counts as disappearing.
+            else => return differently,
+        };
+        const lines = try mox.diff.lines.splitLines(arena, try std.fmt.allocPrint(arena, "{s}\n", .{text}));
+        const fresh_seg = rendering.?;
+        if (fresh_seg.out_len != lines.len) return unplaced;
+        // Its position: the recorded rendering of this row through the same
+        // template, in the same place in output order.
+        var nth: usize = 0;
+        for (fresh.segments) |sg| {
+            if (sg.out_start >= fresh_seg.out_start) break;
+            if (sameRowTemplate(sg, site.data_source, site.row, loop.template)) nth += 1;
+        }
+        const pos = for (lf.segments) |sg| {
+            if (!sameRowTemplate(sg, site.data_source, site.row, loop.template)) continue;
+            if (nth == 0) break sg;
+            nth -= 1;
+        } else return unplaced;
+        if (pos.out_len != lines.len) return unplaced;
+        for (lines, 0..) |line, j| {
+            const live = lf.liveLineAt(pos.out_start + @as(u32, @intCast(j)), false) orelse return unplaced;
+            if (!std.mem.eql(u8, live, line)) return try std.fmt.allocPrint(arena, "data row also renders at line {d} without this edit", .{pos.out_start + 1});
+        }
+    }
+    return null;
+}
+
+fn sameRowTemplate(sg: Segment, data_source: []const u8, row: u32, template: []const u8) bool {
+    const o = switch (sg.origin) {
+        .loop => |o| o,
+        else => return false,
+    };
+    return o.row == row and std.mem.eql(u8, o.data_source, data_source) and std.mem.eql(u8, o.template, template);
+}
+
+/// The loop a row hunk is routed through: the data file and row, the body
+/// template, and the variable and `where` of the loop that rendered it. A
+/// generator leaf also carries its `into` path template, the directory it
+/// renders into, and its live path.
+const RowSite = struct {
+    data_source: []const u8,
+    row: u32,
+    template: []const u8,
+    variable: []const u8,
+    where: ?*const mox.dsl.ast.RowExpr,
+    leaf: ?Leaf = null,
+
+    const Leaf = struct { into: []const u8, dir: []const u8, live_path: []const u8 };
+};
+
+/// What routing a live line through a row decided: the line matches the
+/// template's literal frame in no way, the hunk is manual, or the field
+/// splices to write and the row as they leave it.
+const RowPlan = union(enum) {
+    no_match,
+    manual: []const u8,
+    write: struct { splices: []const LineEdit, record: *const mox.data.toml.Record },
+};
+
+/// A template split for matching against a live line: literal text, where a
+/// capture that is not row data stands as its current expansion, or a
+/// capture of a row field.
+const Piece = struct {
+    text: []const u8,
+    field: ?[]const u8 = null,
+    /// The expander resolves captures inside this field's stored value.
+    expands: bool = false,
+    /// What this capture renders from the row as it stands.
+    current: []const u8 = "",
+};
+
+/// Every complete split of a live line into row fields counts toward this
+/// limit; past it the line is manual.
+const max_row_splits: usize = 256;
+
+/// The capture-expansion context rendering a row of a top-level loop under
+/// `variable`, as compose renders it here with secrets as placeholders.
+fn rowCtx(arena: std.mem.Allocator, cc: *const ClassCtx, file: mox.source.tree.ManagedFile, variable: []const u8, record: *const mox.data.toml.Record) !interp.Ctx {
+    const frames = try arena.dupe(interp.Frame, &.{.{ .name = variable, .value = .{ .record = record } }});
+    return .{ .io = cc.io, .machine = cc.m_state, .repo_dir = file.repo_dir, .private_dir = file.private_dir, .scope = frames };
+}
+
+/// Whether a row passes a loop's `where`; a predicate that cannot be
+/// evaluated passes nothing.
+fn rowPasses(arena: std.mem.Allocator, cc: *const ClassCtx, where: ?*const mox.dsl.ast.RowExpr, frames: []const interp.Frame) !bool {
+    const w = where orelse return true;
+    return mox.dsl.row_expr.evaluate(arena, w, frames, cc.resolver, null) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => false,
+    };
+}
+
+/// The row field a capture body reads when it is row data: a field of the
+/// loop variable or of `entry.`, whose stored value the expander resolves
+/// once more, or a bare field, spliced verbatim. Null for a capture with a
+/// default or a chain, and for `machine.`, `env.`, `data.` and `secret:`.
+fn rowField(inner: []const u8, variable: []const u8) ?struct { name: []const u8, expands: bool } {
+    const capture = mox.compose.capture;
+    if (std.mem.startsWith(u8, inner, "secret:")) return null;
+    const split = capture.splitDefault(inner);
+    if (split.default != null or capture.isChain(split.field)) return null;
+    const f = split.field;
+    for ([_][]const u8{ variable, "entry" }) |head| {
+        if (f.len > head.len + 1 and std.mem.startsWith(u8, f, head) and f[head.len] == '.') return .{ .name = f[head.len + 1 ..], .expands = true };
+    }
+    if (f.len == 0 or capture.hasNamespace(f) or std.mem.eql(u8, f, variable)) return null;
+    return .{ .name = f, .expands = false };
+}
+
+/// `template` as pieces to match a live line against, with every capture
+/// that is not row data expanded against `record`; null when a capture does
+/// not expand.
+fn templatePieces(arena: std.mem.Allocator, template: []const u8, variable: []const u8, record: *const mox.data.toml.Record, ctx: interp.Ctx) !?[]const Piece {
+    var pieces: std.ArrayList(Piece) = .empty;
+    var literal: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '<') {
+            if (mox.compose.capture.closeIndex(template, i)) |close| {
+                const text = template[i .. close + 1];
+                const current = interp.expand(arena, text, record, ctx) catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => return null,
+                };
+                if (rowField(template[i + 1 .. close], variable)) |f| {
+                    if (literal.items.len > 0) try pieces.append(arena, .{ .text = try literal.toOwnedSlice(arena) });
+                    try pieces.append(arena, .{ .text = text, .field = f.name, .expands = f.expands, .current = current });
+                } else {
+                    try literal.appendSlice(arena, current);
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        try literal.append(arena, template[i]);
+        i += 1;
+    }
+    if (literal.items.len > 0) try pieces.append(arena, .{ .text = try literal.toOwnedSlice(arena) });
+    return try pieces.toOwnedSlice(arena);
+}
+
+/// Every way `line` splits against `pieces`, each as the text every piece
+/// takes; null past `limit` splits. Only states from which the rest of the
+/// line can still match are entered, each counted in `visits`.
+fn rowSplits(arena: std.mem.Allocator, pieces: []const Piece, line: []const u8, limit: usize, visits: *usize) !?[]const []const []const u8 {
+    const w = line.len + 1;
+    // reach[p * w + pos]: pieces[p..] can match line[pos..].
+    const reach = try arena.alloc(bool, (pieces.len + 1) * w);
+    @memset(reach, false);
+    reach[pieces.len * w + line.len] = true;
+    var p = pieces.len;
+    while (p > 0) {
+        p -= 1;
+        const piece = pieces[p];
+        if (piece.field == null) {
+            for (0..w) |pos| {
+                reach[p * w + pos] = std.mem.startsWith(u8, line[pos..], piece.text) and reach[(p + 1) * w + pos + piece.text.len];
+            }
+        } else {
+            var any = false;
+            var pos = w;
+            while (pos > 0) {
+                pos -= 1;
+                any = any or reach[(p + 1) * w + pos];
+                reach[p * w + pos] = any;
+            }
+        }
+    }
+    const Walk = struct {
+        arena: std.mem.Allocator,
+        pieces: []const Piece,
+        line: []const u8,
+        reach: []const bool,
+        w: usize,
+        taken: [][]const u8,
+        limit: usize,
+        visits: *usize,
+        out: std.ArrayList([]const []const u8) = .empty,
+
+        fn go(s: *@This(), at: usize, pos: usize) error{ OutOfMemory, TooMany }!void {
+            s.visits.* += 1;
+            if (at == s.pieces.len) {
+                if (s.out.items.len == s.limit) return error.TooMany;
+                try s.out.append(s.arena, try s.arena.dupe([]const u8, s.taken));
+                return;
+            }
+            const piece = s.pieces[at];
+            if (piece.field == null) {
+                s.taken[at] = piece.text;
+                return s.go(at + 1, pos + piece.text.len);
+            }
+            var end = pos;
+            while (end <= s.line.len) : (end += 1) {
+                if (!s.reach[(at + 1) * s.w + end]) continue;
+                s.taken[at] = s.line[pos..end];
+                try s.go(at + 1, end);
+            }
+        }
+    };
+    var walk: Walk = .{ .arena = arena, .pieces = pieces, .line = line, .reach = reach, .w = w, .taken = try arena.alloc([]const u8, pieces.len), .limit = limit, .visits = visits };
+    if (!reach[0]) return &.{};
+    walk.go(0, 0) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.TooMany => return null,
+    };
+    return try walk.out.toOwnedSlice(arena);
+}
+
+/// The distinct row fields `pieces` capture, in the order first captured.
+fn pieceFields(arena: std.mem.Allocator, pieces: []const Piece) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (pieces) |pc| {
+        const f = pc.field orelse continue;
+        if (!isOneOf(f, out.items)) try out.append(arena, f);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+const SplitChoice = union(enum) {
+    no_match,
+    manual: []const u8,
+    split: struct { taken: []const []const u8, changed: []const bool },
+};
+
+/// The split of `line` into row fields a write follows: of the splits whose
+/// captures of one field agree, the one whose changed fields are contained in
+/// every other's, when exactly one is and it changes something.
+fn chooseSplit(arena: std.mem.Allocator, pieces: []const Piece, fields: []const []const u8, line: []const u8) !SplitChoice {
+    const ambiguous = "live line splits into row fields more than one way";
+    var visits: usize = 0;
+    const all = (try rowSplits(arena, pieces, line, max_row_splits, &visits)) orelse return .{ .manual = ambiguous };
+    if (all.len == 0) return .no_match;
+    var consistent: std.ArrayList([]const []const u8) = .empty;
+    var changed_sets: std.ArrayList([]const bool) = .empty;
+    for (all) |taken| {
+        const changed = try arena.alloc(bool, fields.len);
+        @memset(changed, false);
+        if (!splitAgrees(pieces, fields, taken, changed)) continue;
+        try consistent.append(arena, taken);
+        try changed_sets.append(arena, changed);
+    }
+    if (consistent.items.len == 0) return .{ .manual = "field captured twice with different values" };
+    var least: ?usize = null;
+    var n_least: usize = 0;
+    for (changed_sets.items, 0..) |mine, si| {
+        const within = for (changed_sets.items) |other| {
+            if (!isSubset(mine, other)) break false;
+        } else true;
+        if (!within) continue;
+        least = si;
+        n_least += 1;
+    }
+    const chosen = least orelse return .{ .manual = ambiguous };
+    if (n_least != 1 or std.mem.indexOfScalar(bool, changed_sets.items[chosen], true) == null) return .{ .manual = ambiguous };
+    return .{ .split = .{ .taken = consistent.items[chosen], .changed = changed_sets.items[chosen] } };
+}
+
+/// Whether a split's captures of each field agree, marking in `changed`
+/// each field a capture takes other text for than the row renders now.
+fn splitAgrees(pieces: []const Piece, fields: []const []const u8, taken: []const []const u8, changed: []bool) bool {
+    for (fields, changed) |f, *ch| {
+        var value: ?[]const u8 = null;
+        for (pieces, taken) |pc, t| {
+            const pf = pc.field orelse continue;
+            if (!std.mem.eql(u8, pf, f)) continue;
+            if (value) |v| {
+                if (!std.mem.eql(u8, v, t)) return false;
+            } else value = t;
+            if (!std.mem.eql(u8, t, pc.current)) ch.* = true;
+        }
+    }
+    return true;
+}
+
+fn isSubset(a: []const bool, b: []const bool) bool {
+    for (a, b) |x, y| {
+        if (x and !y) return false;
+    }
+    return true;
+}
+
+/// Every `<...>` of `text` the compose grammar's close index recognizes, as
+/// written.
+fn captureTexts(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '<')) |open| {
+        const close = mox.compose.capture.closeIndex(text, open) orelse {
+            i = open + 1;
+            continue;
+        };
+        try out.append(arena, text[open .. close + 1]);
+        i = close + 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// `s` as a TOML basic string: `\`, `"` and control characters escaped.
+fn basicString(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '"');
+    for (s) |c| switch (c) {
+        '\\' => try out.appendSlice(arena, "\\\\"),
+        '"' => try out.appendSlice(arena, "\\\""),
+        '\n' => try out.appendSlice(arena, "\\n"),
+        '\t' => try out.appendSlice(arena, "\\t"),
+        '\r' => try out.appendSlice(arena, "\\r"),
+        0x08 => try out.appendSlice(arena, "\\b"),
+        0x0c => try out.appendSlice(arena, "\\f"),
+        0...0x07, 0x0b, 0x0e...0x1f, 0x7f => try out.print(arena, "\\u{X:0>4}", .{c}),
+        else => try out.append(arena, c),
+    };
+    try out.append(arena, '"');
+    return out.toOwnedSlice(arena);
+}
+
+/// The splice writing `value` over statement `st`'s value in `content`: its
+/// whole lines, keeping its key, spacing and trailing comment.
+fn valueSplice(arena: std.mem.Allocator, path: []const u8, content: []const u8, st: toml_statements.Statement, value: []const u8) !LineEdit {
+    const vs = st.value_span.start;
+    const ve = st.value_span.end;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, content[0..vs], '\n')) |nl| nl + 1 else 0;
+    const line_end = std.mem.indexOfScalarPos(u8, content, ve, '\n') orelse content.len;
+    const start: u32 = @intCast(std.mem.count(u8, content[0..vs], "\n"));
+    const del: u32 = @intCast(std.mem.count(u8, content[vs..ve], "\n") + 1);
+    const line = try std.mem.concat(arena, u8, &.{ content[line_start..vs], value, content[ve..line_end] });
+    return .{ .path = path, .start = start, .del = del, .new_lines = try arena.dupe([]const u8, &.{line}) };
+}
+
+/// Route `live_line` through the row `site` names: split it into row fields,
+/// check each changed field can be written in its own type, splice the
+/// writes over the pre-run data file, and require the row as they leave it
+/// to render `live_line` (and, for a leaf, at its own path).
+fn planRowWrite(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site: RowSite, live_line: []const u8) !RowPlan {
+    const arena = cc.arena;
+    const not_table = RowPlan{ .manual = "data row is not a table section" };
+    const content = Io.Dir.cwd().readFileAlloc(cc.io, site.data_source, arena, .limited(max_file_bytes)) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return not_table,
+    };
+    const stem = mox.data.source.arrayName(site.data_source);
+    const record = rowRecord(arena, content, stem, site.row) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return not_table,
+    } orelse return not_table;
+    const ctx = try rowCtx(arena, cc, file, site.variable, record);
+    const pieces = (try templatePieces(arena, site.template, site.variable, record, ctx)) orelse return .no_match;
+    const fields = try pieceFields(arena, pieces);
+    const split = switch (try chooseSplit(arena, pieces, fields, live_line)) {
+        .no_match => return .no_match,
+        .manual => |reason| return .{ .manual = reason },
+        .split => |sp| sp,
+    };
+
+    const stmts = toml_statements.scan(arena, content) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.NestingTooDeep => return not_table,
+    };
+    const section = toml_statements.arrayTableRow(stmts, stem, site.row) orelse return not_table;
+    var splices: std.ArrayList(LineEdit) = .empty;
+    for (fields, split.changed) |f, changed| {
+        if (!changed) continue;
+        var new: []const u8 = "";
+        var expands = false;
+        for (pieces, split.taken) |pc, t| {
+            const pf = pc.field orelse continue;
+            if (!std.mem.eql(u8, pf, f)) continue;
+            new = t;
+            expands = expands or pc.expands;
+        }
+        const st = for (section.body) |st| {
+            if (st.key.len == 1 and std.mem.eql(u8, st.key[0], f)) break st;
+        } else return not_table;
+        const stored = (try mox.data.toml.parseValue(arena, try st.valueText(arena, content))) orelse return .{ .manual = "data value type" };
+        const kind = mox.data.toml.kindOf(stored);
+        if (kind == .array) return .{ .manual = "data value is an array" };
+        if (expands) {
+            if (record.get(f)) |v| {
+                if ((try captureTexts(arena, try v.format(arena))).len > 0) return .{ .manual = "data value holds a capture" };
+            }
+        }
+        const written = switch (kind) {
+            .string => blk: {
+                if (!std.unicode.utf8ValidateSlice(new)) return .{ .manual = "data value type" };
+                const known = try captureTexts(arena, stored.string);
+                for (try captureTexts(arena, new)) |c| {
+                    if (!isOneOf(c, known)) return .{ .manual = "new value holds a capture" };
+                }
+                break :blk try basicString(arena, new);
+            },
+            .table => return .{ .manual = "data value type" },
+            else => (try mox.data.toml.canonicalScalar(arena, kind, new)) orelse return .{ .manual = "data value type" },
+        };
+        try splices.append(arena, try valueSplice(arena, site.data_source, content, st, written));
+    }
+
+    const after = try splicedContent(arena, content, splices.items);
+    const planned = rowRecord(arena, after, stem, site.row) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => null,
+    } orelse return .{ .manual = "the edited row does not render the edited line" };
+    const pctx = try rowCtx(arena, cc, file, site.variable, planned);
+    if (!try rowPasses(arena, cc, site.where, pctx.scope)) return .{ .manual = "the edited row is filtered out" };
+    const rendered = interp.expand(arena, site.template, planned, pctx) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .manual = "the edited row does not render the edited line" },
+    };
+    if (!std.mem.eql(u8, rendered, live_line)) return .{ .manual = "the edited row does not render the edited line" };
+    if (site.leaf) |leaf| {
+        const moved = RowPlan{ .manual = "the edited row moves the leaf" };
+        const into = interp.expand(arena, leaf.into, planned, pctx) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return moved,
+        };
+        const path = try mox.source.path.joinKeyOnto(arena, leaf.dir, into);
+        if (!std.mem.eql(u8, try mox.source.path.toKey(arena, path), try mox.source.path.toKey(arena, leaf.live_path))) return moved;
+    }
+    return .{ .write = .{ .splices = try splices.toOwnedSlice(arena), .record = planned } };
+}
+
+/// Row `row` of the `[[stem]]` array `content` holds, as a loop reads it, or
+/// null when there is none.
+fn rowRecord(arena: std.mem.Allocator, content: []const u8, stem: []const u8, row: u32) !?*const mox.data.toml.Record {
+    const rows = try mox.data.toml.parse(arena, content);
+    const list = rows.get(stem) orelse return null;
+    if (row >= list.len) return null;
+    return &list[row];
 }
 
 /// Fact name a capture's raw text maps to, when it is a plain `<machine.X>`
@@ -6742,25 +7363,6 @@ fn cmpEditDesc(_: void, a: LineEdit, b: LineEdit) bool {
     return a.start > b.start;
 }
 
-/// Plan all row edits, grouped by data source, rewriting each changed
-/// `key = value` line in place.
-fn planRowEdits(arena: std.mem.Allocator, plan: *WritePlan, edits: []const Owned(RowEdit)) !void {
-    var done: std.ArrayList([]const u8) = .empty;
-    for (edits) |o| {
-        const e = o.edit;
-        if (isOneOf(e.data_source, done.items)) continue;
-        try done.append(arena, e.data_source);
-
-        var content = try plan.bytesOf(arena, e.data_source);
-        for (edits) |ro| {
-            const re = ro.edit;
-            if (!std.mem.eql(u8, re.data_source, e.data_source)) continue;
-            content = try updateTomlRow(arena, content, re.stem, re.row, re.fields);
-        }
-        try plan.set(arena, e.data_source, content);
-    }
-}
-
 /// Write every routed fact edit to the machine-local facts file in one pass,
 /// deduping by name (last edit in `edits` wins) so a batch never asks
 /// `persist` to assign the same key twice. This is the `[f]` write path: it
@@ -6775,74 +7377,6 @@ fn applyFactEdits(arena: std.mem.Allocator, io: Io, facts_path: []const u8, edit
         try answers.append(arena, .{ .name = e.name, .value = e.new_value });
     }
     try mox.machine.interview.persist(arena, io, facts_path, answers.items);
-}
-
-/// Rewrite the `key = "value"` lines of the `target_row`-th `[[stem]]` table,
-/// changing only fields whose value actually differs. Returns arena-owned
-/// bytes; unrelated rows and fields are preserved verbatim.
-fn updateTomlRow(
-    arena: std.mem.Allocator,
-    content: []const u8,
-    stem: []const u8,
-    target_row: u32,
-    fields: []const Field,
-) ![]u8 {
-    const had_trailing_nl = content.len > 0 and content[content.len - 1] == '\n';
-    var out: std.ArrayList(u8) = .empty;
-
-    var row_counter: i64 = -1;
-    var in_target = false;
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    var first = true;
-    while (lines.next()) |line| {
-        // Drop the phantom empty segment a trailing newline produces.
-        if (lines.peek() == null and line.len == 0 and had_trailing_nl) break;
-        if (!first) try out.append(arena, '\n');
-        first = false;
-
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "[[")) {
-            const close = std.mem.indexOf(u8, trimmed, "]]");
-            if (close) |c| {
-                const name = std.mem.trim(u8, trimmed[2..c], " \t");
-                if (std.mem.eql(u8, name, stem)) {
-                    row_counter += 1;
-                    in_target = row_counter == target_row;
-                } else {
-                    in_target = false;
-                }
-            }
-            try out.appendSlice(arena, line);
-            continue;
-        }
-
-        if (in_target) {
-            if (rewriteField(arena, line, fields)) |replaced| {
-                try out.appendSlice(arena, replaced);
-                continue;
-            } else |_| {}
-        }
-        try out.appendSlice(arena, line);
-    }
-
-    if (had_trailing_nl) try out.append(arena, '\n');
-    return out.toOwnedSlice(arena);
-}
-
-/// If `line` assigns one of `fields`, return the line with the new value; a
-/// null-value sentinel error means "not a matching assignment, leave it".
-fn rewriteField(arena: std.mem.Allocator, line: []const u8, fields: []const Field) ![]const u8 {
-    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.NotAField;
-    const key = std.mem.trim(u8, line[0..eq], " \t");
-    for (fields) |f| {
-        if (std.mem.eql(u8, key, f.name)) {
-            const indent_len = line.len - std.mem.trimStart(u8, line, " \t").len;
-            const rebuilt = try std.fmt.allocPrint(arena, "{s}{s} = \"{s}\"", .{ line[0..indent_len], key, f.value });
-            return rebuilt;
-        }
-    }
-    return error.NotAField;
 }
 
 /// True when any `.secret`-origin segment overlaps the hunk's a-range. This
@@ -7185,69 +7719,115 @@ test "legend: the default key never uppercases into a sibling's exact key" {
     try testing.expect(std.mem.indexOf(u8, line2, "[O]verwrite") != null);
 }
 
-test "reverseTemplate: extracts entry captures from a matching line" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const fields = (try reverseTemplate(arena.allocator(), "abbr <entry.key>=\"<entry.expansion>\"", "abbr gs=\"git status -sb\"")).?;
-    try testing.expectEqual(@as(usize, 2), fields.len);
-    try testing.expectEqualStrings("key", fields[0].name);
-    try testing.expectEqualStrings("gs", fields[0].value);
-    try testing.expectEqualStrings("expansion", fields[1].name);
-    try testing.expectEqualStrings("git status -sb", fields[1].value);
+fn testPieces(a: std.mem.Allocator, texts: []const []const u8, current: []const []const u8) ![]const Piece {
+    var out: std.ArrayList(Piece) = .empty;
+    var ci: usize = 0;
+    for (texts) |t| {
+        if (t.len > 0 and t[0] == '<') {
+            try out.append(a, .{ .text = t, .field = t[1 .. t.len - 1], .current = current[ci] });
+            ci += 1;
+        } else try out.append(a, .{ .text = t });
+    }
+    return out.toOwnedSlice(a);
 }
 
-test "reverseTemplate: non-matching frame returns null" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expect(try reverseTemplate(arena.allocator(), "abbr <entry.key>=\"<entry.expansion>\"", "alias gs=git") == null);
+fn expectManual(reason: []const u8, got: SplitChoice) !void {
+    try testing.expect(got == .manual);
+    try testing.expectEqualStrings(reason, got.manual);
 }
 
-test "reverseTemplate: trailing capture consumes the rest" {
+test "chooseSplit: of several splits, the one changing the fewest fields writes" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const fields = (try reverseTemplate(arena.allocator(), "export <entry.name>", "export PATH=/usr/bin")).?;
-    try testing.expectEqual(@as(usize, 1), fields.len);
-    try testing.expectEqualStrings("PATH=/usr/bin", fields[0].value);
+    const a = arena.allocator();
+    const pieces = try testPieces(a, &.{ "<a>", ",", "<b>", ",", "<c>" }, &.{ "1", "2", "3" });
+    const fields = try pieceFields(a, pieces);
+    const got = try chooseSplit(a, pieces, fields, "1,x,y,3");
+    try testing.expectEqualStrings("x,y", got.split.taken[2]);
+    try testing.expectEqualSlices(bool, &.{ false, true, false }, got.split.changed);
 }
 
-test "reverseTemplate: machine captures are not field updates" {
+test "chooseSplit: no least changed field set, a split changing nothing, and no split at all" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const fields = (try reverseTemplate(arena.allocator(), "<entry.key> on <machine.os>", "ll on linux")).?;
-    try testing.expectEqual(@as(usize, 1), fields.len);
-    try testing.expectEqualStrings("key", fields[0].name);
-    try testing.expectEqualStrings("ll", fields[0].value);
+    const a = arena.allocator();
+    const pieces = try testPieces(a, &.{ "<a>", " ", "<b>" }, &.{ "p", "q" });
+    const fields = try pieceFields(a, pieces);
+    try expectManual("live line splits into row fields more than one way", try chooseSplit(a, pieces, fields, "p  q"));
+    try expectManual("live line splits into row fields more than one way", try chooseSplit(a, pieces, fields, "p q"));
+    try testing.expect(try chooseSplit(a, pieces, fields, "pq") == .no_match);
 }
 
-test "updateTomlRow: changes only the target row's changed field" {
+test "rowSplits: enumeration stops at its limit, having visited only states on the splits it counted" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src =
-        \\[[abbrs]]
-        \\key = "ll"
-        \\expansion = "ls -l"
-        \\
-        \\[[abbrs]]
-        \\key = "gs"
-        \\expansion = "git status"
-        \\
-    ;
-    const fields = [_]Field{
-        .{ .name = "key", .value = "gs" },
-        .{ .name = "expansion", .value = "git status -sb" },
+    const a = arena.allocator();
+    // Four fields joined by commas against fourteen commas: 364 splits.
+    const pieces = try testPieces(a, &.{ "<f0>", ",", "<f1>", ",", "<f2>", ",", "<f3>" }, &.{ "x", "x", "x", "x" });
+    const line = "," ** 14;
+    var visits: usize = 0;
+    try testing.expectEqual(@as(usize, 364), (try rowSplits(a, pieces, line, 1000, &visits)).?.len);
+    const limit = 8;
+    visits = 0;
+    try testing.expect(try rowSplits(a, pieces, line, limit, &visits) == null);
+    try testing.expect(visits <= (limit + 1) * (pieces.len + 1));
+    const fields = try pieceFields(a, pieces);
+    try expectManual("live line splits into row fields more than one way", try chooseSplit(a, pieces, fields, line));
+}
+
+test "chooseSplit: two splits with the same least changed fields are manual" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pieces = try testPieces(a, &.{ "<a>", " ", "<b>", " ", "<c>" }, &.{ "x", "y", "z" });
+    const fields = try pieceFields(a, pieces);
+    try expectManual("live line splits into row fields more than one way", try chooseSplit(a, pieces, fields, "p y y q"));
+}
+
+test "chooseSplit: one field captured twice with different texts is manual" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pieces = try testPieces(a, &.{ "<a>", ":", "<a>" }, &.{ "p", "p" });
+    const fields = try pieceFields(a, pieces);
+    try expectManual("field captured twice with different values", try chooseSplit(a, pieces, fields, "x:p"));
+}
+
+test "valueSplice: replaces a value's whole lines, keeping its key, spacing and comment" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "[[t]]\nkey  =  'old'   # note\nlong = \"\"\"\nline one\nline two\"\"\" # tail\nnext = 1\n";
+    const stmts = try toml_statements.scan(a, src);
+    const row = toml_statements.arrayTableRow(stmts, "t", 0).?;
+    const key = try valueSplice(a, "p", src, row.body[0], "\"new\"");
+    const long = try valueSplice(a, "p", src, row.body[1], "\"x\"");
+    try testing.expectEqualStrings("[[t]]\nkey  =  \"new\"   # note\nlong = \"x\" # tail\nnext = 1\n", try splicedContent(a, src, &.{ key, long }));
+    try testing.expectEqual(@as(u32, 3), long.del);
+}
+
+test "basicString: escapes backslashes, quotes and control characters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("\"a\\\\b \\\"q\\\" \\t\\u0001\"", try basicString(arena.allocator(), "a\\b \"q\" \t\x01"));
+}
+
+test "LoopFile.liveLineAt: a matched line, a line inside a one-for-one hunk, and none" {
+    const hunks = [_]Hunk{
+        .{ .a_start = 1, .a_len = 1, .b_start = 1, .b_len = 1 },
+        .{ .a_start = 3, .a_len = 0, .b_start = 3, .b_len = 2 },
+        .{ .a_start = 4, .a_len = 2, .b_start = 6, .b_len = 2 },
+        .{ .a_start = 6, .a_len = 1, .b_start = 8, .b_len = 0 },
     };
-    const out = try updateTomlRow(arena.allocator(), src, "abbrs", 1, &fields);
-    const expected =
-        \\[[abbrs]]
-        \\key = "ll"
-        \\expansion = "ls -l"
-        \\
-        \\[[abbrs]]
-        \\key = "gs"
-        \\expansion = "git status -sb"
-        \\
-    ;
-    try testing.expectEqualStrings(expected, out);
+    const b_lines = [_][]const u8{ "l0", "L1", "l2", "i0", "i1", "l3", "L4", "L5", "l7" };
+    const lf: LoopFile = .{ .file = undefined, .stored = true, .segments = &.{}, .a_lines = &.{}, .b_lines = &b_lines, .hunks = &hunks };
+    try testing.expectEqualStrings("l0", lf.liveLineAt(0, false).?);
+    try testing.expectEqualStrings("L1", lf.liveLineAt(1, false).?);
+    try testing.expectEqualStrings("l3", lf.liveLineAt(3, false).?);
+    try testing.expect(lf.liveLineAt(4, false) == null);
+    try testing.expectEqualStrings("L5", lf.liveLineAt(5, true).?);
+    try testing.expect(lf.liveLineAt(6, true) == null);
+    try testing.expectEqualStrings("l7", lf.liveLineAt(7, false).?);
 }
 
 test "replaceTokens: renames only complete-token occurrences, not superstrings" {
@@ -7441,7 +8021,8 @@ test "routeHunk: a private-only base file's edit is flagged private by location"
         .xdg_data_home = "",
         .xdg_state_home = "",
     };
-    const route = try routeHunk(a, io, &segs, hunk, file, &a_lines, &b_lines, &m_state);
+    var lf: LoopFile = .{ .file = file, .stored = true, .segments = &segs, .a_lines = &a_lines, .b_lines = &b_lines, .hunks = &.{hunk} };
+    const route = try routeHunk(try testClassCtx(a, io, &m_state), &lf, hunk);
     try testing.expect(route == .line);
     try testing.expect(route.line.edit.private);
 }
@@ -7488,9 +8069,49 @@ test "routeHunk: a base file in a sibling directory whose name extends the priva
         .xdg_data_home = "",
         .xdg_state_home = "",
     };
-    const route = try routeHunk(a, io, &segs, hunk, file, &a_lines, &b_lines, &m_state);
+    var lf: LoopFile = .{ .file = file, .stored = true, .segments = &segs, .a_lines = &a_lines, .b_lines = &b_lines, .hunks = &.{hunk} };
+    const route = try routeHunk(try testClassCtx(a, io, &m_state), &lf, hunk);
     try testing.expect(route == .line);
     try testing.expect(!route.line.edit.private);
+}
+
+/// A routing context over `m_state` with no bindings, secrets or input.
+fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.MachineState) !*const ClassCtx {
+    const bindings = try a.create(std.StringHashMap([]const u8));
+    bindings.* = .init(a);
+    const live = try a.create(mox.dsl.resolver.Resolver.Live);
+    live.* = .{ .bindings = bindings };
+    const resolver = try a.create(mox.dsl.resolver.Resolver);
+    resolver.* = .{ .live = live };
+    const secret_map = try a.create(std.process.Environ.Map);
+    secret_map.* = .init(a);
+    const secret_cache = try a.create(mox.secret.cache.Cache);
+    secret_cache.* = .init(a);
+    const out = try a.create(Io.Writer.Allocating);
+    out.* = .init(a);
+    const reader = try a.create(Io.Reader);
+    reader.* = Io.Reader.fixed("");
+    const claims = try a.create(Claims);
+    claims.* = .empty;
+    const cc = try a.create(ClassCtx);
+    cc.* = .{
+        .arena = a,
+        .io = io,
+        .this_bindings = bindings,
+        .resolver = resolver,
+        .m_state = m_state,
+        .secrets = .{ .env = mox.env.Env{ .map = secret_map }, .cache = secret_cache },
+        .machine = mox.machine.bindings.firstLabel(m_state.hostname),
+        .stdout = &out.writer,
+        .err = &out.writer,
+        .input = reader,
+        .ask_mode = .assume_default,
+        .report_mode = false,
+        .interactive = false,
+        .sty = .{ .on = false },
+        .claims = claims,
+    };
+    return cc;
 }
 
 test "resolveCoupling: a q-abort after a decline persists no decline" {

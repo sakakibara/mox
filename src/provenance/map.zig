@@ -30,8 +30,18 @@ pub const Origin = union(enum) {
     /// as manual.
     overlay: struct { path: []const u8 },
     /// A loop body row. `data_source` is the absolute data file; `row` the
-    /// 0-based row index; `template` the loop body template (for reverse-parse).
-    loop: struct { data_source: []const u8, row: u32, template: []const u8 },
+    /// 0-based row index; `template` the loop body template a live line is
+    /// split against.
+    /// `variable` and `site` are known only on a fresh compose and never
+    /// persisted: the loop variable, and the loop's index in the compose's
+    /// loop list when one was requested.
+    loop: struct {
+        data_source: []const u8,
+        row: u32,
+        template: []const u8,
+        variable: []const u8 = "",
+        site: ?u32 = null,
+    },
     /// A resolved secret value: never routed.
     secret,
     /// A base line whose text was changed by `<machine.X>` interpolation:

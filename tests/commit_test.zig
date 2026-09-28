@@ -5937,17 +5937,28 @@ var restore_fail_calls: usize = 0;
 var restore_fail_from: usize = 0;
 var restore_fail_to: usize = std.math.maxInt(usize);
 var restore_fail_real: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File = undefined;
+var restore_fail_real_open: *const fn (?*anyopaque, Io.Dir, []const u8, Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File = undefined;
+
+/// Whether this call on `sub_path` is one of the calls on the target that
+/// fail.
+fn failsNow(sub_path: []const u8) bool {
+    if (restore_fail_target.len == 0 or !namesFailTarget(sub_path)) return false;
+    restore_fail_calls += 1;
+    return restore_fail_calls >= restore_fail_from and restore_fail_calls <= restore_fail_to;
+}
 
 fn restoreFailingCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
-    if (restore_fail_target.len > 0 and namesFailTarget(sub_path)) {
-        restore_fail_calls += 1;
-        if (restore_fail_calls >= restore_fail_from and restore_fail_calls <= restore_fail_to) return error.AccessDenied;
-    }
+    if (failsNow(sub_path)) return error.AccessDenied;
     return restore_fail_real(userdata, dir, sub_path, opts);
 }
 
-/// Whether `path` names the file whose creates fail, however it is spelled:
-/// commit writes a source by its real path.
+fn failingOpenFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+    if (failsNow(sub_path)) return error.AccessDenied;
+    return restore_fail_real_open(userdata, dir, sub_path, opts);
+}
+
+/// Whether `path` names the file whose calls fail, however it is spelled:
+/// commit reaches a source by its real path.
 fn namesFailTarget(path: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = Io.Dir.cwd().realPathFile(std.testing.io, path, &buf) catch return std.mem.eql(u8, path, restore_fail_target);
@@ -5975,13 +5986,27 @@ fn failingCreates(h: Harness, vtable: *Io.VTable, target: []const u8, from: usiz
 /// `h` with the `from`-th through `to`-th creates of the existing file
 /// `target` failing.
 fn failingCreatesThrough(h: Harness, vtable: *Io.VTable, target: []const u8, from: usize, to: usize) !Harness {
+    return failingCallsThrough(h, vtable, .create, target, from, to);
+}
+
+/// `h` with the `from`-th through `to`-th creates, or opens, of the existing
+/// file `target` failing.
+fn failingCallsThrough(h: Harness, vtable: *Io.VTable, call: enum { create, open }, target: []const u8, from: usize, to: usize) !Harness {
     restore_fail_target = try Io.Dir.cwd().realPathFileAlloc(h.io, target, h.a);
     restore_fail_calls = 0;
     restore_fail_from = from;
     restore_fail_to = to;
-    restore_fail_real = h.io.vtable.dirCreateFile;
     vtable.* = h.io.vtable.*;
-    vtable.dirCreateFile = restoreFailingCreateFile;
+    switch (call) {
+        .create => {
+            restore_fail_real = h.io.vtable.dirCreateFile;
+            vtable.dirCreateFile = restoreFailingCreateFile;
+        },
+        .open => {
+            restore_fail_real_open = h.io.vtable.dirOpenFile;
+            vtable.dirOpenFile = failingOpenFile;
+        },
+    }
     var faulty = h;
     faulty.io = .{ .userdata = h.io.userdata, .vtable = vtable };
     return faulty;
@@ -6424,24 +6449,21 @@ test "commit: a coupling rename into a data row field a loop template reads thro
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
 }
 
-/// A generator over data/entries.toml whose leaves also render the email
-/// fact, a loop file with `loop_body` over the same source, and a file that
-/// routes a new email to the fact but fails: the fact is then reverted, and
-/// an edited leaf no longer reproduces.
+/// A generator over data/entries.toml and a loop file with `loop_body` over
+/// the same source.
 fn writeLeafAndLoopFixture(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, loop_body: []const u8) !void {
     try writeRepo(io, tmp, "repo/data/entries.toml", "[[entries]]\nslug = \"a\"\nvalue = \"1\"\nlabel = \"x\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\nlabel = \"y\"\n");
-    try writeRepo(io, tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> <machine.email | default \"nobody@example.com\">\n# mox: end\n");
+    try writeRepo(io, tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value>\n# mox: end\n");
     try writeRepo(io, tmp, "repo/src/.zloop", try std.fmt.allocPrint(a, "# mox: for entry in \"data/entries.toml\"\n{s}\n# mox: end\n", .{loop_body}));
-    try writeRepo(io, tmp, "repo/src/.pfile", "export EDITOR=vim\nexport SPACER=1\nexport EMAIL=<machine.email | default \"nobody@example.com\">\n" ++ os_blocks);
-    try writeRepo(io, tmp, "home/.config/mox/facts.toml", "email = \"old@home.com\"\n");
 }
 
-/// The leaf's value and the email edited; .pfile's EDITOR line sent to the
-/// private layer and its email routed to the fact.
-fn editLeafAndFact(io: Io, a: std.mem.Allocator, h: Harness) !void {
-    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 old@home.com", "key=99 new@home.com");
-    try editLive(io, a, try h.liveOf(".pfile"), "EDITOR=vim", "EDITOR=nvim");
-    try editLive(io, a, try h.liveOf(".pfile"), "EMAIL=old@home.com", "EMAIL=new@home.com");
+/// Commit with the edited leaf's live copy unreadable from its second open
+/// on: routing reads it, verification cannot, so the leaf fails.
+fn commitFailingLeaf(h: Harness) !testutil.RunResult {
+    var vtable: Io.VTable = undefined;
+    const faulty = try failingCallsThrough(h, &vtable, .open, try h.liveOf(".config/id-a.inc"), 2, std.math.maxInt(usize));
+    defer restore_fail_target = "";
+    return faulty.run(&.{ "mox", "commit", "--yes", "--color=never" });
 }
 
 test "commit: a row write a loop file and a failing leaf both made stays under the loop file" {
@@ -6457,19 +6479,18 @@ test "commit: a row write a loop file and a failing leaf both made stays under t
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
 
-    try editLeafAndFact(io, a, h);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=99");
     try editLive(io, a, try h.liveOf(".zloop"), "val 1", "val 99");
 
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\nf\ny\n");
+    const res = try commitFailingLeaf(h);
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
-    // The leaf fails once the fact is reverted, but the row write is also the
-    // loop file's, which passes: the data file keeps it.
+    // The leaf fails, but the row write is also the loop file's, which
+    // passes: the data file keeps it.
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, data_path), "value = \"99\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zloop") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/.config/id-a.inc: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{try h.liveOf(".pfile")}), res.err);
+    try std.testing.expectEqualStrings("mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n", res.err);
 }
 
 test "commit: a failing leaf restores a loop file's data source and the loop file is not committed" {
@@ -6487,18 +6508,17 @@ test "commit: a failing leaf restores a loop file's data source and the loop fil
     const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
     const data_before = try read(io, a, data_path);
 
-    try editLeafAndFact(io, a, h);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=99");
     try editLive(io, a, try h.liveOf(".zloop"), "tag y", "tag w");
 
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\nf\ny\n");
+    const res = try commitFailingLeaf(h);
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
     try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zloop") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/.config/id-a.inc: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n" ++
-        "mox commit: ~/.zloop: not committed: {s} was restored because ~/.config/id-a.inc was not committed; commit it on its own with 'mox commit ~/.zloop'\n", .{ try h.liveOf(".pfile"), data_path }), res.err);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n" ++
+        "mox commit: ~/.zloop: not committed: {s} was restored because ~/.config/id-a.inc was not committed; commit it on its own with 'mox commit ~/.zloop'\n", .{data_path}), res.err);
 }
 
 test "commit: a coupling rename into a data row field read through another field's stored value is dropped" {
@@ -6614,7 +6634,7 @@ test "commit: a coupled update into a generator source is verified through its l
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
 }
 
-test "commit: a coupled update into a generator source that fails a routed leaf is undone" {
+test "commit: a coupling rename into a generator source whose routed template holds the token is dropped" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6635,14 +6655,16 @@ test "commit: a coupled update into a generator source that fails a routed leaf 
     try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 quokkanote", "key=99 quokkanote");
     try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
 
+    // The leaf's row write was checked against the template the rename
+    // would rewrite, so the rename is not offered there.
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
-    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
-    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data/entries.toml" })));
+    try std.testing.expectEqualStrings("[[entries]]\nslug = \"a\"\nvalue = \"99\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data/entries.toml" })));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
-    try std.testing.expectEqualStrings("mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n" ++
-        "mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc could not take it (~/.config/id-a.inc was not committed)\n", res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled, 0 manual") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n", .{try h.srcOf(".config/gen.inc")}), res.err);
 }
 
 test "commit: a coupled update that changes nothing in a generator source leaves a failing leaf's line the only one" {
@@ -6690,7 +6712,7 @@ test "commit: a coupled update that changes nothing in a generator source leaves
     }), res.err);
 }
 
-test "commit: a coupled update into a generator source whose leaf fails only in settling is undone as not committed" {
+test "commit: --dry-run predicts a coupling rename into a generator source whose routed template holds the token is dropped" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6698,8 +6720,39 @@ test "commit: a coupled update into a generator source whose leaf fails only in 
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The token is only in a default no row renders, so the update leaves
-    // the leaves as they are live.
+    const gen_src = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> quokkanote\n# mox: end\n";
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", gen_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 quokkanote", "key=99 quokkanote");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data/entries.toml" })));
+    try std.testing.expectEqualStrings("note quokkanote\n", try read(io, a, try h.srcOf(".aenv")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routable, 0 coupled, 0 manual") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n", .{try h.srcOf(".config/gen.inc")}), res.err);
+}
+
+test "commit: a coupling rename into a generator source with a routed leaf is dropped, and the leaf settles with its data source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The token is only in a default no row renders, but the template holds
+    // it, and every token of a generator source is in its directive lines or
+    // its template.
     const gen_src = "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> <entry.note | default \"quokkanote\">\n# mox: end\n";
     const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\nnote = \"x\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\nnote = \"y\"\n";
     try writeRepo(io, &tmp, "repo/data/entries.toml", data);
@@ -6716,18 +6769,17 @@ test "commit: a coupled update into a generator source whose leaf fails only in 
     try editLive(io, a, try h.liveOf(".zloop"), "EDITOR=vim", "EDITOR=nvim");
     try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
 
-    // The generator passes its first verification. .zloop fails, the data
-    // source is restored, the leaf fails with it, and the generator then
-    // fails its re-verification through the leaf: it was not committed.
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n4\ny\n");
+    // .zloop fails, the data source is restored, and the leaf fails with it.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ny\ny\n4\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n" ++
-        "mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc was not committed\n", .{
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n" ++
+        "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{
+        try h.srcOf(".config/gen.inc"),
         try h.liveOf(".zloop"),
         try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }),
     }), res.err);
@@ -6889,7 +6941,9 @@ fn expectSpelledDataCommits(io: Io, a: std.mem.Allocator, h: Harness) !void {
 /// another spelling, is not committed either.
 fn expectSpelledDataFailsTogether(io: Io, a: std.mem.Allocator, h: Harness) !void {
     try editLive(io, a, try h.liveOf(".abbrs"), "EDITOR=vim", "EDITOR=nvim");
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ny\ny\n");
+    // abbrs.toml declines its key line, which the row write also makes, and
+    // routes the other: the row write stays .abbrs's alone.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ns\ny\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try h.srcOf("abbrs.toml")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") == null);
@@ -7113,8 +7167,9 @@ test "commit: a data source hard-linked to a managed file is one path with that 
     try editLive(io, a, try h.liveOf("abbrs.toml"), "\"git status\"", "\"git status -sb\"");
 
     // .abbrs: route the row, send EDITOR to the private layer, which leaves
-    // it unrouted. abbrs.toml: route its first line, decline the second.
-    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ny\ns\n");
+    // it unrouted. abbrs.toml: decline its first line, which the row write
+    // also makes, and route the second.
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ns\ny\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try h.srcOf("abbrs.toml")));
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
@@ -7937,4 +7992,834 @@ test "commit: a coupling target failed by a restored data source it wrote is nam
         try h.liveOf(".zaliases"),
         try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
     }), res.err);
+}
+
+const email_facts = "email = \"old@home.com\"\n";
+const held_email_line = "export EMAIL=<machine.email | default \"nobody@example.com\">\n";
+
+/// Hold a hunk of `name`: its email line, a capture that `--yes` leaves
+/// manual.
+fn holdEmail(io: Io, a: std.mem.Allocator, h: Harness, name: []const u8) !void {
+    try editLive(io, a, try h.liveOf(name), "EMAIL=old@home.com", "EMAIL=new@home.com");
+}
+
+const three_abbrs = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n\n[[abbrs]]\nkey = \"gd\"\nexpansion = \"git diff\"\n";
+
+test "commit: a loop row edit whose data source gained a row above it since the last apply is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key> <entry.expansion>\n# mox: end\n" ++ held_email_line);
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // A row pulled in since the apply shifts every row after it.
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" });
+    const pulled = "[[abbrs]]\nkey = \"zz\"\nexpansion = \"zoxide\"\n\n" ++ three_abbrs;
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", pulled);
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr gs git status", "abbr gs git status -sb");
+    try holdEmail(io, a, h, ".abbrs");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(pulled, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 2 manual") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop row edit is manual when a row up to it rendered differently at the last apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key> <entry.expansion>\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The first row changed in the data since the apply; live still shows
+    // what the apply wrote there.
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" });
+    try editLive(io, a, data_path, "ls -l", "ls -la");
+    const data_before = try read(io, a, data_path);
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr gs git status", "abbr gs git status -sb");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop row edit beside a row already committed into its source routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key> <entry.expansion>\n# mox: end\nexport SPACER=1\n" ++ held_email_line);
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The first row commits beside a held hunk, so the applied record stays
+    // where the apply left it while the source and live both hold the edit.
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll ls -l", "abbr ll ls -la");
+    try holdEmail(io, a, h, ".abbrs");
+    const first = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), first.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try h.liveOf(".abbrs")}), first.err);
+
+    // The third row's edit routes: the first row already matches live. That
+    // row's own hunk is re-offered against a source that moved on, so it
+    // stays manual.
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr gd git diff", "abbr gd git diff -w");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(
+        "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -la\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n\n[[abbrs]]\nkey = \"gd\"\nexpansion = \"git diff -w\"\n",
+        try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  update ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 2 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try h.liveOf(".abbrs")}), res.err);
+}
+
+test "commit: a loop row edit is manual when its line is not unique among the loop's rows" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rows = "[[hosts]]\nname = \"a\"\nport = \"22\"\n\n[[hosts]]\nname = \"b\"\nport = \"22\"\n\n[[hosts]]\nname = \"c\"\nport = \"22\"\n";
+    try writeRepo(io, &tmp, "repo/data/hosts.toml", rows);
+    try writeRepo(io, &tmp, "repo/src/.ports", "# mox: for entry in \"data/hosts.toml\"\nport <entry.port>\n# mox: end\nexport SPACER=1\n" ++ held_email_line);
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // A row rendering the same text arrived at the top since the apply:
+    // every (row, text) up to the third row is unchanged.
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "hosts.toml" });
+    const pulled = "[[hosts]]\nname = \"z\"\nport = \"22\"\n\n" ++ rows;
+    try writeRepo(io, &tmp, "repo/data/hosts.toml", pulled);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".ports"), .data = "port 22\nport 22\nport 2222\nexport SPACER=1\nexport EMAIL=new@home.com\n" });
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(pulled, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.ports:3 data row is not unique in its loop\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a generator leaf left alone while its data row changed since the last apply is not routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{ .{ "a", "1" }, .{ "b", "2" } });
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
+    try editLive(io, a, data_path, "value = \"1\"", "value = \"5\"");
+    const data_before = try read(io, a, data_path);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 0 manual") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: an edited generator leaf whose data row changed since the last apply is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeGenValueFixture(io, &tmp, &.{ .{ "a", "1" }, .{ "b", "2" } });
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" });
+    try editLive(io, a, data_path, "value = \"1\"", "value = \"5\"");
+    const data_before = try read(io, a, data_path);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=7");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row write beside a held edit, in its own managed data file, to a field the loop reads is not committed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n\n[meta]\nnote = \"<machine.email>\"\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The data file's own copy renames the row's key, which the loop reads,
+    // and holds its capture line; the loop file edits the row's expansion.
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "key = \"gs\"", "key = \"gss\"");
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "note = \"old@home.com\"", "note = \"new@home.com\"");
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    const data_path = try h.srcOf("abbrs.toml");
+    try std.testing.expectEqualStrings(data, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try h.liveOf(".abbrs"), data_path }), res.err);
+}
+
+test "commit: a loop row routes through a loop variable not named entry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for h in \"data/abbrs.toml\"\nabbr <h.key>=\"<h.expansion>\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings(
+        "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\n\n[[abbrs]]\nkey = \"gd\"\nexpansion = \"git diff\"\n",
+        try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+/// A loop file `.abbrs` over data/abbrs.toml rendering `template` for each
+/// row, applied, with `data` as the data file.
+fn loopFixture(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, data: []const u8, template: []const u8) !Harness {
+    try writeRepo(io, tmp, "repo/data/abbrs.toml", data);
+    try writeRepo(io, tmp, "repo/src/.abbrs", try std.fmt.allocPrint(a, "# mox: for entry in \"data/abbrs.toml\"\n{s}\n# mox: end\n", .{template}));
+    try writeRepo(io, tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    return h;
+}
+
+fn abbrsData(h: Harness) ![]const u8 {
+    return read(h.io, h.a, try std.fs.path.join(h.a, &.{ h.repo, "data", "abbrs.toml" }));
+}
+
+test "commit: a row write ends at the next table header of any kind" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[meta]\nexpansion = \"keep\"\n", "abbr <entry.key>=\"<entry.expansion>\"");
+    try editLive(io, a, try h.liveOf(".abbrs"), "ls -l", "ls -la");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -la\"\n\n[meta]\nexpansion = \"keep\"\n", try abbrsData(h));
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row write never rewrites a line inside a multi-line value of its row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, "[[abbrs]]\nkey = \"ll\"\nnote = \"\"\"\nexpansion = inside\n\"\"\"\nexpansion = \"ls -l\"\n", "abbr <entry.key>=\"<entry.expansion>\"");
+    try editLive(io, a, try h.liveOf(".abbrs"), "ls -l", "ls -la");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"ll\"\nnote = \"\"\"\nexpansion = inside\n\"\"\"\nexpansion = \"ls -la\"\n", try abbrsData(h));
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+const host_row = "[[abbrs]]\nname = \"ll\"   # the name\nport = 22\ndir = \"<machine.email>/bin\"\nshells = [\"fish\", \"zsh\"]\n";
+const host_template = "host <entry.name> <entry.port> <entry.dir> <entry.shells>";
+
+test "commit: a row write leaves the fields it did not change as they are" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, host_row, host_template);
+    try editLive(io, a, try h.liveOf(".abbrs"), "host ll ", "host lll ");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nname = \"lll\"   # the name\nport = 22\ndir = \"<machine.email>/bin\"\nshells = [\"fish\", \"zsh\"]\n", try abbrsData(h));
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a changed integer field is written as an integer, and a new value it cannot hold is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, host_row, host_template);
+    try editLive(io, a, try h.liveOf(".abbrs"), " 22 ", " 2222 ");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nname = \"ll\"   # the name\nport = 2222\ndir = \"<machine.email>/bin\"\nshells = [\"fish\", \"zsh\"]\n", try abbrsData(h));
+
+    try editLive(io, a, try h.liveOf(".abbrs"), " 2222 ", " many ");
+    const bad = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), bad.rc);
+    try std.testing.expect(std.mem.indexOf(u8, bad.out, "  manual: ~/.abbrs:1 data value type\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try abbrsData(h), "port = 2222\n") != null);
+    try std.testing.expectEqualStrings("", bad.err);
+}
+
+test "commit: a changed field whose stored value holds a capture is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, host_row, host_template);
+    try editLive(io, a, try h.liveOf(".abbrs"), "old@home.com/bin", "old@home.com/sbin");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(host_row, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data value holds a capture\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a changed array field is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, host_row, host_template);
+    try editLive(io, a, try h.liveOf(".abbrs"), "fish,zsh", "fish,zsh,bash");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(host_row, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data value is an array\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a changed string field is written as a TOML string with its quotes and backslashes escaped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, "[[abbrs]]\nkey = \"hi\"\nexpansion = 'echo hi'  # say it\n", "abbr <entry.key> <entry.expansion>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "echo hi", "echo \"hi\" \\ there");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"hi\"\nexpansion = \"echo \\\"hi\\\" \\\\ there\"  # say it\n", try abbrsData(h));
+    try std.testing.expectEqualStrings("", res.err);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a new string value that introduces a capture is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"hi\"\nexpansion = \"echo hi\"\n";
+    const h = try loopFixture(io, a, &tmp, data, "abbr <key> <expansion>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "echo hi", "echo <machine.email>");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 new value holds a capture\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: an edit to the second line of a loop row spanning lines is manual, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\ntext = \"one\\ntwo\"\n\n[[abbrs]]\ntext = \"three\"\n";
+    const h = try loopFixture(io, a, &tmp, data, "<entry.text>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "two\n", "TWO\n");
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.abbrs:2 data row spans several lines\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") == null);
+    try std.testing.expectEqualStrings("", dry.err);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 data row spans several lines\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: an edit to a generator leaf whose row renders several lines is manual, and --dry-run agrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value>\n# mox: end\n");
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\\n2\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1", "key=9");
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.config/id-a.inc:1 data row spans several lines\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") == null);
+    try std.testing.expectEqualStrings("", dry.err);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 data row spans several lines\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row write lands on its row when a line edit to the data file adds a row above it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\nshell = \"fish\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\nshell = \"fish\"\n";
+    try writeRepo(io, &tmp, "repo/src/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"src/abbrs.toml\" where entry.shell = \"fish\"\nabbr <entry.key>=\"<entry.expansion>\"\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The data file's own copy gains a row the loop filters out, above the
+    // row the loop file edits; each live copy carries the row edit.
+    const added = "[[abbrs]]\nkey = \"zz\"\nexpansion = \"zoxide\"\nshell = \"zsh\"\n\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("abbrs.toml"), .data = added ++ data });
+    try editLive(io, a, try h.liveOf("abbrs.toml"), "git status", "git status -sb");
+    try editLive(io, a, try h.liveOf(".abbrs"), "git status", "git status -sb");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings(
+        added ++ "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\nshell = \"fish\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\nshell = \"fish\"\n",
+        try read(io, a, try h.srcOf("abbrs.toml")),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop line that splits into row fields several ways writes the one field set the edit changed least" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, "[[abbrs]]\na = \"1\"\nb = \"2\"\nc = \"3\"\n", "<entry.a>,<entry.b>,<entry.c>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "1,2,3", "1,x,y,3");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings("[[abbrs]]\na = \"1\"\nb = \"x,y\"\nc = \"3\"\n", try abbrsData(h));
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop line whose edit splits into row fields more than one way is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\na = \"p\"\nb = \"q\"\n";
+    const h = try loopFixture(io, a, &tmp, data, "<entry.a> <entry.b>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "p q", "p  q");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 live line splits into row fields more than one way\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop line capturing one field twice, edited in one place, is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\na = \"p\"\n";
+    const h = try loopFixture(io, a, &tmp, data, "<entry.a>:<a>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "p:p", "x:p");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 field captured twice with different values\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a coupling rename into a loop file's routed template is dropped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const abbrs_src = "# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key> quokkanote\n# mox: end\n" ++ held_email_line;
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", abbrs_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", "note quokkanote\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", email_facts);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll quokkanote", "abbr lll quokkanote");
+    try holdEmail(io, a, h, ".abbrs");
+    try editLive(io, a, try h.liveOf(".aenv"), "quokkanote", "wombatnote");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(abbrs_src, try read(io, a, try h.srcOf(".abbrs")));
+    try std.testing.expect(std.mem.indexOf(u8, try abbrsData(h), "key = \"lll\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled, 1 manual") != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n" ++
+        "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{ try h.srcOf(".abbrs"), try h.liveOf(".abbrs") }), res.err);
+}
+
+test "commit: a row write the file's other loop over the data source renders unchanged is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.hosts", "# mox: for entry in \"data/abbrs.toml\"\nhost <entry.key>\n# mox: end\n# mox: for entry in \"data/abbrs.toml\"\nalias <entry.key>\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".hosts"), "host gs\n", "host gss\n");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row also renders at line 5 without this edit\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row write that makes the row appear in the file's other loop over the data source is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.hosts", "# mox: for entry in \"data/abbrs.toml\"\nhost <entry.key>\n# mox: end\n# mox: for entry in \"data/abbrs.toml\" where entry.key = \"gss\"\nalias <entry.key>\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".hosts"), "host gs\n", "host gss\n");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row would render differently elsewhere in the file\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row edited alike in both of a file's loops over the data source is one write" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.hosts", "# mox: for entry in \"data/abbrs.toml\"\nhost <entry.key>\n# mox: end\n# mox: for entry in \"data/abbrs.toml\"\nalias <entry.key>\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".hosts"), "host gs\n", "host gss\n");
+    try editLive(io, a, try h.liveOf(".hosts"), "alias gs\n", "alias gss\n");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try abbrsData(h), "key = \"gss\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.hosts") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row write that filters the row out of its own loop is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\nkey = \"ll\"\non = \"yes\"\n\n[[abbrs]]\nkey = \"gs\"\non = \"yes\"\n";
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", data);
+    try writeRepo(io, &tmp, "repo/src/.abbrs", "# mox: for entry in \"data/abbrs.toml\" where entry.on = \"yes\"\nabbr <entry.key> <entry.on>\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr gs yes", "abbr gs no");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 the edited row is filtered out\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a leaf row write that moves the leaf is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.slug>\n# mox: end\n");
+    const data = "[[entries]]\nslug = \"a\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=a", "key=z");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 the edited row moves the leaf\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+/// A loop file `.abbrs` whose directive lines are `loop_src`, over
+/// `data_rel`, and `.aenv` holding `token`; the row `ll` edited and `.aenv`
+/// renaming `token` to `renamed`. `--dry-run` and `--yes` both drop the
+/// rename into `.abbrs` with the directive warning.
+fn expectDirectiveTokenDropped(loop_src: []const u8, data_rel: []const u8, token: []const u8, renamed: []const u8) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const stem = std.fs.path.stem(data_rel);
+    try writeRepo(io, &tmp, try std.fmt.allocPrint(a, "repo/{s}", .{data_rel}), try std.fmt.allocPrint(a, "[[{s}]]\nkey = \"ll\"\nkind = \"quokkanote\"\n\n[[{s}]]\nkey = \"gs\"\nkind = \"quokkanote\"\n", .{ stem, stem }));
+    try writeRepo(io, &tmp, "repo/src/.abbrs", loop_src);
+    try writeRepo(io, &tmp, "repo/src/.aenv", try std.fmt.allocPrint(a, "note {s}\n", .{token}));
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor", "--rebuild-coupling" })).rc);
+
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll\n", "abbr lll\n");
+    try editLive(io, a, try h.liveOf(".aenv"), token, renamed);
+    const warning = try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"{s}\" in a loop a row write was routed through; not renaming it there\n", .{ try h.srcOf(".abbrs"), token });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "2 routable, 0 coupled, 0 manual") != null);
+    try std.testing.expectEqualStrings(warning, dry.err);
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expectEqualStrings(loop_src, try read(io, a, try h.srcOf(".abbrs")));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled, 0 manual") != null);
+    try std.testing.expectEqualStrings(warning, res.err);
+}
+
+test "commit: a coupling rename into a loop file whose where holds the token is dropped, and --dry-run predicts it" {
+    try expectDirectiveTokenDropped("# mox: for entry in \"data/abbrs.toml\" where entry.kind = \"quokkanote\"\nabbr <entry.key>\n# mox: end\n", "data/abbrs.toml", "quokkanote", "wombatnote");
+}
+
+test "commit: a coupling rename into a loop file whose data source path is the token is dropped" {
+    try expectDirectiveTokenDropped("# mox: for entry in \"data/quokkanote.toml\"\nabbr <entry.key>\n# mox: end\n", "data/quokkanote.toml", "data/quokkanote.toml", "data/wombatnote.toml");
+}
+
+test "commit: a coupling rename into a loop file whose enclosing gate holds the token is dropped" {
+    try expectDirectiveTokenDropped("# mox: when not profile=\"quokkanote\"\n# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key>\n# mox: end\n# mox: end\n", "data/abbrs.toml", "quokkanote", "wombatnote");
+}
+
+test "commit: a loop line with two splits changing equally few fields is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const data = "[[abbrs]]\na = \"x\"\nb = \"y\"\nc = \"z\"\n";
+    const h = try loopFixture(io, a, &tmp, data, "<entry.a> <entry.b> <entry.c>");
+    try editLive(io, a, try h.liveOf(".abbrs"), "x y z", "p y y q");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 live line splits into row fields more than one way\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop row write that does not render the edited line is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The second capture carries a default, so it is literal text of the
+    // row as it stands; the write renders it changed too.
+    const data = "[[abbrs]]\nkey = \"ll\"\n";
+    const h = try loopFixture(io, a, &tmp, data, "abbr <entry.key> <entry.key | default \"x\">");
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll ll", "abbr lll ll");
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 the edited row does not render the edited line\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a leaf row write that does not render the edited line is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.value> <entry.value | default \"x\">\n# mox: end\n");
+    const data = "[[entries]]\nslug = \"a\"\nvalue = \"1\"\n";
+    try writeRepo(io, &tmp, "repo/data/entries.toml", data);
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".config/id-a.inc"), "key=1 1", "key=9 1");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 the edited row does not render the edited line\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a loop row edit is manual when its line was not unique at the last apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try loopFixture(io, a, &tmp, "[[abbrs]]\nkey = \"ll\"\n\n[[abbrs]]\nkey = \"gs\"\n\n[[abbrs]]\nkey = \"ll\"\n", "abbr <entry.key>");
+    // The duplicate row changed since the apply: only the recorded block
+    // holds the edited row's text twice.
+    const data_path = try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" });
+    const now = "[[abbrs]]\nkey = \"ll\"\n\n[[abbrs]]\nkey = \"gs\"\n\n[[abbrs]]\nkey = \"gd\"\n";
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", now);
+    try editLive(io, a, try h.liveOf(".abbrs"), "abbr ll\nabbr gs", "abbr lll\nabbr gs");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(now, try read(io, a, data_path));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data row is not unique in its loop\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
+}
+
+test "commit: a row write another loop over the data source renders without a row of its own is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", three_abbrs);
+    try writeRepo(io, &tmp, "repo/src/.hosts", "# mox: for entry in \"data/abbrs.toml\"\nhost <entry.key>\n# mox: end\n" ++
+        "# mox: for entry in \"data/abbrs.toml\"\n# mox: when os=darwin\n# alias <entry.key>\n# mox: end\n# mox: end\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf(".hosts"), "host gs\n", "host gss\n");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row also renders elsewhere in the file without a position\n") != null);
+    try std.testing.expectEqualStrings("", res.err);
 }

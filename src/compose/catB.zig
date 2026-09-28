@@ -37,21 +37,24 @@ const Emitter = struct {
 
 /// Emit one base line: interpolate `<machine.X>`/`<secret:...>`, append it with
 /// its trailing newline, and attribute provenance PER LINE -- `.secret` only
-/// when this line resolved an inline secret (so diffs and snapshots redact just
-/// that line, never the whole file), `.interpolated` when machine interp
+/// when this line resolved an inline secret or holds its placeholder (so diffs
+/// and snapshots redact just that line, never the whole file, and a placeholder
+/// compose attributes lines as a resolving one does), `.interpolated` when machine interp
 /// otherwise rewrote it, else `.base`. Both the directive loop and the
 /// directiveless passthrough go through here so their provenance matches.
 fn emitBaseLine(em: *Emitter, arena: std.mem.Allocator, line: []const u8, line_no: u32, machine_present: bool, ctx: interp.Ctx) !void {
     var line_has_secret = false;
+    var line_has_placeholder = false;
     const interpolated = if (machine_present) blk: {
         const exp = try interp.expandTracked(arena, line, null, ctx);
         line_has_secret = exp.secret;
+        line_has_placeholder = exp.placeholder;
         break :blk exp.bytes;
     } else line;
     const start = em.buf.items.len;
     try em.buf.appendSlice(arena, interpolated);
     try em.buf.append(arena, '\n');
-    const origin: Origin = if (line_has_secret)
+    const origin: Origin = if (line_has_secret or line_has_placeholder)
         .secret
     else if (machine_present and !std.mem.eql(u8, interpolated, line))
         .{ .interpolated = .{ .origin_line = line_no } }
@@ -87,7 +90,8 @@ fn bodyLineOrigin(policy: BodyOrigin, i: u32) Origin {
 const BodyTrailing = enum { single, always_add };
 
 /// Emit a body (fragment, region pick, literal/overlay body, when-gate body, or
-/// a loop row) so that ONLY lines resolving an inline secret are `.secret`;
+/// a loop row) so that ONLY lines resolving an inline secret, or holding its
+/// placeholder, are `.secret`;
 /// every other line gets `bodyLineOrigin(policy, i)`. With no secret -- the
 /// common case -- the body is emitted whole in a single span, byte- and
 /// provenance-identical to the site's original append. A secret makes it
@@ -109,7 +113,7 @@ fn emitSecretAwareBody(
     var whole_secret = false;
     const expanded = if (interp_on) blk: {
         const exp = try interp.expandTracked(arena, body, record, ctx);
-        whole_secret = exp.secret;
+        whole_secret = exp.secret or exp.placeholder;
         break :blk exp.bytes;
     } else body;
     if (!whole_secret) {
@@ -135,7 +139,7 @@ fn emitSecretAwareBody(
         var line_secret = false;
         const line_bytes = if (interp_on) blk: {
             const exp = try interp.expandTracked(arena, line, record, ctx);
-            line_secret = exp.secret;
+            line_secret = exp.secret or exp.placeholder;
             break :blk exp.bytes;
         } else line;
         const start = em.buf.items.len;
@@ -545,12 +549,17 @@ pub const GeneratedFile = struct {
     /// `completions` output. Together with `row`, lets `mox commit` route a
     /// field edit in a leaf back to the data source row that produced it.
     data_source: []const u8 = "",
-    /// The loop body's raw (pacifier-stripped, uninterpolated) single-line
-    /// template, or empty when the body carries its own directives (nested)
-    /// or the output is not a `for ... into` row at all: either way there is
-    /// no field-level template to reverse-parse an edit against, so `mox
-    /// commit` treats every line of such a leaf as manual.
+    /// The loop body's raw (pacifier-stripped, uninterpolated) template, or
+    /// empty when the body carries its own directives (nested) or the output
+    /// is not a `for ... into` row at all: either way there is no field-level
+    /// template to split an edit against, so `mox commit` treats every line
+    /// of such a leaf as manual.
     template: []const u8 = "",
+    /// The loop variable, `where` predicate and `into` path template of the
+    /// `for ... into` that produced this row; unset for a `completions` output.
+    variable: []const u8 = "",
+    where: ?*const dsl.ast.RowExpr = null,
+    into: []const u8 = "",
 };
 
 /// Compose a GENERATOR: a managed file whose SOLE top-level directive is a
@@ -690,6 +699,9 @@ pub fn composeGenerator(
             .row = row_idx,
             .data_source = rows.data_path,
             .template = if (!nested) stripped else "",
+            .variable = loop.variable,
+            .where = loop.where,
+            .into = template,
         });
     }
 
@@ -1389,13 +1401,20 @@ fn emitForLoop(
         if (ctx.diag) |dg| dg.set(data_path);
         return error.DataSourceArrayNotFound;
     };
+    const rows_attributed = !nest.in_for and !nested;
+    var site: ?u32 = null;
+    if (ctx.diag) |dg| if (dg.loops) |sites| {
+        site = @intCast(sites.items.len);
+        try sites.append(arena, .{ .data_source = data_path, .template = stripped, .variable = loop.variable, .where = loop.where, .attributed = rows_attributed });
+    };
 
     // Per-row `where` skips non-matching records. A row expands its template
     // UNCONDITIONALLY (a row always carries a record, so `<entry.X>` resolves
     // even with a null machine). Each row is attributed to its data-source row
-    // so commit can reverse-parse an edit back into it -- but only a TOP-LEVEL
-    // loop; a NESTED loop's rows go to the overlay (manual), since a
-    // recursively-composed line cannot be reverse-parsed to one data row.
+    // so commit can route an edit back into it -- but only in a TOP-LEVEL loop
+    // whose body holds no directive; any other loop's rows go to the overlay
+    // (manual), since a recursively-composed line cannot be split into one
+    // data row's fields.
     for (records, 0..) |*record_ptr, row_idx| {
         scope[0] = .{ .name = loop.variable, .value = .{ .record = record_ptr } };
         // Set the row frame first so a `where` can reference the loop variable
@@ -1407,10 +1426,10 @@ fn emitForLoop(
             const inner: Nest = .{ .marker = nest.marker, .record = record_ptr, .in_for = true, .depth = nest.depth + 1 };
             try emitParsedBody(arena, io, em, file, bindings, ctx2, secrets, loop.body_template, parsed_body, inner);
         } else {
-            const origin: Origin = if (nest.in_for)
+            const origin: Origin = if (!rows_attributed)
                 overlayOrigin(file)
             else
-                .{ .loop = .{ .data_source = data_path, .row = @intCast(row_idx), .template = stripped } };
+                .{ .loop = .{ .data_source = data_path, .row = @intCast(row_idx), .template = stripped, .variable = loop.variable, .site = site } };
             try emitSecretAwareBody(em, arena, stripped, ctx2, true, record_ptr, .always_add, .{ .flat = origin });
         }
     }
