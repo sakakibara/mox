@@ -1662,14 +1662,14 @@ test "commit: a coupled update that would diverge an unaffected configuration is
     // naming the configuration, never a machine id, and B restored.
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.gitconfig undone: ~/.gitconfig could not take it (configuration os=linux would change)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.gitconfig undone: ~/.gitconfig could not take it (configuration os=linux would change)\n"), res.err);
 
     // B's source is byte-identical: the unsafe coupling edit was rolled back.
     try std.testing.expectEqualStrings(b_before, try read(io, a, gitconfig_src));
     // The origin's own edit does not depend on the coupled update: it stays
     // committed.
     try std.testing.expectEqualStrings("email = shared@new.example\n", try read(io, a, try h.srcOf(".zshrc")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.zshrc")) != null);
 }
 
 test "commit: dry-run writes neither the routed nor the coupled edit" {
@@ -3412,7 +3412,7 @@ test "commit: a manual-only file that took a coupled edit is not reported commit
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/x.toml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/x.toml")) == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled, 1 manual") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "x.toml: 1 hunk(s) could not be routed and remain only in the live file; not committed") != null);
 }
@@ -3459,7 +3459,7 @@ test "commit: a coupled token update that changes only some configurations a fil
     try editLive(io, a, try h.liveOf(".myenv"), "quokkatoken", "wombattoken");
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/x.conf undone: ~/.config/x.conf could not take it (configuration os=linux would change)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/x.conf undone: ~/.config/x.conf could not take it (configuration os=linux would change)\n"), res.err);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.conf")));
 }
 
@@ -3484,7 +3484,7 @@ test "commit: a coupled token update that breaks a source where it exists is ref
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (configuration os=linux would be unable to compose)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (configuration os=linux would be unable to compose)\n"), res.err);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.toml")));
 }
 
@@ -5654,12 +5654,12 @@ test "commit: a file whose data source is restored for another file's failure is
     // The data source holds its pre-run bytes, so the file whose row edit it
     // held is not committed, says why, and keeps its applied record.
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.abbrs: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.abbrs'\n", .{
-        try h.liveOf(".zaliases"),
+        try shownLive(a, ".zaliases"),
         try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
-    }), res.err);
+    })), res.err);
     try std.testing.expectEqualStrings(abbrs_before, (try appliedContent(h, ".abbrs")).?);
 }
 
@@ -5689,12 +5689,12 @@ test "commit: a file with a held hunk whose routed row lands in a restored data 
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.abbrs: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.abbrs'\n", .{
-        try h.liveOf(".zaliases"),
+        try shownLive(a, ".zaliases"),
         try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
-    }), res.err);
+    })), res.err);
 }
 
 /// A multi-configuration file whose first line carries `token`, and whose
@@ -5728,8 +5728,8 @@ test "commit: a coupled update from a file that is not committed is undone and n
 
     try std.testing.expectEqualStrings("quokkatoken signing\n", try read(io, a, try h.srcOf(".tsigners")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: coupled update to ~/.tsigners undone: ~/.bshrc was not committed\n", .{try h.liveOf(".bshrc")}), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: coupled update to ~/.tsigners undone: ~/.bshrc was not committed\n", .{try shownLive(a, ".bshrc")})), res.err);
 }
 
 test "commit: two origins coupling one target, one not committed, undo both updates and keep the other origin" {
@@ -5759,11 +5759,11 @@ test "commit: two origins coupling one target, one not committed, undo both upda
     // neither is counted. The origin that passed is still committed.
     try std.testing.expectEqualStrings("alphatoken1 quokkatoken\n", try read(io, a, try h.srcOf(".tsigners")));
     try std.testing.expectEqualStrings("note alphatoken2\n", try read(io, a, try h.srcOf(".aenv")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: coupled update to ~/.tsigners undone: {s} was restored because ~/.bshrc was not committed\n" ++
-        "mox commit: coupled update to ~/.tsigners undone: ~/.bshrc was not committed\n", .{ try h.liveOf(".bshrc"), try h.srcOf(".tsigners") }), res.err);
+        "mox commit: coupled update to ~/.tsigners undone: ~/.bshrc was not committed\n", .{ try shownLive(a, ".bshrc"), try h.srcOf(".tsigners") })), res.err);
 }
 
 test "commit: a symlink whose sync fails restores only its own source" {
@@ -5793,9 +5793,9 @@ test "commit: a symlink whose sync fails restores only its own source" {
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("/tmp/mox-a-new\n", try read(io, a, try h.srcOf("alink")));
     try std.testing.expectEqualStrings("/tmp/mox-b-old\n", try read(io, a, try h.srcOf("blink")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/alink") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/blink") == null);
-    try std.testing.expectEqualStrings("mox commit: ~/blink: recomposed symlink target does not match; not committed\n", res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/alink")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/blink")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: ~/blink: recomposed symlink target does not match; not committed\n"), res.err);
 }
 
 test "commit: a generator leaf whose data source is restored for a file's failure is not committed" {
@@ -5821,9 +5821,9 @@ test "commit: a generator leaf whose data source is restored for a file's failur
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
     try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{ try h.liveOf(".zloop"), data_path }), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/id-a.inc")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{ try shownLive(a, ".zloop"), data_path })), res.err);
 }
 
 test "commit: a coupling graph entry that names no managed source is not written" {
@@ -5853,7 +5853,7 @@ test "commit: a coupling graph entry that names no managed source is not written
     try std.testing.expectEqualStrings("old@example.com\n", try read(io, a, notes));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "notes.txt") == null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} is no managed file's source; not updating it\n", .{notes}), res.err);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.myenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.myenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
 }
 
@@ -5885,9 +5885,9 @@ test "commit: a file verified under a fact that is then reverted is re-verified 
 
     try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
     try std.testing.expectEqualStrings(email_line, try read(io, a, try h.srcOf(".rfile")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.rfile") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n", .{try h.liveOf(".pfile")}), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.rfile")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n", .{try shownLive(a, ".pfile")})), res.err);
 }
 
 test "commit: a coupling target failed by a fact revert prints the fact line, and its update as not committed" {
@@ -5927,9 +5927,9 @@ test "commit: a coupling target failed by a fact revert prints the fact line, an
     try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
     try std.testing.expectEqualStrings(rfile, try read(io, a, try h.srcOf(".rfile")));
     try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n" ++
-        "mox commit: coupled update to ~/.rfile undone: ~/.rfile was not committed\n", .{try h.liveOf(".pfile")}), res.err);
+        "mox commit: coupled update to ~/.rfile undone: ~/.rfile was not committed\n", .{try shownLive(a, ".pfile")})), res.err);
 }
 
 var restore_fail_target: []const u8 = "";
@@ -6327,10 +6327,10 @@ test "commit: a facts write that fails restores the routed source, leaves the fa
     try std.testing.expectEqualStrings(facts_before, try read(io, a, facts));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write ~/.config/mox/facts.toml (AccessDenied)\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: could not write ~/.config/mox/facts.toml (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{try h.srcOf(".zshrc")}), res.err);
+        "mox commit: 0 package row(s) already recorded\n", .{try h.srcOf(".zshrc")})), res.err);
 }
 
 test "commit: a path the journal cannot read stops the run before any write" {
@@ -6366,6 +6366,22 @@ test "commit: a path the journal cannot read stops the run before any write" {
 /// `name` as commit shows a live path under the home: `~`-relative.
 fn shownLive(a: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "~{s}{s}", .{ std.fs.path.sep_str, name });
+}
+
+/// `text` with each `~/...` path spelled with the platform separator, as
+/// mox displays a path under home.
+fn tilde(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.fs.path.sep == '/') return text;
+    const out = try a.dupe(u8, text);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "~/")) |at| {
+        var j = at + 1;
+        while (j < out.len and std.mem.indexOfScalar(u8, " \n\t:'\"),;", out[j]) == null) : (j += 1) {
+            if (out[j] == '/') out[j] = std.fs.path.sep;
+        }
+        i = j;
+    }
+    return out;
 }
 
 test "commit: an edited file whose source yields no file is not committed and exits 1 in both modes" {
@@ -6410,11 +6426,11 @@ test "commit --dry-run: a key its target layer cannot hold is manual, as --yes r
     const live = try h.liveOf("config.toml");
     try editLive(io, a, live, "bar = 1", "bar = 1\nbaz = 2");
 
-    const manual = try std.fmt.allocPrint(a, "  manual: {s} foo.baz: src/config.toml cannot hold this key\n", .{live});
+    const manual = try std.fmt.allocPrint(a, "  manual: {s} foo.baz: src/config.toml cannot hold this key\n", .{try shownLive(a, "config.toml")});
     const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\nmox commit: 0 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual}), dry.out);
-    const held = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; not committed\n", .{live});
+    const held = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; not committed\n", .{try shownLive(a, "config.toml")});
     try std.testing.expectEqualStrings(held, dry.err);
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
@@ -6440,11 +6456,11 @@ test "commit: a key a single-configuration layer cannot hold is manual in the pr
     const live = try h.liveOf("app.toml");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[[srv]]\nname = \"a\"\nport = 1\n" });
 
-    const manual = try std.fmt.allocPrint(a, "  manual: {s} srv: src/app.toml cannot hold this key\n", .{live});
+    const manual = try std.fmt.allocPrint(a, "  manual: {s} srv: src/app.toml cannot hold this key\n", .{try shownLive(a, "app.toml")});
     const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\nmox commit: 0 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual}), dry.out);
-    const held = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; not committed\n", .{live});
+    const held = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; not committed\n", .{try shownLive(a, "app.toml")});
     try std.testing.expectEqualStrings(held, dry.err);
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
@@ -6955,7 +6971,7 @@ test "commit: a key routed into a layer a line edit was routed to under another 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
     try std.testing.expect(std.mem.endsWith(u8, dry.out, try std.fmt.allocPrint(a, "{s}\nmox commit: 1 routable, 0 coupled, 1 manual (report only; run without --dry-run on a terminal to apply)\n", .{manual})));
-    const held = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; not committed\n", .{try h.liveOf("app.toml")});
+    const held = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; not committed\n", .{try shownLive(a, "app.toml")});
     try std.testing.expectEqualStrings(held, dry.err);
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
@@ -7050,9 +7066,9 @@ test "commit --dry-run: a coupled update undone because its origin fails at plan
     const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n" ++
         "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n" ++
         "mox commit: coupled update to {s} undone: {s} was not committed\n", .{
-        try h.liveOf(".abbrs"),
+        try shownLive(a, ".abbrs"),
         data,
-        try h.liveOf("abbrs.toml"),
+        try shownLive(a, "abbrs.toml"),
         data,
         try shownLive(a, ".cenv"),
         try shownLive(a, ".abbrs"),
@@ -7115,7 +7131,7 @@ test "commit --dry-run: a configuration that cannot be verified is named as --ye
 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
-    const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: configuration os=linux does not compose (UnknownMachineField); it cannot be verified -- fix that layer, then re-run\n", .{try h.liveOf(".zshrc")});
+    const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: configuration os=linux does not compose (UnknownMachineField); it cannot be verified -- fix that layer, then re-run\n", .{try shownLive(a, ".zshrc")});
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
     try std.testing.expectEqualStrings(want_err, dry.err);
     try std.testing.expectEqual(@as(u8, 0), res.rc);
@@ -7141,7 +7157,7 @@ test "commit --dry-run: a file whose routed key commits beside a manual one is n
     try editLive(io, a, live, "bar = 1", "bar = 1\nbaz = 2");
 
     const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; " ++
-        "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{live});
+        "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try shownLive(a, "config.toml")});
     const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
     try std.testing.expectEqualStrings(want_err, dry.err);
@@ -7280,8 +7296,8 @@ test "commit: a file with an unrouted hunk beside a manual one is not committed"
     const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "1\n4\nm\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf(".zshrc")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zshrc") == null);
-    const left = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n", .{live});
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.zshrc")) == null);
+    const left = try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n", .{try shownLive(a, ".zshrc")});
     try std.testing.expectEqualStrings(left, res.err);
 }
 
@@ -7307,7 +7323,7 @@ test "commit: a coupling rename is not applied over a line another file routed w
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("old@example.com signing extra\n", try read(io, a, try h.srcOf(".mysigners")));
     try std.testing.expectEqualStrings("email = new@example.com\n", try read(io, a, try h.srcOf(".myenv")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.mysigners") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.mysigners")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"old@example.com\"; not renaming it there\n", .{try h.srcOf(".mysigners")}), res.err);
 }
@@ -7339,12 +7355,12 @@ test "commit: a coupling target whose only hunk was left unrouted is not committ
 
     try std.testing.expectEqualStrings(target_src, try read(io, a, try h.srcOf(".tsigners")));
     try std.testing.expectEqualStrings("note wombattoken\n", try read(io, a, try h.srcOf(".aenv")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
     // The target's own line names its unrouted hunk, so the undone line
     // only says it was not committed.
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted; not committed\n" ++
-        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners was not committed\n", .{try h.liveOf(".tsigners")}), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted; not committed\n" ++
+        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners was not committed\n", .{try shownLive(a, ".tsigners")})), res.err);
 }
 
 const shared_abbrs = "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n";
@@ -7406,7 +7422,7 @@ test "commit: a restore that fails saves every path the run still has edited, no
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ try h.liveOf(".zaliases"), y_path, x_path, x_copy, y_path, y_copy });
+        "mox commit: 0 package row(s) already recorded\n", .{ try shownLive(a, ".zaliases"), y_path, x_path, x_copy, y_path, y_copy });
     try std.testing.expectEqualStrings(want, res.err);
 }
 
@@ -7465,7 +7481,7 @@ test "commit: a restore that fails names a path the run created and still restor
         "mox commit: {s} did not exist before this commit; delete it to restore it\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: 0 package row(s) already recorded\n", .{
-        try h.liveOf(".zaliases"),
+        try shownLive(a, ".zaliases"),
         y_path,
         try h.srcOf(".abbrs"),
         try std.fs.path.join(a, &.{ dir, "repo", "src", ".abbrs" }),
@@ -7518,12 +7534,12 @@ test "commit: a restore that fails still reverts by name the facts due that roun
     const p_copy = try std.fs.path.join(a, &.{ dir, "repo", "src", ".pfile" });
     try std.testing.expectEqualStrings(facts_before, try read(io, a, facts_copy));
     try std.testing.expectEqualStrings(p_src, try read(io, a, p_copy));
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: ~/.config/mox/facts.toml: its pre-run bytes are saved in {s}\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ try h.liveOf(".pfile"), p_path, facts_copy, p_path, p_copy }), res.err);
+        "mox commit: 0 package row(s) already recorded\n", .{ try shownLive(a, ".pfile"), p_path, facts_copy, p_path, p_copy })), res.err);
 }
 
 test "commit: a coupling rename into a data row field a loop template reads through a default is dropped" {
@@ -7549,8 +7565,8 @@ test "commit: a coupling rename into a data row field a loop template reads thro
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nquokkanote = \"listing\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
 }
@@ -7594,9 +7610,9 @@ test "commit: a row write a loop file and a failing leaf both made stays under t
     // The leaf fails, but the row write is also the loop file's, which
     // passes: the data file keeps it.
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, data_path), "value = \"99\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zloop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
-    try std.testing.expectEqualStrings("mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n", res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.zloop")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/id-a.inc")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n"), res.err);
 }
 
 test "commit: a failing leaf restores a loop file's data source and the loop file is not committed" {
@@ -7621,10 +7637,10 @@ test "commit: a failing leaf restores a loop file's data source and the loop fil
     try std.testing.expectEqual(@as(u8, 1), res.rc);
 
     try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zloop") == null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n" ++
-        "mox commit: ~/.zloop: not committed: {s} was restored because ~/.config/id-a.inc was not committed; commit it on its own with 'mox commit ~/.zloop'\n", .{data_path}), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.zloop")) == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/id-a.inc")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: ~/.config/id-a.inc: recomposed generator output does not match; not committed\n" ++
+        "mox commit: ~/.zloop: not committed: {s} was restored because ~/.config/id-a.inc was not committed; commit it on its own with 'mox commit ~/.zloop'\n", .{data_path})), res.err);
 }
 
 test "commit: a coupling rename into a data row field read through another field's stored value is dropped" {
@@ -7650,8 +7666,8 @@ test "commit: a coupling rename into a data row field read through another field
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]\na = \"<b>/bin\"\nb = \"quokkanote\"\nc = \"detail\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
 }
@@ -7679,8 +7695,8 @@ test "commit: a coupling rename into a data row field only a bare capture's stor
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]\na = \"<b>/bin\"\nb = \"wombatnote\"\nc = \"detail\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled") != null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -7708,8 +7724,8 @@ test "commit: a coupling rename that only touches comments in a routed data row 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]  # wombatnote\nkey = \"lll\"\na = \"x\"  # wombatnote\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 1 coupled") != null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -7736,7 +7752,7 @@ test "commit: a coupled update into a generator source is verified through its l
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("", res.err);
     try std.testing.expectEqualStrings("# mox: for entry in \"data/entries.toml\" into \"id-<entry.slug>.inc\"\nkey=<entry.slug> wombatnote\n# mox: end\n", try read(io, a, try h.srcOf(".config/gen.inc")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
 }
 
@@ -7767,8 +7783,8 @@ test "commit: a coupling rename into a generator source whose routed template ho
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
     try std.testing.expectEqualStrings("[[entries]]\nslug = \"a\"\nvalue = \"99\"\n\n[[entries]]\nslug = \"b\"\nvalue = \"2\"\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data/entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/id-a.inc")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled, 0 manual") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n", .{try h.srcOf(".config/gen.inc")}), res.err);
 }
@@ -7810,12 +7826,12 @@ test "commit: a coupled update that changes nothing in a generator source leaves
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{
-        try h.liveOf(".zloop"),
+        try shownLive(a, ".zloop"),
         try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }),
-    }), res.err);
+    })), res.err);
 }
 
 test "commit: --dry-run predicts a coupling rename into a generator source whose routed template holds the token is dropped" {
@@ -7880,15 +7896,15 @@ test "commit: a coupling rename into a generator source with a routed leaf is dr
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n" ++
         "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.config/id-a.inc: not committed: {s} was restored because ~/.zloop was not committed; commit it on its own with 'mox commit ~/.config/id-a.inc'\n", .{
         try h.srcOf(".config/gen.inc"),
-        try h.liveOf(".zloop"),
+        try shownLive(a, ".zloop"),
         try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" }),
-    }), res.err);
+    })), res.err);
 }
 
 test "commit: a coupled update that changes nothing leaves its file out of verification" {
@@ -7975,9 +7991,9 @@ test "commit: a coupled update that leaves its target uncomposable in simulation
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(zshrc, try read(io, a, try h.srcOf(".zshrc")));
     try std.testing.expectEqualStrings("note machine.wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n"), res.err);
 }
 
 test "commit: a coupled update that leaves a generator target uncomposable in simulation is undone, not an abort" {
@@ -8003,9 +8019,9 @@ test "commit: a coupled update that leaves a generator target uncomposable in si
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(gen_src, try read(io, a, try h.srcOf(".config/gen.inc")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc could not take it (recompose failed: UnknownMachineField)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/gen.inc undone: ~/.config/gen.inc could not take it (recompose failed: UnknownMachineField)\n"), res.err);
 }
 
 /// A loop file reading the managed data file src/abbrs.toml through
@@ -8037,9 +8053,9 @@ fn expectSpelledDataCommits(io: Io, a: std.mem.Allocator, h: Harness) !void {
         "[[abbrs]]\nkey = \"lll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\n",
         try read(io, a, try h.srcOf("abbrs.toml")),
     );
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were declined and remain only in the live file; the routed edits were committed to the sources -- run 'mox apply' to discard them\n", .{try h.liveOf(".abbrs")}), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/abbrs.toml")) != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were declined and remain only in the live file; the routed edits were committed to the sources -- run 'mox apply' to discard them\n", .{try shownLive(a, ".abbrs")}), res.err);
 }
 
 /// The loop file fails for its EDITOR line, sent to the private layer, so
@@ -8052,9 +8068,9 @@ fn expectSpelledDataFailsTogether(io: Io, a: std.mem.Allocator, h: Harness) !voi
     const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\n4\ns\ny\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try h.liveOf(".abbrs"), try h.srcOf("abbrs.toml") }), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/abbrs.toml")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try shownLive(a, ".abbrs"), try h.srcOf("abbrs.toml") })), res.err);
 }
 
 const spelled_fail_tail = "export SPACER=1\nexport EDITOR=vim\n" ++ os_blocks;
@@ -8127,10 +8143,10 @@ test "commit: a coupled update that leaves a single-configuration target uncompo
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(zshrc, try read(io, a, try h.srcOf(".zshrc")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(
-        "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n",
+        try tilde(a, "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n"),
         res.err,
     );
 }
@@ -8157,11 +8173,11 @@ test "commit: a coupled update that leaves a routed target uncomposable is undon
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("export A=alpha gamma\nexport Q=<machine.quokkanote>\n", try read(io, a, try h.srcOf(".zshrc")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.zshrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.zshrc")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(
-        "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n",
+        try tilde(a, "mox commit: coupled update to ~/.zshrc undone: ~/.zshrc could not take it (recompose failed: UnknownMachineField)\n"),
         res.err,
     );
 }
@@ -8192,11 +8208,11 @@ test "commit: a coupling rename into a routed row field after a multi-line strin
     const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "y\ns\ny\ny\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\ndesc = \"\"\"\n[x]\n\"\"\"\na = \"quokkanote\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n" ++
-        "mox commit: {s}: 1 hunk(s) were declined and remain only in the live file; the routed edits were committed to the sources -- run 'mox apply' to discard them\n", .{ try h.srcOf("abbrs.toml"), try h.liveOf(".abbrs") }), res.err);
+        "mox commit: {s}: 1 hunk(s) were declined and remain only in the live file; the routed edits were committed to the sources -- run 'mox apply' to discard them\n", .{ try h.srcOf("abbrs.toml"), try shownLive(a, ".abbrs") }), res.err);
 }
 
 test "commit: a coupling rename into a data row field a loop's where reads is dropped" {
@@ -8221,7 +8237,7 @@ test "commit: a coupling rename into a data row field a loop's where reads is dr
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nquokkanote = \"yes\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
 }
@@ -8248,7 +8264,7 @@ test "commit: a coupling rename into a data row field a generator's into path re
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[entries]]\nquokkanote = \"a\"\nvalue = \"99\"\n", try read(io, a, try h.srcOf("entries.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/id-a.inc")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("entries.toml")}), res.err);
 }
@@ -8279,9 +8295,9 @@ test "commit: a data source hard-linked to a managed file is one path with that 
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try h.srcOf("abbrs.toml")));
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try h.liveOf(".abbrs"), try h.srcOf("abbrs.toml") }), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/abbrs.toml")) == null);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/abbrs.toml: not committed: {s} was restored because ~/.abbrs was not committed; commit it on its own with 'mox commit ~/abbrs.toml'\n", .{ try shownLive(a, ".abbrs"), try h.srcOf("abbrs.toml") })), res.err);
 }
 
 test "commit: every managed file hard-linked to a coupled update's path is verified as its target" {
@@ -8311,8 +8327,8 @@ test "commit: every managed file hard-linked to a coupled update's path is verif
     try std.testing.expectEqualStrings(linked, try read(io, a, try h.srcOf(".ha")));
     try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.ha undone: ~/.hb was not committed\n" ++
-        "mox commit: coupled update to ~/.hb undone: ~/.hb could not take it (its recomposed output differs from live); ~/.hb not committed\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.ha undone: ~/.hb was not committed\n" ++
+        "mox commit: coupled update to ~/.hb undone: ~/.hb could not take it (its recomposed output differs from live); ~/.hb not committed\n"), res.err);
 }
 
 test "commit: a coupled update whose simulation fails for one hard-linked target is undone for every target before planning" {
@@ -8344,8 +8360,8 @@ test "commit: a coupled update whose simulation fails for one hard-linked target
     try std.testing.expectEqualStrings(linked, try read(io, a, try h.srcOf(".ha")));
     try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.ha undone: ~/.hb could not take it (AccessDenied)\n" ++
-        "mox commit: coupled update to ~/.hb undone: ~/.hb could not take it (AccessDenied)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.ha undone: ~/.hb could not take it (AccessDenied)\n" ++
+        "mox commit: coupled update to ~/.hb undone: ~/.hb could not take it (AccessDenied)\n"), res.err);
 }
 
 test "commit: a restore that fails for a data source outside the repo copies it under other/" {
@@ -8388,7 +8404,7 @@ test "commit: a restore that fails for a data source outside the repo copies it 
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: 0 package row(s) already recorded\n", .{
-        try h.liveOf(".abbrs"),
+        try shownLive(a, ".abbrs"),
         try std.fs.path.join(a, &.{ h.repo, "src", "../../ext/abbrs.toml" }),
         real,
         copy,
@@ -8422,8 +8438,8 @@ test "commit: a file failed by reverted facts names only the reverted facts it r
     const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "4\nf\nf\nd\n");
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(facts_before, try read(io, a, try h.homePath(".config/mox/facts.toml")));
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
-        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n", .{try h.liveOf(".pfile")}), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+        "mox commit: ~/.rfile: not committed: fact email was reverted because ~/.pfile was not committed; commit it on its own with 'mox commit ~/.rfile'\n", .{try shownLive(a, ".pfile")})), res.err);
 }
 
 /// Two files renaming one token each, both coupled into ~/.tsigners, whose
@@ -8456,7 +8472,7 @@ test "commit: two coupled updates into one failing target are one undone line an
     try std.testing.expectEqualStrings("alphatoken1 quokkatoken\nfoo=1\n", try read(io, a, try h.srcOf(".tsigners")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(
-        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (its recomposed output differs from live); ~/.tsigners not committed\n",
+        try tilde(a, "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (its recomposed output differs from live); ~/.tsigners not committed\n"),
         res.err,
     );
 }
@@ -8472,10 +8488,10 @@ test "commit: a coupling target whose recompose differs from live is named only 
 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.tsigners") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.tsigners")) == null);
     try std.testing.expectEqualStrings(
-        "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (its recomposed output differs from live); ~/.tsigners not committed\n",
+        try tilde(a, "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (its recomposed output differs from live); ~/.tsigners not committed\n"),
         res.err,
     );
 }
@@ -8510,8 +8526,8 @@ test "commit: a generator leaf over a data source reached through a symlink and 
         try read(io, a, try h.srcOf("entries.toml")),
     );
     try std.testing.expect(isSymlink(io, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.config/id-a.inc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/entries.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.config/id-a.inc")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/entries.toml")) != null);
 }
 
 test "commit: with MOX_REPO spelled through a symlink, a coupling rename and a row write into one data file are one write" {
@@ -8789,8 +8805,8 @@ test "commit: a coupled update into a routed target whose live copy keeps the ol
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("quokkakey = 1\n", try read(io, a, try h.srcOf(".config/t.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (its recomposed output differs from live); ~/.config/t.toml not committed\n", res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (its recomposed output differs from live); ~/.config/t.toml not committed\n"), res.err);
 }
 
 test "commit: a coupled update its target's own edit already made is not undone when its origin is not committed" {
@@ -8821,10 +8837,10 @@ test "commit: a coupled update its target's own edit already made is not undone 
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(myenv, try read(io, a, try h.srcOf(".myenv")));
     try std.testing.expectEqualStrings("new@example.com signing\n", try read(io, a, try h.srcOf(".mysigners")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.mysigners") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.myenv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.mysigners")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.myenv")) == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n", .{try h.liveOf(".myenv")}), res.err);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n", .{try shownLive(a, ".myenv")}), res.err);
 }
 
 test "commit: a coupled update its target's own edit already made survives its origin's restore for another file" {
@@ -8860,14 +8876,14 @@ test "commit: a coupled update its target's own edit already made survives its o
     try std.testing.expectEqualStrings(abbrs, try read(io, a, try h.srcOf(".abbrs")));
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
     try std.testing.expectEqualStrings("note wombattok\n", try read(io, a, try h.srcOf(".onote")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.onote") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.onote")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 1 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.abbrs: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.abbrs'\n", .{
-        try h.liveOf(".zaliases"),
+        try shownLive(a, ".zaliases"),
         try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
-    }), res.err);
+    })), res.err);
 }
 
 test "commit: a coupled update whose transient simulation write fails is undone before planning, not an abort" {
@@ -8895,9 +8911,9 @@ test "commit: a coupled update whose transient simulation write fails is undone 
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("quokkatoken signing\n", try read(io, a, try h.srcOf(".tsigners")));
     try std.testing.expectEqualStrings("note wombattoken\n", try read(io, a, try h.srcOf(".myenv")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.myenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.myenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (AccessDenied)\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.tsigners undone: ~/.tsigners could not take it (AccessDenied)\n"), res.err);
 }
 
 test "commit: a coupling rename of a routed row's key into a field the loop template reads is dropped" {
@@ -8924,8 +8940,8 @@ test "commit: a coupling rename of a routed row's key into a field the loop temp
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expectEqualStrings("[[abbrs]]\nkey = \"lll\"\nquokkanote = \"listing\"\n", try read(io, a, try h.srcOf("abbrs.toml")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: an edit routed into {s} keeps \"quokkanote\"; not renaming it there\n", .{try h.srcOf("abbrs.toml")}), res.err);
 }
@@ -8969,9 +8985,9 @@ test "commit: a file failed in a round that reverts a fact, by a restored path a
     try std.testing.expectEqualStrings(tloop_src, try read(io, a, try h.srcOf(".tloop")));
     try std.testing.expectEqualStrings("[[t]]\nkey = \"a\"\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "t.toml" })));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") == null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: {s}: recomposed output still differs from live; not committed\n" ++
-        "mox commit: coupled update to ~/.tloop undone: ~/.pfile was not committed\n", .{ try h.liveOf(".pfile"), try h.liveOf(".tloop") }), res.err);
+        "mox commit: coupled update to ~/.tloop undone: ~/.pfile was not committed\n", .{ try shownLive(a, ".pfile"), try shownLive(a, ".tloop") })), res.err);
 }
 
 test "commit: a coupled update that fails only together with the target's own routed edit is undone with the target's reason" {
@@ -9001,9 +9017,9 @@ test "commit: a coupled update that fails only together with the target's own ro
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(t_src, try read(io, a, try h.srcOf(".tconf")));
     try std.testing.expect(!exists(io, try h.srcOf(".tconf.d")));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings("mox commit: coupled update to ~/.tconf undone: ~/.tconf could not take it (configuration os=linux would change); ~/.tconf not committed\n", res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.tconf undone: ~/.tconf could not take it (configuration os=linux would change); ~/.tconf not committed\n"), res.err);
 }
 
 test "commit: with MOX_REPO spelled through a symlink under home, a fragment the run created is named under the repo" {
@@ -9048,13 +9064,13 @@ test "commit: with MOX_REPO spelled through a symlink under home, a fragment the
     try std.testing.expectEqualStrings(z_src, try read(io, a, z_copy));
     // Every path is named as MOX_REPO spells it, the fragment the run
     // created included: it is keyed under the canonical repo root.
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: could not restore ~/dots/src/.zfile (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: ~/dots/src/.xfile: its pre-run bytes are saved in {s}\n" ++
         "mox commit: ~/dots/src/.xfile.d/os/{s} did not exist before this commit; delete it to restore it\n" ++
         "mox commit: ~/dots/src/.zfile: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ try h.liveOf(".zfile"), x_copy, m_state.os, z_copy }), res.err);
+        "mox commit: 0 package row(s) already recorded\n", .{ try shownLive(a, ".zfile"), x_copy, m_state.os, z_copy })), res.err);
 }
 
 test "commit: a coupling target failed by a restored data source it wrote is named by its own line, and its update as not committed" {
@@ -9094,12 +9110,12 @@ test "commit: a coupling target failed by a restored data source it wrote is nam
     try std.testing.expectEqualStrings("note wombatnote\n", try read(io, a, try h.srcOf(".aenv")));
     try std.testing.expectEqualStrings(shared_abbrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "1 routed, 0 coupled") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
+    try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n" ++
         "mox commit: ~/.tloop: not committed: {s} was restored because ~/.zaliases was not committed; commit it on its own with 'mox commit ~/.tloop'\n" ++
         "mox commit: coupled update to ~/.tloop undone: ~/.tloop was not committed\n", .{
-        try h.liveOf(".zaliases"),
+        try shownLive(a, ".zaliases"),
         try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
-    }), res.err);
+    })), res.err);
 }
 
 const email_facts = "email = \"old@home.com\"\n";
@@ -9137,7 +9153,7 @@ test "commit: a loop row edit whose data source gained a row above it since the 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(pulled, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:2 data row no longer matches what the last apply wrote\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "0 routed, 0 coupled, 2 manual") != null);
     try std.testing.expectEqualStrings("", res.err);
@@ -9166,7 +9182,7 @@ test "commit: a loop row edit is manual when a row up to it rendered differently
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:2 data row no longer matches what the last apply wrote\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9190,7 +9206,7 @@ test "commit: a loop row edit beside a row already committed into its source rou
     try holdEmail(io, a, h, ".abbrs");
     const first = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), first.rc);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try h.liveOf(".abbrs")}), first.err);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try shownLive(a, ".abbrs")}), first.err);
 
     // The third row's edit routes: the first row already matches live. That
     // row's own hunk is re-offered against a source that moved on, so it
@@ -9202,10 +9218,10 @@ test "commit: a loop row edit beside a row already committed into its source rou
         "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -la\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n\n[[abbrs]]\nkey = \"gd\"\nexpansion = \"git diff -w\"\n",
         try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })),
     );
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 data row no longer matches what the last apply wrote\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "  update ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 2 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try h.liveOf(".abbrs")}), res.err);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 2 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try shownLive(a, ".abbrs")}), res.err);
 }
 
 test "commit: a loop row edit is manual when its line is not unique among the loop's rows" {
@@ -9235,8 +9251,8 @@ test "commit: a loop row edit is manual when its line is not unique among the lo
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(pulled, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.ports:1 may be an edited loop row\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.ports:5 held beside an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.ports:1 may be an edited loop row\n")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.ports:5 held beside an edited loop row\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -9283,7 +9299,7 @@ test "commit: an edited generator leaf whose data row changed since the last app
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data_before, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 data row no longer matches what the last apply wrote\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.config/id-a.inc:1 data row no longer matches what the last apply wrote\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -9319,7 +9335,7 @@ test "commit: a row write beside a held edit, in its own managed data file, to a
     try std.testing.expectEqualStrings(data, try read(io, a, data_path));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     const want_err = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n" ++
-        "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n", .{ try h.liveOf(".abbrs"), data_path, try h.liveOf("abbrs.toml"), data_path });
+        "mox commit: {s}: the planned edit to {s} does not render the edited line; not committed\n", .{ try shownLive(a, ".abbrs"), data_path, try shownLive(a, "abbrs.toml"), data_path });
     try std.testing.expectEqualStrings(want_err, res.err);
     try std.testing.expectEqualStrings(want_err, dry.err);
 }
@@ -9344,7 +9360,7 @@ test "commit: a loop row routes through a loop variable not named entry" {
         "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\n\n[[abbrs]]\nkey = \"gd\"\nexpansion = \"git diff\"\n",
         try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" })),
     );
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9434,7 +9450,7 @@ test "commit: a changed integer field is written as an integer, and a new value 
     try editLive(io, a, try h.liveOf(".abbrs"), " 2222 ", " many ");
     const bad = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), bad.rc);
-    try std.testing.expect(std.mem.indexOf(u8, bad.out, "  manual: ~/.abbrs:1 data value type\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad.out, try tilde(a, "  manual: ~/.abbrs:1 data value type\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, try abbrsData(h), "port = 2222\n") != null);
     try std.testing.expectEqualStrings("", bad.err);
 }
@@ -9452,7 +9468,7 @@ test "commit: a changed field whose stored value holds a capture is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(host_row, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data value holds a capture\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 data value holds a capture\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9469,7 +9485,7 @@ test "commit: a changed array field is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(host_row, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data value is an array\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 data value is an array\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9504,7 +9520,7 @@ test "commit: a new string value that introduces a capture is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 new value holds a capture\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 new value holds a capture\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9522,14 +9538,14 @@ test "commit: an edit to the second line of a loop row spanning lines is manual,
 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.abbrs:2 data row spans several lines\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "  manual: ~/.abbrs:2 data row spans several lines\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") == null);
     try std.testing.expectEqualStrings("", dry.err);
 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 data row spans several lines\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:2 data row spans several lines\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9550,14 +9566,14 @@ test "commit: an edit to a generator leaf whose row renders several lines is man
 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.config/id-a.inc:1 data row spans several lines\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "  manual: ~/.config/id-a.inc:1 data row spans several lines\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") == null);
     try std.testing.expectEqualStrings("", dry.err);
 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 data row spans several lines\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.config/id-a.inc:1 data row spans several lines\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9588,8 +9604,8 @@ test "commit: a row write lands on its row when a line edit to the data file add
         added ++ "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\nshell = \"fish\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\nshell = \"fish\"\n",
         try read(io, a, try h.srcOf("abbrs.toml")),
     );
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/abbrs.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/abbrs.toml")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9623,7 +9639,7 @@ test "commit: a loop line whose edit splits into row fields more than one way is
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 live line splits into row fields more than one way\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 live line splits into row fields more than one way\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9641,7 +9657,7 @@ test "commit: a loop line capturing one field twice, edited in one place, is man
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 field captured twice with different values\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 field captured twice with different values\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9671,11 +9687,11 @@ test "commit: a coupling rename into a loop file's routed template is dropped" {
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(abbrs_src, try read(io, a, try h.srcOf(".abbrs")));
     try std.testing.expect(std.mem.indexOf(u8, try abbrsData(h), "key = \"lll\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.aenv") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.abbrs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.abbrs")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "2 routed, 0 coupled, 1 manual") != null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: coupling: {s} holds \"quokkanote\" in a loop a row write was routed through; not renaming it there\n" ++
-        "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{ try h.srcOf(".abbrs"), try h.liveOf(".abbrs") }), res.err);
+        "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{ try h.srcOf(".abbrs"), try shownLive(a, ".abbrs") }), res.err);
 }
 
 test "commit: a row write the file's other loop over the data source renders unchanged is manual" {
@@ -9695,7 +9711,7 @@ test "commit: a row write the file's other loop over the data source renders unc
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row also renders at line 5 without this edit\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.hosts:2 data row also renders at line 5 without this edit\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9716,7 +9732,7 @@ test "commit: a row write that makes the row appear in the file's other loop ove
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row would render differently elsewhere in the file\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.hosts:2 data row would render differently elsewhere in the file\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9738,7 +9754,7 @@ test "commit: a row edited alike in both of a file's loops over the data source 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 0), res.rc);
     try std.testing.expect(std.mem.indexOf(u8, try abbrsData(h), "key = \"gss\"\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "committed ~/.hosts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.hosts")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9760,7 +9776,7 @@ test "commit: a row write that filters the row out of its own loop is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:2 the edited row is filtered out\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:2 the edited row is filtered out\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9782,7 +9798,7 @@ test "commit: a leaf row write that moves the leaf is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 the edited row moves the leaf\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.config/id-a.inc:1 the edited row moves the leaf\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9850,7 +9866,7 @@ test "commit: a loop line with two splits changing equally few fields is manual"
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 live line splits into row fields more than one way\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 live line splits into row fields more than one way\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9870,7 +9886,7 @@ test "commit: a loop row write that does not render the edited line is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 the edited row does not render the edited line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 the edited row does not render the edited line\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9892,7 +9908,7 @@ test "commit: a leaf row write that does not render the edited line is manual" {
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(data, try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "entries.toml" })));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.config/id-a.inc:1 the edited row does not render the edited line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.config/id-a.inc:1 the edited row does not render the edited line\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9915,7 +9931,7 @@ test "commit: a loop row edit is manual when its line was not unique at the last
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(now, try read(io, a, data_path));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.abbrs:1 data row is not unique in its loop\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.abbrs:1 data row is not unique in its loop\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9937,7 +9953,7 @@ test "commit: a row write another loop over the data source renders without a ro
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings(three_abbrs, try abbrsData(h));
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.hosts:2 data row also renders elsewhere in the file without a position\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.hosts:2 data row also renders elsewhere in the file without a position\n")) != null);
     try std.testing.expectEqualStrings("", res.err);
 }
 
@@ -9977,7 +9993,10 @@ fn expectAllManual(r: RealignRun, manual: []const []const u8) !void {
     try std.testing.expectEqualStrings(r.src, r.now_src);
     try std.testing.expectEqualStrings(r.data, r.now_data);
     try std.testing.expectEqual(@as(u8, 1), r.res.rc);
-    for (manual) |line| {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (manual) |pinned| {
+        const line = try tilde(arena.allocator(), pinned);
         if (std.mem.indexOf(u8, r.res.out, line) == null) {
             std.debug.print("missing {s} in:\n{s}", .{ line, r.res.out });
             return error.TestExpectedManualLine;
@@ -10001,7 +10020,7 @@ test "commit: a loop row edited to equal a literal past the next row, diffed as 
     // Row a becomes "host b": the diff deletes row a and inserts "host b"
     // after the literal, a literal the next apply would render twice.
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "host b\n", hosts_ab, &.{}, "host b\nhost b\nhost b\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: two literals edited above a loop row, diffed as an insertion and a straddle of a literal and the row, are manual" {
@@ -10013,7 +10032,7 @@ test "commit: two literals edited above a loop row, diffed as an insertion and a
     const a = arena.allocator();
 
     const r = try realignCommit(io, a, &tmp, "host a\nhost a\n" ++ hosts_loop, hosts_a, &.{}, "port 22\nport 22\nhost a\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: two loop rows edited to equal the literal below them, diffed as a straddle of both rows, are manual" {
@@ -10025,7 +10044,7 @@ test "commit: two loop rows edited to equal the literal below them, diffed as a 
     const a = arena.allocator();
 
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "port 22\n", hosts_ab, &.{}, "port 22\nport 22\nport 22\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: a row added above a multi-line template's rows is manual, never literal lines" {
@@ -10037,7 +10056,7 @@ test "commit: a row added above a multi-line template's rows is manual, never li
     const a = arena.allocator();
 
     const r = try realignCommit(io, a, &tmp, "# hosts\n" ++ hosts_block_loop, hosts_a, &.{}, "# hosts\nHost b\n  Port 22\nHost a\n  Port 22\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:2 may be an edited loop row\n")});
 }
 
 test "commit: a refused one-for-one row edit whose text also lands below a literal is manual" {
@@ -10052,7 +10071,7 @@ test "commit: a refused one-for-one row edit whose text also lands below a liter
     // it, so the row write is refused; its "alias a" lands below the literal.
     const src = hosts_loop ++ "alias a\n# mox: for entry in \"data/hosts.toml\" where entry.key = \"a\"\nalias <entry.key>\n# mox: end\n";
     const r = try realignCommit(io, a, &tmp, src, "[[hosts]]\nkey = \"b\"\n", &.{}, "host a\nalias a\nalias a\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: an unequal straddle of a literal and a loop row is never offered a split" {
@@ -10066,7 +10085,7 @@ test "commit: an unequal straddle of a literal and a loop row is never offered a
     // Split, the straddle deleted "port 1" and left the row, while the
     // inserted lines went into the base above "host a".
     const r = try realignCommit(io, a, &tmp, "host a\nport 1\n" ++ hosts_loop, hosts_a, &.{}, "port 22\nport 22\nhost a\n", "y\nx\ny\ns\n");
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
     try std.testing.expect(std.mem.indexOf(u8, r.res.out, "split") == null);
 }
 
@@ -10082,7 +10101,7 @@ test "commit: an equal straddle of a literal and a loop row is never offered a s
     // into the base, where the row was edited.
     const src = hosts_loop ++ "host a\n# mox: for entry in \"data/hosts.toml\"\nalias <entry.key>\n# mox: end\n";
     const r = try realignCommit(io, a, &tmp, src, hosts_a, &.{}, "host b\nhost a\nhost b\nalias b\n", "s\nx\ny\ns\n");
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
     try std.testing.expect(std.mem.indexOf(u8, r.res.out, "split") == null);
 }
 
@@ -10095,7 +10114,7 @@ test "commit: a loop row edited to equal the literal just below it is manual" {
     const a = arena.allocator();
 
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "host c\n", hosts_ab, &.{}, "host a\nhost c\nhost c\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:2 may be an edited loop row\n")});
 }
 
 test "commit: a loop row edited to equal the literal just below it, the literal's neighbour edited too, is manual" {
@@ -10107,7 +10126,7 @@ test "commit: a loop row edited to equal the literal just below it, the literal'
     const a = arena.allocator();
 
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "host c\nport 22\n", hosts_ab, &.{}, "host a\nhost c\nhost c\nport 23\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:2 may be an edited loop row\n")});
 }
 
 test "commit: a loop row edit a run of equal literals shifts into a literal insertion and deletion is manual" {
@@ -10121,7 +10140,7 @@ test "commit: a loop row edit a run of equal literals shifts into a literal inse
     // The diff inserts "host b" above the loop and deletes the last literal:
     // both route into the base, the row keeps "a", and the file recomposes.
     const r = try realignCommit(io, a, &tmp, "host a\nhost a\n" ++ hosts_loop ++ "host a\nhost a\n", hosts_a, &.{}, "host a\nhost a\nhost b\nhost a\nhost a\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: a loop row edited to equal a second loop's row is manual" {
@@ -10134,7 +10153,7 @@ test "commit: a loop row edited to equal a second loop's row is manual" {
 
     const others = "# mox: for entry in \"data/others.toml\"\nhost <entry.key>\n# mox: end\n";
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ others ++ "host b\n", hosts_a, &.{.{ "repo/data/others.toml", "[[others]]\nkey = \"b\"\n" }}, "host b\nhost b\nhost b\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: an unequal straddle whose one-for-one piece would land on a loop row is never offered a split" {
@@ -10148,7 +10167,7 @@ test "commit: an unequal straddle whose one-for-one piece would land on a loop r
     // Split, the literal "host a" was deleted and the row paired with
     // "host b", while the realigned "port 22" went into the base.
     const r = try realignCommit(io, a, &tmp, "host a\n" ++ hosts_loop ++ "port 22\n", hosts_a, &.{}, "host b\nport 22\nport 22\n", "x\ny\ns\ny\n");
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
     try std.testing.expect(std.mem.indexOf(u8, r.res.out, "split") == null);
 }
 
@@ -10161,7 +10180,7 @@ test "commit: a row added to an empty loop with a multi-line template is manual,
     const a = arena.allocator();
 
     const r = try realignCommit(io, a, &tmp, "# hosts\n" ++ hosts_block_loop, "hosts = []\n", &.{}, "# hosts\nHost a\n  Port 22\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:2 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:2 may be an edited loop row\n")});
 }
 
 test "commit: a literal edit beside a loop whose where filters out every row is manual" {
@@ -10176,7 +10195,7 @@ test "commit: a literal edit beside a loop whose where filters out every row is 
     // loop, moving it above the loop's directive.
     const src = "host x\n# mox: for entry in \"data/hosts.toml\" where entry.key = \"z\"\nhost <entry.key>\n# mox: end\nhost x\n";
     const r = try realignCommit(io, a, &tmp, src, hosts_a, &.{}, "host y\nhost x\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:1 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n")});
 }
 
 test "commit: a base line edited beside an equal private-layer line is manual, and the private layer keeps its line" {
@@ -10203,7 +10222,7 @@ test "commit: a base line edited beside an equal private-layer line is manual, a
     try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".myrc")));
     try std.testing.expectEqualStrings(private, try read(io, a, try std.fs.path.join(a, &.{ h.state, "private", ".myrc.d", "profile", "personal.myrc" })));
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:1 hunk straddles origins or is uncovered\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.myrc:1 hunk straddles origins or is uncovered\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed, 0 coupled, 1 manual\n") != null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -10228,7 +10247,7 @@ test "commit: a base line edited beside an equal shared fragment line is manual,
     try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".myrc")));
     try std.testing.expectEqualStrings(fragment, try read(io, a, try h.srcOf(".myrc.d/extra.sh")));
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:1 hunk straddles origins or is uncovered\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.myrc:1 hunk straddles origins or is uncovered\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed, 0 coupled, 1 manual\n") != null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -10246,12 +10265,10 @@ test "commit: a literal edit beside a change that may be an edited loop row is h
     try std.testing.expectEqualStrings(src, r.now_src);
     try std.testing.expectEqualStrings("[[hosts]]\nkey = \"a\"\n\n[[hosts]]\nkey = \"bb\"\n", r.now_data);
     try std.testing.expectEqual(@as(u8, 1), r.res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "  manual: ~/.hosts:4 held beside an edited loop row\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.res.out, "  manual: ~/.hosts:6 may be an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, try tilde(a, "  manual: ~/.hosts:4 held beside an edited loop row\n")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, try tilde(a, "  manual: ~/.hosts:6 may be an edited loop row\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.res.out, "mox commit: 1 routed, 0 coupled, 2 manual\n") != null);
-    const live = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home", ".hosts" });
-    const abs = try std.fs.path.resolve(a, &.{ try std.process.currentPathAlloc(io, a), live });
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 2 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{abs}), r.res.err);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: 2 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try shownLive(a, ".hosts")}), r.res.err);
 }
 
 test "commit: a line removed from the repo while one is added to the private layer holds every line change of the file" {
@@ -10276,8 +10293,8 @@ test "commit: a line removed from the repo while one is added to the private lay
     try std.testing.expectEqualStrings(base, try read(io, a, try h.srcOf(".myrc")));
     try std.testing.expectEqualStrings(private, try read(io, a, try std.fs.path.join(a, &.{ h.state, "private", ".myrc.d", "profile", "personal.myrc" })));
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:2 lines may move between the private layer and the repo\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "  manual: ~/.myrc:5 lines may move between the private layer and the repo\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.myrc:2 lines may move between the private layer and the repo\n")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "  manual: ~/.myrc:5 lines may move between the private layer and the repo\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "mox commit: 0 routed, 0 coupled, 2 manual\n") != null);
     try std.testing.expectEqualStrings("", res.err);
 }
@@ -10298,7 +10315,7 @@ test "commit: a loop file too large to align its lines holds every change" {
     for (0..4096) |k| try live.print(a, "line {d}\n", .{if (k == 7) 70000 else k});
     try live.appendSlice(a, "host a\n");
     const r = try realignCommit(io, a, &tmp, src.items, hosts_a, &.{}, live.items, null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:8 file too large to align its lines\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:8 file too large to align its lines\n")});
 }
 
 test "commit: --dry-run holds and realigns a file exactly as --yes does" {
@@ -10318,8 +10335,8 @@ test "commit: --dry-run holds and realigns a file exactly as --yes does" {
 
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.hosts:4 held beside an edited loop row\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "  manual: ~/.hosts:6 may be an edited loop row\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "  manual: ~/.hosts:4 held beside an edited loop row\n")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "  manual: ~/.hosts:6 may be an edited loop row\n")) != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would update") != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would edit") == null);
     try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf(".hosts")));
@@ -10337,7 +10354,7 @@ test "commit: a literal edit in a file whose loop row renders a value over sever
     // Row b renders "host b" and "c": a line of any text may be a row's.
     const data = "[[hosts]]\nkey = \"a\"\n\n[[hosts]]\nkey = \"b\\nc\"\n";
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "sep\nport 1\n", data, &.{}, "host a\nhost b\nc\nsep\nport 2\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:5 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:5 may be an edited loop row\n")});
 }
 
 test "commit: a literal edit shaped like a row of a loop whose body holds a directive is manual" {
@@ -10350,7 +10367,7 @@ test "commit: a literal edit shaped like a row of a loop whose body holds a dire
 
     const src = "# mox: for entry in \"data/hosts.toml\"\n# mox: when os=darwin\nhost <entry.key>\n# mox: end\n# mox: end\nsep\nhost z\n";
     const r = try realignCommit(io, a, &tmp, src, hosts_a, &.{}, "host a\nsep\nport 1\n", null);
-    try expectAllManual(r, &.{"  manual: ~/.hosts:3 may be an edited loop row\n"});
+    try expectAllManual(r, &.{try tilde(a, "  manual: ~/.hosts:3 may be an edited loop row\n")});
 }
 
 test "commit: a change whose removed lines alone are shaped like a loop row holds the file's other line changes" {
@@ -10363,7 +10380,7 @@ test "commit: a change whose removed lines alone are shaped like a loop row hold
 
     // The row and the literal below it become one line that fits no loop.
     const r = try realignCommit(io, a, &tmp, hosts_loop ++ "port 1\nsep\nport 2\n", hosts_a, &.{}, "port 9\nsep\nport 3\n", null);
-    try expectAllManual(r, &.{ "  manual: ~/.hosts:1 may be an edited loop row\n", "  manual: ~/.hosts:4 held beside an edited loop row\n" });
+    try expectAllManual(r, &.{ try tilde(a, "  manual: ~/.hosts:1 may be an edited loop row\n"), try tilde(a, "  manual: ~/.hosts:4 held beside an edited loop row\n") });
 }
 
 /// Run `mox commit --dry-run` and then `mox commit --yes` on the same tree:
@@ -10422,7 +10439,7 @@ test "commit: a fragment included twice and edited differently in each place rou
     const frag = try h.srcOf(".myrc.d/extra.sh");
     const manual = try std.fmt.allocPrint(a, "  manual: {s}:7 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, ".myrc"), try shownLive(a, ".myrc"), frag });
     _ = try dryRunAgrees(h, manual, try std.fmt.allocPrint(a, "mox commit: {s}: 1 hunk(s) could not be routed and remain only in the live file; " ++
-        "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try h.liveOf(".myrc")}));
+        "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n", .{try shownLive(a, ".myrc")}));
     try std.testing.expectEqualStrings("alias x=1\nalias y=5\nalias z=3\n", try read(io, a, frag));
 }
 
@@ -10646,7 +10663,7 @@ test "commit: a fact write that would change another fact of the facts file is n
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     const facts = try h.homePath(".config/mox/facts.toml");
     try std.testing.expectEqualStrings(facts_before, try read(io, a, facts));
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} changes it outside its keys; not committed\n", .{ try h.liveOf(".a"), try shownFacts(a) }), res.err);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} changes it outside its keys; not committed\n", .{ try shownLive(a, ".a"), try shownFacts(a) }), res.err);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
 }
 
@@ -10697,7 +10714,7 @@ test "commit: a key edit that changes an alias of its value outside its key path
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try editLive(io, a, try h.liveOf("app.yaml"), "hello", "bye");
 
-    const want = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} changes it outside its keys; not committed\n", .{ try h.liveOf("app.yaml"), try h.srcOf("app.yaml") });
+    const want = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} changes it outside its keys; not committed\n", .{ try shownLive(a, "app.yaml"), try h.srcOf("app.yaml") });
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
@@ -10726,7 +10743,7 @@ test "commit: a row write whose fields a table header inserted into its row take
 
     const data = try h.srcOf("abbrs.toml");
     const want = try std.fmt.allocPrint(a, "mox commit: {s}: the planned edit to {s} does not hold expansion; not committed\n" ++
-        "mox commit: {s}: the planned edit to {s} does not hold expansion; not committed\n", .{ try h.liveOf(".abbrs"), data, try h.liveOf("abbrs.toml"), data });
+        "mox commit: {s}: the planned edit to {s} does not hold expansion; not committed\n", .{ try shownLive(a, ".abbrs"), data, try shownLive(a, "abbrs.toml"), data });
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
@@ -10757,7 +10774,7 @@ test "commit: a leaf row write the plan refuses is not committed, and --dry-run 
         "mox commit: {s}: the planned edit to {s} does not hold value; not committed\n", .{
         try shownLive(a, try std.fs.path.join(a, &.{ ".config", "id-a.inc" })),
         src,
-        try h.liveOf("entries.toml"),
+        try shownLive(a, "entries.toml"),
         src,
     });
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
@@ -10768,4 +10785,49 @@ test "commit: a leaf row write the plan refuses is not committed, and --dry-run 
     try std.testing.expectEqualStrings(want, res.err);
     try std.testing.expectEqualStrings(data, try read(io, a, src));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
+}
+
+/// A layered `app.toml` whose base is hard-linked to the text file `text`,
+/// with a key of the base and the text file's defaulted capture both edited
+/// live, committed with `input`.
+fn keyBesideDefault(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, text: []const u8, input: []const u8) !struct { h: Harness, res: testutil.RunResult } {
+    try writeRepo(io, tmp, "repo/src/app.toml", "# e <machine.email | default \"nobody@example.com\">\n[srv]\nx = 1\n");
+    try writeRepo(io, tmp, "repo/src/app.toml.d/os=darwin.toml", "[srv]\ny = 2\n");
+    try Io.Dir.hardLink(tmp.dir, "repo/src/app.toml", tmp.dir, try std.fs.path.join(a, &.{ "repo", "src", text }), io, .{});
+    const h = try setup(a, io, tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editLive(io, a, try h.liveOf("app.toml"), "x = 1", "x = 5");
+    try editLive(io, a, try h.liveOf(text), "# e nobody@example.com", "# e team@work.com");
+    return .{ .h = h, .res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, input) };
+}
+
+test "commit: a default rewrite into a source a key edit was routed to is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try keyBesideDefault(a, io, &tmp, "app.txt", "y\nd\n");
+    try std.testing.expectEqual(@as(u8, 1), r.res.rc);
+    try std.testing.expectEqualStrings("", r.res.err);
+    const manual = try std.fmt.allocPrint(a, "  manual: {s}:1 conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "app.txt"), try shownLive(a, "app.toml"), try r.h.srcOf("app.toml") });
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, manual) != null);
+    try std.testing.expectEqualStrings("# e <machine.email | default \"nobody@example.com\">\n[srv]\nx = 5\n", try read(io, a, try r.h.srcOf("app.toml")));
+}
+
+test "commit: a key edit into a source a default rewrite was routed to is manual" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const r = try keyBesideDefault(a, io, &tmp, "a.txt", "d\ny\n");
+    try std.testing.expectEqual(@as(u8, 1), r.res.rc);
+    const manual = try std.fmt.allocPrint(a, "  manual: {s} srv.x: conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "app.toml"), try shownLive(a, "a.txt"), try r.h.srcOf("a.txt") });
+    try std.testing.expect(std.mem.indexOf(u8, r.res.out, manual) != null);
+    try std.testing.expectEqualStrings("# e <machine.email | default \"team@work.com\">\n[srv]\nx = 1\n", try read(io, a, try r.h.srcOf("app.toml")));
 }

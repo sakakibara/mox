@@ -326,7 +326,7 @@ test "commit golden: a shared base line narrowed to this os synthesizes a region
         \\rc 0
         \\--- stdout
         \\.zshrc  hunk 1/1  ->  shared -- changes 2 configuration(s)
-        \\  <ROOT>/home/.zshrc -- this edit changes every configuration. Keep it universal, or narrow it?
+        \\  ~/.zshrc -- this edit changes every configuration. Keep it universal, or narrow it?
         \\    [1] universal
         \\    [2] os=darwin
         \\    [3] machine=<MACHINE> (only here)
@@ -720,7 +720,7 @@ test "commit golden: a routed hunk beside a manual hunk in one file" {
         \\
         \\mox commit: 1 routed, 0 coupled, 1 manual
         \\--- stderr
-        \\mox commit: <ROOT>/home/.zshrc: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'
+        \\mox commit: ~/.zshrc: 1 hunk(s) could not be routed and remain only in the live file; the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'
         \\--- repo
         \\src/
         \\== src/.zshrc

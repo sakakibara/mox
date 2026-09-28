@@ -290,69 +290,7 @@ prompt's choices. The per-hunk keys are:
 `--yes` takes the defaults, terminal or not; `--dry-run`, or a non-TTY
 without `--yes`, reports only and exits 1 if edits remain;
 `--abort-on-prompt` is strict CI mode, exiting 2 on the first would-be
-prompt. Every mode exits 1 while anything is left undone -- a hunk
-reported manual, a skipped secret, a package still untracked, a file that
-failed to verify -- so a run that exits 0 leaves no drift behind.
-
-Routing: base lines go to `src/`, fragment lines to their fragment,
-loop-row edits to the data source. Private-origin edits go only to the
-private layer, never repo `src/`. A value derived from a secret or an
-interpolation is reported, never routed.
-
-Keeping a live edit works for every kind of drift, not only a file mox
-last wrote. When there is no stored baseline -- a first apply, or a
-secret-bearing composition whose cleartext is deliberately not cached --
-commit recomposes the source to rebuild a verifiable baseline and routes
-the edit against it. A source that now composes to nothing is the one
-exception: there is no file to route into, so commit reports it and
-leaves the live copy for you to remove or re-fill.
-
-A first-contact change always needs a human: content mox never wrote to
-its live path -- a file, a generator leaf, or a symlink with no applied
-record -- is never adopted into the repo unasked. No non-interactive mode
-takes a default for one -- not `--yes`, not a plain non-TTY, and not a
-multi-configuration file's "where does this belong?" route: it is
-reported as `manual: <path>:<line> first contact, needs confirmation` (a
-key of a file merged from layers as `manual: <path> <key>: ...`, a symlink
-as `manual: <path>: ...`), the source is left untouched, and the run exits
-1; `--abort-on-prompt` exits 2 as for any prompt. `--dry-run` reports and
-counts it the same way, so the preview and the run it predicts agree. A
-first-contact file that no layer matches on this machine gets a new
-overlay only for the keys you confirm.
-
-A file merged from several layers routes per KEY instead of per line
-(`y` accept, `p` pick a layer, `s` skip): each changed key goes to the
-layer that defines it, and `p` picks a different layer. A shared (base
-or universal-fragment) edit prompts for where it belongs: keep it
-universal (the default, and what `--yes` takes) or narrow it to an axis
-the source compares by value (synthesizing a `replace from` region). Anything that would reach a
-machine beyond the one you chose -- promoting a key to a layer other
-machines read, say -- lists those configurations and asks first.
-
-The result is verified by recomposing every configuration the source
-expresses; a violation -- any configuration you did not choose to
-affect composing differently than before -- aborts the write and
-restores the source. When a changed token also lives in other managed
-sources, commit prompts `[Y/n/d/D/q]` to update them in the same write
-pass.
-
-A partially owned file always routes per key, over its owned content
-only; one whose owned content resolved a secret is skipped (its record
-is a hash -- edit the source directly).
-
-A repo carrying a `data/packages/` manifest is reconciled before the file
-pass: each untracked package (installed, declared nowhere, not
-blacklisted) is offered `y` add, `b` blacklist, `s` skip -- add a row to
-the file that declares its backend, blacklist it, or skip; skip is the
-default, so `--yes` records nothing and exits 1 while anything stays
-untracked. A row is appended the
-moment it is
-chosen, so `q` here ends the run before the file pass and says how many
-rows were already recorded (rc 1); `--abort-on-prompt` exits 2 at the
-first package prompt the same way. A backend plugin's `declare` verb runs
-here (see [packages.md](packages.md#the-protocol)). `--dry-run` lists the
-untracked packages and writes nothing; a path-scoped `mox commit <file>`
-skips packages entirely.
+prompt. Exit codes are listed at the end of this section.
 
 <!-- generated: flags commit -->
 | Flag | Description |
@@ -362,6 +300,311 @@ skips packages entirely.
 | `--abort-on-prompt` | strict CI: rc 2 on the first prompt |
 | `--color <color>` | auto|always|never |
 <!-- /generated -->
+
+### What is routed
+
+Base lines go to `src/`, fragment lines to their fragment, loop-row edits
+to the loop's data source (see Loop rows). Private-origin edits go only to
+the private layer, never repo `src/`. A value derived from a secret or an
+interpolation is reported, never routed. A source reached through two
+spellings -- a symlink, a `./`, a hard link -- is one file, planned and
+written once.
+
+Keeping a live edit works for every kind of drift, not only a file mox
+last wrote. When there is no stored baseline -- a first apply, or a
+secret-bearing composition whose cleartext is deliberately not cached --
+commit recomposes the source to rebuild a verifiable baseline and routes
+the edit against it. A source that now composes to nothing is the one
+exception: there is no file to route into, so commit reports
+`<path>: source yields no file; remove the live copy or add the data that
+filled it; not committed` and leaves the live copy for you to remove or
+re-fill. A live file that differs from its record only in its final
+newline is reported `manual: <path>: final newline differs`, and a
+special file (FIFO, socket, device) at a path mox recorded is reported
+`manual: <path> (not a regular file)` and never opened.
+
+A first-contact change always needs a human: content mox never wrote to
+its live path -- a file, a generator leaf, or a symlink with no applied
+record -- is never adopted into the repo unasked. No non-interactive mode
+takes a default for one -- not `--yes`, not a plain non-TTY, and not a
+multi-configuration file's "where does this belong?" route: it is
+reported as `manual: <path>:<line> first contact, needs confirmation` (a
+key of a file merged from layers as `manual: <path> <key>: ...`, a symlink
+as `manual: <path>: ...`), the source is left untouched, and the run exits
+1; `--abort-on-prompt` exits 2 as for any prompt. A first-contact file
+that no layer matches on this machine gets a new overlay only for the keys
+you confirm.
+
+A file merged from several layers routes per KEY instead of per line
+(`y` accept, `p` pick a layer, `s` skip): each changed key goes to the
+layer that defines it, and `p` picks a different layer. A key is counted
+routable only when the layer it would go to can hold it, whatever the
+number of configurations, so a key no layer here can take is reported
+`manual: <path> <key>: <layer> cannot hold this key` in the preview as in
+the run. A shared (base or universal-fragment) edit prompts for where it
+belongs: keep it universal (the default, and what `--yes` takes) or
+narrow it to an axis the source compares by value (synthesizing a
+`replace from` region). Anything that would reach a machine beyond the
+one you chose -- promoting a key to a layer other machines read, say --
+lists those configurations and asks first.
+
+A partially owned file always routes per key, over its owned content
+only; one whose owned content resolved a secret is skipped (its record
+is a hash -- edit the source directly).
+
+Two routed edits to one source that overlap and differ are never applied
+one over the other: the later hunk or key is manual, `conflicts with the
+edit routed from <unit> to <path>`. That covers the same data row edited
+through two loop files, overlapping line edits, a fragment included twice
+and edited differently, a row edit beside a direct edit to the same field,
+two routes setting one fact to different values (a `d` default rewrite
+included), and two symlinks setting one source to different targets. A
+key edit to a file merged from layers conflicts with any line, row or
+fact edit to the same file (a `d` default rewrite is a line edit of its
+source), even on other lines, and a symlink target change with any other
+edit to its source. The same edit reached twice (a
+fragment included twice and edited identically, two loops writing one
+field the same value) is written once.
+
+### Units
+
+Commit settles each affected managed file, each generator leaf with an
+accepted row edit, each symlink with an accepted target change, and each
+file that receives only a coupled rename, as one unit. For each unit the
+outcome is one of:
+
+- **committed**: its routed edits are written and it passes verification.
+  Its applied record advances only when its recompose equals the live file
+  exactly (the owned content, for a partially owned file); a unit that
+  also has manual or declined hunks prints `committed` for what it wrote,
+  but stays drifted until those hunks are resolved.
+- **manual**: a hunk commit will not route, with its reason. The change
+  stays only in the live file.
+- **declined**: a hunk you skipped. The change stays only in the live file.
+- **not committed**: the unit failed verification, or lost an edit when a
+  source it shares was restored (below). Its sources are restored to their
+  pre-run bytes; an edit another committed unit made identically stays.
+
+A unit with a hunk that could not be routed where you chose is not
+committed: `<path>: N hunk(s) were left uncommitted, so the recomposed
+output still differs from live; not committed`, or `<path>: N hunk(s)
+were left uncommitted; not committed` when its recompose still matches.
+
+Every edit is planned in memory first, each source's final bytes computed
+once. A source receiving a row, key or fact edit is then parsed back: it
+must hold each written value at its key, differ from its pre-run form only
+at the keys the run wrote, and, for a row edit, still render the edited
+live line through its loop. An edit that fails this -- a YAML value that
+anchors aliases elsewhere, say -- is left out and fails the units that own
+it, each reported
+`<path>: the planned edit to <source> <why>; not committed`, where
+`<why>` is `does not parse`, `does not hold <key>` (for a row, `does not
+hold its row` or `does not hold <field>`), `changes it outside its keys`
+or `does not render the edited line`. A layer that rejects a key outright
+fails its units with `a source layer rejected the edit (<error>)`.
+
+Nothing is recorded until every unit is settled. After the write, each
+unit is verified by recomposing every configuration its source expresses;
+a configuration you did not choose to affect composing differently than
+before fails that unit. A failed unit's sources are restored to their
+pre-run bytes, and every other unit with an edit to a restored source
+fails with it:
+
+```
+mox commit: <live path>: not committed: <source> was restored because <unit> was not committed; commit it on its own with 'mox commit <live path>'
+```
+
+A fact routed only by units that were not committed is reverted, and a
+unit that passed only under the reverted value fails with:
+
+```
+mox commit: <live path>: not committed: fact <name> was reverted because <unit> was not committed; commit it on its own with 'mox commit <live path>'
+```
+
+Settling repeats until no unit fails, so the result does not depend on
+the order units are processed in. Then records and `committed` lines are
+written for the units still passing, symlinks first, then generator
+leaves, then files. A symlink's failure restores only its own source; a
+leaf shares its data source with its siblings and any loop file over it,
+and fails with them.
+
+### Loop rows
+
+A hunk inside a line a `# mox: for` loop rendered is routed to that line's
+own data row. Only the fields whose value changed are written, each
+replacing only its value -- key, spacing and trailing comment kept -- in
+its stored TOML type: a string escaped as a TOML basic string; an integer,
+float, boolean, date or time only when the new text is that type in its
+canonical form. Other fields of the row, and other tables in the file,
+are never touched. A generator leaf's row is written the same way.
+
+Before a row is written, the loop is re-rendered against the planned row
+and must reproduce the edited live line exactly; for a leaf, the `into`
+path must reproduce the leaf's live path. A row edit is manual, with the
+reason, when:
+
+| Reason | Why |
+| --- | --- |
+| `data row spans several lines` | a row, or a generator leaf, renders to more than one line |
+| `multi-line loop template` | the loop's template has more than one line |
+| `loop row insertion or deletion` | the hunk adds or removes a row line rather than replacing one |
+| `data row no longer matches what the last apply wrote` | the loop's rows up to the edited one changed since the last apply, so the index may name another row; a stale generator leaf (its data changed since the last apply) is manual the same way |
+| `data row is not unique in its loop` | the edited row's text repeats in the loop, so the row cannot be told apart |
+| `live line splits into row fields more than one way` | the edit can be read as a change to more than one set of fields |
+| `field captured twice with different values` | the template captures one field twice and the live line gives it two values |
+| `data value holds a capture` | the stored value holds a `<...>` capture; writing the expansion would bake this machine's value in |
+| `new value holds a capture` | the new text holds `<...>` that the stored value does not |
+| `data value is an array` | arrays are not rewritten from rendered text |
+| `data value type` | the new text is not the stored value's type in canonical form |
+| `data row is not a table section` | a captured field has no assignment in the row's own table |
+| `the edited row does not render the edited line` | the planned row does not reproduce the live line |
+| `the edited row is filtered out` | the change makes the loop's `where` drop the row |
+| `the edited row moves the leaf` | the change alters the leaf's `into` path |
+| `data row would render differently elsewhere in the file` | another loop over the same data renders the row, and the write would make it appear or disappear there |
+| `data row also renders at line <n> without this edit` | another rendering of the row was not edited the same way |
+| `data row also renders elsewhere in the file without a position` | another rendering of the row cannot be located |
+
+A row edit committed beside a held hunk does not advance the applied
+record, so a later hunk re-offering that row is manual until the file is
+re-applied. The loop variable may have any name; a capture of its fields,
+an `entry.` field, or a bare `<field>` is row data.
+
+### Realignment
+
+A line diff pairs lines by equality alone, so where equal lines repeat it
+can present an edited loop row as a deletion plus an insertion elsewhere,
+or pair a line edited in one source with an equal line of another. In a
+file whose sources hold a loop, or whose lines come from anything other
+than one plain source file (fragments, overlays, the private layer,
+captures, secrets), commit routes only what every shortest line diff of
+the old and new lines agrees on: each region between lines that every
+such diff matches the same way is one hunk, and a hunk covering more than
+one source is a straddle, manual under `--yes`. It holds:
+
+- a hunk containing a line shaped like a row of any loop in the file,
+  unless it replaces exactly one row line with one line:
+  `may be an edited loop row`;
+- when such a hunk is held, or a row write is refused, every other
+  non-row hunk of the file: `held beside an edited loop row`;
+- in a file with private-layer and repo lines, when one side loses lines
+  and the other gains them, every non-row hunk of the file:
+  `lines may move between the private layer and the repo`;
+- every hunk of a file too large to compare this way:
+  `file too large to align its lines`.
+
+A hunk inside one loop row keeps its row reason (`data row spans several
+lines`, `loop row insertion or deletion`). A hunk with a line shaped like
+a loop row, or spanning a private-layer line and a repo line, is never
+offered for a split. No run writes a line from the private layer into the
+repo or the reverse. With three or more edits around equal lines, a
+routed literal line may land on the other side of a loop or in another
+repo source; row data stays correct.
+
+### Coupled renames
+
+When a changed token also lives in other managed sources, commit prompts
+`[Y/n/d/D/q]` to update them in the same write. All renames into one
+source are applied in one pass, so `foo -> bar` and `bar -> baz` in one
+run never turn `foo` into `baz`. Before any prompt, commit drops, with a
+warning:
+
+- a rename into a path that matches no managed file:
+  `coupling: <path> is no managed file's source; not updating it`;
+- two different new names for one old token, both:
+  `coupling: "<token>" is renamed to different names in this commit; not updating it anywhere else`;
+- a rename into a source whose accepted edit already holds the old token
+  as new text, including a data row a routed row write renders from:
+  `coupling: an edit routed into <path> keeps "<token>"; not renaming it there`;
+- a rename into a loop or generator source whose row write was routed,
+  when the old token is in one of its directive lines or its template:
+  `coupling: <path> holds "<token>" in a loop a row write was routed through; not renaming it there`.
+
+A target that cannot be read, or that the rename leaves unable to compose
+on this machine, has the rename removed before anything is written. A
+file receiving only a rename is never recorded and never printed
+`committed`. When a rename is dropped or undone after the prompt, it is
+not counted as coupled and is reported with its cause:
+
+```
+mox commit: coupled update to <target> undone: <unit> was not committed
+mox commit: coupled update to <target> undone: <target> could not take it (<reason>)
+mox commit: coupled update to <target> undone: <source> was restored because <unit> was not committed
+```
+
+`<reason>` is the error, or `recompose failed: <error>` for a target left
+unable to compose; a target that also had routed edits of its own ends
+the line `; <target> not committed`. Every managed file built from the
+renamed source gets its own line; one that did not fail names the one
+that did (`coupled update to <sibling> undone: <failed target> could not
+take it (<reason>)`, or `... undone: <failed target> was not committed`).
+A rename never makes the unit that produced it fail.
+
+### Failures while writing
+
+A source commit cannot read before writing stops the run at once:
+`could not read <path> (<error>)`, nothing written or recorded, exit 2.
+A write that fails is reported `could not write <path> (<error>)`; every
+source the run had written is restored, listed under `nothing was
+recorded; each path below was restored to its pre-run bytes`, and the run
+exits 2 with nothing recorded.
+
+If a restore itself fails -- after a failed write, or while settling --
+the remaining restores are still attempted, each failure is named
+(`could not restore <path> (<error>)`), and the pre-run bytes of every
+source that still differs from them are copied to a new directory
+`<state dir>/commit-recovery/<timestamp>/` (`<timestamp>-N` if it exists),
+under `repo/<path in the repo>`, `private/<path in the private layer>`,
+`facts`, or `other/<N>` for anything else. The list is headed `nothing
+was recorded; each path below still holds this run's edits` and names
+each path, `<path>: its pre-run bytes are saved in <copy>`; a file the run
+created is named `<path> did not exist before this commit; delete it to
+restore it`, and a copy that cannot be written is printed in full
+instead. Copy each file back over its path, or delete the created ones,
+before running commit again. Temporary writes commit makes to check a
+route, under `--dry-run` too, are restored the same way. Every exit 2
+ends by saying how many package rows were already recorded.
+
+### Preview
+
+`--dry-run` plans every edit the way `--yes` does -- placement checks, row
+checks, realignment, conflicts, coupled renames (every offered one taken,
+as `--yes` takes them) and the parse-back included -- and writes nothing
+but the temporary check writes above. Every route, manual hunk, dropped or
+undone rename, not-committed line and count it reports is what that
+`--yes` run reports; only a failure verification finds in the written
+bytes is left to `--yes`.
+
+### Packages
+
+A repo carrying a `data/packages/` manifest is reconciled before the file
+pass: each untracked package (installed, declared nowhere, not
+blacklisted) is offered `y` add, `b` blacklist, `s` skip -- add a row to
+the file that declares its backend, blacklist it, or skip; skip is the
+default, so `--yes` records nothing and exits 1 while anything stays
+untracked. A row is appended the moment it is chosen, so `q` here ends the
+run before the file pass and says how many rows were already recorded (rc
+1); `--abort-on-prompt` exits 2 at the first package prompt the same way.
+A backend plugin's `declare` verb runs here (see
+[packages.md](packages.md#the-protocol)). `--dry-run` lists the untracked
+packages and writes nothing; a path-scoped `mox commit <file>` skips
+packages entirely.
+
+### Exit codes
+
+- **0**: every unit with drift is committed and its live file equals its
+  recompose; nothing is left undone. `--dry-run`, and a non-TTY without
+  `--yes`, never exit 0 while an edit remains to route.
+- **1**: something is left undone -- a manual, declined or unrouted hunk; a
+  unit not committed; a coupled rename undone because its target failed; a
+  final-newline difference; a source that yields no file here beside an
+  edited live copy; a generator that fails to re-expand; a special file at
+  a recorded path; a head declaration (`own`, `disown`, `check`) that
+  cannot be read on a recorded path whose live content changed; a skipped
+  secret; a package still untracked. The same holds in every mode.
+- **2**: a source could not be read before writing, a write or restore
+  failed (sources restored or copied as above, nothing recorded), a
+  temporary check write failed or could not be reverted, or
+  `--abort-on-prompt` reached a prompt.
 
 ## diff
 

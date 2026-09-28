@@ -263,6 +263,44 @@ All notable changes to mox are documented here. The format follows
   saying why on stderr or through `limitation` -- it is the one judge of
   whether it is usable on a machine. Said in the guide, which promised the
   environment and left the rest to be inferred.
+- `commit` refuses a structured edit that changes anything outside the key
+  it writes: an edit to a YAML value that anchors aliases elsewhere fails.
+- `commit` leaves manual an edit that adds new `<...>` text to a string
+  field carried by a bare capture.
+- `commit` leaves manual a loop line whose edit splits into row fields more
+  than one way, where the leftmost split used to be taken.
+- `commit` leaves a row edit manual when the loop's rows up to the edited one
+  differ from the last apply (a row changed, added or dropped, the template
+  changed, the data source shadowed by the private layer) or the edited
+  row's text repeats in the loop; a row committed beside a held hunk is
+  manual until the file is re-applied.
+- In a file with a loop or with lines from more than one source, `commit`
+  routes only changes every shortest line diff agrees on: a change touching
+  a line shaped like a loop row is held unless it replaces one row line with
+  one line, other non-row changes in that file are held with it, a change
+  that could move a line between the private layer and the repo holds every
+  non-row change, a row edit is manual when the row renders elsewhere in
+  the file unchanged, and a file whose line counts multiply past 2^24 holds
+  every change.
+- `commit` refuses a key edit to a file merged from layers together with any
+  line, row or fact edit to the same file (a `d` default rewrite included,
+  hard links too), even on other lines, and two `d` default rewrites of one
+  fact to different values, although each could land alone.
+- A coupled rename is dropped when its old token is in a data row a routed
+  row write renders from, or in a directive line or template of a loop or
+  generator source whose row write was routed.
+- A row edit writes only the fields whose value changed, each in its stored
+  TOML type, keeping key, spacing and trailing comment, instead of rewriting
+  every captured field as `key = "value"`.
+- A unit owning an edit to a source restored because another unit failed,
+  and a unit with an unrouted hunk, are not committed. Declined-only files,
+  final-newline differences and every file `commit` skips exit 1.
+- `commit` shows a live path as `~/...` in the messages that printed it
+  absolute: failed verification, unrouted hunks, hunks left only in the
+  live file, the notice before a narrowing prompt, a key no layer can hold,
+  partially owned files, secret-bearing files and symlink target changes.
+  Generator-leaf and symlink prompts name the path relative to home, as
+  file prompts do.
 
 ### Fixed
 - `commit` applies an identical edit once. A fragment included twice in a
@@ -534,6 +572,84 @@ All notable changes to mox are documented here. The format follows
   other backend failure is reported in. `commit` printed the internal error
   name -- `declare failed: PluginFailed` -- where a sentence for that failure
   already existed and every sibling call already used it.
+- `commit` routes a loop hunk to the line's own data row. A row added since
+  the last apply, a row rendering several lines, or rows rendering the same
+  text sent the edit to another row, reported committed; each is now manual
+  with its reason.
+- `commit` treats a generator leaf whose data changed since the last apply
+  as stale: an unedited one has no drift, an edited one is manual, instead
+  of routing the old value back into the data source.
+- A row edit reaches the row whatever the loop variable is named; only
+  `entry` was recognized, and the unit failed with no reason given.
+- A row edit ends at the next table header of any kind and ignores lines
+  inside multi-line strings, arrays and inline tables; a following
+  `[table]`'s same-named field, or a line inside a value, was rewritten.
+- A row edit no longer replaces a stored capture with this machine's
+  expansion, turns integers, booleans and arrays into strings, drops the
+  rest of a multi-line value, or mis-decodes `\` and `"`.
+- A row edit is not moved onto another row by a line edit in the same data
+  file that adds or removes a table header above it.
+- A loop line whose edit fits more than one split into fields is manual;
+  the leftmost split could write a field the user did not edit.
+- An edited loop row that the line diff paired with a nearby equal line, and
+  a literal line paired with an equal line of another source, are held; the
+  edit was written as a literal line or into a source the user did not edit,
+  the private layer's lines into the repo included.
+- A row edit whose row also renders elsewhere in the file is manual unless
+  that rendering was edited the same way; the other rendering changed at the
+  next apply.
+- Two routed edits that overlap and differ -- one data row through two loops,
+  overlapping line edits, a row edit beside a line or key edit to the same
+  field, one fact set two ways, one symlink source given two targets -- no
+  longer overwrite each other with both reported committed; the later is
+  manual, naming the first.
+- A coupled rename no longer rewrites the old token inside a line another
+  unit routed, or inside the directive or template a routed row edit was
+  checked against.
+- Coupled renames into one file apply in one pass, so `foo -> bar` and
+  `bar -> baz` in one run no longer turn `foo` into `baz`; two new names for
+  one token are both dropped with a warning.
+- A coupled rename into a path that matches no managed file is dropped with
+  a warning; it was written with no backup and no verification.
+- A coupled rename into a generator source, or one leaving its target
+  unable to compose here, is reported undone instead of aborting the run
+  after the prompts.
+- A coupled rename whose origin or target is not committed is undone and
+  reported with its cause, not counted; a target shared by two origins no
+  longer loses one origin's update silently.
+- Nothing is recorded until every unit is settled. A later unit's failure
+  could restore a data source, base or fragment under a unit already
+  recorded committed, and the next apply discarded its live edit; every
+  unit with an edit to a restored source now fails with it, held hunks
+  included, naming the cause.
+- A failed symlink restores only its own source, and generator leaves are
+  settled with the files that share their data source rather than as a
+  batch.
+- A fact reverted because its unit failed re-verifies every unit that read
+  it; those passing only under the new value are not committed.
+- A unit with a hunk that could not be routed where the user chose is not
+  committed, even beside a manual hunk.
+- A source reached through two spellings, such as a symlink or `./`, is one
+  file: it was backed up and written twice, the later write clobbering the
+  earlier.
+- A write that fails restores every source the run wrote and records
+  nothing, exit 2; earlier writes stayed on disk unverified. A source that
+  cannot be read before writing stops the run with nothing written.
+- A restore that fails no longer loses the pre-run bytes: they are copied to
+  `<state dir>/commit-recovery/<timestamp>/` and each path is named.
+- A temporary write made to check a route is restored with the same
+  guarantees, under `--dry-run` too, and leaves no empty `.d/` behind.
+- `commit --dry-run` checks a key's placement as `--yes` does, for single-
+  and multi-configuration files, so a key no layer can hold is manual in
+  the preview instead of failing at write. The preview runs the same row
+  checks, conflicts, coupled renames and parse-back as `--yes`, and reports
+  the same manual, not-committed and undone lines.
+- `commit` exits 1 when a file is left undone for any reason: its source
+  yields no file here (a secret-bearing file included, now reported like
+  any other), every hunk was declined, it differs only in its final newline
+  (reported `manual: <path>: final newline differs`), a generator fails to
+  re-expand, or a recorded path holds a special file (reported `manual:
+  <path> (not a regular file)`) or a head declaration that cannot be read.
 
 ## [0.11.0] - 2026-09-09
 

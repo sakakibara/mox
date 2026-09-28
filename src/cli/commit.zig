@@ -1,56 +1,39 @@
 //! `mox commit`: route user edits of live files back into their sources.
 //!
-//! A live file that no longer matches what mox last wrote to it (true drift)
-//! is diffed against the last-applied content. Each changed hunk is mapped,
-//! through the provenance recorded at apply time, back to the source that
-//! produced it: a base line to `src/`, a fragment line to its fragment file,
-//! a private-layer line to the private file (NEVER repo src), a loop row to
-//! its data source. Secret, interpolated, and structural-merge hunks have no
-//! safe automatic route and are reported as manual. A hunk spanning more than
-//! one of these origins (a straddle) is also reported manual, unless the user
-//! `split`s it at the per-hunk prompt: each resulting piece lies within one
-//! origin and routes on its own.
+//! A live file that no longer matches what mox last wrote to it is diffed
+//! against that content. Each hunk is mapped, through the provenance recorded
+//! at apply time, to the source that produced it: a base line to `src/`, a
+//! fragment line to its fragment, a private-layer line to the private file
+//! (never repo `src/`), a loop row to the fields of its data row. A file
+//! merged from layers routes per key, a symlink by its target. Secret,
+//! interpolated and first-contact hunks, a hunk spanning several origins
+//! that is not split, and a row edit that cannot be told apart from another
+//! reading of the diff, are manual. Two routed edits that overlap and differ
+//! are never both written: the later is manual.
 //!
-//! On a TTY a routed line/row hunk is confirmed `[y/s]`, an unroutable
-//! hunk `[s/x]`, an interpolated hunk `[f/d/s]`, and a structured key
-//! change `[y/p/s]`; `--yes` takes the defaults, except on first contact,
-//! where a baseline mox never wrote leaves no default to take; `--dry-run`
-//! and a non-TTY without `--yes` only report; every mode exits 1 while
-//! anything is left undone; `--abort-on-prompt` exits 2 for a prompt that
-//! would have been needed, terminal or not. All writes happen after every
-//! prompt, so aborting writes
-//! nothing. After the sources are written, every unit -- a routed file, the
-//! target of a coupled update, a generator leaf, a symlink -- is verified. A
-//! unit's applied record advances only when its recompose equals live by its
-//! own equality -- exact bytes for a whole file, the canonical owned form for
-//! a partial file, the target for a symlink, the content for a leaf -- and no
-//! configuration the user did not choose changed. A coupling-only target is
-//! never compared with live: it must still compose and change no
-//! configuration the user did not choose, and it records nothing. A unit that
-//! fails a check is not committed. A unit not committed has every path
-//! holding one of its own edits restored to its pre-run bytes -- including a
-//! fragment and region directory a narrowing synthesized -- unless that edit
-//! is also owned by a passing unit. A unit fails in turn when a path holding
-//! one of its own edits is restored because another unit failed, or when it
-//! no longer verifies once a fact it reads is reverted because the unit that
-//! routed it failed; this settles until no unit fails anew. A coupled update
-//! never fails the units whose rename produced it: when its path is restored
-//! it is reported undone. One that changes nothing its target's own edit did
-//! not already write is no edit, and is never undone.
+//! Prompts come first; package rows are the only writes made at a prompt.
+//! Every other edit is planned in memory from a journal of the pre-run bytes
+//! of every path it writes, checked by parsing the planned bytes back, then
+//! written. Each unit -- a managed file, a generator leaf, a symlink -- is
+//! verified: its recompose must equal live (exact bytes, the canonical owned
+//! form for a partial file, the target, the leaf content) or differ only by
+//! its manual and declined hunks, and no configuration the user did not
+//! choose may change. A file receiving only a coupled rename must still
+//! compose and change no such configuration, and is never recorded. A unit that fails is not committed, and
+//! every path holding an edit no passing unit owns is restored from the
+//! journal; a unit owning an edit to a restored path, or reading a fact
+//! reverted for a failed unit, fails in turn, until no unit fails anew. A
+//! coupled rename never fails its origin: it is reported undone. Records are
+//! written only after settling, and only for a unit whose recompose equals
+//! live. A write or restore that fails restores what it can, saves the
+//! pre-run bytes of the rest under the state directory, records nothing, and
+//! exits 2.
 //!
-//! A manual hunk, and a hunk the user skips, are differences the recompose
-//! is EXPECTED to keep: skip is `s` in the per-hunk `[y/s]` prompt
-//! (decline the route outright), `s` at the candidate prompt (decline
-//! only the candidate picked), `s` in a structured file's per-key prompt, or
-//! the trailing `s` in its layer-pick menu (including declining that menu's
-//! cross-configuration confirm) -- all stay in the live file by design, so a
-//! file that has one can never recompose to live however well its other
-//! hunks routed. Those routed edits stand, the applied
-//! record does not advance (the rest is still real drift), and the report
-//! says what is left. A hunk the tool could not route to the candidate the
-//! user picked (no automatic path, a hazard) is not something the user asked
-//! for: its unit is not committed whatever else holds, a coupling target
-//! included.
+//! `--dry-run` runs the same routing, checks and plan without writing, so it
+//! reports what `--yes` would do. The exit code is 1 while anything is left
+//! undone -- a manual, declined or unrouted hunk, a unit not committed, a
+//! skipped file -- and 2 when a prompt is reached under `--abort-on-prompt`
+//! or a source cannot be read, written or restored.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1684,7 +1667,7 @@ fn commitRun(
         // A whole-file source that now composes to nothing (an emptied loop, a
         // gated-off region) has no file to route this edit into. The live copy
         // is the user's alone: say how to resolve it rather than routing bytes
-        // nowhere, only for the recompose to reject them and roll back.
+        // nowhere, only for the recompose to reject them and restore them.
         if (file.own_paths.len == 0 and (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, null) catch null) == null) {
             try ctx.err.print("mox commit: {f}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{display.of(file.live_path, m_state.home)});
             pending = true;
@@ -2040,8 +2023,8 @@ fn commitRun(
         for (space.configs, baseline[fidx]) |cfg, out| {
             if (out != .uncomposable) continue;
             try ctx.err.print(
-                "mox commit: {s}: configuration {s} does not compose ({s}); it cannot be verified -- fix that layer, then re-run\n",
-                .{ file.live_path, cfg.label, out.uncomposable },
+                "mox commit: {f}: configuration {s} does not compose ({s}); it cannot be verified -- fix that layer, then re-run\n",
+                .{ display.of(file.live_path, m_state.home), cfg.label, out.uncomposable },
             );
         }
     }
@@ -2199,7 +2182,7 @@ fn commitRun(
             if (file.is_symlink and file_routed[fidx] > 0) units += 1;
             if (!v.file_unit[fidx] or v.file_failed[fidx] or coupling_only[fidx]) continue;
             if (manual_hunks[fidx] + declined_hunks[fidx] > 0) {
-                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], wrote_own[fidx]);
+                try reportUnrouted(ctx.err, display.of(file.live_path, m_state.home), manual_hunks[fidx], declined_hunks[fidx], wrote_own[fidx]);
                 if (wrote_own[fidx]) units += 1;
             } else {
                 units += 1;
@@ -2414,14 +2397,14 @@ fn commitRun(
             // already stood, not something the routing did.
             .composes_to_nothing => {
                 mismatch = true;
-                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], false);
+                try reportUnrouted(ctx.err, display.of(file.live_path, m_state.home), manual_hunks[fidx], declined_hunks[fidx], false);
             },
             // The held hunks stay only in live, so the applied record does
             // not advance; the routed edits stand. A `[f]` route writes a
             // fact rather than a source, and it counts as routed here too.
             .held => {
                 mismatch = true;
-                try reportUnrouted(ctx.err, file.live_path, manual_hunks[fidx], declined_hunks[fidx], wrote_own[fidx]);
+                try reportUnrouted(ctx.err, display.of(file.live_path, m_state.home), manual_hunks[fidx], declined_hunks[fidx], wrote_own[fidx]);
                 if (wrote_own[fidx]) {
                     try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                     committed_count += 1;
@@ -2824,7 +2807,7 @@ const Verifier = struct {
     /// Fail a file whose edit the plan refused.
     fn refuseFile(v: *Verifier, fidx: usize) !bool {
         const reason = v.plan_failed[fidx].?;
-        try v.err.print("mox commit: {s}: {s}; not committed\n", .{ v.files[fidx].live_path, reason });
+        try v.err.print("mox commit: {f}: {s}; not committed\n", .{ display.of(v.files[fidx].live_path, v.m_state.home), reason });
         return v.failFile(fidx, reason);
     }
 
@@ -2884,7 +2867,7 @@ const Verifier = struct {
                 v.file_res[fidx] = .{ .check = .composes_to_nothing };
                 return true;
             }
-            try v.err.print("mox commit: {s}: the edited sources no longer compose; not committed\n", .{file.live_path});
+            try v.err.print("mox commit: {f}: the edited sources no longer compose; not committed\n", .{display.of(file.live_path, v.m_state.home)});
             return v.failFile(fidx, "its sources no longer compose");
         };
         // A partial file's this-machine identity check is canonical: the
@@ -2896,13 +2879,13 @@ const Verifier = struct {
             // skipped (`s`) are both DESIGNED outcomes -- the first has no safe
             // route at all, the second is the user choosing not to commit it
             // this run -- and either stays only in the live file, so the
-            // recompose is EXPECTED to still differ. Rolling the file back for
+            // recompose is EXPECTED to still differ. Restoring the file for
             // that would make the most ordinary mixed edit (one hunk committed,
             // one left alone) uncommittable forever. The routed hunks stand;
             // the applied record does not advance, so the rest still shows as
             // drift.
             if (held == 0) {
-                try v.err.print("mox commit: {s}: recomposed output still differs from live; not committed\n", .{file.live_path});
+                try v.err.print("mox commit: {f}: recomposed output still differs from live; not committed\n", .{display.of(file.live_path, v.m_state.home)});
                 return v.failFile(fidx, "its recomposed output differs from live");
             }
             // An explained mismatch excuses the file from matching live -- it
@@ -2917,7 +2900,7 @@ const Verifier = struct {
             // reproduce.
             if (try unmatchedRoutedKey(arena, v.struct_edits, v.struct_owners, fidx, composed_bytes, live)) |path| {
                 const label = try keyPathLabel(arena, path);
-                try v.err.print("mox commit: {s}: routed key {s} does not recompose to its live value; not committed\n", .{ file.live_path, label });
+                try v.err.print("mox commit: {f}: routed key {s} does not recompose to its live value; not committed\n", .{ display.of(file.live_path, v.m_state.home), label });
                 return v.failFile(fidx, try std.fmt.allocPrint(arena, "routed key {s} does not recompose to its live value", .{label}));
             }
             v.file_res[fidx] = .{ .check = .held };
@@ -2944,11 +2927,11 @@ const Verifier = struct {
         const composed = mox.compose.composeFileTracked(v.arena, v.io, file2, v.resolver, v.m_state, v.secrets, null, null) catch null;
         const n = v.unrouted_hunks[fidx];
         if (composed != null and v.matchesLive(fidx, composed.?, v.readLive(fidx))) {
-            try v.err.print("mox commit: {s}: {d} hunk(s) were left uncommitted; not committed\n", .{ file.live_path, n });
+            try v.err.print("mox commit: {f}: {d} hunk(s) were left uncommitted; not committed\n", .{ display.of(file.live_path, v.m_state.home), n });
         } else {
             try v.err.print(
-                "mox commit: {s}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
-                .{ file.live_path, n },
+                "mox commit: {f}: {d} hunk(s) were left uncommitted, so the recomposed output still differs from live; not committed\n",
+                .{ display.of(file.live_path, v.m_state.home), n },
             );
         }
         return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "{d} hunk(s) were left uncommitted", .{n}));
@@ -2983,8 +2966,8 @@ const Verifier = struct {
             const pc = try partialPerConfig(v.arena, configs, after_per, file);
             if (pc.violation) |viol| {
                 try v.err.print(
-                    "mox commit: {s}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
-                    .{ file.live_path, viol.label, viol.leaf },
+                    "mox commit: {f}: configuration {s}: composed leaf {s} is outside the declared own paths; not committed\n",
+                    .{ display.of(file.live_path, v.m_state.home), viol.label, viol.leaf },
                 );
                 return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "configuration {s}: composed leaf {s} is outside the declared own paths", .{ viol.label, viol.leaf }));
             }
@@ -2992,7 +2975,7 @@ const Verifier = struct {
         }
         if (candidates.firstViolation(configs, v.baseline[fidx], after_per, &v.allowed[fidx])) |vi| {
             const uncomposable = after_per[vi].isUncomposable();
-            try reportViolation(v.err, name, what, configs[vi].label, uncomposable);
+            try reportViolation(v.err, display.of(name, v.m_state.home), what, configs[vi].label, uncomposable);
             const reason = if (uncomposable)
                 try std.fmt.allocPrint(v.arena, "configuration {s} would be unable to compose", .{configs[vi].label})
             else
@@ -4533,8 +4516,8 @@ fn reportUnholdable(
     ra.manual_hunks[fidx] += 1;
     ra.pending.* = true;
     try cc.stdout.print(
-        "  manual: {s} {s}: {s} cannot hold this key\n",
-        .{ file.live_path, try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layer) },
+        "  manual: {f} {s}: {s} cannot hold this key\n",
+        .{ display.of(file.live_path, cc.m_state.home), try keyPathLabel(cc.arena, change.path), structLayerLabel(file, layer) },
     );
 }
 
@@ -4696,8 +4679,8 @@ fn processFallbackFile(
     const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
         if (kind == .secret) {
             try cc.stdout.print(
-                "  cannot verify {s}: the secret-derived content could not be recomposed ({s}); overwrite or skip\n",
-                .{ file.live_path, @errorName(e) },
+                "  cannot verify {f}: the secret-derived content could not be recomposed ({s}); overwrite or skip\n",
+                .{ display.of(file.live_path, cc.m_state.home), @errorName(e) },
             );
         } else {
             try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
@@ -4734,8 +4717,8 @@ fn processFallbackFile(
         // record is stale): the fresh recompose is not provably what mox last
         // wrote, so it is not a safe baseline to diff a live edit against.
         try cc.stdout.print(
-            "  cannot verify {s}: the secret-derived content no longer matches what mox last applied; overwrite or skip\n",
-            .{file.live_path},
+            "  cannot verify {f}: the secret-derived content no longer matches what mox last applied; overwrite or skip\n",
+            .{display.of(file.live_path, cc.m_state.home)},
         );
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
@@ -4989,8 +4972,8 @@ fn processSymlinkFile(
         else
             "its target is derived from a capture (e.g. <machine.X>)";
         try cc.stdout.print(
-            "  manual: {s} (symlink target changed, but {s}; keeping would discard it -- edit the source directly)\n",
-            .{ file.live_path, why },
+            "  manual: {f} (symlink target changed, but {s}; keeping would discard it -- edit the source directly)\n",
+            .{ display.of(file.live_path, cc.m_state.home), why },
         );
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
@@ -5007,8 +4990,8 @@ fn processSymlinkFile(
     // secret, so `has_capture` above never sees it -- this check does.
     if (!isPlainLiteralTarget(prov.items)) {
         try cc.stdout.print(
-            "  manual: {s} (symlink target changed, but its source varies by configuration; keeping would collapse that structure to one literal target -- edit the source directly)\n",
-            .{file.live_path},
+            "  manual: {f} (symlink target changed, but its source varies by configuration; keeping would collapse that structure to one literal target -- edit the source directly)\n",
+            .{display.of(file.live_path, cc.m_state.home)},
         );
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
@@ -5048,7 +5031,7 @@ fn processSymlinkFile(
         return .cont;
     }
     if (cc.interactive) {
-        try printHunkHeader(cc.stdout, cc.sty, file.live_path, "symlink", 1, 1, "symlink target");
+        try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "symlink", 1, 1, "symlink target");
         try cc.sty.green(cc.stdout);
         try cc.stdout.print("    + {s}\n", .{live_target});
         try cc.sty.close(cc.stdout);
@@ -5325,7 +5308,7 @@ fn acceptGeneratedRow(
         return .cont;
     }
     if (cc.interactive) {
-        try printHunkHeader(cc.stdout, cc.sty, leaf.live_path, "hunk", hunk_no, hunk_total, desc);
+        try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, leaf.live_path), "hunk", hunk_no, hunk_total, desc);
         try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
         const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
         switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -5390,7 +5373,7 @@ fn reportGeneratedManual(
         try cc.stdout.print("  manual: {f}:{d} {s}\n", .{ display.of(leaf.live_path, cc.m_state.home), hunk.a_start + 1, reason });
         return .cont;
     }
-    try printHunkHeader(cc.stdout, cc.sty, leaf.live_path, "hunk", hunk_no, hunk_total, try std.fmt.allocPrint(cc.arena, "manual -- {s}", .{reason}));
+    try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, leaf.live_path), "hunk", hunk_no, hunk_total, try std.fmt.allocPrint(cc.arena, "manual -- {s}", .{reason}));
     if (touches_secret) {
         try printSecretNotice(cc, secret_lines, hunk, b_lines);
     } else {
@@ -5454,6 +5437,7 @@ fn processPartialFile(
     const canon_mod = mox.apply.canonical;
     const owned_mod = mox.apply.owned;
     const live_path = file.live_path;
+    const shown = display.of(live_path, cc.m_state.home);
     const own_paths = file.own_paths;
     // The walk only attaches own_paths to structured targets.
     const format = commit_struct.formatOfPath(file.source_base_path).?;
@@ -5463,7 +5447,7 @@ fn processPartialFile(
     const composed = mox.compose.composeFileTracked(arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (compose failed: {s})\n", .{ live_path, @errorName(e) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (compose failed: {s})\n", .{ shown, @errorName(e) });
             return .cont;
         },
     };
@@ -5475,17 +5459,17 @@ fn processPartialFile(
     const owned = partial_mod.OwnedDoc.parse(arena, format, bytes) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed source does not parse as {s})\n", .{ live_path, @tagName(format) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (composed source does not parse as {s})\n", .{ shown, @tagName(format) });
             return .cont;
         },
     };
     switch (mode) {
         .own => if (try partial_mod.undeclaredLeaf(arena, &owned, own_paths)) |leaf| {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed leaf {s} is outside the declared own paths)\n", .{ live_path, leaf });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (composed leaf {s} is outside the declared own paths)\n", .{ shown, leaf });
             return .cont;
         },
         .disown => if (try partial_mod.populatedDisownPath(arena, &owned, own_paths)) |spelled| {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (composed source defines content under disowned path {s})\n", .{ live_path, spelled });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (composed source defines content under disowned path {s})\n", .{ shown, spelled });
             return .cont;
         },
     }
@@ -5495,14 +5479,14 @@ fn processPartialFile(
     const live_target = mox.apply.write.resolvePartialLive(arena, cc.io, live_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DanglingLink => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (live path is a dangling symlink; fix or remove the link)\n", .{live_path});
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (live path is a dangling symlink; fix or remove the link)\n", .{shown});
             return .cont;
         },
     };
     // Kind guard BEFORE the open: a FIFO here would block the read and brick
     // the whole commit.
     if (mox.apply.write.guardLiveRead(cc.io, live_target) == .special) {
-        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (not a regular file)\n", .{live_path});
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (not a regular file)\n", .{shown});
         return .cont;
     }
     const live = Io.Dir.cwd().readFileAlloc(cc.io, live_target, arena, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -5512,7 +5496,7 @@ fn processPartialFile(
     const live_doc = partial_mod.OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} could not be parsed as {s}; edit its source directly\n", .{ live_path, @tagName(format) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} could not be parsed as {s}; edit its source directly\n", .{ shown, @tagName(format) });
             return .cont;
         },
     };
@@ -5528,12 +5512,12 @@ fn processPartialFile(
     }
 
     const rec = record orelse {
-        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --overwrite' reasserts the source)\n", .{live_path});
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (no owned record: first contact; 'mox apply' adopts matching live content, 'mox apply --overwrite' reasserts the source)\n", .{shown});
         return .cont;
     };
     if (rec.secret) {
         // The record is a hash; there is no cleartext to diff against.
-        try cc.stdout.print("  skipped {s} (contains a secret; edit its source directly)\n", .{live_path});
+        try cc.stdout.print("  skipped {f} (contains a secret; edit its source directly)\n", .{shown});
         skipped_secret.* += 1;
         ra.pending.* = true;
         return .cont;
@@ -5558,7 +5542,7 @@ fn processPartialFile(
                 const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
                 const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
                 if (!std.mem.eql(u8, live_sec, composed_sec)) {
-                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --overwrite' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, p.segments) });
+                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} {s}: first contact for this path; 'mox apply --overwrite' adopts or reasserts it\n", .{ shown, try canon_mod.pathSpell(arena, p.segments) });
                 }
             }
             var last_blob: std.ArrayList(u8) = .empty;
@@ -5576,11 +5560,11 @@ fn processPartialFile(
                 const live_sec = try canon_mod.canonicalOwned(arena, &live_doc, &one);
                 const composed_sec = try canon_mod.canonicalOwned(arena, &owned, &one);
                 if (!std.mem.eql(u8, live_sec, composed_sec)) {
-                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: first contact for this path; 'mox apply --overwrite' adopts or reasserts it\n", .{ live_path, try canon_mod.pathSpell(arena, r.segments) });
+                    try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} {s}: first contact for this path; 'mox apply --overwrite' adopts or reasserts it\n", .{ shown, try canon_mod.pathSpell(arena, r.segments) });
                 }
             }
             last_blob_text = owned_mod.recordComplement(arena, owned.format, rec, record_paths, own_paths) orelse {
-                try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (owned record unreadable; run 'mox apply' to refresh it)\n", .{live_path});
+                try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (owned record unreadable; run 'mox apply' to refresh it)\n", .{shown});
                 return .cont;
             };
             const union_paths = try owned_mod.unionPaths(arena, own_paths, record_paths);
@@ -5593,16 +5577,16 @@ fn processPartialFile(
     const diffres = ownedKeyDiff(arena, last_blob_text, live_blob, &live_doc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unrepresentable => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (a reordered array cannot be routed by key)\n", .{live_path});
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (a reordered array cannot be routed by key)\n", .{shown});
             return .cont;
         },
         error.Malformed => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} (owned record unreadable; run 'mox apply' to refresh it)\n", .{live_path});
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (owned record unreadable; run 'mox apply' to refresh it)\n", .{shown});
             return .cont;
         },
     };
     for (diffres.unaddressable) |spelled| {
-        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {s} {s}: key is not addressable by a string key path\n", .{ live_path, spelled });
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} {s}: key is not addressable by a string key path\n", .{ shown, spelled });
     }
     if (diffres.changes.len == 0) return .cont;
 
@@ -5845,8 +5829,8 @@ fn structPickEdits(
 /// the ACTUAL edits: `affected_pick` (the winner set plus any confirmed
 /// `extra`) for a `[p]`, or `affected_winner` for a plain `[y]` (whose only
 /// edit is the winner write). The confirm in `pickLayer` is what makes a
-/// promote's `extra` part of what the user chose; the guard rolls back only a
-/// change OUTSIDE this set (an unseen/unconfirmed one).
+/// promote's `extra` part of what the user chose; the guard fails the unit only
+/// for a change OUTSIDE this set (an unseen/unconfirmed one).
 fn recordStructPlacement(
     cc: *const ClassCtx,
     ra: *const RunAccum,
@@ -6178,11 +6162,11 @@ fn pathsNest(a: []const []const u8, b: []const []const u8) bool {
 
 /// Report the configuration a write may not change: one it would leave unable
 /// to compose, or one the user did not choose to affect.
-fn reportViolation(err: *Io.Writer, path: []const u8, what: []const u8, label: []const u8, uncomposable: bool) !void {
+fn reportViolation(err: *Io.Writer, path: display.Path, what: []const u8, label: []const u8, uncomposable: bool) !void {
     if (uncomposable) {
-        try err.print("mox commit: {s}: {s} would leave configuration {s} unable to compose; not committed\n", .{ path, what, label });
+        try err.print("mox commit: {f}: {s} would leave configuration {s} unable to compose; not committed\n", .{ path, what, label });
     } else {
-        try err.print("mox commit: {s}: {s} would change configuration {s}, which you did not choose to affect; not committed\n", .{ path, what, label });
+        try err.print("mox commit: {f}: {s} would change configuration {s}, which you did not choose to affect; not committed\n", .{ path, what, label });
     }
 }
 
@@ -6239,18 +6223,18 @@ fn editedSinceRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, fi
 
 /// Name the hunks a file left only in its live copy, and whether the edits
 /// that were routed stand.
-fn reportUnrouted(err: *Io.Writer, live_path: []const u8, manual: usize, declined: usize, has_routed: bool) !void {
+fn reportUnrouted(err: *Io.Writer, live_path: display.Path, manual: usize, declined: usize, has_routed: bool) !void {
     if (manual > 0 and declined > 0) {
         if (has_routed) {
             try err.print(
-                "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
+                "mox commit: {f}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
                     "in the live file; the routed edits were committed to the sources -- edit the rest in by hand, " ++
                     "then run 'mox apply'\n",
                 .{ live_path, manual, declined },
             );
         } else {
             try err.print(
-                "mox commit: {s}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
+                "mox commit: {f}: {d} hunk(s) could not be routed and {d} hunk(s) were declined; both remain only " ++
                     "in the live file; not committed\n",
                 .{ live_path, manual, declined },
             );
@@ -6258,26 +6242,26 @@ fn reportUnrouted(err: *Io.Writer, live_path: []const u8, manual: usize, decline
     } else if (manual > 0) {
         if (has_routed) {
             try err.print(
-                "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; " ++
+                "mox commit: {f}: {d} hunk(s) could not be routed and remain only in the live file; " ++
                     "the routed edits were committed to the sources -- edit the rest in by hand, then run 'mox apply'\n",
                 .{ live_path, manual },
             );
         } else {
             try err.print(
-                "mox commit: {s}: {d} hunk(s) could not be routed and remain only in the live file; not committed\n",
+                "mox commit: {f}: {d} hunk(s) could not be routed and remain only in the live file; not committed\n",
                 .{ live_path, manual },
             );
         }
     } else {
         if (has_routed) {
             try err.print(
-                "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; " ++
+                "mox commit: {f}: {d} hunk(s) were declined and remain only in the live file; " ++
                     "the routed edits were committed to the sources -- run 'mox apply' to discard them\n",
                 .{ live_path, declined },
             );
         } else {
             try err.print(
-                "mox commit: {s}: {d} hunk(s) were declined and remain only in the live file; not committed\n",
+                "mox commit: {f}: {d} hunk(s) were declined and remain only in the live file; not committed\n",
                 .{ live_path, declined },
             );
         }
@@ -7081,7 +7065,7 @@ fn splitHunk(arena: std.mem.Allocator, segments: []const Segment, hunk: Hunk) ![
 /// insertion never writes a neighbour and so cannot bake an expanded value in.
 /// A hunk that fails is manual. The recompose check after writing still
 /// catches a mis-routing this cannot see; this names the cause and keeps the
-/// source untouched rather than rolling it back.
+/// source untouched rather than restoring it afterwards.
 fn sourceStillHolds(
     arena: std.mem.Allocator,
     io: Io,
@@ -7239,7 +7223,7 @@ fn findGeneratorLeaf(
 /// to change seed the post-write guard.
 fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: LineEdit, desc: []const u8, space: FileSpace, hunk_no: usize, hunk_total: usize) !Decision {
     const imp = try simulateImpact(cc, file, edit, space.configs);
-    const notice = try impactNotice(cc.arena, file.live_path, imp, space.configs.len - 1);
+    const notice = try impactNotice(cc.arena, display.of(file.live_path, cc.m_state.home), imp, space.configs.len - 1);
     const cands = try candidates.compute(cc.arena, cc.this_bindings, space.ax);
 
     if (cc.report_mode) {
@@ -7289,14 +7273,14 @@ fn classifyLine(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: Li
 
 /// The impact line that heads the intent question: what else, beyond this
 /// machine's own configuration, the edit reaches as it stands.
-fn impactNotice(arena: std.mem.Allocator, live_path: []const u8, imp: impact.Impact, n_other: usize) ![]const u8 {
+fn impactNotice(arena: std.mem.Allocator, live_path: display.Path, imp: impact.Impact, n_other: usize) ![]const u8 {
     if (n_other > 0 and imp.affected.len >= n_other)
-        return std.fmt.allocPrint(arena, "  {s} -- this edit changes every configuration. Keep it universal, or narrow it?\n", .{live_path});
+        return std.fmt.allocPrint(arena, "  {f} -- this edit changes every configuration. Keep it universal, or narrow it?\n", .{live_path});
     if (imp.affected.len == 0)
-        return std.fmt.allocPrint(arena, "  {s} -- this edit changes no other configuration (of {d} known configurations).\n", .{ live_path, n_other });
+        return std.fmt.allocPrint(arena, "  {f} -- this edit changes no other configuration (of {d} known configurations).\n", .{ live_path, n_other });
     return std.fmt.allocPrint(
         arena,
-        "  {s} -- this also changes {s} (of {d} known configurations).\n",
+        "  {f} -- this also changes {s} (of {d} known configurations).\n",
         .{ live_path, try joinLabels(arena, imp.affected), n_other },
     );
 }
@@ -9134,7 +9118,7 @@ pub const command = app.command(Spec, .{
     .name = "commit",
     .usage = "mox commit [--flags] [<paths...>]",
     .summary = "Route live-file edits back into their sources",
-    .details = "Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely. Prompts [y/s] per hunk (--yes: take defaults; --dry-run: report only, exit 1 if edits remain; --abort-on-prompt: strict CI, rc 2 on the first prompt); a structured key change prompts [y/p/s] to accept the winning layer, pick another, or skip. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region); a changed token shared by other sources prompts to update them too.",
+    .details = "Prompts [y/s] per hunk, [y/p/s] per key of a file merged from layers (accept the winning layer, pick another, skip), and [Y/n/d/D/q] to carry a changed token into other sources that hold it; --yes takes the defaults, --dry-run reports what --yes would do and writes nothing (exit 1 if edits remain), --abort-on-prompt exits 2 at the first prompt. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region). Every edit is planned and checked before anything is written; a file that fails verification is not committed and its sources are restored, failing with it every file whose edit shared a restored source, and nothing is recorded until all are settled. Exits 1 while anything is left undone. Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely.",
     .group = .general,
     .needs_context = true,
 }, run);
