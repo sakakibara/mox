@@ -3465,6 +3465,9 @@ EOF
       echo tester:pw | chpasswd
       echo "tester ALL=(ALL:ALL) ALL" >/etc/sudoers.d/tester
       chmod 440 /etc/sudoers.d/tester
+      # On a Linux host /w keeps mktemp -d 0700 and the host user as owner,
+      # which tester cannot enter; Docker Desktop file sharing does not check.
+      chmod -R a+rX /w
       chown -R tester /w/state
       echo "--- apply ---"
       rc=0
@@ -3487,7 +3490,7 @@ EOF
   if [ "$prompts" -ge 1 ] && ! grep -q "stopped, and this run has no terminal" "$out"; then
     ok "$backend ($image): sudo asked for the password on the terminal ($prompts prompt(s)), and nothing was stopped waiting for one"
   else
-    no "$backend ($image): sudo did not get to ask on the terminal" "$(grep -E 'password|stopped|^mox' "$out" | tail -3)"
+    no "$backend ($image): sudo did not get to ask on the terminal" "$(grep -E 'password|stopped|denied|^expect-exit=|^mox' "$out" | tail -3)"
   fi
 
   if grep -q "^apply-exit=0" "$out" && grep -q "^copy=directory" "$out" && grep -q "^link=/var/lib/pacman/local" "$out"; then
