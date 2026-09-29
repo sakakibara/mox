@@ -1890,6 +1890,9 @@ EOF
 # and a `-S --needed -- foo`, the upgrade of `a` lands foo as a dependency
 # and the second step skips it as up to date, so the apply reports it
 # installed while `pacman -Qeq` never does and every status says MISSING.
+# pacman's `-Sy` stores a database with the server's mtime and refetches only
+# a strictly newer one, at one-second resolution, so a republish in the same
+# second as the first sync reads as unchanged; the case dates it a second on.
 run_pacman_upgrade_dependency_case() {
   image="$1"
   backend="pacman upgrade-dependency"
@@ -1923,7 +1926,10 @@ EOF
       pacman -Sy --noconfirm >/dev/null 2>&1
       pacman -S --noconfirm a >/dev/null 2>&1
       (cd /srv/repo && repo-add -q -R moxtest.db.tar.gz a-3-1-any.pkg.tar foo-1-1-any.pkg.tar >/dev/null 2>&1)
+      synced=$(stat -c %Y /var/lib/pacman/sync/moxtest.db)
+      touch -d "@$((synced + 1))" /srv/repo/moxtest.db.tar.gz
       echo "premise-a=$(pacman -Q a | tr " " =)"
+      [ "$(stat -c %Y /srv/repo/moxtest.db.tar.gz)" -gt "$synced" ] && echo "premise-db=newer"
       echo "--- apply ---"
       rc=0
       /w/mox apply || rc=$?
@@ -1942,10 +1948,16 @@ EOF
     return
   fi
 
-  if grep -q "^premise-a=a=2-1" "$out" && grep -q "^a-after=a=3-1" "$out"; then
+  if ! grep -q "^premise-a=a=2-1" "$out" || ! grep -q "^premise-db=newer" "$out"; then
+    no "$backend ($image): the premise does not hold: a 2-1 installed, and the repository's database newer than pacman's copy of it" \
+      "$(grep -E '^premise-' "$out" | tr '\n' ' ')"
+    return
+  fi
+
+  if grep -q "^a-after=a=3-1" "$out"; then
     ok "$backend ($image): the install's upgrade moved a from 2-1 to 3-1, which pulls foo in"
   else
-    no "$backend ($image): the premise does not hold" "$(grep -E '^premise-a=|^a-after=' "$out")"
+    no "$backend ($image): the install's upgrade did not move a to 3-1" "$(grep -E '^a-after=' "$out")"
   fi
 
   if grep -q "Packages: 1 installed, 0 failed" "$out" && grep -q "^apply-exit=0" "$out"; then
