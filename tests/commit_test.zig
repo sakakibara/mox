@@ -10765,6 +10765,7 @@ test "commit: a fact write that would change another fact of the facts file is n
 }
 
 test "commit: two symlinks of one source retargeted differently are refused at routing, and --dry-run agrees" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -388,6 +388,7 @@ fn requireDirAncestor(io: Io, path: []const u8) !void {
     while (dir) |d| : (dir = std.fs.path.dirname(d)) {
         const st = Io.Dir.cwd().statFile(io, d, .{}) catch |e| switch (e) {
             error.FileNotFound => continue,
+            error.NotDir => return error.NotDir,
             else => return,
         };
         if (st.kind != .directory) return error.NotDir;
