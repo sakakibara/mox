@@ -4,7 +4,7 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.0] - 2026-09-21
+## [0.12.0] - 2026-10-02
 
 ### Added
 - Packages. A `data/packages/*.toml` manifest of `[[packages]]` rows (core
@@ -304,6 +304,13 @@ All notable changes to mox are documented here. The format follows
   file prompts do.
 
 ### Fixed
+- `commit` stops before any write when an absent target is beneath a regular
+  file. Windows reported such a path as not found and Linux reported it as
+  not a directory, so the check accepted it and the later write failed.
+- Scoop bootstrap stages its installer with the `.ps1` extension required by
+  `pwsh -File`. A nonzero Brew or Scoop installer exit is reported by exit
+  code; an installer that succeeds without leaving the manager retains its
+  separate diagnostic.
 - `commit` applies an identical edit once. A fragment included twice in a
   file and edited the same way in both places produced two identical
   edits, both applied, so a deleted line took the next one with it and the
