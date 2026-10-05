@@ -1163,6 +1163,9 @@ test "bootstrap: an installer that exits nonzero is reported by its exit code" {
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
+    // As root nothing about administrator access is left to say.
+    mox.cli.app.elevation_override = .root;
+    defer mox.cli.app.elevation_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(fake.called(interpreter));
@@ -4276,4 +4279,362 @@ test "status: a manager whose list output lost its separators is BROKEN, and non
     try std.testing.expect(std.mem.indexOf(u8, p.out, "package_broken\tbrew\t-\tlist\tits list output lost its shape\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing") == null);
     try std.testing.expect(std.mem.indexOf(u8, p.out, "package_untracked") == null);
+}
+
+/// A mac without brew, whose manifest bootstraps it and installs ripgrep:
+/// brew is absent once, the fetch writes the installer the digest covers,
+/// `installer_code` is what the installer exits with, and from then on brew
+/// answers. `sudo -v` answers `sudo_code`; the keepalive's `sudo -n -v` never
+/// reaches this runner, which no refresh may run through. The staged
+/// installer's path and its interpreter argv come back with the runner.
+const BrewBootstrap = struct {
+    fake: *mox.packages.exec.Fake,
+    staged: []const u8,
+    interpreter: []const u8,
+};
+
+fn brewBootstrap(a: std.mem.Allocator, io: Io, h: Harness, installer_code: u8, sudo_code: u8) !BrewBootstrap {
+    const installer = "#!/bin/bash\necho installing brew\n";
+    try writeManifest(io, h, a, "darwin.toml", try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{mox.apply.applied.contentHashHex(installer)}));
+
+    const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    const prefixes = try a.alloc([]const u8, 1);
+    prefixes[0] = prefix_bin;
+    mox.cli.app.brew_prefixes_override = prefixes;
+
+    const staged = try std.fs.path.join(a, &.{
+        h.state,                                                                           "tmp",
+        try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
+    });
+    const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = "sudo -v", .code = sudo_code });
+    try entries.append(a, .{ .argv = interpreter, .code = installer_code });
+    try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
+    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --formula --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew info --json=v2 --formula -- ripgrep", .match = .suffix, .code = 1 });
+    try entries.append(a, .{ .argv = "brew install -- ripgrep", .match = .suffix });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    return .{ .fake = fake, .staged = staged, .interpreter = interpreter };
+}
+
+/// Stands in for `sudo -n -v`, so no test ever runs sudo, and counts.
+const RefreshCount = struct {
+    n: std.atomic.Value(u32) = .init(0),
+
+    fn refresh(self: *RefreshCount) mox.packages.admin.Refresh {
+        return .{ .ctx = self, .run = bump };
+    }
+
+    fn bump(ctx: ?*anyopaque, _: Io) void {
+        const self: *RefreshCount = @ptrCast(@alignCast(ctx.?));
+        _ = self.n.fetchAdd(1, .acq_rel);
+    }
+};
+
+fn useElevation(how: mox.packages.admin.Elevation, refresh: *RefreshCount) void {
+    mox.cli.app.elevation_override = how;
+    mox.cli.app.admin_refresh_override = refresh.refresh();
+}
+
+fn resetBootstrapSeams() void {
+    mox.cli.app.package_runner_override = null;
+    mox.cli.app.brew_prefixes_override = null;
+    mox.cli.app.elevation_override = null;
+    mox.cli.app.admin_refresh_override = null;
+}
+
+fn sudoCalls(fake: *const mox.packages.exec.Fake) usize {
+    var n: usize = 0;
+    for (fake.calls.items) |c| {
+        if (std.mem.startsWith(u8, c, "sudo ")) n += 1;
+    }
+    return n;
+}
+
+test "bootstrap: on macOS with a terminal, sudo -v caches a credential before brew's installer runs" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const fx = try brewBootstrap(a, io, h, 0, 0);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // The order is the point: the credential, then the installer that only
+    // asks `sudo -n`, then the installs.
+    const prime = indexOfCall(fx.fake, "sudo -v") orelse return error.SudoVNeverRan;
+    const installer = indexOfCall(fx.fake, fx.interpreter) orelse return error.InstallerNeverRan;
+    var install: ?usize = null;
+    for (fx.fake.calls.items, 0..) |c, i| {
+        if (std.mem.endsWith(u8, c, "brew install -- ripgrep")) install = i;
+    }
+    try std.testing.expect(prime < installer);
+    try std.testing.expect(installer < (install orelse return error.InstallNeverRan));
+    // On the terminal, where sudo can ask; asked once.
+    try std.testing.expect(fx.fake.streamed.items[prime]);
+    try std.testing.expectEqual(@as(usize, 1), sudoCalls(fx.fake));
+    try std.testing.expect(std.mem.indexOf(u8, r.out,
+        \\  bootstrapping   brew
+        \\  sudo            brew's installer needs administrator access; sudo may ask for your password
+        \\  on PATH         
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    // A run far shorter than the refresh interval refreshes nothing, and the
+    // keepalive is gone once the apply returns.
+    try std.testing.expectEqual(@as(u32, 0), refresh.n.load(.acquire));
+}
+
+test "bootstrap: a refused sudo -v fails the bootstrap by name and the installer never runs" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const fx = try brewBootstrap(a, io, h, 0, 1);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("mox apply: brew: bootstrap needs administrator access: sudo -v exited 1\n", r.err);
+    try std.testing.expect(!fx.fake.called(fx.interpreter));
+    try std.testing.expect(!fx.fake.called("brew install -- ripgrep"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, fx.staged, .{}));
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+}
+
+test "bootstrap: without a terminal no sudo runs, and an installer that fails says it needs one" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const fx = try brewBootstrap(a, io, h, 1, 0);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.unattended, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(fx.fake.called(fx.interpreter));
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fx.fake));
+    try std.testing.expectEqualStrings(
+        "mox apply: brew: bootstrap failed: the installer exited 1; it needs administrator access: run mox from a terminal so sudo can ask for the password, or cache a sudo timestamp first\n",
+        r.err,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  sudo  ") == null);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+}
+
+test "bootstrap: without a terminal a cached sudo timestamp still lets the installer through" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const fx = try brewBootstrap(a, io, h, 0, 0);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.unattended, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fx.fake));
+    try std.testing.expect(fx.fake.called(fx.interpreter));
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "bootstrap: as root brew's installer runs with no sudo" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const fx = try brewBootstrap(a, io, h, 0, 0);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.root, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fx.fake));
+    try std.testing.expect(fx.fake.called(fx.interpreter));
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "bootstrap: off macOS brew's installer is not preceded by sudo -v" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{ .os = "linux" });
+
+    const installer = "#!/bin/bash\necho installing brew\n";
+    try writeManifest(io, h, a, "linux.toml", try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+    , .{mox.apply.applied.contentHashHex(installer)}));
+    const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    const prefixes = try a.alloc([]const u8, 1);
+    prefixes[0] = prefix_bin;
+    mox.cli.app.brew_prefixes_override = prefixes;
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
+    try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
+    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fake));
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+test "bootstrap: after init --clone --apply installed the Command Line Tools, brew's installer runs on that credential" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const bin = try std.fs.path.join(a, &.{ root, "stubs" });
+    const log = try std.fs.path.join(a, &.{ root, "calls.log" });
+    const clt_state = try std.fs.path.join(a, &.{ root, "clt-installed" });
+    const seed = try std.fs.path.join(a, &.{ root, "seed" });
+    // `git` clones the seed tree, so the apply that follows has a manifest
+    // that bootstraps brew; `sudo` runs nothing it is handed.
+    const stubs = [_][2][]const u8{
+        .{ "git", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"git $*\" >> '{s}'\nfor last; do :; done\n/bin/cp -R '{s}' \"$last\"\n", .{ log, seed }) },
+        .{ "xcode-select", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"xcode-select $*\" >> '{s}'\n[ -f '{s}' ] || exit 2\necho /Library/Developer/CommandLineTools\n", .{ log, clt_state }) },
+        .{ "softwareupdate", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"softwareupdate $*\" >> '{s}'\nprintf '%s\\n' '* Label: Command Line Tools for Xcode-16.0'\n", .{log}) },
+        .{ "sudo", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"sudo $*\" >> '{s}'\n[ \"$1\" = softwareupdate ] && : > '{s}'\nexit 0\n", .{ log, clt_state }) },
+    };
+    try tmp.dir.createDirPath(io, "stubs");
+    for (stubs) |s| {
+        const path = try std.fs.path.join(a, &.{ bin, s[0] });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = s[1] });
+        var zbuf: [4096]u8 = undefined;
+        @memcpy(zbuf[0..path.len], path);
+        zbuf[path.len] = 0;
+        _ = std.c.chmod(@ptrCast(&zbuf), 0o755);
+    }
+
+    const h = try testutil.setup(a, io, &tmp, .{ .os = "darwin", .extra_env = &.{.{ .name = "PATH", .value = bin }} });
+    var seeded = h;
+    seeded.repo = seed;
+    try tmp.dir.createDirPath(io, "seed/src");
+    const fx = try brewBootstrap(a, io, seeded, 0, 0);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "init", "--clone", "https://example.invalid/dotfiles.git", "--apply" });
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+
+    // The Command Line Tools' first sudo asked; the apply behind it neither
+    // asks again nor says it might.
+    const log_text = try Io.Dir.cwd().readFileAlloc(io, log, a, .limited(1 << 20));
+    try std.testing.expect(std.mem.startsWith(u8, log_text, "xcode-select -p\nsudo /usr/bin/touch "));
+    try std.testing.expect(std.mem.indexOf(u8, log_text, "sudo -v") == null);
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fx.fake));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.out, "sudo may ask"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  sudo  ") == null);
+    try std.testing.expect(fx.fake.called(fx.interpreter));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+}
+
+test "bootstrap: brew already present means no bootstrap and no sudo, even with a terminal" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+    const fake = try brewWith(a, "", "", &.{.{ .argv = "brew install -- ripgrep", .match = .suffix }});
+    useFake(fake);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fake));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  sudo  ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
 }

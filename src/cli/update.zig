@@ -210,7 +210,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     if (a.no_apply) return 0;
-    return apply_cmd.applyImpl(ctx, false, false, false, false, a.color orelse .auto, &.{});
+    return apply_cmd.applyImpl(ctx, false, false, false, false, a.color orelse .auto, &.{}, null);
 }
 
 pub const command = app.command(Spec, .{

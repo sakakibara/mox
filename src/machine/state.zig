@@ -242,7 +242,7 @@ pub fn captureWith(
 ) !MachineState {
     const builtin = @import("builtin");
 
-    const os_str = envOr(arena, environ, "MOX_OS") orelse osAxisValue(builtin.os.tag);
+    const os_str = osAxis(arena, environ);
     const arch_str = envOr(arena, environ, "MOX_ARCH") orelse @tagName(builtin.cpu.arch);
 
     // Windows has no gethostname/HOST_NAME_MAX under std.posix; the machine
@@ -353,6 +353,11 @@ pub fn captureWith(
 fn envOr(arena: std.mem.Allocator, environ: Environ, key: []const u8) ?[]const u8 {
     const v = environ.getAlloc(arena, key) catch return null;
     return if (v.len == 0) null else v;
+}
+
+/// This machine's `os` axis value: `MOX_OS` when set, else the build's.
+pub fn osAxis(arena: std.mem.Allocator, environ: Environ) []const u8 {
+    return envOr(arena, environ, "MOX_OS") orelse osAxisValue(@import("builtin").os.tag);
 }
 
 /// Canonical `os` axis value. Zig names macOS `.macos`, but the dotfiles

@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
 const paths_mod = @import("paths.zig");
+const tty = @import("tty.zig");
 const Env = @import("env").Env;
 const mox = @import("../root.zig");
 
@@ -69,6 +70,19 @@ pub var package_runner_override: ?mox.packages.exec.Runner = null;
 /// Test seam: where a bootstrapped brew is looked for, instead of the real
 /// prefixes, so a scripted bootstrap can plant its result under a temp dir.
 pub var brew_prefixes_override: ?[]const []const u8 = null;
+/// How a step needing administrator access may get it, when it should not be
+/// read from the process (root, or a terminal on stdin). A caller that drives
+/// `run` in-process -- the test harness -- sets this to take the terminal or
+/// unattended path without a terminal or root of its own. Null means real.
+pub var elevation_override: ?mox.packages.admin.Elevation = null;
+/// What refreshes a cached sudo timestamp during a run, when it should not
+/// be a real `sudo -n -v`. Null means real.
+pub var admin_refresh_override: ?mox.packages.admin.Refresh = null;
+
+/// How a step needing administrator access may get it on this run.
+pub fn elevation() mox.packages.admin.Elevation {
+    return elevation_override orelse mox.packages.admin.elevation(mox.packages.exec.isRoot(), tty.isInteractive(0));
+}
 
 /// The marker mox exports into every plugin's environment, carrying how many
 /// mox runs already sit above it. A plugin may legitimately call `mox` -- it

@@ -69,7 +69,11 @@ Initialize a fresh mox repo (`src/` and `scripts/`). `--clone <url>`
 clones an existing dotfiles repo into the repo dir; by default it stops
 for you to review -- a cloned repo's files and scripts are untrusted
 until you look at them -- and `--apply` applies right away for a
-one-command bootstrap. Refuses a non-empty repo dir. `--apply`'s facts
+one-command bootstrap. Refuses a non-empty repo dir. On macOS, absent
+Xcode Command Line Tools (which `git` needs) are installed before the
+clone through `softwareupdate`, with `sudo` asking for the administrator
+password on the terminal; without a terminal it stops and names
+`xcode-select --install`. `--apply`'s facts
 interview is the ordinary interactive one; add `--defaults` (see
 [apply](#apply)) for the zero-touch form that binds declared defaults
 and declines the rest instead of prompting.
@@ -200,7 +204,10 @@ re-capture; the machine is re-read again after any install or bootstrap,
 so a package installed here is a tool the post scripts see. A manager the
 manifest declares a `[[bootstrap]]` row for is installed first when absent,
 from its verified installer, and used by this same run; if that bootstrap
-fails, its rows are not attempted.
+fails, its rows are not attempted. Homebrew's installer on macOS needs a
+cached `sudo` credential: from a terminal, apply runs `sudo -v` first
+(asking for the administrator password) and keeps it fresh until the
+installs finish; without a terminal it runs the installer as is.
 apt, dnf, pacman, zypper and plugins get their whole set in one invocation;
 brew, scoop and winget install row by row, and a failed row leaves the rest
 to proceed. Any failure is an error class (rc 2), and a failed batch or a

@@ -213,7 +213,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // and a whole-tree apply would sweep in unrelated pending work the user
     // did not open an editor over. `--apply` is the same word `init` and
     // `update` use, meaning the same thing -- and make it take effect.
-    return apply_cmd.applyImpl(ctx, false, false, false, false, .auto, &.{live_path});
+    return apply_cmd.applyImpl(ctx, false, false, false, false, .auto, &.{live_path}, null);
 }
 
 /// Absolute path of the overlay (Cat A/C) or region fragment (Cat B) on `file`

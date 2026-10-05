@@ -62,6 +62,15 @@ pub const Harness = struct {
         mox.cli.app.cwd_override = cwd;
         defer mox.cli.app.cwd_override = saved_cwd;
 
+        // A run never reaches the suite's own terminal or root: whatever
+        // elevates is unattended unless a test says otherwise.
+        const saved_elevation = mox.cli.app.elevation_override;
+        if (saved_elevation == null) mox.cli.app.elevation_override = .unattended;
+        defer mox.cli.app.elevation_override = saved_elevation;
+        const saved_refresh = mox.cli.app.admin_refresh_override;
+        if (saved_refresh == null) mox.cli.app.admin_refresh_override = .{ .run = noRefresh };
+        defer mox.cli.app.admin_refresh_override = saved_refresh;
+
         var reader: Io.Reader = if (stdin) |s| .fixed(s) else undefined;
         const saved_stdin = mox.cli.app.stdin_override;
         mox.cli.app.stdin_override = if (stdin == null) null else &reader;
@@ -87,6 +96,8 @@ pub const Harness = struct {
         return mox.source.path.joinKeyOnto(h.a, h.home, name);
     }
 };
+
+fn noRefresh(_: ?*anyopaque, _: Io) void {}
 
 /// True when any file under `root` contains `needle`, or any symlink under it
 /// has `needle` in its target. Used to assert that nothing of a machine reaches

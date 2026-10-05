@@ -1735,8 +1735,9 @@ test "init --clone --apply: clones the repo and applies it in one command" {
     const source = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "source" });
     try testutil.gitTracked(io, a, source);
 
-    // Empty repo dir (no create_repo_src) so init --clone is allowed.
-    const h = try testutil.setup(a, io, &tmp, .{});
+    // Empty repo dir (no create_repo_src) so init --clone is allowed. Off
+    // macOS, so the clone does not first look for the Command Line Tools.
+    const h = try testutil.setup(a, io, &tmp, .{ .os = "linux" });
 
     const r = try h.run(&.{ "mox", "init", "--clone", source, "--apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -3554,6 +3555,14 @@ fn runExe(h: Harness, argv: []const []const u8) !std.process.RunResult {
     return runExeEnv(h, &env, argv);
 }
 
+/// The built mox binary's absolute path. The build emits a path relative to
+/// the build root, and a child runs with cwd HOME, so it has to be absolutized
+/// against the test process's own directory before it means anything there.
+fn builtMox(h: Harness) ![]const u8 {
+    if (std.fs.path.isAbsolute(exe_options.mox_exe)) return exe_options.mox_exe;
+    return std.fs.path.join(h.a, &.{ try std.process.currentPathAlloc(h.io, h.a), exe_options.mox_exe });
+}
+
 /// `runExe` with a caller-prepared environment. A backend or editor stub has
 /// to be on the PATH of the process that spawns it -- Zig resolves a program
 /// name against the CALLER's PATH, not the environ_map handed to the child --
@@ -3561,13 +3570,7 @@ fn runExe(h: Harness, argv: []const []const u8) !std.process.RunResult {
 fn runExeEnv(h: Harness, env: *std.process.Environ.Map, argv: []const []const u8) !std.process.RunResult {
     try env.put("MOX_REPO", h.repo);
     try env.put("MOX_STATE_DIR", h.state);
-    // The build emits a path relative to the build root, and this child runs
-    // with cwd HOME, so it has to be absolutized against the test process's
-    // own directory before it means anything to the child.
-    const exe = if (std.fs.path.isAbsolute(exe_options.mox_exe))
-        exe_options.mox_exe
-    else
-        try std.fs.path.join(h.a, &.{ try std.process.currentPathAlloc(h.io, h.a), exe_options.mox_exe });
+    const exe = try builtMox(h);
     var full: std.ArrayList([]const u8) = .empty;
     try full.append(h.a, exe);
     try full.appendSlice(h.a, argv);
@@ -4809,4 +4812,147 @@ test "export: one file that cannot compose leaves no tree behind" {
     // An export feeds a parity harness; a tree silently missing a file is
     // worse than no tree, so the good file is not written either.
     try std.testing.expect(!exists(io, out));
+}
+
+/// Stand-ins for what `mox init --clone` runs on a Mac, on a PATH of their
+/// own: each appends the command line it was given to `log`. `xcode-select -p`
+/// fails until `softwareupdate -i` has run under `sudo`; `sudo` runs nothing
+/// it is handed, so no stub can touch the machine. `git` fails with
+/// `git_stderr` and `git_code` when `git_code` is nonzero.
+const InitStubs = struct {
+    path: []const u8,
+    log: []const u8,
+};
+
+fn initStubs(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, root: []const u8, clt_present: bool, git_code: u8, git_stderr: []const u8) !InitStubs {
+    const bin = try std.fs.path.join(a, &.{ root, "stubs" });
+    const log = try std.fs.path.join(a, &.{ root, "calls.log" });
+    const state = try std.fs.path.join(a, &.{ root, "clt-installed" });
+    if (clt_present) try writeRepo(io, tmp, "clt-installed", "");
+    const scripts = [_][2][]const u8{
+        .{ "git", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"git $*\" >> '{s}'\nprintf '%s' '{s}' >&2\nexit {d}\n", .{ log, try std.mem.replaceOwned(u8, a, git_stderr, "'", "'\\''"), git_code }) },
+        .{ "xcode-select", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"xcode-select $*\" >> '{s}'\n[ -f '{s}' ] || {{ echo 'xcode-select: error: unable to get active developer directory' >&2; exit 2; }}\necho /Library/Developer/CommandLineTools\n", .{ log, state }) },
+        .{ "softwareupdate", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"softwareupdate $*\" >> '{s}'\nprintf '%s\\n' 'Software Update Tool' '' '* Label: Command Line Tools for Xcode-9.4' '* Label: Command Line Tools for Xcode-16.0' '* Label: macOS Sequoia 15.1-24B83'\n", .{log}) },
+        .{ "sudo", try std.fmt.allocPrint(a, "#!/bin/sh\necho \"sudo $*\" >> '{s}'\n[ \"$1\" = softwareupdate ] && [ \"$2\" = -i ] && : > '{s}'\nexit 0\n", .{ log, state }) },
+    };
+    for (scripts) |s| {
+        const sub = try std.fmt.allocPrint(a, "stubs/{s}", .{s[0]});
+        try writeExecScript(io, tmp, sub, s[1], try std.fs.path.join(a, &.{ bin, s[0] }));
+    }
+    return .{ .path = bin, .log = log };
+}
+
+fn initHarness(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, os: []const u8, clt_present: bool, git_code: u8, git_stderr: []const u8) !struct { h: Harness, stubs: InitStubs } {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const stubs = try initStubs(a, io, tmp, root, clt_present, git_code, git_stderr);
+    const h = try testutil.setup(a, io, tmp, .{ .os = os, .extra_env = &.{.{ .name = "PATH", .value = stubs.path }} });
+    return .{ .h = h, .stubs = stubs };
+}
+
+fn calls(io: Io, a: std.mem.Allocator, log: []const u8) ![]const u8 {
+    return Io.Dir.cwd().readFileAlloc(io, log, a, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => e,
+    };
+}
+
+const clone_url = "https://example.invalid/dotfiles.git";
+const clt_marker = "/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress";
+
+fn gitCall(a: std.mem.Allocator, repo: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "git -c protocol.ext.allow=never -c protocol.file.allow=user -c core.autocrlf=false clone -- {s} {s}\n", .{ clone_url, repo });
+}
+
+test "init --clone: a failed git clone is reported with git's exit code and its own words" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fx = try initHarness(a, io, &tmp, "linux", true, 128, "Cloning into 'dotfiles'...\nfatal: repository 'https://example.invalid/dotfiles.git/' not found\n");
+    const r = try fx.h.run(&.{ "mox", "init", "--clone", clone_url });
+    try std.testing.expectEqualStrings(
+        "mox init: git clone failed: git exited 128: Cloning into 'dotfiles'...\nfatal: repository 'https://example.invalid/dotfiles.git/' not found\n",
+        r.err,
+    );
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+}
+
+test "init --clone: on a Mac with the Command Line Tools, nothing runs before git but the check" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fx = try initHarness(a, io, &tmp, "darwin", true, 0, "");
+    mox.cli.app.elevation_override = .prompt;
+    defer mox.cli.app.elevation_override = null;
+    const r = try fx.h.run(&.{ "mox", "init", "--clone", clone_url });
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "xcode-select -p\n{s}", .{try gitCall(a, fx.h.repo)}),
+        try calls(io, a, fx.stubs.log),
+    );
+}
+
+test "init --clone: on a Mac without the Command Line Tools, they are installed through sudo before git runs" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fx = try initHarness(a, io, &tmp, "darwin", false, 0, "");
+    mox.cli.app.elevation_override = .prompt;
+    defer mox.cli.app.elevation_override = null;
+    const r = try fx.h.run(&.{ "mox", "init", "--clone", clone_url });
+    try std.testing.expectEqualStrings("", r.err);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(a,
+            \\xcode-select -p
+            \\sudo /usr/bin/touch {s}
+            \\softwareupdate -l
+            \\sudo softwareupdate -i Command Line Tools for Xcode-16.0
+            \\sudo /bin/rm -f {s}
+            \\sudo xcode-select --switch /Library/Developer/CommandLineTools
+            \\xcode-select -p
+            \\{s}
+        , .{ clt_marker, clt_marker, try gitCall(a, fx.h.repo) }),
+        try calls(io, a, fx.stubs.log),
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r.out, "Installing the Xcode Command Line Tools, which git needs; sudo may ask for your administrator password\nCloned " ++ clone_url ++ " to "));
+}
+
+test "init --clone: on a Mac without the Command Line Tools and no terminal, nothing is attempted" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fx = try initHarness(a, io, &tmp, "darwin", false, 0, "");
+    mox.cli.app.elevation_override = .unattended;
+    defer mox.cli.app.elevation_override = null;
+    const r = try fx.h.run(&.{ "mox", "init", "--clone", clone_url });
+    try std.testing.expectEqualStrings(
+        "mox init: the Xcode Command Line Tools are not installed; mox needs git to clone -- install them (xcode-select --install) and re-run\n",
+        r.err,
+    );
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqualStrings("xcode-select -p\n", try calls(io, a, fx.stubs.log));
 }

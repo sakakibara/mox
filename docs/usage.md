@@ -22,6 +22,10 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/instal
     init --clone <you> --apply
 ```
 
+On a fresh Mac this asks once for your administrator password, which
+installing the Xcode Command Line Tools (before the clone) and Homebrew (when
+your repo bootstraps it) both need.
+
 Starting fresh with nothing yet:
 
 ```sh

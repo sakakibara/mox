@@ -21,7 +21,7 @@ pub const Spec = struct {
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths);
+    return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths, null);
 }
 
 /// `machine.state.captureWith`, reporting a `ReservedFactName` (a custom fact
@@ -157,9 +157,12 @@ pub fn walkTreeOrReport(ctx: *app.Ctx, cmd: []const u8, src_dir: []const u8, hom
 /// drift set at the end. `force` (`--overwrite`) writes through
 /// drift instead of skipping it, scoped to `paths` when given. Returns 0
 /// (clean), 1 (drift was skipped and needs a decision), or 2 (a genuine
-/// failure -- see the exit-code split in `applyPass`).
-pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, color: style.ColorFlag, paths: []const []const u8) anyerror!u8 {
-    return applyPass(ctx, force, dry_run, skip_scripts_arg, defaults, color, paths);
+/// failure -- see the exit-code split in `applyPass`). `held` is a keepalive
+/// the caller already holds a sudo credential with (`init`'s Command Line
+/// Tools install); a bootstrap that elevates runs on it instead of asking
+/// again, and the caller stops it.
+pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, color: style.ColorFlag, paths: []const []const u8, held: ?*mox.packages.admin.Keepalive) anyerror!u8 {
+    return applyPass(ctx, force, dry_run, skip_scripts_arg, defaults, color, paths, held);
 }
 
 fn applyPass(
@@ -170,6 +173,7 @@ fn applyPass(
     defaults_only: bool,
     color: style.ColorFlag,
     paths: []const []const u8,
+    held: ?*mox.packages.admin.Keepalive,
 ) anyerror!u8 {
     const context = ctx.context.?;
     // Skip setup scripts (also implied by --dry-run) for fast, side-effect-
@@ -367,7 +371,7 @@ fn applyPass(
     const pkg_counts = if (skip_scripts_arg or paths.len > 0)
         PackageCounts{}
     else
-        try applyPackages(ctx, context, &bindings, dry_run, &script_env, &mox_path_dirs);
+        try applyPackages(ctx, context, &bindings, dry_run, &script_env, &mox_path_dirs, held);
 
     // A failed batch may have landed some of its rows, so the machine is
     // re-read after any attempt, not only after a clean success; an installer
@@ -850,6 +854,11 @@ fn applyPass(
 /// An installer is believed only as far as the manager it was supposed to
 /// leave behind: the probe is asked again afterwards, and one that still
 /// answers absent is this row's failure, whatever the installer exited.
+///
+/// An installer that elevates without prompting (brew's on macOS) runs only
+/// after `sudo -v` has cached a credential on the terminal; `keepalive` is
+/// then started and keeps it fresh until the caller stops it. One already
+/// active holds a credential, so nothing is asked.
 fn bootstrapBackends(
     ctx: *app.Ctx,
     context: app.Context,
@@ -860,7 +869,9 @@ fn bootstrapBackends(
     script_env: *std.process.Environ.Map,
     pkg_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
+    keepalive: *mox.packages.admin.Keepalive,
 ) !struct { bootstrapped: usize, ran: usize, failed: usize, failed_backends: []const []const u8 } {
+    const machine_os = mox.machine.state.osAxis(ctx.alloc, context.env);
     var bootstrapped: usize = 0;
     var ran: usize = 0;
     var failed: usize = 0;
@@ -919,9 +930,28 @@ fn bootstrapBackends(
         // However the install ends, nothing is left in state that a later
         // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+        var unattended_admin = false;
+        if (backend.bootstrap_elevates_on) |os| if (std.mem.eql(u8, os, machine_os)) switch (app.elevation()) {
+            .root => {},
+            .unattended => unattended_admin = true,
+            .prompt => if (!keepalive.active()) {
+                try ctx.out.print("  sudo            {s}'s installer needs administrator access; sudo may ask for your password\n", .{b.backend});
+                if (try primeSudo(ctx, pkg_backends)) |why| {
+                    try ctx.err.print("mox apply: {s}: bootstrap needs administrator access: {s}\n", .{ b.backend, why });
+                    try ctx.err.flush();
+                    failed += 1;
+                    try failed_names.append(ctx.alloc, b.backend);
+                    continue;
+                }
+                keepalive.start(ctx.io, mox.packages.admin.refresh_interval_ms, app.admin_refresh_override orelse mox.packages.admin.sudo_refresh);
+            },
+        };
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
             const why = if (e == error.BootstrapInstallerFailed and backend.installerExit() != null)
-                try std.fmt.allocPrint(ctx.alloc, "the installer exited {d}", .{backend.installerExit().?})
+                if (unattended_admin)
+                    try std.fmt.allocPrint(ctx.alloc, "the installer exited {d}; it needs administrator access: run mox from a terminal so sudo can ask for the password, or cache a sudo timestamp first", .{backend.installerExit().?})
+                else
+                    try std.fmt.allocPrint(ctx.alloc, "the installer exited {d}", .{backend.installerExit().?})
             else
                 try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs());
             try ctx.err.print("mox apply: {s}: bootstrap failed: {s}\n", .{ b.backend, why });
@@ -978,6 +1008,18 @@ fn bootstrapBackends(
         bootstrapped += 1;
     }
     return .{ .bootstrapped = bootstrapped, .ran = ran, .failed = failed, .failed_backends = failed_names.items };
+}
+
+/// `sudo -v` on the terminal, so an installer that only asks `sudo -n` finds
+/// a cached credential. Null when it succeeded, else why it did not.
+fn primeSudo(ctx: *app.Ctx, pkg_backends: *app.PackageBackends) !?[]const u8 {
+    const res = pkg_backends.runner().stream(ctx.alloc, &mox.packages.admin.prime_argv) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()),
+    };
+    if (res.timed_out) return try mox.packages.exec.failureText(ctx.alloc, error.TimedOut, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs());
+    if (!res.ok) return try std.fmt.allocPrint(ctx.alloc, "sudo -v exited {d}", .{res.code});
+    return null;
 }
 
 fn bootstrapFailedFor(failed: []const []const u8, backend: []const u8) bool {
@@ -1040,6 +1082,7 @@ fn applyPackages(
     dry_run: bool,
     script_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
+    held: ?*mox.packages.admin.Keepalive,
 ) !PackageCounts {
     var diag: mox.packages.manifest.Diag = .{};
     const manifest = mox.packages.manifest.load(
@@ -1128,8 +1171,12 @@ fn applyPackages(
     var bootstrap_failed: usize = 0;
     var failed_backends: []const []const u8 = &.{};
     var would_bootstrap: std.ArrayList([]const u8) = .empty;
+    // Held from the bootstrap that cached a credential until the installs
+    // below are done, whichever way this function leaves.
+    var own_keepalive: mox.packages.admin.Keepalive = .{};
+    defer own_keepalive.stop();
     if (!dry_run) {
-        const done = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, pkg_env, mox_path_dirs);
+        const done = try bootstrapBackends(ctx, context, &pkg_backends, registry, manifest, bindings, script_env, pkg_env, mox_path_dirs, held orelse &own_keepalive);
         bootstrapped = done.bootstrapped;
         bootstrap_ran = done.ran;
         bootstrap_failed = done.failed;

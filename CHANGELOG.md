@@ -4,6 +4,21 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `mox init --clone` on a Mac without the Xcode Command Line Tools no longer
+  fails at the clone: it installs them first through `softwareupdate`, with
+  `sudo` asking for the administrator password on the terminal. Without a
+  terminal it stops before the clone and says to run `xcode-select --install`.
+- A failed `git clone` names git's exit code and prints git's own error
+  instead of `CloneFailed`.
+- Bootstrapping Homebrew on macOS no longer stops at "Need sudo access":
+  `mox apply` runs `sudo -v` on the terminal before the installer and keeps
+  the credential fresh until the package installs finish. A refused `sudo -v`
+  fails the bootstrap by name; without a terminal, an installer that fails
+  says it needs administrator access.
+
 ## [0.12.2] - 2026-10-07
 
 ### Fixed
@@ -1488,6 +1503,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
+[Unreleased]: https://github.com/sakakibara/mox/compare/v0.12.2...HEAD
 [0.12.2]: https://github.com/sakakibara/mox/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/sakakibara/mox/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/sakakibara/mox/compare/v0.11.0...v0.12.0

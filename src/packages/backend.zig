@@ -353,6 +353,10 @@ pub const Backend = struct {
     /// whose interpreter decides by the name: PowerShell's `-File` refuses a
     /// script that does not end in `.ps1`.
     installer_extension: []const u8 = "",
+    /// The `os` on which this adapter's installer elevates through `sudo`
+    /// without ever prompting, so the run must hold a cached credential
+    /// before running it; null for an installer that needs none.
+    bootstrap_elevates_on: ?[]const u8 = null,
 
     /// What probing a manager found. `broken` is a manager that is there but
     /// cannot answer its own version query: reading that as absent would make

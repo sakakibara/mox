@@ -5,6 +5,7 @@ pub const style = @import("style.zig");
 pub const display = @import("display.zig");
 pub const prompt = @import("prompt.zig");
 pub const init_cmd = @import("init.zig");
+pub const clt = @import("clt.zig");
 pub const add_cmd = @import("add.zig");
 pub const apply_cmd = @import("apply.zig");
 pub const status_cmd = @import("status.zig");
@@ -63,6 +64,7 @@ test {
     _ = lock;
     _ = status_cmd;
     _ = init_cmd;
+    _ = clt;
     _ = paths;
     _ = tty;
     _ = style;

@@ -113,6 +113,7 @@ pub const Brew = struct {
             .vtable = &vtable,
             .limitation = cask_limitation,
             .install_check = "the formula and cask names brew resolves a row to, and the formulae it already has",
+            .bootstrap_elevates_on = "darwin",
         };
     }
 

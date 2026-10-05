@@ -43,6 +43,10 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/sakakibara/mox/main/instal
     init --clone <you> --apply
 ```
 
+On a fresh Mac this asks once for your administrator password, which
+installing the Xcode Command Line Tools (before the clone) and Homebrew (when
+your repo bootstraps it) both need.
+
 `--clone <you>` is shorthand for `https://github.com/<you>/dotfiles`;
 `owner/repo`, `host/owner/repo`, full URLs, ssh remotes, and local paths
 all work too. The powershell form takes the same arguments directly, no
