@@ -164,7 +164,12 @@ fn askDimension(arena: std.mem.Allocator, dim: dimensions.Dimension, input: *Io.
     while (true) {
         const line = try input.takeDelimiter('\n');
         const trimmed = std.mem.trim(u8, line orelse "", " \t\r");
-        if (trimmed.len == 0) return default orelse "";
+        if (trimmed.len == 0) {
+            if (default) |d| return d;
+            try out.print("  skipped {s}; answer it later with 'mox facts ask {s}'\n", .{ dim.name, dim.name });
+            try out.flush();
+            return "";
+        }
 
         if (dim.roles.value_compared and dim.observed_values.len > 0 and !containsStr(dim.observed_values, trimmed)) {
             const answer = try arena.dupe(u8, trimmed);
@@ -204,11 +209,15 @@ fn printProvenance(out: *Io.Writer, dim: dimensions.Dimension) !void {
 
 fn printPrompt(arena: std.mem.Allocator, out: *Io.Writer, name: []const u8, choices: []const []const u8, default: ?[]const u8) !void {
     try out.print("{s}", .{name});
-    if (choices.len > 0) {
-        const joined = try std.mem.join(arena, ", ", choices);
-        try out.print(" ({s})", .{joined});
+    const joined = try std.mem.join(arena, ", ", choices);
+    if (default) |d| {
+        if (choices.len > 0) try out.print(" ({s})", .{joined});
+        try out.print(" [{s}]", .{d});
+    } else if (choices.len > 0) {
+        try out.print(" ({s}; Enter skips)", .{joined});
+    } else {
+        try out.writeAll(" (Enter skips)");
     }
-    if (default) |d| try out.print(" [{s}]", .{d});
     try out.writeAll(": ");
 }
 
@@ -756,6 +765,41 @@ test "printPrompt: choices and default rendered, provenance line names source co
     try std.testing.expect(std.mem.indexOf(u8, got, "scripts/pre/10-op.sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "personal, work") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "[personal]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Enter skips") == null);
+}
+
+test "printPrompt: with no default, a lone choice is not mistaken for one -- the prompt says Enter skips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out_buf: [256]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    try printPrompt(a, &out, "profile", &.{"work"}, null);
+    try std.testing.expectEqualStrings("profile (work; Enter skips): ", out.buffered());
+
+    out = .fixed(&out_buf);
+    try printPrompt(a, &out, "email", &.{}, null);
+    try std.testing.expectEqualStrings("email (Enter skips): ", out.buffered());
+}
+
+test "askDimension: Enter with no default declines and says how to answer later; with a default it binds silently" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Io.Writer = .fixed(&out_buf);
+    var input: Io.Reader = .fixed("\n");
+    const no_default = testDim("profile", .{ .value_compared = true, .observed_values = &.{"work"} });
+    try std.testing.expectEqualStrings("", try askDimension(a, no_default, &input, &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "skipped profile; answer it later with 'mox facts ask profile'") != null);
+
+    out = .fixed(&out_buf);
+    input = .fixed("\n");
+    const with_default = testDim("holt_backend", .{ .declared_defaults = &.{"icloud"} });
+    try std.testing.expectEqualStrings("icloud", try askDimension(a, with_default, &input, &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "skipped") == null);
 }
 
 test "agreedDefault: disagreeing capture and declared defaults yield no default" {

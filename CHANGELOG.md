@@ -11,6 +11,9 @@ All notable changes to mox are documented here. The format follows
   compares. A fact only a manifest names is asked, and a manifest's values
   join the choices a prompt lists, where `profile` used to offer only the
   values `src/` compared.
+- An interview prompt with no default ends `; Enter skips`, so a lone
+  choice no longer reads as a default, and a skipped fact is announced with
+  the `mox facts ask <name>` that answers it later.
 
 ## [0.12.0] - 2026-10-02
 

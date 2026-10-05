@@ -341,9 +341,14 @@ committed or CI directory cannot ship a secret unnoticed.
   machine is never asked a work-only or backend-only question. A
   `# mox: default <name>="<value>"` line (above) declares a fact's interview
   default in the source that owns the concern; it is an interview default
-  only -- an unbound fact never silently reads as it. Enter with no default
-  binds the empty string: a persisted decline, the same state as
-  legitimately empty, never re-asked. The full surface -- `mox facts`,
+  only -- an unbound fact never silently reads as it. A prompt lists the
+  values the repo compares in parentheses and a default in brackets:
+  `holt_backend (gdrive, icloud) [icloud]: `. With no default it ends
+  `; Enter skips` instead -- `profile (personal, work; Enter skips): ` --
+  and Enter there binds the empty string: a persisted decline, the same
+  state as legitimately empty, never re-asked by the interview. The skip
+  is announced with the command that answers it later,
+  `mox facts ask <name>`. The full surface -- `mox facts`,
   `facts ask`, `facts --report`, `status`'s `unbound facts:` section,
   `doctor`'s stale-fact advisory, `apply --defaults` -- is in
   [commands.md](commands.md).
