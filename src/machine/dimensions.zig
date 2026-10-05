@@ -82,6 +82,7 @@ const dsl = @import("../dsl/root.zig");
 const source = @import("../source/root.zig");
 const state = @import("state.zig");
 const derived_facts = @import("derived_facts.zig");
+const packages_manifest = @import("../packages/manifest.zig");
 
 const Io = std.Io;
 const AxisExpr = dsl.ast.AxisExpr;
@@ -100,8 +101,9 @@ pub const Roles = struct {
 
 pub const Provenance = struct {
     /// Number of distinct source files (`src/` tree files, the data sources
-    /// their loops read, and scripts) that reference this dimension via a
-    /// value-compared, presence, or capture occurrence. A script's
+    /// their loops read, scripts, and `data/packages/` manifests) that
+    /// reference this dimension via a value-compared, presence, or capture
+    /// occurrence. A script's
     /// `# mox: needs`/`MOX_FACT_*` consumption is tracked separately in
     /// `needing_scripts`, not counted here.
     source_count: usize,
@@ -346,6 +348,8 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
         const abs = try std.fs.path.join(arena, &.{ repo_dir, "scripts", stage });
         try self.scanScriptsTree(abs, "scripts/" ++ stage);
     }
+
+    try self.scanPackageManifests(repo_dir);
 
     var result = try self.finalize();
     result.tree_error = tree_error;
@@ -1098,6 +1102,28 @@ const Discoverer = struct {
             .in_for = false,
             .depth = 0,
         });
+    }
+
+    // -- package manifests --------------------------------------------------
+
+    /// A `data/packages/` row's gate (its file's `when` narrowed by its own)
+    /// names facts exactly as a source gate does, so a fact only a manifest
+    /// compares is still asked, and its values are offered. Repo layer only,
+    /// like the rest of discovery. A manifest that does not load contributes
+    /// nothing here: apply's own manifest load diagnoses it.
+    fn scanPackageManifests(self: *Discoverer, repo_dir: []const u8) !void {
+        const m = packages_manifest.load(self.arena, self.io, repo_dir, "", null) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return,
+        };
+        for (m.packages) |row| try self.scanManifestGate(row.when, row.label);
+        for (m.bootstrap) |row| try self.scanManifestGate(row.when, row.label);
+    }
+
+    fn scanManifestGate(self: *Discoverer, when: ?[]const u8, label: []const u8) !void {
+        const src = when orelse return;
+        const expr = dsl.axis.parseString(self.arena, src) catch return;
+        try self.recordAxisExpr(expr, label, null);
     }
 
     // -- scripts tree -------------------------------------------------------
@@ -1920,6 +1946,81 @@ test "discover: presence-only role from a bare when name" {
     try std.testing.expect(!dim.roles.value_compared);
     try std.testing.expect(!dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 0), dim.observed_values.len);
+}
+
+test "discover: a package row's gate adds its values to the ones source gates compare" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/packages/darwin.toml",
+        \\backend = "brew"
+        \\when = "os=darwin"
+        \\
+        \\[[packages]]
+        \\name = "steam"
+        \\kind = "cask"
+        \\when = "profile=personal"
+        \\
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "profile").?;
+    try std.testing.expect(dim.roles.value_compared);
+    try std.testing.expectEqual(@as(usize, 2), dim.observed_values.len);
+    try std.testing.expectEqualStrings("personal", dim.observed_values[0]);
+    try std.testing.expectEqualStrings("work", dim.observed_values[1]);
+    try std.testing.expectEqual(@as(usize, 2), dim.provenance.source_count);
+    try std.testing.expect(findDim(d, "os") == null);
+}
+
+test "discover: a fact only a package manifest compares is still discovered" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "data/packages/darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "google-drive"
+        \\kind = "cask"
+        \\when = "profile=work"
+        \\
+    );
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "profile").?;
+    try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
+    try std.testing.expectEqualStrings("work", dim.observed_values[0]);
+    try std.testing.expect(dim.asking_condition == null);
+}
+
+test "discover: a manifest that does not load leaves the rest of discovery intact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    try writeFile(io, tmp.dir, "data/packages/broken.toml", "[[packages]\nname = \n");
+
+    const repo = try tmpAbsPath(a, &tmp, "");
+    const d = try discover(a, io, repo);
+    const dim = findDim(d, "profile").?;
+    try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
+    try std.testing.expectEqualStrings("work", dim.observed_values[0]);
 }
 
 test "discover: captured role with a default, unconditioned" {

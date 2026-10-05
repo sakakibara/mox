@@ -335,7 +335,8 @@ committed or CI directory cannot ship a secret unnoticed.
   (and `mox facts`) discover which facts to ask about directly from the
   repo's own sources -- every fact a gate compares by value, a capture
   interpolates, a bare presence test names, or a script consumes (see
-  Scripts, below) -- and ask each only when the configuration it gates is
+  Scripts, below), and every fact a `data/packages/` row's `when` names
+  -- and ask each only when the configuration it gates is
   reachable given the answers bound so far in the same run, so a personal
   machine is never asked a work-only or backend-only question. A
   `# mox: default <name>="<value>"` line (above) declares a fact's interview

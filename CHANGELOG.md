@@ -4,6 +4,14 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The facts interview finds the facts a `data/packages/` row's `when`
+  compares. A fact only a manifest names is asked, and a manifest's values
+  join the choices a prompt lists, where `profile` used to offer only the
+  values `src/` compared.
+
 ## [0.12.0] - 2026-10-02
 
 ### Added
@@ -1466,6 +1474,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
+[Unreleased]: https://github.com/sakakibara/mox/compare/v0.12.0...HEAD
 [0.12.0]: https://github.com/sakakibara/mox/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/sakakibara/mox/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/sakakibara/mox/compare/v0.9.0...v0.10.0
