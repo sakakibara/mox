@@ -9,6 +9,7 @@ pub const diag = @import("diag.zig");
 pub const interview = @import("interview.zig");
 pub const dimensions = @import("dimensions.zig");
 pub const job = @import("job.zig");
+pub const stall = @import("stall.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -23,4 +24,5 @@ test {
     _ = interview;
     _ = dimensions;
     _ = job;
+    _ = stall;
 }

@@ -930,6 +930,11 @@ fn bootstrapBackends(
         // However the install ends, nothing is left in state that a later
         // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+        // Staged like an install's: a run the user interrupts from here on
+        // ends inside sudo or the installer, and nothing deferred would say
+        // so.
+        mox.machine.job.stageNote(try std.fmt.allocPrint(ctx.alloc, "mox apply: interrupted bootstrapping {s}; its installer may have left it partly installed\n", .{b.backend}));
+        defer mox.machine.job.clearNote();
         var unattended_admin = false;
         if (backend.bootstrap_elevates_on) |os| if (std.mem.eql(u8, os, machine_os)) switch (app.elevation()) {
             .root => {},
@@ -1142,6 +1147,8 @@ fn applyPackages(
         },
     };
     for (pkg_backends.notes) |note| try ctx.out.print("  note            {s}\n", .{note});
+    // A notice about a quiet install names the run it belongs to.
+    pkg_backends.proc.command = "mox apply";
 
     // Checked before any bootstrap runs: a manifest that every other
     // command refuses must not get an installer downloaded and executed
@@ -1252,6 +1259,7 @@ fn applyPackages(
         .failed = bootstrap_failed + rep.broken.len,
         .would_bootstrap = would_bootstrap.items.len,
     };
+    if (!dry_run) try warnLowSpace(ctx, &pkg_backends, registry, rep, failed_backends);
     for (rep.backends) |b| {
         if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
@@ -1338,6 +1346,40 @@ fn applyPackages(
         if (!batch_failed) counts.installed += rows.items.len - refused - marked - unmarked;
     }
     return counts;
+}
+
+/// Say which volume the installs about to run write to is short of space,
+/// before the first of them: an install that runs out of disk can fail
+/// part-way or hang, and the warning is the one moment to say so. Only the
+/// backends with rows to install are asked, and the check never stops one.
+fn warnLowSpace(
+    ctx: *app.Ctx,
+    pkg_backends: *app.PackageBackends,
+    registry: mox.packages.backend.Registry,
+    rep: mox.packages.report.Report,
+    failed_backends: []const []const u8,
+) !void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (rep.backends) |b| {
+        if (b.drift.missing.len == 0) continue;
+        if (bootstrapFailedFor(failed_backends, b.backend)) continue;
+        const backend = registry.find(b.backend) orelse continue;
+        var rows: std.ArrayList(mox.packages.manifest.Row) = .empty;
+        for (b.drift.missing) |m| try rows.append(ctx.alloc, m.row);
+        const wanted = backend.spacePaths(ctx.alloc, rows.items) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => continue,
+        };
+        next: for (wanted) |p| {
+            for (paths.items) |have| if (std.mem.eql(u8, have, p)) continue :next;
+            try paths.append(ctx.alloc, p);
+        }
+    }
+    if (paths.items.len == 0) return;
+    const min_free = mox.packages.space.default_min_free_bytes;
+    const lows = try mox.packages.space.lowVolumes(ctx.alloc, pkg_backends.runner(), paths.items, min_free, ctx.err, "mox apply");
+    try mox.packages.space.warn(ctx.err, "mox apply", lows, min_free);
+    try ctx.err.flush();
 }
 
 /// The sentence an apply killed mid-install leaves behind: which batch was

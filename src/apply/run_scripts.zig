@@ -52,6 +52,7 @@ const dimensions = @import("../machine/dimensions.zig");
 const derived_facts = @import("../machine/derived_facts.zig");
 const state = @import("../machine/state.zig");
 const job = @import("../machine/job.zig");
+const stall = @import("../machine/stall.zig");
 const trigger_state = @import("../trigger/state.zig");
 
 const Io = std.Io;
@@ -65,6 +66,13 @@ const ps_powershell = "powershell.exe";
 /// (waiting on stdin, a lock, or a stalled network call) cannot block apply
 /// forever. Override per-run with MOX_SCRIPT_TIMEOUT_MS; <= 0 disables it.
 pub const default_script_timeout_ms: i64 = 600_000;
+
+/// When a script that has gone quiet is named, and how its quiet is
+/// observed; null is `stall.zig`'s defaults. Set by a test.
+pub var stall_override: ?stall.Config = null;
+
+/// Where that notice is written; null is standard error. Set by a test.
+pub var stall_out_override: ?*std.Io.Writer = null;
 
 pub const Result = struct {
     ran: usize = 0,
@@ -925,9 +933,21 @@ fn runOne(
         stderr.print("mox apply: {s}: cannot settle its trigger records {s}: {s}; the next apply runs it again\n", .{ path, t.pending, @errorName(e) }) catch {};
     };
 
+    // What a run ended by a signal while the script holds the terminal says
+    // it was doing: no deferred code runs on that death.
+    job.stageNote(try std.fmt.allocPrint(arena, "mox apply: interrupted running {s}\n", .{path}));
+    defer job.clearNote();
     const signals = job.SpawnSignals.install();
     defer signals.restore();
-    var child = spawnScript(arena, io, path, environ_map) catch |e| {
+    // The script inherits mox's stdout and stderr, so it is handed the
+    // terminal for its run the way a shell hands it to a foreground job: a
+    // `sudo` in a pre-script has to be able to prompt, and a background
+    // group that reads the terminal stops on SIGTTIN and waits out the whole
+    // bound instead. Ctrl-C then goes to the script, not to mox. It is
+    // launched already holding the terminal (`job.spawnForeground`), so a
+    // script that reads it at once is never stopped for it.
+    var tty: ?job.Terminal = null;
+    var child = launchScript(arena, io, path, environ_map, signals, &tty) catch |e| {
         // Every regular file in a scripts stage is spawned, so this is what a
         // script that lost its exec bit AND a stray README.md both look like.
         // Failing is right for the first; saying which is right for both.
@@ -941,14 +961,6 @@ fn runOne(
     };
 
     if (child.id) |id| signals.hold(id);
-
-    // The script inherits mox's stdout and stderr, so it is handed the
-    // terminal for its run the way a shell hands it to a foreground job: a
-    // `sudo` in a pre-script has to be able to prompt, and a background
-    // group that reads the terminal stops on SIGTTIN and waits out the whole
-    // bound instead. Ctrl-C then goes to the script, not to mox.
-    var tty: ?job.Terminal = null;
-    if (child.id) |id| tty = job.Terminal.handTo(id);
 
     // Bound the wait: a background task terminates the child once the timeout
     // elapses, unblocking the wait; cancel it if the script finishes first.
@@ -978,7 +990,22 @@ fn runOne(
     // would then never return.
     stdout.flush() catch {};
     stderr.flush() catch {};
+    // A script that goes quiet is named on standard error, through a writer
+    // of the watch's own: a cancel landing mid-flush then leaves its partial
+    // line in a buffer nothing else writes from, never in `stderr`'s.
+    var notice_buf: [256]u8 = undefined;
+    var notice_file: Io.File.Writer = .initStreaming(.stderr(), io, &notice_buf);
+    var watch: stall.Watch = .{
+        .io = io,
+        .config = stall_override orelse .{},
+        .label = try std.fmt.allocPrint(arena, "mox apply: {s}", .{path}),
+        .out = stall_out_override orelse &notice_file.interface,
+    };
+    var watcher: ?Io.Future(Io.Cancelable!void) = io.concurrent(stall.Watch.run, .{&watch}) catch |e| switch (e) {
+        error.ConcurrencyUnavailable => null,
+    };
     const term = job.waitFor(io, &child, tty) catch |e| {
+        if (watcher) |*w| w.cancel(io) catch {};
         guard.reaped.store(true, .release);
         if (killer) |*k| _ = k.cancel(io);
         if (tty) |t| t.takeBack();
@@ -995,6 +1022,7 @@ fn runOne(
         result.failed += 1;
         return;
     };
+    if (watcher) |*w| w.cancel(io) catch {};
     guard.reaped.store(true, .release);
     signals.release();
     if (killer) |*k| _ = k.cancel(io);
@@ -1010,12 +1038,14 @@ fn runOne(
         stderr.print("mox apply: {s}: timed out after {d}ms, killed\n", .{ path, timeout_ms }) catch {};
         return;
     }
-    // A script that died of an interrupt mox did not send was interrupted by
-    // the user at the terminal it held, so the run ends as that Ctrl-C would
-    // have ended mox itself.
-    if (tty != null and term == .signal and term.signal == .INT) {
+    // A script that died of an interrupt mox did not send, or exited the
+    // way a program that catches one does, was interrupted by the user at
+    // the terminal it held, so the run ends as that Ctrl-C would have ended
+    // mox itself.
+    if (tty != null and job.userInterrupted(term)) {
         stdout.flush() catch {};
         stderr.flush() catch {};
+        job.writeStagedNote();
         job.dieOfInterrupt();
     }
     switch (term) {
@@ -1105,6 +1135,23 @@ fn triggerFiles(arena: std.mem.Allocator, environ_map: ?*const EnvironMap) !?Tri
         .state = try std.fs.path.join(arena, &.{ state_dir, trigger_state.state_basename }),
         .pending = pending,
     };
+}
+
+/// `spawnScript`, launched holding the terminal where mox holds one, with
+/// `tty` set to the terminal to take back.
+fn launchScript(arena: std.mem.Allocator, io: Io, path: []const u8, environ_map: ?*const EnvironMap, signals: job.SpawnSignals, tty: *?job.Terminal) !std.process.Child {
+    const held = if (std.mem.endsWith(u8, path, ".ps1"))
+        job.spawnForeground(arena, try psArgv(arena, path, ps_pwsh), environ_map, .close, signals) catch |e| switch (e) {
+            error.FileNotFound => try job.spawnForeground(arena, try psArgv(arena, path, ps_powershell), environ_map, .close, signals),
+            else => return e,
+        }
+    else
+        try job.spawnForeground(arena, try directArgv(arena, path), environ_map, .close, signals);
+    if (held) |fg| {
+        tty.* = fg.tty;
+        return fg.child;
+    }
+    return spawnScript(arena, io, path, environ_map);
 }
 
 /// Spawn one script. A `.ps1` runs under `pwsh -NoProfile -File`, falling back

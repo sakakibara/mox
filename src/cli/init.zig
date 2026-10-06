@@ -109,6 +109,7 @@ fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn, apply_now: bool, 
             .install_timeout_ms = exec.installTimeoutMs(&env_map, ctx.err),
             .out = ctx.out,
             .err = ctx.err,
+            .command = "mox init",
         };
         var on_path: OnPath = .{ .inner = proc.runner(), .io = ctx.io, .path = env_map.get("PATH") orelse "" };
         const hold: clt.Hold = .{
@@ -222,9 +223,9 @@ const OnPath = struct {
         return self.inner.runFn(self.inner.ctx, arena, try self.resolved(arena, argv), stdin, cap, capture);
     }
 
-    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!exec.Result {
+    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, step: ?[]const u8) anyerror!exec.Result {
         const self: *OnPath = @ptrCast(@alignCast(ctx));
-        return self.inner.streamFn(self.inner.ctx, arena, try self.resolved(arena, argv), stdin);
+        return self.inner.streamFn(self.inner.ctx, arena, try self.resolved(arena, argv), stdin, step);
     }
 };
 

@@ -4956,3 +4956,179 @@ test "init --clone: on a Mac without the Command Line Tools and no terminal, not
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expectEqualStrings("xcode-select -p\n", try calls(io, a, fx.stubs.log));
 }
+
+const pty = struct {
+    extern "c" fn posix_openpt(flags: c_int) c_int;
+    extern "c" fn grantpt(fd: c_int) c_int;
+    extern "c" fn unlockpt(fd: c_int) c_int;
+    extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
+    /// Make the terminal open on a descriptor the controlling one of this
+    /// session: macOS's `_IO('t', 97)`; Linux's from its own table.
+    const set_controlling = if (@import("builtin").os.tag == .linux) std.os.linux.T.IOCSCTTY else 0x20007461;
+};
+
+/// Run the built mox on a fresh pseudo-terminal the way a job-control shell
+/// runs a foreground job, with `input` already typed: a session leader holds
+/// the terminal, as a shell does, and launches mox in a group of its own
+/// that it hands the terminal to. mox's group is therefore not orphaned, so
+/// a stop mox makes of itself really stops it, exactly as under a shell; the
+/// session leader reports that as exit status 99. Otherwise the answer is
+/// mox's own exit status, and everything written to the terminal. Everything
+/// both children need is prepared before the fork; between fork and exec
+/// they make async-signal-safe calls alone.
+fn runOnPty(h: Harness, argv: []const []const u8, input: []const u8) !struct { status: u32, out: []const u8 } {
+    const a = h.a;
+    const master = pty.posix_openpt(@bitCast(std.c.O{ .ACCMODE = .RDWR, .NOCTTY = true }));
+    if (master < 0) return error.SkipZigTest;
+    defer _ = std.c.close(master);
+    if (pty.grantpt(master) != 0 or pty.unlockpt(master) != 0) return error.SkipZigTest;
+    _ = std.c.fcntl(master, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+    // Nonblocking, so no write or read of the test's can hang it.
+    _ = std.c.fcntl(master, std.c.F.SETFL, std.c.fcntl(master, std.c.F.GETFL) | @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+    const slave = try a.dupeZ(u8, std.mem.span(pty.ptsname(master) orelse return error.SkipZigTest));
+    // Held open across the fork so the line typed ahead has a terminal to
+    // wait in; a master with no slave open takes no input on macOS.
+    const held = std.c.open(slave.ptr, .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
+    if (held < 0) return error.SkipZigTest;
+    defer _ = std.c.close(held);
+
+    const exe = try a.dupeZ(u8, try builtMox(h));
+    const argv_buf = try a.allocSentinel(?[*:0]const u8, argv.len + 1, null);
+    argv_buf[0] = exe.ptr;
+    for (argv, 1..) |arg, i| argv_buf[i] = (try a.dupeZ(u8, arg)).ptr;
+    const envp = try h.env.map.createPosixBlock(a, .{});
+    const home = try a.dupeZ(u8, h.home);
+
+    // Typed ahead: the terminal holds the line until something reads it.
+    if (std.c.write(master, input.ptr, input.len) != input.len) return error.TypeAheadFailed;
+
+    var ttou = std.posix.sigemptyset();
+    std.posix.sigaddset(&ttou, .TTOU);
+
+    const pid = std.c.fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        // The shell: leads the session and holds the terminal.
+        if (std.c.setsid() < 0) std.c._exit(120);
+        const fd = std.c.open(slave.ptr, .{ .ACCMODE = .RDWR });
+        if (fd < 0) std.c._exit(121);
+        _ = std.c.ioctl(fd, @intCast(pty.set_controlling), @as(c_int, 0));
+        for ([_]c_int{ 0, 1, 2 }) |n| _ = std.c.dup2(fd, n);
+        if (fd > 2) _ = std.c.close(fd);
+        if (std.c.chdir(home.ptr) != 0) std.c._exit(122);
+        _ = std.c.sigprocmask(std.posix.SIG.BLOCK, &ttou, null);
+        const job_pid = std.c.fork();
+        if (job_pid < 0) std.c._exit(123);
+        if (job_pid == 0) {
+            // The job: its own group, handed the terminal before the exec.
+            _ = std.c.setpgid(0, 0);
+            _ = mox.machine.job.libc.tcsetpgrp(0, std.c.getpid());
+            var none = std.posix.sigemptyset();
+            _ = std.c.sigprocmask(std.posix.SIG.SETMASK, &none, null);
+            _ = std.c.execve(exe.ptr, argv_buf.ptr, envp.slice.ptr);
+            std.c._exit(124);
+        }
+        _ = std.c.setpgid(job_pid, job_pid);
+        _ = mox.machine.job.libc.tcsetpgrp(0, job_pid);
+        var st: c_int = 0;
+        while (std.c.waitpid(job_pid, &st, std.c.W.UNTRACED) < 0) {}
+        const job_status: u32 = @bitCast(st);
+        if (std.c.W.IFSTOPPED(job_status)) {
+            _ = std.c.kill(-job_pid, .KILL);
+            std.c._exit(99);
+        }
+        std.c._exit(if (std.c.W.IFEXITED(job_status)) @intCast(std.c.W.EXITSTATUS(job_status)) else 98);
+    }
+
+    // Drained as it runs, or a full terminal buffer would block mox; bounded,
+    // so a mox stopped on the terminal fails the test instead of hanging it.
+    var out: std.ArrayList(u8) = .empty;
+    var raw: c_int = 0;
+    const started = Io.Clock.awake.now(h.io);
+    while (true) {
+        var fds = [_]std.c.pollfd{.{ .fd = master, .events = std.c.POLL.IN, .revents = 0 }};
+        if (std.c.poll(&fds, 1, 50) > 0) {
+            var buf: [4096]u8 = undefined;
+            const n = std.c.read(master, &buf, buf.len);
+            if (n > 0) try out.appendSlice(a, buf[0..@intCast(n)]);
+        }
+        if (std.c.waitpid(pid, &raw, std.c.W.NOHANG) == pid) break;
+        if (started.durationTo(Io.Clock.awake.now(h.io)).toMilliseconds() > 60_000) {
+            _ = std.c.kill(-pid, .KILL);
+            _ = std.c.waitpid(pid, &raw, 0);
+            return error.MoxNeverFinished;
+        }
+    }
+    return .{ .status = @bitCast(raw), .out = out.items };
+}
+
+test "apply: a setup script that reads the terminal the moment it starts is never stopped for it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+
+    // The script's first act is the read: it reaches the terminal before
+    // anything a handover made after the spawn could have done.
+    const got = try std.fs.path.join(a, &.{ h.root, "got" });
+    const script = try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "00-ask.sh" });
+    try writeExecScript(io, &tmp, "repo/scripts/pre/00-ask.sh", try std.fmt.allocPrint(a, "#!/bin/sh\nIFS= read -r line </dev/tty\nprintf '%s' \"$line\" > '{s}'\n", .{got}), script);
+
+    // And one that cannot be executed at all: the exec fails in the child
+    // that already took the terminal, which mox must report and take back.
+    try writeRepo(io, &tmp, "repo/scripts/pre/01-noexec.sh", "#!/bin/sh\nexit 0\n");
+
+    const r = try runOnPty(h, &.{"apply"}, "typed ahead\n");
+    errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
+    try std.testing.expect(std.c.W.IFEXITED(r.status));
+    // 99 is mox found stopped: the script read the terminal before its
+    // group held it, and mox answered that stop as the user's Ctrl-Z.
+    try std.testing.expectEqual(@as(u32, 2), std.c.W.EXITSTATUS(r.status));
+    try std.testing.expectEqualStrings("typed ahead", try read(io, a, got));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "01-noexec.sh: not executable") != null);
+    // The run went on to its summary with the terminal back in its hands.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Applied:") != null);
+}
+
+test "apply: an install that reads the terminal the moment it starts is never stopped for it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+
+    // A plugin whose install reads the terminal first, as a manager asking
+    // for confirmation would; its rows arrive on stdin, so the terminal is
+    // reached through /dev/tty.
+    const got = try std.fs.path.join(a, &.{ h.root, "got" });
+    const plugin = try std.fs.path.join(a, &.{ h.repo, "scripts", "backends", "ttyread" });
+    try writeExecScript(io, &tmp, "repo/scripts/backends/ttyread", try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\cmd=${{1:-}}
+        \\case "$cmd" in
+        \\available) exit 0 ;;
+        \\id) IFS= read -r l; printf '%s\n' "$l" | sed -n 's/^{{ *name = "\([^"]*\)".*/\1/p' ;;
+        \\list) [ -f '{s}' ] && echo probe; exit 0 ;;
+        \\install) IFS= read -r line </dev/tty; printf '%s' "$line" > '{s}' ;;
+        \\declare) printf 'name = "%s"\n' "$2" ;;
+        \\*) exit 64 ;;
+        \\esac
+        \\
+    , .{ got, got }), plugin);
+    try writeRepo(io, &tmp, "repo/data/packages/shared.toml", "backend = \"ttyread\"\n\n[[packages]]\nname = \"probe\"\n");
+
+    const r = try runOnPty(h, &.{"apply"}, "typed ahead\n");
+    errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
+    try std.testing.expect(std.c.W.IFEXITED(r.status));
+    // 99 is mox found stopped on the install's read of the terminal.
+    try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(r.status));
+    try std.testing.expectEqualStrings("typed ahead", try read(io, a, got));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+}

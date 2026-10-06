@@ -618,8 +618,8 @@ any install or bootstrap, so a package installed here is a tool the
 post-scripts see. A declared manager that is absent is bootstrapped first
 (above). apt, dnf,
 pacman, zypper and plugins get the whole set for their backend in one
-invocation; brew, scoop and winget install row by row, and a row that fails
-leaves the rest to proceed. The manager's own output is streamed rather
+invocation; brew (apart from the casks that elevate, below), scoop and winget
+install row by row, and a row that fails leaves the rest to proceed. The manager's own output is streamed rather
 than captured, so progress and errors reach the terminal as they happen,
 and it may talk to the terminal itself (`sudo` asking for a password; apt
 runs with `DEBIAN_FRONTEND=noninteractive` so debconf does not). A batch
@@ -633,6 +633,59 @@ legitimately compile for an hour -- and `MOX_INSTALL_TIMEOUT_MS` bounds it
 when set: at the bound the manager gets SIGINT first, so it can roll back
 its transaction, and SIGKILL ten seconds later.
 `--dry-run` lists what it would install and installs nothing.
+
+An install, a bootstrap's installer, or a setup script that prints nothing
+for five minutes is named on stderr, and again every five minutes it stays
+quiet:
+
+```
+mox apply: brew: logi-options+ has printed nothing for 5m; still waiting (Ctrl-C stops the run)
+```
+
+Nothing is ended for it; `MOX_INSTALL_TIMEOUT_MS` is the one bound that
+kills. mox does not sit between the child and your terminal -- a pipe there
+would turn off an installer's progress bars and change what it asks -- so
+quiet is read from the modification time and size of mox's own stdout and
+stderr, which a write to a terminal, a pipe, or a file advances. Where
+neither can be read that way (`/dev/null`, any stream on Windows) the line
+says how long the call has been running instead of how long it has been
+quiet.
+
+Before the first install, the volumes the installs write to are measured
+with `df -P -k` -- for brew, its prefix, and `/private/tmp` on a mac when a
+cask is to be installed -- and one with less than 10 GiB free is named with
+the space it has. It is a warning: the installs go ahead. A vendor installer
+that runs out of disk has been seen to hang rather than fail, which the
+warning is there to head off.
+
+Ctrl-C during an install ends the run once the manager has wound down, and
+the last line says which install it was part-way through. A manager that
+catches the interrupt to clean up and exits 130 -- brew does -- ends the run
+the same way, rather than mox going on to the next install. The same holds
+for an installer and a setup script: a child that held the terminal and
+exits 130, for whatever reason, is taken as the user's Ctrl-C and stops the
+apply.
+
+A brew cask whose install elevates -- a `pkg`, an installer run with
+`sudo: true`, a keyboard layout, or a preflight or postflight step that needs
+sudo, mirroring Homebrew's own `requires_sudo?` as `brew info --json=v2`
+shows it -- is installed together with the others like it, in one
+`brew install --cask`, before every other brew row. Homebrew clears sudo's
+cached credential the first time each brew process needs it, so one process
+per cask would ask for the administrator password once per cask; one process
+asks once. brew downloads every cask of that run first, so the prompt comes
+when the downloads are done. A line before the run says so:
+
+```
+mox: brew: karabiner-elements, logi-options+ need administrator access to install, so they are installed first, in one brew run; Homebrew downloads them all first, then clears sudo's cached credential before its first elevated step, so the administrator password may be asked once more when the downloads are done
+```
+
+brew goes on to the next cask when one fails, and when that run fails mox
+reads the installed casks back and names each one it left uninstalled. A
+cask brew cannot describe is installed on its own, like every other row, and
+so is one whose elevation the JSON does not show -- a cask that elevates
+only from a `preflight`/`postflight` Ruby block or through a sudo fallback of
+its own: its brew run may ask for the password again.
 
 A dnf install answers dnf's own questions, and the import of a repository's
 signing key is one of them: on a machine whose rpm holds no key for a
@@ -822,9 +875,13 @@ backend.
   Ctrl-C during a query kills the query's group before mox dies of the
   interrupt itself, so no manager is left holding a lock.
 - A streamed call (`install`, `bootstrap`) is handed the terminal for its
-  run, the way a shell hands it to a job. `sudo` can prompt, Ctrl-C goes to
-  the manager and ends mox with it, and Ctrl-Z suspends the job and hands
-  the terminal back, so the shell can `fg` it later. A run with no terminal
+  run, the way a shell hands it to a job. `sudo` can prompt, the manager
+  reads the terminal on stdin (a plugin verb reads what mox hands it
+  there instead: its rows, or nothing), Ctrl-C goes to the manager and ends mox with it -- whether the
+  manager dies of it or exits 130 -- and Ctrl-Z suspends the job and hands
+  the terminal back, so the shell can `fg` it later. Where mox's stdin is
+  not a terminal it holds (a pipe, a file, a run in the background), a
+  streamed call's stdin is closed. A run with no terminal
   to hand over (`mox apply &`, a CI job) cannot answer a prompt, so an
   install that stops waiting for one is ended and named rather than waited
   on forever. Its bound is

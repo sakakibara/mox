@@ -207,51 +207,101 @@ pub fn writeStagedNote() void {
     _ = std.c.write(2, &note_buf, n);
 }
 
-/// The controlling terminal, handed to a streamed child for its run and
-/// taken back once it is reaped. Handed over only when stdin is a terminal
-/// that mox's own group holds: a mox run in the background must not take
-/// it from the job that has it, and a mox without one has nothing to hand.
-/// Windows has no job control, so there it is nothing at all.
+/// The controlling terminal, handed to a streamed child for its run (by
+/// `spawnForeground`, which launches the child holding it) and taken back
+/// once it is reaped. Handed over only when stdin is a terminal that mox's
+/// own group holds: a mox run in the background must not take it from the
+/// job that has it, and a mox without one has nothing to hand. Windows has
+/// no job control, so there it is nothing at all.
 pub const Terminal = if (builtin.os.tag == .windows) NoTerminal else PosixTerminal;
 
 pub const NoTerminal = struct {
-    pub fn handTo(_: std.process.Child.Id) ?NoTerminal {
-        return null;
-    }
     pub fn takeBack(_: NoTerminal) void {}
 };
 
 pub const PosixTerminal = struct {
+    /// The group the terminal goes back to: mox's own.
     owner: std.posix.pid_t,
 
-    pub fn handTo(pgid: std.posix.pid_t) ?PosixTerminal {
+    /// The group holding the terminal on stdin, when that is mox's own: the
+    /// terminal there is to hand over. Null for no terminal, or one another
+    /// job holds.
+    pub fn heldOwner() ?std.posix.pid_t {
         const fd = std.posix.STDIN_FILENO;
         if (std.c.isatty(fd) == 0) return null;
         const owner = libc.tcgetpgrp(fd);
         if (owner < 0 or owner != libc.getpgrp()) return null;
-        if (!setForeground(fd, pgid)) return null;
-        return .{ .owner = owner };
+        return owner;
     }
 
     pub fn takeBack(self: PosixTerminal) void {
         _ = setForeground(std.posix.STDIN_FILENO, self.owner);
     }
 
-    /// `tcsetpgrp` with SIGTTOU ignored for its duration: the call from a
+    /// `tcsetpgrp` with SIGTTOU blocked for its duration: the call from a
     /// background group -- which mox is in while the child has the
-    /// terminal -- stops the caller otherwise.
+    /// terminal -- stops the caller otherwise. Blocked in this thread alone,
+    /// never ignored process-wide, so no other thread's write can slip
+    /// through a disposition flipped under it.
     pub fn setForeground(fd: std.posix.fd_t, pgid: std.posix.pid_t) bool {
-        const ignore: std.posix.Sigaction = .{
-            .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        var previous: std.posix.Sigaction = undefined;
-        std.posix.sigaction(.TTOU, &ignore, &previous);
-        defer std.posix.sigaction(.TTOU, &previous, null);
+        const mask = blockTtou();
+        defer restoreThreadMask(mask);
         return libc.tcsetpgrp(fd, pgid) == 0;
     }
 };
+
+/// The calling thread's signal mask, as `blockTtou` found it.
+pub const ThreadMask = if (builtin.os.tag == .windows) void else std.posix.sigset_t;
+
+/// Block SIGTTOU in the calling thread and answer the mask to put back with
+/// `restoreThreadMask`. A terminal write or `tcsetpgrp` from a background
+/// group raises SIGTTOU -- a write only under `stty tostop` -- and the
+/// default action stops the whole of mox; blocked, the call goes through.
+/// The thread's mask alone changes, never a process-wide disposition.
+pub fn blockTtou() ThreadMask {
+    if (builtin.os.tag == .windows) return {};
+    var set = std.posix.sigemptyset();
+    std.posix.sigaddset(&set, .TTOU);
+    var old: std.posix.sigset_t = undefined;
+    _ = std.c.pthread_sigmask(std.posix.SIG.BLOCK, &set, &old);
+    return old;
+}
+
+pub fn restoreThreadMask(old: ThreadMask) void {
+    if (builtin.os.tag == .windows) return;
+    var ignored: std.posix.sigset_t = undefined;
+    _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, &old, &ignored);
+}
+
+/// Whether stdin is a terminal a streamed child can read: on POSIX one mox's
+/// own group holds, so it is handed to the child for its run; on Windows a
+/// console, which has no foreground group to hold.
+pub fn terminalStdin() bool {
+    if (builtin.os.tag == .windows) {
+        var mode: windows.DWORD = undefined;
+        return console.GetConsoleMode(windows.peb().ProcessParameters.hStdInput, &mode).toBool();
+    }
+    return PosixTerminal.heldOwner() != null;
+}
+
+// In a struct so the winapi declaration is analyzed only on the Windows build.
+const console = struct {
+    extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
+};
+
+/// Whether a child that held the terminal ended because the user pressed
+/// Ctrl-C: it died of SIGINT, or it exited 130, the shell convention for
+/// that death, which is how a program that catches the interrupt to clean
+/// up reports it -- Homebrew's `brew.rb` answers `Interrupt` with `exit 130`
+/// (7.0.8), so a run that read only the signal would go on to the next
+/// install after the user asked it to stop.
+pub fn userInterrupted(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .signal => |sig| sig == .INT,
+        .exited => |code| code == 130,
+        else => false,
+    };
+}
 
 /// What `std.c` leaves undeclared of the job-control calls.
 pub const libc = struct {
@@ -375,6 +425,16 @@ pub fn waitStreamed(child: *std.process.Child, tty: ?Terminal) error{ Unexpected
                 child.id = null;
                 return error.StoppedWantingTerminal;
             };
+            // A read or a write that reached the terminal before the child's
+            // group held it stops the child on SIGTTIN or SIGTTOU. Its group
+            // holds the terminal now, so that is no stop the user asked for:
+            // continued, the child repeats the call as the foreground job.
+            // `spawnForeground` makes this unreachable for a child it
+            // launched; it stays for any other way one comes to be here.
+            if (stoppedBeforeHandover(std.c.W.STOPSIG(status), libc.tcgetpgrp(std.posix.STDIN_FILENO), id)) {
+                _ = signal(-id, .CONT);
+                continue;
+            }
             t.takeBack();
             stopSelf();
             _ = PosixTerminal.setForeground(std.posix.STDIN_FILENO, id);
@@ -384,6 +444,299 @@ pub fn waitStreamed(child: *std.process.Child, tty: ?Terminal) error{ Unexpected
         child.id = null;
         return termOfStatus(status);
     }
+}
+
+/// Whether a child that stopped on `sig` stopped for touching the terminal
+/// before its group was handed it, the terminal now being `holder`'s: a
+/// terminal stop of a group that holds the terminal is not one the user
+/// asked for with Ctrl-Z, which stops it on SIGTSTP instead.
+pub fn stoppedBeforeHandover(sig: std.posix.SIG, holder: std.posix.pid_t, child_group: std.posix.pid_t) bool {
+    return (sig == .TTIN or sig == .TTOU) and holder == child_group;
+}
+
+/// What a child launched by `spawnForeground` reads on stdin.
+pub const ForegroundStdin = union(enum) {
+    /// mox's own: the terminal being handed over.
+    inherit,
+    close,
+    /// A descriptor of mox's, read by the child as its stdin.
+    file: std.posix.fd_t,
+};
+
+/// A child launched holding the terminal, and the terminal to take back
+/// once it is reaped.
+pub const Foreground = struct {
+    child: std.process.Child,
+    tty: Terminal,
+};
+
+/// Spawn `argv` leading its own process group and holding the terminal from
+/// before its first instruction, or answer null when stdin is no terminal
+/// mox's own group holds (the caller spawns as usual, with no handover).
+///
+/// `std.process.spawn` cannot do this: its child leaves the terminal with
+/// mox's group, and a handover made by mox after the spawn returns races the
+/// child -- one that reads the terminal first is stopped by SIGTTIN, and the
+/// read it was making comes back interrupted. So the child takes it, the way
+/// a shell's child does, between fork and exec: with every signal blocked
+/// (inherited from the fork), it resets every disposition mox may have
+/// changed, makes its own group, takes the terminal, and only then clears
+/// its mask and execs. The parent makes the same group (whichever of the two
+/// runs first, the group exists before either signals it) but never touches
+/// the terminal: it waits for the exec, and a late handover of its own could
+/// pull the terminal back from a job the exec'd program set up.
+///
+/// The parent blocks every signal across the fork and records the child's
+/// group in `signals` before unblocking, so the terminal's signals never run
+/// mox's handler in the child, and a Ctrl-C landing just after the fork
+/// already reaches the child's group.
+///
+/// The wait for the exec is a poll of a close-on-exec pipe beside a
+/// non-blocking wait: a child stopped before its exec (Ctrl-Z in the instant
+/// after it took the terminal) is continued rather than waited on forever.
+/// An exec that fails reports its errno over the pipe; the child is killed
+/// and reaped, the terminal taken back, and the spawn answers the error
+/// `std.process.spawn` would have. A child ended by a signal before its exec
+/// is answered the same way, as `KilledBySignal` -- or, for the user's Ctrl-C,
+/// the run ends of it as it would have had the Ctrl-C reached mox.
+///
+/// `argv[0]` without a `/` is looked up on mox's own PATH, as
+/// `std.process.spawn` looks it up, and the child gets `environ_map` (null:
+/// mox's own environment) without `ZIG_PROGRESS`, as that spawn leaves it.
+/// Everything the child needs is allocated before the fork, so between fork
+/// and exec it makes async-signal-safe calls alone. stdout and stderr are
+/// mox's own. POSIX only: Windows has no job control, and answers null.
+pub fn spawnForeground(
+    arena: std.mem.Allocator,
+    argv: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    stdin: ForegroundStdin,
+    signals: SpawnSignals,
+) anyerror!?Foreground {
+    if (builtin.os.tag == .windows) return null;
+    const owner = PosixTerminal.heldOwner() orelse return null;
+
+    const argv_buf = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
+    for (argv, 0..) |arg, i| argv_buf[i] = (try arena.dupeZ(u8, arg)).ptr;
+    const process_environ = std.Io.Threaded.global_single_threaded.environ.process_environ;
+    const envp = if (environ_map) |m|
+        try m.createPosixBlock(arena, .{ .zig_progress_fd = -1 })
+    else
+        try process_environ.createPosixBlock(arena, .{ .zig_progress_fd = -1 });
+    const candidates = try programCandidates(arena, argv[0], pathOf(arena, process_environ));
+
+    var dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var empty = std.posix.sigemptyset();
+    var all = std.posix.sigfillset();
+
+    // Close-on-exec from the start where the system can (`pipe2`), so no
+    // other thread's child inherits it; set just after where it cannot.
+    const err_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+
+    var saved_mask: std.posix.sigset_t = undefined;
+    _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, &all, &saved_mask);
+    const forked = std.c.fork();
+    if (forked == 0) {
+        // The child. Async-signal-safe calls alone from here to the exec,
+        // with every signal blocked until the mask is cleared just before it.
+        const report = err_pipe[1];
+        for (std.enums.values(std.posix.SIG)) |sig| {
+            if (sig == .KILL or sig == .STOP) continue;
+            _ = std.c.sigaction(sig, &dfl, null);
+        }
+        if (std.c.setpgid(0, 0) != 0) childFail(report, std.c._errno().*);
+        _ = libc.tcsetpgrp(std.posix.STDIN_FILENO, std.c.getpid());
+        _ = std.c.sigprocmask(std.posix.SIG.SETMASK, &empty, null);
+        switch (stdin) {
+            .inherit => {},
+            .close => _ = std.c.close(std.posix.STDIN_FILENO),
+            .file => |fd| if (std.c.dup2(fd, std.posix.STDIN_FILENO) < 0) childFail(report, std.c._errno().*),
+        }
+        var last: c_int = @intFromEnum(std.posix.E.NOENT);
+        var denied = false;
+        for (candidates) |path| {
+            _ = std.c.execve(path, argv_buf.ptr, envp.slice.ptr);
+            const e = std.c._errno().*;
+            switch (@as(std.posix.E, @enumFromInt(e))) {
+                .ACCES => denied = true,
+                .NOENT, .NOTDIR => {},
+                else => childFail(report, e),
+            }
+            last = e;
+        }
+        childFail(report, if (denied) @intFromEnum(std.posix.E.ACCES) else last);
+    }
+    if (forked > 0) {
+        // The parent's half: the group exists whichever side runs first, and
+        // it is the group a signal from here on is sent to.
+        _ = std.c.setpgid(forked, forked);
+        signals.hold(forked);
+    }
+    var blocked: std.posix.sigset_t = undefined;
+    _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, &saved_mask, &blocked);
+    _ = std.c.close(err_pipe[1]);
+    if (forked < 0) {
+        _ = std.c.close(err_pipe[0]);
+        return error.SystemResources;
+    }
+    const pid: std.posix.pid_t = forked;
+
+    const outcome = awaitExec(pid, err_pipe[0]);
+    _ = std.c.close(err_pipe[0]);
+    switch (outcome) {
+        .execed => return .{
+            .child = .{
+                .id = pid,
+                .thread_handle = {},
+                .stdin = null,
+                .stdout = null,
+                .stderr = null,
+                .request_resource_usage_statistics = false,
+            },
+            .tty = .{ .owner = owner },
+        },
+        .failed => |f| {
+            if (!f.reaped) {
+                _ = signal(pid, .KILL);
+                reap(pid);
+            }
+            signals.release();
+            _ = PosixTerminal.setForeground(std.posix.STDIN_FILENO, owner);
+            return execError(@enumFromInt(f.errno));
+        },
+        .ended => |term| {
+            signals.release();
+            _ = PosixTerminal.setForeground(std.posix.STDIN_FILENO, owner);
+            if (userInterrupted(term)) {
+                writeStagedNote();
+                dieOfInterrupt();
+            }
+            return error.KilledBySignal;
+        },
+    }
+}
+
+/// How a launched child's way to its exec ended.
+pub const ExecOutcome = union(enum) {
+    /// The exec happened: the pipe closed with nothing on it.
+    execed,
+    /// The exec failed with this errno; `reaped` when the child's exit was
+    /// already collected while waiting for it.
+    failed: struct { errno: c_int, reaped: bool },
+    /// The child ended before its exec, and is reaped.
+    ended: std.process.Child.Term,
+};
+
+/// Wait for child `pid` to exec, or to report on `fd` why it could not. A
+/// stop before the exec is answered with SIGCONT rather than waited out: a
+/// child stopped there holds the pipe open and would never get to it.
+pub fn awaitExec(pid: std.posix.pid_t, fd: std.posix.fd_t) ExecOutcome {
+    var got: [@sizeOf(c_int)]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        var fds = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        if (std.c.poll(&fds, 1, 50) > 0) {
+            const rc = std.c.read(fd, got[n..].ptr, got.len - n);
+            if (rc > 0) {
+                n += @intCast(rc);
+                if (n == got.len) return .{ .failed = .{ .errno = std.mem.readInt(c_int, &got, builtin.cpu.arch.endian()), .reaped = false } };
+                continue;
+            }
+            if (rc == 0) return .execed;
+            if (std.c._errno().* != @intFromEnum(std.posix.E.INTR)) return .execed;
+        }
+        var raw: c_int = undefined;
+        const rc = std.c.waitpid(pid, &raw, std.c.W.UNTRACED | std.c.W.NOHANG);
+        if (rc != pid) continue;
+        const status: u32 = @bitCast(raw);
+        if (std.c.W.IFSTOPPED(status)) {
+            _ = signal(pid, .CONT);
+            continue;
+        }
+        // Ended. What it wrote before it did is still on the pipe.
+        const more = std.c.read(fd, got[n..].ptr, got.len - n);
+        if (more > 0) n += @intCast(more);
+        if (n == got.len) return .{ .failed = .{ .errno = std.mem.readInt(c_int, &got, builtin.cpu.arch.endian()), .reaped = true } };
+        return .{ .ended = termOfStatus(status) };
+    }
+}
+
+/// Reap `pid`, retrying an interrupted wait.
+fn reap(pid: std.posix.pid_t) void {
+    var raw: c_int = undefined;
+    while (std.c.waitpid(pid, &raw, 0) < 0) {
+        if (std.c._errno().* != @intFromEnum(std.posix.E.INTR)) return;
+    }
+}
+
+/// Report `errno` to the parent and end the fork child without running
+/// anything of mox's.
+fn childFail(fd: std.posix.fd_t, errno: c_int) noreturn {
+    var buf: [@sizeOf(c_int)]u8 = undefined;
+    std.mem.writeInt(c_int, &buf, errno, builtin.cpu.arch.endian());
+    _ = std.c.write(fd, &buf, buf.len);
+    std.c._exit(127);
+}
+
+/// The error `std.process.spawn` raises for the same failed exec (its
+/// `posixExecvPath`, Zig 0.16), so a report reads the same whichever way the
+/// child was launched.
+fn execError(e: std.posix.E) anyerror {
+    return switch (e) {
+        .@"2BIG" => error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NAMETOOLONG => error.NameTooLong,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOMEM => error.SystemResources,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .INVAL => error.InvalidExe,
+        .NOEXEC => error.InvalidExe,
+        .IO => error.FileSystem,
+        .LOOP => error.FileSystem,
+        .ISDIR => error.IsDir,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .TXTBSY => error.FileBusy,
+        else => switch (builtin.os.tag) {
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (e) {
+                .BADEXEC, .BADARCH => error.InvalidExe,
+                else => error.Unexpected,
+            },
+            .linux => switch (e) {
+                .LIBBAD => error.InvalidExe,
+                else => error.Unexpected,
+            },
+            else => error.Unexpected,
+        },
+    };
+}
+
+/// mox's own PATH, which a program name is looked up on: the parent's, as
+/// `std.process.spawn` looks it up, never the one handed to the child.
+fn pathOf(arena: std.mem.Allocator, environ: std.process.Environ) []const u8 {
+    var map = std.process.Environ.createMap(environ, arena) catch return std.Io.Threaded.default_PATH;
+    return map.get("PATH") orelse std.Io.Threaded.default_PATH;
+}
+
+/// The paths an exec of `name` tries, in order: `name` itself when it holds
+/// a `/`, else `<dir>/<name>` for each directory of `path`, empty ones
+/// skipped.
+pub fn programCandidates(arena: std.mem.Allocator, name: []const u8, path: []const u8) ![]const [*:0]const u8 {
+    var out: std.ArrayList([*:0]const u8) = .empty;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        try out.append(arena, try arena.dupeZ(u8, name));
+        return out.toOwnedSlice(arena);
+    }
+    var dirs = std.mem.tokenizeScalar(u8, path, ':');
+    while (dirs.next()) |dir| {
+        try out.append(arena, try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, name }, 0));
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Stop mox itself under SIGTSTP's default disposition, the way a shell's
@@ -537,6 +890,284 @@ fn writtenToStderr(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
     _ = std.c.close(saved);
     f.close(io);
     return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096));
+}
+
+fn ttouBlocked() bool {
+    var none = std.posix.sigemptyset();
+    var now: std.posix.sigset_t = undefined;
+    _ = std.c.pthread_sigmask(std.posix.SIG.BLOCK, &none, &now);
+    return std.posix.sigismember(&now, .TTOU);
+}
+
+test "blockTtou: SIGTTOU is blocked in this thread until the mask is put back" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try testing.expect(!ttouBlocked());
+    const mask = blockTtou();
+    try testing.expect(ttouBlocked());
+    restoreThreadMask(mask);
+    try testing.expect(!ttouBlocked());
+}
+
+test "stoppedBeforeHandover: a terminal stop of the group holding the terminal is not the user's Ctrl-Z" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try testing.expect(stoppedBeforeHandover(.TTIN, 42, 42));
+    try testing.expect(stoppedBeforeHandover(.TTOU, 42, 42));
+    // Ctrl-Z stops the foreground group on SIGTSTP: that is the user's.
+    try testing.expect(!stoppedBeforeHandover(.TSTP, 42, 42));
+    // A terminal stop while another group holds the terminal is a child
+    // that wants a terminal it was not given.
+    try testing.expect(!stoppedBeforeHandover(.TTIN, 7, 42));
+}
+
+test "programCandidates: a name is tried in each PATH directory, a path as given" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const looked = try programCandidates(a, "brew", "/opt/homebrew/bin::/usr/bin");
+    try testing.expectEqual(@as(usize, 2), looked.len);
+    try testing.expectEqualStrings("/opt/homebrew/bin/brew", std.mem.span(looked[0]));
+    try testing.expectEqualStrings("/usr/bin/brew", std.mem.span(looked[1]));
+    const direct = try programCandidates(a, "./x/brew", "/usr/bin");
+    try testing.expectEqual(@as(usize, 1), direct.len);
+    try testing.expectEqualStrings("./x/brew", std.mem.span(direct[0]));
+}
+
+test "spawnForeground: without a terminal mox holds, there is nothing to hand over" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // The test runner's stdin is the build system's pipe, never a terminal.
+    if (PosixTerminal.heldOwner() != null) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try spawnForeground(arena.allocator(), &.{"true"}, null, .inherit, SpawnSignals.install())) == null);
+}
+
+fn killAfter(io: Io, pid: std.posix.pid_t, ms: i64) Io.Cancelable!void {
+    const t: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(ms), .clock = .awake } };
+    try t.sleep(io);
+    _ = signal(pid, .KILL);
+}
+
+test "awaitExec: a child stopped before its exec is continued, not waited on for ever" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 3" };
+    const envp = [_:null]?[*:0]const u8{};
+
+    // Stopped between fork and exec, as Ctrl-Z there would leave it: the
+    // pipe stays open and silent until something continues it.
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.kill(std.c.getpid(), .STOP);
+        _ = std.c.execve("/bin/sh", &argv, &envp);
+        std.c._exit(127);
+    }
+    try testing.expect(pid > 0);
+    _ = std.c.close(pipe[1]);
+    defer _ = std.c.close(pipe[0]);
+
+    // A wait that never continued it would block until this kill, and fail
+    // on the time it took rather than hang the suite.
+    var watchdog = try io.concurrent(killAfter, .{ io, pid, 10_000 });
+    const started = Io.Clock.awake.now(io);
+    const outcome = awaitExec(pid, pipe[0]);
+    const elapsed = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    watchdog.cancel(io) catch {};
+
+    try testing.expect(outcome == .execed);
+    try testing.expect(elapsed < 5_000);
+    var raw: c_int = undefined;
+    try testing.expectEqual(pid, std.c.waitpid(pid, &raw, 0));
+    const term = termOfStatus(@bitCast(raw));
+    try testing.expect(term == .exited and term.exited == 3);
+}
+
+test "awaitExec: a failed exec is its errno, with the child left to reap" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    const pid = std.c.fork();
+    if (pid == 0) childFail(pipe[1], @intFromEnum(std.posix.E.NOENT));
+    try testing.expect(pid > 0);
+    _ = std.c.close(pipe[1]);
+    defer _ = std.c.close(pipe[0]);
+    const outcome = awaitExec(pid, pipe[0]);
+    try testing.expect(outcome == .failed);
+    try testing.expectEqual(@as(c_int, @intFromEnum(std.posix.E.NOENT)), outcome.failed.errno);
+    if (!outcome.failed.reaped) reap(pid);
+    try testing.expectEqual(error.FileNotFound, execError(.NOENT));
+}
+
+const pty = struct {
+    extern "c" fn posix_openpt(flags: c_int) c_int;
+    extern "c" fn grantpt(fd: c_int) c_int;
+    extern "c" fn unlockpt(fd: c_int) c_int;
+    extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
+    /// TIOCSCTTY: macOS's `_IO('t', 97)`; Linux's from its own table.
+    const set_controlling = if (builtin.os.tag == .linux) std.os.linux.T.IOCSCTTY else 0x20007461;
+};
+
+const PtyRun = struct { status: u32, out: []const u8 };
+
+/// Run `body` in a helper process that leads a session on a fresh
+/// pseudo-terminal -- its stdin, stdout, stderr and controlling terminal,
+/// which its group holds in the foreground, as a terminal's shell does --
+/// with `input` typed ahead, and answer its exit status and what was written
+/// to the terminal. The helper is a fork of this multithreaded process, so
+/// `body` allocates from pages alone and calls nothing that locks. Bounded:
+/// a helper still running after 30 seconds is killed and reported.
+fn inPtySession(a: std.mem.Allocator, io: Io, input: []const u8, body: *const fn () u8) !PtyRun {
+    const master = pty.posix_openpt(@bitCast(std.c.O{ .ACCMODE = .RDWR, .NOCTTY = true }));
+    if (master < 0) return error.SkipZigTest;
+    defer _ = std.c.close(master);
+    if (pty.grantpt(master) != 0 or pty.unlockpt(master) != 0) return error.SkipZigTest;
+    _ = std.c.fcntl(master, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+    _ = std.c.fcntl(master, std.c.F.SETFL, std.c.fcntl(master, std.c.F.GETFL) | @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+    const slave = try a.dupeZ(u8, std.mem.span(pty.ptsname(master) orelse return error.SkipZigTest));
+    // Held open so the typed-ahead line has a terminal to wait in.
+    const held = std.c.open(slave.ptr, .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
+    if (held < 0) return error.SkipZigTest;
+    defer _ = std.c.close(held);
+    if (std.c.write(master, input.ptr, input.len) != input.len) return error.TypeAheadFailed;
+
+    const pid = std.c.fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        if (std.c.setsid() < 0) std.c._exit(120);
+        const fd = std.c.open(slave.ptr, .{ .ACCMODE = .RDWR });
+        if (fd < 0) std.c._exit(121);
+        _ = std.c.ioctl(fd, @intCast(pty.set_controlling), @as(c_int, 0));
+        for ([_]c_int{ 0, 1, 2 }) |n| _ = std.c.dup2(fd, n);
+        if (fd > 2) _ = std.c.close(fd);
+        std.c._exit(body());
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    var raw: c_int = 0;
+    const started = Io.Clock.awake.now(io);
+    while (true) {
+        var fds = [_]std.c.pollfd{.{ .fd = master, .events = std.c.POLL.IN, .revents = 0 }};
+        if (std.c.poll(&fds, 1, 50) > 0) {
+            var buf: [4096]u8 = undefined;
+            const n = std.c.read(master, &buf, buf.len);
+            if (n > 0) try out.appendSlice(a, buf[0..@intCast(n)]);
+        }
+        if (std.c.waitpid(pid, &raw, std.c.W.NOHANG) == pid) break;
+        if (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() > 30_000) {
+            _ = std.c.kill(-pid, .KILL);
+            reap(pid);
+            return error.PtySessionNeverFinished;
+        }
+    }
+    return .{ .status = @bitCast(raw), .out = out.items };
+}
+
+/// Launch `argv` holding the terminal, wait for it as a streamed call does,
+/// take the terminal back, and answer 0 when it exited `want` and the
+/// terminal is the helper's again; a distinct code for each way it was not.
+fn launchHeld(argv: []const []const u8, want: u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const a = arena.allocator();
+    const signals = SpawnSignals.install();
+    defer signals.restore();
+    const fg = (spawnForeground(a, argv, null, .inherit, signals) catch return 10) orelse return 11;
+    var child = fg.child;
+    const term = waitStreamed(&child, fg.tty) catch return 12;
+    fg.tty.takeBack();
+    if (libc.tcgetpgrp(0) != libc.getpgrp()) return 13;
+    if (term != .exited) return 14;
+    if (term.exited != want) return 15;
+    return 0;
+}
+
+fn bodyReadsAtOnce() u8 {
+    return launchHeld(&.{ "/bin/sh", "-c", "IFS= read -r l </dev/tty; [ \"$l\" = typed ]" }, 0);
+}
+
+fn bodyFailedExec() u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const signals = SpawnSignals.install();
+    defer signals.restore();
+    if (spawnForeground(arena.allocator(), &.{"/nonexistent/mox-test-program"}, null, .inherit, signals)) |_| {
+        return 20;
+    } else |e| if (e != error.FileNotFound) return 21;
+    if (libc.tcgetpgrp(0) != libc.getpgrp()) return 22;
+    return 0;
+}
+
+fn bodyStopsOnTstp() u8 {
+    return launchHeld(&.{ "/bin/sh", "-c", "kill -TSTP $$; exit 7" }, 7);
+}
+
+fn bodyStopsOnTtin() u8 {
+    return launchHeld(&.{ "/bin/sh", "-c", "kill -TTIN $$; exit 5" }, 5);
+}
+
+/// The child's descriptors are checked against the helper's own inheritable
+/// ones: what every exec from this process carries is the process's, not
+/// the launch's (Zig's spawn caches a `/dev/null` without close-on-exec).
+fn bodyCleanState() u8 {
+    if (launchHeld(&.{ "/bin/sh", "-c", "exec grep SigBlk /proc/self/status" }, 0) != 0) return 30;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("for n in $(seq 3 64); do case \" ") catch return 32;
+    for (3..65) |n| {
+        const flags = std.c.fcntl(@intCast(n), std.posix.F.GETFD);
+        if (flags >= 0 and flags & std.posix.FD_CLOEXEC == 0) w.print("{d} ", .{n}) catch return 32;
+    }
+    w.writeAll("\" in *\" $n \"*) continue ;; esac; [ -e /proc/$$/fd/$n ] && echo LEAKED$n; done; exit 0") catch return 32;
+    if (launchHeld(&.{ "/bin/sh", "-c", w.buffered() }, 0) != 0) return 31;
+    return 0;
+}
+
+test "spawnForeground on a terminal: a child that reads it the moment it starts gets the line" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try inPtySession(arena.allocator(), testing.io, "typed\n", bodyReadsAtOnce);
+    errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
+    try testing.expect(std.c.W.IFEXITED(r.status));
+    try testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(r.status));
+}
+
+test "spawnForeground on a terminal: a failed exec is its error, with the terminal taken back" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try inPtySession(arena.allocator(), testing.io, "", bodyFailedExec);
+    errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
+    try testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(r.status));
+}
+
+test "spawnForeground on a terminal: Ctrl-Z's stop and a stray terminal stop both end in the child's own exit" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The helper leads its session, so the stop mox makes of itself on
+    // Ctrl-Z is discarded, as under a terminal with no job-control shell,
+    // and the wait goes on to the child's exit.
+    const tstp = try inPtySession(arena.allocator(), testing.io, "", bodyStopsOnTstp);
+    try testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(tstp.status));
+    const ttin = try inPtySession(arena.allocator(), testing.io, "", bodyStopsOnTtin);
+    try testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(ttin.status));
+}
+
+test "spawnForeground on a terminal: the child starts with no signal blocked and no descriptor the launch opened" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try inPtySession(arena.allocator(), testing.io, "", bodyCleanState);
+    errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
+    try testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(r.status));
+    try testing.expect(std.mem.indexOf(u8, r.out, "SigBlk:\t0000000000000000") != null);
+    try testing.expect(std.mem.indexOf(u8, r.out, "LEAKED") == null);
+}
+
+test "userInterrupted: a death by SIGINT and the exit-130 convention are the user's Ctrl-C, nothing else is" {
+    try testing.expect(userInterrupted(.{ .signal = .INT }));
+    try testing.expect(userInterrupted(.{ .exited = 130 }));
+    try testing.expect(!userInterrupted(.{ .exited = 1 }));
+    try testing.expect(!userInterrupted(.{ .exited = 0 }));
+    try testing.expect(!userInterrupted(.{ .signal = .TERM }));
 }
 
 test "SpawnSignals: the terminal's four ways of ending a run are all handled" {

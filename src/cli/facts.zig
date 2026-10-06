@@ -13,8 +13,14 @@ const BareSpec = struct {
 /// dimension that is still unanswered. `--report` replaces that whole
 /// output with `reportDimensions`'s state-per-dimension listing instead --
 /// bare mode's `name = "value"` lines are a machine-readable format other
-/// tooling parses, kept byte-frozen, so a richer report is a distinct mode
-/// rather than something appended to it.
+/// tooling parses, so a richer report is a distinct mode rather than
+/// something appended to them.
+///
+/// Both list the facts `data/facts.toml` derives, each with its value and
+/// what bound it, or why it is unbound. Bare mode writes them last, after
+/// the interview's own answers, as `#` comment lines: what parses the
+/// listing as facts sees only `name = "value"` lines, and a listing copied
+/// into facts.toml does not pin a value the repo derives on each machine.
 fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
     const context = ctx.context.?;
     var facts_diag: mox.machine.facts.Diag = .{};
@@ -33,6 +39,14 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
     for (current.skipped) |k| {
         try ctx.err.print("mox facts: facts.toml: {s}: {s}; ignored\n", .{ k.name, k.reason });
     }
+    var derived_diag: mox.machine.diag.Diag = .{};
+    const derived = mox.machine.derived_facts.explain(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir, context.paths.home, &derived_diag) catch |e| switch (e) {
+        error.MalformedFactsRow, error.ReservedFactsRowName => {
+            try ctx.err.print("mox facts: {s}\n", .{derived_diag.capture() orelse "data/facts.toml cannot be read"});
+            return 1;
+        },
+        else => return e,
+    };
 
     const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "", discovery.diagnostics, discovery.default_diagnostics);
@@ -47,8 +61,15 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
         );
         return 1;
     }
-    if (args.report) return reportDimensions(ctx, discovery, current.facts);
-    if (discovery.dimensions.len == 0) return 0;
+    if (args.report) {
+        const rc = try reportDimensions(ctx, discovery, current.facts);
+        try writeDerived(ctx.out, derived, current.facts, .report);
+        return rc;
+    }
+    if (discovery.dimensions.len == 0) {
+        try writeDerived(ctx.out, derived, current.facts, .bare);
+        return 0;
+    }
 
     // The interview may persist answers into facts.toml; guard that
     // read-modify-write with the command lock, as `facts set` and `apply` do.
@@ -74,6 +95,7 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
             try ctx.out.print("{s} = \"{s}\"\n", .{ a.name, a.value });
         }
     }
+    try writeDerived(ctx.out, derived, current.facts, .bare);
     // Unlike apply, facts never composes a file: refusing here costs nothing
     // and surfaces an unresolved fact immediately instead of leaving it
     // silently unbound.
@@ -114,6 +136,52 @@ fn reportDimensions(ctx: *app.Ctx, discovery: mox.machine.dimensions.Discovery, 
         try ctx.out.writeAll("\n");
     }
     return 0;
+}
+
+/// One line per `data/facts.toml` row: its value and the env override or
+/// candidate that bound it, or what was looked for when nothing did, and
+/// when facts.toml binds the same name, that its value is the one in effect.
+fn writeDerived(
+    w: *std.Io.Writer,
+    derived: []const mox.machine.derived_facts.Explained,
+    facts: []const mox.machine.state.Fact,
+    mode: enum { bare, report },
+) !void {
+    for (derived) |d| {
+        const lead: []const u8 = if (mode == .bare) "derived: " else "data/facts.toml: ";
+        if (d.bound) |b| {
+            switch (mode) {
+                .bare => try w.print("# {s} = \"{s}\" ({s}", .{ d.row.name, b.value, lead }),
+                .report => try w.print("{s}: derived \"{s}\" ({s}", .{ d.row.name, b.value, lead }),
+            }
+            switch (b.source) {
+                .env => |name| try w.print("env {s}", .{name}),
+                .candidate => |c| try w.print("candidate \"{s}\"", .{c}),
+            }
+        } else {
+            switch (mode) {
+                .bare => try w.print("# {s}: unbound ({s}", .{ d.row.name, lead }),
+                .report => try w.print("{s}: UNBOUND ({s}", .{ d.row.name, lead }),
+            }
+            if (d.row.env) |name| try w.print("env {s} is unset or names no directory", .{name});
+            if (d.row.candidates.len > 0) {
+                if (d.row.env != null) try w.writeAll("; ");
+                try w.writeAll("no candidate exists: ");
+                for (d.row.candidates, 0..) |c, i| try w.print("{s}\"{s}\"", .{ if (i == 0) "" else ", ", c });
+            }
+            if (d.row.env == null and d.row.candidates.len == 0) try w.writeAll("the row names no env and no candidates");
+        }
+        const pinned = findFactValue(facts, d.row.name);
+        switch (mode) {
+            .bare => if (pinned != null) try w.writeAll("; facts.toml's value above is in effect"),
+            .report => {},
+        }
+        try w.writeAll(")");
+        if (mode == .report) {
+            if (pinned) |v| try w.print(" -- facts.toml's \"{s}\" is in effect", .{v});
+        }
+        try w.writeAll("\n");
+    }
 }
 
 fn findFactValue(facts: []const mox.machine.state.Fact, name: []const u8) ?[]const u8 {

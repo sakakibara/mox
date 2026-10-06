@@ -22,6 +22,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const job = @import("../machine/job.zig");
+const stall = @import("../machine/stall.zig");
 const run_scripts = @import("../apply/run_scripts.zig");
 
 const Io = std.Io;
@@ -205,6 +206,7 @@ pub fn errorText(e: anyerror) []const u8 {
         error.FileNotFound => "it is not on this machine",
         error.AccessDenied => "this user may not run it",
         error.IsDir => "its path is a directory, not a program",
+        error.InvalidExe => "the system cannot run this program on this machine (wrong architecture or format)",
         error.NotDir => "a directory in its path is not a directory",
         error.SymLinkLoop => "its path is a loop of symlinks",
         error.NameTooLong => "its path is longer than this system allows",
@@ -317,7 +319,9 @@ pub const Capture = enum { stdout, both };
 pub const Runner = struct {
     ctx: *anyopaque,
     runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize, capture: Capture) anyerror!Result,
-    streamFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result,
+    /// `step` names the work for a notice about it (`brew: ripgrep`); null
+    /// names it by its command line.
+    streamFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, step: ?[]const u8) anyerror!Result,
 
     /// Run and capture stdout: for a query whose output mox parses. stderr
     /// is the terminal's, so a manager's or plugin's own diagnostics reach
@@ -350,14 +354,22 @@ pub const Runner = struct {
     /// Run with mox's own stdout and stderr: for work the user waits on. An
     /// install compiles, downloads, and asks about disk space; capturing that
     /// would replace minutes of progress with a silent hang and throw the
-    /// manager's own diagnostics away. `stdout` comes back empty.
+    /// manager's own diagnostics away. `stdout` comes back empty. The child
+    /// reads mox's own stdin where that is a terminal it can be handed, so a
+    /// manager or an installer that asks the user something can be answered.
     pub fn stream(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, null) catch |e| nameNotFound(e, argv);
+        return self.streamFn(self.ctx, arena, argv, null, null) catch |e| nameNotFound(e, argv);
+    }
+
+    /// `stream`, with the work named for a notice about it: a package, a
+    /// batch, an installer.
+    pub fn streamStep(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, step: []const u8) anyerror!Result {
+        return self.streamFn(self.ctx, arena, argv, null, step) catch |e| nameNotFound(e, argv);
     }
 
     /// `stream` with bytes on the child's stdin.
     pub fn streamInput(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, stdin) catch |e| nameNotFound(e, argv);
+        return self.streamFn(self.ctx, arena, argv, stdin, null) catch |e| nameNotFound(e, argv);
     }
 
     /// `run` or `stream` by flag. An argv that is a PowerShell script
@@ -370,7 +382,7 @@ pub const Runner = struct {
     }
 
     fn call(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, streamed: bool) anyerror!Result {
-        const res = if (streamed) self.streamFn(self.ctx, arena, argv, stdin) else self.runFn(self.ctx, arena, argv, stdin, max_query_bytes, .stdout);
+        const res = if (streamed) self.streamFn(self.ctx, arena, argv, stdin, null) else self.runFn(self.ctx, arena, argv, stdin, max_query_bytes, .stdout);
         return res catch |e| nameNotFound(e, argv);
     }
 };
@@ -473,6 +485,20 @@ pub const Process = struct {
     grace_ms: i64 = default_grace_ms,
     out: ?*Io.Writer = null,
     err: ?*Io.Writer = null,
+    /// What a notice about a streamed call begins with: the command whose
+    /// run it is (`mox apply`).
+    command: []const u8 = "mox",
+    /// When a streamed child that has gone quiet is named, and how its
+    /// quiet is observed.
+    stall: stall.Config = .{},
+    /// Where that notice is written; null is standard error, written apart
+    /// from `err`'s buffer, since the notice is written while the caller
+    /// waits.
+    notice_out: ?*Io.Writer = null,
+    /// Whether mox's stdin is a terminal a streamed child can be given;
+    /// null asks the terminal. Set by a test, whose own stdin is whatever
+    /// the runner gave it.
+    stdin_terminal: ?bool = null,
 
     pub fn runner(self: *Process) Runner {
         return .{ .ctx = self, .runFn = runImpl, .streamFn = streamImpl };
@@ -485,12 +511,24 @@ pub const Process = struct {
 
     fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize, capture: Capture) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawn(arena, argv, stdin, .pipe, if (capture == .both) .pipe else .inherit, cap);
+        return self.spawn(arena, argv, stdin, .pipe, if (capture == .both) .pipe else .inherit, cap, null);
     }
 
-    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
+    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, step: ?[]const u8) anyerror!Result {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        return self.spawn(arena, argv, stdin, .inherit, .inherit, max_query_bytes);
+        return self.spawn(arena, argv, stdin, .inherit, .inherit, max_query_bytes, step orelse try commandStep(arena, argv));
+    }
+
+    /// Whether a streamed child is handed mox's stdin rather than a closed
+    /// one. Only a terminal it can read: on POSIX one that mox's own group
+    /// holds in the foreground, which is the terminal `job.spawnForeground`
+    /// launches the child holding. A mox run in the background inherits one
+    /// too, but a child reading it there stops on SIGTTIN and is killed as a
+    /// child wanting a terminal, where a closed stdin answers it with
+    /// end-of-file as before.
+    /// A pipe or a file is never handed on: what is on it was meant for mox.
+    fn terminalStdin(self: *const Process) bool {
+        return self.stdin_terminal orelse job.terminalStdin();
     }
 
     /// The environment a captured child runs under: the call's own, with
@@ -522,9 +560,15 @@ pub const Process = struct {
     }
 
     /// Spawn with stdin backed by a scratch file holding `stdin` (closed
-    /// when null), and stdout and stderr each captured or inherited; stderr
-    /// is captured only alongside stdout. One deadline bounds the whole
-    /// call: reading what the child writes and waiting for it to exit.
+    /// when null, or mox's own terminal for a streamed call -- see
+    /// `terminalStdin`), and stdout and stderr each captured or inherited;
+    /// stderr is captured only alongside stdout. One deadline bounds the
+    /// whole call: reading what the child writes and waiting for it to exit.
+    ///
+    /// A streamed call, `step` naming it, is watched while it runs: once it
+    /// has printed nothing for `stall.after_ms` a line on standard error
+    /// says so, and again each time as long again passes. Nothing is ended
+    /// by it; `stall.zig` has how the quiet is observed.
     ///
     /// Every child leads its own process group, so a bound reaches the whole
     /// tree: a query blocked behind a helper it spawned (`port | awk`) and an
@@ -563,12 +607,14 @@ pub const Process = struct {
         stdout_io: std.process.SpawnOptions.StdIo,
         stderr_io: std.process.SpawnOptions.StdIo,
         cap: usize,
+        step: ?[]const u8,
     ) anyerror!Result {
         const io = self.io;
 
         var stdin_file: ?Io.File = null;
         defer if (stdin_file) |f| f.close(io);
         var stdin_io: std.process.SpawnOptions.StdIo = .close;
+        if (stdin == null and stdout_io != .pipe and self.terminalStdin()) stdin_io = .inherit;
         if (stdin) |bytes| {
             const tmp_dir = try scratchTmpDir(arena, self.scratch_dir);
             try Io.Dir.cwd().createDirPath(io, tmp_dir);
@@ -591,27 +637,43 @@ pub const Process = struct {
         const captured_env: ?EnvironMap = if (captured) try self.capturedEnviron(arena) else null;
         const signals = job.SpawnSignals.install();
         defer signals.restore();
-        var child = try std.process.spawn(io, .{
-            .argv = argv,
-            .environ_map = if (captured_env) |*m| m else self.env,
-            .stdin = stdin_io,
-            .stdout = stdout_io,
-            .stderr = stderr_io,
-            .pgid = job.own_group,
-        });
-        // A signal between the spawn and this line finds no group recorded
-        // and reaches the child not at all. Blocking the three across the
-        // spawn would close that window and leave the child holding the
-        // block, unable to be interrupted at all, which is worse.
+        // A streamed child is launched already holding the terminal, when
+        // there is one to hand it: see `job.spawnForeground`.
+        var tty: ?job.Terminal = null;
+        var child = launch: {
+            if (!captured) {
+                const held_stdin: job.ForegroundStdin = switch (stdin_io) {
+                    .inherit => .inherit,
+                    .file => |f| .{ .file = f.handle },
+                    else => .close,
+                };
+                if (try job.spawnForeground(arena, argv, self.env, held_stdin, signals)) |fg| {
+                    tty = fg.tty;
+                    break :launch fg.child;
+                }
+            }
+            break :launch try std.process.spawn(io, .{
+                .argv = argv,
+                .environ_map = if (captured_env) |*m| m else self.env,
+                .stdin = stdin_io,
+                .stdout = stdout_io,
+                .stderr = stderr_io,
+                .pgid = job.own_group,
+            });
+        };
+        // `spawnForeground` records the group itself, with every signal
+        // blocked across its fork and cleared again in the child before the
+        // exec, so a launch it made has no window here. One made by
+        // `std.process.spawn` does: a signal between that spawn and this line
+        // finds no group recorded and reaches the child not at all. Blocking
+        // across that spawn would close the window but leave the child
+        // holding the block, since `std.process.spawn` does not clear the
+        // mask it inherits -- unable to be interrupted at all, which is worse.
         if (child.id) |id| signals.hold(id);
         // Remembered here because both the read's own peek and the wait clear
         // it as they reap, and what the child left in its group outlives both.
         const child_group = child.id;
         const deadline = timeoutOf(if (captured) self.timeout_ms else self.install_timeout_ms).toDeadline(io);
-        var tty: ?job.Terminal = null;
-        if (!captured) {
-            if (child.id) |id| tty = job.Terminal.handTo(id);
-        }
 
         var out: []const u8 = "";
         var err_out: []const u8 = "";
@@ -773,7 +835,26 @@ pub const Process = struct {
                 };
             }
         }
+        var notice_buf: [256]u8 = undefined;
+        // Streaming, never positional: a positional writer starts at offset
+        // 0, and on a log file (`mox apply > log 2>&1`) it would write the
+        // notice over the head of the log.
+        var notice_file: Io.File.Writer = .initStreaming(.stderr(), io, &notice_buf);
+        var watch: stall.Watch = .{
+            .io = io,
+            .config = self.stall,
+            .label = if (step) |s| try std.fmt.allocPrint(arena, "{s}: {s}", .{ self.command, s }) else "",
+            .out = self.notice_out orelse &notice_file.interface,
+        };
+        var watcher: ?Io.Future(Io.Cancelable!void) = null;
+        if (step != null and self.stall.after_ms > 0) {
+            // No thread for it: the install runs all the same, unwatched.
+            watcher = io.concurrent(stall.Watch.run, .{&watch}) catch |e| switch (e) {
+                error.ConcurrencyUnavailable => null,
+            };
+        }
         const term = job.waitFor(io, &child, tty) catch |e| {
+            if (watcher) |*w| w.cancel(io) catch {};
             guard.reaped.store(true, .release);
             if (killer) |*k| _ = k.cancel(io);
             if (tty) |t| t.takeBack();
@@ -789,6 +870,7 @@ pub const Process = struct {
             signals.release();
             return e;
         };
+        if (watcher) |*w| w.cancel(io) catch {};
         guard.reaped.store(true, .release);
         signals.release();
         if (killer) |*k| _ = k.cancel(io);
@@ -805,20 +887,29 @@ pub const Process = struct {
         if (guard.fired) {
             res.ok = false;
             res.timed_out = true;
-        } else if (term == .signal) {
-            if (tty != null and term.signal == .INT) {
-                if (self.out) |w| w.flush() catch {};
-                if (self.err) |w| w.flush() catch {};
-                // The user interrupted the child, so this run ends here with
-                // nothing deferred left to say what it was part-way through.
-                job.writeStagedNote();
-                job.dieOfInterrupt();
-            }
-            return error.KilledBySignal;
+            return res;
         }
+        if (tty != null and job.userInterrupted(term)) {
+            if (self.out) |w| w.flush() catch {};
+            if (self.err) |w| w.flush() catch {};
+            // The user interrupted the child, so this run ends here with
+            // nothing deferred left to say what it was part-way through.
+            job.writeStagedNote();
+            job.dieOfInterrupt();
+        }
+        if (term == .signal) return error.KilledBySignal;
         return res;
     }
 };
+
+/// A streamed call no caller named, named by its command line: what the
+/// user would have typed, cut short where it would run on past a line.
+pub fn commandStep(arena: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    const joined = try std.mem.join(arena, " ", argv);
+    const most = 100;
+    if (joined.len <= most) return std.fmt.allocPrint(arena, "`{s}`", .{joined});
+    return std.fmt.allocPrint(arena, "`{s}...`", .{joined[0..most]});
+}
 
 fn killGroupAfter(io: Io, deadline: Io.Timeout, id: std.process.Child.Id, guard: *job.Guard) void {
     deadline.sleep(io) catch return;
@@ -900,6 +991,8 @@ pub const Fake = struct {
     inputs: std.ArrayList([]const u8) = .empty,
     /// Whether each call was streamed rather than captured, in call order.
     streamed: std.ArrayList(bool) = .empty,
+    /// The step each call was named with, in call order ("" when none).
+    steps: std.ArrayList([]const u8) = .empty,
     /// What a run ended by a signal would have said at each call, in call
     /// order: the real spawn stages that before the child exists, so this is
     /// where a test reads whether the staging bracketed the right call.
@@ -927,19 +1020,20 @@ pub const Fake = struct {
 
     fn runImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, cap: usize, capture: Capture) anyerror!Result {
         const self: *Fake = @ptrCast(@alignCast(ctx));
-        return self.answer(arena, argv, stdin, false, cap, capture);
+        return self.answer(arena, argv, stdin, false, cap, capture, null);
     }
 
-    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!Result {
+    fn streamImpl(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, step: ?[]const u8) anyerror!Result {
         const self: *Fake = @ptrCast(@alignCast(ctx));
-        return self.answer(arena, argv, stdin, true, max_query_bytes, .stdout);
+        return self.answer(arena, argv, stdin, true, max_query_bytes, .stdout, step);
     }
 
-    fn answer(self: *Fake, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, is_streamed: bool, cap: usize, capture: Capture) anyerror!Result {
+    fn answer(self: *Fake, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, is_streamed: bool, cap: usize, capture: Capture, step: ?[]const u8) anyerror!Result {
         const joined = try std.mem.join(self.arena, " ", argv);
         try self.calls.append(self.arena, joined);
         try self.inputs.append(self.arena, try self.arena.dupe(u8, stdin orelse ""));
         try self.streamed.append(self.arena, is_streamed);
+        try self.steps.append(self.arena, try self.arena.dupe(u8, step orelse ""));
         try self.notes.append(self.arena, try self.arena.dupe(u8, job.stagedNote()));
         if (self.spent.items.len == 0) {
             for (self.entries) |_| try self.spent.append(self.arena, false);
@@ -1321,6 +1415,117 @@ test "Process: a streamed child that exits in time is neither a timeout nor an i
     try testing.expect(!res.timed_out);
     try testing.expect(!res.ok);
     try testing.expectEqual(@as(u8, 4), res.code);
+}
+
+/// A child whose fd 0 is open exits 0, one whose fd 0 is closed exits 7.
+const stdin_probe = [_][]const u8{ "sh", "-c", "if (exec 3<&0) 2>/dev/null; then exit 0; else exit 7; fi" };
+
+test "Process: a streamed child reads mox's terminal stdin, and a closed one without a terminal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // What is inherited is this process's own fd 0; with none open there is
+    // nothing to hand on and nothing to tell apart.
+    if (std.c.fcntl(0, std.c.F.GETFD) < 0) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var on_tty: Process = .{ .io = std.testing.io, .stdin_terminal = true };
+    try testing.expectEqual(@as(u8, 0), (try on_tty.runner().stream(a, &stdin_probe)).code);
+
+    var off_tty: Process = .{ .io = std.testing.io, .stdin_terminal = false };
+    try testing.expectEqual(@as(u8, 7), (try off_tty.runner().stream(a, &stdin_probe)).code);
+
+    // A captured call is a query, which never reads the user's terminal.
+    try testing.expectEqual(@as(u8, 7), (try on_tty.runner().run(a, &stdin_probe)).code);
+    // Bytes the caller hands on are what the child reads, terminal or not.
+    try testing.expectEqual(@as(u8, 0), (try off_tty.runner().streamInput(a, &stdin_probe, "y\n")).code);
+}
+
+/// A stream that never moves: every look finds the same stamp.
+fn silentStamp(_: ?*anyopaque, _: Io) ?u64 {
+    return 0;
+}
+
+test "Process: a streamed child silent past the notice interval is named, once per interval" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var said: Io.Writer.Allocating = .init(a);
+    var p: Process = .{
+        .io = std.testing.io,
+        .command = "mox apply",
+        .stall = .{ .after_ms = 1000, .poll_ms = 20, .probe = .{ .stampFn = silentStamp } },
+        .notice_out = &said.writer,
+    };
+    // Thresholds at 1s and 2s; a loaded machine may run it past a third.
+    const res = try p.runner().streamStep(a, &.{ "sleep", "2.5" }, "brew: logi-options+");
+    try testing.expect(res.ok);
+    try testing.expect(try stall.isNoticeRun(a, said.written(), "mox apply: brew: logi-options+", 1000, 2));
+
+    // Unnamed, the call is named by its command line; one that ends inside
+    // the interval is never named at all.
+    said.clearRetainingCapacity();
+    _ = try p.runner().stream(a, &.{ "sleep", "1.5" });
+    try testing.expect(try stall.isNoticeRun(a, said.written(), "mox apply: `sleep 1.5`", 1000, 1));
+    said.clearRetainingCapacity();
+    _ = try p.runner().stream(a, &.{ "sh", "-c", "exit 0" });
+    try testing.expectEqualStrings("", said.written());
+
+    // A query is captured and bounded, and is never watched.
+    _ = try p.runner().run(a, &.{ "sleep", "1.5" });
+    try testing.expectEqualStrings("", said.written());
+}
+
+test "Process: a notice to a standard error redirected into a file is appended, never written over its head" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const path = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "log" });
+
+    // `mox apply > log 2>&1`: descriptor 2 is a regular file whose offset
+    // has moved past what the run already said.
+    const log = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    const saved = std.c.dup(2);
+    try testing.expect(saved >= 0);
+    _ = std.c.dup2(log.handle, 2);
+    const head = "what the run said before the install\n";
+    _ = std.c.write(2, head, head.len);
+
+    var p: Process = .{
+        .io = io,
+        .command = "mox apply",
+        .stall = .{ .after_ms = 1000, .poll_ms = 20, .probe = .{ .stampFn = silentStamp } },
+    };
+    const res = p.runner().streamStep(a, &.{ "sleep", "1.5" }, "brew: logi-options+");
+    _ = std.c.dup2(saved, 2);
+    _ = std.c.close(saved);
+    log.close(io);
+    try testing.expect((try res).ok);
+
+    const logged = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096));
+    try testing.expectStringStartsWith(logged, head);
+    try testing.expect(try stall.isNoticeRun(a, logged[head.len..], "mox apply: brew: logi-options+", 1000, 1));
+}
+
+test "Process: a streamed call returns as soon as its child does, the watch over it ended at once" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+
+    // The default watch looks every ten seconds; ending it must not wait
+    // for the next look.
+    var p: Process = .{ .io = io };
+    const started = Io.Clock.awake.now(io);
+    _ = try p.runner().stream(arena.allocator(), &.{ "sh", "-c", "exit 0" });
+    try testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
 }
 
 test "installTimeoutMs: unset is unbounded, and a non-integer warns and falls back" {

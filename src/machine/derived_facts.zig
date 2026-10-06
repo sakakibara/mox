@@ -8,7 +8,6 @@
 const std = @import("std");
 const toml = @import("../data/toml.zig");
 const data_source = @import("../data/source.zig");
-const data_value = @import("../data/value.zig");
 const source_axes = @import("../source/axes.zig");
 const source_tuple = @import("../source/tuple.zig");
 const diag_mod = @import("diag.zig");
@@ -39,16 +38,69 @@ pub fn load(
     home: []const u8,
     diag: ?*Diag,
 ) !LoadResult {
+    var facts: std.ArrayList(state_mod.Fact) = .empty;
+    for (try checkedRows(arena, io, repo_dir, private_dir, diag)) |row| {
+        const got = try resolveRow(arena, io, environ, home, row.env, row.candidates) orelse continue;
+        try facts.append(arena, .{ .name = row.name, .value = got.value });
+    }
+    return .{ .facts = try facts.toOwnedSlice(arena) };
+}
+
+/// How one `data/facts.toml` row resolved on this machine, for a reader who
+/// wants to know where a derived fact came from or why it is missing.
+pub const Explained = struct {
+    row: DeclaredRow,
+    /// The value and what bound it; null when nothing the row names exists.
+    bound: ?Resolution,
+};
+
+/// What bound a row: its `env` override, or one of its `candidates`.
+pub const Resolution = struct {
+    value: []const u8,
+    source: union(enum) {
+        env: []const u8,
+        /// The candidate as the row spells it, before `~` is expanded.
+        candidate: []const u8,
+    },
+};
+
+/// Every `data/facts.toml` row in declaration order, each with how it
+/// resolves here: `load`'s validation and resolution, with the source kept.
+pub fn explain(
+    arena: std.mem.Allocator,
+    io: Io,
+    environ: Environ,
+    repo_dir: []const u8,
+    private_dir: []const u8,
+    home: []const u8,
+    diag: ?*Diag,
+) ![]const Explained {
+    var out: std.ArrayList(Explained) = .empty;
+    for (try checkedRows(arena, io, repo_dir, private_dir, diag)) |row| {
+        try out.append(arena, .{ .row = row, .bound = try resolveRow(arena, io, environ, home, row.env, row.candidates) });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// The rows of `data/facts.toml`, validated the way `load` documents, with
+/// `diag` naming the row a failure is about.
+fn checkedRows(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    private_dir: []const u8,
+    diag: ?*Diag,
+) ![]const DeclaredRow {
     const content = (try data_source.readShadowed(arena, io, repo_dir, private_dir, "facts.toml")) orelse
-        return .{};
+        return &.{};
 
     const array_map = toml.parse(arena, content) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedFactsRow,
     };
-    const rows = array_map.get("facts") orelse return .{};
+    const rows = array_map.get("facts") orelse return &.{};
 
-    var facts: std.ArrayList(state_mod.Fact) = .empty;
+    var out: std.ArrayList(DeclaredRow) = .empty;
     var seen = std.StringHashMap(void).init(arena);
 
     for (rows, 0..) |row, i| {
@@ -81,11 +133,13 @@ pub fn load(
             return error.MalformedFactsRow;
         }
 
-        const value = try resolveRow(arena, io, environ, home, env_field, candidates_field) orelse continue;
-        try facts.append(arena, .{ .name = try arena.dupe(u8, name), .value = value });
+        try out.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .env = if (env_field) |v| (if (v.string.len > 0) v.string else null) else null,
+            .candidates = if (candidates_field) |v| v.array_of_strings else &.{},
+        });
     }
-
-    return .{ .facts = try facts.toOwnedSlice(arena) };
+    return out.toOwnedSlice(arena);
 }
 
 /// One `data/facts.toml` row's declared shape, regardless of whether it
@@ -180,32 +234,28 @@ fn isValidFactCharset(name: []const u8) bool {
     return source_tuple.isValidAxisName(name);
 }
 
-/// Resolve one row to its bound value, or null when nothing exists.
-/// `env`, when set to a non-empty value naming an EXISTING directory, wins
-/// outright. Otherwise each `candidates` entry (`~` expanded to `home`) is
-/// tried in order; the first that exists on disk binds the fact.
+/// Resolve one row to its bound value and what bound it, or null when
+/// nothing exists. `env`, when set to a non-empty value naming an EXISTING
+/// directory, wins outright. Otherwise each `candidates` entry (`~` expanded
+/// to `home`) is tried in order; the first that exists on disk binds the
+/// fact.
 fn resolveRow(
     arena: std.mem.Allocator,
     io: Io,
     environ: Environ,
     home: []const u8,
-    env_field: ?data_value.Value,
-    candidates_field: ?data_value.Value,
-) !?[]const u8 {
-    if (env_field) |ev| {
-        const name = ev.string;
-        if (name.len > 0) {
-            const v = environ.getAlloc(arena, name) catch null;
-            if (v) |val| {
-                if (val.len > 0 and dirExists(io, val)) return val;
-            }
+    env: ?[]const u8,
+    candidates: []const []const u8,
+) !?Resolution {
+    if (env) |name| {
+        const v = environ.getAlloc(arena, name) catch null;
+        if (v) |val| {
+            if (val.len > 0 and dirExists(io, val)) return .{ .value = val, .source = .{ .env = name } };
         }
     }
-    if (candidates_field) |cv| {
-        for (cv.array_of_strings) |c| {
-            const expanded = try dirs.expandTildeIn(arena, home, c);
-            if (dirExists(io, expanded)) return expanded;
-        }
+    for (candidates) |c| {
+        const expanded = try dirs.expandTildeIn(arena, home, c);
+        if (dirExists(io, expanded)) return .{ .value = expanded, .source = .{ .candidate = c } };
     }
     return null;
 }

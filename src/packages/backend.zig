@@ -418,6 +418,11 @@ pub const Backend = struct {
         /// back afterwards can say how many, where the caller could only
         /// hedge. Absent, or null, when it did not look.
         installLanded: ?*const fn (ctx: *anyopaque) ?usize = null,
+        /// The directories installing these rows writes to, for the
+        /// free-space check an apply makes before installing: the manager's
+        /// prefix, and wherever it stages a download. Absent for an adapter
+        /// that names none, whose installs go unchecked.
+        spacePaths: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 = null,
         /// Install the manager itself from an installer mox has already
         /// fetched and digest-verified at `installer_path`. Returns a directory
         /// to put on PATH so this same run can use what it installed, or null.
@@ -515,6 +520,11 @@ pub const Backend = struct {
     pub fn installLanded(self: Backend) ?usize {
         const f = self.vtable.installLanded orelse return null;
         return f(self.ctx);
+    }
+
+    pub fn spacePaths(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const f = self.vtable.spacePaths orelse return &.{};
+        return f(self.ctx, arena, rows);
     }
 
     pub fn declare(self: Backend, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration {

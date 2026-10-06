@@ -6,7 +6,47 @@ All notable changes to mox are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `mox apply` names an install, a manager's installer, or a setup script
+  that has printed nothing for five minutes, on stderr and again every five
+  minutes it stays quiet (`mox apply: brew: logi-options+ has printed
+  nothing for 5m; still waiting (Ctrl-C stops the run)`). Nothing is ended
+  for it; `MOX_INSTALL_TIMEOUT_MS` stays the one bound that kills. Where
+  mox's stdout and stderr cannot be watched for output (`/dev/null`,
+  Windows), the line says how long the call has been running instead.
+- Before the first package install, `mox apply` measures the volumes the
+  installs write to -- brew's prefix, and `/private/tmp` on a Mac when a cask
+  is to be installed -- and warns, naming the free space, about one with
+  less than 10 GiB free. The installs go ahead.
+- `mox facts` and `mox facts --report` list the facts `data/facts.toml`
+  derives, each with its value and the env override or candidate that bound
+  it, and mark the unbound ones with what was looked for. Bare `mox facts`
+  writes them as `#` comment lines after the `name = "value"` lines.
+
 ### Fixed
+- Installing several brew casks that need administrator access (a `pkg`, or
+  an installer run under sudo, such as karabiner-elements and logi-options+)
+  no longer asks for the password once per cask. Homebrew clears sudo's
+  cached credential in each brew process that first needs it, so those casks
+  now install together in one `brew install --cask`, before the formulae,
+  after a line saying the password may be asked once more when their
+  downloads are done. When that run fails, each cask it left uninstalled is
+  named. A cask that elevates only from a Ruby `preflight`/`postflight`
+  block, which `brew info` does not show, still installs on its own.
+- An install now reads the terminal on stdin when mox's stdin is one it
+  holds; it was given a closed stdin, so a manager or an installer that
+  asked a question read end-of-file.
+- Ctrl-C during a brew install ends `mox apply`. brew exits 130 when
+  interrupted rather than dying of the signal, and mox went on to the next
+  install. Any install, installer or setup script that held the terminal and
+  exits 130 is now taken as the user's Ctrl-C and stops the apply. An
+  interrupted bootstrap or setup script names itself in the last line, as an
+  interrupted install already did.
+- An install or a setup script that reads the terminal the moment it starts
+  is no longer stopped for it. mox handed it the terminal only after it had
+  started, so such a read stopped it on SIGTTIN, and mox took that for
+  Ctrl-Z and suspended itself; it is now launched already holding the
+  terminal.
 - `mox init --clone` on a Mac without the Xcode Command Line Tools no longer
   fails at the clone: it installs them first through `softwareupdate`, with
   `sudo` asking for the administrator password on the terminal. Without a

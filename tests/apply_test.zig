@@ -1724,10 +1724,15 @@ test "mox facts: a structurally invalid source tree is a loud non-zero refusal, 
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/.gitconfig.d/path=brew", .data = "[gpg]\n" });
     const c = try cliSetup(a, io, &tmp);
 
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/facts.toml", .data = "[[facts]]\nname = \"brew_prefix\"\ncandidates = ['/nowhere/at/all']\n" });
+
     const r = try c.run(&.{ "mox", "facts" });
     try std.testing.expect(r.rc != 0);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ReservedAxisName") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "unavailable") != null);
+    // A listing the command refuses to finish lists nothing it derives.
+    try std.testing.expectEqualStrings("", r.out);
 
     // apply reports the same failure, via its own richer walkDiag report for
     // the same file, now surfaced from the same tree_error check up front.
@@ -1944,6 +1949,85 @@ test "mox facts --report: bound/declined/UNBOUND states, provenance, and a condi
     ) != null);
     // Never the bare mode's machine-readable lines.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "= \"") == null);
+}
+
+test "mox facts and --report: each derived fact with its value and what bound it, and the unbound ones marked" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try tmp.dir.createDirPath(io, "repo/data");
+    try tmp.dir.createDirPath(io, "brew");
+    try tmp.dir.createDirPath(io, "cargo");
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const brew = try std.fs.path.join(a, &.{ root, "brew" });
+    const cargo = try std.fs.path.join(a, &.{ root, "cargo" });
+    const missing = try std.fs.path.join(a, &.{ root, "nowhere" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/data/facts.toml",
+        .data = try std.fmt.allocPrint(a,
+            \\[[facts]]
+            \\name = "brew_prefix"
+            \\env = "MOX_TEST_BREW_PREFIX"
+            \\candidates = ['{s}', '{s}']
+            \\
+            \\[[facts]]
+            \\name = "cargo_home"
+            \\env = "MOX_TEST_CARGO_HOME"
+            \\candidates = ['{s}']
+            \\
+            \\[[facts]]
+            \\name = "go_root"
+            \\env = "MOX_TEST_GOROOT"
+            \\candidates = ['{s}']
+            \\
+        , .{ missing, brew, missing, missing }),
+    });
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_CARGO_HOME", .value = cargo }} });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "alpha", "1" })).rc);
+
+    // Comment lines, so the listing stays `name = "value"` lines to anything
+    // that reads it as facts, and nothing copied from it into facts.toml
+    // pins a value the repo derives.
+    const bare = try c.run(&.{ "mox", "facts" });
+    try std.testing.expectEqual(@as(u8, 0), bare.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a,
+        \\alpha = "1"
+        \\# brew_prefix = "{s}" (derived: candidate "{s}")
+        \\# cargo_home = "{s}" (derived: env MOX_TEST_CARGO_HOME)
+        \\# go_root: unbound (derived: env MOX_TEST_GOROOT is unset or names no directory; no candidate exists: "{s}")
+        \\
+    , .{ brew, brew, cargo, missing }), bare.out);
+
+    const report = try c.run(&.{ "mox", "facts", "--report" });
+    try std.testing.expectEqual(@as(u8, 0), report.rc);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a,
+        \\brew_prefix: derived "{s}" (data/facts.toml: candidate "{s}")
+        \\cargo_home: derived "{s}" (data/facts.toml: env MOX_TEST_CARGO_HOME)
+        \\go_root: UNBOUND (data/facts.toml: env MOX_TEST_GOROOT is unset or names no directory; no candidate exists: "{s}")
+        \\
+    , .{ brew, brew, cargo, missing }), report.out);
+
+    // A facts.toml value under the same name is the one in effect, and the
+    // derived line says so.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "facts", "set", "cargo_home", "/pinned" })).rc);
+    const shadowed = try c.run(&.{ "mox", "facts", "--report" });
+    try std.testing.expect(std.mem.indexOf(u8, shadowed.out, try std.fmt.allocPrint(
+        a,
+        "cargo_home: derived \"{s}\" (data/facts.toml: env MOX_TEST_CARGO_HOME) -- facts.toml's \"/pinned\" is in effect\n",
+        .{cargo},
+    )) != null);
+    const shadowed_bare = try c.run(&.{ "mox", "facts" });
+    try std.testing.expect(std.mem.indexOf(u8, shadowed_bare.out, try std.fmt.allocPrint(
+        a,
+        "# cargo_home = \"{s}\" (derived: env MOX_TEST_CARGO_HOME; facts.toml's value above is in effect)\n",
+        .{cargo},
+    )) != null);
 }
 
 test "mox facts ask: refuses on a non-terminal, both bare and named" {
@@ -2562,6 +2646,46 @@ test "run_scripts: a hung script is killed within the configured timeout" {
 
     try std.testing.expectEqual(@as(usize, 0), result.ran);
     try std.testing.expectEqual(@as(usize, 1), result.failed);
+}
+
+/// A stream that never moves: every look finds the same stamp.
+fn silentStamp(_: ?*anyopaque, _: std.Io) ?u64 {
+    return 0;
+}
+
+test "run_scripts: a script that goes quiet is named on stderr while it runs, and is not ended for it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const script = try std.fs.path.join(a, &.{ root, "scripts/00-quiet.sh" });
+    try writeExecScript(io, tmp.dir, "scripts/00-quiet.sh", "#!/bin/sh\nsleep 1.5\n", script);
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+
+    mox.apply.run_scripts.stall_override = .{ .after_ms = 1000, .poll_ms = 20, .probe = .{ .stampFn = silentStamp } };
+    defer mox.apply.run_scripts.stall_override = null;
+    var said: std.Io.Writer.Allocating = .init(a);
+    mox.apply.run_scripts.stall_out_override = &said.writer;
+    defer mox.apply.run_scripts.stall_out_override = null;
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    const result = try mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, null, null, &out_aw.writer, &err_aw.writer);
+
+    try std.testing.expectEqual(@as(usize, 1), result.ran);
+    try std.testing.expect(try mox.machine.stall.isNoticeRun(a, said.written(), try std.fmt.allocPrint(a, "mox apply: {s}", .{script}), 1000, 1));
+    // Through the watch's own writer: nothing of it in the stage's stderr.
+    try std.testing.expectEqualStrings("", err_aw.written());
+    // Nothing is left staged for a run that is no longer inside the script.
+    try std.testing.expectEqualStrings("", mox.machine.job.stagedNote());
 }
 
 test "run_scripts: an unparseable MOX_SCRIPT_TIMEOUT_MS warns once and falls back to the default" {

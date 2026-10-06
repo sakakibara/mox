@@ -210,7 +210,10 @@ cached `sudo` credential: from a terminal, apply runs `sudo -v` first
 installs finish; without a terminal it runs the installer as is.
 apt, dnf, pacman, zypper and plugins get their whole set in one invocation;
 brew, scoop and winget install row by row, and a failed row leaves the rest
-to proceed. Any failure is an error class (rc 2), and a failed batch or a
+to proceed. brew's casks whose install elevates go first, together in one
+`brew install --cask`, after a line saying the administrator password may be
+asked once more when their downloads are done: Homebrew clears sudo's
+cached credential in each brew process that first needs it. Any failure is an error class (rc 2), and a failed batch or a
 bootstrap alone still triggers the re-capture, since the machine changed.
 apply only ever installs -- an untracked package is
 reported by `mox status` and reconciled by `mox commit`, never uninstalled.
@@ -226,7 +229,16 @@ When a pre-script ran, the machine is re-read before packages are planned,
 so a `when` gate on a tool or fact the pre stage provided holds in the same
 run. An install is not time-bounded unless `MOX_INSTALL_TIMEOUT_MS` is set; a
 bootstrap's own download is a captured call, bounded like every other by
-`MOX_SCRIPT_TIMEOUT_MS`.
+`MOX_SCRIPT_TIMEOUT_MS`. An install, an installer, or a setup script that
+prints nothing for five minutes is named on stderr (`mox apply: brew:
+logi-options+ has printed nothing for 5m; still waiting (Ctrl-C stops the
+run)`), and again every five minutes; nothing is ended for it. Before the
+first install, a volume the installs write to with less than 10 GiB free is
+named with the space it has, and the installs go ahead. An install reads
+the terminal when mox's stdin is a terminal mox holds in the foreground,
+and Ctrl-C during it ends the run naming what was in flight; an install, an
+installer or a setup script that held the terminal and exits 130 is taken
+as that Ctrl-C too, and stops the apply.
 A repo without `data/packages/` never queries a package manager.
 
 apply never prompts about drift. It writes every file that is clean or absent
@@ -818,6 +830,22 @@ the listing with every discovered fact's state -- `bound "<value>"`,
 `declined (bound empty)`, or `UNBOUND`, each with its provenance (source
 count, needing scripts) and, when conditioned, the expression it is
 asked under.
+
+Both list the facts `data/facts.toml` derives, one line each, with the value
+and what bound it -- the `env` override, or which candidate matched -- or,
+for one that is unbound, what was looked for. Bare, they are `#` comment
+lines after the `name = "value"` lines, so the listing parses as before and
+nothing copied from it into `facts.toml` pins a value the repo derives:
+
+```
+# brew_prefix = "/opt/homebrew" (derived: candidate "/opt/homebrew")
+# cargo_home: unbound (derived: env CARGO_HOME is unset or names no directory; no candidate exists: "~/.cargo")
+```
+
+`--report` writes `brew_prefix: derived "/opt/homebrew" (data/facts.toml:
+candidate "/opt/homebrew")` or `cargo_home: UNBOUND (data/facts.toml: ...)`.
+Where `facts.toml` binds the same name, its value is the one in effect, and
+the line says so.
 
 `facts set <name> <value>` writes one directly; an empty value is the
 scriptable decline (`mox facts set <name> ""`), identical to pressing

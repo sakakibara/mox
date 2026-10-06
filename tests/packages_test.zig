@@ -84,12 +84,21 @@ fn brewWithInstalled(
     // install, and the alias refusal is exercised on its own elsewhere.
     try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     for (extra) |e| try entries.append(a, e);
 
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     return fake;
 }
+
+/// `df -P -k` answering, for any path, a volume with room to spare: the
+/// free-space check before an install, which these fixtures are not about.
+const roomy_df: mox.packages.exec.Fake.Entry = .{
+    .argv = "df -P -k -- ",
+    .match = .prefix,
+    .stdout = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 976562500 1 900000000 1% /\n",
+};
 
 fn useFake(fake: *mox.packages.exec.Fake) void {
     mox.cli.app.package_runner_override = fake.runner();
@@ -1050,6 +1059,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = interpreter });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
@@ -1112,6 +1122,7 @@ test "bootstrap: scoop's installer is staged under the .ps1 name PowerShell's -F
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = run_installer, .makes_dir = shims, .io = io });
     try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s} --version", .{shim}), .stdout = "v0.5.2\n" });
@@ -1157,6 +1168,7 @@ test "bootstrap: an installer that exits nonzero is reported by its exit code" {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = interpreter, .code = 1 });
     const fake = try a.create(mox.packages.exec.Fake);
@@ -1386,6 +1398,7 @@ test "status: a broken manager is BROKEN drift in every format, and no usable ma
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .code = 1 });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
@@ -1477,6 +1490,7 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = "#!/bin/bash\necho substituted\n", .write_after = "-o", .io = io });
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
@@ -1726,6 +1740,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
@@ -2095,6 +2110,7 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
@@ -2278,6 +2294,7 @@ fn noManagers(a: std.mem.Allocator) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     return fake;
@@ -3836,6 +3853,7 @@ test "bootstrap: an installer that exits 0 without installing its manager is a f
     try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} bootstrap ", .{plugin}), .match = .prefix, .makes_dir = made, .io = io });
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
@@ -4091,6 +4109,7 @@ test "plugin: a manifest for a manager not installed yet is checked through id, 
     try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} limitation", .{plugin}), .code = 64 });
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
@@ -4129,6 +4148,7 @@ test "apply: a manager whose verb failed says why, not that it exited" {
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 3 });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
@@ -4261,6 +4281,7 @@ test "status: a manager whose list output lost its separators is BROKEN, and non
     try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg ripgrep bat\n" });
     try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
     useFake(fake);
@@ -4322,6 +4343,7 @@ fn brewBootstrap(a: std.mem.Allocator, io: Io, h: Harness, installer_code: u8, s
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = "sudo -v", .code = sudo_code });
     try entries.append(a, .{ .argv = interpreter, .code = installer_code });
@@ -4529,6 +4551,7 @@ test "bootstrap: off macOS brew's installer is not preceded by sudo -v" {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
@@ -4637,4 +4660,215 @@ test "bootstrap: brew already present means no bootstrap and no sudo, even with 
     try std.testing.expect(std.mem.indexOf(u8, r.out, "  sudo  ") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+}
+
+const sudo_manifest =
+    \\backend = "brew"
+    \\
+    \\[[packages]]
+    \\name = "fd"
+    \\
+    \\[[packages]]
+    \\name = "ghostty"
+    \\kind = "cask"
+    \\
+    \\[[packages]]
+    \\name = "karabiner-elements"
+    \\kind = "cask"
+    \\
+    \\[[packages]]
+    \\name = "logi-options+"
+    \\kind = "cask"
+    \\
+;
+
+/// What `brew info --json=v2 --cask` answers for those casks, in the shapes
+/// Homebrew 7.0.8 writes: an app, a `pkg`, and an installer under sudo.
+const sudo_casks_info =
+    \\{"formulae":[],"casks":[
+    \\{"token":"ghostty","full_token":"ghostty","tap":"homebrew/cask","artifacts":[{"app":["Ghostty.app"]}]},
+    \\{"token":"karabiner-elements","full_token":"karabiner-elements","tap":"homebrew/cask","artifacts":[{"pkg":["Karabiner-Elements.pkg"]}]},
+    \\{"token":"logi-options+","full_token":"logi-options+","tap":"homebrew/cask","artifacts":[{"installer":[{"script":{"executable":"x","sudo":true}}]}]}
+    \\]}
+;
+
+/// brew present with nothing installed, answering the sudo manifest's
+/// `brew info` queries, then `extra`.
+fn brewForSudoCasks(a: std.mem.Allocator, casks_after: []const u8, extra: []const mox.packages.exec.Fake.Entry) !*mox.packages.exec.Fake {
+    const q = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew ";
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 7.0.8\n" });
+    try entries.append(a, .{ .argv = q ++ "list --full-name --installed-on-request" });
+    // The listing the report reads, and then the one a failed batch is read
+    // back with.
+    try entries.append(a, .{ .argv = q ++ "list --cask --full-name", .once = true });
+    try entries.append(a, .{ .argv = q ++ "list --cask --full-name", .stdout = casks_after });
+    try entries.append(a, .{ .argv = q ++ "list --formula --full-name" });
+    try entries.append(a, .{ .argv = q ++ "info --json=v2 --formula -- fd", .code = 1 });
+    try entries.append(a, .{ .argv = q ++ "info --json=v2 --cask -- ghostty karabiner-elements logi-options+", .stdout = sudo_casks_info });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
+    try entries.append(a, .{ .argv = "brew install -- fd" });
+    try entries.append(a, .{ .argv = "brew install --cask -- ghostty" });
+    for (extra) |e| try entries.append(a, e);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    return fake;
+}
+
+fn callIndex(fake: *const mox.packages.exec.Fake, argv: []const u8) ?usize {
+    for (fake.calls.items, 0..) |c, i| {
+        if (std.mem.eql(u8, c, argv)) return i;
+    }
+    return null;
+}
+
+const sudo_heads_up = "mox: brew: karabiner-elements, logi-options+ need administrator access to install, so they are installed first, in one brew run; Homebrew downloads them all first, then clears sudo's cached credential before its first elevated step, so the administrator password may be asked once more when the downloads are done\n";
+
+test "apply: the casks that elevate install in one brew run before the formulae, after a heads-up" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try writeManifest(io, h, a, "darwin.toml", sudo_manifest);
+
+    const fake = try brewForSudoCasks(a, "", &.{
+        .{ .argv = "brew install --cask -- karabiner-elements logi-options+" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings(sudo_heads_up, r.err);
+
+    const batch = callIndex(fake, "brew install --cask -- karabiner-elements logi-options+") orelse return error.NoBatch;
+    const formula = callIndex(fake, "brew install -- fd") orelse return error.NoFormula;
+    const plain = callIndex(fake, "brew install --cask -- ghostty") orelse return error.NoPlainCask;
+    try std.testing.expect(batch < formula);
+    try std.testing.expect(batch < plain);
+    // One brew run for the two, never one each.
+    var installs_naming_them: usize = 0;
+    for (fake.calls.items) |c| {
+        if (std.mem.startsWith(u8, c, "brew install") and std.mem.indexOf(u8, c, "logi-options+") != null) installs_naming_them += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), installs_naming_them);
+    try std.testing.expect(std.mem.indexOf(u8, r.out,
+        \\  installing      brew fd
+        \\  installing      brew ghostty
+        \\  installing      brew karabiner-elements
+        \\  installing      brew logi-options+
+        \\
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 4 installed, 0 failed\n") != null);
+}
+
+test "apply: a batch of casks that fails part-way names the one that did not land, and the rows after it run" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try writeManifest(io, h, a, "darwin.toml", sudo_manifest);
+
+    const fake = try brewForSudoCasks(a, "karabiner-elements\n", &.{
+        .{ .argv = "brew install --cask -- karabiner-elements logi-options+", .code = 1 },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expectEqualStrings(
+        sudo_heads_up ++
+            "mox: brew: \"logi-options+\" is not installed after the batch failed; brew's message above says why\n" ++
+            "mox apply: brew: install failed: the install did not complete, and the manager's own message is above\n",
+        r.err,
+    );
+    try std.testing.expect(fake.called("brew install -- fd"));
+    try std.testing.expect(fake.called("brew install --cask -- ghostty"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed (4 row(s) in failed batches may have landed)\n") != null);
+}
+
+test "apply: a volume short of space is named before the installs, which still run" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+    // brew is found in this prefix, so the prefix is the volume measured.
+    const prefix = try std.fs.path.join(a, &.{ h.state, "prefix" });
+    const prefix_bin = try std.fs.path.join(a, &.{ prefix, "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    const prefixes = try a.alloc([]const u8, 1);
+    prefixes[0] = prefix_bin;
+    mox.cli.app.brew_prefixes_override = prefixes;
+    defer mox.cli.app.brew_prefixes_override = null;
+
+    const fake = try brewWith(a, "", "", &.{.{ .argv = "brew install -- ripgrep" }});
+    // Ahead of the fixture's roomy answer, so this one is what df says.
+    const low: mox.packages.exec.Fake.Entry = .{
+        .argv = try std.fmt.allocPrint(a, "df -P -k -- {s}", .{prefix}),
+        .stdout = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s5 488245288 485000000 3355444 99% /\n",
+    };
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, low);
+    try entries.appendSlice(a, fake.entries);
+    fake.entries = entries.items;
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "mox apply: only 3.2 GiB free on the volume holding {s} (mounted at /); an install that runs out of space can fail part-way or hang, so free at least 10 GiB before going on\n", .{prefix}),
+        r.err,
+    );
+    // A warning, never a refusal.
+    try std.testing.expect(fake.called("brew install -- ripgrep"));
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // Measured before the install it warns about.
+    try std.testing.expect(callIndex(fake, low.argv).? < callIndex(fake, "brew install -- ripgrep").?);
+}
+
+test "bootstrap: the installer run is staged, so a run a signal ends there can still name it" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const fx = try brewBootstrap(a, io, h, 0, 0);
+    defer resetBootstrapSeams();
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const want = "mox apply: interrupted bootstrapping brew; its installer may have left it partly installed\n";
+    // The password prompt and the installer behind it both hold the
+    // terminal, and either is where a Ctrl-C lands.
+    try std.testing.expectEqualStrings(want, fx.fake.notes.items[indexOfCall(fx.fake, "sudo -v").?]);
+    try std.testing.expectEqualStrings(want, fx.fake.notes.items[indexOfCall(fx.fake, fx.interpreter).?]);
+    try std.testing.expectEqualStrings("", mox.machine.job.stagedNote());
 }

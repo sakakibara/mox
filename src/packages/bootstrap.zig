@@ -133,7 +133,7 @@ const Downloader = struct {
         return .{ .ctx = self, .runFn = run, .streamFn = stream };
     }
 
-    fn stream(ctx: *anyopaque, a: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8) anyerror!exec.Result {
+    fn stream(ctx: *anyopaque, a: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, _: ?[]const u8) anyerror!exec.Result {
         return run(ctx, a, argv, stdin, exec.max_query_bytes, .stdout);
     }
 

@@ -34,8 +34,17 @@
 //! missing on every run and "installed" again on every apply, so the adapter
 //! writes that flag itself with `brew tab` instead of running an install
 //! that cannot converge the row.
+//!
+//! An install is one `brew install` per row, so each package's failure is its
+//! own, with one exception: the casks whose install elevates. Homebrew clears
+//! sudo's cached credential (`sudo --reset-timestamp`, from `utils/sudo.sh`)
+//! the first time each brew process needs sudo, so one process per such cask
+//! asks for the administrator password once per cask. They are installed
+//! together in one `brew install --cask`, before everything else, while the
+//! user who answered the bootstrap's prompt is still at the keyboard.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const json = @import("json");
 
 const backend_mod = @import("backend.zig");
@@ -130,7 +139,39 @@ pub const Brew = struct {
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
         .installerExit = installerExitImpl,
+        .spacePaths = spacePathsImpl,
     };
+
+    /// brew's prefix, where every formula lands, and on a mac the
+    /// temporary directory a cask is staged in before it is moved into
+    /// place. The prefix is the one this brew runs from; a brew on PATH
+    /// outside every known prefix names none, and only the staging
+    /// directory is checked.
+    fn spacePathsImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        var out: std.ArrayList([]const u8) = .empty;
+        if (self.prefixDir(arena)) |dir| try out.append(arena, dir);
+        if (builtin.os.tag == .macos) {
+            for (rows) |row| {
+                if (try kindOf(row) != .cask) continue;
+                try out.append(arena, "/private/tmp");
+                break;
+            }
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// The directory above the bin directory brew runs from.
+    fn prefixDir(self: *Brew, arena: std.mem.Allocator) ?[]const u8 {
+        if (std.fs.path.isAbsolute(self.exe)) return std.fs.path.dirname(std.fs.path.dirname(self.exe) orelse return null);
+        const io = self.io orelse return null;
+        for (self.prefixes) |bin| {
+            const exe = std.fs.path.join(arena, &.{ bin, "brew" }) catch return null;
+            Io.Dir.cwd().access(io, exe, .{}) catch continue;
+            return std.fs.path.dirname(bin);
+        }
+        return null;
+    }
 
     fn installerExitImpl(ctx: *anyopaque) ?u8 {
         const self: *Brew = @ptrCast(@alignCast(ctx));
@@ -148,7 +189,7 @@ pub const Brew = struct {
         const io = self.io orelse return error.NoBootstrapForBackend;
 
         self.installer_exit = null;
-        const res = try self.runner.stream(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", installer_path });
+        const res = try self.runner.streamStep(arena, &.{ "env", "NONINTERACTIVE=1", "/bin/bash", installer_path }, "brew: Homebrew's installer");
         try exec.checkTimedOut(res);
         if (!res.ok) {
             self.installer_exit = res.code;
@@ -269,6 +310,16 @@ pub const Brew = struct {
     /// did. A mark that does not take is that row's own failure instead,
     /// counted in `unmarked`: the rows beside it install all the same.
     ///
+    /// The casks whose install elevates (`elevates`) are the exception: they
+    /// go first, in one `brew install --cask`, so Homebrew asks for the
+    /// password once for all of them rather than once each. Every one of them
+    /// is still attempted -- brew 7.0.8 goes on to the next cask when one
+    /// fails (`cmd/install.rb` rescues each with `ofail`) -- and when the run
+    /// fails, the casks it left uninstalled are read back and named one by
+    /// one, so a failure is still attributed to its package. A cask brew
+    /// could not describe is not classified, and installs on its own as any
+    /// other row does.
+    ///
     /// `--` before the name, verified against Homebrew 7.0.1: `brew install
     /// --help` exits 0 having installed nothing, while `brew install --
     /// --help` reads the operand as a formula name and exits 1. `validate` is
@@ -280,12 +331,28 @@ pub const Brew = struct {
         self.refused = 0;
         self.marked = 0;
         self.unmarked = 0;
-        const keep = try self.refuseAliases(arena, rows);
+        var elevated: std.StringHashMap(void) = .init(arena);
+        const keep = try self.refuseAliases(arena, rows, &elevated);
         self.refused = rows.len - keep.len;
+
+        var together: std.ArrayList(Row) = .empty;
+        var alone: std.ArrayList(Row) = .empty;
+        for (keep) |row| {
+            if (try kindOf(row) == .cask and elevated.contains(row.name)) {
+                try together.append(arena, row);
+            } else {
+                try alone.append(arena, row);
+            }
+        }
+
+        var failed = false;
+        if (together.items.len > 0) {
+            if (!try self.installElevated(arena, together.items)) failed = true;
+        }
+
         // Asked once for the batch, and only when a formula row is in it.
         var installed: ?std.StringHashMap(void) = null;
-        var failed = false;
-        for (keep) |row| {
+        for (alone.items) |row| {
             const kind = try kindOf(row);
             if (kind == .formula) {
                 if (installed == null) installed = try self.installedFormulae(arena);
@@ -297,39 +364,99 @@ pub const Brew = struct {
                     continue;
                 }
             }
-            if (tapOf(row.name)) |tap| {
-                const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", "--", tap });
-                try exec.checkTimedOut(tapped);
-                if (!tapped.ok) {
-                    failed = true;
-                    continue;
-                }
-                // Trust the one thing named, never the whole tap: an
-                // untrusted third-party tap is ignored outright since
-                // Homebrew 6.0, and whole-tap trust would extend to every
-                // formula and cask it ever adds. brew keeps the two target
-                // kinds apart, so a cask trusted as a formula is recorded in
-                // the wrong namespace and stays untrusted.
-                const flag: []const u8 = switch (kind) {
-                    .formula => "--formula",
-                    .cask => "--cask",
-                };
-                const trusted = try self.runner.stream(arena, &.{ self.exe, "trust", flag, "--", row.name });
-                try exec.checkTimedOut(trusted);
-                if (!trusted.ok) {
-                    failed = true;
-                    continue;
-                }
+            if (!try self.trustTap(arena, row.name, kind)) {
+                failed = true;
+                continue;
             }
             self.spawned = true;
+            const step = try std.fmt.allocPrint(arena, "brew: {s}", .{row.name});
             const res = switch (kind) {
-                .formula => try self.runner.stream(arena, &.{ self.exe, "install", "--", row.name }),
-                .cask => try self.runner.stream(arena, &.{ self.exe, "install", "--cask", "--", row.name }),
+                .formula => try self.runner.streamStep(arena, &.{ self.exe, "install", "--", row.name }, step),
+                .cask => try self.runner.streamStep(arena, &.{ self.exe, "install", "--cask", "--", row.name }, step),
             };
             try exec.checkTimedOut(res);
             if (!res.ok) failed = true;
         }
         if (failed) return error.BrewInstallFailed;
+    }
+
+    /// Tap and trust what a tap-qualified name needs before brew will install
+    /// it; a core name needs neither. False when either step failed, which
+    /// fails that row alone.
+    fn trustTap(self: *Brew, arena: std.mem.Allocator, name: []const u8, kind: Kind) anyerror!bool {
+        const tap = tapOf(name) orelse return true;
+        const tapped = try self.runner.stream(arena, &.{ self.exe, "tap", "--", tap });
+        try exec.checkTimedOut(tapped);
+        if (!tapped.ok) return false;
+        // Trust the one thing named, never the whole tap: an untrusted
+        // third-party tap is ignored outright since Homebrew 6.0, and
+        // whole-tap trust would extend to every formula and cask it ever
+        // adds. brew keeps the two target kinds apart, so a cask trusted as a
+        // formula is recorded in the wrong namespace and stays untrusted.
+        const flag: []const u8 = switch (kind) {
+            .formula => "--formula",
+            .cask => "--cask",
+        };
+        const trusted = try self.runner.stream(arena, &.{ self.exe, "trust", flag, "--", name });
+        try exec.checkTimedOut(trusted);
+        return trusted.ok;
+    }
+
+    /// Install the casks that elevate in one brew run, after saying why the
+    /// password may be asked for again. brew fetches every download of the
+    /// run before it installs any of them, so that prompt comes once the
+    /// downloads are done, not at the start of the run. False when any of them failed: its
+    /// tap or trust, or the run itself, after which the casks it left
+    /// uninstalled are named.
+    fn installElevated(self: *Brew, arena: std.mem.Allocator, rows: []const Row) anyerror!bool {
+        var ok = true;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (rows) |row| {
+            if (!try self.trustTap(arena, row.name, .cask)) {
+                ok = false;
+                continue;
+            }
+            try names.append(arena, row.name);
+        }
+        if (names.items.len == 0) return ok;
+
+        const list = try std.mem.join(arena, ", ", names.items);
+        self.say(
+            "mox: brew: {s} {s} administrator access to install, so {s} installed first, in one brew run; Homebrew downloads them all first, then clears sudo's cached credential before its first elevated step, so the administrator password may be asked once more when the downloads are done\n",
+            .{ list, if (names.items.len == 1) "needs" else "need", if (names.items.len == 1) "it is" else "they are" },
+        );
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ self.exe, "install", "--cask", "--" });
+        try argv.appendSlice(arena, names.items);
+        self.spawned = true;
+        const res = try self.runner.streamStep(arena, argv.items, try std.fmt.allocPrint(arena, "brew: {s}", .{list}));
+        try exec.checkTimedOut(res);
+        if (res.ok) return ok;
+
+        // The cask query lists the whole Caskroom, so a name it carries is a
+        // cask that is installed, whatever the run's exit said of it.
+        const now = self.runner.run(arena, &(query_env ++ .{ self.exe, "list", "--cask", "--full-name" })) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => null,
+        };
+        if (now == null or now.?.timed_out or !now.?.ok) {
+            self.say(
+                "mox: brew: the installed casks could not be listed after the batch failed, so whether {s} landed is unknown; brew's message above names the one that failed\n",
+                .{list},
+            );
+            return false;
+        }
+        var present: std.StringHashMap(void) = .init(arena);
+        var lines = std.mem.splitScalar(u8, now.?.stdout, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len > 0) try present.put(line, {});
+        }
+        for (names.items) |name| {
+            if (present.contains(name)) continue;
+            self.say("mox: brew: \"{s}\" is not installed after the batch failed; brew's message above says why\n", .{name});
+        }
+        return false;
     }
 
     /// Every formula brew has, asked for by name or pulled in behind one --
@@ -459,7 +586,10 @@ pub const Brew = struct {
     /// that row installs ripgrep and reads as missing for ever. A row naming
     /// a tap this machine does not have gets no answer at all, so it is kept
     /// -- declaring it is the decision to trust that tap.
-    fn refuseAliases(self: *Brew, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Row {
+    ///
+    /// The same answers say which casks elevate to install, recorded in
+    /// `elevated` by canonical name.
+    fn refuseAliases(self: *Brew, arena: std.mem.Allocator, rows: []const Row, elevated: *std.StringHashMap(void)) anyerror![]const Row {
         var asked: [2]bool = .{ false, false };
         // Canonical name -> itself, and each other spelling -> the canonical
         // one. One map per kind, because the two are separate namespaces
@@ -480,7 +610,7 @@ pub const Brew = struct {
             const slot = @intFromEnum(kind);
             if (!asked[slot]) {
                 asked[slot] = true;
-                try self.resolveNames(arena, kind, rows, &resolved[slot]);
+                try self.resolveNames(arena, kind, rows, &resolved[slot], elevated);
             }
             const canonical = resolved[slot].get(row.name) orelse {
                 try keep.append(arena, row);
@@ -537,6 +667,7 @@ pub const Brew = struct {
         kind: Kind,
         rows: []const Row,
         into: *std.StringHashMap([]const u8),
+        elevated: *std.StringHashMap(void),
     ) anyerror!void {
         const flag: []const u8 = switch (kind) {
             .formula => "--formula",
@@ -557,7 +688,7 @@ pub const Brew = struct {
         if (self.runner.run(arena, argv.items)) |res| {
             try exec.checkCaptureTimedOut(res);
             if (res.ok) {
-                try recordAnswers(arena, kind, res.stdout, into);
+                try recordAnswers(arena, kind, res.stdout, into, elevated);
                 return;
             }
         } else |e| switch (e) {
@@ -600,7 +731,7 @@ pub const Brew = struct {
             };
             try exec.checkCaptureTimedOut(got);
             if (!got.ok) continue;
-            try recordAnswers(arena, kind, got.stdout, into);
+            try recordAnswers(arena, kind, got.stdout, into, elevated);
         }
     }
 };
@@ -615,11 +746,15 @@ pub const Brew = struct {
 /// the bare name brew reports. A third-party tap answers `"full_name":
 /// "owner/tap/name"`, which is the qualified spelling itself, so such a row
 /// resolves to what it already says.
+///
+/// A cask whose install elevates goes into `elevated` under its canonical
+/// name.
 fn recordAnswers(
     arena: std.mem.Allocator,
     kind: Kind,
     stdout: []const u8,
     into: *std.StringHashMap([]const u8),
+    elevated: *std.StringHashMap(void),
 ) !void {
     const doc = json.parse(arena, stdout, .{}) catch return;
     if (doc != .object) return;
@@ -637,6 +772,7 @@ fn recordAnswers(
         }) orelse continue;
         if (canonical != .string or canonical.string.len == 0) continue;
         try into.put(canonical.string, canonical.string);
+        if (kind == .cask and elevates(entry)) try elevated.put(canonical.string, {});
         if (try qualifiedName(arena, kind, entry)) |qualified| {
             if (!into.contains(qualified)) try into.put(qualified, canonical.string);
         }
@@ -656,6 +792,58 @@ fn recordAnswers(
             }
         }
     }
+}
+
+/// Whether installing the cask `brew info --json=v2` describes runs anything
+/// under sudo, as far as that JSON can say. It mirrors Homebrew 7.0.8's own
+/// `requires_sudo?`, the check that makes brew reset sudo's credential and
+/// ask for the password: a `pkg` and a `keyboard_layout` always elevate; an
+/// `installer` does when its script says `sudo: true`; preflight and
+/// postflight steps do when a step says `sudo: true` or deletes a keychain
+/// certificate (the optional `"if_needed"` is left out, as brew leaves it
+/// out). Uninstall stanzas never count: nothing here uninstalls.
+///
+/// What the JSON cannot show is not classified: a cask that elevates only
+/// from a `preflight`/`postflight` Ruby block, or through a sudo fallback of
+/// its own, appears there as nothing that elevates. Such a cask installs on
+/// its own, as any other row does, and its brew run may ask for the
+/// password again.
+fn elevates(entry: json.Value) bool {
+    const artifacts = entry.get("artifacts") orelse return false;
+    if (artifacts != .array) return false;
+    for (artifacts.array) |artifact| {
+        if (artifact != .object) continue;
+        const o = artifact.object;
+        if (o.get("pkg") != null or o.get("keyboard_layout") != null) return true;
+        if (o.get("installer")) |args| {
+            if (args == .array) for (args.array) |arg| {
+                if (arg != .object) continue;
+                const script = arg.object.get("script") orelse continue;
+                if (script != .object) continue;
+                const sudo = script.object.get("sudo") orelse continue;
+                if (sudo == .bool and sudo.bool) return true;
+            };
+        }
+        for ([_][]const u8{ "preflight_steps", "postflight_steps" }) |key| {
+            const args = o.get(key) orelse continue;
+            if (args != .array) continue;
+            for (args.array) |arg| {
+                if (arg != .object) continue;
+                const steps = arg.object.get("steps") orelse continue;
+                if (steps != .array) continue;
+                for (steps.array) |step| {
+                    if (step != .object) continue;
+                    if (step.object.get("sudo")) |v| {
+                        if (v == .bool and v.bool) return true;
+                    }
+                    if (step.object.get("type")) |v| {
+                        if (v == .string and std.mem.eql(u8, v.string, "delete_keychain_certificate")) return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /// `<tap>/<name>` for one `brew info` entry, or null when it carries neither.
@@ -1739,4 +1927,182 @@ test "the captured queries run without HOMEBREW_NO_INSTALL_FROM_API, and the ins
         }
     }
     try testing.expect(fake.called("brew install -- bat"));
+}
+
+/// `brew info --json=v2 --cask` for a plain cask and the two shapes of a cask
+/// whose install elevates, as Homebrew 7.0.8 writes them: karabiner-elements
+/// installs a `pkg`, logi-options+ runs its installer under `sudo: true`.
+const sudo_casks_info =
+    \\{"formulae":[],"casks":[
+    \\{"token":"ghostty","full_token":"ghostty","tap":"homebrew/cask","old_tokens":[],"artifacts":[{"app":["Ghostty.app"],"target":"/Applications/Ghostty.app"}]},
+    \\{"token":"karabiner-elements","full_token":"karabiner-elements","tap":"homebrew/cask","old_tokens":[],"artifacts":[{"uninstall":[{"early_script":{"executable":"/x/remove_files.sh","sudo":true}}]},{"pkg":["Karabiner-Elements.pkg"]},{"binary":["/x/karabiner_cli"]}]},
+    \\{"token":"logi-options+","full_token":"logi-options+","tap":"homebrew/cask","old_tokens":[],"artifacts":[{"installer":[{"script":{"executable":"logioptionsplus_installer.app/Contents/MacOS/logioptionsplus_installer","args":["--quiet"],"sudo":true}}]}]}
+    \\]}
+;
+
+const cask_info_argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --cask -- ";
+const formula_info_argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 --formula -- ";
+const cask_list_argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name";
+
+fn caskRow(name: []const u8) Row {
+    return rowOf(name, &.{.{ .key = "kind", .value = .{ .string = "cask" } }});
+}
+
+const batch_heads_up = "mox: brew: karabiner-elements, logi-options+ need administrator access to install, so they are installed first, in one brew run; Homebrew downloads them all first, then clears sudo's cached credential before its first elevated step, so the administrator password may be asked once more when the downloads are done\n";
+
+test "install: the casks that elevate install first, in one brew run, after a heads-up" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = formula_info_argv ++ "fd", .code = 1 },
+        .{ .argv = cask_info_argv ++ "ghostty karabiner-elements logi-options+", .stdout = sudo_casks_info },
+        .{ .argv = "brew install --cask -- karabiner-elements logi-options+" },
+        nothing_installed,
+        .{ .argv = "brew install -- fd" },
+        .{ .argv = "brew install --cask -- ghostty" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{ rowOf("fd", &.{}), caskRow("ghostty"), caskRow("karabiner-elements"), caskRow("logi-options+") });
+
+    // Homebrew asks for the password again in every brew process that first
+    // needs sudo, so the two that elevate share one process, and it runs
+    // before the formulae while the user is still at the keyboard.
+    try testing.expectEqualSlices(u8, "brew install --cask -- karabiner-elements logi-options+", fake.calls.items[2]);
+    const want = [_][]const u8{
+        formula_info_argv ++ "fd",
+        cask_info_argv ++ "ghostty karabiner-elements logi-options+",
+        "brew install --cask -- karabiner-elements logi-options+",
+        nothing_installed.argv,
+        "brew install -- fd",
+        "brew install --cask -- ghostty",
+    };
+    try testing.expectEqual(want.len, fake.calls.items.len);
+    for (want, fake.calls.items) |x, y| try testing.expectEqualStrings(x, y);
+    try testing.expectEqualStrings("brew: karabiner-elements, logi-options+", fake.steps.items[2]);
+    try testing.expectEqualStrings("brew: fd", fake.steps.items[4]);
+    try testing.expectEqualStrings("brew: ghostty", fake.steps.items[5]);
+    try testing.expectEqualStrings(batch_heads_up, w.written());
+}
+
+test "install: a batch that fails part-way is read back, and each cask it left out is named" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // brew 7.0.8 goes on to the next cask when one fails (`cmd/install.rb`
+    // rescues each with `ofail`), so the batch exits 1 having installed the
+    // rest; what landed is read back rather than guessed at.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = cask_info_argv ++ "ghostty karabiner-elements logi-options+", .stdout = sudo_casks_info },
+        .{ .argv = "brew install --cask -- karabiner-elements logi-options+", .code = 1 },
+        .{ .argv = cask_list_argv, .stdout = "firefox\nkarabiner-elements\n" },
+        .{ .argv = "brew install --cask -- ghostty" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{ caskRow("ghostty"), caskRow("karabiner-elements"), caskRow("logi-options+") }));
+    try testing.expect(b.backend().installSpawned());
+    // The row after the batch still runs.
+    try testing.expect(fake.called("brew install --cask -- ghostty"));
+    try testing.expectEqualStrings(
+        batch_heads_up ++
+            "mox: brew: \"logi-options+\" is not installed after the batch failed; brew's message above says why\n",
+        w.written(),
+    );
+}
+
+test "install: a failed batch whose casks cannot be listed says which of them may not have landed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = cask_info_argv ++ "karabiner-elements logi-options+", .stdout = sudo_casks_info },
+        .{ .argv = "brew install --cask -- karabiner-elements logi-options+", .code = 1 },
+        .{ .argv = cask_list_argv, .code = 1 },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try testing.expectError(error.BrewInstallFailed, b.backend().install(a, &.{ caskRow("karabiner-elements"), caskRow("logi-options+") }));
+    try testing.expectEqualStrings(
+        batch_heads_up ++
+            "mox: brew: the installed casks could not be listed after the batch failed, so whether karabiner-elements, logi-options+ landed is unknown; brew's message above names the one that failed\n",
+        w.written(),
+    );
+}
+
+test "install: with no cask that elevates there is no batch and no heads-up" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = formula_info_argv ++ "fd", .code = 1 },
+        .{ .argv = cask_info_argv ++ "ghostty", .stdout = sudo_casks_info },
+        nothing_installed,
+        .{ .argv = "brew install -- fd" },
+        .{ .argv = "brew install --cask -- ghostty" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{ rowOf("fd", &.{}), caskRow("ghostty") });
+    const want = [_][]const u8{
+        formula_info_argv ++ "fd",
+        cask_info_argv ++ "ghostty",
+        nothing_installed.argv,
+        "brew install -- fd",
+        "brew install --cask -- ghostty",
+    };
+    try testing.expectEqual(want.len, fake.calls.items.len);
+    for (want, fake.calls.items) |x, y| try testing.expectEqualStrings(x, y);
+    try testing.expectEqualStrings("", w.written());
+}
+
+test "install: a cask brew cannot describe is installed on its own, as before" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No answer means no classification, never a guess that it elevates.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = cask_info_argv ++ "logi-options+", .code = 1 },
+        .{ .argv = "brew install --cask -- logi-options+" },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer };
+
+    try b.backend().install(a, &.{caskRow("logi-options+")});
+    try testing.expectEqualStrings("", w.written());
+}
+
+test "elevates: Homebrew's own rule for an install that needs sudo, read from brew info" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_]struct { artifacts: []const u8, want: bool }{
+        .{ .artifacts = "[{\"app\":[\"A.app\"]}]", .want = false },
+        .{ .artifacts = "[{\"pkg\":[\"A.pkg\"]}]", .want = true },
+        .{ .artifacts = "[{\"keyboard_layout\":[\"A.bundle\"]}]", .want = true },
+        .{ .artifacts = "[{\"installer\":[{\"script\":{\"executable\":\"x\",\"sudo\":true}}]}]", .want = true },
+        .{ .artifacts = "[{\"installer\":[{\"script\":{\"executable\":\"x\",\"sudo\":false}}]}]", .want = false },
+        .{ .artifacts = "[{\"installer\":[{\"script\":\"x\"}]}]", .want = false },
+        .{ .artifacts = "[{\"installer\":[{\"manual\":\"A Installer.app\"}]}]", .want = false },
+        .{ .artifacts = "[{\"preflight_steps\":[{\"steps\":[{\"type\":\"run\",\"sudo\":true}]}]}]", .want = true },
+        .{ .artifacts = "[{\"postflight_steps\":[{\"steps\":[{\"type\":\"delete_keychain_certificate\"}]}]}]", .want = true },
+        .{ .artifacts = "[{\"postflight_steps\":[{\"steps\":[{\"type\":\"run\",\"sudo\":\"if_needed\"}]}]}]", .want = false },
+        // An uninstall step that elevates says nothing about the install.
+        .{ .artifacts = "[{\"uninstall\":[{\"early_script\":{\"executable\":\"x\",\"sudo\":true}}]}]", .want = false },
+    };
+    for (cases) |c| {
+        const doc = try json.parse(a, try std.fmt.allocPrint(a, "{{\"artifacts\":{s}}}", .{c.artifacts}), .{});
+        try testing.expectEqual(c.want, elevates(doc));
+    }
 }
