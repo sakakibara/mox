@@ -76,13 +76,13 @@ fn brewWithInstalled(
 ) !*mox.packages.exec.Fake {
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = formulae });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = casks });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --formula --full-name", .stdout = installed });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = formulae });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = casks });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name", .stdout = installed });
     // What an install asks brew each row's name stands for. Answered with
     // nothing, so no row is refused as an alias: these fixtures are about the
     // install, and the alias refusal is exercised on its own elsewhere.
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew info --json=v2 ", .match = .prefix, .code = 1 });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 ", .match = .prefix, .code = 1 });
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     for (extra) |e| try entries.append(a, e);
@@ -99,6 +99,9 @@ const roomy_df: mox.packages.exec.Fake.Entry = .{
     .match = .prefix,
     .stdout = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 976562500 1 900000000 1% /\n",
 };
+
+/// A prefix list naming nowhere: brew is in none of its prefixes.
+const no_brew_prefix = [_][]const u8{"/nonexistent/mox-test-prefix/bin"};
 
 fn useFake(fake: *mox.packages.exec.Fake) void {
     mox.cli.app.package_runner_override = fake.runner();
@@ -212,15 +215,15 @@ test "apply: installs what is missing, and a cask through --cask" {
     );
 
     const fake = try brewWith(a, "", "", &.{
-        .{ .argv = "brew install -- fd" },
-        .{ .argv = "brew install --cask -- ghostty" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install --cask -- ghostty" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(fake.called("brew install -- fd"));
-    try std.testing.expect(fake.called("brew install --cask -- ghostty"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install --cask -- ghostty"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 2 installed, 0 failed") != null);
 }
 
@@ -245,8 +248,8 @@ test "apply: the batch being installed is staged, so a run a signal ends can sti
     );
 
     const fake = try brewWith(a, "", "", &.{
-        .{ .argv = "brew install -- fd" },
-        .{ .argv = "brew install -- ripgrep" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -259,14 +262,15 @@ test "apply: the batch being installed is staged, so a run a signal ends can sti
     // nothing deferred runs and the last thing said is `installing`. What the
     // install was part-way through has to be staged before the spawn or it is
     // never said at all -- and only for as long as that install is running.
-    const want = "mox apply: interrupted installing brew: fd, ripgrep (row(s) in this batch may have landed)\n";
-    var staged_at_install = false;
-    for (fake.calls.items, fake.notes.items) |call, note| {
-        if (!std.mem.endsWith(u8, call, "brew install -- ripgrep")) continue;
-        try std.testing.expectEqualStrings(want, note);
-        staged_at_install = true;
-    }
-    try std.testing.expect(staged_at_install);
+    // It names the one install running, never the rows still to come.
+    const at_fd = callIndex(fake, "env HOMEBREW_NO_ASK=1 brew install -- fd").?;
+    const at_ripgrep = callIndex(fake, "env HOMEBREW_NO_ASK=1 brew install -- ripgrep").?;
+    try std.testing.expectEqualStrings("mox apply: interrupted while running brew: fd; it may have been left part-done\n", fake.notes.items[at_fd]);
+    try std.testing.expectEqualStrings("mox apply: interrupted while running brew: ripgrep; it may have been left part-done\n", fake.notes.items[at_ripgrep]);
+    // Between installs -- a query the batch makes -- nothing is part-way,
+    // and what finished stays.
+    const at_query = callIndex(fake, "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name").?;
+    try std.testing.expectEqualStrings("mox apply: interrupted between the brew installs; each one that finished stays installed\n", fake.notes.items[at_query]);
     // The probe that runs before any row is chosen has nothing to name, and
     // the batch being over leaves nothing staged for the run that follows it.
     try std.testing.expectEqualStrings("", fake.notes.items[0]);
@@ -298,7 +302,7 @@ test "apply --dry-run: reports what it would install and installs nothing" {
     const r = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "would install   brew fd") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 would be installed, 0 failed") != null);
-    try std.testing.expect(!fake.called("brew install -- fd"));
+    try std.testing.expect(!fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
 }
 
 test "apply: a tapped formula is tapped and trusted before install" {
@@ -319,9 +323,9 @@ test "apply: a tapped formula is tapped and trusted before install" {
     );
 
     const fake = try brewWith(a, "", "", &.{
-        .{ .argv = "brew tap -- d12frosted/emacs-plus" },
-        .{ .argv = "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
-        .{ .argv = "brew install -- d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew tap -- d12frosted/emacs-plus" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- d12frosted/emacs-plus/emacs-plus@30" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -329,9 +333,9 @@ test "apply: a tapped formula is tapped and trusted before install" {
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     // Tap, then trust, then install: each step needs the one before it.
-    const tap = indexOfCall(fake, "brew tap -- d12frosted/emacs-plus").?;
-    const trust = indexOfCall(fake, "brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30").?;
-    const install = indexOfCall(fake, "brew install -- d12frosted/emacs-plus/emacs-plus@30").?;
+    const tap = indexOfCall(fake, "env HOMEBREW_NO_ASK=1 brew tap -- d12frosted/emacs-plus").?;
+    const trust = indexOfCall(fake, "env HOMEBREW_NO_ASK=1 brew trust --formula -- d12frosted/emacs-plus/emacs-plus@30").?;
+    const install = indexOfCall(fake, "env HOMEBREW_NO_ASK=1 brew install -- d12frosted/emacs-plus/emacs-plus@30").?;
     try std.testing.expect(tap < trust);
     try std.testing.expect(trust < install);
 }
@@ -357,15 +361,15 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     // missing. `brew install` on it exits 0 having done nothing, which would
     // leave the row missing after a run that called it installed.
     const fake = try brewWithInstalled(a, "brotli\n", "", "", &.{
-        .{ .argv = "brew tab --installed-on-request --formula -- brotli" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- brotli" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(fake.called("brew tab --installed-on-request --formula -- brotli"));
-    try std.testing.expect(!fake.called("brew install -- brotli"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- brotli"));
+    try std.testing.expect(!fake.called("env HOMEBREW_NO_ASK=1 brew install -- brotli"));
     // Said as what it was: the package was there before the run, so the
     // summary counts it apart from what mox put on the machine.
     try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it as installed on request instead") != null);
@@ -407,16 +411,16 @@ test "apply: a formula that cannot be marked on request is a failure, not a clea
     // and installs cleanly: that one is not the failed row's to drag down,
     // and the summary must count it as installed rather than hedge over it.
     const fake = try brewWithInstalled(a, "brotli\n", "", "", &.{
-        .{ .argv = "brew tab --installed-on-request --formula -- brotli", .code = 1 },
-        .{ .argv = "brew install -- ripgrep" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- brotli", .code = 1 },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- ripgrep" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(r.rc != 0);
-    try std.testing.expect(!fake.called("brew install -- brotli"));
-    try std.testing.expect(fake.called("brew install -- ripgrep"));
+    try std.testing.expect(!fake.called("env HOMEBREW_NO_ASK=1 brew install -- brotli"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- ripgrep"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be marked as installed on request") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 1 failed\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "may have landed") == null);
@@ -1048,20 +1052,22 @@ test "bootstrap: a manager that is absent is installed from the declared install
     // The scripted installer leaves `brew` where the adapter looks for it.
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    // The installer is what puts `brew` in the prefix: present before it
+    // runs, it would be found there and nothing bootstrapped.
+    const made_brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
     mox.cli.app.brew_prefixes_override = &.{prefix_bin};
     defer mox.cli.app.brew_prefixes_override = null;
     const staged = try std.fs.path.join(a, &.{
         h.state,                                                                           "tmp",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
-    const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
+    const interpreter = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
-    try entries.append(a, .{ .argv = interpreter });
+    try entries.append(a, .{ .argv = interpreter, .makes_file = made_brew, .io = io });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
@@ -1148,6 +1154,10 @@ test "bootstrap: an installer that exits nonzero is reported by its exit code" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const h = try setup(a, io, &tmp, .{});
+    // Absent everywhere a brew is looked for, this machine's own prefixes
+    // included.
+    mox.cli.app.brew_prefixes_override = &no_brew_prefix;
+    defer mox.cli.app.brew_prefixes_override = null;
 
     const installer = "#!/bin/bash\nexit 1\n";
     const hex = mox.apply.applied.contentHashHex(installer);
@@ -1164,7 +1174,7 @@ test "bootstrap: an installer that exits nonzero is reported by its exit code" {
         h.state,                                                                           "tmp",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
-    const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
+    const interpreter = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
     try absentLinuxManagers(a, &entries);
@@ -1196,6 +1206,10 @@ test "status: an absent manager apply would bootstrap is not a clean machine" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const h = try setup(a, io, &tmp, .{});
+    // Absent everywhere a brew is looked for, this machine's own prefixes
+    // included.
+    mox.cli.app.brew_prefixes_override = &no_brew_prefix;
+    defer mox.cli.app.brew_prefixes_override = null;
 
     try writeManifest(io, h, a, "darwin.toml",
         \\backend = "brew"
@@ -1354,8 +1368,8 @@ test "status: one backend failing a verb does not throw away what the others ans
     // every row brew just computed and describe a machine nobody looked at.
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = "agg\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "" });
     try entries.append(a, .{ .argv = "apt-get --version", .stdout = "apt 2.6.1\n" });
     try entries.append(a, .{ .argv = "apt-mark showmanual", .code = 7 });
     try entries.append(a, .{ .argv = "dnf --version", .code = 127 });
@@ -1409,7 +1423,7 @@ test "status: a broken manager is BROKEN drift in every format, and no usable ma
     try std.testing.expect(std.mem.indexOf(u8, r.out, "  BROKEN    brew (brew --version exited 1)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "note      no package manager is usable on this machine\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "treated as absent") == null);
-    try std.testing.expect(!fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
+    try std.testing.expect(!fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request"));
     try std.testing.expectEqual(@as(u8, 1), r.rc);
 
     // Machine formats carry it as a record, keep stdout pure, and put the
@@ -1459,7 +1473,7 @@ test "bootstrap: a manager already present is left alone" {
     }
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping") == null);
     // The package pass still ran over the manager that was already there.
-    try std.testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
+    try std.testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed") != null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
@@ -1472,6 +1486,10 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const h = try setup(a, io, &tmp, .{});
+    // Absent everywhere a brew is looked for, this machine's own prefixes
+    // included.
+    mox.cli.app.brew_prefixes_override = &no_brew_prefix;
+    defer mox.cli.app.brew_prefixes_override = null;
 
     // The digest names something other than what the fetch produces.
     try writeManifest(io, h, a, "darwin.toml",
@@ -1731,7 +1749,9 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     // The scripted installer leaves `brew` where the adapter looks for it.
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    // The installer is what puts `brew` in the prefix: present before it
+    // runs, it would be found there and nothing bootstrapped.
+    const made_brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
     mox.cli.app.brew_prefixes_override = &.{prefix_bin};
     defer mox.cli.app.brew_prefixes_override = null;
     // brew is absent exactly once; the fetch writes the installer the digest
@@ -1742,7 +1762,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
-    try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash", .match = .prefix, .makes_file = made_brew, .io = io });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
@@ -2090,6 +2110,10 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const h = try setup(a, io, &tmp, .{});
+    // Absent everywhere a brew is looked for, this machine's own prefixes
+    // included.
+    mox.cli.app.brew_prefixes_override = &no_brew_prefix;
+    defer mox.cli.app.brew_prefixes_override = null;
 
     try writeManifest(io, h, a, "darwin.toml",
         \\backend = "brew"
@@ -2529,7 +2553,7 @@ test "plugin: a not-runnable twin of a built-in is noted, and the built-in stays
         "note      backend brew: scripts/backends/brew.ps1: a windows-only kind; not runnable here; the built-in stays\n",
     ) != null);
     // The built-in answered: the row is neither inert nor missing.
-    try std.testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request"));
+    try std.testing.expect(fake.called("env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "clean     brew") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -4146,7 +4170,7 @@ test "apply: a manager whose verb failed says why, not that it exited" {
     // is the only thing that says what happened.
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .code = 3 });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .code = 3 });
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
@@ -4278,8 +4302,8 @@ test "status: a manager whose list output lost its separators is BROKEN, and non
     // brew answers its probe, then hands back its whole list on one line.
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 4.0.0\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --full-name --installed-on-request", .stdout = "agg ripgrep bat\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list --cask --full-name", .stdout = "" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = "agg ripgrep bat\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "" });
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     const fake = try a.create(mox.packages.exec.Fake);
@@ -4330,7 +4354,9 @@ fn brewBootstrap(a: std.mem.Allocator, io: Io, h: Harness, installer_code: u8, s
 
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    // The installer is what puts `brew` in the prefix: present before it
+    // runs, it would be found there and nothing bootstrapped.
+    const made_brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
     const prefixes = try a.alloc([]const u8, 1);
     prefixes[0] = prefix_bin;
     mox.cli.app.brew_prefixes_override = prefixes;
@@ -4339,14 +4365,14 @@ fn brewBootstrap(a: std.mem.Allocator, io: Io, h: Harness, installer_code: u8, s
         h.state,                                                                           "tmp",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
-    const interpreter = try std.fmt.allocPrint(a, "env NONINTERACTIVE=1 /bin/bash {s}", .{staged});
+    const interpreter = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash {s}", .{staged});
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
     try entries.append(a, .{ .argv = "sudo -v", .code = sudo_code });
-    try entries.append(a, .{ .argv = interpreter, .code = installer_code });
+    try entries.append(a, .{ .argv = interpreter, .code = installer_code, .makes_file = made_brew, .io = io });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
@@ -4452,7 +4478,7 @@ test "bootstrap: a refused sudo -v fails the bootstrap by name and the installer
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqualStrings("mox apply: brew: bootstrap needs administrator access: sudo -v exited 1\n", r.err);
     try std.testing.expect(!fx.fake.called(fx.interpreter));
-    try std.testing.expect(!fx.fake.called("brew install -- ripgrep"));
+    try std.testing.expect(!fx.fake.called("env HOMEBREW_NO_ASK=1 brew install -- ripgrep"));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, fx.staged, .{}));
     try std.testing.expectEqual(@as(u8, 2), r.rc);
 }
@@ -4544,7 +4570,9 @@ test "bootstrap: off macOS brew's installer is not preceded by sudo -v" {
     , .{mox.apply.applied.contentHashHex(installer)}));
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
+    // The installer is what puts `brew` in the prefix: present before it
+    // runs, it would be found there and nothing bootstrapped.
+    const made_brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
     const prefixes = try a.alloc([]const u8, 1);
     prefixes[0] = prefix_bin;
     mox.cli.app.brew_prefixes_override = prefixes;
@@ -4553,7 +4581,7 @@ test "bootstrap: off macOS brew's installer is not preceded by sudo -v" {
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
-    try entries.append(a, .{ .argv = "env NONINTERACTIVE=1 /bin/bash", .match = .prefix });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash", .match = .prefix, .makes_file = made_brew, .io = io });
     try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
     try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
     try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
@@ -4695,7 +4723,7 @@ const sudo_casks_info =
 /// brew present with nothing installed, answering the sudo manifest's
 /// `brew info` queries, then `extra`.
 fn brewForSudoCasks(a: std.mem.Allocator, casks_after: []const u8, extra: []const mox.packages.exec.Fake.Entry) !*mox.packages.exec.Fake {
-    const q = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew ";
+    const q = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew ";
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 7.0.8\n" });
     try entries.append(a, .{ .argv = q ++ "list --full-name --installed-on-request" });
@@ -4708,8 +4736,8 @@ fn brewForSudoCasks(a: std.mem.Allocator, casks_after: []const u8, extra: []cons
     try entries.append(a, .{ .argv = q ++ "info --json=v2 --cask -- ghostty karabiner-elements logi-options+", .stdout = sudo_casks_info });
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
-    try entries.append(a, .{ .argv = "brew install -- fd" });
-    try entries.append(a, .{ .argv = "brew install --cask -- ghostty" });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_ASK=1 brew install --cask -- ghostty" });
     for (extra) |e| try entries.append(a, e);
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
@@ -4736,7 +4764,7 @@ test "apply: the casks that elevate install in one brew run before the formulae,
     try writeManifest(io, h, a, "darwin.toml", sudo_manifest);
 
     const fake = try brewForSudoCasks(a, "", &.{
-        .{ .argv = "brew install --cask -- karabiner-elements logi-options+" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install --cask -- karabiner-elements logi-options+" },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -4746,15 +4774,15 @@ test "apply: the casks that elevate install in one brew run before the formulae,
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings(sudo_heads_up, r.err);
 
-    const batch = callIndex(fake, "brew install --cask -- karabiner-elements logi-options+") orelse return error.NoBatch;
-    const formula = callIndex(fake, "brew install -- fd") orelse return error.NoFormula;
-    const plain = callIndex(fake, "brew install --cask -- ghostty") orelse return error.NoPlainCask;
+    const batch = callIndex(fake, "env HOMEBREW_NO_ASK=1 brew install --cask -- karabiner-elements logi-options+") orelse return error.NoBatch;
+    const formula = callIndex(fake, "env HOMEBREW_NO_ASK=1 brew install -- fd") orelse return error.NoFormula;
+    const plain = callIndex(fake, "env HOMEBREW_NO_ASK=1 brew install --cask -- ghostty") orelse return error.NoPlainCask;
     try std.testing.expect(batch < formula);
     try std.testing.expect(batch < plain);
     // One brew run for the two, never one each.
     var installs_naming_them: usize = 0;
     for (fake.calls.items) |c| {
-        if (std.mem.startsWith(u8, c, "brew install") and std.mem.indexOf(u8, c, "logi-options+") != null) installs_naming_them += 1;
+        if (std.mem.startsWith(u8, c, "env HOMEBREW_NO_ASK=1 brew install") and std.mem.indexOf(u8, c, "logi-options+") != null) installs_naming_them += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), installs_naming_them);
     try std.testing.expect(std.mem.indexOf(u8, r.out,
@@ -4778,7 +4806,7 @@ test "apply: a batch of casks that fails part-way names the one that did not lan
     try writeManifest(io, h, a, "darwin.toml", sudo_manifest);
 
     const fake = try brewForSudoCasks(a, "karabiner-elements\n", &.{
-        .{ .argv = "brew install --cask -- karabiner-elements logi-options+", .code = 1 },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install --cask -- karabiner-elements logi-options+", .code = 1 },
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
@@ -4792,8 +4820,8 @@ test "apply: a batch of casks that fails part-way names the one that did not lan
             "mox apply: brew: install failed: the install did not complete, and the manager's own message is above\n",
         r.err,
     );
-    try std.testing.expect(fake.called("brew install -- fd"));
-    try std.testing.expect(fake.called("brew install --cask -- ghostty"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install --cask -- ghostty"));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 1 failed (4 row(s) in failed batches may have landed)\n") != null);
 }
 
@@ -4823,7 +4851,7 @@ test "apply: a volume short of space is named before the installs, which still r
     mox.cli.app.brew_prefixes_override = prefixes;
     defer mox.cli.app.brew_prefixes_override = null;
 
-    const fake = try brewWith(a, "", "", &.{.{ .argv = "brew install -- ripgrep" }});
+    const fake = try brewWith(a, "", "", &.{.{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- ripgrep" }});
     // Ahead of the fixture's roomy answer, so this one is what df says.
     const low: mox.packages.exec.Fake.Entry = .{
         .argv = try std.fmt.allocPrint(a, "df -P -k -- {s}", .{prefix}),
@@ -4843,10 +4871,10 @@ test "apply: a volume short of space is named before the installs, which still r
         r.err,
     );
     // A warning, never a refusal.
-    try std.testing.expect(fake.called("brew install -- ripgrep"));
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- ripgrep"));
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     // Measured before the install it warns about.
-    try std.testing.expect(callIndex(fake, low.argv).? < callIndex(fake, "brew install -- ripgrep").?);
+    try std.testing.expect(callIndex(fake, low.argv).? < callIndex(fake, "env HOMEBREW_NO_ASK=1 brew install -- ripgrep").?);
 }
 
 test "bootstrap: the installer run is staged, so a run a signal ends there can still name it" {
@@ -4865,10 +4893,69 @@ test "bootstrap: the installer run is staged, so a run a signal ends there can s
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    const want = "mox apply: interrupted bootstrapping brew; its installer may have left it partly installed\n";
     // The password prompt and the installer behind it both hold the
-    // terminal, and either is where a Ctrl-C lands.
-    try std.testing.expectEqualStrings(want, fx.fake.notes.items[indexOfCall(fx.fake, "sudo -v").?]);
-    try std.testing.expectEqualStrings(want, fx.fake.notes.items[indexOfCall(fx.fake, fx.interpreter).?]);
+    // terminal, and either is where a Ctrl-C lands; each names itself.
+    try std.testing.expectEqualStrings("mox apply: interrupted while running sudo, for brew's installer; it may have been left part-done\n", fx.fake.notes.items[indexOfCall(fx.fake, "sudo -v").?]);
+    try std.testing.expectEqualStrings("mox apply: interrupted while running brew: Homebrew's installer; it may have been left part-done\n", fx.fake.notes.items[indexOfCall(fx.fake, fx.interpreter).?]);
     try std.testing.expectEqualStrings("", mox.machine.job.stagedNote());
+}
+
+test "bootstrap: a brew in a known prefix but off PATH is used, never installed again" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    // A second apply from a shell whose PATH lacks /opt/homebrew/bin: the
+    // brew the first one installed is there, in the prefix the installer
+    // uses, and `brew` on PATH is not.
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    );
+    const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    const brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = brew, .data = "" });
+    const prefixes = try a.alloc([]const u8, 1);
+    prefixes[0] = prefix_bin;
+    mox.cli.app.brew_prefixes_override = prefixes;
+    defer resetBootstrapSeams();
+
+    const q = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 ";
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} --version", .{brew}), .stdout = "Homebrew 7.0.8\n" });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s}{s} list --full-name --installed-on-request", .{ q, brew }) });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s}{s} list --cask --full-name", .{ q, brew }) });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s}{s} list --formula --full-name", .{ q, brew }) });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s}{s} info --json=v2 --formula -- ripgrep", .{ q, brew }), .code = 1 });
+    const install = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 {s} install -- ripgrep", .{brew});
+    try entries.append(a, .{ .argv = install });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    var refresh: RefreshCount = .{};
+    useElevation(.prompt, &refresh);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "bootstrapping") == null);
+    try std.testing.expectEqual(@as(usize, 0), sudoCalls(fake));
+    for (fake.calls.items) |c| try std.testing.expect(!std.mem.startsWith(u8, c, "curl "));
+    try std.testing.expect(fake.called(install));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
 }

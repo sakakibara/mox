@@ -4976,7 +4976,7 @@ const pty = struct {
 /// mox's own exit status, and everything written to the terminal. Everything
 /// both children need is prepared before the fork; between fork and exec
 /// they make async-signal-safe calls alone.
-fn runOnPty(h: Harness, argv: []const []const u8, input: []const u8) !struct { status: u32, out: []const u8 } {
+fn runOnPty(h: Harness, argv: []const []const u8, input: []const u8, ctrl_c_when: ?[]const u8) !struct { status: u32, out: []const u8 } {
     const a = h.a;
     const master = pty.posix_openpt(@bitCast(std.c.O{ .ACCMODE = .RDWR, .NOCTTY = true }));
     if (master < 0) return error.SkipZigTest;
@@ -5037,6 +5037,8 @@ fn runOnPty(h: Harness, argv: []const []const u8, input: []const u8) !struct { s
             _ = std.c.kill(-job_pid, .KILL);
             std.c._exit(99);
         }
+        // A death by a signal reads as a shell reports one: 128 + the signal.
+        if (std.c.W.IFSIGNALED(job_status)) std.c._exit(@intCast(128 + @intFromEnum(std.c.W.TERMSIG(job_status))));
         std.c._exit(if (std.c.W.IFEXITED(job_status)) @intCast(std.c.W.EXITSTATUS(job_status)) else 98);
     }
 
@@ -5045,7 +5047,15 @@ fn runOnPty(h: Harness, argv: []const []const u8, input: []const u8) !struct { s
     var out: std.ArrayList(u8) = .empty;
     var raw: c_int = 0;
     const started = Io.Clock.awake.now(h.io);
+    var typed_ctrl_c = false;
     while (true) {
+        // Ctrl-C, typed once `ctrl_c_when` exists: the terminal sends SIGINT
+        // to whichever group holds it then.
+        if (!typed_ctrl_c) if (ctrl_c_when) |marker| {
+            if (Io.Dir.cwd().access(h.io, marker, .{})) |_| {
+                typed_ctrl_c = std.c.write(master, "\x03", 1) == 1;
+            } else |_| {}
+        };
         var fds = [_]std.c.pollfd{.{ .fd = master, .events = std.c.POLL.IN, .revents = 0 }};
         if (std.c.poll(&fds, 1, 50) > 0) {
             var buf: [4096]u8 = undefined;
@@ -5082,7 +5092,7 @@ test "apply: a setup script that reads the terminal the moment it starts is neve
     // that already took the terminal, which mox must report and take back.
     try writeRepo(io, &tmp, "repo/scripts/pre/01-noexec.sh", "#!/bin/sh\nexit 0\n");
 
-    const r = try runOnPty(h, &.{"apply"}, "typed ahead\n");
+    const r = try runOnPty(h, &.{"apply"}, "typed ahead\n", null);
     errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
     try std.testing.expect(std.c.W.IFEXITED(r.status));
     // 99 is mox found stopped: the script read the terminal before its
@@ -5124,11 +5134,70 @@ test "apply: an install that reads the terminal the moment it starts is never st
     , .{ got, got }), plugin);
     try writeRepo(io, &tmp, "repo/data/packages/shared.toml", "backend = \"ttyread\"\n\n[[packages]]\nname = \"probe\"\n");
 
-    const r = try runOnPty(h, &.{"apply"}, "typed ahead\n");
+    const r = try runOnPty(h, &.{"apply"}, "typed ahead\n", null);
     errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
     try std.testing.expect(std.c.W.IFEXITED(r.status));
     // 99 is mox found stopped on the install's read of the terminal.
     try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(r.status));
     try std.testing.expectEqualStrings("typed ahead", try read(io, a, got));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed") != null);
+}
+
+test "apply: Ctrl-C during a setup script ends the run naming it, and the lock it leaves blocks no later run" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+
+    // The first run waits in the script until Ctrl-C; the next finds the
+    // marker it left and goes straight through.
+    const marker = try std.fs.path.join(a, &.{ h.root, "waiting" });
+    const script = try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "00-wait.sh" });
+    try writeExecScript(io, &tmp, "repo/scripts/pre/00-wait.sh", try std.fmt.allocPrint(a, "#!/bin/sh\n[ -f '{s}' ] && exit 0\ntouch '{s}'\nsleep 30\n", .{ marker, marker }), script);
+
+    const first = try runOnPty(h, &.{"apply"}, "", marker);
+    errdefer std.debug.print("terminal said:\n{s}\n", .{first.out});
+    // mox dies of the interrupt, as it would had the Ctrl-C reached it.
+    try std.testing.expectEqual(@as(u32, 128 + 2), std.c.W.EXITSTATUS(first.status));
+    try std.testing.expect(std.mem.indexOf(u8, first.out, try std.fmt.allocPrint(a, "mox apply: interrupted while running {s}; it may have been left part-done", .{script})) != null);
+    // A death by a signal runs nothing deferred, so the lock stays behind...
+    const lock = try std.fs.path.join(a, &.{ h.state, "mox.lock" });
+    try Io.Dir.cwd().access(io, lock, .{});
+
+    // ...and names a process that is gone, which the next run takes over.
+    const second = try runOnPty(h, &.{"apply"}, "", null);
+    errdefer std.debug.print("second run said:\n{s}\n", .{second.out});
+    try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(second.status));
+    try std.testing.expect(std.mem.indexOf(u8, second.out, "Applied:") != null);
+}
+
+test "apply: a setup script ended by a hangup of the terminal it holds ends the run, naming it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+
+    // When the terminal goes away (an ssh session closing), the kernel sends
+    // SIGHUP to the group holding it -- the script's, not mox's. The script
+    // here takes that signal itself, at the same place.
+    const script = try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "00-hangup.sh" });
+    try writeExecScript(io, &tmp, "repo/scripts/pre/00-hangup.sh", "#!/bin/sh\nkill -HUP $$\nsleep 30\n", script);
+    // Would run next, had the apply gone on without its terminal.
+    const after = try std.fs.path.join(a, &.{ h.root, "went-on" });
+    try writeExecScript(io, &tmp, "repo/scripts/pre/01-after.sh", try std.fmt.allocPrint(a, "#!/bin/sh\ntouch '{s}'\n", .{after}), try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "01-after.sh" }));
+
+    const r = try runOnPty(h, &.{"apply"}, "", null);
+    errdefer std.debug.print("terminal said:\n{s}\n", .{r.out});
+    // mox dies of the hangup too, as it would had it reached mox.
+    try std.testing.expectEqual(@as(u32, 128 + 1), std.c.W.EXITSTATUS(r.status));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "mox apply: interrupted while running {s}; it may have been left part-done", .{script})) != null);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, after, .{}));
 }

@@ -127,9 +127,9 @@ pub fn writeNotice(w: *Io.Writer, label: []const u8, after_ms: i64, observed: bo
     var buf: [32]u8 = undefined;
     const span = formatSpan(&buf, after_ms);
     if (observed) {
-        try w.print("{s} has printed nothing for {s}; still waiting (Ctrl-C stops the run)\n", .{ label, span });
+        try w.print("{s} has printed nothing for {s}; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n", .{ label, span });
     } else {
-        try w.print("{s} has been running for {s}; still waiting (Ctrl-C stops the run)\n", .{ label, span });
+        try w.print("{s} has been running for {s}; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n", .{ label, span });
     }
 }
 
@@ -251,8 +251,8 @@ test "Watch: a silent child is named once per interval, each naming the silence 
     defer arena.deinit();
     var p: ScriptedProbe = .{};
     const said = try watchFor(arena.allocator(), .{ .after_ms = 500, .poll_ms = 20, .probe = p.probe() }, 1250, null);
-    try testing.expectStringStartsWith(said, "mox apply: brew: logi-options+ has printed nothing for 500ms; still waiting (Ctrl-C stops the run)\n" ++
-        "mox apply: brew: logi-options+ has printed nothing for 1s; still waiting (Ctrl-C stops the run)\n");
+    try testing.expectStringStartsWith(said, "mox apply: brew: logi-options+ has printed nothing for 500ms; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n" ++
+        "mox apply: brew: logi-options+ has printed nothing for 1s; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n");
     // A loaded machine may run the watch past a third threshold, never
     // say anything else.
     try testing.expect(try isNoticeRun(arena.allocator(), said, "mox apply: brew: logi-options+", 500, 2));
@@ -274,7 +274,7 @@ test "Watch: streams that cannot be observed fall back to elapsed time, and say 
     var p: ScriptedProbe = .{ .observed = false };
     const said = try watchFor(arena.allocator(), .{ .after_ms = 500, .poll_ms = 20, .probe = p.probe() }, 750, null);
     try testing.expectEqualStrings(
-        "mox apply: brew: logi-options+ has been running for 500ms; still waiting (Ctrl-C stops the run)\n",
+        "mox apply: brew: logi-options+ has been running for 500ms; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n",
         said,
     );
 }
@@ -306,8 +306,8 @@ test "isNoticeRun: the first n notices, from the least on, and nothing else" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const one = "x has printed nothing for 1s; still waiting (Ctrl-C stops the run)\n";
-    const two = one ++ "x has printed nothing for 2s; still waiting (Ctrl-C stops the run)\n";
+    const one = "x has printed nothing for 1s; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n";
+    const two = one ++ "x has printed nothing for 2s; it may be waiting for an answer on the terminal (Ctrl-C stops the run)\n";
     try testing.expect(try isNoticeRun(a, one, "x", 1000, 1));
     try testing.expect(try isNoticeRun(a, two, "x", 1000, 1));
     try testing.expect(!try isNoticeRun(a, one, "x", 1000, 2));

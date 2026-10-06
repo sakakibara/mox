@@ -10,10 +10,11 @@ All notable changes to mox are documented here. The format follows
 - `mox apply` names an install, a manager's installer, or a setup script
   that has printed nothing for five minutes, on stderr and again every five
   minutes it stays quiet (`mox apply: brew: logi-options+ has printed
-  nothing for 5m; still waiting (Ctrl-C stops the run)`). Nothing is ended
-  for it; `MOX_INSTALL_TIMEOUT_MS` stays the one bound that kills. Where
-  mox's stdout and stderr cannot be watched for output (`/dev/null`,
-  Windows), the line says how long the call has been running instead.
+  nothing for 5m; it may be waiting for an answer on the terminal (Ctrl-C
+  stops the run)`). Nothing is ended for it; `MOX_INSTALL_TIMEOUT_MS` stays
+  the one bound that kills. Where mox's stdout and stderr cannot be watched
+  for output (`/dev/null`, Windows), the line says how long the call has
+  been running instead.
 - Before the first package install, `mox apply` measures the volumes the
   installs write to -- brew's prefix, and `/private/tmp` on a Mac when a cask
   is to be installed -- and warns, naming the free space, about one with
@@ -35,13 +36,23 @@ All notable changes to mox are documented here. The format follows
   block, which `brew info` does not show, still installs on its own.
 - An install now reads the terminal on stdin when mox's stdin is one it
   holds; it was given a closed stdin, so a manager or an installer that
-  asked a question read end-of-file.
+  asked a question read end-of-file. Every brew command runs with
+  `HOMEBREW_NO_ASK=1`, so Homebrew's ask mode (on by default in 7.0) does
+  not stop an install at `Do you want to proceed with the installation?`.
 - Ctrl-C during a brew install ends `mox apply`. brew exits 130 when
   interrupted rather than dying of the signal, and mox went on to the next
   install. Any install, installer or setup script that held the terminal and
-  exits 130 is now taken as the user's Ctrl-C and stops the apply. An
-  interrupted bootstrap or setup script names itself in the last line, as an
-  interrupted install already did.
+  exits 130 is now taken as the user's Ctrl-C and stops the apply. The last
+  line names what was running -- the one package, the batch of casks, the
+  installer, or the setup script -- rather than every row still to come.
+- A hangup of the terminal during an install or a setup script (an ssh
+  session closing) ends `mox apply` the way Ctrl-C does. The kernel sends
+  SIGHUP to the group holding the terminal, which is the child's, and mox
+  went on with the next install with nobody there to answer it.
+- A second `mox apply` from a shell whose PATH lacks Homebrew's bin
+  directory no longer runs the Homebrew installer again: brew is looked for
+  in the prefixes its installer uses before it is called absent, and the one
+  found there is used.
 - An install or a setup script that reads the terminal the moment it starts
   is no longer stopped for it. mox handed it the terminal only after it had
   started, so such a read stopped it on SIGTTIN, and mox took that for

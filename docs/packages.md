@@ -639,7 +639,7 @@ for five minutes is named on stderr, and again every five minutes it stays
 quiet:
 
 ```
-mox apply: brew: logi-options+ has printed nothing for 5m; still waiting (Ctrl-C stops the run)
+mox apply: brew: logi-options+ has printed nothing for 5m; it may be waiting for an answer on the terminal (Ctrl-C stops the run)
 ```
 
 Nothing is ended for it; `MOX_INSTALL_TIMEOUT_MS` is the one bound that
@@ -659,12 +659,32 @@ that runs out of disk has been seen to hang rather than fail, which the
 warning is there to head off.
 
 Ctrl-C during an install ends the run once the manager has wound down, and
-the last line says which install it was part-way through. A manager that
+the last line says what was running then -- the one package, the batch of
+casks, the installer, or the setup script:
+
+```
+mox apply: interrupted while running brew: autoconf; it may have been left part-done
+```
+
+A hangup of the terminal while an install or a setup script holds it (an
+ssh session closing) ends the run the same way, with the same line: the
+kernel sends SIGHUP to the group holding the terminal, and a run that went
+on would have nobody to answer what came next. A manager that
 catches the interrupt to clean up and exits 130 -- brew does -- ends the run
 the same way, rather than mox going on to the next install. The same holds
 for an installer and a setup script: a child that held the terminal and
 exits 130, for whatever reason, is taken as the user's Ctrl-C and stops the
 apply.
+
+Every brew command runs with `HOMEBREW_NO_ASK=1`. Homebrew 7.0 turns its
+ask mode on by default, and with a terminal on stdin and stdout -- which an
+install has, when mox does -- `brew install` would stop at `Do you want to
+proceed with the installation? [y/n]` whenever its plan carries a dependency
+the row did not name. A brew that is on no PATH (Homebrew's installer leaves
+`/opt/homebrew/bin` off it until a shell profile adds it) is looked for in
+the prefixes its installer uses -- `/opt/homebrew`, `/usr/local`, and
+Linuxbrew's -- before it is called absent, and a brew found there is the one
+the run uses, rather than one the bootstrap installs again.
 
 A brew cask whose install elevates -- a `pkg`, an installer run with
 `sudo: true`, a keyboard layout, or a preflight or postflight step that needs

@@ -50,10 +50,10 @@ pub const own_group: ?std.posix.pid_t = if (builtin.os.tag == .windows) null els
 ///
 /// A streamed child that was handed the terminal is the foreground group
 /// instead, so a Ctrl-C goes to it and never here: that run ends through
-/// `dieOfInterrupt` once the child is reaped. The two are one death path,
+/// `dieOf` once the child is reaped. The two are one death path,
 /// not two -- a signal that does reach mox while the child holds the
 /// terminal (an explicit `kill`) ends mox inside the handler, before the
-/// wait `dieOfInterrupt` follows can return.
+/// wait `dieOf` follows can return.
 ///
 /// The four handled are the terminal's own ways of ending a process: INT
 /// (Ctrl-C), QUIT (Ctrl-backslash), HUP (the terminal itself going away) and TERM.
@@ -190,6 +190,39 @@ pub fn clearNote() void {
     note_len.store(0, .release);
 }
 
+/// The staged sentence, copied, so a narrower one can stand in for it while
+/// one call runs and it can be put back after.
+pub const SavedNote = struct {
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+
+    pub fn text(self: *const SavedNote) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn saveNote() SavedNote {
+    var saved: SavedNote = .{};
+    const now = stagedNote();
+    @memcpy(saved.buf[0..now.len], now);
+    saved.len = now.len;
+    return saved;
+}
+
+pub fn restoreNote(saved: *const SavedNote) void {
+    if (saved.len == 0) return clearNote();
+    stageNote(saved.text());
+}
+
+/// What a note begins with: the command whose run it ends (`mox apply`).
+pub var run_name: []const u8 = "mox";
+
+/// Stage the note for one call holding the user's terminal: the step it is,
+/// named as precisely as its caller knows it.
+pub fn stageStepNote(arena: std.mem.Allocator, step: []const u8) !void {
+    stageNote(try std.fmt.allocPrint(arena, "{s}: interrupted while running {s}; it may have been left part-done\n", .{ run_name, step }));
+}
+
 /// What is staged, for a caller that wants to assert on it.
 pub fn stagedNote() []const u8 {
     return note_buf[0..note_len.load(.acquire)];
@@ -289,17 +322,30 @@ const console = struct {
     extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
 };
 
-/// Whether a child that held the terminal ended because the user pressed
-/// Ctrl-C: it died of SIGINT, or it exited 130, the shell convention for
-/// that death, which is how a program that catches the interrupt to clean
-/// up reports it -- Homebrew's `brew.rb` answers `Interrupt` with `exit 130`
-/// (7.0.8), so a run that read only the signal would go on to the next
-/// install after the user asked it to stop.
-pub fn userInterrupted(term: std.process.Child.Term) bool {
+/// The terminal's own end of the run, when a child that held the terminal
+/// ended of one, or null. SIGINT is the user's Ctrl-C; SIGHUP is the
+/// terminal going away (an ssh session closing), which the kernel delivers
+/// to the group holding the terminal -- the child's, not mox's. Either ends
+/// the run: going on without the terminal would run every later install and
+/// script with nobody there to answer it. A child that catches the signal to
+/// clean up reports it by exiting 128 + the signal, the shell convention --
+/// Homebrew's `brew.rb` answers `Interrupt` with `exit 130` (7.0.8) -- so
+/// that exit counts too; a run that read only the signal would go on to the
+/// next install after the user asked it to stop.
+pub fn terminalEnded(term: std.process.Child.Term) ?std.posix.SIG {
+    if (builtin.os.tag == .windows) return switch (term) {
+        .signal => |sig| if (sig == .INT) .INT else null,
+        .exited => |code| if (code == 130) .INT else null,
+        else => null,
+    };
     return switch (term) {
-        .signal => |sig| sig == .INT,
-        .exited => |code| code == 130,
-        else => false,
+        .signal => |sig| if (sig == .INT or sig == .HUP) sig else null,
+        .exited => |code| switch (code) {
+            130 => .INT,
+            129 => .HUP,
+            else => null,
+        },
+        else => null,
     };
 }
 
@@ -310,22 +356,27 @@ pub const libc = struct {
     pub extern "c" fn tcsetpgrp(fd: std.c.fd_t, pgrp: std.c.pid_t) c_int;
 };
 
-/// End this process the way the Ctrl-C the user pressed would have, had
-/// the terminal delivered it here: by SIGINT under its default disposition,
-/// so the shell reports an interrupt and a caller's own SIGINT handling
-/// sees one. Reached only where a terminal was handed over, which is never
-/// on Windows.
-pub fn dieOfInterrupt() noreturn {
+/// End this process the way `sig` -- the user's Ctrl-C, or the terminal's
+/// hangup -- would have, had the terminal delivered it here: by that signal
+/// under its default disposition, so the shell reports it and a caller's
+/// own handling of it sees one. What the run was part-way through is said
+/// first, from the staged note. Reached only where a terminal was handed
+/// over, which is never on Windows.
+pub fn dieOf(sig: std.posix.SIG) noreturn {
+    writeStagedNote();
     if (builtin.os.tag != .windows) {
         const default: std.posix.Sigaction = .{
             .handler = .{ .handler = std.posix.SIG.DFL },
             .mask = std.posix.sigemptyset(),
             .flags = 0,
         };
-        std.posix.sigaction(.INT, &default, null);
-        std.posix.raise(.INT) catch {};
+        std.posix.sigaction(sig, &default, null);
+        var only = std.posix.sigemptyset();
+        std.posix.sigaddset(&only, sig);
+        _ = std.c.pthread_sigmask(std.posix.SIG.UNBLOCK, &only, &only);
+        std.posix.raise(sig) catch {};
     }
-    std.process.exit(130);
+    std.process.exit(128 + @as(u8, @intCast(@intFromEnum(sig))));
 }
 
 /// What a child is doing at this instant, without blocking.
@@ -611,10 +662,7 @@ pub fn spawnForeground(
         .ended => |term| {
             signals.release();
             _ = PosixTerminal.setForeground(std.posix.STDIN_FILENO, owner);
-            if (userInterrupted(term)) {
-                writeStagedNote();
-                dieOfInterrupt();
-            }
+            if (terminalEnded(term)) |sig| dieOf(sig);
             return error.KilledBySignal;
         },
     }
@@ -1162,12 +1210,15 @@ test "spawnForeground on a terminal: the child starts with no signal blocked and
     try testing.expect(std.mem.indexOf(u8, r.out, "LEAKED") == null);
 }
 
-test "userInterrupted: a death by SIGINT and the exit-130 convention are the user's Ctrl-C, nothing else is" {
-    try testing.expect(userInterrupted(.{ .signal = .INT }));
-    try testing.expect(userInterrupted(.{ .exited = 130 }));
-    try testing.expect(!userInterrupted(.{ .exited = 1 }));
-    try testing.expect(!userInterrupted(.{ .exited = 0 }));
-    try testing.expect(!userInterrupted(.{ .signal = .TERM }));
+test "terminalEnded: Ctrl-C and the terminal's hangup, by signal or by the 128 + signal exit, and nothing else" {
+    try testing.expectEqual(@as(?std.posix.SIG, .INT), terminalEnded(.{ .signal = .INT }));
+    try testing.expectEqual(@as(?std.posix.SIG, .INT), terminalEnded(.{ .exited = 130 }));
+    try testing.expectEqual(@as(?std.posix.SIG, null), terminalEnded(.{ .exited = 1 }));
+    try testing.expectEqual(@as(?std.posix.SIG, null), terminalEnded(.{ .exited = 0 }));
+    try testing.expectEqual(@as(?std.posix.SIG, null), terminalEnded(.{ .signal = .TERM }));
+    if (builtin.os.tag == .windows) return;
+    try testing.expectEqual(@as(?std.posix.SIG, .HUP), terminalEnded(.{ .signal = .HUP }));
+    try testing.expectEqual(@as(?std.posix.SIG, .HUP), terminalEnded(.{ .exited = 129 }));
 }
 
 test "SpawnSignals: the terminal's four ways of ending a run are all handled" {

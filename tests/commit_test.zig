@@ -6224,7 +6224,7 @@ test "commit: a write that fails reports the package rows already recorded, whic
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest, .data = "backend = \"brew\"\n" });
 
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
-    const brew = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 brew list ";
+    const brew = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list ";
     try entries.appendSlice(a, &.{
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
         .{ .argv = brew ++ "--full-name --installed-on-request", .stdout = "htop\n" },

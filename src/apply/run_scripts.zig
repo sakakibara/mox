@@ -935,7 +935,7 @@ fn runOne(
 
     // What a run ended by a signal while the script holds the terminal says
     // it was doing: no deferred code runs on that death.
-    job.stageNote(try std.fmt.allocPrint(arena, "mox apply: interrupted running {s}\n", .{path}));
+    try job.stageStepNote(arena, path);
     defer job.clearNote();
     const signals = job.SpawnSignals.install();
     defer signals.restore();
@@ -1038,16 +1038,14 @@ fn runOne(
         stderr.print("mox apply: {s}: timed out after {d}ms, killed\n", .{ path, timeout_ms }) catch {};
         return;
     }
-    // A script that died of an interrupt mox did not send, or exited the
-    // way a program that catches one does, was interrupted by the user at
-    // the terminal it held, so the run ends as that Ctrl-C would have ended
-    // mox itself.
-    if (tty != null and job.userInterrupted(term)) {
+    // A script that died of an interrupt mox did not send, or of its
+    // terminal's hangup -- or exited the way a program that catches either
+    // does -- ends the run as that signal would have ended mox itself.
+    if (tty != null) if (job.terminalEnded(term)) |sig| {
         stdout.flush() catch {};
         stderr.flush() catch {};
-        job.writeStagedNote();
-        job.dieOfInterrupt();
-    }
+        job.dieOf(sig);
+    };
     switch (term) {
         .exited => |code| {
             if (code == 0) {

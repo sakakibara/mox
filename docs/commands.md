@@ -231,14 +231,16 @@ run. An install is not time-bounded unless `MOX_INSTALL_TIMEOUT_MS` is set; a
 bootstrap's own download is a captured call, bounded like every other by
 `MOX_SCRIPT_TIMEOUT_MS`. An install, an installer, or a setup script that
 prints nothing for five minutes is named on stderr (`mox apply: brew:
-logi-options+ has printed nothing for 5m; still waiting (Ctrl-C stops the
-run)`), and again every five minutes; nothing is ended for it. Before the
+logi-options+ has printed nothing for 5m; it may be waiting for an answer on
+the terminal (Ctrl-C stops the run)`), and again every five minutes; nothing
+is ended for it. Before the
 first install, a volume the installs write to with less than 10 GiB free is
 named with the space it has, and the installs go ahead. An install reads
 the terminal when mox's stdin is a terminal mox holds in the foreground,
-and Ctrl-C during it ends the run naming what was in flight; an install, an
-installer or a setup script that held the terminal and exits 130 is taken
-as that Ctrl-C too, and stops the apply.
+and Ctrl-C during it -- or a hangup of the terminal -- ends the run naming
+what was in flight; an install, an installer or a setup script that held the
+terminal and exits 130 (or 129) is taken as that Ctrl-C (or hangup) too, and
+stops the apply.
 A repo without `data/packages/` never queries a package manager.
 
 apply never prompts about drift. It writes every file that is clean or absent

@@ -358,18 +358,30 @@ pub const Runner = struct {
     /// reads mox's own stdin where that is a terminal it can be handed, so a
     /// manager or an installer that asks the user something can be answered.
     pub fn stream(self: Runner, arena: std.mem.Allocator, argv: []const []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, null, null) catch |e| nameNotFound(e, argv);
+        return self.streamNamed(arena, argv, null, null);
     }
 
     /// `stream`, with the work named for a notice about it: a package, a
     /// batch, an installer.
     pub fn streamStep(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, step: []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, null, step) catch |e| nameNotFound(e, argv);
+        return self.streamNamed(arena, argv, null, step);
     }
 
     /// `stream` with bytes on the child's stdin.
     pub fn streamInput(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: []const u8) anyerror!Result {
-        return self.streamFn(self.ctx, arena, argv, stdin, null) catch |e| nameNotFound(e, argv);
+        return self.streamNamed(arena, argv, stdin, null);
+    }
+
+    /// Every streamed call goes through here. The call is named -- by its
+    /// step, or its command line -- and that name is what a run ended by a
+    /// signal during it says it was running, in place of whatever the
+    /// caller had staged for the stretch around it, which is put back after.
+    fn streamNamed(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, step: ?[]const u8) anyerror!Result {
+        const named = step orelse try commandStep(arena, argv);
+        const around = job.saveNote();
+        defer job.restoreNote(&around);
+        try job.stageStepNote(arena, named);
+        return self.streamFn(self.ctx, arena, argv, stdin, named) catch |e| nameNotFound(e, argv);
     }
 
     /// `run` or `stream` by flag. An argv that is a PowerShell script
@@ -382,8 +394,8 @@ pub const Runner = struct {
     }
 
     fn call(self: Runner, arena: std.mem.Allocator, argv: []const []const u8, stdin: ?[]const u8, streamed: bool) anyerror!Result {
-        const res = if (streamed) self.streamFn(self.ctx, arena, argv, stdin, null) else self.runFn(self.ctx, arena, argv, stdin, max_query_bytes, .stdout);
-        return res catch |e| nameNotFound(e, argv);
+        if (streamed) return self.streamNamed(arena, argv, stdin, null);
+        return self.runFn(self.ctx, arena, argv, stdin, max_query_bytes, .stdout) catch |e| nameNotFound(e, argv);
     }
 };
 
@@ -889,14 +901,14 @@ pub const Process = struct {
             res.timed_out = true;
             return res;
         }
-        if (tty != null and job.userInterrupted(term)) {
+        if (tty != null) if (job.terminalEnded(term)) |sig| {
             if (self.out) |w| w.flush() catch {};
             if (self.err) |w| w.flush() catch {};
-            // The user interrupted the child, so this run ends here with
-            // nothing deferred left to say what it was part-way through.
-            job.writeStagedNote();
-            job.dieOfInterrupt();
-        }
+            // The user interrupted the child, or its terminal went away, so
+            // this run ends here with nothing deferred left to say what it
+            // was part-way through.
+            job.dieOf(sig);
+        };
         if (term == .signal) return error.KilledBySignal;
         return res;
     }
@@ -978,6 +990,9 @@ pub const Fake = struct {
         /// Create this directory when matched: what an install leaves on the
         /// machine, for a test about what is read back after one.
         makes_dir: ?[]const u8 = null,
+        /// Create this empty file when matched: an installer leaving its
+        /// program where it installs it.
+        makes_file: ?[]const u8 = null,
         io: ?Io = null,
         /// Answers the first matching call only, then steps aside for a
         /// later entry: a manager absent before a bootstrap and present after.
@@ -1051,6 +1066,7 @@ pub const Fake = struct {
             if (e.timed_out) return .{ .code = 255, .ok = false, .stdout = "", .timed_out = true };
             if (e.stderr.len > 0 and (is_streamed or capture != .both)) return error.StderrNotCaptured;
             if (e.makes_dir) |path| try Io.Dir.cwd().createDirPath(e.io.?, path);
+            if (e.makes_file) |path| try Io.Dir.cwd().writeFile(e.io.?, .{ .sub_path = path, .data = "" });
             if (e.write_after) |flag| {
                 for (argv, 0..) |a, j| {
                     if (std.mem.eql(u8, a, flag) and j + 1 < argv.len) {

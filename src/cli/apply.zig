@@ -176,6 +176,9 @@ fn applyPass(
     held: ?*mox.packages.admin.Keepalive,
 ) anyerror!u8 {
     const context = ctx.context.?;
+    // What a run ended by a signal says it was in the middle of begins with
+    // this.
+    mox.machine.job.run_name = "mox apply";
     // Skip setup scripts (also implied by --dry-run) for fast, side-effect-
     // free file-only applies; scripts may install packages or hit the network.
     const skip_scripts = dry_run or skip_scripts_arg;
@@ -941,7 +944,7 @@ fn bootstrapBackends(
             .unattended => unattended_admin = true,
             .prompt => if (!keepalive.active()) {
                 try ctx.out.print("  sudo            {s}'s installer needs administrator access; sudo may ask for your password\n", .{b.backend});
-                if (try primeSudo(ctx, pkg_backends)) |why| {
+                if (try primeSudo(ctx, pkg_backends, b.backend)) |why| {
                     try ctx.err.print("mox apply: {s}: bootstrap needs administrator access: {s}\n", .{ b.backend, why });
                     try ctx.err.flush();
                     failed += 1;
@@ -1017,8 +1020,8 @@ fn bootstrapBackends(
 
 /// `sudo -v` on the terminal, so an installer that only asks `sudo -n` finds
 /// a cached credential. Null when it succeeded, else why it did not.
-fn primeSudo(ctx: *app.Ctx, pkg_backends: *app.PackageBackends) !?[]const u8 {
-    const res = pkg_backends.runner().stream(ctx.alloc, &mox.packages.admin.prime_argv) catch |e| switch (e) {
+fn primeSudo(ctx: *app.Ctx, pkg_backends: *app.PackageBackends, backend: []const u8) !?[]const u8 {
+    const res = pkg_backends.runner().streamStep(ctx.alloc, &mox.packages.admin.prime_argv, try std.fmt.allocPrint(ctx.alloc, "sudo, for {s}'s installer", .{backend})) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => return try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()),
     };
@@ -1302,7 +1305,7 @@ fn applyPackages(
         // after it, and a signal that ends mox runs no deferred code at all.
         // Staged before the spawn, so the death itself can say what was in
         // flight; dropped again the moment the batch is over.
-        mox.machine.job.stageNote(try interruptNote(ctx.alloc, b.backend, rows.items));
+        mox.machine.job.stageNote(try interruptNote(ctx.alloc, b.backend));
         backend.install(ctx.alloc, rows.items) catch |e| {
             // A batch that never got as far as running its manager did not
             // fail to install: it failed before an install was attempted, and
@@ -1382,21 +1385,12 @@ fn warnLowSpace(
     try ctx.err.flush();
 }
 
-/// The sentence an apply killed mid-install leaves behind: which batch was
-/// running, and the hedge the external-kill path already prints over rows a
-/// failed batch may have landed.
-fn interruptNote(
-    arena: std.mem.Allocator,
-    backend: []const u8,
-    rows: []const mox.packages.manifest.Row,
-) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    try out.writer.print("mox apply: interrupted installing {s}:", .{backend});
-    for (rows, 0..) |row, i| {
-        try out.writer.print("{s} {s}", .{ if (i == 0) "" else ",", row.name });
-    }
-    try out.writer.writeAll(" (row(s) in this batch may have landed)\n");
-    return out.written();
+/// The sentence an apply killed while it is inside a backend's installs but
+/// between the calls that hold the terminal leaves behind: nothing is
+/// part-way then, and each install that finished stays. A call that holds
+/// the terminal stages its own, naming itself (`exec.Runner.streamNamed`).
+fn interruptNote(arena: std.mem.Allocator, backend: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "mox apply: interrupted between the {s} installs; each one that finished stays installed\n", .{backend});
 }
 
 /// True when `a` and `b` name the same facts in the same order (the order
