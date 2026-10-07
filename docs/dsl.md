@@ -414,7 +414,9 @@ error for that script, not a silent skip.
 
 Every setup script (both stages) runs with mox's own environment plus
 `MOX_REPO` (the dotfiles repo root), `MOX_STATE_DIR`, `MOX_HOME` (the live
-root), a `PATH` led by `<state dir>/bin`, a directory holding only the mox
+root), `MOX_TRIGGER_PENDING` (where the script's `mox trigger` records wait
+until it exits 0, so a script that fails is run again by the next apply),
+a `PATH` led by `<state dir>/bin`, a directory holding only the mox
 that is running the script (so `mox` resolves to it even from a bootstrap that
 ran mox by absolute path), and every fact as `MOX_FACT_<UPPERCASE_NAME>` (a
 character outside `[A-Z0-9_]` in the fact name becomes `_`; a name that cannot

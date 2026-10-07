@@ -3,6 +3,14 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 
+/// The trigger state a check reads and saves. Under `mox apply` a script's
+/// checks go to the run's pending records, which apply keeps only when the
+/// script exits 0; run by hand, they go straight to the state file.
+fn loadState(ctx: *app.Ctx, context: app.Context) !mox.trigger.state.State {
+    const pending = context.env.get(ctx.alloc, mox.trigger.state.pending_env);
+    return mox.trigger.state.loadForCheck(ctx.alloc, ctx.io, context.paths.triggers_path, pending);
+}
+
 const HashSpec = struct {
     files: cli.Rest(.{ .help = "files to hash-check" }),
 };
@@ -13,7 +21,7 @@ fn hash(ctx: *app.Ctx, a: cli.Args(HashSpec)) anyerror!u8 {
         try ctx.err.writeAll("mox trigger hash: usage: mox trigger hash <file>...\n");
         return 2;
     }
-    var state = try mox.trigger.state.State.loadOrEmpty(ctx.alloc, ctx.io, context.paths.triggers_path);
+    var state = try loadState(ctx, context);
     const changed = try state.checkHash(ctx.alloc, a.files);
     try state.save();
     return if (changed) 0 else 1;
@@ -25,7 +33,7 @@ const SeenVersionSpec = struct {
 
 fn seenVersion(ctx: *app.Ctx, a: cli.Args(SeenVersionSpec)) anyerror!u8 {
     const context = ctx.context.?;
-    var state = try mox.trigger.state.State.loadOrEmpty(ctx.alloc, ctx.io, context.paths.triggers_path);
+    var state = try loadState(ctx, context);
     const first_time = try state.checkSeenVersion(ctx.alloc, a.key);
     try state.save();
     return if (first_time) 0 else 1;
@@ -38,7 +46,7 @@ const EverySpec = struct {
 
 fn every(ctx: *app.Ctx, a: cli.Args(EverySpec)) anyerror!u8 {
     const context = ctx.context.?;
-    var state = try mox.trigger.state.State.loadOrEmpty(ctx.alloc, ctx.io, context.paths.triggers_path);
+    var state = try loadState(ctx, context);
     const ready = try state.checkEvery(ctx.alloc, a.key, a.interval);
     try state.save();
     return if (ready) 0 else 1;

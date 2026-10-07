@@ -1,5 +1,48 @@
 const std = @import("std");
 
+/// The trigger state file's name under the state directory.
+pub const state_basename = "triggers.txt";
+
+/// Where a setup script's trigger records wait while it runs, under the state
+/// directory. `mox apply` names it to each script it runs in `pending_env`.
+pub const pending_basename = "triggers.pending";
+
+/// Set by `mox apply` for the scripts it runs. A trigger check under it reads
+/// the run's pending records and writes there, not to the state file, so a
+/// script's checks count only once apply sees it exit 0 (`settlePending`).
+pub const pending_env = "MOX_TRIGGER_PENDING";
+
+/// Load for a check. With `pending_path` set, the check reads the records a
+/// run has pending when there are any and the saved state otherwise, and its
+/// save writes to `pending_path`.
+pub fn loadForCheck(arena: std.mem.Allocator, io: std.Io, state_path: []const u8, pending_path: ?[]const u8) !State {
+    const pending = pending_path orelse return State.loadOrEmpty(arena, io, state_path);
+    const has_pending = if (std.Io.Dir.cwd().access(io, pending, .{})) |_| true else |e| switch (e) {
+        error.FileNotFound => false,
+        else => return e,
+    };
+    var s = try State.loadOrEmpty(arena, io, if (has_pending) pending else state_path);
+    s.path = pending;
+    return s;
+}
+
+/// End a script run's trigger records: kept, they replace the state file;
+/// otherwise they are dropped. A run that recorded nothing leaves no pending
+/// file, and either way the state file is untouched.
+pub fn settlePending(io: std.Io, state_path: []const u8, pending_path: []const u8, keep: bool) !void {
+    if (keep) {
+        std.Io.Dir.rename(std.Io.Dir.cwd(), pending_path, std.Io.Dir.cwd(), state_path, io) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+    } else {
+        std.Io.Dir.cwd().deleteFile(io, pending_path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+    }
+}
+
 /// Persistent state used by trigger predicates so scripts can opt out of
 /// expensive work.
 ///
@@ -169,3 +212,89 @@ pub const State = struct {
         self.dirty = false;
     }
 };
+
+fn testPaths(arena: std.mem.Allocator, tmp: *std.testing.TmpDir) !struct { state: []const u8, pending: []const u8 } {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, arena);
+    const dir = try std.fs.path.join(arena, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    return .{
+        .state = try std.fs.path.join(arena, &.{ dir, state_basename }),
+        .pending = try std.fs.path.join(arena, &.{ dir, pending_basename }),
+    };
+}
+
+fn exists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+    return true;
+}
+
+test "loadForCheck: with no pending path a check saves straight to the state file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try testPaths(a, &tmp);
+
+    var s = try loadForCheck(a, std.testing.io, p.state, null);
+    try std.testing.expect(try s.checkSeenVersion(a, "k"));
+    try s.save();
+    try std.testing.expect(exists(p.state));
+    try std.testing.expect(!exists(p.pending));
+}
+
+test "loadForCheck: under a pending path a check reads the state file but saves only to the pending file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try testPaths(a, &tmp);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = p.state, .data = "seen:old=\n" });
+
+    var s = try loadForCheck(a, std.testing.io, p.state, p.pending);
+    try std.testing.expect(!try s.checkSeenVersion(a, "old"));
+    try std.testing.expect(try s.checkSeenVersion(a, "new"));
+    try s.save();
+
+    const state_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, p.state, a, .limited(1024));
+    try std.testing.expectEqualStrings("seen:old=\n", state_after);
+    var again = try loadForCheck(a, std.testing.io, p.state, p.pending);
+    try std.testing.expect(!try again.checkSeenVersion(a, "new"));
+    try std.testing.expect(!try again.checkSeenVersion(a, "old"));
+}
+
+test "settlePending: kept records replace the state file; dropped ones leave it as it was" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try testPaths(a, &tmp);
+    const io = std.testing.io;
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.state, .data = "seen:old=\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.pending, .data = "seen:old=\nseen:new=\n" });
+    try settlePending(io, p.state, p.pending, false);
+    try std.testing.expect(!exists(p.pending));
+    try std.testing.expectEqualStrings("seen:old=\n", try std.Io.Dir.cwd().readFileAlloc(io, p.state, a, .limited(1024)));
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.pending, .data = "seen:old=\nseen:new=\n" });
+    try settlePending(io, p.state, p.pending, true);
+    try std.testing.expect(!exists(p.pending));
+    try std.testing.expectEqualStrings("seen:old=\nseen:new=\n", try std.Io.Dir.cwd().readFileAlloc(io, p.state, a, .limited(1024)));
+}
+
+test "settlePending: a run that recorded nothing is a no-op either way" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try testPaths(a, &tmp);
+    const io = std.testing.io;
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p.state, .data = "seen:old=\n" });
+    try settlePending(io, p.state, p.pending, true);
+    try settlePending(io, p.state, p.pending, false);
+    try std.testing.expectEqualStrings("seen:old=\n", try std.Io.Dir.cwd().readFileAlloc(io, p.state, a, .limited(1024)));
+}

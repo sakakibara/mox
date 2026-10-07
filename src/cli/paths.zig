@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const env_mod = @import("env");
+const trigger_state = @import("../trigger/state.zig");
 const Env = env_mod.Env;
 const dirs = env_mod.dirs;
 
@@ -81,7 +82,7 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
     };
 
     const private_dir = try std.fs.path.join(arena, &.{ state_dir, "private" });
-    const triggers_path = try std.fs.path.join(arena, &.{ state_dir, "triggers.txt" });
+    const triggers_path = try std.fs.path.join(arena, &.{ state_dir, trigger_state.state_basename });
     const snapshots_dir = try std.fs.path.join(arena, &.{ state_dir, "snapshots" });
 
     const config_base = try dirs.baseDirIn(arena, env, os_tag, .config, home);

@@ -4,6 +4,17 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A setup script's `mox trigger` checks count only once the script exits 0.
+  A check recorded its hash, key or timestamp as it ran, so a script that
+  failed after its `mox trigger hash ... || exit 0` line was skipped by every
+  later apply until its inputs changed, and its work was never retried.
+  Under `mox apply` the records now wait in the run's pending file
+  (`$MOX_TRIGGER_PENDING`) and are dropped when the script fails, times out
+  or is killed, so the next apply runs it again.
+
 ## [0.12.1] - 2026-10-07
 
 ### Fixed
@@ -1477,6 +1488,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
+[Unreleased]: https://github.com/sakakibara/mox/compare/v0.12.1...HEAD
 [0.12.1]: https://github.com/sakakibara/mox/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/sakakibara/mox/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/sakakibara/mox/compare/v0.10.0...v0.11.0

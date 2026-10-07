@@ -52,6 +52,7 @@ const dimensions = @import("../machine/dimensions.zig");
 const derived_facts = @import("../machine/derived_facts.zig");
 const state = @import("../machine/state.zig");
 const job = @import("../machine/job.zig");
+const trigger_state = @import("../trigger/state.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
@@ -460,6 +461,7 @@ pub fn buildScriptEnv(
     try map.put("MOX_REPO", repo);
     try map.put("MOX_STATE_DIR", state_dir);
     try map.put("MOX_HOME", home);
+    try map.put(trigger_state.pending_env, try std.fs.path.join(arena, &.{ state_dir, trigger_state.pending_basename }));
 
     var mox_bin_why: ?[]const u8 = null;
     const mox_bin_dir = if (refresh_bin) try moxBinDir(arena, io, state_dir, &mox_bin_why) else null;
@@ -910,6 +912,19 @@ fn runOne(
     // For the length of the run mox answers the terminal signals, so a Ctrl-C
     // that reaches mox rather than the script takes the script's group with
     // it instead of orphaning it; `job.SpawnSignals` has the whole rule.
+    // A script's trigger records count only once it exits 0, so a failed
+    // run's `mox trigger` checks do not mark its work done and the next apply
+    // runs it again. A stale pending file, left by a run mox did not outlive,
+    // is cleared first.
+    const triggers = try triggerFiles(arena, environ_map);
+    if (triggers) |t| trigger_state.settlePending(io, t.state, t.pending, false) catch |e| {
+        stderr.print("mox apply: {s}: cannot clear pending trigger records {s}: {s}\n", .{ path, t.pending, @errorName(e) }) catch {};
+    };
+    var script_succeeded = false;
+    defer if (triggers) |t| trigger_state.settlePending(io, t.state, t.pending, script_succeeded) catch |e| {
+        stderr.print("mox apply: {s}: cannot settle its trigger records {s}: {s}; the next apply runs it again\n", .{ path, t.pending, @errorName(e) }) catch {};
+    };
+
     const signals = job.SpawnSignals.install();
     defer signals.restore();
     var child = spawnScript(arena, io, path, environ_map) catch |e| {
@@ -1006,6 +1021,7 @@ fn runOne(
     switch (term) {
         .exited => |code| {
             if (code == 0) {
+                script_succeeded = true;
                 result.ran += 1;
                 stdout.print("  ran {s}\n", .{path}) catch {};
             } else {
@@ -1074,6 +1090,21 @@ fn findWhenHeader(head: []const u8) ?[]const u8 {
         return std.mem.trim(u8, after, " \t");
     }
     return null;
+}
+
+const TriggerFiles = struct { state: []const u8, pending: []const u8 };
+
+/// The trigger state file and the pending records a script run settles, named
+/// by the environment `buildScriptEnv` built. Null when scripts run without
+/// one: they inherit mox's own, and their checks save as they are made.
+fn triggerFiles(arena: std.mem.Allocator, environ_map: ?*const EnvironMap) !?TriggerFiles {
+    const m = environ_map orelse return null;
+    const pending = m.get(trigger_state.pending_env) orelse return null;
+    const state_dir = m.get("MOX_STATE_DIR") orelse return null;
+    return .{
+        .state = try std.fs.path.join(arena, &.{ state_dir, trigger_state.state_basename }),
+        .pending = pending,
+    };
 }
 
 /// Spawn one script. A `.ps1` runs under `pwsh -NoProfile -File`, falling back

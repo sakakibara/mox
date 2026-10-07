@@ -6657,3 +6657,125 @@ test "diff: a secret directive dropped since the last apply never prints the res
     try std.testing.expect(std.mem.indexOf(u8, r.err, old_secret) == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, mox.provenance.map.secret_redaction) != null);
 }
+
+/// A script that records `record` among the trigger records pending for its
+/// run, as `mox trigger` does under apply, then exits `code`.
+fn pendingRecordScript(a: std.mem.Allocator, record: []const u8, code: u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fmt.allocPrint(a, "Add-Content -LiteralPath $env:MOX_TRIGGER_PENDING -Value '{s}'\nexit {d}\n", .{ record, code });
+    }
+    return std.fmt.allocPrint(a, "#!/bin/sh\nprintf '%s\\n' '{s}' >> \"$MOX_TRIGGER_PENDING\"\nexit {d}\n", .{ record, code });
+}
+
+/// Runs the one script at `rel` (under `tmp`'s scripts dir) through runStage
+/// with a real script environment whose state dir is `state_dir`.
+fn runTriggerScript(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, rel: []const u8, body: []const u8, state_dir: []const u8) !mox.apply.run_scripts.Result {
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    try writeExecScript(io, tmp.dir, rel, body, try std.fs.path.join(a, &.{ root, rel }));
+    const scripts_dir = try std.fs.path.join(a, &.{ root, "scripts" });
+    var bindings = std.StringHashMap([]const u8).init(a);
+    var bindings_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &bindings } };
+    var script_env = (try mox.apply.run_scripts.buildScriptEnv(a, io, Env{ .process = std.testing.environ }, "/repo", state_dir, "/home", &.{}, false)).map;
+    var out_aw: std.Io.Writer.Allocating = .init(a);
+    var err_aw: std.Io.Writer.Allocating = .init(a);
+    return mox.apply.run_scripts.runStage(a, io, scripts_dir, "scripts", &bindings_r, &script_env, null, &out_aw.writer, &err_aw.writer);
+}
+
+fn readOrEmpty(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => e,
+    };
+}
+
+test "run_scripts: a script's trigger records count once it exits 0" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(io, a), ".zig-cache", "tmp", &state_tmp.sub_path });
+
+    const rel = try std.fmt.allocPrint(a, "scripts/00-setup{s}", .{script_ext});
+    const result = try runTriggerScript(a, io, &tmp, rel, try pendingRecordScript(a, "seen:setup=", 0), state_dir);
+    try std.testing.expectEqual(@as(usize, 1), result.ran);
+
+    const state_text = try readOrEmpty(io, a, try std.fs.path.join(a, &.{ state_dir, "triggers.txt" }));
+    try std.testing.expect(std.mem.indexOf(u8, state_text, "seen:setup=") != null);
+    try std.testing.expectEqualStrings("", try readOrEmpty(io, a, try std.fs.path.join(a, &.{ state_dir, "triggers.pending" })));
+}
+
+test "run_scripts: a failed script's trigger records are dropped, so the next apply runs it again" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(io, a), ".zig-cache", "tmp", &state_tmp.sub_path });
+    try Io.Dir.cwd().createDirPath(io, state_dir);
+    const state_path = try std.fs.path.join(a, &.{ state_dir, "triggers.txt" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = state_path, .data = "seen:earlier=\n" });
+
+    const rel = try std.fmt.allocPrint(a, "scripts/00-setup{s}", .{script_ext});
+    const result = try runTriggerScript(a, io, &tmp, rel, try pendingRecordScript(a, "seen:setup=", 1), state_dir);
+    try std.testing.expectEqual(@as(usize, 1), result.failed);
+
+    try std.testing.expectEqualStrings("seen:earlier=\n", try readOrEmpty(io, a, state_path));
+    try std.testing.expectEqualStrings("", try readOrEmpty(io, a, try std.fs.path.join(a, &.{ state_dir, "triggers.pending" })));
+    var s = try mox.trigger.state.State.loadOrEmpty(a, io, state_path);
+    try std.testing.expect(try s.checkSeenVersion(a, "setup"));
+}
+
+test "run_scripts: pending trigger records a crashed run left behind are cleared before a script runs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_tmp = std.testing.tmpDir(.{});
+    defer state_tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try std.fs.path.join(a, &.{ try std.process.currentPathAlloc(io, a), ".zig-cache", "tmp", &state_tmp.sub_path });
+    try Io.Dir.cwd().createDirPath(io, state_dir);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state_dir, "triggers.pending" }), .data = "seen:stale=\n" });
+
+    const noop = if (builtin.os.tag == .windows) "" else "#!/bin/sh\ntrue\n";
+    const rel = try std.fmt.allocPrint(a, "scripts/00-noop{s}", .{script_ext});
+    const result = try runTriggerScript(a, io, &tmp, rel, noop, state_dir);
+    try std.testing.expectEqual(@as(usize, 1), result.ran);
+
+    try std.testing.expect(std.mem.indexOf(u8, try readOrEmpty(io, a, try std.fs.path.join(a, &.{ state_dir, "triggers.txt" })), "stale") == null);
+    try std.testing.expectEqualStrings("", try readOrEmpty(io, a, try std.fs.path.join(a, &.{ state_dir, "triggers.pending" })));
+}
+
+test "trigger: under apply's pending path a check writes the pending records, by hand the state file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const plain = try cliSetup(a, io, &tmp);
+    const pending = try std.fs.path.join(a, &.{ plain.state, "triggers.pending" });
+    const state_path = try std.fs.path.join(a, &.{ plain.state, "triggers.txt" });
+    const under_apply = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TRIGGER_PENDING", .value = pending }} });
+
+    const r1 = try under_apply.run(&.{ "mox", "trigger", "seen-version", "k" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    const r2 = try under_apply.run(&.{ "mox", "trigger", "seen-version", "k" });
+    try std.testing.expectEqual(@as(u8, 1), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try readOrEmpty(io, a, pending), "seen:k=") != null);
+    try std.testing.expectEqualStrings("", try readOrEmpty(io, a, state_path));
+
+    const r3 = try plain.run(&.{ "mox", "trigger", "seen-version", "k" });
+    try std.testing.expectEqual(@as(u8, 0), r3.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try readOrEmpty(io, a, state_path), "seen:k=") != null);
+}

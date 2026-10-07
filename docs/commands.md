@@ -972,7 +972,14 @@ Resolve a secret URI to stdout: `env:NAME`, `file://PATH`,
 ## trigger
 
 Setup-script staleness primitives (`hash`, `seen-version`, `every`)
-for guarding expensive work inside a setup script.
+for guarding expensive work inside a setup script. Each exits 0 when the
+work is due -- a file's hash changed, a key is new, an interval elapsed --
+and records that, and exits 1 otherwise, so `mox trigger hash <file> ||
+exit 0` skips a script whose inputs have not changed. Under `mox apply`
+the record counts only once the script exits 0: until then it waits in
+the run's pending records (`$MOX_TRIGGER_PENDING`), and a script that
+fails, times out or is killed leaves its checks unrecorded, so the next
+apply runs it again. Run by hand, a check records at once.
 
 ## version
 
