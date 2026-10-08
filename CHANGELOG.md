@@ -4,7 +4,7 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.3] - 2026-10-08
 
 ### Added
 - `mox apply` names an install, a manager's installer, or a setup script
@@ -1554,7 +1554,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
-[Unreleased]: https://github.com/sakakibara/mox/compare/v0.12.2...HEAD
+[0.12.3]: https://github.com/sakakibara/mox/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/sakakibara/mox/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/sakakibara/mox/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/sakakibara/mox/compare/v0.11.0...v0.12.0
