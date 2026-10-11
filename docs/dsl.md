@@ -848,7 +848,9 @@ an orphaned generator's files takes only manifests of this repo and HOME.
   a symlink -- names a file outside HOME's own tree: it is never removed,
   only forgotten.
 - A released path is forgotten and never removed -- on macOS and Windows,
-  whose filesystems ignore case, whatever the case its record spells -- a
+  whose filesystems ignore case, whatever the ASCII case its record or its
+  generator spells (other case differences, and Unicode normalization, are
+  not folded; see the warning below) -- a
   `.moxignore`-matched one left alone, and one that is the same file as a
   managed path (a case-only rename on a case-insensitive filesystem, or a
   hardlink) forgotten with nothing removed.
@@ -869,7 +871,11 @@ new one. `mox remove` leaves a tombstone, `released = true`, in
 a released generator's leaves included -- and keeps its live file. A
 tombstone is one line and is never pruned, since mox cannot know when every
 machine has applied; `mox add` or `mox mv` onto the path removes it, and a
-source back at a released path without one is that file's error. `mox remove
+source back at a released path without one is that file's error. A
+tombstone that matches no record, no generator and no managed file here is
+a warning in `status` and `apply` (`WARN released ~/x matches nothing mox
+manages`) until an apply has seen it once; one that a managed file matches
+only by case is a warning on every run, naming that file. `mox remove
 --purge` deletes the live file here and leaves no tombstone, so other
 machines' applies remove their unedited copies too.
 

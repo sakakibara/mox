@@ -268,6 +268,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // does (same classifier, `apply/drift.zig`) -- fed to the shared renderer
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
+    if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, tree)) |u|
+        try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
         tally.add(.err);
         try rows.print("  {s:<8} {f} ({s})\n", .{ Label.err.text(), display.of(e.live_path, home), e.err });

@@ -103,6 +103,60 @@ pub fn candidatesOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8, rep
     return out.toOwnedSlice(arena);
 }
 
+/// A tombstone this machine cannot match: `managed` names a managed file
+/// whose path differs from it only in case, else it matches nothing.
+pub const Unmatched = struct { live_path: []const u8, managed: ?[]const u8 = null };
+
+/// The tombstones of `tree` that match no record, no generator manifest and
+/// no managed file exactly, less those an apply has already seen. One that
+/// matches a managed file only by case is always listed.
+pub fn unmatchedTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const u8, tree: tree_mod.ManagedTree) ![]Unmatched {
+    if (tree.released.len == 0) return &.{};
+    var known = std.StringHashMap(void).init(arena);
+    for (try recordBytes(arena, io, state_dir, "applied-owned", 64 * 1024 * 1024)) |bytes| {
+        const rec = (try applied.parseOwned(arena, bytes)) orelse continue;
+        try known.put(try foldCase(arena, rec.live_path), {});
+    }
+    for (try recordBytes(arena, io, state_dir, "applied-symlink", 1024 * 1024)) |bytes| {
+        const rec = try applied.parseSymlink(arena, bytes);
+        if (rec.live_path) |l| try known.put(try foldCase(arena, l), {});
+    }
+    for (try recordBytes(arena, io, state_dir, "applied", 1024 * 1024)) |bytes| {
+        const rec = (try applied.parseWhole(arena, bytes)) orelse continue;
+        try known.put(try foldCase(arena, rec.live_path), {});
+    }
+    for (try generated.allGenerators(arena, io, state_dir)) |g| try known.put(try foldCase(arena, g), {});
+    var out: std.ArrayList(Unmatched) = .empty;
+    outer: for (tree.released) |p| {
+        const fp = try foldCase(arena, p);
+        for (tree.files) |f| {
+            if (std.mem.eql(u8, try foldCase(arena, f.live_path), fp)) {
+                try out.append(arena, .{ .live_path = p, .managed = f.live_path });
+                continue :outer;
+            }
+        }
+        if (known.contains(fp)) continue;
+        Io.Dir.cwd().access(io, try markerPath(arena, state_dir, fp), .{}) catch {
+            try out.append(arena, .{ .live_path = p });
+        };
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Note that an apply has seen every tombstone in `released`, so one that
+/// matches nothing is reported once.
+pub fn markTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const u8, released: []const []const u8) !void {
+    for (released) |p| {
+        const path = try markerPath(arena, state_dir, try foldCase(arena, p));
+        if (std.fs.path.dirname(path)) |d| try Io.Dir.cwd().createDirPath(io, d);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "" });
+    }
+}
+
+fn markerPath(arena: std.mem.Allocator, state_dir: []const u8, folded: []const u8) ![]const u8 {
+    return std.fs.path.join(arena, &.{ state_dir, "released", &applied.contentHashHex(folded) });
+}
+
 /// `paths` as a set matched through `foldCase`.
 pub fn releasedSet(arena: std.mem.Allocator, paths: []const []const u8) !std.StringHashMap(void) {
     var out = std.StringHashMap(void).init(arena);

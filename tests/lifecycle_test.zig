@@ -6163,3 +6163,46 @@ test "stale: a run under another HOME sharing the state directory sweeps none of
     try std.testing.expectEqualStrings("z\n", try read(io, a, try h.liveOf(".zshrc")));
     try std.testing.expect(exists(io, try h.liveOf(".config/id-a.inc")));
 }
+
+test "remove: a generator tombstone whose case differs keeps its leaves on a case-insensitive system" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g/Gen.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g/Gen.inc"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".config/g/gen.inc\"]\nreleased = true\n");
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try h.liveOf(".config/g/id-a.inc")));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "matches nothing mox manages") == null);
+}
+
+test "remove: a tombstone that matches nothing is a warning until apply has seen it once" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.kept", "k\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".nothing\"]\nreleased = true\n");
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s.out, "WARN", "released ~/.nothing matches nothing mox manages"));
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(lineWith(r.out, "WARN", "released ~/.nothing matches nothing mox manages"));
+    const again = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, again.out, "matches nothing") == null);
+    const s2 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s2.out, "matches nothing") == null);
+}

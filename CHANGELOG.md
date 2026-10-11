@@ -67,6 +67,10 @@ All notable changes to mox are documented here. The format follows
   files) here and leaves no tombstone, so other machines remove their
   unedited copies. A private-only file can be removed, forgotten here with
   no tombstone.
+- A tombstone matches a generator by its recorded live path, case-folded on
+  macOS and Windows, and one that matches nothing mox manages here is a
+  warning in `status` and `apply`. A generator's manifest now records the
+  generator's live path.
 - `mox mv` moves no state: the next apply on every machine removes the old
   live file (or reports it as drift, or leaves an old partially owned file in
   place), instead of leaving it orphaned. A move whose attributes entry the

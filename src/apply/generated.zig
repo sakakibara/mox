@@ -20,6 +20,7 @@ const std = @import("std");
 const Io = std.Io;
 const applied = @import("applied.zig");
 const snapshot = @import("snapshot.zig");
+const stale = @import("stale.zig");
 const parent_link = @import("parent_link.zig");
 const write = @import("write.zig");
 const prov_map = @import("../provenance/root.zig").map;
@@ -46,6 +47,9 @@ pub const Options = struct {
     /// Manifest names (`manifestName`) of generators `.mox/attributes.toml`
     /// released: their manifests are forgotten and their leaves kept.
     released: ?*const std.StringHashMap(void) = null,
+    /// The released live paths through `stale.foldCase`, matched against a
+    /// manifest's recorded generator path.
+    released_live: ?*const std.StringHashMap(void) = null,
     /// Live paths the tree plants as symlinks: a leaf below one is never
     /// removed.
     links: ?*const std.StringHashMap(void) = null,
@@ -88,7 +92,34 @@ fn leavesOf(arena: std.mem.Allocator, bytes: []const u8) ![]const []const u8 {
         defer first = false;
         if (t.len == 0) continue;
         if (first and std.mem.startsWith(u8, t, "repo ")) continue;
+        if (std.mem.startsWith(u8, t, generator_prefix)) continue;
         try out.append(arena, try arena.dupe(u8, t));
+    }
+    return out.toOwnedSlice(arena);
+}
+
+const generator_prefix = "generator ";
+
+/// The generator's live path a manifest's bytes record, or null for one
+/// written before manifests recorded it.
+pub fn generatorOf(arena: std.mem.Allocator, bytes: []const u8) !?[]const u8 {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, generator_prefix)) return applied.pctDecode(arena, line[generator_prefix.len..]);
+    }
+    return null;
+}
+
+/// The generator live path of every manifest in `<state>/generated/`.
+pub fn allGenerators(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]const []const u8 {
+    const gen_dir_path = try std.fs.path.join(arena, &.{ state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (entries) |entry| {
+        if (entry.kind != .file) continue;
+        const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
+        if (try generatorOf(arena, bytes)) |g| try out.append(arena, g);
     }
     return out.toOwnedSlice(arena);
 }
@@ -124,6 +155,9 @@ pub fn writeManifest(arena: std.mem.Allocator, io: Io, state_dir: []const u8, ge
     defer body.deinit(arena);
     try body.appendSlice(arena, "repo ");
     try body.appendSlice(arena, try applied.pctEncode(arena, repo));
+    try body.append(arena, '\n');
+    try body.appendSlice(arena, generator_prefix);
+    try body.appendSlice(arena, try applied.pctEncode(arena, gen_live));
     try body.append(arena, '\n');
     for (paths) |p| {
         try body.appendSlice(arena, p);
@@ -180,8 +214,11 @@ pub fn sweepOrphans(
             if (!std.mem.eql(u8, r, opts.repo)) continue;
         }
         const leaves = try leavesOf(arena, bytes);
-        if (opts.released) |rel| {
-            if (rel.contains(name)) {
+        const released = if (try generatorOf(arena, bytes)) |g|
+            (if (opts.released_live) |rl| rl.contains(try stale.foldCase(arena, g)) else false)
+        else if (opts.released) |rel| rel.contains(name) else false;
+        {
+            if (released) {
                 if (!opts.dry_run) {
                     for (leaves) |leaf| {
                         if (keep.contains(leaf)) continue;

@@ -601,7 +601,7 @@ test "commit golden: a generator leaf row routed to its data source" {
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\generated/
-        \\generated/{~/.config/gen.inc} 44321712034612f5
+        \\generated/{~/.config/gen.inc} 4aa9bf20407edeb2
         \\provenance/
         \\provenance/{~/.config/id-a.inc} 6eeb23a77115120c
         \\provenance/{~/.config/id-b.inc} 9abba5483ccaa232
@@ -946,7 +946,7 @@ test "commit golden: a symlink, a generator leaf and a text file committed in on
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\generated/
-        \\generated/{~/.config/gen.inc} 44321712034612f5
+        \\generated/{~/.config/gen.inc} 4aa9bf20407edeb2
         \\provenance/
         \\provenance/{~/.config/id-a.inc} 6eeb23a77115120c
         \\provenance/{~/.config/id-b.inc} 9abba5483ccaa232

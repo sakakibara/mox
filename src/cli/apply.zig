@@ -450,6 +450,11 @@ fn applyPass(
     var gen_states: std.ArrayList(GenState) = .empty;
     var compose_failed: std.ArrayList([]const u8) = .empty;
 
+    // A tombstone that matches nothing here is reported before any record
+    // changes, so this run's own sweep cannot hide it.
+    if (!scoped) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, tree)) |u|
+        try printUnmatched(ctx.out, u, home);
+
     // A broken attributes entry no source claims may be a mistyped
     // tombstone: its path is an error, never a source that left the tree.
     if (!scoped) for (tree.entry_errors) |e| {
@@ -748,6 +753,7 @@ fn applyPass(
             .dry_run = dry_run,
             .repo = repo_tag,
             .released = &released_names,
+            .released_live = &released_live,
             .links = &tree_links,
         }, &known, &keep_set, ctx.out, ctx.err);
         counts.removed += swept.removed;
@@ -776,6 +782,7 @@ fn applyPass(
             .dry_run = dry_run,
         }, &units, &counts, &snapshotted);
     }
+    if (!scoped and !dry_run) try mox.apply.stale.markTombstones(ctx.alloc, ctx.io, context.paths.state_dir, tree.released);
 
     // Exact-directory sweep: after every managed file is written, remove live
     // entries in `.mox-exact` directories that mox did not produce. The global
@@ -1928,6 +1935,13 @@ const StaleInput = struct {
 /// with its records forgotten. A released path is forgotten and never
 /// removed; an ignored one is left alone; the same file as a managed path
 /// (a case-only rename) is forgotten, nothing removed.
+/// One tombstone this machine cannot match, as status and apply print it.
+pub fn printUnmatched(out: *std.Io.Writer, u: mox.apply.stale.Unmatched, home: []const u8) !void {
+    try out.print("  WARN    released {f} matches nothing mox manages", .{display.of(u.live_path, home)});
+    if (u.managed) |m| try out.print("; managed {f} differs from it only in case", .{display.of(m, home)});
+    try out.writeAll("\n");
+}
+
 fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.drift.Unit), counts: *Counts, snapshotted: *bool) !void {
     const context = ctx.context.?;
     const stale = mox.apply.stale;
