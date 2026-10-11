@@ -319,6 +319,14 @@ owned one is left in place, and a released one is forgotten. Nothing is
 swept in a path-scoped run, or in one where any file failed to compose or
 write.
 
+apply never removes a path through a symlinked directory: when a
+directory between HOME and the path is a symlink, or a path the tree
+plants as one, the path names a file elsewhere, so a stale file, a
+generator's dropped file, a file that composes to nothing and an exact
+directory's entries there are left in place, their records forgotten
+(`~/x: left in place: a parent directory is a symlink`). `mox remove
+--purge` of such a path is refused.
+
 Every structured layer and every composed output is parsed in its format
 before anything is written (see [dsl.md](dsl.md#validation)); a file that
 does not parse is an `ERROR` line naming the layer and line, with a hint,
@@ -1009,7 +1017,9 @@ is never whole-file restored: the snapshot's owned subtree is
 re-patched onto the current live file (the program's writes since then
 survive) through the same verification and `check` hook as apply, and
 a snapshot whose owned values were secret-masked is refused --
-re-apply the source instead.
+re-apply the source instead. An entry whose live path is now a symlink,
+or lies below one, is not restored: rollback names the live path and the
+snapshot copy left in place, and exits 1.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10); apply prunes
 the rest. A value that is not an integer warns and the default stands.

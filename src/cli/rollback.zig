@@ -115,6 +115,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     var repatched: usize = 0;
     var failed: usize = 0;
+    for (restored.refused) |r| {
+        try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ display.of(r.live_path, context.paths.home), r.snapshot_path });
+        failed += 1;
+    }
     // Resolved on the first check hook, once for the run: a run that spawns
     // none leaves the state directory as it is.
     var mox_bin_dir: ?[]const u8 = null;

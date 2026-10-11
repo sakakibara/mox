@@ -11,6 +11,8 @@ const std = @import("std");
 const applied = @import("applied.zig");
 const write = @import("write.zig");
 const dirent = @import("../source/dirent.zig");
+const tree_mod = @import("../source/tree.zig");
+const parent_link = @import("parent_link.zig");
 
 const Io = std.Io;
 
@@ -49,7 +51,7 @@ pub fn find(
 
     for (try recordBytes(arena, io, state_dir, "applied-owned", 64 * 1024 * 1024)) |bytes| {
         const rec = (try applied.parseOwned(arena, bytes)) orelse continue;
-        if (!tagged(rec.repo, repo) or !underHome(rec.live_path, home)) continue;
+        if (!tagged(rec.repo, repo) or !parent_link.underHome(rec.live_path, home)) continue;
         if (keep.contains(rec.live_path) or seen.contains(rec.live_path)) continue;
         try seen.put(rec.live_path, {});
         try out.append(arena, .{ .live_path = rec.live_path, .kind = .owned });
@@ -57,14 +59,14 @@ pub fn find(
     for (try recordBytes(arena, io, state_dir, "applied-symlink", 1024 * 1024)) |bytes| {
         const rec = try applied.parseSymlink(arena, bytes);
         const live = rec.live_path orelse continue;
-        if (!tagged(rec.repo, repo) or !underHome(live, home)) continue;
+        if (!tagged(rec.repo, repo) or !parent_link.underHome(live, home)) continue;
         if (keep.contains(live) or seen.contains(live)) continue;
         try seen.put(live, {});
         try out.append(arena, .{ .live_path = live, .kind = .symlink, .target = rec.target });
     }
     for (try recordBytes(arena, io, state_dir, "applied", 1024 * 1024)) |bytes| {
         const rec = (try applied.parseWhole(arena, bytes)) orelse continue;
-        if (!tagged(rec.repo, repo) or !underHome(rec.live_path, home)) continue;
+        if (!tagged(rec.repo, repo) or !parent_link.underHome(rec.live_path, home)) continue;
         if (keep.contains(rec.live_path)) continue;
         // A path holding both a whole-file and a symlink record is judged by
         // what the record of its live kind says.
@@ -81,11 +83,6 @@ pub fn find(
     }
     std.mem.sort(Candidate, out.items, {}, lessByPath);
     return out.toOwnedSlice(arena);
-}
-
-fn underHome(path: []const u8, home: []const u8) bool {
-    if (home.len == 0 or path.len <= home.len or !std.mem.startsWith(u8, path, home)) return false;
-    return std.fs.path.isSep(path[home.len]) or std.fs.path.isSep(home[home.len - 1]);
 }
 
 fn isSymlink(io: Io, path: []const u8) bool {
@@ -130,11 +127,30 @@ pub const Verdict = enum {
     leave,
     /// Not a regular file or symlink mox could have left: refused.
     special,
+    /// A directory above it is a symlink, so the path names a file outside
+    /// HOME's own tree: left in place, its records forgotten.
+    linked_parent,
 };
 
+/// The live paths `files` plants as symlinks.
+pub fn managedLinks(arena: std.mem.Allocator, files: []const tree_mod.ManagedFile) !std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(arena);
+    for (files) |f| if (f.is_symlink) try out.put(f.live_path, {});
+    return out;
+}
+
 /// Judge `c` against the live tree. `tree_inodes` holds the inode of every
-/// live path the tree manages that exists.
-pub fn judge(arena: std.mem.Allocator, io: Io, c: Candidate, tree_inodes: *const std.AutoHashMap(u128, void)) !Verdict {
+/// live path the tree manages that exists; `links` the live paths it plants
+/// as symlinks.
+pub fn judge(
+    arena: std.mem.Allocator,
+    io: Io,
+    c: Candidate,
+    tree_inodes: *const std.AutoHashMap(u128, void),
+    home: []const u8,
+    links: *const std.StringHashMap(void),
+) !Verdict {
+    if (parent_link.through(io, home, c.live_path, links)) return .linked_parent;
     const st = Io.Dir.cwd().statFile(io, c.live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return .gone,
         else => return .special,

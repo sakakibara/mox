@@ -20,6 +20,7 @@ const std = @import("std");
 const Io = std.Io;
 const applied = @import("applied.zig");
 const snapshot = @import("snapshot.zig");
+const parent_link = @import("parent_link.zig");
 const write = @import("write.zig");
 const prov_map = @import("../provenance/root.zig").map;
 const dirent = @import("../source/dirent.zig");
@@ -45,6 +46,9 @@ pub const Options = struct {
     /// Manifest names (`manifestName`) of generators `.mox/attributes.toml`
     /// released: their manifests are forgotten and their leaves kept.
     released: ?*const std.StringHashMap(void) = null,
+    /// Live paths the tree plants as symlinks: a leaf below one is never
+    /// removed.
+    links: ?*const std.StringHashMap(void) = null,
 };
 
 pub const Result = struct {
@@ -237,6 +241,11 @@ fn removeLeaf(
     stderr: *Io.Writer,
     result: *Result,
 ) !void {
+    if (parent_link.through(io, opts.home, live_path, opts.links)) {
+        if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
+        try stdout.print("  {s}: {s}\n", .{ live_path, parent_link.reason });
+        return;
+    }
     // Inspect the leaf WITHOUT following a symlink. A leaf that drifted into a
     // link must be snapshotted AS a link and removed -- never dereferenced,
     // which would back up an unrelated target's content and change the entry's

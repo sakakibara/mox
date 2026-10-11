@@ -15,6 +15,7 @@ const snapshot = @import("snapshot.zig");
 const ignore_match = @import("../source/ignore/match.zig");
 const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
+const parent_link = @import("parent_link.zig");
 
 /// Bound on how deep an unmanaged subdirectory is walked when snapshotting its
 /// files before removal. A pathologically deep foreign tree stops here rather
@@ -28,6 +29,8 @@ pub const Options = struct {
     home: []const u8,
     force: bool,
     dry_run: bool,
+    /// Live paths the tree plants as symlinks: nothing below one is swept.
+    links: ?*const std.StringHashMap(void) = null,
 };
 
 pub const Result = struct {
@@ -90,6 +93,10 @@ fn enforceOne(
     ruleset: *const ignore_match.RuleSet,
     home: []const u8,
 ) !void {
+    if (parent_link.through(io, home, try std.fs.path.join(arena, &.{ dir_live, "_" }), opts.links)) {
+        try stdout.print("  {s}/: {s}\n", .{ dir_live, parent_link.reason });
+        return;
+    }
     var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return,
         else => return e,

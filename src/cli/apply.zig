@@ -654,6 +654,7 @@ fn applyPass(
     // Every path a generator manifest lists, before this run rewrites or
     // drops any: the stale-record sweep below never touches one.
     const manifest_leaves = try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir);
+    const tree_links = try mox.apply.stale.managedLinks(ctx.alloc, tree.files);
 
     // Second pass: prune each SUCCEEDED generator's dropped leaves against the
     // global keep, then record its current set. A failed generator prunes
@@ -670,6 +671,7 @@ fn applyPass(
             .force = force,
             .dry_run = dry_run,
             .mute_drift_message = true,
+            .links = &tree_links,
         }, g.prior, &keep_set, ctx.out, ctx.err);
         if (prune.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += prune.error_refused;
@@ -731,6 +733,7 @@ fn applyPass(
             .dry_run = dry_run,
             .repo = repo_tag,
             .released = &released_names,
+            .links = &tree_links,
         }, &known, &keep_set, ctx.out, ctx.err);
         if (swept.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += swept.error_refused;
@@ -778,6 +781,7 @@ fn applyPass(
                 .home = context.paths.home,
                 .force = force,
                 .dry_run = dry_run,
+                .links = &tree_links,
             },
             ctx.out,
             ctx.err,
@@ -1809,6 +1813,12 @@ fn omitFile(
     }
 
     const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    if (recorded != null and mox.apply.parent_link.through(ctx.io, context.paths.home, live_path, null)) {
+        if (!dry_run) try mox.apply.applied.forgetWholeFile(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+        counts.skip += 1;
+        try ctx.out.print("  {s}: {s}\n", .{ shown, mox.apply.parent_link.reason });
+        return;
+    }
     const live: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch null;
 
     // Nothing of mox's whole-file writing to remove: no record (a symlink, an
@@ -1904,6 +1914,7 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
     var live_paths: std.ArrayList([]const u8) = .empty;
     for (in.tree) |f| try live_paths.append(ctx.alloc, f.live_path);
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
+    const links = try stale.managedLinks(ctx.alloc, in.tree);
     for (cands) |c| {
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         if (in.released.contains(c.live_path)) {
@@ -1912,9 +1923,13 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
         }
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
         if (in.ruleset.isPathIgnored(rel, false)) continue;
-        const verdict = try stale.judge(ctx.alloc, ctx.io, c, &inodes);
+        const verdict = try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links);
         switch (verdict) {
             .gone, .same_file => if (!in.dry_run) try forgetAll(ctx, c.live_path),
+            .linked_parent => {
+                if (!in.dry_run) try forgetAll(ctx, c.live_path);
+                try ctx.out.print("  {s}: {s}\n", .{ shown, mox.apply.parent_link.reason });
+            },
             .special => {
                 try ctx.err.print("mox apply: {s}: no longer managed, but not a file mox wrote; left in place\n", .{shown});
                 counts.fail += 1;

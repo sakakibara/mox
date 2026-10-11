@@ -73,6 +73,12 @@ All notable changes to mox are documented here. The format follows
 - A private base at a path the repo manages is refused naming both (it was
   silently dropped), as is a private overlay defining content under a path
   the repo disowns.
+- apply never removes a path below a symlinked directory (one on disk, or
+  one the tree plants as a symlink): a stale file, a generator's dropped
+  file, a file that composes to nothing and an exact directory's entries
+  there are left in place and forgotten, `remove --purge` of one is
+  refused, and `rollback` names an entry it cannot restore through a
+  symlink instead of failing with `NotDir`.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
   run where any file failed to compose or write or carried a head error.
 

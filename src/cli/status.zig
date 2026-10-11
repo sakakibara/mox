@@ -155,12 +155,17 @@ fn staleRows(
     const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
     if (cands.len == 0) return;
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
+    const links = try stale.managedLinks(ctx.alloc, tree.files);
     for (cands) |c| {
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
         if (ruleset.isPathIgnored(rel, false)) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
-        switch (try stale.judge(ctx.alloc, ctx.io, c, &inodes)) {
+        switch (try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links)) {
             .gone, .same_file => {},
+            .linked_parent => {
+                tally.add(.stale);
+                try rows.print("  {s:<8} {s} (no longer managed; {s})\n", .{ Label.stale.text(), shown, mox.apply.parent_link.reason });
+            },
             .remove, .leave => {
                 tally.add(.stale);
                 try rows.print("  {s:<8} {s} (no longer managed)\n", .{ Label.stale.text(), shown });

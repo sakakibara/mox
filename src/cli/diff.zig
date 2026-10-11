@@ -344,11 +344,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         for (tree.entry_errors) |e| try keep.put(e.live_path, {});
         const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
+        const links = try stale.managedLinks(ctx.alloc, tree.files);
         for (cands) |c| {
             if (c.kind != .whole) continue;
             const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
             if (ruleset.isPathIgnored(rel, false)) continue;
-            if (try stale.judge(ctx.alloc, ctx.io, c, &inodes) != .remove) continue;
+            if (try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links) != .remove) continue;
             try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
         }
     }

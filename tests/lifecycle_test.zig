@@ -5882,3 +5882,126 @@ test "stale: a failed write at a moved path keeps the old path's file" {
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expectEqualStrings("a\n", try read(io, a, try h.liveOf(".a")));
 }
+
+test "stale: a directory the tree now plants as a symlink into the repo loses nothing inside the repo, and rollback refuses to restore through it" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/nvim/init.lua", "x\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try Io.Dir.cwd().deleteTree(io, try h.srcOf(".config/nvim"));
+    try writeRepo(io, &tmp, "repo/nvim/init.lua", "x\n");
+    try writeRepo(io, &tmp, "repo/src/.config/nvim", try std.fs.path.join(a, &.{ h.repo, "nvim" }));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".config/nvim\"]\nsymlink = true\n");
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s.out, "STALE", "a parent directory is a symlink"));
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(lineWith(r.out, "~/.config/nvim/init.lua", "left in place: a parent directory is a symlink"));
+    try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".config/nvim/init.lua"))) == null);
+
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(lineWith(rb.err, "~/.config/nvim/init.lua", "not restored: a parent directory is a symlink; the snapshot copy is at"));
+    try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
+}
+
+test "stale: a hand-made symlinked parent pointing outside HOME keeps the file it reaches" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/nvim/init.lua", "x\n");
+    try writeRepo(io, &tmp, "repo/src/.keep", "keep\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try Io.Dir.cwd().deleteTree(io, try h.srcOf(".config"));
+    const code = try std.fs.path.join(a, &.{ h.repo, "..", "code", "nvim" });
+    try Io.Dir.cwd().createDirPath(io, code);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ code, "init.lua" }), .data = "x\n" });
+    try Io.Dir.cwd().deleteTree(io, try h.liveOf(".config/nvim"));
+    try Io.Dir.cwd().symLink(io, code, try h.liveOf(".config/nvim"), .{});
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(lineWith(r.out, "~/.config/nvim/init.lua", "left in place: a parent directory is a symlink"));
+    try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ code, "init.lua" })));
+}
+
+test "generated: a dropped leaf below a symlinked directory is kept and forgotten" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g/gen.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nkey=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const ext = try std.fs.path.join(a, &.{ h.repo, "..", "ext" });
+    try Io.Dir.cwd().rename(try h.liveOf(".config/g"), Io.Dir.cwd(), ext, io);
+    try Io.Dir.cwd().symLink(io, ext, try h.liveOf(".config/g"), .{});
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"b\"\n");
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineWith(r.out, "id-a.inc", "left in place: a parent directory is a symlink"));
+    try std.testing.expectEqualStrings("key=a\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "id-a.inc" })));
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".config/g/id-a.inc"))) == null);
+}
+
+test "symlinked parent: a file that composes to nothing, an exact dir and a purge keep what the link reaches" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/t/ids.inc", "# mox: for e in \"data/ids.toml\"\nname = <e.k>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nk = \"one\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/x/keep.txt", "keep\n");
+    try writeRepo(io, &tmp, "repo/src/.config/x/.mox-exact", "");
+    try writeRepo(io, &tmp, "repo/src/.config/p/f", "p\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const ext = try std.fs.path.join(a, &.{ h.repo, "..", "ext" });
+    try Io.Dir.cwd().createDirPath(io, ext);
+    for ([_][]const u8{ "t", "x", "p" }) |d| {
+        const moved = try std.fs.path.join(a, &.{ ext, d });
+        try Io.Dir.cwd().rename(try h.liveOf(try std.fs.path.join(a, &.{ ".config", d })), Io.Dir.cwd(), moved, io);
+        try Io.Dir.cwd().symLink(io, moved, try h.liveOf(try std.fs.path.join(a, &.{ ".config", d })), .{});
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ ext, "x", "foreign" }), .data = "f\n" });
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "ids = []\n");
+
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expect(lineWith(r.out, "~/.config/t/ids.inc", "left in place: a parent directory is a symlink"));
+    try std.testing.expect(lineWith(r.out, ".config/x/", "left in place: a parent directory is a symlink"));
+    try std.testing.expectEqualStrings("name = one\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "t", "ids.inc" })));
+    try std.testing.expectEqualStrings("f\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "x", "foreign" })));
+
+    const p = try h.run(&.{ "mox", "remove", "--purge", ".config/p/f" });
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+    try std.testing.expect(std.mem.indexOf(u8, p.err, "--purge is refused: a parent directory is a symlink") != null);
+    try std.testing.expect(exists(io, try h.srcOf(".config/p/f")));
+    try std.testing.expectEqualStrings("p\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "p", "f" })));
+}

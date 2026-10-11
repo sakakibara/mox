@@ -830,6 +830,9 @@ record whose path lies outside this run's HOME is never a candidate.
 - A partially owned file is never removed, since the rest of it is the
   program's: it is reported once as no longer managed, left in place, and
   its records forgotten.
+- A path below a symlinked directory -- one on disk, or one the tree plants as
+  a symlink -- names a file outside HOME's own tree: it is never removed,
+  only forgotten.
 - A released path is forgotten and never removed, a `.moxignore`-matched one
   left alone, and one that is the same file as a managed path (a case-only
   rename on a case-insensitive filesystem, or a hardlink) forgotten with

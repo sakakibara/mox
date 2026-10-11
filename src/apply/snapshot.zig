@@ -21,6 +21,7 @@
 const std = @import("std");
 
 const Io = std.Io;
+const parent_link = @import("parent_link.zig");
 const write_mod = @import("write.zig");
 const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
@@ -267,6 +268,14 @@ pub fn prune(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, keep: 
 
 pub const Restored = struct {
     count: usize = 0,
+    /// Entries not restored because a directory above their live path is a
+    /// symlink: each names its live path and the snapshot copy left behind.
+    refused: []const Refused = &.{},
+};
+
+pub const Refused = struct {
+    live_path: []const u8,
+    snapshot_path: []const u8,
 };
 
 /// A snapshot file whose live path the caller asked to withhold from the
@@ -310,8 +319,10 @@ pub fn restoreExcept(
     defer dir.close(io);
 
     var result: Restored = .{};
-    try restoreDir(arena, io, dir, snap_dir_path, "", home, skip, skipped, &result);
-    try restoreDirModes(arena, io, snapshots_dir, id, home);
+    var refused: std.ArrayList(Refused) = .empty;
+    try restoreDir(arena, io, dir, snap_dir_path, "", home, skip, skipped, &result, &refused);
+    try restoreDirModes(arena, io, snapshots_dir, id, home, &refused);
+    result.refused = try refused.toOwnedSlice(arena);
     return result;
 }
 
@@ -327,6 +338,7 @@ fn restoreDirModes(
     snapshots_dir: []const u8,
     id: []const u8,
     home: []const u8,
+    refused: *std.ArrayList(Refused),
 ) !void {
     const manifest_path = try dirmodesPath(arena, snapshots_dir, id);
     const data = Io.Dir.cwd().readFileAlloc(io, manifest_path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
@@ -342,6 +354,10 @@ fn restoreDirModes(
         const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.CorruptDirmodes;
         const mode = std.fmt.parseInt(u32, line[0..sp], 8) catch return error.CorruptDirmodes;
         const live = try source_path.joinKeyOnto(arena, home, line[sp + 1 ..]);
+        if (parent_link.through(io, home, live, null) or isSymlink(io, live)) {
+            try refused.append(arena, .{ .live_path = live, .snapshot_path = try std.fs.path.join(arena, &.{ snapshots_dir, id, line[sp + 1 ..] }) });
+            continue;
+        }
         try entries.append(arena, .{ .live = live, .mode = mode });
     }
 
@@ -351,6 +367,11 @@ fn restoreDirModes(
         i -= 1;
         try write_mod.setMode(entries.items[i].live, entries.items[i].mode);
     }
+}
+
+fn isSymlink(io: Io, path: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
 }
 
 fn restoreDir(
@@ -363,6 +384,7 @@ fn restoreDir(
     skip: ?*const std.StringHashMap(void),
     skipped: ?*std.ArrayList(Withheld),
     result: *Restored,
+    refused: *std.ArrayList(Refused),
 ) !void {
     // Raw iterate() is sound here: a restore replays EVERY entry to disk, so
     // the order it visits them cannot be observed in the result.
@@ -378,11 +400,15 @@ fn restoreDir(
                 var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
                 defer sub.close(io);
                 const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, entry.name });
-                try restoreDir(arena, io, sub, sub_abs, rel, home, skip, skipped, result);
+                try restoreDir(arena, io, sub, sub_abs, rel, home, skip, skipped, result, refused);
             },
             .file => {
-                const content = try dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024 * 1024));
                 const target = try source_path.joinKeyOnto(arena, home, rel);
+                if (parent_link.through(io, home, target, null)) {
+                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }) });
+                    continue;
+                }
+                const content = try dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024 * 1024));
                 if (skip != null and skip.?.contains(target)) {
                     if (skipped) |out| try out.append(arena, .{ .live_path = target, .content = content });
                     continue;
@@ -395,6 +421,10 @@ fn restoreDir(
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
                 const n = try dir.readLink(io, entry.name, &buf);
                 const target = try source_path.joinKeyOnto(arena, home, rel);
+                if (parent_link.through(io, home, target, null)) {
+                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }) });
+                    continue;
+                }
                 if (std.fs.path.dirname(target)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
                 Io.Dir.cwd().deleteFile(io, target) catch {};
                 try Io.Dir.cwd().symLink(io, buf[0..n], target, .{});

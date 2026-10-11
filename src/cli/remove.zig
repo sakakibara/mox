@@ -88,6 +88,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.err.print("mox remove: {s}: --purge is refused for a partially owned file (the live file's remainder is not mox's to delete; plain 'mox remove' stops managing it)\n", .{name});
         return 1;
     }
+    if (purge) {
+        const links = try mox.apply.stale.managedLinks(ctx.alloc, merged.files);
+        if (mox.apply.parent_link.through(ctx.io, context.paths.home, live_path, &links)) {
+            try ctx.err.print("mox remove: {s}: --purge is refused: a parent directory is a symlink, so the live path names a file outside HOME's own tree\n", .{name});
+            return 1;
+        }
+    }
 
     // The attributes file this remove rewrites: the private layer's for a
     // private-only file, else the repo's, which keeps a tombstone unless the
@@ -193,6 +200,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 const other = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, f.live_path);
                 for (other) |leaf| try keep.put(leaf, {});
             }
+            const links = try mox.apply.stale.managedLinks(ctx.alloc, merged.files);
             const res = try mox.apply.generated.pruneStale(ctx.alloc, ctx.io, .{
                 .state_dir = context.paths.state_dir,
                 .snapshots_dir = context.paths.snapshots_dir,
@@ -200,6 +208,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 .home = context.paths.home,
                 .force = true,
                 .dry_run = false,
+                .links = &links,
             }, prior, &keep, ctx.out, ctx.err);
             // Drop the manifest only when the whole set was pruned. A refused
             // leaf (undeletable, a directory, an unsnapshottable drift) would
