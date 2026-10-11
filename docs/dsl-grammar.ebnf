@@ -8,7 +8,10 @@
 
    A directive is a single comment line whose body begins with `mox:`. The
    comment marker is the host file's own line-comment lead (`#`, `--`, `//`,
-   ...), inferred from extension, shebang, or an apparent directive line. *)
+   ...): a structured format's own (`#` for TOML, YAML, INI and gitconfig,
+   `//` for JSONC), else inferred from extension, shebang, or an apparent
+   directive line. Strict JSON (`.json`) has no comments and so no marker: it
+   carries no directive, and a `mox:` comment in it is refused. *)
 
 directive     = marker "mox:" ( line_dir | region_open | "end" ) EOL ;
 
@@ -121,7 +124,7 @@ lower         = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j"
    glob and regex axis values do not parse. A bare ident is ASCII only
    (letters, digits, "_", "+", "-", "."); a quoted string is the escape
    hatch for a value outside that set, e.g. a non-ASCII fact value. *)
-marker        = ? host file's line-comment lead, e.g. "#" "--" "//" ? ;
+marker        = ? host file's line-comment lead, e.g. "#" "--" "//"; none for strict JSON ? ;
 string        = '"' { ? any byte except '"' ? } '"' ;
 ident         = ident_start { ident_cont } ;
 ident_start   = letter | digit | "_" | "+" | "-" | "." ;

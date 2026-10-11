@@ -4,6 +4,89 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `.jsonc` is a structured format: its layers merge, it can be partially
+  owned, and `mox commit` writes edits back into it. `format = "jsonc"` in
+  `.mox/attributes.toml` reads a `.json` target as JSONC too, for a program
+  that reads comments (VS Code's `settings.json`, `tsconfig.json`).
+- A strict-JSON target declares `own`, `disown`, `check`, `when` and
+  `defaults` in its `.mox/attributes.toml` entry, where every other target
+  writes head directives; fact discovery and the axis inventory read them.
+  Such a target needs no base: its attributes and overlays are a complete
+  file.
+- A file whose source left the tree -- deleted, moved, or released -- is
+  `STALE` in `mox status` and shown as a pending removal by `mox diff`, and
+  `mox apply` converges it: an unedited whole file or symlink is removed
+  snapshot-first, an edited one is drift, and a partially owned one is left
+  in place, no longer managed, its records forgotten. Every record now names
+  the repo it came from, so one repo's apply never touches another's files.
+- The private layer reads its own `<state dir>/private/.mox/attributes.toml`
+  and joins fact discovery. A private entry may set any key for a
+  private-only path, and only `mode` for a path the repo manages, which
+  wins over the repo's mode and the automatic 0600.
+
+### Changed
+- Every structured layer, matching this machine or not, is parsed in its
+  format and dialect before it composes, and every composed output after
+  capture expansion. Some previously composed files may now report `ERROR`
+  in `apply`, `status`, `diff` and `export`; each such file was producing
+  output its format does not allow. The error names the layer and line (or
+  the output line and its layers), with a hint, and never quotes a line
+  carrying a resolved secret.
+- A `.json` target is strict JSON: a comment or trailing comma in any of its
+  layers, or in a partial target's live file, is an `ERROR`, and a `// mox:`
+  comment is refused naming the attributes key or overlay that replaces it.
+  Move such directives into `.mox/attributes.toml`, or set `format =
+  "jsonc"` for a program that reads comments. An empty JSON base is refused;
+  write `{}`.
+- Duplicate JSON keys are refused where mox merges layers or expands a key
+  capture, since the merged result would depend on which layer the parser
+  read last.
+- Captures in the JSON family expand per string token and are escaped for
+  JSON, so a `"` or `\` in a resolved value no longer breaks the output. A
+  quoted single `<data.FILE.KEY>` capture of a number or bool used to give a
+  string and now gives the typed value; store a TOML string to keep a
+  string. Captures inside JSONC comments are no longer expanded.
+- A generic INI file may hold a bare key everywhere mox reads it.
+- `mox remove` keeps the live file on every machine: it leaves a tombstone,
+  `released = true`, in `.mox/attributes.toml`, and a removed generator's
+  produced files stay too. `--purge` deletes the live file (or the produced
+  files) here and leaves no tombstone, so other machines remove their
+  unedited copies. A private-only file can be removed, forgotten here with
+  no tombstone.
+- `mox mv` moves no state: the next apply on every machine removes the old
+  live file (or reports it as drift, or leaves an old partially owned file in
+  place), instead of leaving it orphaned. A move whose attributes entry the
+  new name cannot hold is refused.
+- `mox add` of a `.json` file holding comments records `format = "jsonc"`;
+  `add --own`/`--disown`/`--gate` of a strict-JSON file writes the
+  declaration into `.mox/attributes.toml` and the owned content as plain
+  JSON. `mox commit` writes a strict-JSON source back strictly.
+- An `.mox/attributes.toml` entry that breaks the schema is that file's
+  `ERROR` instead of stopping every command, and a command that would
+  rewrite an attributes file holding a comment is refused before it changes
+  anything.
+- A private base at a path the repo manages is refused naming both (it was
+  silently dropped), as is a private overlay defining content under a path
+  the repo disowns.
+- Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
+  run where any file failed to compose or carried a head error.
+
+### Upgrading
+- A machine on an older mox rejects an attributes file carrying the new keys
+  (`format`, the directive keys, `released`), and `mox remove` now writes
+  one. Upgrade every machine before committing them.
+- A record written before records named their repo is never swept: a file
+  deleted, drifted or gated off before the upgrade stays as it was, and the
+  first apply after upgrading tags every file it still produces.
+- Downgrading after the upgrade shows every symlink as drift, because an
+  older binary reads the new three-line symlink record as the link target.
+- State is shared across repos, so the first apply after upgrading still
+  sweeps another repo's untagged generator manifests, as every apply did
+  before; once tagged, they are never swept again.
+
 ## [0.12.4] - 2026-10-11
 
 ### Fixed

@@ -105,19 +105,24 @@ mox composes each managed file from a **base** file in `src/` plus
 `machine` and `hostname`, plus any fact your source compares by value
 (`profile`, say). How an overlay applies depends on the file's format:
 
-- **Structured files** (TOML, JSON, YAML, INI, gitconfig): overlays are
-  sibling files in a `<name>.d/` directory, named by the axis tuple they
+- **Structured files** (TOML, JSON, JSONC, YAML, INI, gitconfig): overlays
+  are sibling files in a `<name>.d/` directory, named by the axis tuple they
   match (`config.toml.d/os=darwin.toml`). An overlay is a partial document
   that deep-merges into the base -- nested tables merge key by key, a
   scalar or array replaces -- and the most specific matching tuple wins.
+  Every layer and every composed file is parsed in its format first, so a
+  file its program cannot read never reaches it; a `.json` file is strict
+  JSON, and `format = "jsonc"` in `.mox/attributes.toml` (or a `.jsonc`
+  name) allows comments.
 - **Text and code files** (`.zshrc`, a Lua config): per-axis content is
   selected *in place* by a small comment DSL -- a `# mox: when os=darwin`
   region, an `include` / `replace from` splice from the file's `.d/`
   directory, a `for` loop over data rows. The full DSL reference is
   [docs/dsl.md](docs/dsl.md).
 - **Whole-file gating**, either kind: a leading `# mox: when <expr>`
-  governs whether the file appears at all; a file with overlays and no
-  base materializes only where an overlay matches.
+  governs whether the file appears at all (strict JSON, which has no
+  comments, takes it as a `when` attribute instead); a file with overlays
+  and no base materializes only where an overlay matches.
 
 The rest of the model, briefly:
 
@@ -141,8 +146,9 @@ The rest of the model, briefly:
   A symlink is a source whose content is the link target, composed by
   axis like anything else.
 - **Partial ownership** -- for a file a program also writes, `mox: own
-  <key-path>` head directives (or `mox: disown` for the complement)
-  scope mox to the declared subtrees. mox never changes a byte of the
+  <key-path>` head directives (or `mox: disown` for the complement; for
+  strict JSON, `own`/`disown` attributes) scope mox to the declared
+  subtrees. mox never changes a byte of the
   other side -- verified before every write, refused when it cannot be
   proven -- and an optional `mox: check` script must accept each
   candidate. Onboard with `mox add --own`; the walkthrough is in
@@ -176,9 +182,9 @@ Full behavioral contracts for every command are in
 | `add <path>` / `add -r <dir>` | Start managing a live file (or every file under a dir) as `src/` sources; `--own`/`--disown` key-paths onboard a partially owned file |
 | `apply` | Compose and write every managed file. Never silently overwrites a hand-edited live file: leaves drift untouched and reports it, resolved with `apply --overwrite <path>` or `commit <path>`; also installs the packages a `data/packages/` manifest declares, bootstrapping an absent manager first |
 | `commit` | Route live-file edits back into their sources -- per hunk for text, per key for merged layers -- confirming each, and verifying that no configuration you did not choose changes; also offers each untracked package to record or blacklist |
-| `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, ...) plus the live probe log, plus a `packages:` section when the repo declares one. `status` exits 1 on anything actionable |
+| `diff` / `status` | Composed-vs-live diff; per-file state (`clean`, `OUTDATED`, `DRIFT`, `STALE` for a file whose source left the tree, `ERROR` for one that does not parse, ...) plus the live probe log, plus a `packages:` section when the repo declares one. `status` exits 1 on anything actionable |
 | `edit <name>` | Open the source behind a live path in `$EDITOR`; `--axis <tuple>` opens the overlay or fragment for that variant |
-| `mv <old> <new>` / `remove <name>` | Rename a source (apply writes the new live path; the old live file is left orphaned in place) / stop managing (source to recoverable trash; `--purge` also removes the live file) |
+| `mv <old> <new>` / `remove <name>` | Rename a source (every machine's next apply writes the new live path and removes the old file, or reports it as drift if edited) / stop managing (source to recoverable trash; every machine keeps its live file; `--purge` removes it here and lets other machines remove theirs) |
 | `export <out>` | Bake the fully composed tree to a directory (`--as <tuple>` for another machine's view) -- the walk-away guarantee |
 | `facts` | List, set, and interview for facts; `facts probe` resolves one `tool=`/`env=` query scriptably |
 | `data <name>` | Print a data source as TOML or JSON, with your machine-local private copy shadowing the repo's |

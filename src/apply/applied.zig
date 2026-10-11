@@ -102,7 +102,7 @@ fn namedValue(arena: std.mem.Allocator, line: []const u8, name: []const u8) !?[]
 }
 
 /// A parsed whole-file record: the content hash, the live path, and the repo
-/// it came from (null for a record written before records named their repo).
+/// it came from (null for an untagged one-line record).
 pub const WholeRecord = struct {
     hash: [hash_hex_len]u8,
     live_path: []const u8,
@@ -211,8 +211,7 @@ pub const OwnedRecord = struct {
     own_paths: []const []const u8,
     /// The declared paths whose composed value resolved a secret, raw.
     secret_paths: []const []const u8,
-    /// The repo the record came from; null for one written before records
-    /// named their repo.
+    /// The repo the record came from; null for an untagged record.
     repo: ?[]const u8 = null,
     /// The live path the record names (set by `readOwned`).
     live_path: []const u8 = "",
@@ -339,8 +338,8 @@ pub fn recordSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, li
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
 }
 
-/// A parsed symlink record. A record written before records named their
-/// repo is the bare target alone: `live_path` and `repo` are null.
+/// A parsed symlink record. An untagged record is the bare target alone:
+/// `live_path` and `repo` are null.
 pub const SymlinkRecord = struct {
     target: []const u8,
     live_path: ?[]const u8 = null,
@@ -578,7 +577,7 @@ test "recordSymlink then readSymlink round-trips the target" {
     try std.testing.expectEqualStrings("/repo/nvim with space\n", got.?);
     try std.testing.expect(try readSymlink(a, io, state_dir, "/home/me/.other") == null);
 
-    // A record written before records named their repo is the bare target.
+    // An untagged record is the bare target.
     const legacy = try parseSymlink(a, "/old/target");
     try std.testing.expectEqualStrings("/old/target", legacy.target);
     try std.testing.expect(legacy.repo == null);

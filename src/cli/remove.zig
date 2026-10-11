@@ -22,7 +22,7 @@ const max_file_bytes: usize = 64 * 1024 * 1024;
 
 const Spec = struct {
     name: cli.Pos([]const u8, .{ .help = "managed name to stop managing" }),
-    purge: cli.Flag(.{ .help = "also delete the live file (snapshotted first)" }),
+    purge: cli.Flag(.{ .help = "also delete the live file here (snapshotted first) and leave no tombstone" }),
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {

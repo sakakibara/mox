@@ -5,7 +5,7 @@
 //! records are found here and another's never are. A record of this repo
 //! is stale when no current managed file (repo or private layer, gated-off
 //! ones included) and no generator manifest names its path. A record that
-//! does not name its repo predates the tag and is never stale.
+//! names no repo is never stale.
 
 const std = @import("std");
 const applied = @import("applied.zig");
@@ -162,7 +162,7 @@ test "find: only this repo's tagged records whose path nothing keeps" {
     try applied.record(a, io, state, "/h/gone", "x", "/repo");
     try applied.record(a, io, state, "/h/other", "x", "/other-repo");
     try applied.recordSymlink(a, io, state, "/h/link", "/t", "/repo");
-    // A record written before records named their repo is never stale.
+    // An untagged record is never stale.
     const legacy = try std.fs.path.join(a, &.{ state, "applied", &applied.contentHashHex("/h/legacy") });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = legacy, .data = "0000000000000000000000000000000000000000000000000000000000000000 /h/legacy\n" });
 

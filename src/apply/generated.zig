@@ -89,8 +89,7 @@ fn leavesOf(arena: std.mem.Allocator, bytes: []const u8) ![]const []const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// The repo a manifest's bytes name, or null for one written before
-/// manifests named their repo.
+/// The repo a manifest's bytes name, or null for an untagged one.
 fn repoOf(arena: std.mem.Allocator, bytes: []const u8) !?[]const u8 {
     const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
     const first = bytes[0..nl];
@@ -148,7 +147,7 @@ pub fn manifestName(gen_live: []const u8) [64]u8 {
 /// a generator. Each orphan's listed leaves are pruned against `keep`
 /// (snapshot-first, drift-refusing, exactly like a live generator's prune),
 /// then the manifest itself is dropped. A manifest another repo tagged is
-/// left alone; one written before manifests named their repo is swept. A
+/// left alone; an untagged one is swept. A
 /// generator `.mox/attributes.toml` released has its manifest and its leaves'
 /// records forgotten, the leaves kept. Callers skip this sweep on a scoped
 /// apply (an unwalked generator is not an orphan) and in a run where any file

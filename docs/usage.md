@@ -275,25 +275,27 @@ through verbatim, and `status`, `diff`, and `commit` never even look at it.
 
 When the PROGRAM's region is the sparse one -- a settings file where you
 manage nearly everything and the program writes a key or two back -- declare
-the complement instead:
+the complement instead. A `.json` file is strict JSON, which has no comments,
+so its declaration goes in `.mox/attributes.toml` and its source stays plain
+JSON:
 
-```jsonc
-// mox: disown model
-{
-  "theme": "dark",
-  ...
-}
+```toml
+[".claude/settings.json"]
+disown = ["model"]
 ```
 
 Under `disown` the whole file is yours EXCEPT the declared subtrees: apply
 reasserts your keys and preserves the program's spans byte-for-byte, present
 or not. A declared path owns its whole subtree either way, the directives
 never reach the live file, and the full grammar and rules are in
-[dsl.md](dsl.md#file-attributes-and-head-directives).
+[dsl.md](dsl.md#file-attributes-and-head-directives). A file whose program
+reads comments (`.jsonc`, or `format = "jsonc"` for a `.json` path) declares
+in its head instead, as `// mox: disown model`.
 
 For a file that should exist only where its tool does, make the base
 directive-only: the ownership lines plus a whole-file gate, no content, with
-the owned content coming from `<name>.d/` overlays:
+the owned content coming from `<name>.d/` overlays (a strict-JSON target puts
+both in its attributes, as `own` and `when`, and needs no base at all):
 
 ```toml
 # mox: own tui.keymap.global
@@ -318,7 +320,10 @@ mox add --own tui.keymap.global --own tui.keymap.composer \
 It extracts the named subtrees' raw bytes into a new source file (your comments
 inside them survive verbatim), writes the `mox: own` directive lines at its
 head -- the declaration and the content are created together, in one file --
-and reports how much of the file remains the program's.
+and reports how much of the file remains the program's. For a strict-JSON
+file the declaration is written into `.mox/attributes.toml` instead, and the
+source is the extracted JSON alone. A `.json` live file holding comments is
+captured as JSONC, recorded as `format = "jsonc"` with a note saying why.
 When the live layout forces it, the extraction reorders spans -- a root-level
 key is placed before the block tables so it parses the same -- and the capture
 is validated three ways before anything is written: it must parse, lie entirely
@@ -338,21 +343,23 @@ mox add --own tui.keymap.global --gate "tool=codex" ~/.codex/config.toml
 ```
 
 The created source head is the ownership directives followed by the
-whole-file `mox: when` gate line, so the file applies only where the
-expression holds and stays untouched everywhere else. The expression must
+whole-file `mox: when` gate line (for strict JSON, the `when` attribute), so
+the file applies only where the expression holds and stays untouched
+everywhere else. The expression must
 parse; a malformed one is refused with the parser's diagnostic, and nothing
 is written.
 
 A named path absent from the live file is an error; a key you want kept *out*
 everywhere is declared with `--own-absent <key-path>` instead (own mode only),
 and apply then enforces its absence. A plain `mox add` of a target whose
-source head declares ownership is refused (it is managed per key-path), and
+source declares ownership is refused (it is managed per key-path), and
 `add -r` skips it.
 
-Backing out of ownership is the head edit in reverse: delete the `mox: own`
-(or `mox: disown`) lines from the source, and the next `mox apply` returns
-the file to whole-file management -- the whole composed source becomes the
-contract, drift-checked as one file.
+Backing out of ownership is the declaration edit in reverse: delete the `mox:
+own` (or `mox: disown`) lines from the source, or the `own`/`disown` key from
+a strict-JSON target's attributes, and the next `mox apply` returns the file
+to whole-file management -- the whole composed source becomes the contract,
+drift-checked as one file.
 
 ### The lifecycle
 

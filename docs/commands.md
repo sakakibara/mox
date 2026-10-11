@@ -123,6 +123,12 @@ matching the path you named and no other, so forcing an ignored
 directory still honors the rules inside it. The key-path options below
 name a location inside one file and are refused with `-r`.
 
+A `.json` live file holding comments -- valid JSONC, invalid strict
+JSON -- is captured as JSONC: add records `format = "jsonc"` for it in
+`.mox/attributes.toml` and says why on stderr. A trailing comma alone does
+not: that file is strict JSON its program reads, and the comma is its
+error.
+
 Partial ownership at onboarding:
 
 - `--own <key-path>` (repeatable) takes partial ownership of a
@@ -138,8 +144,16 @@ Partial ownership at onboarding:
   machine-gated partial file in one command. The expression must
   parse; a malformed one is refused with the parser's diagnostic.
 
-A plain `add` of a target whose source head declares ownership is
-refused.
+A strict-JSON target has no comments for head directives: its
+declaration (`own`, with every `--own-absent` path, or `disown`) and its
+gate (`when`) are written into `.mox/attributes.toml`, and its source is
+the owned content as valid JSON. A target's dialect is resolved from its
+path and attributes before any source exists.
+
+A plain `add` of a target whose source declares ownership is refused.
+Adding a path a tombstone released removes the tombstone. A command that
+would rewrite an `.mox/attributes.toml` holding a comment is refused
+before it changes anything.
 
 <!-- generated: flags add -->
 | Flag | Description |
@@ -158,26 +172,41 @@ refused.
 Rename a managed file's source (base file and its `.d/` overlay dir) so
 the live target changes on the next apply. The old source is copied
 into the timestamped trash first (recoverable); its
-`.mox/attributes.toml` entry (mode, symlink, seed-once) is carried to
-the new name; a head ownership declaration travels inside the renamed
-source, and a partial target's owned record is re-keyed -- the old live
-file keeps its owned content, like any orphaned live file. The old live
-path is not removed: apply writes the new one and leaves the old file
-orphaned, to delete yourself.
+`.mox/attributes.toml` entry is carried to the new name whole, and a move
+whose entry holds a key the new name cannot (a `format` or a
+strict-JSON directive moved to another format) is refused before
+anything moves. A tombstone at the new name is removed; a head ownership
+declaration travels inside the renamed source.
+
+mv moves no state. Every machine's next apply, this one included, writes
+the new path and converges the old one (see [dsl.md](dsl.md#sources-that-leave-the-tree)):
+an unedited old live file is removed, snapshot-first, an edited one is
+reported as drift, and an old partially owned file is left in place, no
+longer managed. A machine whose record of the old path names no repo
+keeps the old file.
 
 ## remove
 
-Stop managing a file: move its source (base + `.d/`) into
-`<state dir>/trash/<timestamp>/` recoverably and leave the live file
-orphaned. mox forgets the path's applied state, so a later re-add
-starts from first contact. `--purge` also deletes the live file,
-snapshotting it first; it is refused for a partially owned file (the
-live remainder is not mox's to delete).
+Stop managing a file and keep its live file on every machine: move its
+source (base + `.d/`) into `<state dir>/trash/<timestamp>/` recoverably,
+and leave a tombstone, `released = true`, in `.mox/attributes.toml` in
+place of its entry. Every machine's apply then forgets the path's records
+and leaves its file alone; a released generator's leaves stay too,
+forgotten. mox forgets the path's applied state here as well, so a later
+re-add starts from first contact; `mox add` or `mox mv` onto the path
+removes the tombstone, and tombstones are never pruned otherwise.
+
+`--purge` deletes the live file here, snapshotting it first (a
+generator's produced files likewise), and leaves no tombstone, so every
+other machine's apply removes its unedited copy too; it is refused for a
+partially owned file (the live remainder is not mox's to delete). A
+private-only file is forgotten here with no tombstone, its entry dropped
+from the private layer's attributes.
 
 <!-- generated: flags remove -->
 | Flag | Description |
 | --- | --- |
-| `--purge` | also delete the live file (snapshotted first) |
+| `--purge` | also delete the live file here (snapshotted first) and leave no tombstone |
 <!-- /generated -->
 
 ## apply
@@ -279,6 +308,17 @@ emptied data set, a region gated away) is removed rather than left as a
 stale copy -- snapshot-first, so `mox rollback` recovers it. One edited
 since mox wrote it is not deleted silently: it is reported as drift and
 kept until resolved. See `docs/dsl.md` (Empty output) and `keep-empty`.
+A file whose source left the tree -- deleted, moved by `mox mv`, or
+released by `mox remove` -- converges the same way (see
+[dsl.md](dsl.md#sources-that-leave-the-tree)): an unedited one is removed
+(`removed ~/x (no longer managed)`), an edited one is drift, a partially
+owned one is left in place, and a released one is forgotten. Nothing is
+swept in a path-scoped run, or in one where any file failed to compose.
+
+Every structured layer and every composed output is parsed in its format
+before anything is written (see [dsl.md](dsl.md#validation)); a file that
+does not parse is an `ERROR` line naming the layer and line, with a hint,
+and counts as a failure (exit 2).
 
 Every `scripts/pre/`/`scripts/post/` script lands under one of five labels,
 summarized on the closing line (`scripts: N ran, N skipped, N failed, N
@@ -647,7 +687,10 @@ packages entirely.
 Show a unified diff of the composed output against each live file
 (`--stat` for a per-file added/removed summary). A partially owned
 file diffs its canonical owned content only, with secret-bearing keys
-masked on both sides. Read-only and takes no lock. A difference is not
+masked on both sides. A file whose source left the tree, which apply
+would remove, shows its live content on the removed side; a file that
+does not parse in its format is an `ERROR` line on stderr, as apply
+reports it. Read-only and takes no lock. A difference is not
 an error, so a run that completes exits 0 whether or not anything
 differs; a refusal -- a path that is not managed, a malformed ownership
 declaration or `attributes.toml` -- exits 1.
@@ -682,8 +725,12 @@ Show each managed file's state: `clean`, `OUTDATED`, `DRIFT`,
 an `unbound facts:` section listing every discovered fact still
 eligible and unbound, each with its provenance -- its own section, not
 folded into the probe log. `STALE` is a file mox wrote whose source now
-composes to nothing: apply will remove it (an edited such file is
-`DRIFT` instead, kept until resolved). A partially owned file is
+composes to nothing, or whose source left the tree: apply will remove it
+(an edited such file is `DRIFT` instead, kept until resolved), or, for a
+partially owned one, leave it in place, no longer managed. `ERROR`
+includes a file whose layers or output do not parse in its format, with
+the layer and line and a hint, and a file whose `.mox/attributes.toml`
+entry breaks the schema. A partially owned file is
 classified on its owned content only, so the program's writes on the
 other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 `MISSING`, `STALE`, or `ERROR`.
@@ -805,7 +852,9 @@ not a whole live file. Read-only wrt mox state; the walk-away guarantee and CI
 parity input.
 
 Everything composes before anything is written, so a run that cannot
-compose every file reports them and writes nothing: an export is a
+compose every file -- one whose layers or output do not parse in its
+format is an `ERROR` line, as apply reports it -- reports them and writes
+nothing: an export is a
 deliverable, and a tree that silently lacks a file is worse than no
 tree. Composing still happens exactly once, which matters because a
 second pass would resolve every `op://` secret again -- another round

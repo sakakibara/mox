@@ -6,14 +6,20 @@ lines. The normative grammar is in `dsl-grammar.ebnf`; this page is the
 practical tour: every directive, with the rules that govern it.
 
 A directive is a comment line whose body starts with `mox:`. The comment
-marker is the file's own line-comment lead, inferred from extension, shebang,
-or an apparent directive line:
+marker is the file's own line-comment lead: a structured format's own (`#` for
+TOML, YAML, INI and gitconfig, `//` for JSONC), and for any other file the one
+inferred from extension, shebang, or an apparent directive line:
 
 ```
 # mox: when os=darwin        (shell, toml, gitconfig, python, ...)
 -- mox: replace "work.lua"   (lua, sql)
-// mox: include "extra.js"   (js, ts, c, ...)
+// mox: include "extra.js"   (js, ts, jsonc, c, ...)
 ```
+
+Strict JSON has no comments, so a `.json` source carries no directive at
+all: its ownership, gate and interview defaults live in
+`.mox/attributes.toml` (see File attributes and head directives), and its
+captures inside string values (see Captures in JSON).
 
 ## Line directives
 
@@ -26,6 +32,10 @@ One line, no body.
 | `default <name>="<value>"` | Declare the interview default for fact `<name>`; stripped from output, never gates or emits anything. `<name>` is `[a-z][a-z0-9_]*`. |
 | `keep-empty` | Materialize the file even when it composes to nothing, instead of omitting it (see Empty output). No arguments; stripped from output. |
 
+None of these is written in strict JSON: a secret there is a `<secret:URI>`
+capture inside a string, an interview default the `defaults` attribute, a
+fragment an overlay, and `keep-empty` is never needed.
+
 ## Empty output
 
 A file that composes to nothing is not written: an empty render means "no
@@ -37,11 +47,13 @@ already produce zero files.
 Three kinds of file are exempt. A file mox infers **no comment marker** for,
 so it could not carry a directive in the first place: a genuinely empty
 `.hushlogin` or `.keep` is written verbatim as an empty file. A structured
-file (`.toml`, `.json`, `.yaml`, `.yml`, `.ini`, gitconfig), which composes
-through the structural path rather than the region one. And a partially owned
-file (an `own`/`disown` head): mox patches only its declared keys into a file
-a program also writes, so an empty render there means "mox owns nothing here",
-not "no file".
+file (`.toml`, `.json`, `.jsonc`, `.yaml`, `.yml`, `.ini`, gitconfig) that
+composes through the structural path rather than the region one -- strict
+JSON always does, and an empty JSON document is no document, so an empty
+`.json` base is refused instead (write `{}`). And a partially owned file
+(`own`/`disown`): mox patches only its declared keys into a file a program
+also writes, so an empty render there means "mox owns nothing here", not "no
+file", and is exempt from format validation too.
 
 Note what the first exemption is NOT: it is the absence of an inferred comment
 marker, not the absence of directives. An empty `.sh`, `.zsh`, `.conf`, `.lua`
@@ -81,7 +93,7 @@ parser reads it, so `when(os=darwin)` nests like `when os=darwin`, and an
 | `when <axis>` | Emit the body only when the axis matches. |
 | `for <var> in <source> [when <axis>] [where <row>] [into "<path>"]` | Repeat the body once per data row; `into` makes the file a generator (see Generator directives). |
 
-A structurally merged source (a `.toml`, `.json`, `.yaml`, `.yml`, `.ini` or
+A structurally merged source (a `.toml`, `.jsonc`, `.yaml`, `.yml`, `.ini` or
 gitconfig file with `.d/` overlays) cannot carry a region directive in any of
 its layers, base or overlay, whether or not the layer matches the machine
 composing: in a merge a directive line is only a comment, so the region's
@@ -94,6 +106,12 @@ scan runs before either decides the file is absent. A line
 that reads as a directive is one wherever it sits, a string value included:
 the DSL reads comment lines, not the format. Gate such content with an
 overlay instead, or keep the file single-layer.
+
+Strict JSON reads its layers as JSON instead: any comment in a `.json` layer
+is refused, a `mox:` one naming where its directive lives (the attributes key
+for `own`, `disown`, `check`, a leading `when` and `default`; an overlay
+`<file>.d/<axis>.json` for a region or `include`; a `<secret:URI>` capture
+for `secret`), and a string that merely spells `// mox:` is content.
 
 The rule reads the same way from the other side. An axis-named `.d/` file is
 an overlay only where a category has layers to fold or to pick from: a
@@ -280,7 +298,8 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   private layer shadows the repo, exactly as `mox data` resolves it).
   `KEY` is a top-level key; `<data.FILE.TABLE.KEY>` reads a scalar one table
   deep. Only these two depths exist. A string renders as its exact bytes, an
-  integer/bool as its TOML literal. A missing file or key is a compose error
+  integer/bool as its TOML literal; a JSON string that is the capture alone
+  emits the value in its own JSON type (see Captures in JSON). A missing file or key is a compose error
   unless a `default` rescues it; a non-scalar value (array/table) is always an
   error, even with a default.
 - `<a | b | c>` - a chain: first non-empty member wins.
@@ -314,6 +333,36 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
 Captures must not be adjacent (`<a><b>`) and a name must not repeat within one
 template; both are compose-time errors. A malformed `data.` capture (`<data.x>`
 or one nested deeper than a table) is rejected up front.
+
+### Captures in JSON
+
+In a JSON or JSONC source a capture lives inside a string token, and expands
+per token: the string is decoded (so `"<a | default \"x\">"` is the capture
+`<a | default "x">`), expanded, and written back as a JSON string, with every
+`"`, `\` and control byte in the resolved value escaped. A Windows path, a
+quote in a secret, or a newline in a fact value cannot break the document,
+and the expansion never adds a line. A string with no capture, and every byte
+outside a capture-bearing string -- structure, whitespace, a JSONC comment --
+is left exactly as written, so a capture-free file composes byte for byte;
+a capture inside a comment is not expanded.
+
+A string value (not a key) that is exactly one `<data.FILE.KEY>` capture,
+with no chain and no default, emits the scalar in its own JSON type:
+
+```json
+{ "port": "<data.server.port>", "debug": "<data.server.debug>" }
+```
+
+composes to `{ "port": 8080, "debug": false }` when `data/server.toml` holds
+`port = 8080` and `debug = false`. A TOML integer or float becomes a number, a
+bool a bool, a string a string, and a date-time stays a string. The type is
+the value's as resolved, so a private `data/` file that shadows it with
+another TOML type changes the emitted type too; store a TOML string to keep a
+string. Anything else -- a chain, a default, text around the capture, a key
+-- is a string. A key capture that expands to a key its object already holds
+is refused (see Validation). A capture written outside a string
+(`"port": <data.server.port>`) is not JSON and is refused, with the hint to
+quote it.
 
 A resolved secret is kept out of mox's own on-disk state, but `mox export`
 bakes the resolved cleartext into every file it writes -- that flat tree is the
@@ -526,18 +575,44 @@ never a silent skip.
 
 A body expresses content, not metadata: a managed file still has a mode, may
 be a symlink or seeded once, and may be owned only in part, and none of that
-can be written inside it. mox has no filename prefix for any of these.
-Filesystem metadata git cannot carry lives in `.mox/attributes.toml`; the
-ownership contract is content semantics and lives in the source file itself,
-as head directives.
+can be written inside it as content. mox has no filename prefix for any of
+these. Filesystem metadata git cannot carry lives in `.mox/attributes.toml`.
+The ownership contract, the whole-file gate and interview defaults are the
+file's own directives, written in its leading comment block as head
+directives -- where the format has comments. Strict JSON has none, so a
+`.json` target's directives are attributes instead:
+
+| Target | `own` / `disown` / `check` | whole-file `when` | `default` |
+|---|---|---|---|
+| TOML, YAML, INI, gitconfig | head directive, `#` | head directive, `#` | line directive, `#` |
+| JSONC (`.jsonc`, or `format = "jsonc"`) | head directive, `//` | head directive, `//` | line directive, `//` |
+| strict JSON (`.json`) | `own` / `disown` / `check` attribute | `when` attribute | `defaults` attribute |
+| any other text file | not allowed | head directive, its marker | line directive, its marker |
+
+Each file has one home for its directives: a directive attribute on any
+target but strict JSON is refused ("write it as a head directive in the
+file"), and a `mox:` comment in strict JSON is refused naming its attribute.
 
 ### Attributes (`.mox/attributes.toml`)
+
+An entry is keyed by the target's home-relative key:
+
+```toml
+[".ssh/config"]
+mode = "0600"
+
+[".claude/settings.json"]
+disown = ["model", "autoMode", "feedbackDrafts"]
+
+[".config/Code/User/settings.json"]
+format = "jsonc"
+```
 
 - **Mode.** The target's mode is the source file's own permission bits: `chmod
   +x` the source and git carries the exec bit (git round-trips 0644 and 0755
   across a clone). A mode git cannot carry -- anything other than 0644 or 0755,
-  such as 0600 or 0444 -- is recorded in `.mox/attributes.toml`, since git
-  collapses it to 0644 on clone.
+  such as 0600 or 0444 -- is recorded as `mode`, since git collapses it to 0644
+  on clone.
 - **Symlink.** `mox add` of a live symlink stores the link target as the source
   content and flags `symlink = true`. Apply plants a symlink at the live path.
   The target is ordinary composed content, so it can vary by axis or interpolate
@@ -545,16 +620,35 @@ as head directives.
 - **Seed-once.** `mox add --seed-once` records `seed_once = true`. Apply writes
   the target only when it is absent and never overwrites, drift-checks, or
   commits an existing one -- for a machine-local skeleton the user then edits.
+- **Format.** A `.json` target is strict JSON. `format = "jsonc"` reads one as
+  JSON with comments and trailing commas, for a program that reads them (VS
+  Code's `settings.json`, `tsconfig.json`); a `.jsonc` file is JSONC by its
+  name. No other `format` value, and no other path, is accepted.
+- **Directives of a strict-JSON target.** `own` and `disown` are lists of
+  key-paths, exclusive as their head forms are; `check` is the argv list the
+  `check` head directive takes, and requires `own` or `disown` in the same
+  entry; `when` is an axis expression, the whole-file gate; `defaults` is a
+  table of fact name to interview default (`defaults = { profile = "work" }`),
+  as `default` lines declare. Fact discovery and the axis inventory read
+  them exactly as they read head directives.
+- **Released.** `released = true` is the tombstone `mox remove` leaves (see
+  Sources that leave the tree). It takes no other key.
 
-`.mox/attributes.toml` is maintained by mox (`add`, `mv`, `remove`); commands
-that re-key or drop entries rewrite it deterministically.
+An entry that breaks the schema -- an unknown key, a wrong type, a directive
+key on a target that is not strict JSON -- is that file's error alone: it is
+reported as the file's `ERROR`, and every other file still applies. A file
+that is not valid TOML stops the run.
+
+The file is maintained by mox (`add`, `mv`, `remove`): commands that write
+entries rewrite it deterministically, so it carries no comments. A command
+that would rewrite a file holding one is refused before it changes anything
+("comments here would be lost; remove them").
 
 ### Head directives (partial ownership)
 
-A structured source file declares its ownership contract in its LEADING
+A source file with comments declares its ownership contract in its LEADING
 comment block -- recognized after an optional shebang and before the first
-content line, one directive per line, in the file's comment marker (`#`
-everywhere, `//` for JSONC):
+content line, one directive per line, in the format's comment marker:
 
 ```toml
 # mox: own tui.keymap.global
@@ -567,6 +661,14 @@ everywhere, `//` for JSONC):
 ```jsonc
 // mox: disown model
 { ... }
+```
+
+A strict-JSON target declares the same contract in its attributes, and its
+source is the JSON alone:
+
+```toml
+[".claude/settings.json"]
+disown = ["model"]
 ```
 
 - **`own <path>`** (repeatable; the rest of the line is ONE key-path)
@@ -585,19 +687,21 @@ everywhere, `//` for JSONC):
 The directives never reach composed output: compose strips exactly the
 recognized lines from the base text, so the live file a program reads contains
 no mox syntax. Overlays cannot declare ownership; the contract is the file's,
-machine-independent, stated once at its head. A whole-file gate shares the
-same leading block, before or after the ownership lines -- the whole block is
-read in one pass, and the gate holds as long as only consumed directive lines
-precede it.
+machine-independent, stated once. A whole-file gate shares the same leading
+block, before or after the ownership lines -- the whole block is read in one
+pass, and the gate holds as long as only consumed directive lines precede it.
 
-The base may consist of nothing BUT its leading block: ownership directives,
-an optional `check`, an optional whole-file gate, zero content. Overlays in
-`<name>.d/` then supply all owned content, per machine. (This is general
-structured-merge behavior: a blank base -- or blank first layer -- of a
-multi-layer structured file composes from the remaining layers.) This is the
-way to declare ownership for a machine-gated file: the contract and the gate
-live in the base, the per-machine content in overlays, and a machine where the
-gate fails leaves the live file (and mox's records) completely untouched.
+A base may hold no content of its own: a TOML, YAML, INI or gitconfig base may
+consist of nothing BUT its leading block (ownership directives, an optional
+`check`, an optional whole-file gate), and a JSONC base is that block and
+`{}`, since an empty JSON document is no document. A strict-JSON target needs
+no base at all: its attributes entry and its overlays are a complete file, and
+a base it does have is `{}` or real content -- an empty one is refused. The
+overlays in `<name>.d/` then supply all owned content, per machine. This is
+the way to declare ownership for a machine-gated file: the contract and the
+gate live in the base (or the attributes), the per-machine content in
+overlays, and a machine where the gate fails leaves the live file (and mox's
+records) completely untouched.
 
 A key-path is TOML dotted-key syntax, verbatim: bare segments
 (`A-Za-z0-9_-`), `"..."`/`'...'`-quoted segments, whitespace allowed around
@@ -610,7 +714,7 @@ declared path itself. An owned YAML scalar that does not render on one
 line (a multiline string value) refuses the file rather than reflowing
 it. Reasserted owned content renders with LF line endings even in a CRLF
 live file; every remainder byte, CRLF included, is preserved untouched.
-Ownership requires a structured target (TOML, JSON, YAML, INI,
+Ownership requires a structured target (TOML, JSON, JSONC, YAML, INI,
 gitconfig) and cannot combine with `symlink`, `seed_once`, or a generator
 source. Under `own`, the composed source must lie entirely within the
 declaration -- a composed leaf outside every declared path is a per-file
@@ -624,9 +728,15 @@ A change to the declared list is first contact for the affected content: an
 adopted when it already matches the source, and reported as drift otherwise;
 a `disown` path you add simply stops being compared.
 
+A partially owned target's live file is read in the target's format and
+dialect: a strict-JSON live file holding a comment or a trailing comma is
+refused with a hint, since mox cannot patch what it cannot preserve, and its
+program would reject it too unless it reads JSONC.
+
 ### Check hook
 
-`check "<repo-relative executable>" ["arg" ...]`
+`check "<repo-relative executable>" ["arg" ...]` (a strict-JSON target's
+`check = ["<exe>", "arg", ...]` attribute)
 validates every candidate partial write before it lands (apply and rollback
 both run it). The executable is spawned directly with the argv given -- no
 shell -- with cwd at the repo root; a `.ps1` checker runs under PowerShell
@@ -642,6 +752,130 @@ tool that resolves sibling files must be wrapped by the checker script.
 `check` executes repo-authored code at apply time -- the same authority as
 `scripts/`, with the same opt-out: under `--skip-scripts` the hook does not
 run and the check-bearing file is not written.
+
+## JSON and JSONC
+
+A `.json` target is strict RFC 8259 JSON: no comments, no trailing commas, the
+format its programs read. A `.jsonc` target, or a `.json` one whose attributes
+set `format = "jsonc"`, is JSON with comments, and is structured just the
+same: its layers merge, it can be partially owned, and `mox commit` writes
+edits back into it. Every layer, overlay and fragment of a target, and its
+live file, is read in the target's dialect.
+
+A single layer passes through as written, comments and formatting included,
+with only its capture-bearing strings rewritten. A multi-layer composition
+re-emits the merged document as plain pretty-printed JSON, in either dialect,
+so comments survive only the single-layer pass-through. `mox commit` writes a
+strict-JSON source back as strict JSON, never introducing a comment or a
+trailing comma, and refuses one that does not parse strictly before editing
+it.
+
+## Validation
+
+Every structured layer is parsed in its target's format and dialect before it
+composes: the base after its head pass (a line named in the error is the line
+the source file has it on), and every overlay, private ones included,
+matching this machine or not -- a broken layer is the repo's problem on every
+machine. Every composed output is then parsed again after capture expansion.
+The parsers are mox's own for each format: JSON or JSONC, TOML, YAML 1.2.2
+(a stream, so zero or several documents are as valid as one), and INI, in the
+gitconfig dialect for gitconfig. A generic INI file may hold a bare key
+(`skip-networking` in a `my.cnf`).
+
+Some layers are no document until composed, and are checked through the
+output instead: an `include` fragment (a member snippet such as
+`\tsigningkey = ...`), a non-JSON layer holding a capture (TOML's
+`label = "<a | default "x">"`, or a bare `port = <data.u.port>`), a non-JSON
+layer holding a region (alternate regions may repeat a key), and a JSONC layer
+composed through its regions or loops. A strict-JSON layer has no such case:
+its captures live inside strings, and it has no regions.
+
+In the JSON family, a duplicate object key is refused where mox could have
+made it: in a layer of a multi-layer merge, which parsing would silently
+reduce to its last value, and in output where a key capture expanded. A
+single layer with no key capture is passed to its program as written: JSON
+permits duplicate keys, and what they mean is the program's call.
+
+A failure is that file's `ERROR` in `apply`, `status`, `diff` and `export`,
+and nothing of it reaches the live tree:
+
+```
+ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml as disown = ["..."] for this file)
+ERROR ~/app.toml (composed output line 2 from src/app.toml and src/app.toml.d/os=darwin.toml: <redacted>)
+```
+
+The location is `<layer>:<line>:<col>` for a layer and `composed output line
+<n> from <layers>` for output. A line carrying a resolved secret is never
+quoted: its message reads `<redacted>`. A strict-JSON failure carries a hint
+by its cause: the replacement for a mox directive (see Region directives);
+`format = "jsonc"` for any other comment; removing a trailing comma; `{}` for
+an empty file; quoting a bare capture. An empty partial render ("mox owns
+nothing here") is exempt.
+
+## Sources that leave the tree
+
+Every record mox keeps of a file it wrote names the repo it came from (the
+repo root's real path), so one repo's records are never mistaken for
+another's when several `MOX_REPO`s share a state directory. After the walk,
+`mox apply` finds this repo's records whose path no managed file -- repo or
+private layer, gated-off ones included, since a gate is not removal -- and no
+generator manifest names: a source that was deleted, moved, or released.
+
+- An unedited whole file or symlink is removed, snapshot-first, so `mox
+  rollback` recovers it; an edited one is drift, kept until `mox apply
+  --overwrite`; one already gone is forgotten.
+- A partially owned file is never removed, since the rest of it is the
+  program's: it is reported once as no longer managed, left in place, and
+  its records forgotten.
+- A released path is forgotten and never removed, a `.moxignore`-matched one
+  left alone, and one that is the same file as a managed path (a case-only
+  rename on a case-insensitive filesystem, or a hardlink) forgotten with
+  nothing removed.
+
+`mox status` reports such a file `STALE` (an edited one `DRIFT`), and `mox
+diff` shows a pending removal. Nothing is swept -- by this sweep or by the
+sweep of an orphaned generator's leaves -- in a path-scoped apply, or in a run
+where any file failed to compose or carried a head error: a failure at a
+moved path must not remove the old path's file before the new one is
+written. A record that names no repo -- a one-line whole-file record, a
+bare symlink target, an owned record without `repo` -- is never swept; apply
+tags the record of every file it still produces, unchanged ones included.
+
+`mox mv` therefore moves no state: every machine's next apply, this one
+included, removes the old live file (or reports it as drift) and writes the
+new one. `mox remove` leaves a tombstone, `released = true`, in
+`.mox/attributes.toml`: every machine's apply forgets the path's records --
+a released generator's leaves included -- and keeps its live file. A
+tombstone is one line and is never pruned, since mox cannot know when every
+machine has applied; `mox add` or `mox mv` onto the path removes it, and a
+source back at a released path without one is that file's error. `mox remove
+--purge` deletes the live file here and leaves no tombstone, so other
+machines' applies remove their unedited copies too.
+
+## Private layer
+
+The private layer is `<state dir>/private/`, machine-local and never
+committed. It mirrors `src/`: its overlays, regions and fragments compose over
+the repo's sources at the same path, and its `data/` shadows the repo's.
+Its attributes are `<state dir>/private/.mox/attributes.toml`; neither
+`data/` nor `.mox/` is ever walked as a source.
+
+- A private-only path (one the repo does not manage) is the private layer's
+  alone, and its entry may set any key.
+- For a path the repo manages, a private entry may set only `mode`, which
+  wins over the repo's mode and over the automatic 0600 for an `op://` or
+  `pass://` secret -- the way to keep a file private on one machine, such as
+  one a private overlay adds a `cmd:` secret to. Any other key there is that
+  file's error.
+- A private base at a path the repo manages is an error naming both: vary
+  the repo's file with a private overlay instead.
+- A private overlay defining content under a path the repo disowns is
+  refused, naming the overlay.
+
+The private layer's gates and defaults reach fact discovery like the repo's,
+so a fact only a private source compares is still asked. `mox remove` of a
+private-only file forgets it here and writes no tombstone, editing the
+private attributes, not the repo's.
 
 ## Concurrency and snapshots
 
