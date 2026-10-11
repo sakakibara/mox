@@ -1310,7 +1310,7 @@ fn commitRun(
         },
         error.TomlParseError,
         => {
-            try ctx.err.print("mox commit: .mox/attributes.toml: not valid TOML\n", .{});
+            try ctx.err.print("mox commit: {s}\n", .{try mox.source.attributes.parseFailure(ctx.alloc, ctx.io, context.paths.repo_dir)});
             return 1;
         },
         else => return e,

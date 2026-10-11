@@ -121,7 +121,7 @@ pub fn walkTreeOrReport(ctx: *app.Ctx, cmd: []const u8, src_dir: []const u8, hom
         },
         error.TomlParseError,
         => {
-            try ctx.err.print("{s}: .mox/attributes.toml: not valid TOML\n", .{cmd});
+            try ctx.err.print("{s}: {s}\n", .{ cmd, try mox.source.attributes.parseFailure(ctx.alloc, ctx.io, ctx.context.?.paths.repo_dir) });
             return null;
         },
         error.ReservedAxisName => {

@@ -78,7 +78,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             },
             error.TomlParseError,
             => blk: {
-                try ctx.err.print("mox rollback: warning: .mox/attributes.toml: not valid TOML; whole-file restores proceed, partial targets cannot be re-patched\n", .{});
+                try ctx.err.print("mox rollback: warning: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{try mox.source.attributes.parseFailure(ctx.alloc, ctx.io, context.paths.repo_dir)});
                 break :blk null;
             },
             else => return e,

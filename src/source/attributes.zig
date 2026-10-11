@@ -315,7 +315,16 @@ fn validFactName(s: []const u8) bool {
     return true;
 }
 
-const directive_home = "a directive key belongs to a strict-JSON target; write it as a head directive in the file";
+/// Why `e`'s directive keys cannot be held for a target that is not strict
+/// JSON, naming the first one.
+fn directiveHome(e: Entry) []const u8 {
+    const tail = " is a directive key, which only a strict-JSON target takes; write it as a head directive in the file";
+    if (e.ownership == .own) return "own" ++ tail;
+    if (e.ownership == .disown) return "disown" ++ tail;
+    if (e.check.len > 0) return "check" ++ tail;
+    if (e.when != null) return "when" ++ tail;
+    return "defaults" ++ tail;
+}
 
 /// Parse one entry's table. A schema violation is recorded in `err`, with the
 /// fields read so far kept, never returned as an error.
@@ -381,7 +390,7 @@ fn parseEntry(arena: std.mem.Allocator, key: []const u8, tbl: anytype) !Entry {
         e.paths = l;
     }
     if (e.check.len > 0 and e.ownership == .none) return failedText(arena, e, "check requires own or disown in the same entry");
-    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return failedText(arena, e, directive_home);
+    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return failedText(arena, e, directiveHome(e));
     if (e.released and (e.mode != null or e.symlink or e.seed_once or e.jsonc or e.hasDirectives()))
         return failedText(arena, e, "released = true is a tombstone and takes no other keys");
     return e;
@@ -392,7 +401,7 @@ fn parseEntry(arena: std.mem.Allocator, key: []const u8, tbl: anytype) !Entry {
 /// -- checked as `load` checks them.
 pub fn invalidAt(e: Entry, key: []const u8) ?[]const u8 {
     if (e.jsonc and !format_mod.isJsonPath(key)) return "format = \"jsonc\" applies only to a .json path";
-    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return directive_home;
+    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return directiveHome(e);
     return null;
 }
 
@@ -458,6 +467,30 @@ pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Attributes 
         try attrs.set(entry.key_ptr.*, e);
     }
     return attrs;
+}
+
+/// Where and why `<repo_dir>/.mox/attributes.toml` is not valid TOML:
+/// `.mox/attributes.toml:<line>:<col>: <reason>`.
+pub fn parseFailure(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]const u8 {
+    const generic = ".mox/attributes.toml: not valid TOML";
+    const path = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "attributes.toml" });
+    const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_bytes)) catch return generic;
+    var errs: std.ArrayList(toml.Diagnostic) = .empty;
+    _ = toml.parse(arena, content, .{ .errors = &errs }) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            if (errs.items.len == 0) return generic;
+            const start: usize = @min(@as(usize, @intCast(errs.items[0].span.start)), content.len);
+            var line: usize = 1;
+            var line_start: usize = 0;
+            for (content[0..start], 0..) |c, i| if (c == '\n') {
+                line += 1;
+                line_start = i + 1;
+            };
+            return std.fmt.allocPrint(arena, ".mox/attributes.toml:{d}:{d}: {s}", .{ line, start - line_start + 1, errs.items[0].message });
+        },
+    };
+    return generic;
 }
 
 /// `load`, refusing a file any entry of which breaks the schema: the

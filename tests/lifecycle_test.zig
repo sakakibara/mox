@@ -6059,3 +6059,21 @@ test "diff: a broken attributes entry is a refusal, exit 1, with or without a so
     try std.testing.expectEqual(@as(u8, 1), d2.rc);
     try std.testing.expect(lineWith(d2.err, "ERROR", "~/.nosource"));
 }
+
+test "attributes: a directive key on a non-JSON target is named, and a TOML error has its line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "a = 1\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\ndisown = [\"a\"]\n");
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s.out, "~/app.toml", "disown is a directive key, which only a strict-JSON target takes"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\nmode = \"0600\"\nmode =\n");
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: .mox/attributes.toml:3:") != null);
+}
