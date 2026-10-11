@@ -75,6 +75,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.err.print("mox remove: {s}: not managed\n", .{name});
         return 1;
     };
+    if (repo_file) |rf| {
+        if (fileops.privateVaries(merged, rf)) {
+            try ctx.err.print("mox remove: {s}: the private layer still varies this file; remove its private overlays first\n", .{name});
+            return 1;
+        }
+    }
 
     // A partial target's live file is mostly the program's: purging would
     // delete the remainder mox never owned. Plain remove stops managing it.
@@ -158,7 +164,15 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     {
         const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
         if (prior.len > 0 and !purge) {
+            // A leaf another producer still writes keeps its records.
+            var claimed: std.StringHashMap(void) = .init(ctx.alloc);
+            for (merged.files) |f| {
+                if (std.mem.eql(u8, f.live_path, live_path)) continue;
+                try claimed.put(f.live_path, {});
+                for (try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, f.live_path)) |leaf| try claimed.put(leaf, {});
+            }
             for (prior) |leaf| {
+                if (claimed.contains(leaf)) continue;
                 try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, leaf);
                 try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, leaf);
             }

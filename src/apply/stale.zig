@@ -32,13 +32,16 @@ pub const Candidate = struct {
     target: []const u8 = "",
 };
 
-/// Every stale record of `repo`, one per live path, sorted by path. `keep`
-/// holds the live paths the tree and the generator manifests name.
+/// Every stale record of `repo` under `home`, one per live path, sorted by
+/// path. `keep` holds the live paths the tree and the generator manifests
+/// name. A record outside `home` belongs to a run with another HOME and is
+/// never a candidate.
 pub fn find(
     arena: std.mem.Allocator,
     io: Io,
     state_dir: []const u8,
     repo: []const u8,
+    home: []const u8,
     keep: *const std.StringHashMap(void),
 ) ![]Candidate {
     var seen = std.StringHashMap(void).init(arena);
@@ -46,7 +49,7 @@ pub fn find(
 
     for (try recordBytes(arena, io, state_dir, "applied-owned", 64 * 1024 * 1024)) |bytes| {
         const rec = (try applied.parseOwned(arena, bytes)) orelse continue;
-        if (!tagged(rec.repo, repo) or rec.live_path.len == 0) continue;
+        if (!tagged(rec.repo, repo) or !underHome(rec.live_path, home)) continue;
         if (keep.contains(rec.live_path) or seen.contains(rec.live_path)) continue;
         try seen.put(rec.live_path, {});
         try out.append(arena, .{ .live_path = rec.live_path, .kind = .owned });
@@ -54,20 +57,40 @@ pub fn find(
     for (try recordBytes(arena, io, state_dir, "applied-symlink", 1024 * 1024)) |bytes| {
         const rec = try applied.parseSymlink(arena, bytes);
         const live = rec.live_path orelse continue;
-        if (!tagged(rec.repo, repo)) continue;
+        if (!tagged(rec.repo, repo) or !underHome(live, home)) continue;
         if (keep.contains(live) or seen.contains(live)) continue;
         try seen.put(live, {});
         try out.append(arena, .{ .live_path = live, .kind = .symlink, .target = rec.target });
     }
     for (try recordBytes(arena, io, state_dir, "applied", 1024 * 1024)) |bytes| {
         const rec = (try applied.parseWhole(arena, bytes)) orelse continue;
-        if (!tagged(rec.repo, repo)) continue;
-        if (keep.contains(rec.live_path) or seen.contains(rec.live_path)) continue;
+        if (!tagged(rec.repo, repo) or !underHome(rec.live_path, home)) continue;
+        if (keep.contains(rec.live_path)) continue;
+        // A path holding both a whole-file and a symlink record is judged by
+        // what the record of its live kind says.
+        if (seen.contains(rec.live_path)) {
+            for (out.items) |*c| {
+                if (c.kind == .symlink and std.mem.eql(u8, c.live_path, rec.live_path) and !isSymlink(io, c.live_path)) {
+                    c.* = .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash };
+                }
+            }
+            continue;
+        }
         try seen.put(rec.live_path, {});
         try out.append(arena, .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash });
     }
     std.mem.sort(Candidate, out.items, {}, lessByPath);
     return out.toOwnedSlice(arena);
+}
+
+fn underHome(path: []const u8, home: []const u8) bool {
+    if (home.len == 0 or path.len <= home.len or !std.mem.startsWith(u8, path, home)) return false;
+    return std.fs.path.isSep(path[home.len]) or std.fs.path.isSep(home[home.len - 1]);
+}
+
+fn isSymlink(io: Io, path: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
 }
 
 fn tagged(rec_repo: ?[]const u8, repo: []const u8) bool {
@@ -113,7 +136,7 @@ pub const Verdict = enum {
 /// live path the tree manages that exists.
 pub fn judge(arena: std.mem.Allocator, io: Io, c: Candidate, tree_inodes: *const std.AutoHashMap(u128, void)) !Verdict {
     const st = Io.Dir.cwd().statFile(io, c.live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
-        error.FileNotFound => return .gone,
+        error.FileNotFound, error.NotDir => return .gone,
         else => return .special,
     };
     if (tree_inodes.contains(@intCast(st.inode))) return .same_file;
@@ -168,7 +191,8 @@ test "find: only this repo's tagged records whose path nothing keeps" {
 
     var keep = std.StringHashMap(void).init(a);
     try keep.put("/h/kept", {});
-    const got = try find(a, io, state, "/repo", &keep);
+    const got = try find(a, io, state, "/repo", "/h", &keep);
+    try testing.expectEqual(@as(usize, 0), (try find(a, io, state, "/repo", "/elsewhere", &keep)).len);
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualStrings("/h/gone", got[0].live_path);
     try testing.expectEqual(Kind.whole, got[0].kind);

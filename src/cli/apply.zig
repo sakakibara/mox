@@ -1894,7 +1894,7 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
     const context = ctx.context.?;
     const stale = mox.apply.stale;
     const home = context.paths.home;
-    const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, in.repo, in.keep);
+    const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, in.repo, home, in.keep);
     if (cands.len == 0) return;
     var live_paths: std.ArrayList([]const u8) = .empty;
     for (in.tree) |f| try live_paths.append(ctx.alloc, f.live_path);

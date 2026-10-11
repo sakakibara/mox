@@ -72,6 +72,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         return 1;
     };
 
+    const merged = try mox.private.layer.merge(ctx.alloc, ctx.io, tree, context.paths.private_dir, context.paths.home);
+    if (fileops.privateVaries(merged, file)) {
+        try ctx.err.print("mox mv: {s}: the private layer still varies this file; move or remove its private overlays first\n", .{old_name});
+        return 1;
+    }
+
     const new_base_rel = try fileops.newBaseRel(ctx.alloc, new_live, context.paths.home);
     // A destination with a `..` segment would rename the source outside the repo
     // (path.join does not normalize) -- refuse the escape.

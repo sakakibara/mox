@@ -21,6 +21,13 @@ pub fn findByLive(tree: mox.source.tree.ManagedTree, live_path: []const u8) ?Man
     return null;
 }
 
+/// True when the private layer adds overlays or regions to the repo file
+/// `repo_file` in the merged tree `merged`.
+pub fn privateVaries(merged: mox.source.tree.ManagedTree, repo_file: ManagedFile) bool {
+    const m = findByLive(merged, repo_file.live_path) orelse return false;
+    return m.overlays.len != repo_file.overlays.len or m.regions.len != repo_file.regions.len;
+}
+
 /// Absolute path of a file's `.d/` overlay directory, or null when the file
 /// has no overlays/regions. For a based file it sits beside the base; for an
 /// orphan `.d/` it is the parent of the first overlay/fragment.

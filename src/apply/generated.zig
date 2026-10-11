@@ -179,7 +179,10 @@ pub fn sweepOrphans(
         if (opts.released) |rel| {
             if (rel.contains(name)) {
                 if (!opts.dry_run) {
-                    for (leaves) |leaf| try forgetRecords(arena, io, opts.state_dir, leaf);
+                    for (leaves) |leaf| {
+                        if (keep.contains(leaf)) continue;
+                        try forgetRecords(arena, io, opts.state_dir, leaf);
+                    }
                     Io.Dir.cwd().deleteFile(io, path) catch {};
                 }
                 continue;

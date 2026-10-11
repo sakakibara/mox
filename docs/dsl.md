@@ -819,7 +819,8 @@ repo root's real path), so one repo's records are never mistaken for
 another's when several `MOX_REPO`s share a state directory. After the walk,
 `mox apply` finds this repo's records whose path no managed file -- repo or
 private layer, gated-off ones included, since a gate is not removal -- and no
-generator manifest names: a source that was deleted, moved, or released.
+generator manifest names: a source that was deleted, moved, or released. A
+record whose path lies outside this run's HOME is never a candidate.
 
 - An unedited whole file or symlink is removed, snapshot-first, so `mox
   rollback` recovers it; an edited one is drift, kept until `mox apply

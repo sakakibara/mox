@@ -398,8 +398,8 @@ fn composeYaml(
         return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
-    // Same blank-seed rule as JSON: a directive-only base leaves no
-    // parseable document, so the first overlay seeds the merge.
+    // A directive-only base leaves no YAML document to parse, so the first
+    // overlay seeds the merge.
     const blank = std.mem.trim(u8, hd.body, " \t\r\n").len == 0;
     var merged: yaml.Value = if (blank)
         try parseYamlFile(arena, io, layers[1])

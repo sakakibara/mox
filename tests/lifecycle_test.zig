@@ -398,7 +398,7 @@ test "status: an unbound, unconditioned dimension gets its own section with prov
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\n[core]\n\tx = 1\n# mox: end\n");
 
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "\nunbound facts:\n  profile (1 source)\n") != null);
@@ -413,7 +413,7 @@ test "status: a bound fact is never listed as unbound" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\n[core]\n\tx = 1\n# mox: end\n");
     try tmp.dir.createDirPath(io, "home/.config/mox");
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"work\"\n" });
 
@@ -1568,7 +1568,7 @@ test "doctor: a bound fact this repo's sources actually consume is never flagged
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\nx = 1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when profile=work\n[core]\n\tx = 1\n# mox: end\n");
     const facts_path = try h.homePath(".config/mox/facts.toml");
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "profile = \"work\"\n" });
@@ -1591,7 +1591,7 @@ test "doctor: an unused fact close to an unbound dimension's name bridges as a p
     const h = try setup(a, io, &tmp, null);
     // "persona" (unbound dimension) vs "personb" (bound, unused): edit
     // distance 1, both well past the length guard.
-    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when persona\nx = 1\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "# mox: when persona\n[core]\n\tx = 1\n# mox: end\n");
     const facts_path = try h.homePath(".config/mox/facts.toml");
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(facts_path).?);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = facts_path, .data = "personb = \"x\"\n" });
@@ -5770,4 +5770,71 @@ test "remove: a released generator's leaves stay and are forgotten on every mach
     try std.testing.expect(exists(io, leaf));
     try std.testing.expect((try mox.apply.applied.read(a, io, other.state, leaf)) == null);
     try std.testing.expectEqual(@as(usize, 0), (try mox.apply.generated.readManifest(a, io, other.state, try other.homePath(".config/gen.inc"))).len);
+}
+
+test "mv and remove: a rewrite of a commented attributes file is refused before anything moves" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const attrs = "# hand note\n[\".a\"]\nmode = \"0600\"\n";
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", attrs);
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try writeRepo(io, &tmp, "repo/src/.b", "b\n");
+    const mv = try h.run(&.{ "mox", "mv", ".a", ".c" });
+    try std.testing.expectEqual(@as(u8, 1), mv.rc);
+    try std.testing.expect(std.mem.indexOf(u8, mv.err, "comments here would be lost; remove them") != null);
+    try std.testing.expect(exists(io, try h.srcOf(".a")));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "trash" })));
+    const rm = try h.run(&.{ "mox", "remove", ".b" });
+    try std.testing.expectEqual(@as(u8, 1), rm.rc);
+    try std.testing.expect(std.mem.indexOf(u8, rm.err, "comments here would be lost; remove them") != null);
+    try std.testing.expect(exists(io, try h.srcOf(".b")));
+    try std.testing.expectEqualStrings(attrs, try read(io, a, try std.fs.path.join(a, &.{ h.repo, ".mox", "attributes.toml" })));
+}
+
+test "private: an attributes entry for a repo path holds with no private file there" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.ssh/config", "Host x\n");
+    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
+    try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".ssh/config\"]\nmode = \"0600\"\n\n[\".other\"]\nreleased = true\n");
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    const st = try Io.Dir.cwd().statFile(io, try h.liveOf(".ssh/config"), .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    try std.testing.expect(lineWith(r.err, "ERROR   ~/.other", "only mode may be set for a path the repo manages"));
+}
+
+test "mv and remove: a file the private layer still varies is refused before anything moves" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "base\n");
+    try writeRepo(io, &tmp, "state/private/.zshrc.d/os=darwin", "mine\n");
+    const mv = try h.run(&.{ "mox", "mv", ".zshrc", ".bashrc" });
+    try std.testing.expectEqual(@as(u8, 1), mv.rc);
+    try std.testing.expect(std.mem.indexOf(u8, mv.err, "the private layer still varies this file") != null);
+    try std.testing.expect(exists(io, try h.srcOf(".zshrc")));
+    const rm = try h.run(&.{ "mox", "remove", ".zshrc" });
+    try std.testing.expectEqual(@as(u8, 1), rm.rc);
+    try std.testing.expect(std.mem.indexOf(u8, rm.err, "the private layer still varies this file") != null);
+    try std.testing.expect(exists(io, try h.srcOf(".zshrc")));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "trash" })));
 }

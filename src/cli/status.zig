@@ -151,7 +151,7 @@ fn staleRows(
     }
     for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
     for (tree.released) |p| try keep.put(p, {});
-    const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, &keep);
+    const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
     if (cands.len == 0) return;
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
     for (cands) |c| {

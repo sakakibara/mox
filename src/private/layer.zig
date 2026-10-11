@@ -75,7 +75,18 @@ pub fn merge(
 
     for (base_tree.files) |bf| {
         if (seen_in_private.contains(bf.source_base_path)) continue;
-        try merged.append(arena, bf);
+        // A private entry for a repo path holds with no private file there.
+        var combined = bf;
+        const target_key = if (std.mem.startsWith(u8, bf.source_base_path, "src/")) bf.source_base_path["src/".len..] else bf.source_base_path;
+        if (combined.head_error.len == 0) {
+            if (try privateEntryError(arena, &private_attrs, target_key)) |err| {
+                combined.head_error = err;
+            } else if (private_attrs.mode(target_key)) |m| {
+                combined.mode = m;
+                combined.mode_explicit = true;
+            }
+        }
+        try merged.append(arena, combined);
     }
 
     // Every merged file learns the private root so repo-relative loop data
@@ -101,7 +112,7 @@ pub fn merge(
     return .{
         .files = out,
         .exact_dirs = try exact.toOwnedSlice(arena),
-        .released = try concatPaths(arena, base_tree.released, private_tree.released),
+        .released = try concatPaths(arena, base_tree.released, try privateReleased(arena, private_tree.released, base_tree.files)),
     };
 }
 
@@ -121,13 +132,7 @@ fn repoPathError(
             base_file.source_base_path,
         });
     }
-    if (private_attrs.lookup(target_key)) |e| {
-        var only_mode = e;
-        only_mode.mode = null;
-        if (e.err.len > 0) return try std.fmt.allocPrint(arena, "private {s}", .{e.err});
-        if (!source.attributes.entryEmpty(only_mode))
-            return "private .mox/attributes.toml: only mode may be set for a path the repo manages";
-    }
+    if (try privateEntryError(arena, private_attrs, target_key)) |err| return err;
     if (base_file.ownership == .disown) {
         const format = base_file.format orelse return null;
         for (pf.overlays) |o| {
@@ -141,6 +146,29 @@ fn repoPathError(
         }
     }
     return null;
+}
+
+/// Why a private attributes entry for a path the repo manages is refused,
+/// or null: it may set `mode` alone.
+fn privateEntryError(arena: std.mem.Allocator, private_attrs: *const source.attributes.Attributes, target_key: []const u8) !?[]const u8 {
+    const e = private_attrs.lookup(target_key) orelse return null;
+    if (e.err.len > 0) return try std.fmt.allocPrint(arena, "private {s}", .{e.err});
+    var only_mode = e;
+    only_mode.mode = null;
+    if (!source.attributes.entryEmpty(only_mode))
+        return "private .mox/attributes.toml: only mode may be set for a path the repo manages";
+    return null;
+}
+
+/// The private layer's tombstones, less any at a path the repo manages,
+/// where only `mode` is the private layer's to set.
+fn privateReleased(arena: std.mem.Allocator, released: []const []const u8, repo_files: []const ManagedFile) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    outer: for (released) |p| {
+        for (repo_files) |f| if (std.mem.eql(u8, f.live_path, p)) continue :outer;
+        try out.append(arena, p);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 fn concatOverlays(arena: std.mem.Allocator, a: []const Overlay, b: []const Overlay) ![]const Overlay {

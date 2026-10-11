@@ -338,7 +338,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
         for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
         for (tree.released) |p| try keep.put(p, {});
-        const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, &keep);
+        const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         for (cands) |c| {
             if (c.kind != .whole) continue;

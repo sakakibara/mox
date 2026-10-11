@@ -59,7 +59,8 @@ All notable changes to mox are documented here. The format follows
 - `mox mv` moves no state: the next apply on every machine removes the old
   live file (or reports it as drift, or leaves an old partially owned file in
   place), instead of leaving it orphaned. A move whose attributes entry the
-  new name cannot hold is refused.
+  new name cannot hold is refused, as are `mv` and `remove` of a file the
+  private layer still varies with overlays or regions.
 - `mox add` of a `.json` file holding comments records `format = "jsonc"`;
   `add --own`/`--disown`/`--gate` of a strict-JSON file writes the
   declaration into `.mox/attributes.toml` and the owned content as plain

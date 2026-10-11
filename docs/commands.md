@@ -176,7 +176,9 @@ into the timestamped trash first (recoverable); its
 whose entry holds a key the new name cannot (a `format` or a
 strict-JSON directive moved to another format) is refused before
 anything moves. A tombstone at the new name is removed; a head ownership
-declaration travels inside the renamed source.
+declaration travels inside the renamed source. A file the private layer
+still varies with overlays or regions is refused; move or remove those
+first.
 
 mv moves no state. Every machine's next apply, this one included, writes
 the new path and converges the old one (see [dsl.md](dsl.md#sources-that-leave-the-tree)):
@@ -201,7 +203,8 @@ generator's produced files likewise), and leaves no tombstone, so every
 other machine's apply removes its unedited copy too; it is refused for a
 partially owned file (the live remainder is not mox's to delete). A
 private-only file is forgotten here with no tombstone, its entry dropped
-from the private layer's attributes.
+from the private layer's attributes. A repo file the private layer still
+varies with overlays or regions is refused; remove those first.
 
 <!-- generated: flags remove -->
 | Flag | Description |
