@@ -708,7 +708,8 @@ Show a unified diff of the composed output against each live file
 (`--stat` for a per-file added/removed summary). A partially owned
 file diffs its canonical owned content only, with secret-bearing keys
 masked on both sides. A file whose source left the tree, which apply
-would remove, shows its live content on the removed side; a file that
+would remove, shows its live content on the removed side, and such a
+symlink the line `symlink -> <target>`; a file that
 does not parse in its format is an `ERROR` line on stderr, as apply
 reports it. Read-only and takes no lock. A difference is not
 an error, so a run that completes exits 0 whether or not anything

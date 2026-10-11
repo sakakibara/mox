@@ -5583,6 +5583,8 @@ test "stale: an owned file is left in place and forgotten, and a symlink is remo
     const s = try h.run(&.{ "mox", "status" });
     try std.testing.expect(lineWith(s.out, "STALE", "~/app.toml"));
     try std.testing.expect(lineWith(s.out, "STALE", "~/link"));
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "-symlink -> /nonexistent/target") != null);
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "left ~/app.toml in place (no longer managed)") != null);

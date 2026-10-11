@@ -344,11 +344,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         const links = try stale.managedLinks(ctx.alloc, tree.files);
         for (cands) |c| {
-            if (c.kind != .whole) continue;
+            if (c.kind == .owned) continue;
             const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
             if (ruleset.isPathIgnored(rel, false)) continue;
             if (try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links) != .remove) continue;
-            try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
+            if (c.kind == .symlink) {
+                try diffLinkRemoval(ctx, sty, stat_mode, c.live_path, c.target, &total, &changed);
+            } else try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
         }
     }
 
@@ -356,6 +358,28 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print(" {d} file(s) changed, +{d} -{d}\n", .{ changed, total.added, total.removed });
     }
     return if (refused) 1 else 0;
+}
+
+/// A symlink apply would remove, shown as its one line `symlink -> <target>`
+/// going away.
+fn diffLinkRemoval(
+    ctx: *app.Ctx,
+    sty: style.Style,
+    stat_mode: bool,
+    live_path: []const u8,
+    target: []const u8,
+    total: *Stat,
+    changed: *usize,
+) !void {
+    const a_lines = try mox.diff.lines.splitLines(ctx.alloc, try std.fmt.allocPrint(ctx.alloc, "symlink -> {s}\n", .{target}));
+    const hunks = try mox.diff.lines.diff(ctx.alloc, a_lines, &.{});
+    changed.* += 1;
+    total.removed += 1;
+    if (stat_mode) {
+        try ctx.out.print(" {f} | +0 -1\n", .{display.of(live_path, ctx.context.?.paths.home)});
+        return;
+    }
+    try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_lines, &.{}, hunks, &.{}, &.{}, sty));
 }
 
 /// Diff one composed result against its live file, printing the rendered hunks
