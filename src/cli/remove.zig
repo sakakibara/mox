@@ -130,11 +130,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const id = mox.apply.snapshot.idNow(ctx.io);
     const trash = try fileops.trashRoot(ctx.alloc, context.paths.state_dir, &id);
+    // A private-only file's walk names it under `src/` like a repo file; it
+    // is shown, and trashed, under `private/` instead.
+    const src_name = if (private_only)
+        try std.fmt.allocPrint(ctx.alloc, "private/{s}", .{if (std.mem.startsWith(u8, file.source_base_path, "src/")) file.source_base_path["src/".len..] else file.source_base_path})
+    else
+        file.source_base_path;
 
     // Trash the source: copy into the trash first, then delete the original,
     // so a failed copy never loses the file.
     if (file.has_base and file.source_base_abs.len > 0) {
-        const dst = try std.fs.path.join(ctx.alloc, &.{ trash, file.source_base_path });
+        const dst = try std.fs.path.join(ctx.alloc, &.{ trash, src_name });
         try fileops.copyTree(ctx.io, ctx.alloc, file.source_base_abs, dst);
         Io.Dir.cwd().deleteFile(ctx.io, file.source_base_abs) catch |e| {
             try ctx.err.print("mox remove: could not delete source {f}: {s}\n", .{ display.of(file.source_base_abs, ctx.context.?.paths.home), @errorName(e) });
@@ -143,7 +149,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
     if (try fileops.dotDAbs(ctx.alloc, file)) |dd| {
         if (Io.Dir.cwd().access(ctx.io, dd, .{})) |_| {
-            const dst = try std.fmt.allocPrint(ctx.alloc, "{s}.d", .{try std.fs.path.join(ctx.alloc, &.{ trash, file.source_base_path })});
+            const dst = try std.fmt.allocPrint(ctx.alloc, "{s}.d", .{try std.fs.path.join(ctx.alloc, &.{ trash, src_name })});
             try fileops.copyTree(ctx.io, ctx.alloc, dd, dst);
             Io.Dir.cwd().deleteTree(ctx.io, dd) catch |e| {
                 try ctx.err.print("mox remove: could not delete overlay dir {s}: {s}\n", .{ dd, @errorName(e) });
@@ -162,7 +168,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
     try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
 
-    try ctx.out.print("Removed {s} (trashed to {s})\n", .{ file.source_base_path, trash });
+    try ctx.out.print("Removed {s} (trashed to {s})\n", .{ src_name, trash });
 
     // A GENERATOR owns a produced set, not a single live file. Its manifest is
     // keyed by the (phantom) live path. Released, its leaves stay where they

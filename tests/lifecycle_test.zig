@@ -5774,6 +5774,9 @@ test "remove: a private-only file is forgotten here, with no tombstone, and its 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     const r = try h.run(&.{ "mox", "remove", ".mine" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Removed private/.mine (trashed to ") != null);
+    const trash_gen = try soleChild(io, a, try std.fs.path.join(a, &.{ h.state, "trash" }));
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ trash_gen, "private", ".mine" })));
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.repo, ".mox", "attributes.toml" })));
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "private", ".mox", "attributes.toml" })));
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "private", ".mine" })));
