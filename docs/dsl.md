@@ -802,14 +802,18 @@ A failure is that file's `ERROR` in `apply`, `status`, `diff` and `export`,
 and nothing of it reaches the live tree:
 
 ```
-ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml as disown = ["..."] for this file)
-ERROR ~/app.toml (composed output line 2 from src/app.toml and src/app.toml.d/os=darwin.toml: <redacted>)
+ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml: [".claude/settings.json"] disown = ["model", "autoMode"])
+ERROR ~/app.toml (composed output line 2 from src/app.toml and src/app.toml.d/os=darwin.toml: invalid integer)
 ```
 
 The location is `<layer>:<line>:<col>` for a layer and `composed output line
 <n> from <layers>` for output. A line carrying a resolved secret is never
-quoted: its message reads `<redacted>`. A strict-JSON failure carries a hint
-by its cause: the replacement for a mox directive (see Region directives);
+quoted: the parser's reason stays, with any text it quotes replaced by
+`<redacted>`, and a duplicate key either of whose spellings sits on such a
+line reads `duplicate key <redacted>`; any other key is printed as a JSON
+string. A strict-JSON failure carries a hint by its cause: the attributes
+table and key that replace a mox directive, ready to paste (see Region
+directives);
 `format = "jsonc"` for any other comment; removing a trailing comma; `{}` for
 an empty file; quoting a bare capture. An empty partial render ("mox owns
 nothing here") is exempt.

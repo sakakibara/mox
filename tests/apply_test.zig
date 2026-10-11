@@ -6954,7 +6954,7 @@ test "strict json: a note comment, an inline comment and a trailing comma are ER
 
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; JSON has no comments: remove it, or set format = \"jsonc\""));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; remove it, or set format = \"jsonc\""));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:11: trailing comma not allowed in strict json; remove the trailing comma"));
     // Nothing of an invalid file reaches the live tree; the rest applies.
@@ -6988,7 +6988,7 @@ test "strict json: a leading directive is refused naming the attributes key that
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/settings.json", "src/settings.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml as disown = [\"...\"] for this file"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/settings.json", "src/settings.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml: [\"settings.json\"] disown = [\"model\"]"));
     try std.testing.expect(!exists(io, try c.homePath("settings.json")));
 }
 
@@ -7202,7 +7202,7 @@ test "validation: a line carrying a resolved secret is never quoted in a parse e
     const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t value" }} });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "composed output line 2 from src/app.toml: <redacted>)"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "composed output line 2 from src/app.toml: "));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "s3cr3t") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "s3cr3t") == null);
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
@@ -7636,4 +7636,30 @@ test "captures in JSON: a key capture stays a string, and a duplicate it makes i
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.jsonc", "duplicate key \"same\""));
+}
+
+test "validation: a secret-bearing error keeps its reason, and a duplicate key from a secret capture is never printed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\ntoken = <secret:env:MOX_TEST_TOKEN>\n");
+    try put(io, &tmp, "repo/src/d.json", "{\n\"<secret:env:MOX_TEST_TOKEN>\": 1,\n\"hunter2\": 2\n}\n");
+    try put(io, &tmp, "repo/src/e.json", "{\"a\\n\\\"b\": 1, \"a\\n\\\"b\": 2, \"<machine.os>\": 3}\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "hunter2" }} });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
+    var it = std.mem.splitScalar(u8, r.err, '\n');
+    var toml_line: []const u8 = "";
+    while (it.next()) |l| if (std.mem.indexOf(u8, l, "~/app.toml") != null) {
+        toml_line = l;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, toml_line, "composed output line 2 from src/app.toml: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toml_line, ": <redacted>)") == null);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "duplicate key <redacted>"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/e.json", "duplicate key \"a\\n\\\"b\""));
 }

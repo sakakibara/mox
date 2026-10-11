@@ -18,7 +18,7 @@ const Format = source.format.Format;
 
 pub const Error = error{ FormatViolation, OutOfMemory };
 
-const comment_hint = "JSON has no comments: remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments";
+const comment_hint = "remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments";
 const trailing_comma_hint = "remove the trailing comma";
 const empty_hint = "an empty file is not JSON: write {}";
 const data_capture_hint = "quote it: a quoted single data capture emits its typed value";
@@ -61,9 +61,9 @@ pub fn checkOutput(
     diag: ?*interp.Diag,
 ) Error!void {
     const f = (try firstFailure(arena, format, bytes, "")) orelse return;
-    const secret = f.line >= 1 and f.line - 1 < secret_lines.len and secret_lines[f.line - 1];
     const loc = try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ f.line, try layerList(arena, layers) });
-    return report(arena, diag, loc, if (secret) "<redacted>" else f.message, if (secret) null else f.hint);
+    const message = if (isSecretLine(secret_lines, f.line)) try redactQuoted(arena, f.message) else f.message;
+    return report(arena, diag, loc, message, f.hint);
 }
 
 /// A duplicate object key in a JSON-family document, reported against
@@ -79,13 +79,57 @@ pub fn checkDuplicateKeys(
 ) Error!void {
     const hit = (try duplicateKey(arena, format.jsonDialect(), bytes)) orelse return;
     const lc = lineCol(bytes, hit.offset);
-    const secret = lc.line >= 1 and lc.line - 1 < secret_lines.len and secret_lines[lc.line - 1];
+    // Either spelling of the key may be a resolved secret.
+    const secret = isSecretLine(secret_lines, lc.line) or isSecretLine(secret_lines, lineCol(bytes, hit.first_offset).line);
     const loc = if (layers.len > 0)
         try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ lc.line, try layerList(arena, layers) })
     else
         try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, lc.line, lc.col });
-    const message = if (secret) "<redacted>" else try std.fmt.allocPrint(arena, "duplicate key \"{s}\"", .{hit.key});
+    const message = if (secret) "duplicate key <redacted>" else try std.fmt.allocPrint(arena, "duplicate key {s}", .{try quoteKey(arena, hit.key)});
     return report(arena, diag, loc, message, null);
+}
+
+fn isSecretLine(secret_lines: []const bool, line: u32) bool {
+    return line >= 1 and line - 1 < secret_lines.len and secret_lines[line - 1];
+}
+
+/// `message` with every quoted span replaced by `<redacted>`: a parser
+/// quotes the text it stopped at, which on a secret-bearing line may be the
+/// secret itself.
+fn redactQuoted(arena: std.mem.Allocator, message: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < message.len) {
+        const c = message[i];
+        if (c == '"' or c == '\'' or c == '`') {
+            if (std.mem.indexOfScalarPos(u8, message, i + 1, c)) |end| {
+                try out.appendSlice(arena, "<redacted>");
+                i = end + 1;
+                continue;
+            }
+        }
+        try out.append(arena, c);
+        i += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// `key` as a JSON string literal, so a quote or control character in it
+/// cannot break the report line.
+fn quoteKey(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '"');
+    for (key) |c| switch (c) {
+        '"' => try out.appendSlice(arena, "\\\""),
+        '\\' => try out.appendSlice(arena, "\\\\"),
+        '\n' => try out.appendSlice(arena, "\\n"),
+        '\r' => try out.appendSlice(arena, "\\r"),
+        '\t' => try out.appendSlice(arena, "\\t"),
+        0...8, 11, 12, 14...0x1f, 0x7f => try out.print(arena, "\\u{x:0>4}", .{c}),
+        else => try out.append(arena, c),
+    };
+    try out.append(arena, '"');
+    return out.toOwnedSlice(arena);
 }
 
 fn report(arena: std.mem.Allocator, diag: ?*interp.Diag, loc: []const u8, message: []const u8, hint: ?[]const u8) Error {
@@ -200,6 +244,9 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     var seen_value = false;
     var first: ?struct { verb: []const u8, start: usize, leading: bool } = null;
     var has_end = false;
+    // The arguments of every directive spelled with the first one's verb,
+    // for a hint that can be pasted into the attributes file.
+    var args_seen: std.ArrayList([]const u8) = .empty;
     while (t.next()) |tok| {
         if (tok.kind != .comment) {
             seen_value = true;
@@ -213,18 +260,22 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
         const verb = args[0..verb_end];
         if (std.mem.eql(u8, verb, "end")) has_end = true;
         if (first == null) first = .{ .verb = verb, .start = start, .leading = !seen_value };
+        if (std.mem.eql(u8, verb, first.?.verb)) try args_seen.append(arena, std.mem.trim(u8, args[verb_end..], " \t"));
     }
     const hit = first orelse return null;
     const lc = lineCol(text, hit.start);
     const v = hit.verb;
-    const hint: []const u8 = if (eqAny(v, &.{ "own", "disown", "check" }))
-        try std.fmt.allocPrint(arena, "declare it in .mox/attributes.toml as {s} = [\"...\"] for this file", .{v})
+    const where = try attributesWhere(arena, display);
+    const hint: []const u8 = if (std.mem.eql(u8, v, "own") or std.mem.eql(u8, v, "disown"))
+        try std.fmt.allocPrint(arena, "declare it in {s}: {s} {s} = {s}", .{ where.file, where.table, v, try tomlList(arena, args_seen.items, false) })
+    else if (std.mem.eql(u8, v, "check"))
+        try std.fmt.allocPrint(arena, "declare it in {s}: {s} check = {s}", .{ where.file, where.table, try tomlList(arena, args_seen.items[0..1], true) })
     else if (std.mem.eql(u8, v, "when") and hit.leading and !has_end)
-        "declare the whole-file gate in .mox/attributes.toml as when = \"<axis-expr>\" for this file"
+        try std.fmt.allocPrint(arena, "declare the whole-file gate in {s}: {s} when = {s}", .{ where.file, where.table, try tomlString(arena, args_seen.items[0]) })
     else if (std.mem.eql(u8, v, "secret"))
         "use a \"<secret:URI>\" capture inside a JSON string instead"
     else if (std.mem.eql(u8, v, "default"))
-        "declare it in .mox/attributes.toml as defaults = { <name> = \"<value>\" } for this file"
+        try std.fmt.allocPrint(arena, "declare it in {s}: {s} defaults = {s}", .{ where.file, where.table, try tomlDefaults(arena, args_seen.items) })
     else if (std.mem.eql(u8, v, "keep-empty"))
         "remove it: a structured file is never omitted when empty"
     else if (eqAny(v, &.{ "when", "include", "replace", "append", "prepend", "remove", "from", "for", "end" }))
@@ -233,6 +284,57 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
         comment_hint;
     const message = try std.fmt.allocPrint(arena, "mox directive \"{s}\" in strict JSON, which has no comments", .{v});
     return .{ .line = lc.line, .col = lc.col, .message = message, .hint = hint };
+}
+
+const Where = struct { file: []const u8, table: []const u8 };
+
+/// The attributes file and table header a layer named `display` (repo- or
+/// private-relative, `src/` or `private/` first) declares its target in.
+fn attributesWhere(arena: std.mem.Allocator, display: []const u8) !Where {
+    const slash = std.mem.indexOfScalar(u8, display, '/') orelse return .{ .file = ".mox/attributes.toml", .table = "[\"<target>\"]" };
+    var key = display[slash + 1 ..];
+    if (std.mem.indexOf(u8, key, ".d/")) |d| key = key[0..d];
+    const private = std.mem.startsWith(u8, display, "private/");
+    return .{
+        .file = if (private) "the private layer's .mox/attributes.toml" else ".mox/attributes.toml",
+        .table = try std.fmt.allocPrint(arena, "[{s}]", .{try tomlString(arena, key)}),
+    };
+}
+
+/// A TOML basic string holding `s`.
+fn tomlString(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    return quoteKey(arena, s);
+}
+
+/// The TOML array of `items`: each a directive argument, or with `argv`
+/// the double-quoted argv items of one `check` line.
+fn tomlList(arena: std.mem.Allocator, items: []const []const u8, argv: bool) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    for (items) |item| {
+        if (!argv) {
+            try parts.append(arena, try tomlString(arena, item));
+            continue;
+        }
+        var rest = item;
+        while (std.mem.indexOfScalar(u8, rest, '"')) |open| {
+            const close = std.mem.indexOfScalarPos(u8, rest, open + 1, '"') orelse break;
+            try parts.append(arena, rest[open .. close + 1]);
+            rest = rest[close + 1 ..];
+        }
+    }
+    return std.fmt.allocPrint(arena, "[{s}]", .{try std.mem.join(arena, ", ", parts.items)});
+}
+
+/// The TOML inline table of `default name="value"` arguments.
+fn tomlDefaults(arena: std.mem.Allocator, items: []const []const u8) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    for (items) |item| {
+        const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;
+        const name = std.mem.trim(u8, item[0..eq], " \t");
+        const value = std.mem.trim(u8, std.mem.trim(u8, item[eq + 1 ..], " \t"), "\"");
+        try parts.append(arena, try std.fmt.allocPrint(arena, "{s} = {s}", .{ name, try tomlString(arena, value) }));
+    }
+    return std.fmt.allocPrint(arena, "{{ {s} }}", .{try std.mem.join(arena, ", ", parts.items)});
 }
 
 fn eqAny(s: []const u8, set: []const []const u8) bool {
@@ -252,12 +354,12 @@ fn commentBody(tok: []const u8) []const u8 {
     return std.mem.trim(u8, b, " \t\r\n");
 }
 
-pub const DupHit = struct { key: []const u8, offset: usize };
+pub const DupHit = struct { key: []const u8, offset: usize, first_offset: usize };
 
 /// The first object key that repeats within its object, or null. Keys are
 /// compared decoded, so `"a"` and `"\u0061"` are one key.
 pub fn duplicateKey(arena: std.mem.Allocator, dialect: json.Dialect, text: []const u8) !?DupHit {
-    const Frame = struct { object: bool, want_key: bool, keys: std.StringHashMap(void) };
+    const Frame = struct { object: bool, want_key: bool, keys: std.StringHashMap(usize) };
     var stack: std.ArrayList(Frame) = .empty;
     var t = json.Tokenizer.init(text, dialect);
     while (t.next()) |tok| {
@@ -277,7 +379,8 @@ pub fn duplicateKey(arena: std.mem.Allocator, dialect: json.Dialect, text: []con
                     const decoded = json.parse(arena, slice, .{}) catch continue;
                     if (decoded != .string) continue;
                     const gop = try top.keys.getOrPut(decoded.string);
-                    if (gop.found_existing) return .{ .key = decoded.string, .offset = @intCast(tok.span.start) };
+                    if (gop.found_existing) return .{ .key = decoded.string, .offset = @intCast(tok.span.start), .first_offset = gop.value_ptr.* };
+                    gop.value_ptr.* = @intCast(tok.span.start);
                 }
             },
             else => {},
@@ -316,17 +419,17 @@ fn expectFailure(format: Format, text: []const u8, want: []const []const u8) !vo
 }
 
 test "strict JSON: a directive head is refused naming its attributes key" {
-    try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "disown = [\"...\"]", ".mox/attributes.toml" });
+    try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "declare it in .mox/attributes.toml: [\"s.json\"] disown = [\"a\"]" });
 }
 
 test "strict JSON: each directive kind names its replacement" {
-    try expectFailure(.json, "// mox: own a\n{}\n", &.{"own = [\"...\"]"});
-    try expectFailure(.json, "// mox: check \"x\"\n{}\n", &.{"check = [\"...\"]"});
-    try expectFailure(.json, "// mox: when os=darwin\n{}\n", &.{"when = \"<axis-expr>\""});
+    try expectFailure(.json, "// mox: own a\n// mox: own b.c\n{}\n", &.{"[\"s.json\"] own = [\"a\", \"b.c\"]"});
+    try expectFailure(.json, "// mox: check \"x\" \"--y\"\n{}\n", &.{"[\"s.json\"] check = [\"x\", \"--y\"]"});
+    try expectFailure(.json, "// mox: when os=darwin\n{}\n", &.{"[\"s.json\"] when = \"os=darwin\""});
     try expectFailure(.json, "{\n// mox: when os=darwin\n\"a\": 1\n// mox: end\n}\n", &.{ "s.json:2:1:", "overlay s.json.d/<axis>.json" });
     try expectFailure(.json, "{\n// mox: include \"x.json\"\n}\n", &.{"overlay s.json.d/<axis>.json"});
     try expectFailure(.json, "{\n// mox: secret \"env:X\"\n}\n", &.{"\"<secret:URI>\" capture inside a JSON string"});
-    try expectFailure(.json, "// mox: default profile=\"work\"\n{}\n", &.{"defaults = {"});
+    try expectFailure(.json, "// mox: default profile=\"work\"\n{}\n", &.{"[\"s.json\"] defaults = { profile = \"work\" }"});
     try expectFailure(.json, "// mox: keep-empty\n{}\n", &.{"never omitted when empty"});
 }
 
@@ -367,7 +470,8 @@ test "checkOutput: names the output line and the layers, and never quotes a secr
 
     var s: interp.Diag = .{};
     try testing.expectError(error.FormatViolation, checkOutput(a, .json, "{\n\"t\": hunter2\n}\n", &.{"src/x.json"}, &.{ false, true, false }, &s));
-    try testing.expectEqualStrings("composed output line 2 from src/x.json: <redacted>", s.capture().?);
+    try testing.expect(std.mem.startsWith(u8, s.capture().?, "composed output line 2 from src/x.json: "));
+    try testing.expect(std.mem.indexOf(u8, s.capture().?, "hunter2") == null);
 }
 
 test "checkOutput: every format names the output line" {
@@ -404,4 +508,13 @@ test "every format reports a layer with a line" {
     try testing.expect((try failureText(.yaml, "a: 1\n---\nb: 2\n")) == null);
     try testing.expect((try failureText(.ini, "[mysqld]\nskip-networking\n")) == null);
     try testing.expect((try failureText(.toml, "")) == null);
+}
+
+test "redactQuoted and quoteKey" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("unexpected <redacted> after <redacted>", try redactQuoted(a, "unexpected 'x1' after \"y\""));
+    try testing.expectEqualStrings("expected value", try redactQuoted(a, "expected value"));
+    try testing.expectEqualStrings("\"a\\n\\\"b\\u0001\"", try quoteKey(a, "a\n\"b\x01"));
 }
