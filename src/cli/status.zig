@@ -151,6 +151,7 @@ fn staleRows(
     }
     for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
     for (tree.released) |p| try keep.put(p, {});
+    for (tree.entry_errors) |e| try keep.put(e.live_path, {});
     const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
     if (cands.len == 0) return;
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
@@ -269,6 +270,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // does (same classifier, `apply/drift.zig`) -- fed to the shared renderer
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
+    if (a.paths.len == 0) for (tree.entry_errors) |e| {
+        tally.add(.err);
+        try rows.print("  {s:<8} {f} ({s})\n", .{ Label.err.text(), display.of(e.live_path, home), e.err });
+    };
     for (files) |file| {
         // Every row names the file the way a human reads it; the real path is
         // still what the checks below are run against.

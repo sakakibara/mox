@@ -251,7 +251,13 @@ pub const ManagedTree = struct {
     /// for and no source manages: every machine keeps the live file and
     /// forgets its records.
     released: []const []const u8 = &.{},
+    /// Entries of `.mox/attributes.toml` that break the schema and that no
+    /// source claims, each reported as its live path's error.
+    entry_errors: []const EntryError = &.{},
 };
+
+/// A broken attributes entry with no source at its live path.
+pub const EntryError = struct { live_path: []const u8, err: []const u8 };
 
 /// Marker filename that makes its containing directory exact.
 pub const exact_marker = ".mox-exact";
@@ -392,7 +398,35 @@ pub fn walkExcluding(
         .files = out,
         .exact_dirs = try exact.toOwnedSlice(arena),
         .released = try releasedLive(arena, &attrs, out, home_dir),
+        .entry_errors = try unclaimedErrors(arena, &attrs, out, home_dir),
     };
+}
+
+/// Every broken attributes entry no walked source claims, sorted by live
+/// path. A tombstone with a typo is one, so it never reads as a source
+/// that left the tree.
+fn unclaimedErrors(
+    arena: std.mem.Allocator,
+    attrs: *const attributes.Attributes,
+    files: []const ManagedFile,
+    home_dir: []const u8,
+) ![]const EntryError {
+    var claimed = std.StringHashMap(void).init(arena);
+    for (files) |f| try claimed.put(f.live_path, {});
+    var out: std.ArrayList(EntryError) = .empty;
+    var it = attrs.map.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.err.len == 0) continue;
+        const live = try path_mod.joinKeyOnto(arena, home_dir, kv.key_ptr.*);
+        if (claimed.contains(live)) continue;
+        try out.append(arena, .{ .live_path = live, .err = kv.value_ptr.err });
+    }
+    std.mem.sort(EntryError, out.items, {}, entryErrorLess);
+    return out.toOwnedSlice(arena);
+}
+
+fn entryErrorLess(_: void, a: EntryError, b: EntryError) bool {
+    return std.mem.lessThan(u8, a.live_path, b.live_path);
 }
 
 /// The live paths of every tombstone no walked source claims. A tombstone

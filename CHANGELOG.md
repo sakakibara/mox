@@ -66,9 +66,10 @@ All notable changes to mox are documented here. The format follows
   declaration into `.mox/attributes.toml` and the owned content as plain
   JSON. `mox commit` writes a strict-JSON source back strictly.
 - An `.mox/attributes.toml` entry that breaks the schema is that file's
-  `ERROR` instead of stopping every command, and a command that would
-  rewrite an attributes file holding a comment is refused before it changes
-  anything.
+  `ERROR` instead of stopping every command (one with no source, such as a
+  mistyped tombstone, is reported at its path and stops the stale sweep),
+  and a command that would rewrite an attributes file holding a comment is
+  refused before it changes anything.
 - A private base at a path the repo manages is refused naming both (it was
   silently dropped), as is a private overlay defining content under a path
   the repo disowns.

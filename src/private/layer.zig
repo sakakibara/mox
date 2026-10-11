@@ -113,6 +113,7 @@ pub fn merge(
         .files = out,
         .exact_dirs = try exact.toOwnedSlice(arena),
         .released = try concatPaths(arena, base_tree.released, try privateReleased(arena, private_tree.released, base_tree.files)),
+        .entry_errors = try entryErrors(arena, base_tree, private_tree),
     };
 }
 
@@ -167,6 +168,18 @@ fn privateReleased(arena: std.mem.Allocator, released: []const []const u8, repo_
     outer: for (released) |p| {
         for (repo_files) |f| if (std.mem.eql(u8, f.live_path, p)) continue :outer;
         try out.append(arena, p);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// The repo's unclaimed broken entries and the private layer's, less any at
+/// a path the repo manages, which is that file's error instead.
+fn entryErrors(arena: std.mem.Allocator, base_tree: ManagedTree, private_tree: ManagedTree) ![]const source.tree.EntryError {
+    var out: std.ArrayList(source.tree.EntryError) = .empty;
+    try out.appendSlice(arena, base_tree.entry_errors);
+    outer: for (private_tree.entry_errors) |e| {
+        for (base_tree.files) |f| if (std.mem.eql(u8, f.live_path, e.live_path)) continue :outer;
+        try out.append(arena, .{ .live_path = e.live_path, .err = try std.fmt.allocPrint(arena, "private {s}", .{e.err}) });
     }
     return out.toOwnedSlice(arena);
 }

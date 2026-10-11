@@ -435,6 +435,12 @@ fn applyPass(
     var gen_states: std.ArrayList(GenState) = .empty;
     var compose_failed: std.ArrayList([]const u8) = .empty;
 
+    // A broken attributes entry no source claims may be a mistyped
+    // tombstone: its path is an error, never a source that left the tree.
+    if (!scoped) for (tree.entry_errors) |e| {
+        try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, home), e.err });
+        counts.fail += 1;
+    };
     for (files) |file| {
         // Every line about this file names it the way a human reads it; the
         // real path is still what gets composed, snapshotted, and written.
@@ -683,7 +689,7 @@ fn applyPass(
     // moved path must not remove the old path's file before the new one is
     // written.
     const sweep_ok = blk: {
-        if (scoped or compose_failed.items.len > 0) break :blk false;
+        if (scoped or compose_failed.items.len > 0 or tree.entry_errors.len > 0) break :blk false;
         for (files) |f| if (f.head_error.len > 0) break :blk false;
         for (gen_states.items) |g| if (!g.succeeded) break :blk false;
         break :blk true;

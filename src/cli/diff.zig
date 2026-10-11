@@ -254,6 +254,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var total: Stat = .{};
     var changed: usize = 0;
 
+    if (a.paths.len == 0) for (tree.entry_errors) |e| {
+        try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, home), e.err });
+    };
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
@@ -338,6 +341,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
         for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
         for (tree.released) |p| try keep.put(p, {});
+        for (tree.entry_errors) |e| try keep.put(e.live_path, {});
         const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         for (cands) |c| {

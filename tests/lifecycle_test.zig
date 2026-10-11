@@ -5838,3 +5838,29 @@ test "mv and remove: a file the private layer still varies is refused before any
     try std.testing.expect(exists(io, try h.srcOf(".zshrc")));
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "trash" })));
 }
+
+test "stale: a broken attributes entry with no source is an ERROR, and nothing is swept" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.kept", "k\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".kept"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".kept\"]\nrelased = true\n");
+    try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".mine\"]\nbogus = 1\n");
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s.out, "ERROR", "~/.kept (.mox/attributes.toml"));
+    try std.testing.expect(lineWith(s.out, "ERROR", "~/.mine (private .mox/attributes.toml"));
+    try std.testing.expect(!lineWith(s.out, "STALE", "~/.kept"));
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineWith(r.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
+    try std.testing.expectEqualStrings("k\n", try read(io, a, try h.liveOf(".kept")));
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".kept"))) != null);
+}
