@@ -8,6 +8,7 @@
 //! names no repo is never stale.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const applied = @import("applied.zig");
 const write = @import("write.zig");
 const dirent = @import("../source/dirent.zig");
@@ -92,9 +93,29 @@ pub fn candidatesOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8, rep
     var keep = std.StringHashMap(void).init(arena);
     for (tree.files) |f| try keep.put(f.live_path, {});
     for (try generated.allLeaves(arena, io, state_dir)) |leaf| try keep.put(leaf, {});
-    for (tree.released) |p| try keep.put(p, {});
     for (tree.entry_errors) |e| try keep.put(e.live_path, {});
-    return find(arena, io, state_dir, repo, home, &keep);
+    const released = try releasedSet(arena, tree.released);
+    var out: std.ArrayList(Candidate) = .empty;
+    for (try find(arena, io, state_dir, repo, home, &keep)) |c| {
+        if (released.contains(try foldCase(arena, c.live_path))) continue;
+        try out.append(arena, c);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// `paths` as a set matched through `foldCase`.
+pub fn releasedSet(arena: std.mem.Allocator, paths: []const []const u8) !std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(arena);
+    for (paths) |p| try out.put(try foldCase(arena, p), {});
+    return out;
+}
+
+/// `path` as a case-insensitive filesystem compares it: ASCII-lowercased on
+/// macOS and Windows, unchanged elsewhere. A tombstone written for `.foo`
+/// releases a record of `~/.Foo` there, since both name one file.
+pub fn foldCase(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return path;
+    return std.ascii.allocLowerString(arena, path);
 }
 
 /// The candidate in `cands` at `live_path`, or null.

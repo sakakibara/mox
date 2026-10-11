@@ -712,9 +712,8 @@ fn applyPass(
         break :blk true;
     };
     var released_names: std.StringHashMap(void) = .init(ctx.alloc);
-    var released_live: std.StringHashMap(void) = .init(ctx.alloc);
+    const released_live = try mox.apply.stale.releasedSet(ctx.alloc, tree.released);
     for (tree.released) |p| {
-        try released_live.put(p, {});
         try released_names.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(p)), {});
     }
 
@@ -1913,7 +1912,7 @@ const StaleInput = struct {
     /// Live paths the tree and every generator manifest name.
     keep: *const std.StringHashMap(void),
     tree: []const mox.source.tree.ManagedFile,
-    /// Live paths `.mox/attributes.toml` released.
+    /// Live paths `.mox/attributes.toml` released, through `stale.foldCase`.
     released: *const std.StringHashMap(void),
     ruleset: *const mox.source.ignore.match.RuleSet,
     snap_id: []const u8,
@@ -1942,7 +1941,7 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
     for (cands) |c| {
         if (in.only) |only| if (!only.contains(c.live_path)) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
-        if (in.released.contains(c.live_path)) {
+        if (in.released.contains(try mox.apply.stale.foldCase(ctx.alloc, c.live_path))) {
             if (!in.dry_run) try forgetAll(ctx, c.live_path);
             continue;
         }

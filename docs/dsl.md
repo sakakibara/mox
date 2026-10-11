@@ -845,10 +845,11 @@ record whose path lies outside this run's HOME is never a candidate.
 - A path below a symlinked directory -- one on disk, or one the tree plants as
   a symlink -- names a file outside HOME's own tree: it is never removed,
   only forgotten.
-- A released path is forgotten and never removed, a `.moxignore`-matched one
-  left alone, and one that is the same file as a managed path (a case-only
-  rename on a case-insensitive filesystem, or a hardlink) forgotten with
-  nothing removed.
+- A released path is forgotten and never removed -- on macOS and Windows,
+  whose filesystems ignore case, whatever the case its record spells -- a
+  `.moxignore`-matched one left alone, and one that is the same file as a
+  managed path (a case-only rename on a case-insensitive filesystem, or a
+  hardlink) forgotten with nothing removed.
 
 `mox status` reports such a file `STALE` (an edited one `DRIFT`), and `mox
 diff` shows a pending removal. Nothing is swept -- by this sweep or by the

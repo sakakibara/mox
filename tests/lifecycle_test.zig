@@ -6118,3 +6118,24 @@ test "apply: leaves of a generator that left the tree, or no longer produced, co
     try std.testing.expect(std.mem.indexOf(u8, orphan.out, ", 1 removed,") != null);
     try std.testing.expect(!exists(io, try h.liveOf(".config/id-a.inc")));
 }
+
+test "remove: a tombstone whose case differs from the record still keeps the file on a case-insensitive system" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.Foo", "f\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".Foo"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".foo\"]\nreleased = true\n");
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "STALE") == null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("f\n", try read(io, a, try h.liveOf(".Foo")));
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".Foo"))) == null);
+}
