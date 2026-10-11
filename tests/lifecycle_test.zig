@@ -6206,3 +6206,26 @@ test "remove: a tombstone that matches nothing is a warning until apply has seen
     const s2 = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, s2.out, "matches nothing") == null);
 }
+
+test "rollback: a live path that is now a symlink keeps the link and names the snapshot copy" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.rc", "one\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.rc", "two\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".rc"));
+    try Io.Dir.cwd().symLink(io, "/etc/hosts", try h.liveOf(".rc"), .{});
+    const r = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(lineWith(r.err, "~/.rc", "not restored: ~/.rc is a symlink; the snapshot copy is at"));
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf(".rc"), &buf)]);
+}

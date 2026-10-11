@@ -276,7 +276,21 @@ pub const Restored = struct {
 pub const Refused = struct {
     live_path: []const u8,
     snapshot_path: []const u8,
+    why: Why,
+
+    pub const Why = enum {
+        /// A directory above the live path is a symlink.
+        parent_link,
+        /// The live path itself is a symlink a restore would destroy.
+        is_link,
+    };
 };
+
+fn refusal(io: Io, home: []const u8, live: []const u8) ?Refused.Why {
+    if (parent_link.through(io, home, live, null)) return .parent_link;
+    if (isSymlink(io, live)) return .is_link;
+    return null;
+}
 
 /// A snapshot file whose live path the caller asked to withhold from the
 /// whole-file restore, with the snapshot's content for its own handling.
@@ -354,8 +368,8 @@ fn restoreDirModes(
         const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.CorruptDirmodes;
         const mode = std.fmt.parseInt(u32, line[0..sp], 8) catch return error.CorruptDirmodes;
         const live = try source_path.joinKeyOnto(arena, home, line[sp + 1 ..]);
-        if (parent_link.through(io, home, live, null) or isSymlink(io, live)) {
-            try refused.append(arena, .{ .live_path = live, .snapshot_path = try std.fs.path.join(arena, &.{ snapshots_dir, id, line[sp + 1 ..] }) });
+        if (refusal(io, home, live)) |why| {
+            try refused.append(arena, .{ .live_path = live, .snapshot_path = try std.fs.path.join(arena, &.{ snapshots_dir, id, line[sp + 1 ..] }), .why = why });
             continue;
         }
         try entries.append(arena, .{ .live = live, .mode = mode });
@@ -404,8 +418,8 @@ fn restoreDir(
             },
             .file => {
                 const target = try source_path.joinKeyOnto(arena, home, rel);
-                if (parent_link.through(io, home, target, null)) {
-                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }) });
+                if (refusal(io, home, target)) |why| {
+                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
                     continue;
                 }
                 const content = try dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024 * 1024));
@@ -421,8 +435,8 @@ fn restoreDir(
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
                 const n = try dir.readLink(io, entry.name, &buf);
                 const target = try source_path.joinKeyOnto(arena, home, rel);
-                if (parent_link.through(io, home, target, null)) {
-                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }) });
+                if (refusal(io, home, target)) |why| {
+                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
                     continue;
                 }
                 if (std.fs.path.dirname(target)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
@@ -502,11 +516,8 @@ test "restore: a symlink whose readLink fails propagates instead of silently ski
 var stat_fail_target: []const u8 = "";
 
 fn failingStatFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, opts: Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat {
-    _ = userdata;
-    _ = dir;
-    _ = opts;
     if (std.mem.eql(u8, sub_path, stat_fail_target)) return error.Unexpected;
-    unreachable; // this fixture stats exactly one path
+    return std.testing.io.vtable.dirStatFile(userdata, dir, sub_path, opts);
 }
 
 test "save: a live-file stat failure propagates instead of degrading the preserved mode to 0644" {
