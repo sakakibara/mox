@@ -4,7 +4,7 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.4] - 2026-10-11
 
 ### Fixed
 - `mox status` reported a brew formula installed through a tap alias as
@@ -1586,7 +1586,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
-[Unreleased]: https://github.com/sakakibara/mox/compare/v0.12.3...HEAD
+[0.12.4]: https://github.com/sakakibara/mox/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/sakakibara/mox/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/sakakibara/mox/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/sakakibara/mox/compare/v0.12.0...v0.12.1
