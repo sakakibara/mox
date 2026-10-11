@@ -316,7 +316,8 @@ released by `mox remove` -- converges the same way (see
 [dsl.md](dsl.md#sources-that-leave-the-tree)): an unedited one is removed
 (`removed ~/x (no longer managed)`), an edited one is drift, a partially
 owned one is left in place, and a released one is forgotten. Nothing is
-swept in a path-scoped run, or in one where any file failed to compose.
+swept in a path-scoped run, or in one where any file failed to compose or
+write.
 
 Every structured layer and every composed output is parsed in its format
 before anything is written (see [dsl.md](dsl.md#validation)); a file that

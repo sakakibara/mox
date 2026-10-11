@@ -5864,3 +5864,21 @@ test "stale: a broken attributes entry with no source is an ERROR, and nothing i
     try std.testing.expectEqualStrings("k\n", try read(io, a, try h.liveOf(".kept")));
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".kept"))) != null);
 }
+
+test "stale: a failed write at a moved path keeps the old path's file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".blocker"), .data = "not a dir\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "mv", ".a", ".blocker/a" })).rc);
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expectEqualStrings("a\n", try read(io, a, try h.liveOf(".a")));
+}

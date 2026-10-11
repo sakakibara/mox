@@ -838,8 +838,8 @@ record whose path lies outside this run's HOME is never a candidate.
 `mox status` reports such a file `STALE` (an edited one `DRIFT`), and `mox
 diff` shows a pending removal. Nothing is swept -- by this sweep or by the
 sweep of an orphaned generator's leaves -- in a path-scoped apply, or in a run
-where any file failed to compose or carried a head error: a failure at a
-moved path must not remove the old path's file before the new one is
+where any file failed to compose or write or carried a head error: a failure
+at a moved path must not remove the old path's file before the new one is
 written. A record that names no repo -- a one-line whole-file record, a
 bare symlink target, an owned record without `repo` -- is never swept; apply
 tags the record of every file it still produces, unchanged ones included.

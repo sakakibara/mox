@@ -684,12 +684,11 @@ fn applyPass(
     }
 
     // The sweeps below remove files whose source left the tree. A run that
-    // could not judge every file -- scoped, or with one that failed to
-    // compose or carried a head error -- sweeps nothing: a failure at a
-    // moved path must not remove the old path's file before the new one is
-    // written.
+    // could not judge or write every file -- scoped, or with any failure so
+    // far -- sweeps nothing: a failure at a moved path must not remove the
+    // old path's file before the new one is written.
     const sweep_ok = blk: {
-        if (scoped or compose_failed.items.len > 0 or tree.entry_errors.len > 0) break :blk false;
+        if (scoped or counts.fail > 0 or compose_failed.items.len > 0) break :blk false;
         for (files) |f| if (f.head_error.len > 0) break :blk false;
         for (gen_states.items) |g| if (!g.succeeded) break :blk false;
         break :blk true;

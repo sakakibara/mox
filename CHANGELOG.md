@@ -74,7 +74,7 @@ All notable changes to mox are documented here. The format follows
   silently dropped), as is a private overlay defining content under a path
   the repo disowns.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
-  run where any file failed to compose or carried a head error.
+  run where any file failed to compose or write or carried a head error.
 
 ### Upgrading
 - A machine on an older mox rejects an attributes file carrying the new keys
