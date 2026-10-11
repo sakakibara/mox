@@ -10,6 +10,7 @@ pub const partial = @import("partial.zig");
 pub const canonical = @import("canonical.zig");
 pub const owned = @import("owned.zig");
 pub const mox_path = @import("mox_path.zig");
+pub const stale = @import("stale.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -25,4 +26,5 @@ test {
     _ = canonical;
     _ = owned;
     _ = mox_path;
+    _ = stale;
 }

@@ -1,8 +1,9 @@
 //! Generator (`for ... into`) produced-set manifest and prune.
 //!
 //! A generator OWNS the set of live files it fans out. mox records that set
-//! per generator under `<state>/generated/<hash(gen-live-path)>` (one produced
-//! path per line). On the next apply, after the current set is written, any
+//! per generator under `<state>/generated/<hash(gen-live-path)>`: a first line
+//! `repo <pct>` naming the repo it came from, then one produced path per
+//! line. On the next apply, after the current set is written, any
 //! prior-set path no longer produced is removed -- snapshot-first, and only
 //! when the removal is safe: a path this generator no longer owns is deleted
 //! only if it is a clean mox-written leaf (or `--overwrite`), never a foreign or
@@ -38,6 +39,12 @@ pub const Options = struct {
     /// `false` keeps the per-leaf message (an orphaned generator has no
     /// scopeable row to fold into, so the per-leaf line is the only report).
     mute_drift_message: bool = false,
+    /// The repo this run applies, as records name it: the orphan sweep
+    /// leaves another repo's tagged manifests alone.
+    repo: []const u8 = "",
+    /// Manifest names (`manifestName`) of generators `.mox/attributes.toml`
+    /// released: their manifests are forgotten and their leaves kept.
+    released: ?*const std.StringHashMap(void) = null,
 };
 
 pub const Result = struct {
@@ -64,21 +71,57 @@ pub fn readManifest(arena: std.mem.Allocator, io: Io, state_dir: []const u8, gen
         error.FileNotFound => return &.{},
         else => return e,
     };
+    return leavesOf(arena, bytes);
+}
+
+/// The produced paths a manifest's bytes list, its repo line skipped.
+fn leavesOf(arena: std.mem.Allocator, bytes: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var first = true;
     while (lines.next()) |line| {
         const t = std.mem.trim(u8, line, " \t\r");
+        defer first = false;
         if (t.len == 0) continue;
+        if (first and std.mem.startsWith(u8, t, "repo ")) continue;
         try out.append(arena, try arena.dupe(u8, t));
     }
     return out.toOwnedSlice(arena);
 }
 
-/// Record `paths` as the generator's current produced set (one path per line).
-pub fn writeManifest(arena: std.mem.Allocator, io: Io, state_dir: []const u8, gen_live: []const u8, paths: []const []const u8) !void {
+/// The repo a manifest's bytes name, or null for one written before
+/// manifests named their repo.
+fn repoOf(arena: std.mem.Allocator, bytes: []const u8) !?[]const u8 {
+    const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
+    const first = bytes[0..nl];
+    if (!std.mem.startsWith(u8, first, "repo ")) return null;
+    return applied.pctDecode(arena, first["repo ".len..]);
+}
+
+/// Every produced path any manifest in `<state>/generated/` lists, whatever
+/// repo wrote it.
+pub fn allLeaves(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]const []const u8 {
+    const gen_dir_path = try std.fs.path.join(arena, &.{ state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (entries) |entry| {
+        if (entry.kind != .file) continue;
+        const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
+        try out.appendSlice(arena, try leavesOf(arena, bytes));
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Record `paths` as the generator's current produced set, under a first
+/// line naming `repo`.
+pub fn writeManifest(arena: std.mem.Allocator, io: Io, state_dir: []const u8, gen_live: []const u8, paths: []const []const u8, repo: []const u8) !void {
     const path = try manifestPath(arena, state_dir, gen_live);
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(arena);
+    try body.appendSlice(arena, "repo ");
+    try body.appendSlice(arena, try applied.pctEncode(arena, repo));
+    try body.append(arena, '\n');
     for (paths) |p| {
         try body.appendSlice(arena, p);
         try body.append(arena, '\n');
@@ -104,9 +147,12 @@ pub fn manifestName(gen_live: []const u8) [64]u8 {
 /// source was deleted outside `mox remove`, or the file no longer parses as
 /// a generator. Each orphan's listed leaves are pruned against `keep`
 /// (snapshot-first, drift-refusing, exactly like a live generator's prune),
-/// then the manifest itself is dropped. Callers must skip this sweep on a
-/// scoped apply (an unwalked generator is not an orphan) and after a
-/// drift-prompt abort.
+/// then the manifest itself is dropped. A manifest another repo tagged is
+/// left alone; one written before manifests named their repo is swept. A
+/// generator `.mox/attributes.toml` released has its manifest and its leaves'
+/// records forgotten, the leaves kept. Callers skip this sweep on a scoped
+/// apply (an unwalked generator is not an orphan) and in a run where any file
+/// failed to compose or carried a head error.
 pub fn sweepOrphans(
     arena: std.mem.Allocator,
     io: Io,
@@ -127,11 +173,21 @@ pub fn sweepOrphans(
         const name = entry.name;
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        if (try repoOf(arena, bytes)) |r| {
+            if (!std.mem.eql(u8, r, opts.repo)) continue;
+        }
+        const leaves = try leavesOf(arena, bytes);
+        if (opts.released) |rel| {
+            if (rel.contains(name)) {
+                if (!opts.dry_run) {
+                    for (leaves) |leaf| try forgetRecords(arena, io, opts.state_dir, leaf);
+                    Io.Dir.cwd().deleteFile(io, path) catch {};
+                }
+                continue;
+            }
+        }
         var all_removed = true;
-        while (lines.next()) |line| {
-            const leaf = std.mem.trim(u8, line, " \t\r");
-            if (leaf.len == 0) continue;
+        for (leaves) |leaf| {
             if (keep.contains(leaf)) continue;
             const before = result.drift_refused + result.error_refused;
             try removeLeaf(arena, io, opts, leaf, stdout, stderr, &result);
@@ -318,7 +374,7 @@ test "readManifest: absent manifest is an empty set; write then read round-trips
 
     try std.testing.expectEqual(@as(usize, 0), (try readManifest(a, io, state, "/home/me/.config/git/gen")).len);
 
-    try writeManifest(a, io, state, "/home/me/.config/git/gen", &.{ "/home/me/.config/git/id-a.inc", "/home/me/.config/git/id-b.inc" });
+    try writeManifest(a, io, state, "/home/me/.config/git/gen", &.{ "/home/me/.config/git/id-a.inc", "/home/me/.config/git/id-b.inc" }, "/repo");
     const got = try readManifest(a, io, state, "/home/me/.config/git/gen");
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualStrings("/home/me/.config/git/id-a.inc", got[0]);

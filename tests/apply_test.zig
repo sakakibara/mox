@@ -345,7 +345,7 @@ test "applied: record then read roundtrip" {
         cwd, ".zig-cache", "tmp", &tmp.sub_path, "state",
     });
 
-    try mox.apply.applied.record(arena.allocator(), io, state_dir, "/home/me/.zshrc", "export EDITOR=nvim\n");
+    try mox.apply.applied.record(arena.allocator(), io, state_dir, "/home/me/.zshrc", "export EDITOR=nvim\n", "/repo");
 
     const got = try mox.apply.applied.read(arena.allocator(), io, state_dir, "/home/me/.zshrc");
     try std.testing.expect(got != null);
@@ -3277,7 +3277,7 @@ test "apply generator: a for-into mixed with stray top-level content is rejected
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
 }
 
-test "apply generator: mox remove deletes all produced files" {
+test "apply generator: mox remove --purge deletes all produced files" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3290,7 +3290,7 @@ test "apply generator: mox remove deletes all produced files" {
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, try c.homePath(".config/id-a.inc")));
 
-    const r = try c.run(&.{ "mox", "remove", ".config/gen.inc" });
+    const r = try c.run(&.{ "mox", "remove", "--purge", ".config/gen.inc" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
     try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
@@ -3475,7 +3475,7 @@ test "apply generator: a leaf moving between generators is never deleted+recreat
     try std.testing.expect(!(try snapshotHas(io, a, c.state, ".config/shared-x.inc", "val=x\n")));
 }
 
-test "apply generator: mox remove does not delete a leaf another generator owns" {
+test "apply generator: mox remove --purge does not delete a leaf another generator owns" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3506,9 +3506,9 @@ test "apply generator: mox remove does not delete a leaf another generator owns"
     });
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/da.toml", .data = "" });
     const gen_a_live = try c.homePath(".config/genA.inc");
-    try mox.apply.generated.writeManifest(a, io, c.state, gen_a_live, &.{shared});
+    try mox.apply.generated.writeManifest(a, io, c.state, gen_a_live, &.{shared}, c.repo);
 
-    const r = try c.run(&.{ "mox", "remove", ".config/genA.inc" });
+    const r = try c.run(&.{ "mox", "remove", "--purge", ".config/genA.inc" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     // genB's leaf survives, with its content intact.
     try std.testing.expectEqualStrings("val=b\n", try read(io, a, shared));
@@ -3545,7 +3545,7 @@ test "apply generator: a leaf drifted into a symlink is pruned without dereferen
     try std.testing.expect(!(try treeContainsBytes(io, a, c.state, "PRIVATE-DATA")));
 }
 
-test "apply generator: mox remove retains the manifest when a leaf is refused" {
+test "apply generator: mox remove --purge retains the manifest when a leaf is refused" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3564,7 +3564,7 @@ test "apply generator: mox remove retains the manifest when a leaf is refused" {
     try Io.Dir.cwd().deleteFile(io, leaf_b);
     try Io.Dir.cwd().createDirPath(io, leaf_b);
 
-    const r = try c.run(&.{ "mox", "remove", ".config/gen.inc" });
+    const r = try c.run(&.{ "mox", "remove", "--purge", ".config/gen.inc" });
     try std.testing.expect(r.rc != 0); // a refused leaf -> nonzero exit
 
     const gen_live = try c.homePath(".config/gen.inc");

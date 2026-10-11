@@ -47,32 +47,113 @@ pub fn contentHashHex(content: []const u8) [hash_hex_len]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+/// Whole-file and symlink records are read up to this size: a
+/// percent-encoded Windows long path fits with room to spare.
+const max_record_bytes: usize = 1024 * 1024;
+
+/// The repo identity records carry: the repo root's real path, or the path
+/// as given when it cannot be resolved.
+pub fn repoTag(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]const u8 {
+    return Io.Dir.realPathFileAbsoluteAlloc(io, repo_dir, arena) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return arena.dupe(u8, repo_dir),
+    };
+}
+
+/// `s` percent-encoded: every byte outside `A-Za-z0-9-._~/:` becomes `%XX`,
+/// so a record value never holds a space, newline or `%` of its own.
+pub fn pctEncode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        const plain = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~' or c == '/' or c == ':';
+        if (plain) {
+            try out.append(arena, c);
+        } else {
+            var buf: [3]u8 = undefined;
+            try out.appendSlice(arena, std.fmt.bufPrint(&buf, "%{X:0>2}", .{c}) catch unreachable);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// The inverse of `pctEncode`, or null on a malformed escape.
+pub fn pctDecode(arena: std.mem.Allocator, s: []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] != '%') {
+            try out.append(arena, s[i]);
+            i += 1;
+            continue;
+        }
+        if (i + 3 > s.len) return null;
+        const v = std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16) catch return null;
+        try out.append(arena, v);
+        i += 3;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// The value of a `<name> <pct>` record line, decoded, or null when `line`
+/// is not one.
+fn namedValue(arena: std.mem.Allocator, line: []const u8, name: []const u8) !?[]const u8 {
+    if (line.len <= name.len or !std.mem.startsWith(u8, line, name) or line[name.len] != ' ') return null;
+    return pctDecode(arena, line[name.len + 1 ..]);
+}
+
+/// A parsed whole-file record: the content hash, the live path, and the repo
+/// it came from (null for a record written before records named their repo).
+pub const WholeRecord = struct {
+    hash: [hash_hex_len]u8,
+    live_path: []const u8,
+    repo: ?[]const u8,
+};
+
+/// Parse a whole-file record's bytes, or null when malformed.
+pub fn parseWhole(arena: std.mem.Allocator, bytes: []const u8) !?WholeRecord {
+    const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
+    const first = bytes[0..nl];
+    if (first.len < hash_hex_len + 1 or first[hash_hex_len] != ' ') return null;
+    var hash: [hash_hex_len]u8 = undefined;
+    @memcpy(&hash, first[0..hash_hex_len]);
+    for (hash) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    var repo: ?[]const u8 = null;
+    if (nl < bytes.len) {
+        const rest = std.mem.trimEnd(u8, bytes[nl + 1 ..], "\n");
+        if (rest.len > 0) repo = try namedValue(arena, rest, "repo");
+    }
+    return .{ .hash = hash, .live_path = first[hash_hex_len + 1 ..], .repo = repo };
+}
+
 /// Read the recorded content hash for `live_path`, or null when this path
 /// has never been recorded. A malformed record is treated as absent (the
 /// conservative direction: absent + differing live content = drift).
 pub fn read(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?[hash_hex_len]u8 {
     const rec_path = try recordPath(arena, state_dir, live_path);
-    const bytes = Io.Dir.cwd().readFileAlloc(io, rec_path, arena, .limited(4096)) catch |e| switch (e) {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, rec_path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
     };
-    if (bytes.len < hash_hex_len) return null;
-    var hash: [hash_hex_len]u8 = undefined;
-    @memcpy(&hash, bytes[0..hash_hex_len]);
-    for (hash) |c| {
-        if (!std.ascii.isHex(c)) return null;
-    }
-    return hash;
+    const rec = (try parseWhole(arena, bytes)) orelse return null;
+    return rec.hash;
 }
 
-/// Record `content` as the bytes mox just wrote to `live_path`.
-pub fn record(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, content: []const u8) !void {
+/// A record names a live path on one line, so a path holding a newline
+/// cannot be recorded.
+pub const RecordError = error{NewlineInLivePath};
+
+/// Record `content` as the bytes mox just wrote to `live_path`, from the repo
+/// `repo` names.
+pub fn record(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, content: []const u8, repo: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, live_path, '\n') != null) return error.NewlineInLivePath;
     const rec_path = try recordPath(arena, state_dir, live_path);
     if (std.fs.path.dirname(rec_path)) |parent| {
         try Io.Dir.cwd().createDirPath(io, parent);
     }
     const hash = contentHashHex(content);
-    const body = try std.fmt.allocPrint(arena, "{s} {s}\n", .{ &hash, live_path });
+    const body = try std.fmt.allocPrint(arena, "{s} {s}\nrepo {s}\n", .{ &hash, live_path, try pctEncode(arena, repo) });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rec_path, .data = body });
 }
 
@@ -130,6 +211,11 @@ pub const OwnedRecord = struct {
     own_paths: []const []const u8,
     /// The declared paths whose composed value resolved a secret, raw.
     secret_paths: []const []const u8,
+    /// The repo the record came from; null for one written before records
+    /// named their repo.
+    repo: ?[]const u8 = null,
+    /// The live path the record names (set by `readOwned`).
+    live_path: []const u8 = "",
 };
 
 const owned_version: i128 = 1;
@@ -155,6 +241,7 @@ pub fn recordOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live
     }
     try root.put(arena, "own_paths", .{ .array = try jsonStringArray(arena, rec.own_paths) });
     try root.put(arena, "secret_paths", .{ .array = try jsonStringArray(arena, rec.secret_paths) });
+    if (rec.repo) |r| try root.put(arena, "repo", .{ .string = r });
 
     var aw: Io.Writer.Allocating = .init(arena);
     try json.encode(&aw.writer, .{ .object = root }, .{ .indent = 2 });
@@ -171,6 +258,11 @@ pub fn readOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_p
         error.FileNotFound => return null,
         else => return e,
     };
+    return parseOwned(arena, bytes);
+}
+
+/// Parse an owned record's bytes, or null when malformed.
+pub fn parseOwned(arena: std.mem.Allocator, bytes: []const u8) !?OwnedRecord {
     const v = json.parse(arena, bytes, .{}) catch return null;
     if (v != .object) return null;
     const secret = switch (v.get("secret") orelse return null) {
@@ -185,6 +277,8 @@ pub fn readOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_p
         .secret = secret,
         .own_paths = own_list,
         .secret_paths = secret_list,
+        .repo = stringOf(v.get("repo")),
+        .live_path = stringOf(v.get("live_path")) orelse "",
     };
     if (stringOf(v.get("mode"))) |m| {
         rec.mode = std.meta.stringToEnum(Mode, m) orelse return null;
@@ -228,27 +322,51 @@ fn ownedPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const
     return std.fs.path.join(arena, &.{ state_dir, "applied-owned", &name });
 }
 
-const max_symlink_target_bytes: usize = 64 * 1024;
-
 /// Record the symlink `target` mox last materialized at `live_path`, under
-/// `<state>/applied-symlink/`. Lets a later apply tell "mox wrote this link
-/// (source target changed, safe to update)" from "the user put something here"
-/// (drift), mirroring the content-hash record for regular files.
-pub fn recordSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, target: []const u8) !void {
+/// `<state>/applied-symlink/`, from the repo `repo` names. Lets a later apply
+/// tell "mox wrote this link (source target changed, safe to update)" from
+/// "the user put something here" (drift), mirroring the content-hash record
+/// for regular files. Three named lines, each value percent-encoded.
+pub fn recordSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, target: []const u8, repo: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, live_path, '\n') != null) return error.NewlineInLivePath;
     const path = try symlinkPath(arena, state_dir, live_path);
     if (std.fs.path.dirname(path)) |parent| {
         try Io.Dir.cwd().createDirPath(io, parent);
     }
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = target });
+    const body = try std.fmt.allocPrint(arena, "target {s}\npath {s}\nrepo {s}\n", .{
+        try pctEncode(arena, target), try pctEncode(arena, live_path), try pctEncode(arena, repo),
+    });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+}
+
+/// A parsed symlink record. A record written before records named their
+/// repo is the bare target alone: `live_path` and `repo` are null.
+pub const SymlinkRecord = struct {
+    target: []const u8,
+    live_path: ?[]const u8 = null,
+    repo: ?[]const u8 = null,
+};
+
+pub fn parseSymlink(arena: std.mem.Allocator, bytes: []const u8) !SymlinkRecord {
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
+    const l1 = lines.next() orelse return .{ .target = bytes };
+    const l2 = lines.next() orelse return .{ .target = bytes };
+    const l3 = lines.next() orelse return .{ .target = bytes };
+    if (lines.next() != null) return .{ .target = bytes };
+    const target = (try namedValue(arena, l1, "target")) orelse return .{ .target = bytes };
+    const live = (try namedValue(arena, l2, "path")) orelse return .{ .target = bytes };
+    const repo = (try namedValue(arena, l3, "repo")) orelse return .{ .target = bytes };
+    return .{ .target = target, .live_path = live, .repo = repo };
 }
 
 /// Read the last-applied symlink target for `live_path`, or null when none.
 pub fn readSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?[]const u8 {
     const path = try symlinkPath(arena, state_dir, live_path);
-    return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_symlink_target_bytes)) catch |e| switch (e) {
-        error.FileNotFound => null,
-        else => e,
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
     };
+    return (try parseSymlink(arena, bytes)).target;
 }
 
 fn symlinkPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const u8) ![]u8 {
@@ -454,9 +572,51 @@ test "recordSymlink then readSymlink round-trips the target" {
     const a = arena.allocator();
     const state_dir = try stateDirAbs(a, io, &tmp.sub_path);
 
-    try recordSymlink(a, io, state_dir, "/home/me/.config/nvim", "/repo/nvim");
+    try recordSymlink(a, io, state_dir, "/home/me/.config/nvim", "/repo/nvim with space\n", "/r");
     const got = try readSymlink(a, io, state_dir, "/home/me/.config/nvim");
     try std.testing.expect(got != null);
-    try std.testing.expectEqualStrings("/repo/nvim", got.?);
+    try std.testing.expectEqualStrings("/repo/nvim with space\n", got.?);
     try std.testing.expect(try readSymlink(a, io, state_dir, "/home/me/.other") == null);
+
+    // A record written before records named their repo is the bare target.
+    const legacy = try parseSymlink(a, "/old/target");
+    try std.testing.expectEqualStrings("/old/target", legacy.target);
+    try std.testing.expect(legacy.repo == null);
+}
+
+test "record: line 2 names the repo; a one-line record is untagged; a newline in the live path is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try stateDirAbs(a, io, &tmp.sub_path);
+
+    try record(a, io, state_dir, "/home/me/.zshrc", "x\n", "/repo with %");
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, try recordPath(a, state_dir, "/home/me/.zshrc"), a, .limited(4096));
+    const h = contentHashHex("x\n");
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s} /home/me/.zshrc\nrepo /repo%20with%20%25\n", .{&h}), bytes);
+    const rec = (try parseWhole(a, bytes)).?;
+    try std.testing.expectEqualStrings("/repo with %", rec.repo.?);
+    try std.testing.expectEqualStrings("/home/me/.zshrc", rec.live_path);
+    try std.testing.expect((try parseWhole(a, try std.fmt.allocPrint(a, "{s} /home/me/.zshrc\n", .{&h}))).?.repo == null);
+    try std.testing.expectError(error.NewlineInLivePath, record(a, io, state_dir, "/home/me/a\nb", "x", "/r"));
+}
+
+test "read: a record over 4096 bytes reads under the larger limit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try stateDirAbs(a, io, &tmp.sub_path);
+    const long = try a.alloc(u8, 6000);
+    @memset(long, 'x');
+    long[0] = '/';
+    try record(a, io, state_dir, long, "c", "/r");
+    try std.testing.expect((try read(a, io, state_dir, long)) != null);
+    try recordSymlink(a, io, state_dir, long, long, "/r");
+    try std.testing.expectEqualStrings(long, (try readSymlink(a, io, state_dir, long)).?);
 }

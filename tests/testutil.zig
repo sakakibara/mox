@@ -95,6 +95,32 @@ pub const Harness = struct {
     pub fn homePath(h: Harness, name: []const u8) ![]u8 {
         return mox.source.path.joinKeyOnto(h.a, h.home, name);
     }
+
+    /// Another machine sharing this repo: its own HOME and state directory
+    /// under `<root>/<name>/`.
+    pub fn otherMachine(h: Harness, name: []const u8) !Harness {
+        const home = try std.fs.path.join(h.a, &.{ h.root, name, "home" });
+        const state = try std.fs.path.join(h.a, &.{ h.root, name, "state" });
+        try Io.Dir.cwd().createDirPath(h.io, home);
+        return h.withEnv(&.{ .{ .name = "HOME", .value = home }, .{ .name = "MOX_STATE_DIR", .value = state } }, home, h.repo, state);
+    }
+
+    /// This machine applying another repo: `MOX_REPO` names `repo`.
+    pub fn otherRepo(h: Harness, repo: []const u8) !Harness {
+        return h.withEnv(&.{.{ .name = "MOX_REPO", .value = repo }}, h.home, repo, h.state);
+    }
+
+    fn withEnv(h: Harness, set: []const EnvPair, home: []const u8, repo: []const u8, state: []const u8) !Harness {
+        const map_ptr = try h.a.create(std.process.Environ.Map);
+        map_ptr.* = try h.env.createMap(h.a);
+        for (set) |e| try map_ptr.put(e.name, e.value);
+        var out = h;
+        out.env = .{ .map = map_ptr };
+        out.home = home;
+        out.repo = repo;
+        out.state = state;
+        return out;
+    }
 };
 
 fn noRefresh(_: ?*anyopaque, _: Io) void {}

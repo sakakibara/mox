@@ -1,7 +1,11 @@
-//! `mox remove <name>`: stop managing a file. Its source (base + `.d/`) is
-//! moved into the timestamped trash (`<state>/trash/<id>/`) so it stays
-//! recoverable, and the live file is left orphaned. `--purge` additionally
-//! deletes the live file, snapshotting it first. Under the lock.
+//! `mox remove <name>`: stop managing a file, keeping its live file on every
+//! machine. Its source (base + `.d/`) is moved into the timestamped trash
+//! (`<state>/trash/<id>/`) so it stays recoverable, and `.mox/attributes.toml`
+//! keeps a tombstone (`released = true`) every other machine's apply honours
+//! by forgetting the file, never removing it. `--purge` deletes the live file
+//! here, snapshotting it first, and leaves no tombstone, so other machines'
+//! applies remove their unedited copies too. A private-only file is this
+//! machine's alone: it is forgotten here, with no tombstone. Under the lock.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -63,7 +67,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         else => return e,
     };
 
-    const file = fileops.findByLive(tree, live_path) orelse {
+    const merged = try mox.private.layer.merge(ctx.alloc, ctx.io, tree, context.paths.private_dir, context.paths.home);
+    const repo_file = fileops.findByLive(tree, live_path);
+    // A path the repo does not manage belongs to the private layer alone.
+    const private_only = repo_file == null;
+    const file = repo_file orelse fileops.findByLive(merged, live_path) orelse {
         try ctx.err.print("mox remove: {s}: not managed\n", .{name});
         return 1;
     };
@@ -73,6 +81,38 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (purge and file.own_paths.len > 0) {
         try ctx.err.print("mox remove: {s}: --purge is refused for a partially owned file (the live file's remainder is not mox's to delete; plain 'mox remove' stops managing it)\n", .{name});
         return 1;
+    }
+
+    // The attributes file this remove rewrites: the private layer's for a
+    // private-only file, else the repo's, which keeps a tombstone unless the
+    // live file is purged. Loaded, and its comment refusal checked, before
+    // any side effect.
+    const key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, live_path);
+    const attrs_root = if (private_only) context.paths.private_dir else context.paths.repo_dir;
+    var attrs_diag: mox.source.attributes.Diag = .{};
+    var attrs = mox.source.attributes.loadStrict(ctx.alloc, ctx.io, attrs_root, &attrs_diag) catch |e| switch (e) {
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox remove: attributes.toml: {s}: {s}\n", .{
+                attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
+        else => return e,
+    };
+    const tombstone = !private_only and !purge;
+    // A stale mode / symlink / seed-once flag would bleed onto a plain file
+    // later re-added at the same path (add merges, it does not clear a flag
+    // it was not given), so the entry goes; a tombstone replaces it.
+    const had_entry = attrs.remove(key);
+    if (tombstone) try attrs.set(key, .{ .released = true });
+    const rewrite = had_entry or tombstone;
+    if (rewrite) {
+        attrs.refuseComments() catch {
+            try ctx.err.print("mox remove: {s}: comments here would be lost; remove them\n", .{attrs.path});
+            return 1;
+        };
     }
 
     const id = mox.apply.snapshot.idNow(ctx.io);
@@ -99,25 +139,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         } else |_| {}
     }
 
-    // Drop the target's `.mox/attributes.toml` entry: leaving a stale mode /
-    // symlink / seed-once flag would bleed onto a plain file later re-added at
-    // the same path (add merges, it does not clear a flag it was not given).
-    {
-        const key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, live_path);
-        var attrs_diag: mox.source.attributes.Diag = .{};
-        var attrs = mox.source.attributes.loadStrict(ctx.alloc, ctx.io, context.paths.repo_dir, &attrs_diag) catch |e| switch (e) {
-            error.UnknownAttributeKey,
-            error.InvalidAttributeValue,
-            => {
-                try ctx.err.print("mox remove: attributes.toml: {s}: {s}\n", .{
-                    attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-                });
-                return 1;
-            },
-            else => return e,
-        };
-        if (attrs.remove(key)) try attrs.write(ctx.io, context.paths.repo_dir);
-    }
+    if (rewrite) try attrs.write(ctx.io, attrs_root);
 
     // Forget every last-applied record for the path (content hash, content
     // cache, symlink target, owned record) and its provenance: mox stopped
@@ -130,13 +152,20 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     try ctx.out.print("Removed {s} (trashed to {s})\n", .{ file.source_base_path, trash });
 
     // A GENERATOR owns a produced set, not a single live file. Its manifest is
-    // keyed by the (phantom) live path. When one exists, remove every produced
-    // leaf (snapshot-first, recoverable) and drop the manifest -- there is no
-    // single live file to leave in place, so this happens with or without
-    // --purge. `force` here means a drifted generated leaf is still pruned
-    // (it is mox-owned and the removal is snapshotted).
+    // keyed by the (phantom) live path. Released, its leaves stay where they
+    // are and are forgotten; purged, every produced leaf is removed
+    // (snapshot-first, recoverable) and the manifest dropped.
     {
         const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+        if (prior.len > 0 and !purge) {
+            for (prior) |leaf| {
+                try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, leaf);
+                try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, leaf);
+            }
+            try mox.apply.generated.deleteManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+            try ctx.out.print("  {d} generated file(s) left in place, no longer managed\n", .{prior.len});
+            return 0;
+        }
         if (prior.len > 0) {
             // Never prune a path another producer legitimately owns: keep every
             // OTHER tree target (regular managed files and generator phantoms)
@@ -144,7 +173,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             // would let removing this generator delete a leaf another generator
             // still owns when the two manifests overlap in a stale state.
             var keep: std.StringHashMap(void) = .init(ctx.alloc);
-            for (tree.files) |f| {
+            for (merged.files) |f| {
                 if (std.mem.eql(u8, f.live_path, live_path)) continue;
                 try keep.put(f.live_path, {});
                 const other = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, f.live_path);
@@ -212,6 +241,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  purged live file: {f}\n", .{display.of(live_path, context.paths.home)});
     } else {
         try ctx.out.print("  live file left in place: {f}\n", .{display.of(live_path, context.paths.home)});
+        if (tombstone) try ctx.out.print("  released in .mox/attributes.toml: every machine keeps its live copy\n", .{});
     }
     return 0;
 }
@@ -220,7 +250,7 @@ pub const command = app.command(Spec, .{
     .name = "remove",
     .summary = "Stop managing a file",
     .usage = "mox remove <name> [--purge]",
-    .details = "Trashes its source recoverably, orphans the live file (--purge also deletes the live file).",
+    .details = "Trashes its source recoverably and keeps the live file on every machine through a tombstone in .mox/attributes.toml; --purge deletes the live file here and leaves no tombstone, so other machines remove their unedited copies too.",
     .group = .general,
     .needs_context = true,
 }, run);

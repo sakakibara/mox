@@ -129,6 +129,54 @@ fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool)
     try w.writeAll(".\n");
 }
 
+/// One row per file whose source left the tree: STALE where apply would
+/// remove it or leave it no longer managed, DRIFT where it was edited.
+fn staleRows(
+    ctx: *app.Ctx,
+    tree: mox.source.tree.ManagedTree,
+    ruleset: *const mox.source.ignore.match.RuleSet,
+    rows: *std.Io.Writer,
+    tally: *Tally,
+    units: *std.ArrayList(mox.apply.drift.Unit),
+) !void {
+    const context = ctx.context.?;
+    const stale = mox.apply.stale;
+    const home = context.paths.home;
+    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
+    var keep: std.StringHashMap(void) = .init(ctx.alloc);
+    var live_paths: std.ArrayList([]const u8) = .empty;
+    for (tree.files) |f| {
+        try keep.put(f.live_path, {});
+        try live_paths.append(ctx.alloc, f.live_path);
+    }
+    for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
+    for (tree.released) |p| try keep.put(p, {});
+    const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, &keep);
+    if (cands.len == 0) return;
+    var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
+    for (cands) |c| {
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
+        if (ruleset.isPathIgnored(rel, false)) continue;
+        const shown = try display.alloc(ctx.alloc, c.live_path, home);
+        switch (try stale.judge(ctx.alloc, ctx.io, c, &inodes)) {
+            .gone, .same_file => {},
+            .remove, .leave => {
+                tally.add(.stale);
+                try rows.print("  {s:<8} {s} (no longer managed)\n", .{ Label.stale.text(), shown });
+            },
+            .drift => {
+                tally.add(.drift);
+                try units.append(ctx.alloc, mox.apply.drift.vanished(c.live_path));
+                try rows.print("  {s:<8} {s} (no longer managed)\n", .{ Label.drift.text(), shown });
+            },
+            .special => {
+                tally.add(.err);
+                try rows.print("  {s:<8} {s} (no longer managed, not a file mox wrote)\n", .{ Label.err.text(), shown });
+            },
+        }
+    }
+}
+
 /// Map an apply disposition to its status label. `MISSING`/`OUTDATED`/`DRIFT`
 /// each mean `mox apply` would change the file, so all three set the exit
 /// code; `clean` does not. `GATED` and `ERROR` are handled by the caller.
@@ -398,6 +446,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         if (mox.apply.drift.wholeFile(file.live_path, recorded, live, composed.?)) |u| try units.append(ctx.alloc, u);
         try rows.print("  {s:<8} {s}\n", .{ cell.text(), shown });
     }
+
+    // Files whose source left the tree, as apply's sweep would judge them.
+    if (a.paths.len == 0) try staleRows(ctx, tree, &ruleset, rows, &tally, &units);
 
     // One order for every consumer -- the report and both serializers -- so
     // machine output is stable across runs, OSes, and pipes.

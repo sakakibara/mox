@@ -1,8 +1,9 @@
 //! `mox mv <old> <new>`: rename a managed file's source (base + its `.d/`
 //! overlay dir) so the live target changes on the next apply. The old source
 //! is copied into the timestamped trash first (recoverable), then renamed, and
-//! any `.mox/attributes.toml` entry (mode, symlink, seed-once) is re-keyed as a
-//! whole to the new target. Under the lock.
+//! its `.mox/attributes.toml` entry is re-keyed as a whole to the new target.
+//! No state moves: every machine's next apply converges the old path through
+//! its stale-record sweep, this one included. Under the lock.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -101,6 +102,38 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const old_dot_d = try fileops.dotDAbs(ctx.alloc, file);
 
+    // The attributes entry travels with the source, and a tombstone at the
+    // destination goes: checked, comment refusal included, before anything
+    // moves.
+    const old_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, old_live);
+    const new_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, new_live);
+    var attrs_diag: mox.source.attributes.Diag = .{};
+    var attrs = mox.source.attributes.loadStrict(ctx.alloc, ctx.io, context.paths.repo_dir, &attrs_diag) catch |e| switch (e) {
+        error.UnknownAttributeKey,
+        error.InvalidAttributeValue,
+        => {
+            try ctx.err.print("mox mv: attributes.toml: {s}: {s}\n", .{
+                attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
+            });
+            return 1;
+        },
+        else => return e,
+    };
+    const entry = attrs.lookup(old_key);
+    if (entry) |e| {
+        if (mox.source.attributes.invalidAt(e, new_key)) |why| {
+            try ctx.err.print("mox mv: {s}: its .mox/attributes.toml entry cannot move to {s}: {s}\n", .{ old_name, new_key, why });
+            return 1;
+        }
+    }
+    const rekey = entry != null or attrs.released(new_key);
+    if (rekey) {
+        attrs.refuseComments() catch {
+            try ctx.err.print("mox mv: {s}: comments here would be lost; remove them\n", .{attrs.path});
+            return 1;
+        };
+    }
+
     // Snapshot first: back the source (base + .d) into the trash so the move
     // is recoverable if anything goes wrong.
     const id = mox.apply.snapshot.idNow(ctx.io);
@@ -116,47 +149,16 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         } else |_| {}
     }
 
-    // Re-key any attributes entry (mode git cannot carry) from the old target
-    // to the new one BEFORE the rename; keys are portable, derived from the live
-    // paths. Doing it first means a write failure aborts with nothing moved
-    // (consistent), and if a later rename fails the re-key is already done, so a
-    // re-run completes the move without orphaning the entry on the old key.
-    const old_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, old_live);
-    const new_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, new_live);
-    var attrs_diag: mox.source.attributes.Diag = .{};
-    var attrs = mox.source.attributes.loadStrict(ctx.alloc, ctx.io, context.paths.repo_dir, &attrs_diag) catch |e| switch (e) {
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
-        => {
-            try ctx.err.print("mox mv: attributes.toml: {s}: {s}\n", .{
-                attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-            });
-            return 1;
-        },
-        else => return e,
-    };
-    if (attrs.lookup(old_key)) |entry| {
+    // Re-key the attributes entry BEFORE the rename; keys are portable,
+    // derived from the live paths. Doing it first means a write failure
+    // aborts with nothing moved (consistent), and if a later rename fails
+    // the re-key is already done, so a re-run completes the move without
+    // orphaning the entry on the old key.
+    if (rekey) {
         _ = attrs.remove(old_key);
-        try attrs.set(new_key, entry);
+        _ = attrs.remove(new_key);
+        if (entry) |e| try attrs.set(new_key, e);
         try attrs.write(ctx.io, context.paths.repo_dir);
-    }
-
-    // The owned record is keyed by live path: re-key it so the next apply of
-    // the new path compares against the recorded owned state instead of
-    // treating it as first contact, and the old path leaves no stale record.
-    if (try mox.apply.applied.readOwned(ctx.alloc, ctx.io, context.paths.state_dir, old_live)) |owned_rec| {
-        try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, new_live, owned_rec);
-        try mox.apply.applied.forgetOwned(ctx.alloc, ctx.io, context.paths.state_dir, old_live);
-    }
-
-    // A generator's produced-set manifest is keyed by the generator's live path,
-    // not its source file, so a rename would leave the old leaves tracked under
-    // the old key -- orphaned, never pruned. Re-key the manifest to the new live
-    // path so the next apply prunes the old leaves rather than leaking them.
-    const prior_gen = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, old_live);
-    if (prior_gen.len > 0) {
-        try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, new_live, prior_gen);
-        try mox.apply.generated.deleteManifest(ctx.alloc, ctx.io, context.paths.state_dir, old_live);
     }
 
     // Rename base then its overlay dir.
@@ -178,9 +180,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     try ctx.out.print("Moved {s} -> {s} (run 'mox apply' to update live files)\n", .{ file.source_base_path, new_base_rel });
     if (file.own_paths.len > 0) {
-        // Same orphan rule as a whole-file mv, stated: mox stops managing
-        // the old path, it does not undo what it wrote there.
-        try ctx.out.print("  old live file keeps its owned content: {f}\n", .{display.of(old_live, context.paths.home)});
+        try ctx.out.print("  the next apply leaves the old live file in place, no longer managed: {f}\n", .{display.of(old_live, context.paths.home)});
+    } else {
+        try ctx.out.print("  the next apply removes the old live file, or reports it as drift if edited: {f}\n", .{display.of(old_live, context.paths.home)});
     }
     return 0;
 }

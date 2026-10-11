@@ -325,6 +325,30 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try diffOne(ctx, context.paths.state_dir, sty, stat_mode, file.live_path, composed_bytes, prov.items, &total, &changed);
     }
 
+    // A file whose source left the tree: apply removes it when unedited, so
+    // its live content shows on the removed side.
+    if (a.paths.len == 0) {
+        const stale = mox.apply.stale;
+        const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
+        var keep: std.StringHashMap(void) = .init(ctx.alloc);
+        var live_paths: std.ArrayList([]const u8) = .empty;
+        for (tree.files) |f| {
+            try keep.put(f.live_path, {});
+            try live_paths.append(ctx.alloc, f.live_path);
+        }
+        for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
+        for (tree.released) |p| try keep.put(p, {});
+        const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, &keep);
+        var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
+        for (cands) |c| {
+            if (c.kind != .whole) continue;
+            const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
+            if (ruleset.isPathIgnored(rel, false)) continue;
+            if (try stale.judge(ctx.alloc, ctx.io, c, &inodes) != .remove) continue;
+            try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
+        }
+    }
+
     if (stat_mode) {
         try ctx.out.print(" {d} file(s) changed, +{d} -{d}\n", .{ changed, total.added, total.removed });
     }

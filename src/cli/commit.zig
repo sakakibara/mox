@@ -2375,7 +2375,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target);
+        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir));
         try ctx.out.print("  committed {f}\n", .{display.of(s.live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2384,7 +2384,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
+        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir));
         if (!r.secret) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
         try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.prov);
         try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
@@ -2426,7 +2426,7 @@ fn commitRun(
                     // no line provenance.
                     try advanceOwnedRecord(ctx, file, r.composed, r.prov);
                 } else {
-                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
+                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir));
                     // Never cache the cleartext of a secret-bearing composition.
                     if (!mox.provenance.map.hasSecret(r.prov)) {
                         try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
@@ -2587,6 +2587,7 @@ fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed
         .secret = any_secret,
         .own_paths = raws,
         .secret_paths = secret_raws.items,
+        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir),
     });
 }
 

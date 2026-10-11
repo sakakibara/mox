@@ -387,6 +387,15 @@ fn parseEntry(arena: std.mem.Allocator, key: []const u8, tbl: anytype) !Entry {
     return e;
 }
 
+/// Why `e` cannot be held for `key`, or null when it can: the keys whose
+/// validity depends on the target's path -- `format` and the directive keys
+/// -- checked as `load` checks them.
+pub fn invalidAt(e: Entry, key: []const u8) ?[]const u8 {
+    if (e.jsonc and !format_mod.isJsonPath(key)) return "format = \"jsonc\" applies only to a .json path";
+    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return directive_home;
+    return null;
+}
+
 fn lessDefault(_: void, a: Default, b: Default) bool {
     return std.mem.order(u8, a.name, b.name) == .lt;
 }

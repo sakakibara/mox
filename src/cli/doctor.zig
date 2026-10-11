@@ -413,9 +413,9 @@ fn trackedAndIgnored(
 }
 
 /// `.mox/attributes.toml` keys that no walked managed target derives (a
-/// target's key is its source path under `src/`, private layer included).
-/// Such an entry is dead: the walk never pairs it with a file, so its
-/// mode/symlink/seed-once intent silently applies to nothing. Null means
+/// target's key is its source path under `src/`, private layer included),
+/// tombstones aside. Such an entry is dead: the walk never pairs it with a
+/// file, so its intent silently applies to nothing. Null means
 /// attributes.toml, machine state, or the source tree could not be read (the
 /// check could not run), distinct from running and finding nothing. Sorted,
 /// arena-owned keys.
@@ -441,9 +441,11 @@ fn orphanedAttributes(
     }
 
     var out: std.ArrayList([]const u8) = .empty;
-    var it = attrs.map.keyIterator();
-    while (it.next()) |k| {
-        if (!derived.contains(k.*)) try out.append(arena, k.*);
+    var it = attrs.map.iterator();
+    while (it.next()) |kv| {
+        // A tombstone pairs with no source by design.
+        if (kv.value_ptr.released) continue;
+        if (!derived.contains(kv.key_ptr.*)) try out.append(arena, kv.key_ptr.*);
     }
     std.mem.sort([]const u8, out.items, {}, lessString);
     return try out.toOwnedSlice(arena);

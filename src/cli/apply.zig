@@ -384,6 +384,8 @@ fn applyPass(
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     const base_tree = (try walkTreeOrReport(ctx, "mox apply", src_dir, m_state.home)) orelse return 2;
+    // Every record this run writes names the repo it came from.
+    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
 
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 
@@ -444,12 +446,19 @@ fn applyPass(
             counts.fail += 1;
             continue;
         }
+        // A record names its live path on one line.
+        if (std.mem.indexOfScalar(u8, file.live_path, '\n') != null) {
+            try ctx.err.print("  ERROR   {s} (a live path holding a newline cannot be recorded)\n", .{shown});
+            counts.fail += 1;
+            try compose_failed.append(ctx.alloc, file.live_path);
+            continue;
+        }
 
         // A GENERATOR (`for ... into`) fans out to N files instead of writing
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are
         // deferred to a second pass against the global keep set below.
-        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home)) continue;
+        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home, repo_tag)) continue;
 
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never composed or written.
@@ -506,7 +515,7 @@ fn applyPass(
 
                 if (disposition == .unchanged) {
                     counts.unchanged += 1;
-                    if (!dry_run) try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
+                    if (!dry_run) try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, repo_tag);
                     try ctx.out.print("  unchanged {s} -> {s}\n", .{ shown, target });
                     continue;
                 }
@@ -545,7 +554,7 @@ fn applyPass(
                         counts.fail += 1;
                         continue;
                     };
-                    try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
+                    try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, repo_tag);
                     counts.ok += 1;
                     try ctx.out.print("  symlinked {s} -> {s} (directory backed up)\n", .{ shown, target });
                     continue;
@@ -576,7 +585,7 @@ fn applyPass(
                     counts.fail += 1;
                     continue;
                 };
-                try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target);
+                try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, repo_tag);
                 counts.ok += 1;
                 try ctx.out.print("  symlinked {s} -> {s}\n", .{ shown, target });
             } else if (file.own_paths.len > 0) {
@@ -593,9 +602,11 @@ fn applyPass(
                     .check_timeout_ms = check_timeout_ms,
                     .extra_path_dirs = mox_path_dirs.items,
                     .mox_bin_dir = mox_bin_dir,
+                    .repo = repo_tag,
                 }, &counts, &snapshotted);
             } else {
                 try applyRegularFile(ctx, .{
+                    .repo = repo_tag,
                     .live_path = file.live_path,
                     .bytes = bytes,
                     .prov_items = prov.items,
@@ -634,6 +645,10 @@ fn applyPass(
         }
     }
 
+    // Every path a generator manifest lists, before this run rewrites or
+    // drops any: the stale-record sweep below never touches one.
+    const manifest_leaves = try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir);
+
     // Second pass: prune each SUCCEEDED generator's dropped leaves against the
     // global keep, then record its current set. A failed generator prunes
     // nothing and keeps its old manifest. `mute_drift_message` suppresses the
@@ -659,7 +674,25 @@ fn applyPass(
             try units.append(ctx.alloc, mox.apply.drift.generatedSet(g.live_path));
             counts.drift += 1;
         }
-        if (!dry_run) try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, g.live_path, g.current);
+        if (!dry_run) try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, g.live_path, g.current, repo_tag);
+    }
+
+    // The sweeps below remove files whose source left the tree. A run that
+    // could not judge every file -- scoped, or with one that failed to
+    // compose or carried a head error -- sweeps nothing: a failure at a
+    // moved path must not remove the old path's file before the new one is
+    // written.
+    const sweep_ok = blk: {
+        if (scoped or compose_failed.items.len > 0) break :blk false;
+        for (files) |f| if (f.head_error.len > 0) break :blk false;
+        for (gen_states.items) |g| if (!g.succeeded) break :blk false;
+        break :blk true;
+    };
+    var released_names: std.StringHashMap(void) = .init(ctx.alloc);
+    var released_live: std.StringHashMap(void) = .init(ctx.alloc);
+    for (tree.released) |p| {
+        try released_live.put(p, {});
+        try released_names.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(p)), {});
     }
 
     // Third pass: sweep manifests whose generator left the tree (source
@@ -671,7 +704,7 @@ fn applyPass(
     // tree to scope an `--overwrite <path>` to, so its drift-class refusals
     // count toward the exit code but do not add a report row; the existing
     // per-leaf message (kept, unmuted) is the only place this surfaces.
-    if (!scoped) {
+    if (sweep_ok) {
         var known: std.StringHashMap(void) = .init(ctx.alloc);
         for (gen_states.items) |g| {
             try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(g.live_path)), {});
@@ -691,11 +724,29 @@ fn applyPass(
             .home = context.paths.home,
             .force = force,
             .dry_run = dry_run,
+            .repo = repo_tag,
+            .released = &released_names,
         }, &known, &keep_set, ctx.out, ctx.err);
         if (swept.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += swept.error_refused;
         counts.drift += swept.drift_refused;
         unrowed_drift += swept.drift_refused;
+
+        var tree_keep: std.StringHashMap(void) = .init(ctx.alloc);
+        for (tree.files) |f| try tree_keep.put(f.live_path, {});
+        for (manifest_leaves) |leaf| try tree_keep.put(leaf, {});
+        var pit = produced.keyIterator();
+        while (pit.next()) |p| try tree_keep.put(p.*, {});
+        try sweepStale(ctx, .{
+            .repo = repo_tag,
+            .keep = &tree_keep,
+            .tree = tree.files,
+            .released = &released_live,
+            .ruleset = &ruleset,
+            .snap_id = snap_id,
+            .force = force,
+            .dry_run = dry_run,
+        }, &units, &counts, &snapshotted);
     }
 
     // Exact-directory sweep: after every managed file is written, remove live
@@ -1820,9 +1871,124 @@ fn omitFile(
     if (!gated) try ctx.out.print("    add \"# mox: keep-empty\" to keep it as an empty file\n", .{});
 }
 
+const StaleInput = struct {
+    repo: []const u8,
+    /// Live paths the tree and every generator manifest name.
+    keep: *const std.StringHashMap(void),
+    tree: []const mox.source.tree.ManagedFile,
+    /// Live paths `.mox/attributes.toml` released.
+    released: *const std.StringHashMap(void),
+    ruleset: *const mox.source.ignore.match.RuleSet,
+    snap_id: []const u8,
+    force: bool,
+    dry_run: bool,
+};
+
+/// Converge files whose source left the tree: an unedited whole file or
+/// symlink mox wrote is removed snapshot-first, an edited one is drift, one
+/// already gone is forgotten, and a partially owned one is left in place
+/// with its records forgotten. A released path is forgotten and never
+/// removed; an ignored one is left alone; the same file as a managed path
+/// (a case-only rename) is forgotten, nothing removed.
+fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.drift.Unit), counts: *Counts, snapshotted: *bool) !void {
+    const context = ctx.context.?;
+    const stale = mox.apply.stale;
+    const home = context.paths.home;
+    const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, in.repo, in.keep);
+    if (cands.len == 0) return;
+    var live_paths: std.ArrayList([]const u8) = .empty;
+    for (in.tree) |f| try live_paths.append(ctx.alloc, f.live_path);
+    var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
+    for (cands) |c| {
+        const shown = try display.alloc(ctx.alloc, c.live_path, home);
+        if (in.released.contains(c.live_path)) {
+            if (!in.dry_run) try forgetAll(ctx, c.live_path);
+            continue;
+        }
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
+        if (in.ruleset.isPathIgnored(rel, false)) continue;
+        const verdict = try stale.judge(ctx.alloc, ctx.io, c, &inodes);
+        switch (verdict) {
+            .gone, .same_file => if (!in.dry_run) try forgetAll(ctx, c.live_path),
+            .special => {
+                try ctx.err.print("mox apply: {s}: no longer managed, but not a file mox wrote; left in place\n", .{shown});
+                counts.fail += 1;
+            },
+            .leave => {
+                if (in.dry_run) {
+                    try ctx.out.print("  would leave {s} in place (no longer managed)\n", .{shown});
+                } else {
+                    try forgetAll(ctx, c.live_path);
+                    try ctx.out.print("  left {s} in place (no longer managed)\n", .{shown});
+                }
+            },
+            .drift => if (!in.force) {
+                counts.drift += 1;
+                try units.append(ctx.alloc, mox.apply.drift.vanished(c.live_path));
+            } else try removeStale(ctx, c, in, shown, units, counts, snapshotted),
+            .remove => try removeStale(ctx, c, in, shown, units, counts, snapshotted),
+        }
+    }
+}
+
+/// Remove one stale file or symlink, snapshotting it first.
+fn removeStale(ctx: *app.Ctx, c: mox.apply.stale.Candidate, in: StaleInput, shown: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), counts: *Counts, snapshotted: *bool) !void {
+    const context = ctx.context.?;
+    if (in.dry_run) {
+        counts.removed += 1;
+        try ctx.out.print("  would remove {s} (no longer managed)\n", .{shown});
+        return;
+    }
+    const site = mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, c.live_path);
+    const snap_res = switch (site) {
+        .symlink => |target| mox.apply.snapshot.saveSymlink(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, c.live_path, target),
+        .directory, .absent => {
+            try forgetAll(ctx, c.live_path);
+            return;
+        },
+        .other => blk: {
+            const live = std.Io.Dir.cwd().readFileAlloc(ctx.io, c.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| {
+                try ctx.err.print("mox apply: {s}: cannot read to back up, not removing: {s}\n", .{ shown, @errorName(e) });
+                counts.fail += 1;
+                return;
+            };
+            // Edited since it was judged: drift, kept.
+            if (!in.force and c.kind == .whole and !std.mem.eql(u8, &mox.apply.applied.contentHashHex(live), &c.hash)) {
+                counts.drift += 1;
+                try units.append(ctx.alloc, mox.apply.drift.vanished(c.live_path));
+                return;
+            }
+            break :blk mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, c.live_path, try redactedPriorContent(ctx, c.live_path, live));
+        },
+    };
+    snap_res catch |e| {
+        try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ shown, @errorName(e) });
+        counts.fail += 1;
+        return;
+    };
+    snapshotted.* = true;
+    std.Io.Dir.cwd().deleteFile(ctx.io, c.live_path) catch |e| {
+        try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ shown, @errorName(e) });
+        counts.fail += 1;
+        return;
+    };
+    try forgetAll(ctx, c.live_path);
+    counts.removed += 1;
+    try ctx.out.print("  removed {s} (no longer managed)\n", .{shown});
+}
+
+/// Forget every record family mox keeps for `live_path`, provenance included.
+fn forgetAll(ctx: *app.Ctx, live_path: []const u8) !void {
+    const state_dir = ctx.context.?.paths.state_dir;
+    try mox.apply.applied.forget(ctx.alloc, ctx.io, state_dir, live_path);
+    try mox.provenance.map.forget(ctx.alloc, ctx.io, state_dir, live_path);
+}
+
 /// Inputs to `applyRegularFile`: everything the per-file write path needs that
 /// differs between a normal managed file and one generator output.
 const RegularInput = struct {
+    /// The repo every record names.
+    repo: []const u8,
     live_path: []const u8,
     bytes: []const u8,
     prov_items: []const mox.provenance.map.Segment,
@@ -1915,7 +2081,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
                 // A stale owned record from a formerly partial path would make
                 // rollback withhold this file's whole-file restores forever.
                 try mox.apply.applied.forgetOwned(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path);
-                try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
+                try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes, in.repo);
                 if (!contains_secret) {
                     try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
                 }
@@ -1959,7 +2125,7 @@ fn applyRegularFile(ctx: *app.Ctx, in: RegularInput, counts: *Counts, snapshotte
     };
     if (!in.create_once) {
         try mox.apply.applied.forgetOwned(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path);
-        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
+        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes, in.repo);
         if (!contains_secret) {
             try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, in.live_path, in.bytes);
         }
@@ -1989,6 +2155,8 @@ const PartialInput = struct {
     /// `mox apply` (rollback names no scripts, so it passes none).
     extra_path_dirs: []const []const u8 = &.{},
     mox_bin_dir: ?[]const u8 = null,
+    /// The repo the owned record names.
+    repo: []const u8,
 };
 
 /// Run a partial file's `check` hook against `candidate`, materialized
@@ -2245,11 +2413,18 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     if (live_matches) {
         counts.unchanged += 1;
         if (in.dry_run or record_current) {
+            // An unchanged file writes nothing, so a current record that
+            // does not yet name this repo is tagged in place.
+            if (!in.dry_run and record_current and !sameRepo(record.?.repo, in.repo)) {
+                var tagged = record.?;
+                tagged.repo = in.repo;
+                try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, live_path, tagged);
+            }
             try ctx.out.print("  unchanged {s}\n", .{shown});
         } else {
             // Clean adoption: the live owned content is already the composed
             // content, so only the record is established; no byte changes.
-            try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items);
+            try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items, in.repo);
             try ctx.out.print("  adopted {s} (live owned content matches the source)\n", .{shown});
         }
         return;
@@ -2344,7 +2519,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
         },
     };
 
-    try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items);
+    try writeOwnedRecord(ctx, live_path, mode, composed_canon, any_secret, own_paths, secret_raws.items, in.repo);
     counts.ok += 1;
     try ctx.out.print("  {s} {s}\n", .{ if (live == null) "created" else "wrote", shown });
 }
@@ -2357,6 +2532,7 @@ fn writeOwnedRecord(
     any_secret: bool,
     own_paths: []const mox.source.tree.OwnPath,
     secret_raws: []const []const u8,
+    repo: []const u8,
 ) !void {
     const context = ctx.context.?;
     const raws = try ctx.alloc.alloc([]const u8, own_paths.len);
@@ -2372,7 +2548,13 @@ fn writeOwnedRecord(
         .secret = any_secret,
         .own_paths = raws,
         .secret_paths = secret_raws,
+        .repo = repo,
     });
+}
+
+fn sameRepo(a: ?[]const u8, b: []const u8) bool {
+    const r = a orelse return false;
+    return std.mem.eql(u8, r, b);
 }
 
 /// Apply a GENERATOR file, or report it is not one. Returns false when `file`
@@ -2403,6 +2585,7 @@ fn applyGenerator(
     gen_states: *std.ArrayList(GenState),
     ruleset: *const mox.source.ignore.match.RuleSet,
     home: []const u8,
+    repo: []const u8,
 ) !bool {
     const shown = try display.alloc(ctx.alloc, file.live_path, home);
     var diag: mox.compose.interp.Diag = .{};
@@ -2436,6 +2619,13 @@ fn applyGenerator(
             try recordFailedGenerator(ctx, file, gen_states);
             return true;
         }
+        if (std.mem.indexOfScalar(u8, o.live_path, '\n') != null) {
+            try ctx.err.print("mox apply: {s}: a generated path holding a newline cannot be recorded\n", .{shown});
+            try ctx.err.flush();
+            counts.fail += 1;
+            try recordFailedGenerator(ctx, file, gen_states);
+            return true;
+        }
         if (generatedParentEscapes(ctx.io, base_dir, o.live_path)) {
             try ctx.err.print("mox apply: {s}: generated path escapes the target dir through a symlink: {f}\n", .{ shown, display.of(o.live_path, home) });
             try ctx.err.flush();
@@ -2459,6 +2649,7 @@ fn applyGenerator(
         try current.append(ctx.alloc, o.live_path);
         try produced.put(o.live_path, {});
         try applyRegularFile(ctx, .{
+            .repo = repo,
             .live_path = o.live_path,
             .bytes = o.content,
             .prov_items = o.prov,
