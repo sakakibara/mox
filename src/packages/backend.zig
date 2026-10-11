@@ -376,6 +376,20 @@ pub const Backend = struct {
         };
     };
 
+    /// An installed package its manager holds in a way that carries it off
+    /// the row naming it: what the manager does to the package next -- an
+    /// upgrade, a reinstall -- acts on another package.
+    pub const Astray = struct {
+        /// The id, as `idOf` spells it for the row.
+        id: []const u8,
+        /// What holds the package astray, as a clause.
+        why: []const u8,
+        /// The command line that puts the package back under the row's own
+        /// name, for the user to run. mox never uninstalls, and this repair
+        /// can need to.
+        fix: []const u8,
+    };
+
     pub const VTable = struct {
         /// Whether this manager is usable on this machine.
         available: *const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Availability,
@@ -436,6 +450,11 @@ pub const Backend = struct {
         /// backend. Absent when the `limitation` field states it, or when there is
         /// nothing to state.
         limitation: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror!?[]const u8 = null,
+        /// Of these rows, every one of them installed, the ones whose package
+        /// the manager holds astray. Absent for an adapter whose manager keeps
+        /// no binding that can move off the package, where the answer is
+        /// always none.
+        astray: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Astray = null,
         /// The row that would name an observed installed id: the inverse of
         /// `idOf`, for writing a hand-installed package back into the
         /// manifest. `idOf` of the result must equal the id given.
@@ -524,6 +543,11 @@ pub const Backend = struct {
 
     pub fn spacePaths(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
         const f = self.vtable.spacePaths orelse return &.{};
+        return f(self.ctx, arena, rows);
+    }
+
+    pub fn astray(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Astray {
+        const f = self.vtable.astray orelse return &.{};
         return f(self.ctx, arena, rows);
     }
 

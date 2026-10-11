@@ -28,35 +28,75 @@ pub const Missing = struct {
     id: []const u8,
 };
 
+/// A desired package that is installed, but that its manager holds astray
+/// from the row: what the manager does to it next acts on another package.
+/// Carries the adapter's account of why, and the repair for the user to run.
+pub const Astray = struct {
+    row: Row,
+    id: []const u8,
+    why: []const u8,
+    fix: []const u8,
+};
+
 pub const Drift = struct {
     /// Desired here, not installed.
     missing: []const Missing = &.{},
     /// Installed, declared nowhere in the manifest, and not blacklisted.
     untracked: []const []const u8 = &.{},
+    /// Desired here and installed, but held astray from the row.
+    astray: []const Astray = &.{},
 
     pub fn clean(self: Drift) bool {
-        return self.missing.len == 0 and self.untracked.len == 0;
+        return self.missing.len == 0 and self.untracked.len == 0 and self.astray.len == 0;
     }
 };
 
+/// The desired rows for `b` whose package is installed: the rows
+/// `Backend.astray` is asked about.
+pub fn held(
+    arena: std.mem.Allocator,
+    b: Backend,
+    desired: []const Row,
+    installed: []const []const u8,
+) ![]const Row {
+    var installed_set = std.StringHashMap(void).init(arena);
+    for (installed) |i| try installed_set.put(i, {});
+
+    var out: std.ArrayList(Row) = .empty;
+    for (desired) |row| {
+        if (!std.mem.eql(u8, row.backend, b.name)) continue;
+        if (installed_set.contains(try b.idOf(arena, row))) try out.append(arena, row);
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Drift for one backend. `desired` is the gated selection (any backend;
-/// rows for others are ignored), `installed` what the backend reports.
+/// rows for others are ignored), `installed` what the backend reports, and
+/// `astray` its answer for the rows `held` names.
 pub fn compute(
     arena: std.mem.Allocator,
     b: Backend,
     desired: []const Row,
     installed: []const []const u8,
+    astray: []const Backend.Astray,
     m: Manifest,
 ) !Drift {
     const backend = b.name;
     var installed_set = std.StringHashMap(void).init(arena);
     for (installed) |i| try installed_set.put(i, {});
+    var astray_by_id = std.StringHashMap(Backend.Astray).init(arena);
+    for (astray) |s| try astray_by_id.put(s.id, s);
 
     var missing: std.ArrayList(Missing) = .empty;
+    var strayed: std.ArrayList(Astray) = .empty;
     for (desired) |row| {
         if (!std.mem.eql(u8, row.backend, backend)) continue;
         const id = try b.idOf(arena, row);
-        if (!installed_set.contains(id)) try missing.append(arena, .{ .row = row, .id = id });
+        if (!installed_set.contains(id)) {
+            try missing.append(arena, .{ .row = row, .id = id });
+        } else if (astray_by_id.get(id)) |s| {
+            try strayed.append(arena, .{ .row = row, .id = id, .why = s.why, .fix = s.fix });
+        }
     }
 
     var declared = std.StringHashMap(void).init(arena);
@@ -81,6 +121,7 @@ pub fn compute(
     return .{
         .missing = try missing.toOwnedSlice(arena),
         .untracked = try untracked.toOwnedSlice(arena),
+        .astray = try strayed.toOwnedSlice(arena),
     };
 }
 
@@ -140,7 +181,7 @@ test "compute: missing is desired minus installed" {
     const desired = [_]Row{ rowOf("ripgrep", "brew", null), rowOf("fd", "brew", null) };
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, &.{}, m);
     try testing.expectEqual(@as(usize, 1), d.missing.len);
     try testing.expectEqualStrings("fd", d.missing[0].row.name);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
@@ -154,7 +195,7 @@ test "compute: untracked is installed minus everything the manifest declares" {
     const desired = [_]Row{rowOf("ripgrep", "brew", null)};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "htop" }, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "htop" }, &.{}, m);
     try testing.expectEqual(@as(usize, 1), d.untracked.len);
     try testing.expectEqualStrings("htop", d.untracked[0]);
 }
@@ -170,7 +211,7 @@ test "compute: a package gated to another machine is tracked, not untracked" {
     const desired = [_]Row{rowOf("ripgrep", "brew", null)};
     const m: Manifest = .{ .packages = &all };
 
-    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "work-tool" }, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "work-tool" }, &.{}, m);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
     try testing.expectEqual(@as(usize, 0), d.missing.len);
 }
@@ -182,7 +223,7 @@ test "compute: a blacklisted package is never untracked" {
 
     const m: Manifest = .{ .blacklist = &.{blacklistOf("usage", "brew")} };
 
-    const d = try compute(a, test_backend.make("brew"), &.{}, &.{"usage"}, m);
+    const d = try compute(a, test_backend.make("brew"), &.{}, &.{"usage"}, &.{}, m);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
 }
 
@@ -195,7 +236,7 @@ test "compute: another backend's rows and installs do not cross over" {
     const m: Manifest = .{ .packages = &all };
 
     // `bat` is declared for dnf only, so on brew it is untracked.
-    const d = try compute(a, test_backend.make("brew"), &all, &.{ "ripgrep", "bat" }, m);
+    const d = try compute(a, test_backend.make("brew"), &all, &.{ "ripgrep", "bat" }, &.{}, m);
     try testing.expectEqual(@as(usize, 1), d.untracked.len);
     try testing.expectEqualStrings("bat", d.untracked[0]);
     try testing.expectEqual(@as(usize, 0), d.missing.len);
@@ -210,7 +251,7 @@ test "compute: a cask is not satisfied by the formula of the same name" {
     const desired = [_]Row{caskRow("docker")};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, test_backend.make("brew"), &desired, &.{"docker"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"docker"}, &.{}, m);
     try testing.expectEqual(@as(usize, 1), d.missing.len);
     try testing.expectEqualStrings("docker", d.missing[0].row.name);
     try testing.expectEqualStrings("cask:docker", d.missing[0].id);
@@ -227,7 +268,7 @@ test "compute: a declared cask matches its prefixed installed id" {
     const desired = [_]Row{caskRow("ghostty")};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, test_backend.make("brew"), &desired, &.{"cask:ghostty"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"cask:ghostty"}, &.{}, m);
     try testing.expect(d.clean());
 }
 
@@ -239,7 +280,7 @@ test "compute: clean reports no drift either way" {
     const desired = [_]Row{rowOf("ripgrep", "brew", null)};
     const m: Manifest = .{ .packages = &desired };
 
-    const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, m);
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{"ripgrep"}, &.{}, m);
     try testing.expect(d.clean());
 }
 
@@ -250,6 +291,51 @@ test "compute: a blacklisted cask is never untracked" {
 
     const m: Manifest = .{ .blacklist = &.{caskBlacklistOf("ghostty", "brew")} };
 
-    const d = try compute(a, test_backend.make("brew"), &.{}, &.{"cask:ghostty"}, m);
+    const d = try compute(a, test_backend.make("brew"), &.{}, &.{"cask:ghostty"}, &.{}, m);
     try testing.expectEqual(@as(usize, 0), d.untracked.len);
+}
+
+test "compute: an installed row its manager holds astray is astray, not missing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const desired = [_]Row{ rowOf("emacs-plus@30", "brew", null), rowOf("ripgrep", "brew", null) };
+    const m: Manifest = .{ .packages = &desired };
+    const answers = [_]Backend.Astray{.{ .id = "emacs-plus@30", .why = "moved", .fix = "repair" }};
+
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{ "emacs-plus@30", "ripgrep" }, &answers, m);
+    try testing.expectEqual(@as(usize, 0), d.missing.len);
+    try testing.expectEqual(@as(usize, 1), d.astray.len);
+    try testing.expectEqualStrings("emacs-plus@30", d.astray[0].row.name);
+    try testing.expectEqualStrings("moved", d.astray[0].why);
+    try testing.expectEqualStrings("repair", d.astray[0].fix);
+    try testing.expect(!d.clean());
+}
+
+test "compute: an answer for a row that is not installed leaves it missing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const desired = [_]Row{rowOf("emacs-plus@30", "brew", null)};
+    const m: Manifest = .{ .packages = &desired };
+    const answers = [_]Backend.Astray{.{ .id = "emacs-plus@30", .why = "moved", .fix = "repair" }};
+
+    const d = try compute(a, test_backend.make("brew"), &desired, &.{}, &answers, m);
+    try testing.expectEqual(@as(usize, 1), d.missing.len);
+    try testing.expectEqual(@as(usize, 0), d.astray.len);
+}
+
+test "held: the desired rows of this backend that are installed, by id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The formula `docker` is installed, which does not hold the cask row.
+    const desired = [_]Row{ rowOf("ripgrep", "brew", null), rowOf("fd", "brew", null), caskRow("docker"), rowOf("bat", "dnf", null) };
+
+    const rows = try held(a, test_backend.make("brew"), &desired, &.{ "ripgrep", "docker", "bat" });
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("ripgrep", rows[0].name);
 }

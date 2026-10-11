@@ -154,13 +154,13 @@ pub fn walkTreeOrReport(ctx: *app.Ctx, cmd: []const u8, src_dir: []const u8, hom
 ///
 /// Non-interactive: apply never prompts. It writes every clean file, skips
 /// every drifted one (no write, no snapshot, no record), and reports the
-/// drift set at the end. `force` (`--overwrite`) writes through
-/// drift instead of skipping it, scoped to `paths` when given. Returns 0
-/// (clean), 1 (drift was skipped and needs a decision), or 2 (a genuine
-/// failure -- see the exit-code split in `applyPass`). `held` is a keepalive
-/// the caller already holds a sudo credential with (`init`'s Command Line
-/// Tools install); a bootstrap that elevates runs on it instead of asking
-/// again, and the caller stops it.
+/// drift set at the end. `force` (`--overwrite`) writes through drift instead
+/// of skipping it, scoped to `paths` when given. Returns 0 (clean), 1 (drift
+/// was skipped, or a package is astray, and needs a decision), or 2 (a
+/// genuine failure -- see the exit-code split in `applyPass`). `held` is a
+/// keepalive the caller already holds a sudo credential with (`init`'s
+/// Command Line Tools install); a bootstrap that elevates runs on it instead
+/// of asking again, and the caller stops it.
 pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, color: style.ColorFlag, paths: []const []const u8, held: ?*mox.packages.admin.Keepalive) anyerror!u8 {
     return applyPass(ctx, force, dry_run, skip_scripts_arg, defaults, color, paths, held);
 }
@@ -776,15 +776,17 @@ fn applyPass(
             // to anyone not watching stderr.
             if (pkg_counts.would_bootstrap > 0) {
                 try ctx.out.print(
-                    "Packages: {d} would be installed, {d} failed, after bootstrapping {d} manager(s)\n",
+                    "Packages: {d} would be installed, {d} failed, after bootstrapping {d} manager(s)",
                     .{ pkg_counts.would, pkg_counts.failed, pkg_counts.would_bootstrap },
                 );
             } else {
                 try ctx.out.print(
-                    "Packages: {d} would be installed, {d} failed\n",
+                    "Packages: {d} would be installed, {d} failed",
                     .{ pkg_counts.would, pkg_counts.failed },
                 );
             }
+            if (pkg_counts.astray > 0) try ctx.out.print(", {d} astray", .{pkg_counts.astray});
+            try ctx.out.writeAll("\n");
         }
     } else {
         try ctx.out.print(
@@ -809,6 +811,7 @@ fn applyPass(
                 ", {d} already on the machine",
                 .{pkg_counts.marked},
             );
+            if (pkg_counts.astray > 0) try ctx.out.print(", {d} astray", .{pkg_counts.astray});
             if (pkg_counts.attempted > 0) try ctx.out.print(
                 " ({d} row(s) in failed batches may have landed)",
                 .{pkg_counts.attempted},
@@ -836,12 +839,12 @@ fn applyPass(
 
     // A blocked script (its fact contract could not be resolved), a compose
     // failure, an unwritable target, or lock contention is a genuine failure:
-    // rc 2. Drift left untouched (skipped, not forced) is a normal, actionable
-    // non-success: rc 1. Neither: rc 0.
+    // rc 2. Drift left untouched (skipped, not forced), or a package left
+    // astray, is a normal, actionable non-success: rc 1. Neither: rc 0.
     const error_class = counts.fail + pre_result.failed + post_result.failed +
         pre_result.blocked + post_result.blocked + pkg_counts.failed;
     if (error_class > 0) return 2;
-    if (counts.drift > 0) return 1;
+    if (counts.drift > 0 or pkg_counts.astray > 0) return 1;
     return 0;
 }
 
@@ -1072,6 +1075,9 @@ const PackageCounts = struct {
     would: usize = 0,
     would_bootstrap: usize = 0,
     failed: usize = 0,
+    /// Installed rows their manager holds astray, left as they are: the
+    /// repair can uninstall, and mox never does.
+    astray: usize = 0,
 };
 
 /// Install every package the manifest declares and this machine lacks.
@@ -1224,6 +1230,7 @@ fn applyPackages(
         registry,
         bindings,
         would_bootstrap.items,
+        .judge,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -1263,6 +1270,21 @@ fn applyPackages(
         .would_bootstrap = would_bootstrap.items.len,
     };
     if (!dry_run) try warnLowSpace(ctx, &pkg_backends, registry, rep, failed_backends);
+    for (rep.backends) |b| {
+        // Installs go ahead: what is missing is known all the same.
+        if (b.unchecked) |why| try ctx.err.print(
+            "mox apply: {s}: whether its installed packages are held astray is unknown: {s}\n",
+            .{ b.backend, why },
+        );
+        for (b.drift.astray) |s| {
+            try ctx.err.print(
+                "mox apply: {s}: {s} is {s}; mox never uninstalls, so it was left as it is; to fix: {s}\n",
+                .{ b.backend, s.row.name, s.why, s.fix },
+            );
+            counts.astray += 1;
+        }
+    }
+    try ctx.err.flush();
     for (rep.backends) |b| {
         if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
@@ -2480,7 +2502,7 @@ pub const command = app.command(Spec, .{
     .name = "apply",
     .usage = "mox apply [--flags] [<paths...>]",
     .summary = "Compose all managed files and write to live paths",
-    .details = "Never prompts about drift. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift left for a decision, 2 a genuine failure.",
+    .details = "Never prompts about drift. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift or an astray package left for a decision, 2 a genuine failure.",
     .group = .general,
     .needs_context = true,
 }, run);

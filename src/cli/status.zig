@@ -108,6 +108,8 @@ fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool)
     const counts = [_]struct { n: usize, word: []const u8 }{
         .{ .n = pkgs.report.missingCount(), .word = "missing" },
         .{ .n = pkgs.report.untrackedCount(), .word = "untracked" },
+        .{ .n = pkgs.report.astrayCount(), .word = "astray" },
+        .{ .n = pkgs.report.uncheckedCount(), .word = "unchecked" },
         .{ .n = pkgs.report.broken.len, .word = "broken" },
         .{ .n = if (actionable_only) 0 else pkgs.report.gatedCount(), .word = "gated" },
     };
@@ -143,7 +145,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, why for a backend whose installed packages could not be checked for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -471,7 +473,7 @@ const Packages = struct {
     /// Every package the report counts against the exit code, and every
     /// manager that is there but broken.
     fn problems(self: Packages) usize {
-        return self.report.missingCount() + self.report.untrackedCount() + self.report.broken.len + @intFromBool(self.broken);
+        return self.report.missingCount() + self.report.untrackedCount() + self.report.astrayCount() + self.report.uncheckedCount() + self.report.broken.len + @intFromBool(self.broken);
     }
 };
 
@@ -553,6 +555,7 @@ fn reportPackages(
         prep.registry,
         bindings,
         &.{},
+        .judge,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -636,14 +639,20 @@ fn printPackages(
         if (!drift_only) {
             if (b.limitation) |note| try ctx.out.print("  note      {s}: {s}\n", .{ b.backend, note });
         }
+        if (b.unchecked) |why| {
+            try ctx.out.print("  {s:<9} {s} (whether its installed packages are held astray is unknown: {s})\n", .{ "UNCHECKED", b.backend, why });
+        }
         if (b.drift.clean()) {
-            if (!drift_only) try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
+            if (!drift_only and b.unchecked == null) try ctx.out.print("  {s:<9} {s}\n", .{ "clean", b.backend });
         } else {
             for (b.drift.missing) |m| {
                 try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, m.row.name });
             }
             for (b.drift.untracked) |id| {
                 try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
+            }
+            for (b.drift.astray) |s| {
+                try ctx.out.print("  {s:<9} {s} {s} ({s}; to fix: {s})\n", .{ "ASTRAY", b.backend, s.row.name, s.why, s.fix });
             }
         }
         // A row this machine's gate excludes, named with the gate that
@@ -666,16 +675,21 @@ fn printPackages(
 
 /// Emit the drift set as JSON: `{"files":[...],"packages":[...]}`. A file is
 /// `{path, kind, [key], first_contact}`; a package is `{backend, state, id,
-/// [name]}`, `state` being `missing` or `untracked` and `id` the identity its
-/// backend compares by (a brew cask carries its `cask:` prefix, so it can
-/// never be confused with the formula of the same name). `name` is what the
-/// manifest row spells, present only for a missing package. A manager that
-/// is there but broken is `{backend, state: "broken", exit, probe, [why]}`,
-/// `exit` being the exit code or null for a call that never reached one
-/// (killed at its bound, ended for want of a terminal, answered in a shape
-/// that is not an answer); `why` carries the reason in words for exactly
-/// those, so a genuine exit of 255 can never read as one of them. A manifest that
-/// would not load or validate is `{"state":"refused"}`, carrying no `backend`
+/// [name], [why], [fix]}`, `state` being `missing`, `untracked` or `astray`
+/// and `id` the identity its backend compares by (a brew cask carries its
+/// `cask:` prefix, so it can never be confused with the formula of the same
+/// name). `name` is what the manifest row spells, present for a missing or an
+/// astray package. An astray package is installed, but held by its manager
+/// under a binding that moved off it; `why` says how, and `fix` is the
+/// command line that repairs it, which mox leaves to the user because it can
+/// need an uninstall. A backend whose installed packages could not be checked
+/// for that is `{backend, state: "unchecked", why}`. A manager that is there
+/// but broken is `{backend, state: "broken", exit, probe, [why]}`, `exit`
+/// being the exit code or null for a call that never reached one (killed at
+/// its bound, ended for want of a terminal, answered in a shape that is not
+/// an answer); `why` carries the reason in words for exactly those, so a
+/// genuine exit of 255 can never read as one of them. A manifest that would
+/// not load or validate is `{"state":"refused"}`, carrying no `backend`
 /// because nothing was reached: without it the empty array is byte-identical
 /// to a machine whose every package is accounted for, and the reason is on
 /// stderr.
@@ -740,6 +754,15 @@ fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
         try out.writeByte('}');
     }
     for (rep.backends) |b| {
+        if (b.unchecked) |why| {
+            if (!first) try out.writeByte(',');
+            first = false;
+            try out.writeAll("{\"backend\":");
+            try writeJsonString(out, b.backend);
+            try out.writeAll(",\"state\":\"unchecked\",\"why\":");
+            try writeJsonString(out, why);
+            try out.writeByte('}');
+        }
         for (b.drift.missing) |m| {
             if (!first) try out.writeByte(',');
             first = false;
@@ -758,6 +781,21 @@ fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
             try writeJsonString(out, b.backend);
             try out.writeAll(",\"state\":\"untracked\",\"id\":");
             try writeJsonString(out, id);
+            try out.writeByte('}');
+        }
+        for (b.drift.astray) |s| {
+            if (!first) try out.writeByte(',');
+            first = false;
+            try out.writeAll("{\"backend\":");
+            try writeJsonString(out, b.backend);
+            try out.writeAll(",\"state\":\"astray\",\"id\":");
+            try writeJsonString(out, s.id);
+            try out.writeAll(",\"name\":");
+            try writeJsonString(out, s.row.name);
+            try out.writeAll(",\"why\":");
+            try writeJsonString(out, s.why);
+            try out.writeAll(",\"fix\":");
+            try writeJsonString(out, s.fix);
             try out.writeByte('}');
         }
     }
@@ -785,8 +823,9 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
 /// A package record is `package_missing` / `package_untracked` \t backend \t
-/// id, or `package_broken` \t backend \t exit code \t probe \t why -- the exit
-/// code being `-` for a call that never reached one (killed at its bound,
+/// id, `package_astray` \t backend \t id \t why \t fix, `package_unchecked`
+/// \t backend \t why, or `package_broken` \t backend \t exit code \t probe \t
+/// why -- the exit code being `-` for a call that never reached one (killed at its bound,
 /// ended for want of a terminal, answered in a shape that is not an answer),
 /// which is the only thing that tells those apart from a genuine exit of 255;
 /// `probe` is what was asked and `why` the reason in words, empty where the
@@ -825,6 +864,13 @@ fn emitPorcelain(
         try out.writeByte('\n');
     }
     for (rep.backends) |b| {
+        if (b.unchecked) |why| {
+            try out.writeAll("package_unchecked\t");
+            try writePorcelainField(out, b.backend);
+            try out.writeByte('\t');
+            try writePorcelainField(out, why);
+            try out.writeByte('\n');
+        }
         for (b.drift.missing) |m| {
             try out.writeAll("package_missing\t");
             try writePorcelainField(out, b.backend);
@@ -837,6 +883,17 @@ fn emitPorcelain(
             try writePorcelainField(out, b.backend);
             try out.writeByte('\t');
             try writePorcelainField(out, id);
+            try out.writeByte('\n');
+        }
+        for (b.drift.astray) |s| {
+            try out.writeAll("package_astray\t");
+            try writePorcelainField(out, b.backend);
+            try out.writeByte('\t');
+            try writePorcelainField(out, s.id);
+            try out.writeByte('\t');
+            try writePorcelainField(out, s.why);
+            try out.writeByte('\t');
+            try writePorcelainField(out, s.fix);
             try out.writeByte('\n');
         }
     }
@@ -975,7 +1032,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be checked, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -1116,6 +1173,79 @@ test "emitPorcelain / emitJson: packages ride the same records, keyed by state" 
         "{\"files\":[],\"packages\":[" ++
             "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"cask:ghostty\",\"name\":\"ghostty\"}," ++
             "{\"backend\":\"brew\",\"state\":\"untracked\",\"id\":\"htop\"}]}\n",
+        jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: an astray package carries its reason and its repair" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const astray = [_]mox.packages.drift.Astray{.{
+        .row = .{
+            .name = "owner/tap/emacs-plus@30",
+            .backend = "brew",
+            .when = null,
+            .fields = &.{},
+            .origin = "/tmp/x.toml",
+            .label = "data/packages/a.toml",
+            .index = 0,
+        },
+        .id = "owner/tap/emacs-plus@30",
+        .why = "installed through the alias \"x\"",
+        .fix = "brew uninstall a\tb && brew install c",
+    }};
+    const backends = [_]mox.packages.report.BackendDrift{.{
+        .backend = "brew",
+        .drift = .{ .astray = &astray },
+    }};
+    const pkgs: Packages = .{ .report = .{ .in_use = true, .backends = &backends } };
+    // Counted against the exit code: the machine does not match its
+    // declaration until the package is held under its own name.
+    try testing.expectEqual(@as(usize, 1), pkgs.problems());
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "package_astray\tbrew\towner/tap/emacs-plus@30\tinstalled through the alias \"x\"\tbrew uninstall a\\tb && brew install c\n",
+        pw.written(),
+    );
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[" ++
+            "{\"backend\":\"brew\",\"state\":\"astray\",\"id\":\"owner/tap/emacs-plus@30\",\"name\":\"owner/tap/emacs-plus@30\"," ++
+            "\"why\":\"installed through the alias \\\"x\\\"\",\"fix\":\"brew uninstall a\\tb && brew install c\"}]}\n",
+        jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: a backend whose astray check failed is a record, never a clean set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const backends = [_]mox.packages.report.BackendDrift{.{
+        .backend = "brew",
+        .drift = .{},
+        .unchecked = "an install receipt could not be read, as the line above says",
+    }};
+    const pkgs: Packages = .{ .report = .{ .in_use = true, .backends = &backends } };
+    try testing.expectEqual(@as(usize, 1), pkgs.problems());
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "package_unchecked\tbrew\tan install receipt could not be read, as the line above says\n",
+        pw.written(),
+    );
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"unchecked\",\"why\":\"an install receipt could not be read, as the line above says\"}]}\n",
         jw.written(),
     );
 }

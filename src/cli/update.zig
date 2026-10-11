@@ -114,8 +114,9 @@ pub fn classifyStatus(arena: std.mem.Allocator, porcelain: []const u8) !Status {
 
 /// Fetch and rebase the repo behind `git`. Returns 0 on success and 2 on any
 /// refusal or failure -- never 1, which `mox update` reserves for apply's
-/// "drift left for a decision". It takes no lock and no Context so it is
-/// drivable against any repo, e.g. a clone in a test tmp dir.
+/// "drift or an astray package left for a decision". It takes no lock and no
+/// Context so it is drivable against any repo, e.g. a clone in a test tmp
+/// dir.
 pub fn fetchRebase(git: Git, stdout: *Io.Writer, stderr: *Io.Writer) !u8 {
     const wt = try git.run(&.{ "git", "rev-parse", "--is-inside-work-tree" });
     if (!wt.ok or !std.mem.eql(u8, std.mem.trim(u8, wt.stdout, " \t\r\n"), "true")) {
@@ -217,7 +218,7 @@ pub const command = app.command(Spec, .{
     .name = "update",
     .usage = "mox update [--flags]",
     .summary = "Fetch, rebase, and apply",
-    .details = "Brings this machine up to date: fetches, rebases onto the upstream, then applies. Refuses on uncommitted changes; a rebase conflict stops for you to resolve or abort. --no-apply stops after the rebase so you can 'mox diff' first. Exit 0 clean, 1 drift left for a decision, 2 a refusal or failure. Sending work the other way is 'mox publish'.",
+    .details = "Brings this machine up to date: fetches, rebases onto the upstream, then applies. Refuses on uncommitted changes; a rebase conflict stops for you to resolve or abort. --no-apply stops after the rebase so you can 'mox diff' first. Exit 0 clean, 1 drift or an astray package left for a decision, 2 a refusal or failure. Sending work the other way is 'mox publish'.",
     .group = .general,
     .needs_context = true,
 }, run);

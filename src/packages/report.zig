@@ -36,6 +36,10 @@ pub const BackendDrift = struct {
     /// row that appears in no output at all reads exactly like a row the
     /// manifest never carried.
     gated: []const Row = &.{},
+    /// Why this backend's installed rows could not be checked for being held
+    /// astray, or null when they were. Counted as drift: an astray row is,
+    /// and an answer that could not be had is not an answer of none.
+    unchecked: ?[]const u8 = null,
 };
 
 /// A manager that is there but cannot answer its own version query. Treated
@@ -67,7 +71,7 @@ pub const Report = struct {
     pub fn clean(self: Report) bool {
         if (self.broken.len > 0) return false;
         for (self.backends) |b| {
-            if (!b.drift.clean()) return false;
+            if (!b.drift.clean() or b.unchecked != null) return false;
         }
         return true;
     }
@@ -81,6 +85,18 @@ pub const Report = struct {
     pub fn untrackedCount(self: Report) usize {
         var n: usize = 0;
         for (self.backends) |b| n += b.drift.untracked.len;
+        return n;
+    }
+
+    pub fn astrayCount(self: Report) usize {
+        var n: usize = 0;
+        for (self.backends) |b| n += b.drift.astray.len;
+        return n;
+    }
+
+    pub fn uncheckedCount(self: Report) usize {
+        var n: usize = 0;
+        for (self.backends) |b| n += @intFromBool(b.unchecked != null);
         return n;
     }
 
@@ -127,6 +143,11 @@ fn noteBroken(
     });
 }
 
+/// What a report is built for. `reconcile` needs only what is untracked, so
+/// it skips the checks that judge installed rows, and the manager calls they
+/// make.
+pub const Purpose = enum { judge, reconcile };
+
 /// `gather` for a manifest already loaded, so a caller that reads it for its
 /// own reasons does not read it twice. `assume_available` names backends to
 /// treat as usable with nothing installed, without asking them: a dry run
@@ -145,6 +166,7 @@ pub fn fromManifest(
     registry: Registry,
     r: *const Resolver,
     assume_available: []const []const u8,
+    purpose: Purpose,
     diag: ?*Diag,
 ) !Report {
     if (!m.inUse()) return .{};
@@ -219,7 +241,7 @@ pub fn fromManifest(
     for (assumed.items) |b| {
         try out.append(arena, .{
             .backend = b.name,
-            .drift = drift_mod.compute(arena, b, rows, &.{}, m) catch |e| {
+            .drift = drift_mod.compute(arena, b, rows, &.{}, &.{}, m) catch |e| {
                 try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
@@ -262,14 +284,25 @@ pub fn fromManifest(
             ));
             break :blk null;
         };
+        // A failed astray check leaves what is missing and untracked known,
+        // so the backend is not broken and apply still installs; but the
+        // answer it could not give is no answer of none, so it is carried
+        // as drift of its own.
+        var unchecked: ?[]const u8 = null;
+        const astray: []const Backend.Astray = if (purpose == .reconcile) &.{} else astrayOf(arena, b, rows, installed) catch |e| blk: {
+            if (e == error.OutOfMemory) return e;
+            unchecked = exec.errorText(e);
+            break :blk &.{};
+        };
         try out.append(arena, .{
             .backend = b.name,
-            .drift = drift_mod.compute(arena, b, rows, installed, m) catch |e| {
+            .drift = drift_mod.compute(arena, b, rows, installed, astray, m) catch |e| {
                 try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
             .limitation = limitation,
             .gated = try gatedFor(arena, gated.items, b.name),
+            .unchecked = unchecked,
         });
     }
 
@@ -279,6 +312,14 @@ pub fn fromManifest(
         .notes = try notes.toOwnedSlice(arena),
         .broken = try broken.toOwnedSlice(arena),
     };
+}
+
+/// What `b` holds astray among the desired rows it has installed. Not asked
+/// at all when it has none of them.
+fn astrayOf(arena: std.mem.Allocator, b: Backend, rows: []const Row, installed: []const []const u8) ![]const Backend.Astray {
+    const held = try drift_mod.held(arena, b, rows, installed);
+    if (held.len == 0) return &.{};
+    return b.astray(arena, held);
 }
 
 /// The gated-out rows naming `backend`, in manifest order.
@@ -335,6 +376,13 @@ const exec = @import("exec.zig");
 const brew_mod = @import("brew.zig");
 const plugin_mod = @import("plugin.zig");
 
+/// `brew --prefix` and `brew --repository` naming a prefix with no install
+/// receipts, so no installed formula is held astray.
+const no_receipts = [_]exec.Fake.Entry{
+    .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = "/nonexistent/mox-test-brew-prefix\n" },
+    .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = "/nonexistent/mox-test-brew-prefix\n" },
+};
+
 fn rowOf(name: []const u8, backend: []const u8) Row {
     return .{
         .name = name,
@@ -365,7 +413,7 @@ test "fromManifest: a manager no row names failing a verb is a note, not this re
     const r: resolver_mod.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 0), rep.broken.len);
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
     try testing.expect(std.mem.indexOf(u8, rep.notes[0], "no row asks it to install anything") != null);
@@ -382,7 +430,7 @@ test "fromManifest: a repo not using the subsystem reports nothing" {
     // No manifest files: every installed package would otherwise read as
     // untracked on a machine that never opted in.
     const m: manifest_mod.Manifest = .{ .files = 0 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{} }, &r, &.{}, .judge, null);
     try testing.expect(!rep.in_use);
     try testing.expect(rep.clean());
 }
@@ -400,7 +448,7 @@ test "fromManifest: an unusable backend is never queried" {
         .packages = &.{rowOf("bat", "dnf")},
         .files = 1,
     };
-    try testing.expectError(error.Unreached, fromManifest(a, m, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, null));
+    try testing.expectError(error.Unreached, fromManifest(a, m, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, .judge, null));
 }
 
 test "fromManifest: drift comes back per backend" {
@@ -423,7 +471,7 @@ test "fromManifest: drift comes back per backend" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expect(rep.in_use);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
@@ -447,8 +495,10 @@ test "fromManifest: a manifest matching the machine is clean" {
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "ghostty\n" },
+        no_receipts[0],
+        no_receipts[1],
     } };
-    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io };
 
     const cask: Row = .{
         .name = "ghostty",
@@ -464,7 +514,7 @@ test "fromManifest: a manifest matching the machine is clean" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expect(rep.clean());
 }
 
@@ -487,7 +537,7 @@ test "fromManifest: an invalid manifest is refused before anything is queried" {
     var d: Diag = .{};
     try testing.expectError(
         validate_mod.Error.UnknownBackend,
-        fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, &d),
+        fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, &d),
     );
 }
 
@@ -524,7 +574,7 @@ test "fromManifest: an absent backend apply would bootstrap is assumed, its rows
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
     try testing.expectEqualStrings("absent; apply will bootstrap it", rep.backends[0].limitation.?);
@@ -555,7 +605,7 @@ test "fromManifest: a bootstrap row whose gate excludes this machine assumes not
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
@@ -586,7 +636,7 @@ test "fromManifest: an inert backend is not assumed for its bootstrap row" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{p.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{p.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
@@ -613,7 +663,7 @@ test "fromManifest: a broken backend is not bootstrapped over, whatever the mani
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 1), rep.broken.len);
     // No backend drift at all: its rows were not judged.
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
@@ -639,7 +689,7 @@ test "fromManifest: a broken backend is treated as absent and listed as broken" 
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     // Broken is drift of its own: nothing to install, but nothing clean.
     try testing.expect(!rep.clean());
@@ -676,7 +726,7 @@ test "fromManifest: a broken manager only a blacklist row names is a note saying
     };
     const m: manifest_mod.Manifest = .{ .blacklist = &.{bl}, .files = 1 };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 0), rep.broken.len);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
@@ -698,15 +748,17 @@ test "fromManifest: a probe error on a backend no row names is a note, and the r
         .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "" },
+        no_receipts[0],
+        no_receipts[1],
     } };
-    var b: brew_mod.Brew = .{ .runner = fake.runner() };
+    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io };
 
     // test_backend's `available` errors; nothing names dnf.
     const m: manifest_mod.Manifest = .{
         .packages = &.{rowOf("ripgrep", "brew")},
         .files = 1,
     };
-    const rep = try fromManifest(a, m, .{ .backends = &.{ b.backend(), test_backend.make("dnf") } }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{ b.backend(), test_backend.make("dnf") } }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
     try testing.expect(rep.clean());
@@ -731,11 +783,11 @@ test "fromManifest: a probe error on a backend a blacklist or bootstrap row name
     };
     const by_blacklist: manifest_mod.Manifest = .{ .blacklist = &.{bl}, .files = 1 };
     var d: Diag = .{};
-    try testing.expectError(error.Unreached, fromManifest(a, by_blacklist, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, &d));
+    try testing.expectError(error.Unreached, fromManifest(a, by_blacklist, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, .judge, &d));
     try testing.expectEqualStrings("dnf: available failed: Unreached", d.capture().?);
 
     const by_bootstrap: manifest_mod.Manifest = .{ .bootstrap = &.{bootstrapRowOf("dnf", null)}, .files = 1 };
-    try testing.expectError(error.Unreached, fromManifest(a, by_bootstrap, .{ .backends = &.{test_backend.makeBootstrappable("dnf")} }, &r, &.{}, null));
+    try testing.expectError(error.Unreached, fromManifest(a, by_bootstrap, .{ .backends = &.{test_backend.makeBootstrappable("dnf")} }, &r, &.{}, .judge, null));
 }
 
 test "fromManifest: a usable backend leaves no note about usability" {
@@ -754,9 +806,80 @@ test "fromManifest: a usable backend leaves no note about usability" {
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
     const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
     try testing.expectEqual(@as(usize, 0), rep.notes.len);
     // Whatever limitation rides here is the adapter's own; being usable adds
     // nothing, and never "absent; apply will bootstrap it".
     try testing.expectEqual(b.backend().limitation, rep.backends[0].limitation);
+}
+
+test "fromManifest: an installed row brew holds astray is drift, and comes back with its repair" {
+    if (!std.Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A prefix where `emacs-plus@30` was installed through the alias
+    // `emacs-plus`, which has since moved on to `emacs-plus@31`.
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const prefix = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const aliases = try std.fs.path.join(a, &.{ prefix, "Library/Taps/owner/homebrew-tap/Aliases" });
+    try std.Io.Dir.cwd().createDirPath(io, aliases);
+    const alias = try std.fs.path.join(a, &.{ aliases, "emacs-plus" });
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ prefix, "Library/Taps/owner/homebrew-tap/Formula" }));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix, "Library/Taps/owner/homebrew-tap/Formula/emacs-plus@31.rb" }), .data = "" });
+    try std.Io.Dir.cwd().symLink(io, "../Formula/emacs-plus@31.rb", alias, .{});
+    const opt = try std.fs.path.join(a, &.{ prefix, "opt", "emacs-plus@30" });
+    try std.Io.Dir.cwd().createDirPath(io, opt);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ opt, "INSTALL_RECEIPT.json" }),
+        .data = try std.fmt.allocPrint(a, "{{\"source\":{{\"path\":\"{s}\"}}}}", .{alias}),
+    });
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .stdout = "Homebrew 7.0.9\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = "owner/tap/emacs-plus@30\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = prefix },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = prefix },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = io };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const m: manifest_mod.Manifest = .{ .packages = &.{rowOf("owner/tap/emacs-plus@30", "brew")}, .files = 1 };
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    try testing.expectEqual(@as(usize, 0), rep.missingCount());
+    try testing.expectEqual(@as(usize, 1), rep.astrayCount());
+    const s = rep.backends[0].drift.astray[0];
+    try testing.expectEqualStrings("owner/tap/emacs-plus@30", s.row.name);
+    try testing.expectEqualStrings("brew uninstall --formula --ignore-dependencies owner/tap/emacs-plus@30 && brew install --formula owner/tap/emacs-plus@30", s.fix);
+    try testing.expect(!rep.clean());
+}
+
+test "fromManifest: an astray check that fails is drift of its own, and the rest of the drift stands" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "brew --version", .stdout = "Homebrew 7.0.9\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = "ripgrep\n" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "" },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .code = 1 },
+    } };
+    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io };
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    const m: manifest_mod.Manifest = .{ .packages = &.{ rowOf("ripgrep", "brew"), rowOf("fd", "brew") }, .files = 1 };
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    try testing.expectEqual(@as(usize, 0), rep.broken.len);
+    try testing.expectEqual(@as(usize, 1), rep.missingCount());
+    try testing.expectEqual(@as(usize, 1), rep.uncheckedCount());
+    try testing.expectEqualStrings("brew exited nonzero answering what mox asked, saying why above", rep.backends[0].unchecked.?);
+    try testing.expect(!rep.clean());
 }

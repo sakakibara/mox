@@ -86,6 +86,10 @@ fn brewWithInstalled(
     try absentLinuxManagers(a, &entries);
     try entries.append(a, roomy_df);
     for (extra) |e| try entries.append(a, e);
+    // Where the astray check reads install receipts: nowhere, so no formula
+    // is held astray. After `extra`, so a fixture with receipts answers first.
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = "/nonexistent/mox-test-brew-prefix\n" });
+    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = "/nonexistent/mox-test-brew-prefix\n" });
 
     const fake = try a.create(mox.packages.exec.Fake);
     fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
@@ -383,6 +387,143 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     // so the one summary every manager shares claims no record at all, and
     // the per-row message above says what this one did.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "recorded as asked for") == null);
+}
+
+/// A brew prefix under `root` where `keg` was installed through the tap
+/// alias `alias`, which now names `target`; answers the `brew --prefix` and
+/// `brew --repository` the astray check asks.
+fn movedAliasPrefix(a: std.mem.Allocator, io: Io, root: []const u8, keg: []const u8, alias: []const u8, target: []const u8) ![2]mox.packages.exec.Fake.Entry {
+    const prefix = try std.fs.path.join(a, &.{ root, "brew-prefix" });
+    const aliases = try std.fs.path.join(a, &.{ prefix, "Library/Taps/owner/homebrew-tap/Aliases" });
+    try Io.Dir.cwd().createDirPath(io, aliases);
+    const link = try std.fs.path.join(a, &.{ aliases, alias });
+    const formula = try std.fs.path.join(a, &.{ prefix, "Library/Taps/owner/homebrew-tap/Formula" });
+    try Io.Dir.cwd().createDirPath(io, formula);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ formula, try std.fmt.allocPrint(a, "{s}.rb", .{target}) }), .data = "" });
+    try Io.Dir.cwd().symLink(io, try std.fmt.allocPrint(a, "../Formula/{s}.rb", .{target}), link, .{});
+    const opt = try std.fs.path.join(a, &.{ prefix, "opt", keg });
+    try Io.Dir.cwd().createDirPath(io, opt);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ opt, "INSTALL_RECEIPT.json" }),
+        .data = try std.fmt.allocPrint(a, "{{\"installed_on_request\":true,\"source\":{{\"path\":\"{s}\"}}}}", .{link}),
+    });
+    return .{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = prefix },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = prefix },
+    };
+}
+
+test "status: a formula installed through an alias that moved is astray, and fails the exit code" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "owner/tap/emacs-plus@30"
+        \\
+    );
+    const prefix = try movedAliasPrefix(a, io, h.root, "emacs-plus@30", "emacs-plus", "emacs-plus@31");
+    const fake = try brewWith(a, "owner/tap/emacs-plus@30\n", "", &prefix);
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.out,
+        "ASTRAY    brew owner/tap/emacs-plus@30 (installed through the alias \"owner/tap/emacs-plus\", which now names \"owner/tap/emacs-plus@31\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "to fix: brew uninstall --formula --ignore-dependencies owner/tap/emacs-plus@30 && brew install --formula owner/tap/emacs-plus@30)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 astray.") != null);
+}
+
+test "apply: an astray formula is named with its repair and left alone, and the run exits 1" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "owner/tap/emacs-plus@30"
+        \\
+    );
+    const prefix = try movedAliasPrefix(a, io, h.root, "emacs-plus@30", "emacs-plus", "emacs-plus@31");
+    // Nothing that would change the package is scripted, so an uninstall,
+    // an install or a reinstall of it fails the run's Fake.
+    const fake = try brewWith(a, "owner/tap/emacs-plus@30\n", "", &prefix);
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        r.err,
+        "mox apply: brew: owner/tap/emacs-plus@30 is installed through the alias \"owner/tap/emacs-plus\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox never uninstalls, so it was left as it is; to fix: brew uninstall --formula --ignore-dependencies owner/tap/emacs-plus@30 && brew install --formula owner/tap/emacs-plus@30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 0 installed, 0 failed, 1 astray") != null);
+    for (fake.calls.items) |c| {
+        for ([_][]const u8{ " brew uninstall ", " brew install ", " brew reinstall " }) |verb| {
+            try std.testing.expect(std.mem.indexOf(u8, c, verb) == null);
+        }
+    }
+}
+
+test "status and apply: an astray check brew cannot answer is UNCHECKED, and apply still installs" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+    );
+    const fake = try brewWith(a, "ripgrep\n", "", &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .code = 1 },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const st = try h.run(&.{ "mox", "status" });
+    // Not a clean machine: whether ripgrep is held astray is unknown.
+    try std.testing.expectEqual(@as(u8, 1), st.rc);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "UNCHECKED brew (whether its installed packages are held astray is unknown: brew exited nonzero answering what mox asked, saying why above)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "Packages: 1 missing, 1 unchecked.") != null);
+
+    const ap = try h.run(&.{ "mox", "apply" });
+    // The install goes ahead and the run is clean: nothing apply could
+    // decide is left.
+    try std.testing.expectEqual(@as(u8, 0), ap.rc);
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expect(std.mem.indexOf(u8, ap.err, "mox apply: brew: whether its installed packages are held astray is unknown") != null);
 }
 
 test "apply: a formula that cannot be marked on request is a failure, not a clean run" {

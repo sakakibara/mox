@@ -538,6 +538,47 @@ whole tap -- an untrusted third-party tap is ignored outright since Homebrew
 6.0, and whole-tap trust would extend to everything it ever adds. A cask from
 a third-party tap is trusted as a cask; the two namespaces are distinct.
 
+### A formula installed through an alias
+
+Homebrew records the name a formula was installed by in its install
+receipt, and when that name is a tap alias, `brew upgrade` and
+`brew reinstall` follow the alias to whatever formula it names now. A
+formula installed as `emacs-plus` while that alias named `emacs-plus@30`
+satisfies an `emacs-plus@30` row, but once the tap points the alias at
+`emacs-plus@31`, the next upgrade replaces it with `emacs-plus@31` -- or,
+while that formula's tap is not trusted for it, every `brew upgrade` and
+`brew outdated` on the machine fails.
+
+`mox status` reports such a row `ASTRAY`, naming the alias, what it names
+now, and the repair:
+
+```
+  ASTRAY    brew d12frosted/emacs-plus/emacs-plus@30 (installed through the alias "d12frosted/emacs-plus/emacs-plus", which now names "d12frosted/emacs-plus/emacs-plus@31", so brew upgrade and brew reinstall follow it to "d12frosted/emacs-plus/emacs-plus@31", and fail while that cannot be loaded; to fix: brew uninstall --formula --ignore-dependencies d12frosted/emacs-plus/emacs-plus@30 && brew install --formula d12frosted/emacs-plus/emacs-plus@30)
+```
+
+Only an install by the formula's own name rewrites the receipt: `brew
+install` leaves an installed formula as it is, and `brew reinstall` follows
+the alias. So the repair uninstalls, and `mox apply` leaves it to you,
+naming the row and exiting 1. The uninstall ignores dependents, which
+`brew uninstall` otherwise refuses over and the install right after it
+satisfies again; the install is the one the receipt records, `--HEAD` and
+build options included. Until it
+finishes, the formula is not installed -- a formula built from source, as
+emacs-plus is, is gone for the length of the build -- and the uninstall
+removes the alias's own opt link (`opt/emacs-plus` here), which the new
+install does not bring back, since the alias names another formula now.
+
+No brew query reports the alias -- `brew outdated` names it only after
+loading the new target, which is the load an untrusted one fails -- so mox
+reads the receipt through the formula's opt link and applies Homebrew's own
+rule: the recorded source is still a symlink directly in the `Aliases`
+directory of one of this brew's taps, and the alias names a formula of
+another name. What a tap's alias names is its symlink; a homebrew/core
+alias is asked of brew instead, under your environment, because Homebrew
+resolves it through the API unless `HOMEBREW_NO_INSTALL_FROM_API` is set,
+and a local core checkout can be stale. A formula installed from the API
+records no alias, and Homebrew follows none for it.
+
 ### What a manager cannot be asked
 
 Every query above answers the question its manager can answer, and that is
@@ -594,6 +635,17 @@ under the backend rather than leaving it to be discovered.
   (`ERROR     the package pass was refused; the reason is the mox status:
   packages: line`). Counted toward the exit code: an empty section would
   otherwise read as a clean machine.
+- **ASTRAY** -- declared, installed, but held by its manager under a binding
+  that has moved off it, so what the manager does to it next acts on another
+  package (see [A formula installed through an
+  alias](#a-formula-installed-through-an-alias)). `status` counts it toward
+  the exit code with the command line that repairs it; `apply` names it and
+  exits 1, leaving it alone, since the repair uninstalls.
+- **UNCHECKED** -- the backend's installed rows could not be checked for
+  being astray (`UNCHECKED brew (whether its installed packages are held
+  astray is unknown: ...)`). Counted toward the exit code, since an answer
+  that could not be had is not an answer of none; `apply` says so and
+  installs what is missing all the same.
 - **BROKEN** -- the manager is installed but cannot answer
   (`BROKEN    brew (brew --version exited 1)`). Its rows are neither judged
   nor installed, and a machine in that state is not a clean one: `status`
@@ -790,8 +842,10 @@ above are compiled in because they are what mox supports out of the box, with
 no shell dependency; everything else is a **plugin**: an executable in the
 repo that speaks the protocol below. A plugin satisfies exactly the same
 contract as a compiled backend, so `status`, `apply` and `commit` cannot tell
-them apart. What stays fixed by mox is the set of things a backend is asked to
-do -- there is no `remove` or `upgrade` verb, and adding one is a mox change.
+them apart. The one check the protocol has no verb for is `ASTRAY`, which only
+brew's compiled backend makes: a plugin's packages are never reported astray.
+What stays fixed by mox is the set of things a backend is asked to do -- there
+is no `remove` or `upgrade` verb, and adding one is a mox change.
 
 ### Where
 

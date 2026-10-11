@@ -4,6 +4,23 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `mox status` reported a brew formula installed through a tap alias as
+  clean after the alias moved on to another formula, though `brew upgrade`
+  and `brew reinstall` then follow the alias to that formula -- or, when
+  its tap is not trusted for it, fail for every package on the machine.
+  Such a row is now `ASTRAY`, naming the alias, the formula it names now,
+  and the command line that repairs it (`brew uninstall --formula
+  --ignore-dependencies <name> && brew install --formula <name>`, carrying
+  the `--HEAD` and build options the receipt records). `--json` gives it `state: "astray"` with `why` and
+  `fix`, and `--porcelain` a `package_astray` record. `mox apply` names it
+  on stderr and exits 1 without touching it: the repair uninstalls, which
+  mox never does. A check that cannot be made is `UNCHECKED` (`state:
+  "unchecked"`, `package_unchecked`) and counted by status, rather than
+  read as a machine with nothing astray.
+
 ## [0.12.3] - 2026-10-08
 
 ### Added
@@ -1554,6 +1571,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
+[Unreleased]: https://github.com/sakakibara/mox/compare/v0.12.3...HEAD
 [0.12.3]: https://github.com/sakakibara/mox/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/sakakibara/mox/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/sakakibara/mox/compare/v0.12.0...v0.12.1
