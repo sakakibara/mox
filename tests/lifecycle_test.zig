@@ -6097,3 +6097,24 @@ test "add: a .json file with a trailing comma is captured with a warning naming 
     const ok = try h.run(&.{ "mox", "add", "~/ok.json" });
     try std.testing.expect(std.mem.indexOf(u8, ok.err, "warning") == null);
 }
+
+test "apply: leaves of a generator that left the tree, or no longer produced, count as removed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n\n[[ids]]\nslug = \"b\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    const pruned = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, pruned.out, ", 1 removed,") != null);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    const orphan = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, orphan.out, ", 1 removed,") != null);
+    try std.testing.expect(!exists(io, try h.liveOf(".config/id-a.inc")));
+}

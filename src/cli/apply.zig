@@ -688,6 +688,7 @@ fn applyPass(
             .mute_drift_message = true,
             .links = &tree_links,
         }, g.prior, &keep_set, ctx.out, ctx.err);
+        counts.removed += prune.removed;
         if (prune.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += prune.error_refused;
         // Counted once per generator, not once per refused-prune leaf, to
@@ -750,6 +751,7 @@ fn applyPass(
             .released = &released_names,
             .links = &tree_links,
         }, &known, &keep_set, ctx.out, ctx.err);
+        counts.removed += swept.removed;
         if (swept.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += swept.error_refused;
         counts.drift += swept.drift_refused;
@@ -807,6 +809,7 @@ fn applyPass(
             &ruleset,
             context.paths.home,
         );
+        counts.removed += exact_result.removed;
         if (exact_result.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += exact_result.error_refused;
         counts.drift += exact_result.drift_refused;
