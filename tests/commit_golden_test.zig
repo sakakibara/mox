@@ -246,7 +246,7 @@ test "commit golden: a text line routed to its base" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/.zshrc} 70e088a1db4236d1
-        \\applied/{~/.zshrc} aeb83051df2e5fa6
+        \\applied/{~/.zshrc} 42cd2a2f9cadf341
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -298,7 +298,7 @@ test "commit golden: a loop row string field routed to its data source" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
+        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -367,7 +367,7 @@ test "commit golden: a shared base line narrowed to this os synthesizes a region
         \\applied/
         \\applied-content/
         \\applied-content/{~/.zshrc} 064a800582e89c33
-        \\applied/{~/.zshrc} c227ad85c3302422
+        \\applied/{~/.zshrc} 34a22cc73ed97fa6
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -412,7 +412,7 @@ test "commit golden: a structured key routed to the os overlay that wins it" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/config.toml} b97e05e77de1da85
-        \\applied/{~/config.toml} 751045dfaa6c0632
+        \\applied/{~/config.toml} 4bf1376757beed07
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -455,7 +455,7 @@ test "commit golden: an owned key of a partial file routed to its base" {
         \\submit = "ctrl-enter"
         \\--- state
         \\applied-owned/
-        \\applied-owned/{~/app.toml} 2675ae9fcc65b0c0
+        \\applied-owned/{~/app.toml} df8d7236025b9877
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\
@@ -501,7 +501,7 @@ test "commit golden: a capture-derived line routed to the machine fact" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/.zshrc} 1a57e47d5d6e8b1f
-        \\applied/{~/.zshrc} 6832a8b2ae99ad2f
+        \\applied/{~/.zshrc} dc7273ea5fde9187
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -544,7 +544,7 @@ test "commit golden: a symlink target synced to its source" {
         \\/tmp/mox-new-target
         \\--- state
         \\applied-symlink/
-        \\applied-symlink/{~/mylink} 4da9a2c020691ebb
+        \\applied-symlink/{~/mylink} 2c653ee27eafb291
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\
@@ -596,12 +596,12 @@ test "commit golden: a generator leaf row routed to its data source" {
         \\applied-content/
         \\applied-content/{~/.config/id-a.inc} c9232dba09b77625
         \\applied-content/{~/.config/id-b.inc} c54aaff57e4c9a3a
-        \\applied/{~/.config/id-a.inc} 8ed001161b24ff16
-        \\applied/{~/.config/id-b.inc} a686fb20b04b1b18
+        \\applied/{~/.config/id-a.inc} 39062391789fb78d
+        \\applied/{~/.config/id-b.inc} 842bd0fb23659d60
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\generated/
-        \\generated/{~/.config/gen.inc} fcd38308b6837df9
+        \\generated/{~/.config/gen.inc} 44321712034612f5
         \\provenance/
         \\provenance/{~/.config/id-a.inc} 6eeb23a77115120c
         \\provenance/{~/.config/id-b.inc} 9abba5483ccaa232
@@ -647,8 +647,8 @@ test "commit golden: a token rename updates its coupled consumer" {
         \\applied-content/
         \\applied-content/{~/.myenv} 96306e5aea28e071
         \\applied-content/{~/.mysigners} 901706149d79baf5
-        \\applied/{~/.myenv} 2a3ef2970bc97a7f
-        \\applied/{~/.mysigners} 40974a329b96dbbe
+        \\applied/{~/.myenv} 0b5e5d6e92744ecb
+        \\applied/{~/.mysigners} 74f093319c6bd297
         \\coupling/
         \\coupling/graph.json 9e9341024fa9f107
         \\provenance/
@@ -692,7 +692,7 @@ test "commit golden: a first-contact file confirmed at the prompt" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/.bashrc} c41026694098dd79
-        \\applied/{~/.bashrc} 29a2641a9e87b59d
+        \\applied/{~/.bashrc} 3e27c644f944a619
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -738,7 +738,7 @@ test "commit golden: a routed hunk beside a manual hunk in one file" {
         \\applied/
         \\applied-content/
         \\applied-content/{~/.zshrc} b7c91210a67218b5
-        \\applied/{~/.zshrc} 4a545ef349ecd55f
+        \\applied/{~/.zshrc} cfc581c93da0b603
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -802,8 +802,8 @@ test "commit golden: one data row edited through two loop files, routed in one a
         \\applied-content/
         \\applied-content/{~/.abbrs2} fb428ae02a4f2e1e
         \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs2} 05de84aa2b90584d
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
+        \\applied/{~/.abbrs2} 7e6479d8487d29f6
+        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json dd5d468c769ac4f0
         \\provenance/
@@ -861,9 +861,9 @@ test "commit golden: one rename made in two files with a third sharing the token
         \\applied-content/{~/.mycontacts} b74ec336d15e1515
         \\applied-content/{~/.myenv} 96306e5aea28e071
         \\applied-content/{~/.mysigners} 2ce71af7eb434a42
-        \\applied/{~/.mycontacts} 53c13e1a88192fb4
-        \\applied/{~/.myenv} 2a3ef2970bc97a7f
-        \\applied/{~/.mysigners} a642a0096e421006
+        \\applied/{~/.mycontacts} 21e4130916b01b07
+        \\applied/{~/.myenv} 0b5e5d6e92744ecb
+        \\applied/{~/.mysigners} 66be2907da5f7189
         \\coupling/
         \\coupling/graph.json f5ece01951fbd549
         \\provenance/
@@ -939,14 +939,14 @@ test "commit golden: a symlink, a generator leaf and a text file committed in on
         \\applied-content/{~/.config/id-b.inc} e6077e23d07bf6e5
         \\applied-content/{~/.zshrc} 3082dc99cc937277
         \\applied-symlink/
-        \\applied-symlink/{~/mylink} 4da9a2c020691ebb
-        \\applied/{~/.config/id-a.inc} ea48fe2b9a5fef2f
-        \\applied/{~/.config/id-b.inc} 90fc66d94269bd33
-        \\applied/{~/.zshrc} 0b806ddfaf2e8056
+        \\applied-symlink/{~/mylink} 2c653ee27eafb291
+        \\applied/{~/.config/id-a.inc} acbd8c4e7eee44ca
+        \\applied/{~/.config/id-b.inc} 927578fab23ce82b
+        \\applied/{~/.zshrc} c106085c5981665b
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\generated/
-        \\generated/{~/.config/gen.inc} fcd38308b6837df9
+        \\generated/{~/.config/gen.inc} 44321712034612f5
         \\provenance/
         \\provenance/{~/.config/id-a.inc} 6eeb23a77115120c
         \\provenance/{~/.config/id-b.inc} 9abba5483ccaa232
@@ -1007,8 +1007,8 @@ test "commit golden: two loop files edit different fields of one data row" {
         \\applied-content/
         \\applied-content/{~/.abbr-expansions} 61e048bd9cc31695
         \\applied-content/{~/.abbr-keys} e1abcf61834df7ea
-        \\applied/{~/.abbr-expansions} 7b1094a47698a696
-        \\applied/{~/.abbr-keys} 5295b02ab0bc0a53
+        \\applied/{~/.abbr-expansions} 5ab72ae5ec7ad95e
+        \\applied/{~/.abbr-keys} fb91bc97cd79d360
         \\coupling/
         \\coupling/graph.json 143cfab9a5a5b964
         \\provenance/
@@ -1064,8 +1064,8 @@ test "commit golden: a managed data file row edited through its loop and directl
         \\applied-content/
         \\applied-content/{~/.abbrs} 759912bfca82a599
         \\applied-content/{~/abbrs.toml} 23e0d3c836d135f7
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
-        \\applied/{~/abbrs.toml} b0f6e4c2af7b983b
+        \\applied/{~/.abbrs} 41b5a01af29747af
+        \\applied/{~/abbrs.toml} f8b912e7156b863f
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1120,9 +1120,9 @@ test "commit golden: a partial file and a symlink committed in one run" {
         \\/tmp/mox-new-target
         \\--- state
         \\applied-owned/
-        \\applied-owned/{~/app.toml} 2675ae9fcc65b0c0
+        \\applied-owned/{~/app.toml} df8d7236025b9877
         \\applied-symlink/
-        \\applied-symlink/{~/mylink} 4da9a2c020691ebb
+        \\applied-symlink/{~/mylink} 2c653ee27eafb291
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\
@@ -1175,7 +1175,7 @@ test "commit golden: a loop row field edited beside a multi-line string holding 
         \\applied/
         \\applied-content/
         \\applied-content/{~/.tools} 599c3cd5917ae432
-        \\applied/{~/.tools} 8831f7030c4c960a
+        \\applied/{~/.tools} a8f3d5330273d2ce
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1230,7 +1230,7 @@ test "commit golden: one file with two loops over one data source, one loop line
         \\applied/
         \\applied-content/
         \\applied-content/{~/.hosts} da58489fa57654f3
-        \\applied/{~/.hosts} b24f3053ade283fd
+        \\applied/{~/.hosts} d166a23c86b8608d
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1282,7 +1282,7 @@ test "commit golden: a bare field capture under a loop variable not named entry"
         \\applied/
         \\applied-content/
         \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
+        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1332,7 +1332,7 @@ test "commit golden: a loop row edited beside a row whose data value resolves a 
         \\# mox: end
         \\--- state
         \\applied/
-        \\applied/{~/.exports} f1a59a238e1144c9
+        \\applied/{~/.exports} 29699b753af0a7b0
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1385,7 +1385,7 @@ test "commit golden: a first-contact loop file confirmed at the prompt with a ro
         \\applied/
         \\applied-content/
         \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
+        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1436,7 +1436,7 @@ test "commit golden: a loop row edited in a file that resolves a secret" {
         \\# mox: end
         \\--- state
         \\applied/
-        \\applied/{~/.abbrs} 29110810dd197e25
+        \\applied/{~/.abbrs} 0f72e049784b8e06
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1493,7 +1493,7 @@ test "commit golden: two loops over one data source with disjoint where filters,
         \\applied/
         \\applied-content/
         \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
+        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1553,8 +1553,8 @@ test "commit golden: a managed data file row edited through its loop, another ro
         \\applied-content/
         \\applied-content/{~/.abbrs} 759912bfca82a599
         \\applied-content/{~/abbrs.toml} 42cac2fc684eb169
-        \\applied/{~/.abbrs} f7d4b3c779bc082a
-        \\applied/{~/abbrs.toml} 79a02dd1936b0f8e
+        \\applied/{~/.abbrs} 41b5a01af29747af
+        \\applied/{~/abbrs.toml} 3debab26fb235eac
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/
@@ -1615,8 +1615,8 @@ test "commit golden: a managed data file committed before its loop file, each ed
         \\applied-content/
         \\applied-content/{~/abbrs.toml} 6a401119d05ed878
         \\applied-content/{~/zabbrs} 10a0138cf5ed91f8
-        \\applied/{~/abbrs.toml} 0e5c00e0b675abbc
-        \\applied/{~/zabbrs} 50ca4f2e5abfd093
+        \\applied/{~/abbrs.toml} 9957d8bce1cea2b8
+        \\applied/{~/zabbrs} 16a84b369bc1ef04
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
         \\provenance/

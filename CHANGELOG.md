@@ -23,7 +23,8 @@ All notable changes to mox are documented here. The format follows
   <path>` removes it, `commit <path>` keeps the edit and forgets the path
   here), and a partially owned one is left in place, no longer managed, its
   records forgotten. Every record now names
-  the repo it came from, so one repo's apply never touches another's files.
+  the repo and HOME it came from, so one repo's apply, or a run under
+  another HOME sharing the state directory, never touches another's files.
 - The private layer reads its own `<state dir>/private/.mox/attributes.toml`
   and joins fact discovery. A private entry may set any key for a
   private-only path, and only `mode` for a path the repo manages, which

@@ -1,11 +1,11 @@
 //! Records whose source left the tree.
 //!
 //! A file mox wrote stays recorded under `<state>/` after its source is
-//! deleted or moved. A record names the repo it came from, so one repo's
-//! records are found here and another's never are. A record of this repo
-//! is stale when no current managed file (repo or private layer, gated-off
-//! ones included) and no generator manifest names its path. A record that
-//! names no repo is never stale.
+//! deleted or moved. A record names the repo and HOME it came from, so this
+//! run's records are found here and another repo's or HOME's never are. A
+//! record of this run is stale when no current managed file (repo or private
+//! layer, gated-off ones included) and no generator manifest names its path.
+//! A record that names no repo is never stale.
 
 const std = @import("std");
 const builtin = @import("builtin");

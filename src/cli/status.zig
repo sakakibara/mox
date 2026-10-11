@@ -142,7 +142,7 @@ fn staleRows(
     const context = ctx.context.?;
     const stale = mox.apply.stale;
     const home = context.paths.home;
-    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
     const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
     if (cands.len == 0) return;
     var live_paths: std.ArrayList([]const u8) = .empty;

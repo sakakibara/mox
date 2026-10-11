@@ -827,13 +827,14 @@ mark. An empty partial render ("mox owns nothing here") is exempt.
 
 ## Sources that leave the tree
 
-Every record mox keeps of a file it wrote names the repo it came from (the
-repo root's real path), so one repo's records are never mistaken for
-another's when several `MOX_REPO`s share a state directory. After the walk,
-`mox apply` finds this repo's records whose path no managed file -- repo or
-private layer, gated-off ones included, since a gate is not removal -- and no
-generator manifest names: a source that was deleted, moved, or released. A
-record whose path lies outside this run's HOME is never a candidate.
+Every record mox keeps of a file it wrote names the repo it came from and the
+HOME it was applied under (the real paths of both), so one repo's records,
+or one HOME's, are never mistaken for another's when several `MOX_REPO`s or
+HOMEs share a state directory. After the walk, `mox apply` finds the records
+of this repo and HOME whose path no managed file -- repo or private layer,
+gated-off ones included, since a gate is not removal -- and no generator
+manifest names: a source that was deleted, moved, or released. The sweep of
+an orphaned generator's files takes only manifests of this repo and HOME.
 
 - An unedited whole file or symlink is removed, snapshot-first, so `mox
   rollback` recovers it; an edited one is drift, kept until it is named:

@@ -105,6 +105,11 @@ pub const Harness = struct {
         return h.withEnv(&.{ .{ .name = "HOME", .value = home }, .{ .name = "MOX_STATE_DIR", .value = state } }, home, h.repo, state);
     }
 
+    /// This machine's state under another HOME, `home`.
+    pub fn otherHome(h: Harness, home: []const u8) !Harness {
+        return h.withEnv(&.{.{ .name = "HOME", .value = home }}, home, h.repo, h.state);
+    }
+
     /// This machine applying another repo: `MOX_REPO` names `repo`.
     pub fn otherRepo(h: Harness, repo: []const u8) !Harness {
         return h.withEnv(&.{.{ .name = "MOX_REPO", .value = repo }}, h.home, repo, h.state);

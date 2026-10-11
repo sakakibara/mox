@@ -51,12 +51,19 @@ pub fn contentHashHex(content: []const u8) [hash_hex_len]u8 {
 /// percent-encoded Windows long path fits with room to spare.
 const max_record_bytes: usize = 1024 * 1024;
 
-/// The repo identity records carry: the repo root's real path, or the path
-/// as given when it cannot be resolved.
-pub fn repoTag(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]const u8 {
-    return Io.Dir.realPathFileAbsoluteAlloc(io, repo_dir, arena) catch |e| switch (e) {
+/// The identity records carry: the repo root's real path and the real path
+/// of the HOME it was applied under, joined by a NUL (neither path can hold
+/// one). A path that cannot be resolved is used as given. A record is one
+/// run's only when both match, so a run under another HOME sharing the
+/// state directory never takes another HOME's records for its own.
+pub fn repoTag(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, home: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}\x00{s}", .{ try realOrGiven(arena, io, repo_dir), try realOrGiven(arena, io, home) });
+}
+
+fn realOrGiven(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
+    return Io.Dir.realPathFileAbsoluteAlloc(io, path, arena) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return arena.dupe(u8, repo_dir),
+        else => return arena.dupe(u8, path),
     };
 }
 

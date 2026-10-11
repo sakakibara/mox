@@ -337,7 +337,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // its live content shows on the removed side.
     if (a.paths.len == 0) {
         const stale = mox.apply.stale;
-        const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
+        const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
         const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
         var live_paths: std.ArrayList([]const u8) = .empty;
         for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);

@@ -386,7 +386,7 @@ fn applyPass(
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     const base_tree = (try walkTreeOrReport(ctx, "mox apply", src_dir, m_state.home)) orelse return 2;
     // Every record this run writes names the repo it came from.
-    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
 
     const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
 

@@ -6142,3 +6142,24 @@ test "remove: a tombstone whose case differs from the record still keeps the fil
     try std.testing.expectEqualStrings("f\n", try read(io, a, try h.liveOf(".Foo")));
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".Foo"))) == null);
 }
+
+test "stale: a run under another HOME sharing the state directory sweeps none of the first run's files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "z\n");
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const outer = try h.otherHome(std.fs.path.dirname(h.home).?);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    const r = try outer.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("z\n", try read(io, a, try h.liveOf(".zshrc")));
+    try std.testing.expect(exists(io, try h.liveOf(".config/id-a.inc")));
+}
