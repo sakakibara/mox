@@ -5730,3 +5730,22 @@ test "walk: format = \"jsonc\" resolves a .json target's dialect, which a strict
     try std.testing.expect(tree.files[0].marker("// mox: own a\n{}\n") == null);
     try std.testing.expectEqualStrings("//", tree.files[1].marker("{}").?);
 }
+
+test "compose catA json: off the resolving path a secret capture stays its placeholder, still a JSON string" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/s.json", "{\"t\": \"<secret:cmd:printf \\\"%s\\\" ok>\", \"o\": \"<machine.os>\"}\n");
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    const m_state = dataTestMachine();
+    const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, &m_state, null)).?;
+    try std.testing.expectEqualStrings("{\"t\": \"<SECRET:cmd:printf \\\"%s\\\" ok>\", \"o\": \"linux\"}\n", out);
+}

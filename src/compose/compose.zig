@@ -99,6 +99,7 @@ pub fn wholeFileGateAxisExpr(
     io: Io,
     file: ManagedFile,
 ) !?*const dsl.ast.AxisExpr {
+    if (file.gate != null) return catA.wholeFileGateAxisExpr(arena, io, file);
     if (!file.has_base) return null;
     const sample = try peekFile(io, arena, file.source_base_abs);
     const cat = category.detect(file.format, file.source_base_path, sample);

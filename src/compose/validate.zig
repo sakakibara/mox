@@ -370,6 +370,23 @@ test "checkOutput: names the output line and the layers, and never quotes a secr
     try testing.expectEqualStrings("composed output line 2 from src/x.json: <redacted>", s.capture().?);
 }
 
+test "checkOutput: every format names the output line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { f: Format, text: []const u8, line: []const u8 }{
+        .{ .f = .yaml, .text = "a: 1\nb: c: d\n", .line = "composed output line 2 from x: " },
+        .{ .f = .ini, .text = "[s]\nk = 1\n[t\n", .line = "composed output line 3 from x: " },
+        .{ .f = .gitconfig, .text = "[user]\n\tname = me\n\tbad key = 1\n", .line = "composed output line 3 from x: " },
+        .{ .f = .jsonc, .text = "{\n  \"a\": 1,\n  oops\n}\n", .line = "composed output line 3 from x: " },
+    };
+    for (cases) |c| {
+        var d: interp.Diag = .{};
+        try testing.expectError(error.FormatViolation, checkOutput(a, c.f, c.text, &.{"x"}, &.{}, &d));
+        try testing.expect(std.mem.startsWith(u8, d.capture().?, c.line));
+    }
+}
+
 test "duplicateKey: finds a repeat within one object only" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -7249,6 +7249,14 @@ test "validation: a bare-key ini file merges, patches partially and commits" {
     try std.testing.expect(std.mem.indexOf(u8, merged, "skip-networking") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "protocol = tcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "adopted") != null);
+
+    // An edit of the merged file commits back into the layer that wins it.
+    try testutil.gitTracked(io, a, c.repo);
+    const live = try c.homePath("my.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = try std.mem.replaceOwned(u8, a, merged, "port = 3306", "port = 3307") });
+    const cm = try c.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), cm.rc);
+    try std.testing.expectEqualStrings("[mysqld]\nskip-networking\nport = 3307\n", try read(io, a, try std.fs.path.join(a, &.{ c.repo, "src", "my.ini" })));
 }
 
 test "validation: an empty partial render is exempt, and a jsonc region layer is checked on its output only" {
