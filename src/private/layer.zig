@@ -60,7 +60,10 @@ pub fn merge(
             combined.regions = try concatRegions(arena, base_file.regions, pf.regions);
             const target_key = if (std.mem.startsWith(u8, key, "src/")) key["src/".len..] else key;
             if (combined.head_error.len == 0) {
-                if (try repoPathError(arena, io, base_file, pf, &private_attrs, target_key)) |err| {
+                if (try privateEntryError(arena, &private_attrs, target_key)) |err| {
+                    combined.head_error = err;
+                    combined.head_error_attrs = true;
+                } else if (try repoPathError(arena, io, base_file, pf)) |err| {
                     combined.head_error = err;
                 } else if (private_attrs.mode(target_key)) |m| {
                     combined.mode = m;
@@ -81,6 +84,7 @@ pub fn merge(
         if (combined.head_error.len == 0) {
             if (try privateEntryError(arena, &private_attrs, target_key)) |err| {
                 combined.head_error = err;
+                combined.head_error_attrs = true;
             } else if (private_attrs.mode(target_key)) |m| {
                 combined.mode = m;
                 combined.mode_explicit = true;
@@ -124,8 +128,6 @@ fn repoPathError(
     io: std.Io,
     base_file: ManagedFile,
     pf: ManagedFile,
-    private_attrs: *const source.attributes.Attributes,
-    target_key: []const u8,
 ) !?[]const u8 {
     if (pf.has_base) {
         return try std.fmt.allocPrint(arena, "a private base at a path the repo manages: {s} and {s}; vary it with a private overlay instead", .{
@@ -133,7 +135,6 @@ fn repoPathError(
             base_file.source_base_path,
         });
     }
-    if (try privateEntryError(arena, private_attrs, target_key)) |err| return err;
     if (base_file.ownership == .disown) {
         const format = base_file.format orelse return null;
         for (pf.overlays) |o| {

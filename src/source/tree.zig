@@ -193,6 +193,9 @@ pub const ManagedFile = struct {
     /// and each command reports this file as its own error instead of
     /// aborting the whole run.
     head_error: []const u8 = "",
+    /// True when `head_error` is a malformed declaration in an attributes
+    /// file, which a read-only command reports as a refusal.
+    head_error_attrs: bool = false,
     /// The structured format, and for the JSON family the dialect, resolved
     /// by the walk from the target key and its `format` attribute. Null for
     /// an unstructured target.
@@ -553,6 +556,7 @@ fn walkDir(
             .own_paths = decl.own_paths,
             .check_argv = decl.check_argv,
             .head_error = decl.head_error,
+            .head_error_attrs = decl.attrs_error,
             .format = decl.format,
             .gate = decl.gate,
             .defaults = decl.defaults,
@@ -626,6 +630,7 @@ fn walkDir(
             .own_paths = decl.own_paths,
             .check_argv = decl.check_argv,
             .head_error = decl.head_error,
+            .head_error_attrs = decl.attrs_error,
             .format = decl.format,
             .gate = decl.gate,
             .defaults = decl.defaults,
@@ -647,6 +652,7 @@ const Decl = struct {
     own_paths: []const OwnPath = &.{},
     check_argv: []const []const u8 = &.{},
     head_error: []const u8 = "",
+    attrs_error: bool = false,
     format: ?format_mod.Format = null,
     gate: ?[]const u8 = null,
     defaults: []const attributes.Default = &.{},
@@ -687,11 +693,12 @@ fn declChecked(
 ) !Decl {
     const entry = attrs.lookup(target_key) orelse attributes.Entry{};
     const format = format_mod.resolve(target_key, entry.jsonc);
-    if (entry.err.len > 0) return .{ .head_error = entry.err, .format = format };
+    if (entry.err.len > 0) return .{ .head_error = entry.err, .attrs_error = true, .format = format };
     if (entry.released) return .{ .head_error = released_with_source_error, .format = format };
     if (format == .json) {
         var decl = try attributeDecl(arena, io, base, target_key, entry, attrs);
         decl.format = format;
+        decl.attrs_error = decl.head_error.len > 0;
         return decl;
     }
     const b = base orelse return .{ .format = format };

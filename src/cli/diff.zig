@@ -1,7 +1,7 @@
 //! `mox diff`: show, per managed file, a unified diff of the composed output
 //! against the current live file. Read-only: takes no lock and writes nothing.
 //! `--stat` prints a one-line added/removed summary per file instead of the
-//! full hunks. Always exits 0 (reporting drift is not an error).
+//! full hunks. A difference is not an error (exit 0); a refusal exits 1.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -253,15 +253,20 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     var total: Stat = .{};
     var changed: usize = 0;
+    // A malformed attributes entry is a refusal: exit 1 once the rest has
+    // diffed.
+    var refused = false;
 
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, home), e.err });
+        refused = true;
     };
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
             try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
+            if (file.head_error_attrs) refused = true;
             continue;
         }
         // A tracked source matching an ignore rule (itself or a containing
@@ -350,7 +355,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (stat_mode) {
         try ctx.out.print(" {d} file(s) changed, +{d} -{d}\n", .{ changed, total.added, total.removed });
     }
-    return 0;
+    return if (refused) 1 else 0;
 }
 
 /// Diff one composed result against its live file, printing the rendered hunks

@@ -6039,3 +6039,23 @@ test "symlinked parent: a file that composes to nothing, an exact dir and a purg
     try std.testing.expect(exists(io, try h.srcOf(".config/p/f")));
     try std.testing.expectEqualStrings("p\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "p", "f" })));
 }
+
+test "diff: a broken attributes entry is a refusal, exit 1, with or without a source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".a\"]\nbogus = 1\n");
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 1), d.rc);
+    try std.testing.expect(lineWith(d.err, "ERROR", "~/.a"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".nosource\"]\nbogus = 1\n");
+    const d2 = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 1), d2.rc);
+    try std.testing.expect(lineWith(d2.err, "ERROR", "~/.nosource"));
+}
