@@ -6077,3 +6077,21 @@ test "attributes: a directive key on a non-JSON target is named, and a TOML erro
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: .mox/attributes.toml:3:") != null);
 }
+
+test "add: a .json file with a trailing comma is captured with a warning naming its line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("t.json"), .data = "{\n  \"a\": 1,\n}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("ok.json"), .data = "{\"a\": 1}\n" });
+    const r = try h.run(&.{ "mox", "add", "~/t.json" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(lineWith(r.err, "warning: not strict JSON (src/t.json:3:1: trailing comma", "apply refuses it until it parses"));
+    const ok = try h.run(&.{ "mox", "add", "~/ok.json" });
+    try std.testing.expect(std.mem.indexOf(u8, ok.err, "warning") == null);
+}

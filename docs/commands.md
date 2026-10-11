@@ -127,7 +127,8 @@ A `.json` live file holding comments -- valid JSONC, invalid strict
 JSON -- is captured as JSONC: add records `format = "jsonc"` for it in
 `.mox/attributes.toml` and says why on stderr. A trailing comma alone does
 not: that file is strict JSON its program reads, and the comma is its
-error.
+error, so add captures it with a warning naming the line (`warning: not
+strict JSON (src/x.json:3:1: ...)`), and apply refuses it until it parses.
 
 Partial ownership at onboarding:
 

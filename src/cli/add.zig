@@ -40,6 +40,8 @@ pub const Result = struct {
     src_path: []const u8 = "",
     /// The capture recorded `format = "jsonc"` because the file has comments.
     recorded_jsonc: bool = false,
+    /// Why the captured strict-JSON file does not parse, or null.
+    not_strict: ?[]const u8 = null,
 };
 
 /// True when `live_path` names HOME itself (ignoring a trailing separator),
@@ -172,7 +174,11 @@ pub fn addFile(
     if (std.fs.path.dirname(src_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch {};
     try mox.apply.write.writeAtomic(io, src_path, content, mode);
     try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
-    return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc };
+    const not_strict = if (resolved.format == .json)
+        try mox.compose.validate.liveFailure(arena, .json, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}))
+    else
+        null;
+    return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc, .not_strict = not_strict };
 }
 
 /// The format a captured target takes: its attributes' `format` when it has
@@ -759,6 +765,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         .added => {
             try ctx.out.print("Added {s} -> {f}\n", .{ shown, display.of(result.src_path, home) });
             if (result.recorded_jsonc) try noteJsonc(ctx, shown);
+            if (result.not_strict) |why| try ctx.err.print("mox add: {s}: warning: not strict JSON ({s}); apply refuses it until it parses\n", .{ shown, why });
             if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(live_path))) {
                 try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{shown});
             }
