@@ -10,6 +10,7 @@ const mox = @import("../root.zig");
 const display = @import("display.zig");
 const style = @import("style.zig");
 const tty = @import("tty.zig");
+const status_mod = @import("status.zig");
 const scope = @import("scope.zig");
 const edit = @import("edit.zig");
 
@@ -261,10 +262,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, home), e.err });
         refused = true;
     };
+    var gens: status_mod.Generators = .init(ctx.alloc);
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
+            try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
             try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
             if (file.head_error_attrs) refused = true;
             continue;
@@ -283,7 +286,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // apply writes -- rather than erroring on the generator itself.
         {
             var gdiag: mox.compose.interp.Diag = .{};
-            if (mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| {
+            const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| err: {
+                try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
+                break :err e;
+            };
+            if (gen_out) |maybe| {
+                if (maybe) |outs| {
+                    try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
+                    for (outs) |o| try gens.keep.put(o.live_path, {});
+                }
+            } else |_| {}
+            if (gen_out catch |e| {
                 try ctx.err.print("mox diff: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
                 if (gdiag.capture()) |cap|
                     try ctx.err.print("mox diff:   failing item: {s}\n", .{cap});
@@ -351,6 +364,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             if (c.kind == .symlink) {
                 try diffLinkRemoval(ctx, sty, stat_mode, c.live_path, c.target, &total, &changed);
             } else try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
+        }
+        // A file of a generator that left the tree, which apply would remove.
+        for (try status_mod.orphansOf(ctx, tree, &gens)) |o| {
+            if (!o.clean) continue;
+            try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.leaf, "", &.{}, &total, &changed);
         }
     }
 

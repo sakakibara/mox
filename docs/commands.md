@@ -709,7 +709,8 @@ Show a unified diff of the composed output against each live file
 file diffs its canonical owned content only, with secret-bearing keys
 masked on both sides. A file whose source left the tree, which apply
 would remove, shows its live content on the removed side, and such a
-symlink the line `symlink -> <target>`; a file that
+symlink the line `symlink -> <target>`, as does an unedited file of a
+generator that left the tree; a file that
 does not parse in its format is an `ERROR` line on stderr, as apply
 reports it. Read-only and takes no lock. A difference is not
 an error, so a run that completes exits 0 whether or not anything
@@ -746,7 +747,8 @@ Show each managed file's state: `clean`, `OUTDATED`, `DRIFT`,
 an `unbound facts:` section listing every discovered fact still
 eligible and unbound, each with its provenance -- its own section, not
 folded into the probe log. `STALE` is a file mox wrote whose source now
-composes to nothing, or whose source left the tree: apply will remove it
+composes to nothing, whose source left the tree, or whose generator left
+the tree (`its generator left the tree`): apply will remove it
 (an edited such file is `DRIFT` instead, kept until resolved), or, for a
 partially owned one, leave it in place, no longer managed. `ERROR`
 includes a file whose layers or output do not parse in its format, with

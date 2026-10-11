@@ -6229,3 +6229,27 @@ test "rollback: a live path that is now a symlink keeps the link and names the s
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf(".rc"), &buf)]);
 }
+
+test "status and diff preview the files of a generator that left the tree" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n\n[[ids]]\nslug = \"b\"\n");
+    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/id-b.inc"), .data = "edited\n" });
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), s.rc);
+    try std.testing.expect(lineWith(s.out, "STALE", "~/.config/id-a.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/id-b.inc (its generator left the tree)"));
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "edited") == null);
+}

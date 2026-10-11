@@ -246,6 +246,46 @@ pub fn sweepOrphans(
     return result;
 }
 
+/// A file an orphaned generator produced that the orphan sweep would
+/// reach: `clean` when it is what mox last wrote (removed), else drift.
+pub const Orphan = struct { leaf: []const u8, clean: bool };
+
+/// What `sweepOrphans` would do, for status and diff: every existing leaf
+/// of a manifest of `opts.repo` (or an untagged one) whose name is not in
+/// `known`, not released
+/// and not in `keep`, less any below a symlinked directory.
+pub fn orphanLeaves(
+    arena: std.mem.Allocator,
+    io: Io,
+    opts: Options,
+    known: *const std.StringHashMap(void),
+    keep: *const std.StringHashMap(void),
+) ![]const Orphan {
+    var out: std.ArrayList(Orphan) = .empty;
+    const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
+    for (entries) |entry| {
+        if (entry.kind != .file or known.contains(entry.name)) continue;
+        const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ gen_dir_path, entry.name }), arena, .limited(max_content_bytes)) catch continue;
+        if (try repoOf(arena, bytes)) |r| {
+            if (!std.mem.eql(u8, r, opts.repo)) continue;
+        }
+        const released = if (try generatorOf(arena, bytes)) |g|
+            (if (opts.released_live) |rl| rl.contains(try stale.foldCase(arena, g)) else false)
+        else if (opts.released) |rel| rel.contains(entry.name) else false;
+        if (released) continue;
+        for (try leavesOf(arena, bytes)) |leaf| {
+            if (keep.contains(leaf) or parent_link.through(io, opts.home, leaf, opts.links)) continue;
+            if (write.guardLiveRead(io, leaf) == .special) continue;
+            const content = Io.Dir.cwd().readFileAlloc(io, leaf, arena, .limited(max_content_bytes)) catch continue;
+            const rec = try applied.read(arena, io, opts.state_dir, leaf);
+            const clean = if (rec) |h| std.mem.eql(u8, &h, &applied.contentHashHex(content)) else false;
+            try out.append(arena, .{ .leaf = leaf, .clean = clean });
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Remove every prior-set path not in `keep`, snapshot-first. `keep` holds the
 /// paths that must survive: the current produced set plus every other managed
 /// or generated target, so a path handed off to another producer is never
