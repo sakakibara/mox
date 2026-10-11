@@ -36,9 +36,10 @@ pub const BackendDrift = struct {
     /// row that appears in no output at all reads exactly like a row the
     /// manifest never carried.
     gated: []const Row = &.{},
-    /// Why this backend's installed rows could not be checked for being held
-    /// astray, or null when they were. Counted as drift: an astray row is,
-    /// and an answer that could not be had is not an answer of none.
+    /// Why none of this backend's installed rows could be checked for being
+    /// held astray, or null when the check was made; a row it could not
+    /// judge alone is in `drift.unchecked`. Counted as drift: an astray row
+    /// is, and an answer that could not be had is not an answer of none.
     unchecked: ?[]const u8 = null,
 };
 
@@ -94,9 +95,11 @@ pub const Report = struct {
         return n;
     }
 
+    /// Backends whose check could not be made at all, and rows it could
+    /// not judge alone.
     pub fn uncheckedCount(self: Report) usize {
         var n: usize = 0;
-        for (self.backends) |b| n += @intFromBool(b.unchecked != null);
+        for (self.backends) |b| n += @intFromBool(b.unchecked != null) + b.drift.unchecked.len;
         return n;
     }
 
@@ -241,7 +244,7 @@ pub fn fromManifest(
     for (assumed.items) |b| {
         try out.append(arena, .{
             .backend = b.name,
-            .drift = drift_mod.compute(arena, b, rows, &.{}, &.{}, m) catch |e| {
+            .drift = drift_mod.compute(arena, b, rows, &.{}, .{}, m) catch |e| {
                 try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
@@ -289,14 +292,14 @@ pub fn fromManifest(
         // answer it could not give is no answer of none, so it is carried
         // as drift of its own.
         var unchecked: ?[]const u8 = null;
-        const astray: []const Backend.Astray = if (purpose == .reconcile) &.{} else astrayOf(arena, b, rows, installed) catch |e| blk: {
+        const judged: Backend.Judged = if (purpose == .reconcile) .{} else astrayOf(arena, b, rows, installed) catch |e| blk: {
             if (e == error.OutOfMemory) return e;
             unchecked = exec.errorText(e);
-            break :blk &.{};
+            break :blk .{};
         };
         try out.append(arena, .{
             .backend = b.name,
-            .drift = drift_mod.compute(arena, b, rows, installed, astray, m) catch |e| {
+            .drift = drift_mod.compute(arena, b, rows, installed, judged, m) catch |e| {
                 try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
@@ -316,9 +319,9 @@ pub fn fromManifest(
 
 /// What `b` holds astray among the desired rows it has installed. Not asked
 /// at all when it has none of them.
-fn astrayOf(arena: std.mem.Allocator, b: Backend, rows: []const Row, installed: []const []const u8) ![]const Backend.Astray {
+fn astrayOf(arena: std.mem.Allocator, b: Backend, rows: []const Row, installed: []const []const u8) !Backend.Judged {
     const held = try drift_mod.held(arena, b, rows, installed);
-    if (held.len == 0) return &.{};
+    if (held.len == 0) return .{};
     return b.astray(arena, held);
 }
 
@@ -845,6 +848,7 @@ test "fromManifest: an installed row brew holds astray is drift, and comes back 
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = "" },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = prefix },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = prefix },
+        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 --formula -- owner/tap/emacs-plus@30", .stdout = "{\"formulae\":[{\"name\":\"emacs-plus@30\",\"disabled\":false}]}" },
     } };
     var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = io };
     var bindings = std.StringHashMap([]const u8).init(a);

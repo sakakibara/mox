@@ -145,7 +145,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, why for a backend whose installed packages could not be checked for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, id (- for every installed package of the backend), why for an installed package that could not be judged for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -654,6 +654,9 @@ fn printPackages(
             for (b.drift.astray) |s| {
                 try ctx.out.print("  {s:<9} {s} {s} ({s}; to fix: {s})\n", .{ "ASTRAY", b.backend, s.row.name, s.why, s.fix });
             }
+            for (b.drift.unchecked) |u| {
+                try ctx.out.print("  {s:<9} {s} {s} (whether it is held astray is unknown: {s})\n", .{ "UNCHECKED", b.backend, u.row.name, u.why });
+            }
         }
         // A row this machine's gate excludes, named with the gate that
         // excluded it. Not drift, so it keeps the company of the clean rows
@@ -675,15 +678,16 @@ fn printPackages(
 
 /// Emit the drift set as JSON: `{"files":[...],"packages":[...]}`. A file is
 /// `{path, kind, [key], first_contact}`; a package is `{backend, state, id,
-/// [name], [why], [fix]}`, `state` being `missing`, `untracked` or `astray`
-/// and `id` the identity its backend compares by (a brew cask carries its
-/// `cask:` prefix, so it can never be confused with the formula of the same
-/// name). `name` is what the manifest row spells, present for a missing or an
-/// astray package. An astray package is installed, but held by its manager
-/// under a binding that moved off it; `why` says how, and `fix` is the
-/// command line that repairs it, which mox leaves to the user because it can
-/// need an uninstall. A backend whose installed packages could not be checked
-/// for that is `{backend, state: "unchecked", why}`. A manager that is there
+/// [name], [why], [fix]}`, `state` being `missing`, `untracked`, `astray` or
+/// `unchecked` and `id` the identity its backend compares by (a brew cask
+/// carries its `cask:` prefix, so it can never be confused with the formula
+/// of the same name). `name` is what the manifest row spells, present for all
+/// but an untracked package. An astray package is installed, but held by its
+/// manager under a binding that moved off it; `why` says how, and `fix` what
+/// repairs it, which mox leaves to the user because it can need an
+/// uninstall. An unchecked package is installed, but could not be judged for
+/// that; `why` says why. A backend that could judge none of its installed
+/// packages is `{backend, state: "unchecked", why}`. A manager that is there
 /// but broken is `{backend, state: "broken", exit, probe, [why]}`, `exit`
 /// being the exit code or null for a call that never reached one (killed at
 /// its bound, ended for want of a terminal, answered in a shape that is not
@@ -798,6 +802,19 @@ fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
             try writeJsonString(out, s.fix);
             try out.writeByte('}');
         }
+        for (b.drift.unchecked) |u| {
+            if (!first) try out.writeByte(',');
+            first = false;
+            try out.writeAll("{\"backend\":");
+            try writeJsonString(out, b.backend);
+            try out.writeAll(",\"state\":\"unchecked\",\"id\":");
+            try writeJsonString(out, u.id);
+            try out.writeAll(",\"name\":");
+            try writeJsonString(out, u.row.name);
+            try out.writeAll(",\"why\":");
+            try writeJsonString(out, u.why);
+            try out.writeByte('}');
+        }
     }
     try out.writeByte(']');
 }
@@ -824,10 +841,12 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
 /// A package record is `package_missing` / `package_untracked` \t backend \t
 /// id, `package_astray` \t backend \t id \t why \t fix, `package_unchecked`
-/// \t backend \t why, or `package_broken` \t backend \t exit code \t probe \t
-/// why -- the exit code being `-` for a call that never reached one (killed at its bound,
-/// ended for want of a terminal, answered in a shape that is not an answer),
-/// which is the only thing that tells those apart from a genuine exit of 255;
+/// \t backend \t id \t why -- the id being `-` for a backend that could judge
+/// none of its installed packages -- or `package_broken` \t backend \t exit
+/// code \t probe \t why -- the exit code being `-` for a call that never
+/// reached one (killed at its bound, ended for want of a terminal, answered
+/// in a shape that is not an answer), which is the only thing that tells
+/// those apart from a genuine exit of 255;
 /// `probe` is what was asked and `why` the reason in words, empty where the
 /// code says it. A manifest that would not
 /// load or validate is the single field `package_refused`, with no backend
@@ -867,7 +886,7 @@ fn emitPorcelain(
         if (b.unchecked) |why| {
             try out.writeAll("package_unchecked\t");
             try writePorcelainField(out, b.backend);
-            try out.writeByte('\t');
+            try out.writeAll("\t-\t");
             try writePorcelainField(out, why);
             try out.writeByte('\n');
         }
@@ -894,6 +913,15 @@ fn emitPorcelain(
             try writePorcelainField(out, s.why);
             try out.writeByte('\t');
             try writePorcelainField(out, s.fix);
+            try out.writeByte('\n');
+        }
+        for (b.drift.unchecked) |u| {
+            try out.writeAll("package_unchecked\t");
+            try writePorcelainField(out, b.backend);
+            try out.writeByte('\t');
+            try writePorcelainField(out, u.id);
+            try out.writeByte('\t');
+            try writePorcelainField(out, u.why);
             try out.writeByte('\n');
         }
     }
@@ -1032,7 +1060,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be checked, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -1230,7 +1258,7 @@ test "emitPorcelain / emitJson: a backend whose astray check failed is a record,
     const backends = [_]mox.packages.report.BackendDrift{.{
         .backend = "brew",
         .drift = .{},
-        .unchecked = "an install receipt could not be read, as the line above says",
+        .unchecked = "brew exited nonzero answering what mox asked, saying why above",
     }};
     const pkgs: Packages = .{ .report = .{ .in_use = true, .backends = &backends } };
     try testing.expectEqual(@as(usize, 1), pkgs.problems());
@@ -1238,14 +1266,51 @@ test "emitPorcelain / emitJson: a backend whose astray check failed is a record,
     var pw: std.Io.Writer.Allocating = .init(al);
     try emitPorcelain(&pw.writer, &.{}, pkgs);
     try testing.expectEqualStrings(
-        "package_unchecked\tbrew\tan install receipt could not be read, as the line above says\n",
+        "package_unchecked\tbrew\t-\tbrew exited nonzero answering what mox asked, saying why above\n",
         pw.written(),
     );
 
     var jw: std.Io.Writer.Allocating = .init(al);
     try emitJson(&jw.writer, &.{}, pkgs);
     try testing.expectEqualStrings(
-        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"unchecked\",\"why\":\"an install receipt could not be read, as the line above says\"}]}\n",
+        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"unchecked\",\"why\":\"brew exited nonzero answering what mox asked, saying why above\"}]}\n",
+        jw.written(),
+    );
+}
+
+test "emitPorcelain / emitJson: an installed package that could not be judged is a record of its own" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const unchecked = [_]mox.packages.drift.Unchecked{.{
+        .row = .{
+            .name = "readline",
+            .backend = "brew",
+            .when = null,
+            .fields = &.{},
+            .origin = "/tmp/x.toml",
+            .label = "data/packages/a.toml",
+            .index = 0,
+        },
+        .id = "readline",
+        .why = "its install receipt\tx could not be read",
+    }};
+    const backends = [_]mox.packages.report.BackendDrift{.{
+        .backend = "brew",
+        .drift = .{ .unchecked = &unchecked },
+    }};
+    const pkgs: Packages = .{ .report = .{ .in_use = true, .backends = &backends } };
+    try testing.expectEqual(@as(usize, 1), pkgs.problems());
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings("package_unchecked\tbrew\treadline\tits install receipt\\tx could not be read\n", pw.written());
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[{\"backend\":\"brew\",\"state\":\"unchecked\",\"id\":\"readline\",\"name\":\"readline\",\"why\":\"its install receipt\\tx could not be read\"}]}\n",
         jw.written(),
     );
 }

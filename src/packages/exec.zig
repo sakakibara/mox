@@ -235,8 +235,6 @@ pub fn errorText(e: anyerror) []const u8 {
         error.ScoopBucketListFailed => "scoop could not list its buckets, saying why above",
         error.BrewAnswerFailed => "brew exited nonzero answering what mox asked, saying why above",
         error.BrewAnswerUnreadable => "brew answered in a shape mox could not read",
-        error.BrewReceiptUnreadable => "an install receipt could not be read, as the line above says",
-        error.BrewAliasUnreadable => "the alias an install receipt records could not be read, as the line above says",
         error.NoIo => "this run has no way to read the files it needs",
         error.UnreadableExport => "the manager's export came back in a shape mox could not read",
         error.BrewInstallFailed,

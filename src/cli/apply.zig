@@ -786,6 +786,7 @@ fn applyPass(
                 );
             }
             if (pkg_counts.astray > 0) try ctx.out.print(", {d} astray", .{pkg_counts.astray});
+            if (pkg_counts.unchecked > 0) try ctx.out.print(", {d} unchecked", .{pkg_counts.unchecked});
             try ctx.out.writeAll("\n");
         }
     } else {
@@ -812,6 +813,7 @@ fn applyPass(
                 .{pkg_counts.marked},
             );
             if (pkg_counts.astray > 0) try ctx.out.print(", {d} astray", .{pkg_counts.astray});
+            if (pkg_counts.unchecked > 0) try ctx.out.print(", {d} unchecked", .{pkg_counts.unchecked});
             if (pkg_counts.attempted > 0) try ctx.out.print(
                 " ({d} row(s) in failed batches may have landed)",
                 .{pkg_counts.attempted},
@@ -1078,6 +1080,10 @@ const PackageCounts = struct {
     /// Installed rows their manager holds astray, left as they are: the
     /// repair can uninstall, and mox never does.
     astray: usize = 0,
+    /// Installed rows, or whole backends, not judged for being held astray.
+    /// Said, and counted in nothing else: what apply installs is known all
+    /// the same.
+    unchecked: usize = 0,
 };
 
 /// Install every package the manifest declares and this machine lacks.
@@ -1283,8 +1289,16 @@ fn applyPackages(
             );
             counts.astray += 1;
         }
+        for (b.drift.unchecked) |u| {
+            try ctx.err.print(
+                "mox apply: {s}: whether {s} is held astray is unknown: {s}\n",
+                .{ b.backend, u.row.name, u.why },
+            );
+        }
+        counts.unchecked += @intFromBool(b.unchecked != null) + b.drift.unchecked.len;
     }
     try ctx.err.flush();
+    var installed_here: std.ArrayList([]const u8) = .empty;
     for (rep.backends) |b| {
         if (b.drift.missing.len == 0) continue;
         const backend = registry.find(b.backend) orelse continue;
@@ -1317,60 +1331,147 @@ fn applyPackages(
         }
         if (rows.items.len == 0) continue;
 
-        // The whole set goes to the adapter at once: a manager that resolves
-        // a batch in one pass (apt, pacman) must not be driven one package at
-        // a time. The adapter streams its own output, so which package failed
-        // is on the terminal from the manager itself.
-        var batch_failed = false;
-        // An install is where a run that is killed leaves the machine in a
-        // state nothing recorded: the ledger and the manifest are written
-        // after it, and a signal that ends mox runs no deferred code at all.
-        // Staged before the spawn, so the death itself can say what was in
-        // flight; dropped again the moment the batch is over.
-        mox.machine.job.stageNote(try interruptNote(ctx.alloc, b.backend));
-        backend.install(ctx.alloc, rows.items) catch |e| {
-            // A batch that never got as far as running its manager did not
-            // fail to install: it failed before an install was attempted, and
-            // saying otherwise sends the reader looking for a manager that
-            // was never asked anything.
-            const spawned = backend.installSpawned();
+        try installRows(ctx, &pkg_backends, backend, b.backend, rows.items, &counts);
+        try installed_here.append(ctx.alloc, b.backend);
+    }
+
+    // An install can undo what a backend recorded for a package it did not
+    // install: brew upgrading a declared keg-only formula as another's
+    // dependency records the new keg as installed on request no longer
+    // (`FormulaInstaller#install_dependency` reads the old flag only through
+    // a linked keg, which a keg-only formula has none of). So each backend
+    // that installed is asked again, and a row it held before and holds no
+    // longer goes back through its install, which for an installed package
+    // is the adapter's own way of recording it.
+    if (installed_here.items.len > 0) try restoreRegressed(ctx, &pkg_backends, registry, manifest, bindings, rep, installed_here.items, &counts);
+    return counts;
+}
+
+/// Hand `rows` to `backend` in one batch and count what came of it.
+fn installRows(
+    ctx: *app.Ctx,
+    pkg_backends: *app.PackageBackends,
+    backend: mox.packages.backend.Backend,
+    name: []const u8,
+    rows: []const mox.packages.manifest.Row,
+    counts: *PackageCounts,
+) !void {
+    // The whole set goes to the adapter at once: a manager that resolves
+    // a batch in one pass (apt, pacman) must not be driven one package at
+    // a time. The adapter streams its own output, so which package failed
+    // is on the terminal from the manager itself.
+    var batch_failed = false;
+    // An install is where a run that is killed leaves the machine in a
+    // state nothing recorded: the ledger and the manifest are written
+    // after it, and a signal that ends mox runs no deferred code at all.
+    // Staged before the spawn, so the death itself can say what was in
+    // flight; dropped again the moment the batch is over.
+    mox.machine.job.stageNote(try interruptNote(ctx.alloc, name));
+    backend.install(ctx.alloc, rows) catch |e| {
+        // A batch that never got as far as running its manager did not
+        // fail to install: it failed before an install was attempted, and
+        // saying otherwise sends the reader looking for a manager that
+        // was never asked anything.
+        const spawned = backend.installSpawned();
+        try ctx.err.print(
+            "mox apply: {s}: {s}: {s}\n",
+            .{
+                name,
+                if (spawned) "install failed" else "install did not run",
+                try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()),
+            },
+        );
+        try ctx.err.flush();
+        batch_failed = true;
+        counts.failed += 1;
+        // The adapter is asked whether its manager ran, rather than its
+        // error read: a check that runs before the install fails in the
+        // same ways the install does. One that then read the machine
+        // back says what landed, and there is nothing left to hedge.
+        if (spawned) {
+            if (backend.installLanded()) |landed| {
+                counts.landed += landed;
+            } else {
+                counts.attempted += rows.len - backend.installRefused() - backend.installMarked() - backend.installUnmarked();
+            }
+        }
+    };
+    mox.machine.job.clearNote();
+    // A row the adapter refused, or one whose mark did not take, is a
+    // failure of that row alone: the rows beside it were installed, so
+    // counting the batch instead would report work that happened as work
+    // that did not. A marked row converged whatever the batch did after
+    // it: the mark ran to completion before any install was asked for.
+    const refused = backend.installRefused();
+    const marked = backend.installMarked();
+    const unmarked = backend.installUnmarked();
+    counts.failed += refused + unmarked;
+    counts.marked += marked;
+    if (!batch_failed) counts.installed += rows.len - refused - marked - unmarked;
+}
+
+/// Ask each backend in `backends` again what it holds, and hand back to its
+/// install every desired row it held when `before` was taken and holds no
+/// longer.
+fn restoreRegressed(
+    ctx: *app.Ctx,
+    pkg_backends: *app.PackageBackends,
+    registry: mox.packages.backend.Registry,
+    manifest: mox.packages.manifest.Manifest,
+    bindings: *const mox.dsl.resolver.Resolver,
+    before: mox.packages.report.Report,
+    backends: []const []const u8,
+    counts: *PackageCounts,
+) !void {
+    var diag: mox.packages.manifest.Diag = .{};
+    const after = mox.packages.report.fromManifest(ctx.alloc, manifest, registry, bindings, &.{}, .reconcile, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
             try ctx.err.print(
-                "mox apply: {s}: {s}: {s}\n",
-                .{
-                    b.backend,
-                    if (spawned) "install failed" else "install did not run",
-                    try mox.packages.exec.failureText(ctx.alloc, e, pkg_backends.installTimeoutMs(), "MOX_INSTALL_TIMEOUT_MS", pkg_backends.captureTimeoutMs()),
-                },
+                "mox apply: packages: what the installs left could not be read back, so a package they unrecorded is not restored this run: {s}\n",
+                .{diag.capture() orelse mox.packages.exec.errorText(e)},
             );
             try ctx.err.flush();
-            batch_failed = true;
-            counts.failed += 1;
-            // The adapter is asked whether its manager ran, rather than its
-            // error read: a check that runs before the install fails in the
-            // same ways the install does. One that then read the machine
-            // back says what landed, and there is nothing left to hedge.
-            if (spawned) {
-                if (backend.installLanded()) |landed| {
-                    counts.landed += landed;
-                } else {
-                    counts.attempted += rows.items.len - backend.installRefused() - backend.installMarked() - backend.installUnmarked();
-                }
+            return;
+        },
+    };
+    // A backend the second report could not read is said by name: the rows
+    // it may have unrecorded stay so, and the next status shows them.
+    unread: for (backends) |name| {
+        for (after.backends) |b| if (std.mem.eql(u8, b.backend, name)) continue :unread;
+        for (after.broken) |br| {
+            if (!std.mem.eql(u8, br.backend, name)) continue;
+            if (br.code) |code| {
+                try ctx.err.print("mox apply: {s}: what its installs left could not be read back, so a package they unrecorded is not restored this run: {s} exited {d}\n", .{ name, br.probe, code });
+            } else {
+                try ctx.err.print("mox apply: {s}: what its installs left could not be read back, so a package they unrecorded is not restored this run: {s}: {s}\n", .{ name, br.probe, br.why });
             }
-        };
-        mox.machine.job.clearNote();
-        // A row the adapter refused, or one whose mark did not take, is a
-        // failure of that row alone: the rows beside it were installed, so
-        // counting the batch instead would report work that happened as work
-        // that did not. A marked row converged whatever the batch did after
-        // it: the mark ran to completion before any install was asked for.
-        const refused = backend.installRefused();
-        const marked = backend.installMarked();
-        const unmarked = backend.installUnmarked();
-        counts.failed += refused + unmarked;
-        counts.marked += marked;
-        if (!batch_failed) counts.installed += rows.items.len - refused - marked - unmarked;
+            continue :unread;
+        }
+        try ctx.err.print("mox apply: {s}: what its installs left could not be read back, so a package they unrecorded is not restored this run\n", .{name});
     }
-    return counts;
+    try ctx.err.flush();
+    for (after.backends) |b| {
+        if (!containsName(backends, b.backend)) continue;
+        const backend = registry.find(b.backend) orelse continue;
+        var was_missing = std.StringHashMap(void).init(ctx.alloc);
+        for (before.backends) |prev| {
+            if (!std.mem.eql(u8, prev.backend, b.backend)) continue;
+            for (prev.drift.missing) |m| try was_missing.put(m.id, {});
+        }
+        var rows: std.ArrayList(mox.packages.manifest.Row) = .empty;
+        for (b.drift.missing) |m| {
+            if (was_missing.contains(m.id)) continue;
+            try ctx.out.print("  restoring       {s} {s} (an install above left it unrecorded)\n", .{ b.backend, m.row.name });
+            try rows.append(ctx.alloc, m.row);
+        }
+        if (rows.items.len > 0) try installRows(ctx, pkg_backends, backend, b.backend, rows.items, counts);
+    }
+}
+
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// Say which volume the installs about to run write to is short of space,

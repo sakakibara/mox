@@ -74,9 +74,25 @@ fn brewWithInstalled(
     casks: []const u8,
     extra: []const mox.packages.exec.Fake.Entry,
 ) !*mox.packages.exec.Fake {
+    return brewWithRecorded(a, installed, formulae, formulae, casks, extra);
+}
+
+/// The same machine, whose formulae asked for by name are `formulae` the
+/// first time brew is asked and `then` every time after: what an install
+/// changes about another formula's record.
+fn brewWithRecorded(
+    a: std.mem.Allocator,
+    installed: []const u8,
+    formulae: []const u8,
+    then: []const u8,
+    casks: []const u8,
+    extra: []const mox.packages.exec.Fake.Entry,
+) !*mox.packages.exec.Fake {
+    const explicit = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request";
     var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
     try entries.append(a, .{ .argv = "brew --version", .stdout = "Homebrew 6.0.0\n" });
-    try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .stdout = formulae });
+    try entries.append(a, .{ .argv = explicit, .stdout = formulae, .once = true });
+    try entries.append(a, .{ .argv = explicit, .stdout = then });
     try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .stdout = casks });
     try entries.append(a, .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name", .stdout = installed });
     // What an install asks brew each row's name stands for. Answered with
@@ -362,8 +378,8 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     );
 
     // brotli is in the Cellar but nothing asked for it by name, so the row is
-    // missing. `brew install` on it exits 0 having done nothing, which would
-    // leave the row missing after a run that called it installed.
+    // missing. `brew install` would upgrade it on the way when it is
+    // outdated; a mark records the request and leaves the package alone.
     const fake = try brewWithInstalled(a, "brotli\n", "", "", &.{
         .{ .argv = "env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- brotli" },
     });
@@ -376,7 +392,7 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     try std.testing.expect(!fake.called("env HOMEBREW_NO_ASK=1 brew install -- brotli"));
     // Said as what it was: the package was there before the run, so the
     // summary counts it apart from what mox put on the machine.
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it as installed on request instead") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "marking it as installed on request and leaving the package as it is") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         r.out,
@@ -389,10 +405,139 @@ test "apply: a formula installed as a dependency is marked on request, not reins
     try std.testing.expect(std.mem.indexOf(u8, r.out, "recorded as asked for") == null);
 }
 
+test "apply: a declared formula an install leaves unrecorded is restored in the same run" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "readline"
+        \\
+        \\[[packages]]
+        \\name = "emacs"
+        \\
+    );
+
+    // readline is asked for before the run. Installing emacs upgrades it as
+    // a dependency, and brew records the upgraded keg-only formula as
+    // installed on request no longer; emacs itself lands.
+    const fake = try brewWithRecorded(a, "readline\n", "readline\n", "emacs\n", "", &.{
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- emacs" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- readline" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const install = indexOfCall(fake, "env HOMEBREW_NO_ASK=1 brew install -- emacs").?;
+    const mark = indexOfCall(fake, "env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- readline").?;
+    try std.testing.expect(install < mark);
+    // emacs was in the first batch and is held afterwards: not handed over
+    // a second time.
+    var installs: usize = 0;
+    for (fake.calls.items) |c| installs += @intFromBool(std.mem.eql(u8, c, "env HOMEBREW_NO_ASK=1 brew install -- emacs"));
+    try std.testing.expectEqual(@as(usize, 1), installs);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  restoring       brew readline (an install above left it unrecorded)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed, 1 already on the machine") != null);
+}
+
+test "apply: a read-back that fails after the installs is said, and restores nothing" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "readline"
+        \\
+        \\[[packages]]
+        \\name = "emacs"
+        \\
+    );
+
+    const explicit = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request";
+    const fake = try brewWithRecorded(a, "readline\n", "readline\n", "", "", &.{
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- emacs" },
+    });
+    // The second answer, and every one after it, fails.
+    for (@constCast(fake.entries)) |*e| {
+        if (std.mem.eql(u8, e.argv, explicit) and !e.once) e.code = 1;
+    }
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- emacs"));
+    try std.testing.expect(!fake.called("env HOMEBREW_NO_ASK=1 brew tab --installed-on-request --formula -- readline"));
+    // Named with the query that failed, as a broken manager is.
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: what its installs left could not be read back, so a package they unrecorded is not restored this run: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not restored this run: list: the manager's own listing exited nonzero") != null);
+}
+
+test "status and apply: an installed row brew cannot judge is UNCHECKED alone, and counted" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "readline"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+    );
+    // readline's receipt is truncated.
+    const prefix = try std.fs.path.join(a, &.{ h.root, "brew-prefix" });
+    const opt = try std.fs.path.join(a, &.{ prefix, "opt", "readline" });
+    try Io.Dir.cwd().createDirPath(io, opt);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ opt, "INSTALL_RECEIPT.json" }), .data = "{truncated" });
+    const fake = try brewWith(a, "readline\n", "", &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = prefix },
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = prefix },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), st.rc);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "UNCHECKED brew readline (whether it is held astray is unknown: its install receipt ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "opt/readline/INSTALL_RECEIPT.json could not be read: it is not JSON)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "Packages: 1 missing, 1 unchecked.") != null);
+
+    const ap = try h.run(&.{ "mox", "apply" });
+    // Said and counted, but nothing apply could decide is left.
+    try std.testing.expectEqual(@as(u8, 0), ap.rc);
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expect(std.mem.indexOf(u8, ap.err, "mox apply: brew: whether readline is held astray is unknown: its install receipt ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ap.out, "Packages: 1 installed, 0 failed, 1 unchecked") != null);
+}
+
 /// A brew prefix under `root` where `keg` was installed through the tap
 /// alias `alias`, which now names `target`; answers the `brew --prefix` and
 /// `brew --repository` the astray check asks.
-fn movedAliasPrefix(a: std.mem.Allocator, io: Io, root: []const u8, keg: []const u8, alias: []const u8, target: []const u8) ![2]mox.packages.exec.Fake.Entry {
+fn movedAliasPrefix(a: std.mem.Allocator, io: Io, root: []const u8, keg: []const u8, alias: []const u8, target: []const u8) ![3]mox.packages.exec.Fake.Entry {
     const prefix = try std.fs.path.join(a, &.{ root, "brew-prefix" });
     const aliases = try std.fs.path.join(a, &.{ prefix, "Library/Taps/owner/homebrew-tap/Aliases" });
     try Io.Dir.cwd().createDirPath(io, aliases);
@@ -410,6 +555,11 @@ fn movedAliasPrefix(a: std.mem.Allocator, io: Io, root: []const u8, keg: []const
     return .{
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --prefix", .stdout = prefix },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew --repository", .stdout = prefix },
+        // The formula under its current name: not renamed, not disabled.
+        .{
+            .argv = try std.fmt.allocPrint(a, "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 --formula -- owner/tap/{s}", .{keg}),
+            .stdout = try std.fmt.allocPrint(a, "{{\"formulae\":[{{\"name\":\"{s}\",\"disabled\":false}}]}}", .{keg}),
+        },
     };
 }
 

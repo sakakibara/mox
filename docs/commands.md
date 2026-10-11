@@ -218,9 +218,15 @@ bootstrap alone still triggers the re-capture, since the machine changed.
 apply only ever installs -- an untracked package is
 reported by `mox status` and reconciled by `mox commit`, never uninstalled.
 An `ASTRAY` package (see [status](#status)) is left as it is for the same
-reason: apply names it on stderr with the command line that repairs it,
-counts it in the summary (`, N astray`), and exits 1, as for file drift it
-leaves untouched.
+reason: apply names it on stderr with what repairs it, counts it in the
+summary (`, N astray`), and exits 1, as for file drift it leaves untouched.
+An `UNCHECKED` one is named on stderr and counted (`, N unchecked`) but
+changes nothing about the exit code: what apply installs is known all the
+same. Each backend that installed anything is asked again afterwards, and a
+declared package it held before the installs and holds no longer -- brew
+records a keg-only formula it upgraded as another's dependency as no longer
+installed on request -- is handed back to its install in the same run
+(`restoring`), which for a package on the machine is the backend's mark.
 Under `--dry-run` nothing is fetched or installed and the run lists what
 it would install, planned as though any absent manager had been
 bootstrapped. The failures a plan can have on its own -- a probe that did not
@@ -691,11 +697,12 @@ a binding that has moved off it, so what the manager does to it next acts
 on another package: a brew formula installed through a tap alias that now
 names another formula, which `brew upgrade` and `brew reinstall` then
 replace with that formula, or fail on when its tap is not trusted. The row
-says why and gives the command line that repairs it, which mox never runs
-because it uninstalls. A backend whose installed packages could not be
-checked for that is `UNCHECKED`, counted as well: an answer that could not
-be had is not an answer of none. A declared row of a backend this machine
-can use whose `when` excludes this machine is `GATED` there, printed with the
+says why and what repairs it, which mox never does because it uninstalls.
+An installed package that could not be judged for that is `UNCHECKED`, and
+so is a backend that could judge none of them, counted as well: an answer
+that could not be had is not an answer of none. A declared row of a backend
+this machine can use whose `when` excludes this machine is `GATED` there,
+printed with the
 gate that excluded it: it is not drift and counts toward nothing, but a row
 that appeared in no output at all could not be told from a row the manifest
 never carried, which is what a `when` written under the wrong table header
@@ -748,21 +755,23 @@ read as one of them; a manifest that would not load is
 `{state: "refused"}`, alone and leading the package set, since it is the
 whole pass rather than one backend; a package is
 `{backend, state, id, name?, why?, fix?}`, where `state` is `missing`,
-`untracked` or `astray` and `id` is the identity its backend compares by --
-a brew cask carries its `cask:` prefix, so it can never be read as the
-formula of the same name. `name` is what the manifest row spells, and is
-present for a missing or an astray package; `why` and `fix` are present for
-an astray one, saying what holds it astray and the command line that
-repairs it. A backend that could not be checked for astray packages is
+`untracked`, `astray` or `unchecked` and `id` is the identity its backend
+compares by -- a brew cask carries its `cask:` prefix, so it can never be
+read as the formula of the same name. `name` is what the manifest row
+spells, and is present for all but an untracked package; `why` is present
+for an astray or an unchecked one, saying what holds it astray or why it
+could not be judged, and `fix` for an astray one, saying what repairs it. A
+backend that could judge none of its installed packages is
 `{backend, state: "unchecked", why}`.
 
 `--porcelain` emits stable tab-separated lines, one record per line, with
 the record kind as the first field. File records are `kind`, `key`,
 `first_contact` (0/1), `path`. Package records are `package_missing` or
 `package_untracked`, then `backend`, then `id`; an astray package is
-`package_astray`, then `backend`, then `id`, then why, then the fix; a
-backend that could not be checked for that is `package_unchecked`, then
-`backend`, then why; a broken manager is
+`package_astray`, then `backend`, then `id`, then why, then the fix; one
+that could not be judged for that is `package_unchecked`, then `backend`,
+then `id`, then why, the `id` being `-` for a backend that could judge none
+of its installed packages; a broken manager is
 `package_broken`, then `backend`, then the exit code, then the probe, then
 why -- the exit code being `-` for a call that never reached one (killed at
 its bound, ended for want of a terminal, or answered in a shape that is not
@@ -781,7 +790,7 @@ break the framing; unescape those four to recover exact bytes. Both imply
 | `--color <color>` | auto|always|never |
 | `--drift` | show only the drift set (suppress the clean/gated table) |
 | `--json` | emit the drift set as JSON (implies --drift) |
-| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, why for a backend whose installed packages could not be checked for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
+| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, id (- for every installed package of the backend), why for an installed package that could not be judged for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
 <!-- /generated -->
 
 ## export
@@ -970,8 +979,9 @@ That is mox's guarded fetch without the write -- a dirty tree refused,
 a missing upstream reported in mox's terms, the arriving commit count
 printed -- which `mox git -- pull --rebase` does not give you.
 
-Exit 0 clean, 1 drift or an astray package left for a decision, 2 a refusal or failure, the
-same contract `apply` uses. Sending work the other way is `publish`.
+Exit 0 clean, 1 drift or an astray package left for a decision, 2 a
+refusal or failure, the same contract `apply` uses. Sending work the other
+way is `publish`.
 
 <!-- generated: flags update -->
 | Flag | Description |

@@ -392,9 +392,9 @@ test "brew: the installed-formulae query answers for a formula the explicit one 
 
     // What an install rests on: a formula that is installed but was never
     // asked for by name is reported by the whole-Cellar query and NOT by the
-    // explicit one, so the two together tell "brew install would do nothing"
-    // from "brew install would install it". Differential against the
-    // receipts, not against another brew query.
+    // explicit one, so the two together tell a formula that needs a mark
+    // from one that needs an install. Differential against the receipts, not
+    // against another brew query.
     const inv = try inventory(a, io);
     const all = try rawLines(a, io, &.{ "brew", "list", "--formula", "--full-name" });
     const requested = try rawLines(a, io, &.{ "brew", "list", "--full-name", "--installed-on-request" });
@@ -656,4 +656,31 @@ test "brew: a third-party tap's formula is reported under its qualified name" {
     // with and nothing is refused.
     const want = try std.fmt.allocPrint(a, "\"full_name\": \"{s}\"", .{name});
     try testing.expect(std.mem.indexOf(u8, res.stdout, want) != null);
+}
+
+test "brew: every formula asked for by name is judged for an alias that moved" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+    const ids = try brewIds(a, io);
+    var rows: std.ArrayList(packages.manifest.Row) = .empty;
+    for (ids) |id| {
+        if (std.mem.startsWith(u8, id, "cask:")) continue;
+        try rows.append(a, .{ .name = id, .backend = "brew", .origin = "/dev/null", .label = "data/packages/brew.toml", .index = rows.items.len });
+    }
+    if (rows.items.len == 0) return skipUnlessCi("no formula is installed on request");
+
+    // The receipts are where brew's own installs put them, so every one is
+    // read: a row left unchecked is a path or a shape the check has wrong.
+    var p: packages.exec.Process = .{ .io = io };
+    var b: packages.brew.Brew = .{ .runner = p.runner(), .io = io };
+    const judged = try b.backend().astray(a, rows.items);
+    for (judged.unchecked) |u| std.debug.print("'{s}' could not be judged: {s}\n", .{ u.id, u.why });
+    try testing.expectEqual(@as(usize, 0), judged.unchecked.len);
+    // A runner's formulae come from a fresh install by their own names, which
+    // records no alias.
+    if (onCi()) try testing.expectEqual(@as(usize, 0), judged.astray.len);
 }

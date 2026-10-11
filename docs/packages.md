@@ -562,22 +562,43 @@ the alias. So the repair uninstalls, and `mox apply` leaves it to you,
 naming the row and exiting 1. The uninstall ignores dependents, which
 `brew uninstall` otherwise refuses over and the install right after it
 satisfies again; the install is the one the receipt records, `--HEAD` and
-build options included. Until it
-finishes, the formula is not installed -- a formula built from source, as
-emacs-plus is, is gone for the length of the build -- and the uninstall
-removes the alias's own opt link (`opt/emacs-plus` here), which the new
-install does not bring back, since the alias names another formula now.
+build options included. Until it finishes, the formula is not installed --
+a formula built from source, as emacs-plus is, is gone for the length of
+the build -- and the uninstall removes the alias's own opt link
+(`opt/emacs-plus` here), which the new install does not bring back, since
+the alias names another formula now.
+
+An alias usually moves because the formula it named is being retired.
+Once brew has disabled that formula, `brew install` refuses it, and an
+uninstall would leave nothing installed; the repair is then to declare the
+formula the alias names now in the row's place, uninstall the old one, and
+run `mox apply`.
 
 No brew query reports the alias -- `brew outdated` names it only after
 loading the new target, which is the load an untrusted one fails -- so mox
-reads the receipt through the formula's opt link and applies Homebrew's own
-rule: the recorded source is still a symlink directly in the `Aliases`
-directory of one of this brew's taps, and the alias names a formula of
-another name. What a tap's alias names is its symlink; a homebrew/core
-alias is asked of brew instead, under your environment, because Homebrew
-resolves it through the API unless `HOMEBREW_NO_INSTALL_FROM_API` is set,
-and a local core checkout can be stale. A formula installed from the API
-records no alias, and Homebrew follows none for it.
+reads the receipt of the keg brew links for the formula, else of its opt
+link, and applies Homebrew's own rule: the recorded source is still a
+symlink in the `Aliases` directory of one of this brew's taps, and
+the alias of that name in the formula's own tap names a formula other than
+this one by its current name -- a formula renamed since it was installed,
+its alias moving with it, is not astray -- or names nothing Homebrew can
+load, which fails every `brew upgrade` and `brew outdated` as well. What a
+tap's alias names is its symlink, resolved one level, as Homebrew's alias
+table resolves it; a homebrew/core alias is asked of brew instead, under
+your environment, because Homebrew resolves it through the API unless
+`HOMEBREW_NO_INSTALL_FROM_API` is set, and a local core checkout can be
+stale. A formula installed from the API records no alias, and Homebrew
+follows none for it.
+
+### A formula an install leaves unrecorded
+
+Installing one formula can upgrade another as its dependency. When that
+other one is declared and keg-only -- `readline`, `sqlite` -- Homebrew
+records the upgraded keg as installed on request no longer, because it
+reads the old record only through a linked keg, and a keg-only formula has
+none. `mox apply` asks brew again after its installs, and marks such a row
+installed on request in the same run, printing `restoring` for it, so the
+run that installed the dependent does not end with the row `MISSING`.
 
 ### What a manager cannot be asked
 
@@ -641,11 +662,13 @@ under the backend rather than leaving it to be discovered.
   alias](#a-formula-installed-through-an-alias)). `status` counts it toward
   the exit code with the command line that repairs it; `apply` names it and
   exits 1, leaving it alone, since the repair uninstalls.
-- **UNCHECKED** -- the backend's installed rows could not be checked for
-  being astray (`UNCHECKED brew (whether its installed packages are held
-  astray is unknown: ...)`). Counted toward the exit code, since an answer
-  that could not be had is not an answer of none; `apply` says so and
-  installs what is missing all the same.
+- **UNCHECKED** -- a declared, installed row that could not be judged for
+  being astray (`UNCHECKED brew readline (whether it is held astray is
+  unknown: ...)`), or, with no row named, a backend that could judge none of
+  them (`UNCHECKED brew (whether its installed packages are held astray is
+  unknown: ...)`). `status` counts it toward the exit code, since an answer
+  that could not be had is not an answer of none; `apply` says so, counts it
+  in its summary, and installs what is missing all the same.
 - **BROKEN** -- the manager is installed but cannot answer
   (`BROKEN    brew (brew --version exited 1)`). Its rows are neither judged
   nor installed, and a machine in that state is not a clean one: `status`

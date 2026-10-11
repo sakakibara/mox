@@ -350,81 +350,138 @@ pub const Brew = struct {
     /// No brew query answers this: `brew info --json=v2` carries no install
     /// alias, and `brew outdated` names one only in prose, after loading the
     /// new target -- the load an untrusted one fails. So the receipt is read
-    /// where Homebrew first looks for it, through the opt link, and judged by
-    /// Homebrew's own rule (`Formula#installed_alias_path`,
-    /// `#installed_alias_target_changed?`): its `source.path` is a symlink in
-    /// the `Aliases` directory of one of this brew's taps, naming a formula of
-    /// another name. An install from the API records no alias, and Homebrew
-    /// follows none.
+    /// from the keg Homebrew reads it from and judged by Homebrew's own rule
+    /// (`Formula#installed_alias_path`, `#installed_alias_target_changed?`):
+    /// the recorded source is a symlink in the `Aliases` directory of a tap,
+    /// and the alias of that name in the formula's own tap names a formula
+    /// other than this one by its current name. An install from the API
+    /// records no alias, and Homebrew follows none.
     ///
-    /// What the alias names now is the tap's symlink, except for
-    /// homebrew/core: Homebrew resolves a core alias through the API unless
-    /// told not to, so a local core checkout can be stale, and brew itself is
-    /// asked, under the user's own environment.
-    ///
-    /// Casks have no aliases. A formula with no opt link or no receipt is a
-    /// keg brew cannot judge either, and is passed over.
-    ///
-    /// The repair uninstalls, which mox never does itself: only an install
-    /// through the formula's own name rewrites the receipt, and `brew install`
-    /// leaves an installed formula as it is. The uninstall ignores dependents,
-    /// which `brew uninstall` otherwise refuses over and the install right
-    /// after it satisfies again, and the install is the one the receipt
-    /// records, `--HEAD` and build options included, which `brew reinstall`
-    /// would have kept.
-    fn astrayImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const Backend.Astray {
+    /// A formula that cannot be judged is that row's answer alone; only a
+    /// brew that cannot say where it keeps its kegs and taps fails them all.
+    /// Casks have no aliases, and a formula with no receipt is a keg brew
+    /// cannot judge either: both are passed over.
+    fn astrayImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!Backend.Judged {
         const self: *Brew = @ptrCast(@alignCast(ctx));
         var formulae: std.ArrayList(Row) = .empty;
         for (rows) |row| {
             if (try kindOf(row) == .formula) try formulae.append(arena, row);
         }
-        if (formulae.items.len == 0) return &.{};
+        if (formulae.items.len == 0) return .{};
         const io = self.io orelse return error.NoIo;
 
-        const prefix = try self.queryPath(arena, "--prefix");
-        const taps = try std.fs.path.join(arena, &.{ try self.queryPath(arena, "--repository"), "Library", "Taps" });
-
-        var out: std.ArrayList(Backend.Astray) = .empty;
+        const places: Places = .{
+            .prefix = try self.queryPath(arena, "--prefix"),
+            .taps = try std.fs.path.join(arena, &.{ try self.queryPath(arena, "--repository"), "Library", "Taps" }),
+        };
+        var astray: std.ArrayList(Backend.Astray) = .empty;
+        var unchecked: std.ArrayList(Backend.Unchecked) = .empty;
         for (formulae.items) |row| {
-            const path = try std.fs.path.join(arena, &.{ prefix, "opt", baseName(row.name), "INSTALL_RECEIPT.json" });
-            const receipt = readReceipt(arena, io, path) catch |e| {
-                self.say("mox: brew: the install receipt {s} could not be read: {s}\n", .{ path, receiptErrorText(e) });
-                return error.BrewReceiptUnreadable;
-            } orelse continue;
-            const alias = tapAlias(arena, io, taps, receipt.source_path) catch |e| {
-                self.say("mox: brew: the alias {s} that {s} records could not be read: {s}\n", .{ receipt.source_path, path, receiptErrorText(e) });
-                return error.BrewAliasUnreadable;
-            } orelse continue;
-            const target = if (alias.core) try self.coreAliasTarget(arena, alias.name) else alias.target;
-            if (std.mem.eql(u8, target, baseName(row.name))) continue;
-
-            // Homebrew names the alias by the installed formula's own tap
-            // (`Formula#full_installed_alias_name`), which the receipt records.
-            const tap = receipt.tap orelse alias.tap;
-            const alias_name = try qualifyBy(arena, tap, alias.name);
-            const target_name = try qualifyBy(arena, tap, target);
-            var fix: std.Io.Writer.Allocating = .init(arena);
-            try fix.writer.writeAll("brew uninstall --formula --ignore-dependencies ");
-            try writeShellWord(&fix.writer, row.name);
-            try fix.writer.writeAll(" && brew install --formula");
-            if (receipt.head) try fix.writer.writeAll(" --HEAD");
-            for (receipt.options) |o| {
-                try fix.writer.writeByte(' ');
-                try writeShellWord(&fix.writer, o);
+            switch (try self.judge(arena, io, places, row)) {
+                .held => {},
+                .astray => |s| try astray.append(arena, s),
+                .unchecked => |why| try unchecked.append(arena, .{ .id = row.name, .why = why }),
             }
-            try fix.writer.writeByte(' ');
-            try writeShellWord(&fix.writer, row.name);
-            try out.append(arena, .{
-                .id = row.name,
-                .why = try std.fmt.allocPrint(
-                    arena,
-                    "installed through the alias \"{s}\", which now names \"{s}\", so brew upgrade and brew reinstall follow it to \"{s}\", and fail while that cannot be loaded",
-                    .{ alias_name, target_name, target_name },
-                ),
-                .fix = fix.written(),
-            });
         }
-        return out.toOwnedSlice(arena);
+        return .{
+            .astray = try astray.toOwnedSlice(arena),
+            .unchecked = try unchecked.toOwnedSlice(arena),
+        };
+    }
+
+    const Places = struct {
+        prefix: []const u8,
+        /// `<repository>/Library/Taps`.
+        taps: []const u8,
+    };
+
+    const Verdict = union(enum) {
+        held,
+        astray: Backend.Astray,
+        /// Why the row could not be judged, as a clause.
+        unchecked: []const u8,
+    };
+
+    /// One formula row, judged. Fails only when memory runs out: anything
+    /// else that stops the judgment is the row's own `unchecked`.
+    fn judge(self: *Brew, arena: std.mem.Allocator, io: Io, places: Places, row: Row) std.mem.Allocator.Error!Verdict {
+        const keg = baseName(row.name);
+        const path = receiptPath(arena, io, places.prefix, keg) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .unchecked = try std.fmt.allocPrint(arena, "the keg brew links for it could not be found: {s}", .{fileErrorText(e)}) };
+        } orelse return .held;
+        const receipt = readReceipt(arena, io, path) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .unchecked = try std.fmt.allocPrint(arena, "its install receipt {s} could not be read: {s}", .{ path, fileErrorText(e) }) };
+        } orelse return .held;
+        const recorded = recordedAlias(arena, io, places.taps, receipt.source_path) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .unchecked = try std.fmt.allocPrint(arena, "the alias {s} its receipt records could not be read: {s}", .{ receipt.source_path, fileErrorText(e) }) };
+        } orelse return .held;
+
+        // Homebrew looks the alias up in the formula's own tap
+        // (`Formula#full_installed_alias_name`), which the receipt records.
+        // An alias there that names nothing it can load fails every
+        // `brew upgrade` and `brew outdated` as surely as one that moved.
+        const tap = receipt.tap orelse recorded.tap;
+        const target: ?[]const u8 = if (tap) |t| blk: {
+            const dir = try tapDir(arena, places.taps, t);
+            const alias = try std.fs.path.join(arena, &.{ dir, "Aliases", recorded.name });
+            const named = aliasTarget(arena, io, alias) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                return .{ .unchecked = try std.fmt.allocPrint(arena, "the alias {s} could not be read: {s}", .{ alias, fileErrorText(e) }) };
+            };
+            if (named != null) break :blk named;
+            // With no alias of that name, Homebrew loads the name as the tap
+            // has it otherwise (`Formulary.tap_formula_name_type`): renamed,
+            // migrated to another tap, or a formula of its own.
+            const instead = tapLoads(arena, io, dir, recorded.name) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                return .{ .unchecked = try std.fmt.allocPrint(arena, "the tap {s} could not be read: {s}", .{ dir, fileErrorText(e) }) };
+            };
+            break :blk switch (instead) {
+                .formula => |f| f,
+                .migrated => |to| return .{ .unchecked = try std.fmt.allocPrint(arena, "the alias \"{s}\" is not in its tap any more, whose tap_migrations.json moves that name to \"{s}\", which mox does not follow", .{ recorded.name, to }) },
+                .nothing => null,
+            };
+        } else blk: {
+            // Homebrew resolves a homebrew/core alias through the API unless
+            // told not to, so a local core checkout can be stale: brew itself
+            // is asked, under the user's own environment.
+            const named = self.describe(arena, recorded.name) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                return .{ .unchecked = try std.fmt.allocPrint(arena, "brew could not say what the alias \"{s}\" names now: {s}", .{ recorded.name, exec.errorText(e) }) };
+            };
+            break :blk named.name;
+        };
+        if (target) |t| if (std.mem.eql(u8, t, keg)) return .held;
+
+        // A formula renamed since it was installed keeps its keg's old name,
+        // while Homebrew compares the alias's target with the current one.
+        const current = self.describe(arena, row.name) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .unchecked = try std.fmt.allocPrint(arena, "brew could not describe it, to tell a moved alias from a renamed formula: {s}", .{exec.errorText(e)}) };
+        };
+        if (target) |t| if (std.mem.eql(u8, t, current.name)) return .held;
+
+        const alias_name = try qualifyBy(arena, tap, recorded.name);
+        const why = if (target) |t| blk: {
+            const target_name = try qualifyBy(arena, tap, t);
+            break :blk try std.fmt.allocPrint(
+                arena,
+                "installed through the alias \"{s}\", which now names \"{s}\", so brew upgrade and brew reinstall follow it to \"{s}\", and fail while that cannot be loaded",
+                .{ alias_name, target_name, target_name },
+            );
+        } else try std.fmt.allocPrint(
+            arena,
+            "installed through the alias \"{s}\", which names no formula brew can load now, so brew upgrade and brew outdated fail loading it",
+            .{alias_name},
+        );
+        return .{ .astray = .{
+            .id = row.name,
+            .why = why,
+            .fix = try repair(arena, row.name, receipt, current.disabled, if (target) |t| try qualifyBy(arena, tap, t) else null),
+        } };
     }
 
     /// The absolute path `brew <flag>` prints.
@@ -437,20 +494,33 @@ pub const Brew = struct {
         return path;
     }
 
-    /// The formula the homebrew/core alias `name` names, as the user's own
-    /// brew resolves it: through the API, or the local checkout when
+    const Described = struct {
+        /// The formula's current name, renames and aliases resolved.
+        name: []const u8,
+        disabled: bool,
+    };
+
+    /// The formula `name` loads as, as the user's own brew resolves it:
+    /// through the API, or the local checkout when
     /// `HOMEBREW_NO_INSTALL_FROM_API` says so.
-    fn coreAliasTarget(self: *Brew, arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+    fn describe(self: *Brew, arena: std.mem.Allocator, name: []const u8) !Described {
         const res = try self.runner.run(arena, &.{ "env", "HOMEBREW_NO_AUTO_UPDATE=1", ask_off, self.exe, "info", "--json=v2", "--formula", "--", name });
         try exec.checkTimedOut(res);
         if (!res.ok) return error.BrewAnswerFailed;
-        const doc = json.parse(arena, res.stdout, .{}) catch return error.BrewAnswerUnreadable;
+        const doc = json.parse(arena, res.stdout, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return error.BrewAnswerUnreadable,
+        };
         if (doc != .object) return error.BrewAnswerUnreadable;
         const list = doc.get("formulae") orelse return error.BrewAnswerUnreadable;
         if (list != .array or list.array.len == 0 or list.array[0] != .object) return error.BrewAnswerUnreadable;
         const got = list.array[0].get("name") orelse return error.BrewAnswerUnreadable;
         if (got != .string or got.string.len == 0) return error.BrewAnswerUnreadable;
-        return got.string;
+        const disabled = list.array[0].get("disabled");
+        return .{
+            .name = got.string,
+            .disabled = disabled != null and disabled.? == .bool and disabled.?.bool,
+        };
     }
 
     /// One `brew install` per row, every row attempted: a formula that fails
@@ -505,9 +575,9 @@ pub const Brew = struct {
             const kind = try kindOf(row);
             if (kind == .formula) {
                 if (installed == null) installed = try self.installedFormulae(arena);
-                // Already there, so an install is a no-op and the tap and
-                // the trust an install needs are moot: the tap is on this
-                // machine or the formula could not have come from it.
+                // Already there, so it is marked rather than installed, and
+                // the tap and the trust an install needs are moot: the tap is
+                // on this machine or the formula could not have come from it.
                 if (installed.?.contains(row.name)) {
                     try self.markOnRequest(arena, row.name);
                     continue;
@@ -651,14 +721,12 @@ pub const Brew = struct {
     /// A mark that does not take is that row's own failure, counted in
     /// `unmarked`, never the batch's: the rows beside it are untouched by it.
     ///
-    /// `brew install` cannot do this. Homebrew drops a formula it already has,
-    /// linked and current, from the install list before a `FormulaInstaller`
-    /// exists for it, and the receipt's `installed_on_request` is written by
-    /// that installer -- so the command warns, exits 0, and the explicit
-    /// query goes on omitting the name. `brew tab` writes the flag on its
-    /// own, refuses a name that is not installed, and keeps formulae and
-    /// casks apart the way `brew trust` does. brew's own `bundle` reaches
-    /// for it for this same reason.
+    /// `brew install` writes the flag too, for a formula already current
+    /// (`Install.install_formula?`), but upgrades an outdated one on the way,
+    /// and an apply installs what is missing and nothing more. `brew tab`
+    /// writes the flag alone, refuses a name that is not installed, and keeps
+    /// formulae and casks apart the way `brew trust` does. brew's own
+    /// `bundle` marks with it too.
     ///
     /// Marking, not installing: the package was on the machine before this
     /// run and is untouched: what changes is brew's record of who asked for
@@ -670,7 +738,7 @@ pub const Brew = struct {
     /// never missing.
     fn markOnRequest(self: *Brew, arena: std.mem.Allocator, name: []const u8) anyerror!void {
         self.say(
-            "mox: brew: \"{s}\" is installed already but not on request, so \"brew install\" would do nothing and leave the row missing; marking it as installed on request instead\n",
+            "mox: brew: \"{s}\" is installed already but not on request; marking it as installed on request and leaving the package as it is\n",
             .{name},
         );
         const res = try self.runner.stream(arena, &(stream_env ++ .{ self.exe, "tab", "--installed-on-request", "--formula", "--", name }));
@@ -1053,14 +1121,51 @@ fn qualifyBy(arena: std.mem.Allocator, tap: ?[]const u8, name: []const u8) ![]co
     return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ tap orelse "", if (tap == null) "" else "/", name });
 }
 
+/// What puts an astray formula back under its own name. Only an install by
+/// that name rewrites the receipt, and `brew install` leaves an installed
+/// formula as it is, so the formula is uninstalled first, ignoring
+/// dependents, which `brew uninstall` otherwise refuses over and the install
+/// right after it satisfies again. The install is the one the receipt
+/// records, `--HEAD` and build options included, which `brew reinstall`
+/// would have kept. A disabled formula `brew install` refuses, so the row
+/// has to name another -- the alias's target, when it names one -- and the
+/// uninstall comes once it does, minding dependents, since nothing installs
+/// the formula again.
+fn repair(arena: std.mem.Allocator, name: []const u8, receipt: Receipt, disabled: bool, target: ?[]const u8) std.mem.Allocator.Error![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    // An allocating writer fails only for want of memory.
+    writeRepair(&w.writer, name, receipt, disabled, target) catch return error.OutOfMemory;
+    return w.written();
+}
+
+fn writeRepair(w: *std.Io.Writer, name: []const u8, receipt: Receipt, disabled: bool, target: ?[]const u8) std.Io.Writer.Error!void {
+    if (disabled) {
+        try w.print("brew install refuses \"{s}\", which is disabled, so declare ", .{name});
+        if (target) |t| try w.print("\"{s}\"", .{t}) else try w.writeAll("a formula brew still installs");
+        try w.writeAll(" in its place, then run brew uninstall --formula ");
+        try writeShellWord(w, name);
+        return w.writeAll(" && mox apply");
+    }
+    try w.writeAll("brew uninstall --formula --ignore-dependencies ");
+    try writeShellWord(w, name);
+    try w.writeAll(" && brew install --formula");
+    if (receipt.head) try w.writeAll(" --HEAD");
+    for (receipt.options) |o| {
+        try w.writeByte(' ');
+        try writeShellWord(w, o);
+    }
+    try w.writeByte(' ');
+    try writeShellWord(w, name);
+}
+
 /// What an install receipt says about how a formula was installed.
 const Receipt = struct {
     /// What the install was asked for by: a formula file, an alias, or the
     /// API's cache.
     source_path: []const u8,
-    /// The tap the formula came from, as a name qualifies a formula with:
-    /// null for homebrew/core, or a receipt that does not say.
-    tap: ?[]const u8,
+    /// The tap the formula came from as a name qualifies a formula with,
+    /// null for homebrew/core; itself null when the receipt does not say.
+    tap: ??[]const u8,
     head: bool,
     /// The build options the install was given.
     options: []const []const u8,
@@ -1069,6 +1174,21 @@ const Receipt = struct {
 /// The receipt brew writes is a few KiB; anything near this is not one.
 const max_receipt_bytes = 4 * 1024 * 1024;
 
+/// The receipt of the keg Homebrew reads a formula's from (`Keg.from_rack`):
+/// the linked keg, else the opt-linked one. Null for a formula with neither.
+fn receiptPath(arena: std.mem.Allocator, io: Io, prefix: []const u8, keg: []const u8) !?[]const u8 {
+    for ([_][]const u8{ "var/homebrew/linked", "opt" }) |dir| {
+        const link = try std.fs.path.join(arena, &.{ prefix, dir, keg });
+        const st = Io.Dir.cwd().statFile(io, link, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return e,
+        };
+        if (st.kind != .directory) continue;
+        return try std.fs.path.join(arena, &.{ link, "INSTALL_RECEIPT.json" });
+    }
+    return null;
+}
+
 /// The receipt at `path`; null when there is none or it records no source
 /// path.
 fn readReceipt(arena: std.mem.Allocator, io: Io, path: []const u8) !?Receipt {
@@ -1076,7 +1196,10 @@ fn readReceipt(arena: std.mem.Allocator, io: Io, path: []const u8) !?Receipt {
         error.FileNotFound, error.NotDir => return null,
         else => return e,
     };
-    const doc = json.parse(arena, bytes, .{}) catch return error.NotJson;
+    const doc = json.parse(arena, bytes, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.NotJson,
+    };
     if (doc != .object) return error.NotJson;
     const source = doc.get("source") orelse return null;
     if (source != .object) return null;
@@ -1093,63 +1216,153 @@ fn readReceipt(arena: std.mem.Allocator, io: Io, path: []const u8) !?Receipt {
     }
     return .{
         .source_path = source_path.string,
-        .tap = if (tap != null and tap.? == .string and tap.?.string.len > 0 and !std.mem.eql(u8, tap.?.string, "homebrew/core")) tap.?.string else null,
+        .tap = if (tap == null or tap.? != .string or tap.?.string.len == 0)
+            null
+        else if (isCoreTap(tap.?.string)) @as(?[]const u8, null) else try std.ascii.allocLowerString(arena, tap.?.string),
         .head = spec != null and spec.? == .string and std.mem.eql(u8, spec.?.string, "head"),
         .options = try options.toOwnedSlice(arena),
     };
 }
 
-const TapAlias = struct {
+/// Whether `tap` (`user/repo`, as Homebrew spells a tap) is homebrew/core.
+fn isCoreTap(tap: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, tap, '/') orelse return false;
+    const user = tap[0..slash];
+    const repo = tap[slash + 1 ..];
+    return (std.ascii.eqlIgnoreCase(user, "homebrew") or std.ascii.eqlIgnoreCase(user, "linuxbrew")) and
+        (std.ascii.eqlIgnoreCase(repo, "core") or std.ascii.eqlIgnoreCase(repo, "homebrew-core"));
+}
+
+const RecordedAlias = struct {
     /// The alias's own name.
     name: []const u8,
-    /// The formula its symlink names.
-    target: []const u8,
     /// Its tap as a name qualifies a formula with (`owner/tap`), or null for
     /// homebrew/core's.
     tap: ?[]const u8,
-    core: bool,
 };
 
-/// The tap alias `path` is, when it is a symlink directly in the `Aliases`
-/// directory of a tap under `taps` (`<taps>/<user>/<repo>/Aliases/<name>`);
-/// null for anything else, which Homebrew follows no alias for.
-fn tapAlias(arena: std.mem.Allocator, io: Io, taps: []const u8, path: []const u8) !?TapAlias {
+/// The alias a receipt's `path` records an install through, when it is a
+/// symlink in the `Aliases` directory of a tap under `taps`
+/// (`<taps>/<user>/<repo>/Aliases/<name>`); null for anything else, which
+/// Homebrew follows no alias for.
+fn recordedAlias(arena: std.mem.Allocator, io: Io, taps: []const u8, path: []const u8) !?RecordedAlias {
     if (!std.mem.startsWith(u8, path, taps) or path.len <= taps.len or path[taps.len] != '/') return null;
     var parts = std.mem.splitScalar(u8, path[taps.len + 1 ..], '/');
     const user = parts.next() orelse return null;
     const repo = parts.next() orelse return null;
     const dir = parts.next() orelse return null;
-    const name = parts.next() orelse return null;
-    if (parts.next() != null or user.len == 0 or repo.len == 0 or name.len == 0) return null;
-    if (!std.mem.eql(u8, dir, "Aliases")) return null;
+    if (user.len == 0 or repo.len == 0 or !std.mem.eql(u8, dir, "Aliases")) return null;
+    // Homebrew matches the path anywhere below `Aliases` and names the alias
+    // by its basename.
+    var name: []const u8 = "";
+    while (parts.next()) |part| name = part;
+    if (name.len == 0) return null;
 
     const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return null,
         else => return e,
     };
     if (st.kind != .sym_link) return null;
-    // Resolved the whole way, as Homebrew's alias table is; a dangling alias
-    // is in no table, and names nothing brew could load.
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = Io.Dir.cwd().realPathFile(io, path, &buf) catch |e| switch (e) {
-        error.FileNotFound => return null,
-        else => return e,
-    };
-    const file = std.fs.path.basename(buf[0..n]);
-    const target = if (std.mem.endsWith(u8, file, ".rb")) file[0 .. file.len - ".rb".len] else file;
-    if (target.len == 0) return null;
     const short = if (std.mem.startsWith(u8, repo, "homebrew-")) repo["homebrew-".len..] else repo;
-    const core = std.mem.eql(u8, user, "homebrew") and std.mem.eql(u8, short, "core");
+    const tap = try std.fmt.allocPrint(arena, "{s}/{s}", .{ user, short });
     return .{
         .name = try arena.dupe(u8, name),
-        .target = try arena.dupe(u8, target),
-        .tap = if (core) null else try std.fmt.allocPrint(arena, "{s}/{s}", .{ user, short }),
-        .core = core,
+        .tap = if (isCoreTap(tap)) null else tap,
     };
 }
 
-/// Why a receipt or the alias it records could not be read, as a clause.
-fn receiptErrorText(e: anyerror) []const u8 {
+/// Where the tap `tap` (`user/repo`) is checked out, as `Tap#path` spells
+/// it.
+fn tapDir(arena: std.mem.Allocator, taps: []const u8, tap: []const u8) ![]const u8 {
+    const slash = std.mem.indexOfScalar(u8, tap, '/') orelse return std.fs.path.join(arena, &.{ taps, tap });
+    var repo = tap[slash + 1 ..];
+    for ([_][]const u8{ "homebrew-", "linuxbrew-" }) |official| {
+        if (std.mem.startsWith(u8, repo, official)) repo = repo[official.len..];
+    }
+    const rel = try std.fmt.allocPrint(arena, "{s}/homebrew-{s}", .{ tap[0..slash], repo });
+    return std.fs.path.join(arena, &.{ taps, std.ascii.lowerString(rel, rel) });
+}
+
+const Loads = union(enum) {
+    /// The formula the name loads, by its name.
+    formula: []const u8,
+    /// Where the tap's `tap_migrations.json` sends the name.
+    migrated: []const u8,
+    nothing,
+};
+
+/// What the tap at `dir` loads `name` as when it has no alias of that name,
+/// in Homebrew's order (`Formulary.tap_formula_name_type`, then
+/// `find_formula_in_tap`): a rename in `formula_renames.json`, a move in
+/// `tap_migrations.json`, or a formula file of that name in `Tap#formula_dir`
+/// -- the first of `Formula` and `HomebrewFormula` that exists, sharded
+/// below, else the tap's root.
+fn tapLoads(arena: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8) !Loads {
+    if (try jsonEntry(arena, io, try std.fs.path.join(arena, &.{ dir, "formula_renames.json" }), name)) |new| return .{ .formula = new };
+    if (try jsonEntry(arena, io, try std.fs.path.join(arena, &.{ dir, "tap_migrations.json" }), name)) |to| return .{ .migrated = to };
+    const file = try std.fmt.allocPrint(arena, "{s}.rb", .{name});
+    for ([_][]const u8{ "Formula", "HomebrewFormula" }) |sub| {
+        const formulae = try std.fs.path.join(arena, &.{ dir, sub });
+        var d = Io.Dir.cwd().openDir(io, formulae, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return e,
+        };
+        defer d.close(io);
+        var walker = try d.walk(arena);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .directory and std.mem.eql(u8, entry.basename, file)) return .{ .formula = name };
+        }
+        return .nothing;
+    }
+    _ = Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ dir, file }), .{}) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return .nothing,
+        else => return e,
+    };
+    return .{ .formula = name };
+}
+
+/// The string `key` maps to in the JSON object at `path`; null when there is
+/// no such file or key.
+fn jsonEntry(arena: std.mem.Allocator, io: Io, path: []const u8, key: []const u8) !?[]const u8 {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_receipt_bytes)) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    const doc = json.parse(arena, bytes, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.NotJson,
+    };
+    if (doc != .object) return error.NotJson;
+    const v = doc.get(key) orelse return null;
+    if (v != .string or v.string.len == 0) return null;
+    return v.string;
+}
+
+/// The formula the alias at `path` names, as Homebrew's alias table has it
+/// (`Tap#alias_table`): the file its symlink points at, resolved one level.
+/// Null for an alias that is not there or names nothing, which the table
+/// leaves out and Homebrew then fails to load.
+fn aliasTarget(arena: std.mem.Allocator, io: Io, path: []const u8) !?[]const u8 {
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    if (st.kind != .file) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = if (Io.Dir.cwd().readLink(io, path, &buf)) |n|
+        std.fs.path.basename(buf[0..n])
+    else |e| switch (e) {
+        error.NotLink => std.fs.path.basename(path),
+        else => return e,
+    };
+    const target = if (std.mem.endsWith(u8, file, ".rb")) file[0 .. file.len - ".rb".len] else file;
+    if (target.len == 0) return null;
+    return try arena.dupe(u8, target);
+}
+
+/// Why a file brew keeps could not be read, as a clause.
+fn fileErrorText(e: anyerror) []const u8 {
     return switch (e) {
         error.NotJson => "it is not JSON",
         error.StreamTooLong => "it is larger than any install receipt",
@@ -1687,7 +1900,7 @@ test "install: a formula brew already has is marked on request, never handed to 
         if (std.mem.endsWith(u8, c, "brew list --formula --full-name")) asks += 1;
     }
     try testing.expectEqual(@as(usize, 1), asks);
-    try testing.expect(std.mem.indexOf(u8, w.written(), "marking it as installed on request instead") != null);
+    try testing.expect(std.mem.indexOf(u8, w.written(), "marking it as installed on request and leaving the package as it is") != null);
 }
 
 test "install: a mark that fails is that row's failure, and the rows beside it go on" {
@@ -2491,6 +2704,14 @@ const Prefix = struct {
     }
 };
 
+/// What `brew info` says `name` is now: `current`, disabled or not.
+fn described(a: std.mem.Allocator, name: []const u8, current: []const u8, disabled: bool) !exec.Fake.Entry {
+    return .{
+        .argv = try std.fmt.allocPrint(a, "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 --formula -- {s}", .{name}),
+        .stdout = try std.fmt.allocPrint(a, "{{\"formulae\":[{{\"name\":\"{s}\",\"disabled\":{}}}]}}", .{ current, disabled }),
+    };
+}
+
 test "astray: a formula installed through an alias that now names another formula" {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
     const io = testing.io;
@@ -2506,21 +2727,22 @@ test "astray: a formula installed through an alias that now names another formul
     try p.alias("emacs-plus", "emacs-plus@31");
     try p.installed("emacs-plus@30", try p.aliasPath("emacs-plus"));
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", false) } };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
     const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
 
-    try testing.expectEqual(@as(usize, 1), got.len);
-    try testing.expectEqualStrings("owner/tap/emacs-plus@30", got[0].id);
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    try testing.expectEqualStrings("owner/tap/emacs-plus@30", got.astray[0].id);
     try testing.expectEqualStrings(
         "installed through the alias \"owner/tap/emacs-plus\", which now names \"owner/tap/emacs-plus@31\", so brew upgrade and brew reinstall follow it to \"owner/tap/emacs-plus@31\", and fail while that cannot be loaded",
-        got[0].why,
+        got.astray[0].why,
     );
     // `brew reinstall` would follow the alias too, so the repair is an
     // uninstall and an install by the formula's own name.
     try testing.expectEqualStrings(
         "brew uninstall --formula --ignore-dependencies owner/tap/emacs-plus@30 && brew install --formula owner/tap/emacs-plus@30",
-        got[0].fix,
+        got.astray[0].fix,
     );
 }
 
@@ -2547,7 +2769,7 @@ test "astray: a formula is held by its own name, or by an alias that still names
         rowOf("owner/tap/emacs-plus@30", &.{}),
         rowOf("ripgrep", &.{}),
     });
-    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
 }
 
 test "astray: an alias path that is no longer a tap's alias symlink binds nothing" {
@@ -2580,7 +2802,7 @@ test "astray: an alias path that is no longer a tap's alias symlink binds nothin
         // No receipt at all: a keg brew cannot judge either.
         rowOf("no-receipt", &.{}),
     });
-    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
 }
 
 test "astray: a core alias is resolved by brew, not by a checkout that may be stale" {
@@ -2604,19 +2826,23 @@ test "astray: a core alias is resolved by brew, not by a checkout that may be st
     try p.installedWith("python@3.13", link, "homebrew/core", "stable", "[]");
 
     const where = p.entries();
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{
-        where[0],
-        where[1],
-        // Under the user's own environment: HOMEBREW_NO_INSTALL_FROM_API is
-        // theirs to set, and decides what the alias names for them.
-        .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 --formula -- python", .stdout = "{\"formulae\":[{\"name\":\"python@3.14\",\"full_name\":\"python@3.14\"}]}" },
-    } };
+    var fake: exec.Fake = .{
+        .arena = a,
+        .entries = &.{
+            where[0],
+            where[1],
+            // Under the user's own environment: HOMEBREW_NO_INSTALL_FROM_API is
+            // theirs to set, and decides what the alias names for them.
+            .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 --formula -- python", .stdout = "{\"formulae\":[{\"name\":\"python@3.14\",\"full_name\":\"python@3.14\"}]}" },
+            try described(a, "python@3.13", "python@3.13", false),
+        },
+    };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
     const got = try b.backend().astray(a, &.{rowOf("python@3.13", &.{})});
-    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
     try testing.expectEqualStrings(
         "installed through the alias \"python\", which now names \"python@3.14\", so brew upgrade and brew reinstall follow it to \"python@3.14\", and fail while that cannot be loaded",
-        got[0].why,
+        got.astray[0].why,
     );
 }
 
@@ -2629,7 +2855,7 @@ test "astray: casks are never asked about, and brew is not called for them" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
     var b: Brew = .{ .runner = fake.runner(), .io = testing.io };
     const got = try b.backend().astray(a, &.{rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }})});
-    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
 }
 
 test "astray: a prefix brew cannot name is an error, never a clean answer" {
@@ -2650,7 +2876,8 @@ test "astray: a prefix brew cannot name is an error, never a clean answer" {
     try testing.expectError(error.BrewAnswerUnreadable, g.backend().astray(a, &.{rowOf("ripgrep", &.{})}));
 }
 
-test "astray: a receipt that is not JSON is an error, never a clean answer" {
+test "astray: a receipt that is not JSON leaves that row unchecked, and the rest are judged" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2663,12 +2890,21 @@ test "astray: a receipt that is not JSON is an error, never a clean answer" {
     try Io.Dir.cwd().createDirPath(io, dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, "INSTALL_RECEIPT.json" }), .data = "{truncated" });
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
-    var said: std.Io.Writer.Allocating = .init(a);
-    var b: Brew = .{ .runner = fake.runner(), .io = io, .err = &said.writer };
-    try testing.expectError(error.BrewReceiptUnreadable, b.backend().astray(a, &.{rowOf("ripgrep", &.{})}));
-    // Named by path, so the receipt to look at is on the terminal.
-    try testing.expect(std.mem.indexOf(u8, said.written(), "opt/ripgrep/INSTALL_RECEIPT.json could not be read: it is not JSON") != null);
+    // And beside it, a formula held astray: one row that cannot be judged
+    // does not hide another that can.
+    try p.alias("emacs-plus", "emacs-plus@31");
+    try p.installed("emacs-plus@30", try p.aliasPath("emacs-plus"));
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", false) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{ rowOf("ripgrep", &.{}), rowOf("owner/tap/emacs-plus@30", &.{}) });
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    try testing.expectEqualStrings("owner/tap/emacs-plus@30", got.astray[0].id);
+    try testing.expectEqual(@as(usize, 1), got.unchecked.len);
+    try testing.expectEqualStrings("ripgrep", got.unchecked[0].id);
+    // Named by path, so the receipt to look at is in the row.
+    try testing.expect(std.mem.endsWith(u8, got.unchecked[0].why, "opt/ripgrep/INSTALL_RECEIPT.json could not be read: it is not JSON"));
 }
 
 test "astray: the repair installs as the receipt says, HEAD and build options included" {
@@ -2684,15 +2920,16 @@ test "astray: the repair installs as the receipt says, HEAD and build options in
     try p.alias("emacs-plus", "emacs-plus@31");
     try p.installedWith("emacs-plus@30", try p.aliasPath("emacs-plus"), "owner/tap", "head", "[\"--with-native-comp\",\"--with-icon=a b\"]");
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", false) } };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
     const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
-    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
     // What `brew reinstall` would have kept, and a shell reads each option as
     // one word.
     try testing.expectEqualStrings(
         "brew uninstall --formula --ignore-dependencies owner/tap/emacs-plus@30 && brew install --formula --HEAD --with-native-comp '--with-icon=a b' owner/tap/emacs-plus@30",
-        got[0].fix,
+        got.astray[0].fix,
     );
 }
 
@@ -2715,7 +2952,7 @@ test "astray: an alias in a tap of another brew is not one this brew follows" {
     var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
     const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
-    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
 }
 
 test "writeShellWord: a word with nothing a shell reads stays bare, anything else is quoted whole" {
@@ -2741,11 +2978,12 @@ test "astray: an alias is named by the formula's tap, whatever the row spells" {
     try p.alias("emacs-plus", "emacs-plus@31");
     try p.installed("emacs-plus@30", try p.aliasPath("emacs-plus"));
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "emacs-plus@30", "emacs-plus@30", false) } };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
     const got = try b.backend().astray(a, &.{rowOf("emacs-plus@30", &.{})});
-    try testing.expectEqual(@as(usize, 1), got.len);
-    try testing.expect(std.mem.startsWith(u8, got[0].why, "installed through the alias \"owner/tap/emacs-plus\", which now names \"owner/tap/emacs-plus@31\""));
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    try testing.expect(std.mem.startsWith(u8, got.astray[0].why, "installed through the alias \"owner/tap/emacs-plus\", which now names \"owner/tap/emacs-plus@31\""));
 }
 
 test "astray: a brew with no way to read files is an error, never a clean answer" {
@@ -2758,7 +2996,7 @@ test "astray: a brew with no way to read files is an error, never a clean answer
     try testing.expectError(error.NoIo, b.backend().astray(a, &.{rowOf("ripgrep", &.{})}));
 }
 
-test "astray: a core alias brew cannot resolve is an error, never a clean answer" {
+test "astray: a core alias brew cannot resolve leaves that row unchecked, never clean" {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2782,17 +3020,27 @@ test "astray: a core alias brew cannot resolve is an error, never a clean answer
         .{ .argv = info, .code = 1 },
         .{ .argv = info, .stdout = "not json" },
         .{ .argv = info, .stdout = "{\"formulae\":[]}" },
-    }, [_]anyerror{ error.BrewAnswerFailed, error.BrewAnswerUnreadable, error.BrewAnswerUnreadable }) |answer, want| {
+    }, [_][]const u8{
+        "brew could not say what the alias \"python\" names now: brew exited nonzero answering what mox asked, saying why above",
+        "brew could not say what the alias \"python\" names now: brew answered in a shape mox could not read",
+        "brew could not say what the alias \"python\" names now: brew answered in a shape mox could not read",
+    }) |answer, want| {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], answer } };
         var b: Brew = .{ .runner = fake.runner(), .io = io };
-        try testing.expectError(want, b.backend().astray(a, &.{rowOf("python@3.13", &.{})}));
+        const got = try b.backend().astray(a, &.{rowOf("python@3.13", &.{})});
+        try testing.expectEqual(@as(usize, 0), got.astray.len);
+        try testing.expectEqual(@as(usize, 1), got.unchecked.len);
+        try testing.expectEqualStrings("python@3.13", got.unchecked[0].id);
+        try testing.expectEqualStrings(want, got.unchecked[0].why);
     }
 
     // And brew answering with the formula itself is an alias that still
     // names it.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], .{ .argv = info, .stdout = "{\"formulae\":[{\"name\":\"python@3.13\"}]}" } } };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
-    try testing.expectEqual(@as(usize, 0), (try b.backend().astray(a, &.{rowOf("python@3.13", &.{})})).len);
+    const held = try b.backend().astray(a, &.{rowOf("python@3.13", &.{})});
+    try testing.expectEqual(@as(usize, 0), held.astray.len);
+    try testing.expectEqual(@as(usize, 0), held.unchecked.len);
 }
 
 test "astray: an official tap other than core is resolved by its symlink and named qualified" {
@@ -2813,15 +3061,17 @@ test "astray: an official tap other than core is resolved by its symlink and nam
     try Io.Dir.cwd().symLink(io, "../Formula/bar@2.rb", link, .{});
     try p.installedWith("bar@1", link, "homebrew/foo", "stable", "[]");
 
-    // No `brew info`: the Fake fails on any call it was not given.
-    var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
+    // `brew info` only for the formula itself, never for the alias: the
+    // Fake fails on any call it was not given.
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "homebrew/foo/bar@1", "bar@1", false) } };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
     const got = try b.backend().astray(a, &.{rowOf("homebrew/foo/bar@1", &.{})});
-    try testing.expectEqual(@as(usize, 1), got.len);
-    try testing.expect(std.mem.startsWith(u8, got[0].why, "installed through the alias \"homebrew/foo/bar\", which now names \"homebrew/foo/bar@2\""));
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    try testing.expect(std.mem.startsWith(u8, got.astray[0].why, "installed through the alias \"homebrew/foo/bar\", which now names \"homebrew/foo/bar@2\""));
 }
 
-test "astray: a symlink outside a tap's Aliases directory, or a dangling alias, binds nothing" {
+test "astray: a symlink outside a tap's Aliases directory binds nothing" {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2835,19 +3085,267 @@ test "astray: a symlink outside a tap's Aliases directory, or a dangling alias, 
     const in_formula = try p.formulaPath("shim");
     try Io.Dir.cwd().symLink(io, "other.rb", in_formula, .{});
     try p.installed("shim-target", in_formula);
-    // One nested below Aliases.
-    const nested_dir = try std.fs.path.join(a, &.{ p.root, Prefix.tap_dir, "Aliases", "sub" });
-    try Io.Dir.cwd().createDirPath(io, nested_dir);
-    const nested = try std.fs.path.join(a, &.{ nested_dir, "deep" });
-    try Io.Dir.cwd().symLink(io, "../../Formula/other.rb", nested, .{});
-    try p.installed("deep-target", nested);
-    // An alias naming a formula file the tap no longer has.
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("shim-target", &.{})});
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
+    try testing.expectEqual(@as(usize, 0), got.unchecked.len);
+}
+
+test "astray: an alias that names nothing Homebrew can load is astray, its upgrade failing" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    // Still a symlink, so Homebrew follows it (`installed_alias_path`), but
+    // to a formula file the tap no longer has, which it cannot load.
     const dangling = try p.aliasPath("gone");
     try Io.Dir.cwd().symLink(io, "../Formula/gone@2.rb", dangling, .{});
     try p.installed("gone@1", dangling);
 
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/gone@1", "gone@1", false) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/gone@1", &.{})});
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    try testing.expectEqualStrings(
+        "installed through the alias \"owner/tap/gone\", which names no formula brew can load now, so brew upgrade and brew outdated fail loading it",
+        got.astray[0].why,
+    );
+    try testing.expectEqualStrings(
+        "brew uninstall --formula --ignore-dependencies owner/tap/gone@1 && brew install --formula owner/tap/gone@1",
+        got.astray[0].fix,
+    );
+}
+
+test "astray: a formula renamed since it was installed, its alias moving with it, is held" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    // The keg keeps the old name; Homebrew loads it as the new one and
+    // compares the alias's target with that.
+    try p.alias("thing", "newname");
+    try p.installed("oldname", try p.aliasPath("thing"));
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/oldname", "newname", false) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/oldname", &.{})});
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
+    try testing.expectEqual(@as(usize, 0), got.unchecked.len);
+}
+
+test "astray: a disabled formula brew install refuses is repaired by naming the alias's target" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    try p.alias("emacs-plus", "emacs-plus@31");
+    try p.installed("emacs-plus@30", try p.aliasPath("emacs-plus"));
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", true) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    // Uninstalling first would leave nothing installed: the reinstall fails.
+    try testing.expectEqualStrings(
+        "brew install refuses \"owner/tap/emacs-plus@30\", which is disabled, so declare \"owner/tap/emacs-plus@31\" in its place, then run brew uninstall --formula owner/tap/emacs-plus@30 && mox apply",
+        got.astray[0].fix,
+    );
+}
+
+test "astray: a formula brew cannot describe leaves that row unchecked" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    try p.alias("emacs-plus", "emacs-plus@31");
+    try p.installed("emacs-plus@30", try p.aliasPath("emacs-plus"));
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], .{ .argv = "env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew info --json=v2 --formula -- owner/tap/emacs-plus@30", .code = 1 } } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
+    try testing.expectEqual(@as(usize, 1), got.unchecked.len);
+    try testing.expectEqualStrings(
+        "brew could not describe it, to tell a moved alias from a renamed formula: brew exited nonzero answering what mox asked, saying why above",
+        got.unchecked[0].why,
+    );
+}
+
+test "astray: the receipt is read from the linked keg before the opt-linked one" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    // opt says installed by its own name; the keg brew links says through
+    // the alias, and that one is what Homebrew reads (`Keg.from_rack`).
+    try p.alias("emacs-plus", "emacs-plus@31");
+    try p.installed("emacs-plus@30", try p.formulaPath("emacs-plus@30"));
+    const linked = try std.fs.path.join(a, &.{ p.root, "var/homebrew/linked/emacs-plus@30" });
+    try Io.Dir.cwd().createDirPath(io, linked);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(a, &.{ linked, "INSTALL_RECEIPT.json" }),
+        .data = try std.fmt.allocPrint(a, "{{\"source\":{{\"tap\":\"owner/tap\",\"path\":\"{s}\",\"spec\":\"stable\"}}}}", .{try p.aliasPath("emacs-plus")}),
+    });
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", false) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+}
+
+test "astray: the alias is looked up in the formula's own tap, not the tap its path names" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    // Recorded through another tap's alias, which still names the formula;
+    // the receipt's own tap has an alias of that name that moved.
+    const other = try std.fs.path.join(a, &.{ p.root, "Library/Taps/other/homebrew-x" });
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ other, "Aliases" }));
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ other, "Formula" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ other, "Formula/emacs-plus@30.rb" }), .data = "" });
+    const recorded = try std.fs.path.join(a, &.{ other, "Aliases", "emacs-plus" });
+    try Io.Dir.cwd().symLink(io, "../Formula/emacs-plus@30.rb", recorded, .{});
+    try p.alias("emacs-plus", "emacs-plus@31");
+    try p.installed("emacs-plus@30", recorded);
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", false) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    try testing.expect(std.mem.startsWith(u8, got.astray[0].why, "installed through the alias \"owner/tap/emacs-plus\", which now names \"owner/tap/emacs-plus@31\""));
+}
+
+test "astray: an alias is resolved one level, as Homebrew's alias table resolves it" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    // The alias names b.rb, itself a symlink to c.rb: Homebrew sees `b`.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try p.formulaPath("c"), .data = "" });
+    try Io.Dir.cwd().symLink(io, "c.rb", try p.formulaPath("b"), .{});
+    try Io.Dir.cwd().symLink(io, "../Formula/b.rb", try p.aliasPath("a"), .{});
+    try p.installed("b", try p.aliasPath("a"));
+
     var fake: exec.Fake = .{ .arena = a, .entries = &p.entries() };
     var b: Brew = .{ .runner = fake.runner(), .io = io };
-    const got = try b.backend().astray(a, &.{ rowOf("shim-target", &.{}), rowOf("deep-target", &.{}), rowOf("gone@1", &.{}) });
-    try testing.expectEqual(@as(usize, 0), got.len);
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/b", &.{})});
+    try testing.expectEqual(@as(usize, 0), got.astray.len);
+    try testing.expectEqual(@as(usize, 0), got.unchecked.len);
+}
+
+test "astray: an alias the tap dropped for a formula of that name follows the formula" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+
+    // Recorded through another tap's alias; the receipt's tap has no alias
+    // `emacs-plus` but a formula `emacs-plus`, which Homebrew loads instead.
+    const other = try std.fs.path.join(a, &.{ p.root, "Library/Taps/other/homebrew-x" });
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ other, "Aliases" }));
+    const recorded = try std.fs.path.join(a, &.{ other, "Aliases", "emacs-plus" });
+    try Io.Dir.cwd().symLink(io, "../Formula/emacs-plus@30.rb", recorded, .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try p.formulaPath("emacs-plus"), .data = "" });
+    // The receipt spells its tap in capitals; the checkout is lowercase.
+    try p.installedWith("emacs-plus@30", recorded, "Owner/Tap", "stable", "[]");
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{ where[0], where[1], try described(a, "owner/tap/emacs-plus@30", "emacs-plus@30", false) } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{rowOf("owner/tap/emacs-plus@30", &.{})});
+    try testing.expectEqual(@as(usize, 0), got.unchecked.len);
+    try testing.expectEqual(@as(usize, 1), got.astray.len);
+    // Named as Homebrew names a tap: lowercase.
+    try testing.expect(std.mem.indexOf(u8, got.astray[0].why, "which now names \"owner/tap/emacs-plus\"") != null);
+}
+
+test "astray: a dropped alias loads as the tap has the name otherwise: renamed, sharded, migrated" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest; // no symlinks to create
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try Prefix.init(a, io, &tmp);
+    const tap = try std.fs.path.join(a, &.{ p.root, Prefix.tap_dir });
+
+    // Each recorded through an alias nested below Aliases, which Homebrew
+    // follows by its basename, and which the tap has no top-level alias for.
+    const nested = try std.fs.path.join(a, &.{ tap, "Aliases", "sub" });
+    try Io.Dir.cwd().createDirPath(io, nested);
+    for ([_][]const u8{ "renamed", "sharded", "moved" }) |alias| {
+        try Io.Dir.cwd().symLink(io, "../../Formula/x.rb", try std.fs.path.join(a, &.{ nested, alias }), .{});
+    }
+    try p.installed("renamed@1", try std.fs.path.join(a, &.{ nested, "renamed" }));
+    try p.installed("sharded@1", try std.fs.path.join(a, &.{ nested, "sharded" }));
+    try p.installed("moved@1", try std.fs.path.join(a, &.{ nested, "moved" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ tap, "formula_renames.json" }), .data = "{\"renamed\":\"renamed@2\"}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ tap, "tap_migrations.json" }), .data = "{\"moved\":\"other/tap\"}" });
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ tap, "Formula", "s" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ tap, "Formula", "s", "sharded.rb" }), .data = "" });
+
+    const where = p.entries();
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        where[0],
+        where[1],
+        try described(a, "owner/tap/renamed@1", "renamed@1", false),
+        try described(a, "owner/tap/sharded@1", "sharded@1", false),
+    } };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
+    const got = try b.backend().astray(a, &.{ rowOf("owner/tap/renamed@1", &.{}), rowOf("owner/tap/sharded@1", &.{}), rowOf("owner/tap/moved@1", &.{}) });
+    try testing.expectEqual(@as(usize, 2), got.astray.len);
+    try testing.expect(std.mem.indexOf(u8, got.astray[0].why, "which now names \"owner/tap/renamed@2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got.astray[1].why, "which now names \"owner/tap/sharded\"") != null);
+    try testing.expectEqual(@as(usize, 1), got.unchecked.len);
+    try testing.expectEqualStrings("owner/tap/moved@1", got.unchecked[0].id);
+    try testing.expect(std.mem.indexOf(u8, got.unchecked[0].why, "moves that name to \"other/tap\", which mox does not follow") != null);
 }

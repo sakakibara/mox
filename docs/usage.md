@@ -424,7 +424,8 @@ placeholders are never written live; re-apply the source instead.
 
 A `data/packages/*.toml` manifest declares which packages belong on a machine,
 gated by the same axes your files use. `mox status` grows a `packages:` section
-naming what each manager is `MISSING` and what it has `UNTRACKED`; `mox apply`
+naming what each manager is `MISSING`, what it has `UNTRACKED`, and what it
+holds `ASTRAY` under a name that has moved to another package; `mox apply`
 installs the missing ones, bootstrapping a declared manager that is not there
 yet; `mox commit` offers each untracked package `[y/b/s]` -- record it in the
 manifest, blacklist it so it is never offered again, or leave it. Apply only

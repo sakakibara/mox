@@ -12,14 +12,29 @@ All notable changes to mox are documented here. The format follows
   and `brew reinstall` then follow the alias to that formula -- or, when
   its tap is not trusted for it, fail for every package on the machine.
   Such a row is now `ASTRAY`, naming the alias, the formula it names now,
-  and the command line that repairs it (`brew uninstall --formula
-  --ignore-dependencies <name> && brew install --formula <name>`, carrying
-  the `--HEAD` and build options the receipt records). `--json` gives it `state: "astray"` with `why` and
-  `fix`, and `--porcelain` a `package_astray` record. `mox apply` names it
-  on stderr and exits 1 without touching it: the repair uninstalls, which
-  mox never does. A check that cannot be made is `UNCHECKED` (`state:
-  "unchecked"`, `package_unchecked`) and counted by status, rather than
-  read as a machine with nothing astray.
+  and the repair: `brew uninstall --formula --ignore-dependencies <name> &&
+  brew install --formula <name>`, carrying the `--HEAD` and build options
+  the receipt records, or, for a formula brew has disabled and will not
+  install again, declaring the alias's new target in its place. `--json`
+  gives it `state: "astray"` with `why` and `fix`, and `--porcelain` a
+  `package_astray` record. `mox apply` names it on stderr and exits 1
+  without touching it: the repair uninstalls, which mox never does. A
+  formula renamed since it was installed is not astray; one installed
+  through an alias that names nothing brew can load, which fails every
+  `brew upgrade` and `brew outdated` too, is. An installed row that cannot
+  be judged is `UNCHECKED` on its own, and a brew that cannot say where it
+  keeps its kegs and taps leaves the whole backend `UNCHECKED` (`state:
+  "unchecked"`, `package_unchecked`); status counts either rather than read
+  it as a machine with nothing astray.
+- `mox apply` could finish reporting success with a declared keg-only
+  formula left `MISSING`: installing another formula upgrades it as a
+  dependency, and Homebrew records the upgraded keg as no longer installed
+  on request. Each backend that installed is now asked again afterwards,
+  and a row it held before the installs and no longer holds is marked
+  again in the same run (`restoring`).
+- The message for a formula marked on request said `brew install` would do
+  nothing for it; `brew install` marks it too, but upgrades an outdated
+  one first, which is why mox marks it instead.
 
 ## [0.12.3] - 2026-10-08
 
