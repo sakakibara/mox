@@ -35,8 +35,10 @@ All notable changes to mox are documented here. The format follows
   capture expansion. Some previously composed files may now report `ERROR`
   in `apply`, `status`, `diff` and `export`; each such file was producing
   output its format does not allow. The error names the layer and line (or
-  the output line and its layers), with a hint, and never quotes a line
-  carrying a resolved secret. A layer that is no document of its format on
+  the output line and its layers), with a hint. When a secret was resolved
+  into the output, or into a live file mox reads, the reason is fixed text
+  and a duplicate key reads `duplicate key <redacted>`, so no byte of the
+  file reaches the report. A layer that is no document of its format on
   its own is checked through the output instead: an include fragment, a
   non-JSON layer holding a capture or a region, and a JSONC layer holding a
   `// mox:` directive. An output is checked only where machine state is at

@@ -109,17 +109,14 @@ fn checkComposed(
 ) !void {
     if (file.ownership != .none and std.mem.trim(u8, out, " \t\r\n").len == 0) return;
     if (secrets == null and std.mem.indexOf(u8, out, "<SECRET:") != null) return;
-    const lines = prov_mod.map.lineCount(out);
-    const secret_lines = try arena.alloc(bool, lines + 1);
-    @memset(secret_lines, false);
-    for (segments) |seg| {
-        if (seg.origin != .secret) continue;
-        var i: u32 = seg.out_start;
-        while (i < seg.out_start + seg.out_len and i < secret_lines.len) : (i += 1) secret_lines[i] = true;
-    }
-    try validate.checkOutput(arena, format, out, run.layers, secret_lines, diag);
+    // A resolved secret anywhere in the output keeps every byte of the
+    // parser's message out of the report: a message can quote any line.
+    const has_secret = for (segments) |seg| {
+        if (seg.origin == .secret) break true;
+    } else false;
+    try validate.checkOutput(arena, format, out, run.layers, has_secret, diag);
     if (format.isJson() and (run.layers.len > 1 or diag.json_key_capture)) {
-        try validate.checkDuplicateKeys(arena, format, out, "", run.layers, secret_lines, diag);
+        try validate.checkDuplicateKeys(arena, format, out, "", run.layers, has_secret, diag);
     }
 }
 
@@ -277,7 +274,7 @@ fn checkLayers(
         };
         if (!skip) {
             try validate.checkLayer(arena, format, hd.body, display, hd.body_removed, diag);
-            if (format.isJson() and merging) try validate.checkDuplicateKeys(arena, format, hd.body, display, &.{}, &.{}, diag);
+            if (format.isJson() and merging) try validate.checkDuplicateKeys(arena, format, hd.body, display, &.{}, false, diag);
         }
     }
     for (file.overlays) |o| {
@@ -289,7 +286,7 @@ fn checkLayers(
         const display = layerDisplay(arena, file, o.path);
         try validate.checkLayer(arena, format, raw, display, &.{}, diag);
         if (format.isJson() and merging and match_mod.matches(match_mod.effectiveOverlayTuple(o, bindings), bindings)) {
-            try validate.checkDuplicateKeys(arena, format, raw, display, &.{}, &.{}, diag);
+            try validate.checkDuplicateKeys(arena, format, raw, display, &.{}, false, diag);
         }
     }
 }

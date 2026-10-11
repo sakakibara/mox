@@ -3506,7 +3506,7 @@ test "commit: a coupled token update that breaks a source where it exists is ref
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (recompose failed: src/.config/x.toml:3:1: duplicate key 'wombattoken')\n"), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (recompose failed: src/.config/x.toml:3:1: duplicate key \"wombattoken\")\n"), res.err);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.toml")));
 }
 
@@ -8903,7 +8903,7 @@ test "commit: a coupled update into a routed target whose live copy keeps the ol
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("quokkakey = 1\n", try read(io, a, try h.srcOf(".config/t.toml")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
-    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (recompose failed: src/.config/t.toml:2:1: duplicate key 'wombatkey'); ~/.config/t.toml not committed\n"), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (recompose failed: src/.config/t.toml:2:1: duplicate key \"wombatkey\"); ~/.config/t.toml not committed\n"), res.err);
 }
 
 test "commit: a coupled update its target's own edit already made is not undone when its origin is not committed" {
@@ -11004,8 +11004,8 @@ test "commit: a source layer or live file that does not parse is named with its 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("l.json"), .data = "{\n  \"a\": 5,\n  \"b\": 2,\n}\n" });
 
     const r = try h.run(&.{ "mox", "commit", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, r.err, try tilde(a, "~/m.json: not committed: src/m.json.d/os=darwin.json:1:9: trailing comma")) != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "could not be parsed (live ~/l.json:4:1: trailing comma")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try tilde(a, "~/m.json: not committed: src/m.json.d/os=darwin.json:1:8: trailing comma")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "could not be parsed (live ~/l.json:3:9: trailing comma")) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "FormatViolation") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "ParseError") == null);
 }

@@ -6956,7 +6956,7 @@ test "strict json: a note comment, an inline comment and a trailing comma are ER
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; remove it, or set format = \"jsonc\""));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:11: trailing comma not allowed in strict json; remove the trailing comma"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:9: trailing comma not allowed in strict json; remove the trailing comma"));
     // Nothing of an invalid file reaches the live tree; the rest applies.
     try std.testing.expect(!exists(io, try c.homePath("b.json")));
     try std.testing.expect(!exists(io, try c.homePath("c.json")));
@@ -6965,7 +6965,7 @@ test "strict json: a note comment, an inline comment and a trailing comma are ER
 
     const s = try c.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), s.rc);
-    try std.testing.expect(lineHasBoth(s.out, "ERROR", "src/d.json:1:11: trailing comma"));
+    try std.testing.expect(lineHasBoth(s.out, "ERROR", "src/d.json:1:9: trailing comma"));
 
     const d = try c.run(&.{ "mox", "diff" });
     try std.testing.expect(lineHasBoth(d.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
@@ -7684,4 +7684,45 @@ test "validation: a bare capture in a merged TOML or YAML layer names its layer,
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "a capture in a merged layer must sit inside a string"));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "src/c.yaml:3:1: unterminated flow sequence"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "TomlParseError") == null);
+}
+
+test "validation: no byte of a resolved secret reaches any command's output when its file does not parse" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/t1.toml", "[\"<secret:env:MOX_SEC1>\"]\nx = {a=1}\nx.b = 2\n");
+    try put(io, &tmp, "repo/src/t2.toml", "\"<secret:env:MOX_SEC2>\" = 1\ntokzq = 2\n");
+    try put(io, &tmp, "repo/src/t3.json", "{\"<secret:env:MOX_SEC3>\": 1, \"a\": <data.u.n>}\n");
+    try put(io, &tmp, "repo/src/t4.toml", "k = \"\"\"<secret:env:MOX_SEC4>\"\"\"\n");
+    try put(io, &tmp, "repo/src/t5.json", "{\"<secret:env:MOX_SEC3>\": 1, \"<secret:env:MOX_SEC3>\": 2}\n");
+    try put(io, &tmp, "repo/data/u.toml", "n = 1\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{
+        .{ .name = "MOX_SEC1", .value = "s3cr3tval" },
+        .{ .name = "MOX_SEC2", .value = "tokzq" },
+        .{ .name = "MOX_SEC3", .value = "qu'o\"te\\bsq" },
+        .{ .name = "MOX_SEC4", .value = "ml\"\"\"\nzzml = = \n" },
+    } });
+    const secrets = [_][]const u8{ "s3cr3tval", "qu'o", "te\\bsq", "zzml" };
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/t1.toml", "composed output line 3 from src/t1.toml: does not parse as toml"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/t2.toml", "duplicate key <redacted>"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/t5.json", "duplicate key <redacted>"));
+    for ([_][]const []const u8{ &.{"apply"}, &.{"diff"}, &.{"status"}, &.{ "commit", "--dry-run" } }) |args| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(a, "mox");
+        try argv.appendSlice(a, args);
+        const res = try c.run(argv.items);
+        for (secrets) |sec| {
+            if (std.mem.indexOf(u8, res.out, sec) != null or std.mem.indexOf(u8, res.err, sec) != null) {
+                std.debug.print("{s} leaked {s}:\n{s}\n{s}\n", .{ args[0], sec, res.out, res.err });
+                return error.SecretLeaked;
+            }
+        }
+        try std.testing.expect(std.mem.indexOf(u8, res.out, "tokzq") == null and std.mem.indexOf(u8, res.err, "tokzq") == null);
+    }
 }

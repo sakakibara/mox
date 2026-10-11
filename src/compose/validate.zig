@@ -23,6 +23,7 @@ const trailing_comma_hint = "remove the trailing comma";
 const empty_hint = "an empty file is not JSON: write {}";
 const data_capture_hint = "quote it: a quoted single data capture emits its typed value";
 const capture_hint = "quote it";
+const bom_hint = "strip the byte order mark at the start of the file";
 const merged_capture_hint = "layers merge before captures expand, so a capture in a merged layer must sit inside a string";
 
 /// One parse failure: 1-based line and column in the checked text, the
@@ -32,11 +33,17 @@ const Failure = struct {
     col: u32,
     message: []const u8,
     hint: ?[]const u8 = null,
+    /// The parser's error, which names its kind without quoting the text.
+    err: anyerror = error.ParseError,
+    /// For a duplicate key, the key as the text spells it.
+    dup_key: ?[]const u8 = null,
+    /// The hint quotes the text (a directive's arguments).
+    hint_quotes: bool = false,
 };
 
 /// Check one layer as written. `display` names it; `removed` maps a line of
 /// the checked text back to the line the source file has it on (the base's
-/// stripped head lines).
+/// stripped head lines). A layer holds no resolved secret.
 pub fn checkLayer(
     arena: std.mem.Allocator,
     format: Format,
@@ -45,36 +52,38 @@ pub fn checkLayer(
     removed: []const u32,
     diag: ?*interp.Diag,
 ) Error!void {
-    const f = (try firstFailure(arena, format, text, display)) orelse return;
+    var f = (try firstFailure(arena, format, text, display)) orelse return;
     const line = source.head.sourceLine(removed, f.line);
-    return report(arena, diag, try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, line, f.col }), f.message, f.hint);
+    if (f.hint == null and !format.isJson() and interp.containsCapture(lineAt(text, lineOffset(text, f.line)))) f.hint = merged_capture_hint;
+    return report(arena, diag, try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, line, f.col }), try reason(arena, format, f, false), f.hint);
 }
 
 /// Why a live file `display` names does not parse in `format`, as
-/// `<display>:<line>:<col>: <message>[; <hint>]`, or null when it parses.
-/// A live file may hold secrets mox wrote, so quoted text is redacted.
-pub fn liveFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?[]const u8 {
+/// `<display>:<line>:<col>: <reason>[; <hint>]`, or null when it parses.
+/// `has_secret` says mox resolved a secret into it, so no byte of the
+/// parser's message may be printed.
+pub fn liveFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, has_secret: bool) !?[]const u8 {
     const f = (try firstFailure(arena, format, text, display)) orelse return null;
-    const message = try redactQuoted(arena, f.message);
-    if (f.hint) |h| return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}; {s}", .{ display, f.line, f.col, message, h });
-    return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}", .{ display, f.line, f.col, message });
+    const why = try reason(arena, format, f, has_secret);
+    const hint = shownHint(f, has_secret);
+    if (hint) |h| return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}; {s}", .{ display, f.line, f.col, why, h });
+    return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}", .{ display, f.line, f.col, why });
 }
 
 /// Check a composed output. `layers` names the layers it came from;
-/// `secret_lines[i]` marks output line `i + 1` as carrying a resolved
-/// secret, whose text is never quoted.
+/// `has_secret` says a secret was resolved into it, so the report carries
+/// fixed text only.
 pub fn checkOutput(
     arena: std.mem.Allocator,
     format: Format,
     bytes: []const u8,
     layers: []const []const u8,
-    secret_lines: []const bool,
+    has_secret: bool,
     diag: ?*interp.Diag,
 ) Error!void {
     const f = (try firstFailure(arena, format, bytes, "")) orelse return;
     const loc = try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ f.line, try layerList(arena, layers) });
-    const message = if (isSecretLine(secret_lines, f.line)) try redactQuoted(arena, f.message) else f.message;
-    return report(arena, diag, loc, message, f.hint);
+    return report(arena, diag, loc, try reason(arena, format, f, has_secret), shownHint(f, has_secret));
 }
 
 /// A duplicate object key in a JSON-family document, reported against
@@ -85,42 +94,47 @@ pub fn checkDuplicateKeys(
     bytes: []const u8,
     display: []const u8,
     layers: []const []const u8,
-    secret_lines: []const bool,
+    has_secret: bool,
     diag: ?*interp.Diag,
 ) Error!void {
     const hit = (try duplicateKey(arena, format.jsonDialect(), bytes)) orelse return;
     const lc = lineCol(bytes, hit.offset);
-    // Either spelling of the key may be a resolved secret.
-    const secret = isSecretLine(secret_lines, lc.line) or isSecretLine(secret_lines, lineCol(bytes, hit.first_offset).line);
     const loc = if (layers.len > 0)
         try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ lc.line, try layerList(arena, layers) })
     else
         try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, lc.line, lc.col });
-    const message = if (secret) "duplicate key <redacted>" else try std.fmt.allocPrint(arena, "duplicate key {s}", .{try quoteKey(arena, hit.key)});
-    return report(arena, diag, loc, message, null);
+    return report(arena, diag, loc, try dupReason(arena, hit.key, has_secret), null);
 }
 
-fn isSecretLine(secret_lines: []const bool, line: u32) bool {
-    return line >= 1 and line - 1 < secret_lines.len and secret_lines[line - 1];
+/// The reason a report gives for `f`: the parser's message, a duplicate
+/// key as a JSON string, or with `has_secret` fixed text alone.
+fn reason(arena: std.mem.Allocator, format: Format, f: Failure, has_secret: bool) ![]const u8 {
+    if (f.dup_key) |k| return dupReason(arena, k, has_secret);
+    if (!has_secret) return f.message;
+    if (std.mem.startsWith(u8, f.message, "duplicate")) return "duplicate key <redacted>";
+    if (format == .ini or format == .gitconfig) return errorWords(arena, f.err);
+    return std.fmt.allocPrint(arena, "does not parse as {s}", .{@tagName(format)});
 }
 
-/// `message` with every quoted span replaced by `<redacted>`: a parser
-/// quotes the text it stopped at, which on a secret-bearing line may be the
-/// secret itself.
-fn redactQuoted(arena: std.mem.Allocator, message: []const u8) ![]const u8 {
+fn dupReason(arena: std.mem.Allocator, key: []const u8, has_secret: bool) ![]const u8 {
+    if (has_secret) return "duplicate key <redacted>";
+    return std.fmt.allocPrint(arena, "duplicate key {s}", .{try quoteKey(arena, key)});
+}
+
+fn shownHint(f: Failure, has_secret: bool) ?[]const u8 {
+    return if (has_secret and f.hint_quotes) null else f.hint;
+}
+
+/// A parser error's name as words: `ExpectedAssignment` -> "expected
+/// assignment". The name is the parser's, never the text's.
+fn errorWords(arena: std.mem.Allocator, err: anyerror) ![]const u8 {
+    const name = @errorName(err);
     var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < message.len) {
-        const c = message[i];
-        if (c == '"' or c == '\'' or c == '`') {
-            if (std.mem.indexOfScalarPos(u8, message, i + 1, c)) |end| {
-                try out.appendSlice(arena, "<redacted>");
-                i = end + 1;
-                continue;
-            }
-        }
-        try out.append(arena, c);
-        i += 1;
+    for (name, 0..) |c, i| {
+        if (std.ascii.isUpper(c)) {
+            if (i > 0) try out.append(arena, ' ');
+            try out.append(arena, std.ascii.toLower(c));
+        } else try out.append(arena, c);
     }
     return out.toOwnedSlice(arena);
 }
@@ -179,6 +193,12 @@ fn lineCol(text: []const u8, offset: usize) LineCol {
 /// The first parse failure of `text` in `format`, or null when it parses.
 /// `display` names the file in a directive refusal's overlay hint.
 fn firstFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?Failure {
+    var f = (try parserFailure(arena, format, text, display)) orelse return null;
+    if (f.hint == null and std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) f.hint = bom_hint;
+    return f;
+}
+
+fn parserFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?Failure {
     return switch (format) {
         .json, .jsonc => jsonFailure(arena, format, text, display),
         .toml => blk: {
@@ -211,14 +231,33 @@ fn firstFailure(arena: std.mem.Allocator, format: Format, text: []const u8, disp
 }
 
 fn fromSpan(text: []const u8, diags: anytype, e: anyerror) !Failure {
-    if (diags.len == 0) return .{ .line = 1, .col = 1, .message = @errorName(e) };
+    if (diags.len == 0) return .{ .line = 1, .col = 1, .message = @errorName(e), .err = e };
     const d = diags[0];
-    const start: usize = @intCast(d.span.start);
+    const start: usize = @min(@as(usize, @intCast(d.span.start)), text.len);
+    const end: usize = @min(@as(usize, @intCast(d.span.end)), text.len);
     const lc = lineCol(text, start);
-    var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message };
-    if (std.mem.indexOfScalar(u8, lineAt(text, start), '<') != null and interp.containsCapture(lineAt(text, start)))
-        f.hint = merged_capture_hint;
+    var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message, .err = e };
+    if (std.mem.startsWith(u8, d.message, "duplicate key") and end > start) f.dup_key = unquoteKey(text[start..end]);
     return f;
+}
+
+/// A key token without its TOML/YAML/INI quotes.
+fn unquoteKey(tok: []const u8) []const u8 {
+    const t = std.mem.trimStart(u8, tok, " \t");
+    if (t.len >= 2 and (t[0] == '"' or t[0] == '\'')) {
+        if (std.mem.indexOfScalarPos(u8, t, 1, t[0])) |close| return t[1..close];
+    }
+    return t[0 .. std.mem.indexOfAny(u8, t, " \t=:") orelse t.len];
+}
+
+/// Byte offset where 1-based `line` starts.
+fn lineOffset(text: []const u8, line: u32) usize {
+    var n: u32 = 1;
+    for (text, 0..) |c, i| {
+        if (n == line) return i;
+        if (c == '\n') n += 1;
+    }
+    return text.len;
 }
 
 /// The line of `text` holding byte `offset`.
@@ -240,15 +279,20 @@ fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, displ
     _ = json.parse(arena, text, .{ .dialect = format.jsonDialect(), .errors = &errs }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            if (errs.items.len == 0) return .{ .line = 1, .col = 1, .message = @errorName(e) };
+            if (errs.items.len == 0) return .{ .line = 1, .col = 1, .message = @errorName(e), .err = e };
             const d = errs.items[0];
-            const start: usize = @intCast(d.span.start);
-            const lc = lineCol(text, start);
-            var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message };
+            var start: usize = @min(@as(usize, @intCast(d.span.start)), text.len);
             const at: u8 = if (start < text.len) text[start] else 0;
+            const trailing = std.mem.indexOf(u8, d.message, "trailing comma") != null;
+            // The parser stops at the closing bracket; the comma is the error.
+            if (trailing) {
+                if (std.mem.lastIndexOfScalar(u8, text[0..start], ',')) |comma| start = comma;
+            }
+            const lc = lineCol(text, start);
+            var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message, .err = e };
             if (at == '/' and format == .json) {
                 f.hint = comment_hint;
-            } else if (std.mem.indexOf(u8, d.message, "trailing comma") != null) {
+            } else if (trailing) {
                 f.hint = trailing_comma_hint;
             } else if (at == '<') {
                 f.hint = if (std.mem.startsWith(u8, std.mem.trimStart(u8, text[start + 1 ..], " \t"), "data.")) data_capture_hint else capture_hint;
@@ -306,7 +350,7 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     else
         comment_hint;
     const message = try std.fmt.allocPrint(arena, "mox directive \"{s}\" in strict JSON, which has no comments", .{v});
-    return .{ .line = lc.line, .col = lc.col, .message = message, .hint = hint };
+    return .{ .line = lc.line, .col = lc.col, .message = message, .hint = hint, .hint_quotes = true };
 }
 
 const Where = struct { file: []const u8, table: []const u8 };
@@ -462,7 +506,7 @@ test "strict JSON: a string spelling // mox: is content" {
 
 test "strict JSON: each hint by cause" {
     try expectFailure(.json, "{\n  \"a\": 1 // note\n}\n", &.{ "s.json:2:10:", "comments not allowed", "set format = \"jsonc\"" });
-    try expectFailure(.json, "{ \"b\": 1, }\n", &.{ "s.json:1:11:", "trailing comma", "remove the trailing comma" });
+    try expectFailure(.json, "{ \"b\": 1, }\n", &.{ "s.json:1:9:", "trailing comma", "remove the trailing comma" });
     try expectFailure(.json, "", &.{ "s.json:1:1:", "write {}" });
     try expectFailure(.jsonc, "  \n", &.{"write {}"});
     try expectFailure(.json, "{\"port\": <data.u.port>}\n", &.{"quote it: a quoted single data capture emits its typed value"});
@@ -488,11 +532,11 @@ test "checkOutput: names the output line and the layers, and never quotes a secr
     defer arena.deinit();
     const a = arena.allocator();
     var d: interp.Diag = .{};
-    try testing.expectError(error.FormatViolation, checkOutput(a, .toml, "a = 1\nb = hunter2\n", &.{ "src/x.toml", "src/x.toml.d/os=darwin.toml" }, &.{}, &d));
+    try testing.expectError(error.FormatViolation, checkOutput(a, .toml, "a = 1\nb = hunter2\n", &.{ "src/x.toml", "src/x.toml.d/os=darwin.toml" }, false, &d));
     try testing.expect(std.mem.indexOf(u8, d.capture().?, "composed output line 2 from src/x.toml and src/x.toml.d/os=darwin.toml: ") != null);
 
     var s: interp.Diag = .{};
-    try testing.expectError(error.FormatViolation, checkOutput(a, .json, "{\n\"t\": hunter2\n}\n", &.{"src/x.json"}, &.{ false, true, false }, &s));
+    try testing.expectError(error.FormatViolation, checkOutput(a, .json, "{\n\"t\": hunter2\n}\n", &.{"src/x.json"}, true, &s));
     try testing.expect(std.mem.startsWith(u8, s.capture().?, "composed output line 2 from src/x.json: "));
     try testing.expect(std.mem.indexOf(u8, s.capture().?, "hunter2") == null);
 }
@@ -509,7 +553,7 @@ test "checkOutput: every format names the output line" {
     };
     for (cases) |c| {
         var d: interp.Diag = .{};
-        try testing.expectError(error.FormatViolation, checkOutput(a, c.f, c.text, &.{"x"}, &.{}, &d));
+        try testing.expectError(error.FormatViolation, checkOutput(a, c.f, c.text, &.{"x"}, false, &d));
         try testing.expect(std.mem.startsWith(u8, d.capture().?, c.line));
     }
 }
@@ -533,11 +577,18 @@ test "every format reports a layer with a line" {
     try testing.expect((try failureText(.toml, "")) == null);
 }
 
-test "redactQuoted and quoteKey" {
+test "quoteKey, errorWords and a reason with a secret" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("unexpected <redacted> after <redacted>", try redactQuoted(a, "unexpected 'x1' after \"y\""));
-    try testing.expectEqualStrings("expected value", try redactQuoted(a, "expected value"));
     try testing.expectEqualStrings("\"a\\n\\\"b\\u0001\"", try quoteKey(a, "a\n\"b\x01"));
+    try testing.expectEqualStrings("expected assignment", try errorWords(a, error.ExpectedAssignment));
+    var d: interp.Diag = .{};
+    try testing.expectError(error.FormatViolation, checkOutput(a, .toml, "[\"s3cr3t\"]\nx = {a=1}\nx.b = 2\n", &.{"src/t.toml"}, true, &d));
+    try testing.expectEqualStrings("composed output line 3 from src/t.toml: does not parse as toml", d.capture().?);
+}
+
+test "a byte order mark gets its hint, and a layer's reason is the parser's own" {
+    try expectFailure(.json, "\xEF\xBB\xBF{}\n", &.{ "s.json:1:1:", "strip the byte order mark" });
+    try expectFailure(.toml, "a = 1\na = 2\n", &.{ "s.json:2:1:", "duplicate key \"a\"" });
 }

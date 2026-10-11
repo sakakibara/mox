@@ -226,7 +226,7 @@ fn repatchPartial(
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
             const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(live_path, ctx.context.?.paths.home)});
-            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse, and mox cannot patch what it cannot preserve)\n", .{ shown, try partial.liveParseError(ctx.alloc, format, live_text, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown})) });
+            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse, and mox cannot patch what it cannot preserve)\n", .{ shown, try partial.liveParseError(ctx.alloc, format, live_text, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown}), mox.provenance.map.holdsSecret(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path)) });
             failed.* += 1;
             return false;
         },

@@ -6096,7 +6096,7 @@ test "add: a .json file with a trailing comma is captured with a warning naming 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("ok.json"), .data = "{\"a\": 1}\n" });
     const r = try h.run(&.{ "mox", "add", "~/t.json" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(lineWith(r.err, "warning: not strict JSON (src/t.json:3:1: trailing comma", "apply refuses it until it parses"));
+    try std.testing.expect(lineWith(r.err, "warning: not strict JSON (src/t.json:2:9: trailing comma", "apply refuses it until it parses"));
     const ok = try h.run(&.{ "mox", "add", "~/ok.json" });
     try std.testing.expect(std.mem.indexOf(u8, ok.err, "warning") == null);
 }

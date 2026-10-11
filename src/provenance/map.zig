@@ -324,6 +324,14 @@ pub fn persist(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_pat
 }
 
 /// Read persisted provenance for `live_path`, or null when none / malformed.
+/// True when the last apply resolved a secret into `live_path`, or its
+/// record cannot be read: its parse errors must then quote nothing.
+pub fn holdsSecret(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) bool {
+    const m = (read(arena, io, state_dir, live_path) catch return true) orelse return false;
+    for (m.segments) |seg| if (seg.origin == .secret) return true;
+    return false;
+}
+
 pub fn read(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?Map {
     const path = try recordPath(arena, state_dir, live_path);
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
