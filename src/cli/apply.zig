@@ -9,6 +9,7 @@ const drift_report = @import("drift_report.zig");
 const mox = @import("../root.zig");
 const scope = @import("scope.zig");
 const edit = @import("edit.zig");
+const fileops = @import("fileops.zig");
 const display = @import("display.zig");
 
 pub const Spec = struct {
@@ -394,9 +395,23 @@ fn applyPass(
 
     const scoped = paths.len > 0;
     var files: []const mox.source.tree.ManagedFile = tree.files;
+    // A named path whose source left the tree is judged by the stale sweep
+    // alone; every other named path must be managed.
+    var stale_named: std.StringHashMap(void) = .init(ctx.alloc);
     if (scoped) {
+        const cands = try mox.apply.stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
+        var managed_paths: std.ArrayList([]const u8) = .empty;
+        for (paths) |p| {
+            const live = edit.liveTarget(ctx.alloc, home, context.cwd, p) catch {
+                try managed_paths.append(ctx.alloc, p);
+                continue;
+            };
+            if (fileops.findByLive(tree, live) == null and mox.apply.stale.at(cands, live) != null) {
+                try stale_named.put(live, {});
+            } else try managed_paths.append(ctx.alloc, p);
+        }
         var diag: scope.Diag = .{};
-        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, context.cwd, paths, &diag) catch |e| switch (e) {
+        files = scope.filterTree(ctx.alloc, ctx.io, tree.files, home, context.cwd, managed_paths.items, &diag) catch |e| switch (e) {
             error.NotManaged => {
                 try ctx.err.print("mox apply: {s}: not managed\n", .{diag.capture().?});
                 if (diag.captureResolved()) |r|
@@ -739,7 +754,10 @@ fn applyPass(
         counts.fail += swept.error_refused;
         counts.drift += swept.drift_refused;
         unrowed_drift += swept.drift_refused;
-
+    }
+    // A full run sweeps every stale path but removes an edited one only when
+    // a scoped run names it; a scoped run sweeps only the stale paths it names.
+    if (sweep_ok or (stale_named.count() > 0 and counts.fail == 0)) {
         var tree_keep: std.StringHashMap(void) = .init(ctx.alloc);
         for (tree.files) |f| try tree_keep.put(f.live_path, {});
         for (manifest_leaves) |leaf| try tree_keep.put(leaf, {});
@@ -752,7 +770,8 @@ fn applyPass(
             .released = &released_live,
             .ruleset = &ruleset,
             .snap_id = snap_id,
-            .force = force,
+            .force = force and scoped,
+            .only = if (scoped) &stale_named else null,
             .dry_run = dry_run,
         }, &units, &counts, &snapshotted);
     }
@@ -1896,6 +1915,8 @@ const StaleInput = struct {
     ruleset: *const mox.source.ignore.match.RuleSet,
     snap_id: []const u8,
     force: bool,
+    /// When set, only these stale paths are judged.
+    only: ?*const std.StringHashMap(void) = null,
     dry_run: bool,
 };
 
@@ -1916,6 +1937,7 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
     const links = try stale.managedLinks(ctx.alloc, in.tree);
     for (cands) |c| {
+        if (in.only) |only| if (!only.contains(c.live_path)) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         if (in.released.contains(c.live_path)) {
             if (!in.dry_run) try forgetAll(ctx, c.live_path);

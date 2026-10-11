@@ -825,8 +825,10 @@ generator manifest names: a source that was deleted, moved, or released. A
 record whose path lies outside this run's HOME is never a candidate.
 
 - An unedited whole file or symlink is removed, snapshot-first, so `mox
-  rollback` recovers it; an edited one is drift, kept until `mox apply
-  --overwrite`; one already gone is forgotten.
+  rollback` recovers it; an edited one is drift, kept until it is named:
+  `mox apply --overwrite <path>` removes it, snapshot-first, and `mox commit
+  <path>` keeps the edit by forgetting the path on this machine. An unscoped
+  `--overwrite` never removes it. One already gone is forgotten.
 - A partially owned file is never removed, since the rest of it is the
   program's: it is reported once as no longer managed, left in place, and
   its records forgotten.

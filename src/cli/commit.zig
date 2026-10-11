@@ -1339,6 +1339,9 @@ fn commitRun(
     if (paths.len > 0) {
         var direct: std.ArrayList([]const u8) = .empty;
         var leaf_targets: std.ArrayList([]const u8) = .empty;
+        var stale_live: std.ArrayList([]const u8) = .empty;
+        const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
+        const cands = try mox.apply.stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, m_state.home, tree);
         for (paths) |p| {
             const live = edit_mod.liveTarget(ctx.alloc, m_state.home, context.cwd, p) catch |e| switch (e) {
                 error.OutOfMemory => return e,
@@ -1346,10 +1349,25 @@ fn commitRun(
             };
             if (findByLive(tree, live) != null) {
                 try direct.append(ctx.alloc, p);
+            } else if (mox.apply.stale.at(cands, live) != null) {
+                try stale_live.append(ctx.alloc, live);
             } else {
                 try leaf_targets.append(ctx.alloc, live);
             }
         }
+        // A named path whose source left the tree keeps its live edit: this
+        // machine forgets it, and no other file is committed for it.
+        for (stale_live.items) |lp| {
+            const shown = display.of(lp, m_state.home);
+            if (dry_run) {
+                try ctx.out.print("  would release {f} on this machine (its source left the tree; the file is kept)\n", .{shown});
+                continue;
+            }
+            try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, lp);
+            try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, lp);
+            try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{shown});
+        }
+        if (stale_live.items.len > 0 and direct.items.len == 0 and leaf_targets.items.len == 0) return 0;
 
         var diag: scope.Diag = .{};
         const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, context.cwd, direct.items, &diag) catch |e| switch (e) {

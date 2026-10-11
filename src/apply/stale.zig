@@ -13,6 +13,7 @@ const write = @import("write.zig");
 const dirent = @import("../source/dirent.zig");
 const tree_mod = @import("../source/tree.zig");
 const parent_link = @import("parent_link.zig");
+const generated = @import("generated.zig");
 
 const Io = std.Io;
 
@@ -83,6 +84,23 @@ pub fn find(
     }
     std.mem.sort(Candidate, out.items, {}, lessByPath);
     return out.toOwnedSlice(arena);
+}
+
+/// The stale records of `repo` under `home` against the whole tree `tree`:
+/// what a full apply would sweep, before any generator runs.
+pub fn candidatesOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, home: []const u8, tree: tree_mod.ManagedTree) ![]Candidate {
+    var keep = std.StringHashMap(void).init(arena);
+    for (tree.files) |f| try keep.put(f.live_path, {});
+    for (try generated.allLeaves(arena, io, state_dir)) |leaf| try keep.put(leaf, {});
+    for (tree.released) |p| try keep.put(p, {});
+    for (tree.entry_errors) |e| try keep.put(e.live_path, {});
+    return find(arena, io, state_dir, repo, home, &keep);
+}
+
+/// The candidate in `cands` at `live_path`, or null.
+pub fn at(cands: []const Candidate, live_path: []const u8) ?Candidate {
+    for (cands) |c| if (std.mem.eql(u8, c.live_path, live_path)) return c;
+    return null;
 }
 
 fn isSymlink(io: Io, path: []const u8) bool {

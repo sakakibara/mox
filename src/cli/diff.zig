@@ -333,16 +333,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (a.paths.len == 0) {
         const stale = mox.apply.stale;
         const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir);
-        var keep: std.StringHashMap(void) = .init(ctx.alloc);
+        const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
         var live_paths: std.ArrayList([]const u8) = .empty;
-        for (tree.files) |f| {
-            try keep.put(f.live_path, {});
-            try live_paths.append(ctx.alloc, f.live_path);
-        }
-        for (try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir)) |leaf| try keep.put(leaf, {});
-        for (tree.released) |p| try keep.put(p, {});
-        for (tree.entry_errors) |e| try keep.put(e.live_path, {});
-        const cands = try stale.find(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, &keep);
+        for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         const links = try stale.managedLinks(ctx.alloc, tree.files);
         for (cands) |c| {

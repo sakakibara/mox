@@ -316,8 +316,10 @@ released by `mox remove` -- converges the same way (see
 [dsl.md](dsl.md#sources-that-leave-the-tree)): an unedited one is removed
 (`removed ~/x (no longer managed)`), an edited one is drift, a partially
 owned one is left in place, and a released one is forgotten. Nothing is
-swept in a path-scoped run, or in one where any file failed to compose or
-write.
+swept in a run where any file failed to compose or write. A path-scoped run
+sweeps only the stale paths it names: `mox apply --overwrite <path>` is
+how an edited one is removed, since an unscoped `--overwrite` keeps it, and
+`mox commit <path>` keeps its edit by forgetting the path on this machine.
 
 apply never removes a path through a symlinked directory: when a
 directory between HOME and the path is a symlink, or a path the tree
@@ -374,6 +376,11 @@ prompt's choices. The per-hunk keys are:
 without `--yes`, reports only and exits 1 if edits remain;
 `--abort-on-prompt` is strict CI mode, exiting 2 on the first would-be
 prompt. Exit codes are listed at the end of this section.
+
+A named path whose source left the tree (a `STALE` or edited stale file)
+has no source to route into: `mox commit <path>` keeps the live file and
+forgets the path on this machine (`released ~/x on this machine`), and
+`--dry-run` says it would.
 
 <!-- generated: flags commit -->
 | Flag | Description |

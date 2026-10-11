@@ -5376,10 +5376,44 @@ test "stale: a deleted source is STALE and diffed as removed, apply removes it s
     const snaps = try mox.apply.snapshot.list(a, io, try std.fs.path.join(a, &.{ h.state, "snapshots" }));
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "snapshots", snaps[snaps.len - 1], ".gone" })));
 
-    // --overwrite resolves the edited one the same way, and status is clean.
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    // The guidance names the edited path, and only naming it removes it.
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "mox apply --overwrite ~/.edited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "mox commit ~/.edited") != null);
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
+    const named = try h.run(&.{ "mox", "apply", "--overwrite", "~/.edited" });
+    try std.testing.expectEqual(@as(u8, 0), named.rc);
+    try std.testing.expect(std.mem.indexOf(u8, named.out, "removed ~/.edited (no longer managed)") != null);
     try std.testing.expect(!exists(io, try h.liveOf(".edited")));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "stale: commit of an edited stale path keeps the edit and releases it here" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.edited", "mine\n");
+    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".edited"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".edited"), .data = "mine, edited\n" });
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run", "~/.edited" });
+    try std.testing.expectEqual(@as(u8, 0), dry.rc);
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    const c = try h.run(&.{ "mox", "commit", "~/.edited" });
+    try std.testing.expectEqual(@as(u8, 0), c.rc);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "released ~/.edited on this machine") != null);
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) == null);
+    try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
 }
 
 test "stale: a gated-off file, an ignored path, and a run that cannot judge every file sweep nothing" {

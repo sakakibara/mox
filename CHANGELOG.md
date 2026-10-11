@@ -19,8 +19,10 @@ All notable changes to mox are documented here. The format follows
 - A file whose source left the tree -- deleted, moved, or released -- is
   `STALE` in `mox status` and shown as a pending removal by `mox diff`, and
   `mox apply` converges it: an unedited whole file or symlink is removed
-  snapshot-first, an edited one is drift, and a partially owned one is left
-  in place, no longer managed, its records forgotten. Every record now names
+  snapshot-first, an edited one is drift until named (`apply --overwrite
+  <path>` removes it, `commit <path>` keeps the edit and forgets the path
+  here), and a partially owned one is left in place, no longer managed, its
+  records forgotten. Every record now names
   the repo it came from, so one repo's apply never touches another's files.
 - The private layer reads its own `<state dir>/private/.mox/attributes.toml`
   and joins fact discovery. A private entry may set any key for a
