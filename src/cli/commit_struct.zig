@@ -79,9 +79,9 @@ pub fn changedKeyPaths(
             if (live != .table or composed != .table) return error.NotATable;
             try walkToml(arena, &.{}, live, composed, &out);
         },
-        .json => {
-            const live = try json.parse(arena, live_bytes, .{ .dialect = .jsonc });
-            const composed = try json.parse(arena, composed_bytes, .{ .dialect = .jsonc });
+        .json, .jsonc => {
+            const live = try json.parse(arena, live_bytes, .{ .dialect = format.jsonDialect() });
+            const composed = try json.parse(arena, composed_bytes, .{ .dialect = format.jsonDialect() });
             if (live != .object or composed != .object) return error.NotAnObject;
             try walkJson(arena, &.{}, live, composed, &out);
         },
@@ -433,7 +433,7 @@ pub fn layerBytes(arena: std.mem.Allocator, format: Format, existing: ?[]const u
     if (change.path.len == 0) return error.EmptyPath;
     return switch (format) {
         .toml => try applyTomlLayer(arena, existing, change),
-        .json => try applyJsonLayer(arena, existing, change),
+        .json, .jsonc => try applyJsonLayer(arena, format.jsonDialect(), existing, change),
         .yaml => try applyYamlLayer(arena, existing, change),
         .ini, .gitconfig => try applyIniLayer(arena, existing, change, format),
     };
@@ -462,8 +462,11 @@ fn applyTomlLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPa
     return emitDoc(arena, &doc);
 }
 
-fn applyJsonLayer(arena: std.mem.Allocator, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
-    var doc = if (emptyLayer(existing)) try json.Document.empty(arena, .{ .dialect = .jsonc }) else try json.Document.parse(arena, existing.?, .{ .dialect = .jsonc });
+/// A strict-JSON layer is read and written strictly: one that does not parse
+/// as strict JSON is refused before any edit, and the edit adds no comment
+/// or trailing comma.
+fn applyJsonLayer(arena: std.mem.Allocator, dialect: json.Dialect, existing: ?[]const u8, change: KeyPathChange) ![]const u8 {
+    var doc = if (emptyLayer(existing)) try json.Document.empty(arena, .{ .dialect = dialect }) else try json.Document.parse(arena, existing.?, .{ .dialect = dialect });
     if (change.removed) try doc.removeSegments(change.path) else try doc.setValueSegments(change.path, change.new.?.json);
     return emitDoc(arena, &doc);
 }
@@ -492,8 +495,6 @@ fn emitDoc(arena: std.mem.Allocator, doc: anytype) ![]const u8 {
     return arena.dupe(u8, aw.written());
 }
 
-pub const formatOfPath = source_format.formatOfPath;
-
 const iniDialect = source_format.iniDialect;
 
 /// Parse one layer's bytes into a `Value` tagged by `format`, for the pure
@@ -501,7 +502,7 @@ const iniDialect = source_format.iniDialect;
 pub fn parseLayer(arena: std.mem.Allocator, format: Format, bytes: []const u8) !Value {
     return switch (format) {
         .toml => .{ .toml = try toml.parse(arena, bytes, .{}) },
-        .json => .{ .json = try json.parse(arena, bytes, .{ .dialect = .jsonc }) },
+        .json, .jsonc => .{ .json = try json.parse(arena, bytes, .{ .dialect = format.jsonDialect() }) },
         .yaml => .{ .yaml = try yaml.parse(arena, bytes, .{}) },
         .ini, .gitconfig => .{ .ini = try ini.parse(arena, bytes, .{ .dialect = iniDialect(format) }) },
     };
@@ -593,7 +594,7 @@ pub fn shadowers(
 fn definesPath(format: Format, value: Value, path: []const []const u8) bool {
     return switch (format) {
         .toml => tomlHas(value.toml, path),
-        .json => jsonHas(value.json, path),
+        .json, .jsonc => jsonHas(value.json, path),
         .yaml => yamlHas(value.yaml, path),
         .ini, .gitconfig => iniHas(value.ini, path),
     };
@@ -683,7 +684,7 @@ fn containerHas(format: Format, value: Value, prefix: []const []const u8, key: [
             .table => |t| t.get(key) != null,
             else => null,
         } else null,
-        .json => if (jsonAt(value.json, prefix)) |c| switch (c) {
+        .json, .jsonc => if (jsonAt(value.json, prefix)) |c| switch (c) {
             .object => |o| o.get(key) != null,
             else => null,
         } else null,
@@ -706,7 +707,7 @@ fn containerKeysCaptured(format: Format, value: Value, prefix: []const []const u
             .table => |t| tomlKeysCaptured(t),
             else => false,
         } else false,
-        .json => if (jsonAt(value.json, prefix)) |c| switch (c) {
+        .json, .jsonc => if (jsonAt(value.json, prefix)) |c| switch (c) {
             .object => |o| jsonKeysCaptured(o),
             else => false,
         } else false,
@@ -749,7 +750,7 @@ fn jsonKeysCaptured(o: anytype) bool {
 pub fn capturedAt(format: Format, value: Value, path: []const []const u8) bool {
     return switch (format) {
         .toml => if (tomlAt(value.toml, path)) |v| tomlCapture(v) else false,
-        .json => if (jsonAt(value.json, path)) |v| jsonCapture(v) else false,
+        .json, .jsonc => if (jsonAt(value.json, path)) |v| jsonCapture(v) else false,
         .yaml => if (yamlAt(value.yaml, path)) |v| yamlCapture(v) else false,
         .ini, .gitconfig => if (iniAt(value.ini, path)) |v| iniCapture(v) else false,
     };
@@ -760,14 +761,14 @@ pub fn capturedAt(format: Format, value: Value, path: []const []const u8) bool {
 pub fn holdsChange(format: Format, value: Value, change: KeyPathChange) bool {
     if (change.removed) return switch (format) {
         .toml => tomlAt(value.toml, change.path) == null,
-        .json => jsonAt(value.json, change.path) == null,
+        .json, .jsonc => jsonAt(value.json, change.path) == null,
         .yaml => yamlAt(value.yaml, change.path) == null,
         .ini, .gitconfig => iniAt(value.ini, change.path) == null,
     };
     const new = change.new orelse return false;
     return switch (format) {
         .toml => if (tomlAt(value.toml, change.path)) |v| v.eql(new.toml) else false,
-        .json => if (jsonAt(value.json, change.path)) |v| jsonEql(v, new.json) else false,
+        .json, .jsonc => if (jsonAt(value.json, change.path)) |v| jsonEql(v, new.json) else false,
         .yaml => if (yamlAt(value.yaml, change.path)) |v| v.eql(new.yaml) else false,
         .ini, .gitconfig => if (iniAt(value.ini, change.path)) |v| iniEql(v, new.ini) else false,
     };
@@ -876,7 +877,7 @@ pub fn displayAt(arena: std.mem.Allocator, format: Format, bytes: []const u8, pa
     const v = try parseLayer(arena, format, bytes);
     return switch (format) {
         .toml => tomlDisplay(arena, v.toml, path),
-        .json => jsonDisplay(arena, v.json, path),
+        .json, .jsonc => jsonDisplay(arena, v.json, path),
         .yaml => yamlDisplay(arena, v.yaml, path),
         .ini, .gitconfig => iniDisplay(arena, v.ini, path),
     };

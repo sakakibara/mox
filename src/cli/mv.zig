@@ -58,12 +58,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             });
             return 1;
         },
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
+        error.TomlParseError,
         => {
-            try ctx.err.print("mox mv: attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-            });
+            try ctx.err.print("mox mv: .mox/attributes.toml: not valid TOML\n", .{});
             return 1;
         },
         else => return e,
@@ -127,7 +124,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const old_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, old_live);
     const new_key = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, new_live);
     var attrs_diag: mox.source.attributes.Diag = .{};
-    var attrs = mox.source.attributes.load(ctx.alloc, ctx.io, context.paths.repo_dir, &attrs_diag) catch |e| switch (e) {
+    var attrs = mox.source.attributes.loadStrict(ctx.alloc, ctx.io, context.paths.repo_dir, &attrs_diag) catch |e| switch (e) {
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
         => {

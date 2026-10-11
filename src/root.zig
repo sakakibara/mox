@@ -197,20 +197,20 @@ test "match: no match returns null" {
 }
 
 test "category: .toml is A" {
-    try std.testing.expectEqual(compose.category.Category.a, compose.category.detect("config.toml", "[user]\n"));
+    try std.testing.expectEqual(compose.category.Category.a, compose.category.detect(.toml, "config.toml", "[user]\n"));
 }
 
 test "category: .lua is B" {
-    try std.testing.expectEqual(compose.category.Category.b, compose.category.detect("init.lua", "local M = {}\n"));
+    try std.testing.expectEqual(compose.category.Category.b, compose.category.detect(null, "init.lua", "local M = {}\n"));
 }
 
 test "category: binary content is C" {
     var bin = [_]u8{ 0x89, 0x50, 0x4e, 0x47 };
-    try std.testing.expectEqual(compose.category.Category.c, compose.category.detect("icon.png", &bin));
+    try std.testing.expectEqual(compose.category.Category.c, compose.category.detect(null, "icon.png", &bin));
 }
 
 test "category: unknown extension defaults to B if text" {
-    try std.testing.expectEqual(compose.category.Category.b, compose.category.detect("README", "Hello world\n"));
+    try std.testing.expectEqual(compose.category.Category.b, compose.category.detect(null, "README", "Hello world\n"));
 }
 
 test "pacifier: strips lua diagnostic directive" {

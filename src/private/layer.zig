@@ -1,15 +1,20 @@
 const std = @import("std");
 const source = @import("../source/root.zig");
+const partial = @import("../apply/partial.zig");
 
 const ManagedTree = source.tree.ManagedTree;
 const ManagedFile = source.tree.ManagedFile;
 const Overlay = source.tree.Overlay;
 const Region = source.tree.Region;
 
-/// Merge private overlays from `private_dir` into `base_tree`. Returns a new
-/// tree where each ManagedFile has its overlays/regions extended with private
-/// entries. Files that exist only in the private layer are added as
-/// has_base=false entries.
+/// Merge the private layer at `private_dir` into `base_tree`. The private
+/// root mirrors `src/`: its overlays and regions extend the repo file at the
+/// same path, and a file that exists only in the private layer is added as
+/// it stands. Its `.mox/attributes.toml` may set any key for a private-only
+/// path, and only `mode` for a path the repo manages, which then wins over
+/// the repo's. A private base at a path the repo manages, any other private
+/// attribute there, and a private overlay defining content under a path the
+/// repo disowns are that file's error.
 ///
 /// If `private_dir` doesn't exist, returns `base_tree` unchanged.
 pub fn merge(
@@ -25,12 +30,19 @@ pub fn merge(
     };
 
     // The private root's `data/` is data (`mox data`, loop sources, the
-    // package manifest), never a source: walking it would plan `~/data/...`.
-    const private_tree = try source.tree.walkExcluding(arena, io, private_dir, home_dir, &.{"data"}, null);
-
+    // package manifest) and its `.mox/` holds its attributes, never a source:
+    // walking either would plan `~/data/...`.
     var base_map = std.StringHashMap(ManagedFile).init(arena);
     defer base_map.deinit();
-    for (base_tree.files) |f| try base_map.put(f.source_base_path, f);
+    var repo_paths = std.StringHashMap(void).init(arena);
+    defer repo_paths.deinit();
+    for (base_tree.files) |f| {
+        try base_map.put(f.source_base_path, f);
+        try repo_paths.put(f.source_base_path, {});
+    }
+
+    const private_tree = try source.tree.walkExcluding(arena, io, private_dir, private_dir, home_dir, &.{ "data", ".mox" }, &repo_paths, null);
+    const private_attrs = try source.attributes.load(arena, io, private_dir);
 
     var merged: std.ArrayList(ManagedFile) = .empty;
     errdefer merged.deinit(arena);
@@ -46,6 +58,15 @@ pub fn merge(
             var combined = base_file;
             combined.overlays = try concatOverlays(arena, base_file.overlays, pf.overlays);
             combined.regions = try concatRegions(arena, base_file.regions, pf.regions);
+            const target_key = if (std.mem.startsWith(u8, key, "src/")) key["src/".len..] else key;
+            if (combined.head_error.len == 0) {
+                if (try repoPathError(arena, io, base_file, pf, &private_attrs, target_key)) |err| {
+                    combined.head_error = err;
+                } else if (private_attrs.mode(target_key)) |m| {
+                    combined.mode = m;
+                    combined.mode_explicit = true;
+                }
+            }
             try merged.append(arena, combined);
         } else {
             try merged.append(arena, pf);
@@ -77,7 +98,49 @@ pub fn merge(
         if (!dup) try exact.append(arena, d);
     }
 
-    return .{ .files = out, .exact_dirs = try exact.toOwnedSlice(arena) };
+    return .{
+        .files = out,
+        .exact_dirs = try exact.toOwnedSlice(arena),
+        .released = try concatPaths(arena, base_tree.released, private_tree.released),
+    };
+}
+
+/// Why the private layer's contribution to a path the repo manages is
+/// refused, or null when it is not.
+fn repoPathError(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base_file: ManagedFile,
+    pf: ManagedFile,
+    private_attrs: *const source.attributes.Attributes,
+    target_key: []const u8,
+) !?[]const u8 {
+    if (pf.has_base) {
+        return try std.fmt.allocPrint(arena, "a private base at a path the repo manages: {s} and {s}; vary it with a private overlay instead", .{
+            try source.path.toKey(arena, pf.source_base_abs),
+            base_file.source_base_path,
+        });
+    }
+    if (private_attrs.lookup(target_key)) |e| {
+        var only_mode = e;
+        only_mode.mode = null;
+        if (e.err.len > 0) return try std.fmt.allocPrint(arena, "private {s}", .{e.err});
+        if (!source.attributes.entryEmpty(only_mode))
+            return "private .mox/attributes.toml: only mode may be set for a path the repo manages";
+    }
+    if (base_file.ownership == .disown) {
+        const format = base_file.format orelse return null;
+        for (pf.overlays) |o| {
+            const text = std.Io.Dir.cwd().readFileAlloc(io, o.path, arena, .limited(4 * 1024 * 1024)) catch continue;
+            const doc = partial.OwnedDoc.parse(arena, format, text) catch continue;
+            if (try partial.populatedDisownPath(arena, &doc, base_file.own_paths)) |spelled| {
+                return try std.fmt.allocPrint(arena, "private overlay {s} defines content under disowned path {s}", .{
+                    try source.path.toKey(arena, o.path), spelled,
+                });
+            }
+        }
+    }
+    return null;
 }
 
 fn concatOverlays(arena: std.mem.Allocator, a: []const Overlay, b: []const Overlay) ![]const Overlay {
@@ -89,6 +152,13 @@ fn concatOverlays(arena: std.mem.Allocator, a: []const Overlay, b: []const Overl
 
 fn concatRegions(arena: std.mem.Allocator, a: []const Region, b: []const Region) ![]const Region {
     const result = try arena.alloc(Region, a.len + b.len);
+    @memcpy(result[0..a.len], a);
+    @memcpy(result[a.len..], b);
+    return result;
+}
+
+fn concatPaths(arena: std.mem.Allocator, a: []const []const u8, b: []const []const u8) ![]const []const u8 {
+    const result = try arena.alloc([]const u8, a.len + b.len);
     @memcpy(result[0..a.len], a);
     @memcpy(result[a.len..], b);
     return result;

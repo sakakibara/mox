@@ -1308,12 +1308,9 @@ fn commitRun(
             });
             return 1;
         },
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
+        error.TomlParseError,
         => {
-            try ctx.err.print("mox commit: attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-            });
+            try ctx.err.print("mox commit: .mox/attributes.toml: not valid TOML\n", .{});
             return 1;
         },
         else => return e,
@@ -1679,10 +1676,22 @@ fn commitRun(
         // gated-off region) has no file to route this edit into. The live copy
         // is the user's alone: say how to resolve it rather than routing bytes
         // nowhere, only for the recompose to reject them and restore them.
-        if (file.own_paths.len == 0 and (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, null) catch null) == null) {
-            try ctx.err.print("mox commit: {f}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{display.of(file.live_path, m_state.home)});
-            pending = true;
-            continue;
+        if (file.own_paths.len == 0) {
+            var cdiag: mox.compose.interp.Diag = .{};
+            const now = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, &cdiag) catch |e| {
+                if (e == error.FormatViolation) {
+                    try ctx.err.print("mox commit: {f}: not committed: {s}\n", .{ display.of(file.live_path, m_state.home), cdiag.capture() orelse "?" });
+                } else {
+                    try ctx.err.print("mox commit: {f}: source does not compose: {s}; not committed\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
+                }
+                pending = true;
+                continue;
+            };
+            if (now == null) {
+                try ctx.err.print("mox commit: {f}: source yields no file; remove the live copy or add the data that filled it; not committed\n", .{display.of(file.live_path, m_state.home)});
+                pending = true;
+                continue;
+            }
         }
 
         var prov = (try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
@@ -1700,7 +1709,7 @@ fn commitRun(
         // the same content the persisted one does, provably -- so prefer it.
         // Any mismatch (source changed since the apply) keeps the persisted
         // stamp, which is the only honest description of what live came from.
-        if (commit_struct.formatOfPath(file.source_base_path) != null) {
+        if (file.format != null) {
             var fresh: std.ArrayList(Segment) = .empty;
             if (mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, &fresh, null) catch null) |now| {
                 if (std.mem.eql(u8, now, last_content)) prov.segments = fresh.items;
@@ -1729,7 +1738,7 @@ fn commitRun(
         // overlay reveals must be seen), so its FileSpace carries the repo-wide
         // configs. Stashing it in spaces[fidx] means baseline, snapshot, and the
         // guard all verify this file over that space with no guard-loop change.
-        if (commit_struct.formatOfPath(file.source_base_path)) |sf| {
+        if (file.format) |sf| {
             if (containsOverlayOrigin(prov.segments)) {
                 spaces[fidx] = try structFileSpace(ctx.alloc, ctx.io, &bindings, file, context.paths.repo_dir);
                 switch (try processStructFile(&cc, &ra, file, fidx, spaces[fidx].?, sf, last_content, live, false)) {
@@ -2493,7 +2502,7 @@ fn partialPerConfig(
     file: mox.source.tree.ManagedFile,
 ) !PartialPerConfig {
     const partial_mod = mox.apply.partial;
-    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
     const out = try arena.alloc(impact.ConfigOutput, per.len);
     var result: PartialPerConfig = .{ .per = out, .violation = null };
     for (per, configs, out) |src, cfg, *o| {
@@ -2528,7 +2537,7 @@ fn partialPerConfig(
 /// side reads as a mismatch (the conservative direction).
 fn partialLiveMatches(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile, composed: []const u8, live: []const u8) bool {
     const partial_mod = mox.apply.partial;
-    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
     const owned = partial_mod.OwnedDoc.parse(arena, format, composed) catch return false;
     const live_doc = partial_mod.OwnedDoc.parse(arena, format, live) catch return false;
     const composed_canon = partialExtract(arena, file, &owned) catch return false;
@@ -2552,7 +2561,7 @@ fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed
     const context = ctx.context.?;
     const partial_mod = mox.apply.partial;
     const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
-    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
     const owned = try partial_mod.OwnedDoc.parse(ctx.alloc, format, composed);
     const canon = try partialExtract(ctx.alloc, file, &owned);
     var pdiag: partial_mod.Diag = .{};
@@ -3809,7 +3818,7 @@ fn addDirectiveTexts(arena: std.mem.Allocator, io: Io, m: *AcceptedTexts, file: 
     const path = try m.ids.canonical(file.source_base_abs);
     try addAccepted(arena, m, path, .{ .text = template, .directive = true });
     const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch return;
-    const marker = mox.dsl.comment.markerForFile(file.source_base_path, content) orelse return;
+    const marker = file.marker(content) orelse return;
     const events = mox.dsl.scanner.scan(arena, content, marker) catch |e| switch (e) {
         error.OutOfMemory => return e,
         // Too long to be a directive the parser accepts: every token counts.
@@ -4731,7 +4740,7 @@ fn processFallbackFile(
     // second case: create one instead of silently doing nothing.
     const baseline = composed orelse {
         switch (kind) {
-            .first_contact => if (commit_struct.formatOfPath(file.source_base_path)) |format| {
+            .first_contact => if (file.format) |format| {
                 const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch &.{};
                 if (layers.len == 0) return createFirstContactOverlay(cc, ra, file, fidx, spaces, format, live, repo_dir);
             },
@@ -4770,7 +4779,7 @@ fn processFallbackFile(
     // manual ("came from a structural merge") rather than routing by key,
     // which is conservative, not unsafe.
     if (!has_secret) {
-        if (commit_struct.formatOfPath(file.source_base_path)) |sf| {
+        if (file.format) |sf| {
             if (containsOverlayOrigin(prov.items)) {
                 spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
                 return processStructFile(cc, ra, file, fidx, spaces[fidx].?, sf, baseline, live, kind == .first_contact);
@@ -4936,7 +4945,7 @@ fn lessPairName(_: void, a: mox.source.tree.AxisTuple.Pair, b: mox.source.tree.A
 fn emptyDocText(format: commit_struct.Format) []const u8 {
     return switch (format) {
         .toml, .ini, .gitconfig => "",
-        .json, .yaml => "{}",
+        .json, .jsonc, .yaml => "{}",
     };
 }
 
@@ -5472,7 +5481,7 @@ fn processPartialFile(
     const shown = display.of(live_path, cc.m_state.home);
     const own_paths = file.own_paths;
     // The walk only attaches own_paths to structured targets.
-    const format = commit_struct.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
 
     var prov: std.ArrayList(Segment) = .empty;
     var cdiag: mox.compose.interp.Diag = .{};
@@ -6239,7 +6248,7 @@ fn editedSinceRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, fi
     };
     if (recorded) |hash| return !std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(live));
     const rec = owned.?;
-    const format = commit_struct.formatOfPath(file.source_base_path) orelse return true;
+    const format = file.format orelse return true;
     const doc = mox.apply.partial.OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.OwnedUnparseable => return true,
@@ -6710,7 +6719,7 @@ fn realignScope(cc: *const ClassCtx, lf: *LoopFile) !bool {
             return true;
         },
     };
-    const marker = mox.dsl.comment.markerForFile(file.source_base_path, content) orelse return false;
+    const marker = file.marker(content) orelse return false;
     const events = mox.dsl.scanner.scan(cc.arena, content, marker) catch |e| switch (e) {
         error.OutOfMemory => return e,
         // Too long to be a directive the parser accepts, loop or not.
@@ -7350,7 +7359,7 @@ fn classifyChoice(
     }
 
     const base_content = try Io.Dir.cwd().readFileAlloc(cc.io, edit.path, cc.arena, .limited(max_file_bytes));
-    const marker = mox.dsl.comment.markerForFile(file.source_base_path, base_content) orelse {
+    const marker = file.marker(base_content) orelse {
         try cc.stdout.print("  {s}: unknown comment marker; cannot synthesize a region; left uncommitted\n", .{desc});
         return .unroutable;
     };

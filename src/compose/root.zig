@@ -7,6 +7,8 @@ pub const catB = @import("catB.zig");
 pub const catC = @import("catC.zig");
 pub const capture = @import("capture.zig");
 pub const interp = @import("interp.zig");
+pub const json_interp = @import("json_interp.zig");
+pub const validate = @import("validate.zig");
 pub const toml_merge = @import("toml_merge.zig");
 pub const json_merge = @import("json_merge.zig");
 pub const yaml_merge = @import("yaml_merge.zig");
@@ -24,4 +26,6 @@ test {
     _ = json_merge;
     _ = yaml_merge;
     _ = ini_merge;
+    _ = json_interp;
+    _ = validate;
 }

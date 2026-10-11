@@ -6,6 +6,7 @@ const match_mod = @import("match.zig");
 const pacifier = @import("pacifier.zig");
 const data_mod = @import("../data/root.zig");
 const interp = @import("interp.zig");
+const json_interp = @import("json_interp.zig");
 const machine = @import("../machine/root.zig");
 const secret = @import("../secret/root.zig");
 const prov_mod = @import("../provenance/root.zig");
@@ -112,6 +113,8 @@ fn emitSecretAwareBody(
     policy: BodyOrigin,
 ) !void {
     var whole_secret = false;
+    // A secret re-expands the body line by line from the same scanner state.
+    const json_start: ?json_interp.ScanState = if (ctx.json) |js| js.* else null;
     const expanded = if (interp_on) blk: {
         const exp = try interp.expandTracked(arena, body, record, ctx);
         whole_secret = exp.secret or exp.placeholder;
@@ -132,6 +135,7 @@ fn emitSecretAwareBody(
     // `single` collapses a body's own trailing newline to one and so drops its
     // empty final segment; `always_add` emits that segment too, doubling the
     // newline exactly as the pre-helper append did (trimmed by the post-loop pop).
+    if (ctx.json) |js| js.* = json_start.?;
     const drop_final = trailing == .single and body.len > 0 and body[body.len - 1] == '\n';
     var lines = std.mem.splitScalar(u8, body, '\n');
     var i: u32 = 0;
@@ -374,9 +378,16 @@ pub fn composeTrackedContent(
 ) !?[]u8 {
     if (!file.has_base) return error.NoBase;
 
-    const ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
+    var ctx = interpCtx(io, file, machine_state_opt, secrets, diag);
+    // A JSONC file expands its captures per string token, across the lines
+    // and bodies this composer emits one at a time.
+    var json_state: json_interp.ScanState = .{};
+    if (file.format) |f| if (f.isJson()) {
+        json_state.dialect = f.jsonDialect();
+        ctx.json = &json_state;
+    };
 
-    const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse {
+    const marker = file.marker(base_content) orelse {
         // No signal at all. Pass through verbatim -- directiveless config
         // files shouldn't need a marker -- but still run `<machine.X>` interp
         // so user-baked facts substitute consistently with the directive
@@ -524,7 +535,7 @@ pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse return null;
+    const marker = file.marker(base_content) orelse return null;
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;
     return wholeFileGateExpr(base_content, parsed);
 }
@@ -598,7 +609,7 @@ pub fn composeGenerator(
     if (!file.has_base or file.source_base_abs.len == 0) return null;
 
     const base_content = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
-    const marker = dsl.comment.markerForFile(file.source_base_path, base_content) orelse return null;
+    const marker = file.marker(base_content) orelse return null;
     // A parse error here is not a generator decision: let the normal compose
     // path re-parse and report it with a source location.
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;

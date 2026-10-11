@@ -76,12 +76,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 });
                 break :blk null;
             },
-            error.UnknownAttributeKey,
-            error.InvalidAttributeValue,
+            error.TomlParseError,
             => blk: {
-                try ctx.err.print("mox rollback: warning: attributes.toml: {s}: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{
-                    walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-                });
+                try ctx.err.print("mox rollback: warning: .mox/attributes.toml: not valid TOML; whole-file restores proceed, partial targets cannot be re-patched\n", .{});
                 break :blk null;
             },
             else => return e,
@@ -177,7 +174,7 @@ fn repatchPartial(
 ) !bool {
     const partial = mox.apply.partial;
     const live_path = file.live_path;
-    const format = mox.source.format.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
     var pdiag: partial.Diag = .{};
 
     const snap_doc = partial.OwnedDoc.parse(ctx.alloc, format, snap_content) catch |e| switch (e) {
@@ -224,7 +221,7 @@ fn repatchPartial(
     _ = partial.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {f} (live file does not parse as {s}; mox cannot patch what it cannot preserve)\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
+            try ctx.err.print("  ERROR   {f} (live file does not parse as {s}; mox cannot patch what it cannot preserve{s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format), partial.liveParseHint(ctx.alloc, format, live_text) });
             failed.* += 1;
             return false;
         },

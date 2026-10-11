@@ -179,12 +179,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             });
             return 1;
         },
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
+        error.TomlParseError,
         => {
-            try ctx.err.print("mox status: attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-            });
+            try ctx.err.print("mox status: .mox/attributes.toml: not valid TOML\n", .{});
             return 1;
         },
         else => return e,
@@ -327,7 +324,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const annot = try ownAnnotation(ctx.alloc, file);
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, null, &diag) catch |e| {
-            if (diag.capture()) |cap| {
+            if (e == error.FormatViolation) {
+                try rows.print("  {s:<8} {s}{s} ({s})\n", .{ Label.err.text(), shown, annot, diag.capture() orelse "?" });
+            } else if (diag.capture()) |cap| {
                 try rows.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ Label.err.text(), shown, annot, @errorName(e), cap });
             } else {
                 try rows.print("  {s:<8} {s}{s} (compose failed: {s})\n", .{ Label.err.text(), shown, annot, @errorName(e) });
@@ -944,7 +943,7 @@ fn writePorcelainField(out: *std.Io.Writer, s: []const u8) !void {
 /// `walkDiag` above already caught and refused on one before this point, so
 /// by the time this runs the tree is known to parse.
 fn printUnboundFacts(ctx: *app.Ctx, repo_dir: []const u8, bindings: *const mox.dsl.resolver.Resolver) !void {
-    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, repo_dir);
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, repo_dir, ctx.context.?.paths.private_dir);
     const outcome = try mox.machine.interview.walkDimensions(ctx.alloc, discovery.dimensions, bindings, .report_only);
     if (outcome.unbound.len == 0) return;
 
@@ -1013,7 +1012,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
     const owned_mod = mox.apply.owned;
     const err_cell: Label = .err;
     // The walk only attaches own_paths to structured targets.
-    const format = mox.source.format.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
 
     const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed) catch |e| switch (e) {

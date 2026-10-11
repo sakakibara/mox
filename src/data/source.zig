@@ -29,12 +29,21 @@ pub fn arrayName(data_source: []const u8) []const u8 {
 
 pub const ScalarError = error{ NonScalarData, DataFileError } || std.mem.Allocator.Error;
 
+/// A data scalar: its rendered text and the TOML type it was written as.
+pub const Scalar = struct {
+    text: []const u8,
+    kind: Kind,
+
+    pub const Kind = enum { string, integer, float, boolean, datetime };
+};
+
 /// Look up a scalar in `data/<file>.toml`, the private layer shadowing the repo
 /// exactly as `mox data` does. `table` (when non-null) then `key` navigate
-/// one level deep. Returns the rendered scalar text (arena-owned), or null when
-/// the file, table, or key is absent (a `| default` may then rescue it). A
-/// present-but-non-scalar value (array/table) is `error.NonScalarData`; a read
-/// or TOML parse failure is `error.DataFileError`.
+/// one level deep. Returns the rendered scalar text (arena-owned) with its
+/// type, or null when the file, table, or key is absent (a `| default` may
+/// then rescue it). A present-but-non-scalar value (array/table) is
+/// `error.NonScalarData`; a read or TOML parse failure is
+/// `error.DataFileError`.
 ///
 /// `file` is a bare stem; the joins are native (`repo_dir`/`data`/`file.toml`),
 /// never a portable key, so the same call is correct on every platform.
@@ -46,7 +55,7 @@ pub fn lookupScalar(
     file: []const u8,
     table: ?[]const u8,
     key: []const u8,
-) ScalarError!?[]const u8 {
+) ScalarError!?Scalar {
     const filename = try std.fmt.allocPrint(arena, "{s}.toml", .{file});
     const content = (try readShadowed(arena, io, repo_dir, private_dir, filename)) orelse return null;
 
@@ -66,8 +75,15 @@ pub fn lookupScalar(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.DataFileError,
     };
-    if (text) |t| return t;
-    return error.NonScalarData;
+    const t = text orelse return error.NonScalarData;
+    const kind: Scalar.Kind = switch (leaf) {
+        .string => .string,
+        .integer => .integer,
+        .float => .float,
+        .boolean => .boolean,
+        else => .datetime,
+    };
+    return .{ .text = t, .kind = kind };
 }
 
 /// Read `data/<filename>` from the private layer if present there, else the
@@ -127,10 +143,13 @@ test "lookupScalar: renders string, int, bool, and a two-level table scalar" {
     const a = arena.allocator();
     const repo = try tmpDataAbs(a, io, &tmp.sub_path, "repo");
 
-    try std.testing.expectEqualStrings("AAAAkey", (try lookupScalar(a, io, repo, "", "signing", null, "personal_key")).?);
-    try std.testing.expectEqualStrings("3", (try lookupScalar(a, io, repo, "", "signing", null, "count")).?);
-    try std.testing.expectEqualStrings("true", (try lookupScalar(a, io, repo, "", "signing", null, "enabled")).?);
-    try std.testing.expectEqualStrings("SUBKEY", (try lookupScalar(a, io, repo, "", "signing", "keys", "personal")).?);
+    try std.testing.expectEqualStrings("AAAAkey", (try lookupScalar(a, io, repo, "", "signing", null, "personal_key")).?.text);
+    try std.testing.expectEqualStrings("3", (try lookupScalar(a, io, repo, "", "signing", null, "count")).?.text);
+    try std.testing.expectEqual(Scalar.Kind.integer, (try lookupScalar(a, io, repo, "", "signing", null, "count")).?.kind);
+    try std.testing.expectEqualStrings("true", (try lookupScalar(a, io, repo, "", "signing", null, "enabled")).?.text);
+    try std.testing.expectEqual(Scalar.Kind.boolean, (try lookupScalar(a, io, repo, "", "signing", null, "enabled")).?.kind);
+    try std.testing.expectEqualStrings("SUBKEY", (try lookupScalar(a, io, repo, "", "signing", "keys", "personal")).?.text);
+    try std.testing.expectEqual(Scalar.Kind.string, (try lookupScalar(a, io, repo, "", "signing", "keys", "personal")).?.kind);
 }
 
 test "lookupScalar: private layer shadows repo" {
@@ -148,9 +167,9 @@ test "lookupScalar: private layer shadows repo" {
     const repo = try tmpDataAbs(a, io, &tmp.sub_path, "repo");
     const priv = try tmpDataAbs(a, io, &tmp.sub_path, "private");
 
-    try std.testing.expectEqualStrings("priv", (try lookupScalar(a, io, repo, priv, "ids", null, "k")).?);
+    try std.testing.expectEqualStrings("priv", (try lookupScalar(a, io, repo, priv, "ids", null, "k")).?.text);
     // Without the private layer the repo value shows through.
-    try std.testing.expectEqualStrings("repo", (try lookupScalar(a, io, repo, "", "ids", null, "k")).?);
+    try std.testing.expectEqualStrings("repo", (try lookupScalar(a, io, repo, "", "ids", null, "k")).?.text);
 }
 
 test "lookupScalar: missing file and missing key are null; non-scalar errors" {

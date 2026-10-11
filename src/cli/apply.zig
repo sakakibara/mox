@@ -118,14 +118,9 @@ pub fn walkTreeOrReport(ctx: *app.Ctx, cmd: []const u8, src_dir: []const u8, hom
             });
             return null;
         },
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
+        error.TomlParseError,
         => {
-            try ctx.err.print("{s}: attributes.toml: {s}: {s}\n", .{
-                cmd,
-                walk_diag.capture() orelse "?",
-                mox.source.attributes.diagText(e),
-            });
+            try ctx.err.print("{s}: .mox/attributes.toml: not valid TOML\n", .{cmd});
             return null;
         },
         error.ReservedAxisName => {
@@ -249,7 +244,7 @@ fn applyPass(
     // `# mox: default`) are loud per-site diagnostics, never a swallowed
     // failure; `discover` itself has no blanket catch, so an actual
     // OOM/IO-class error here propagates like any other.
-    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "mox apply: ", discovery.diagnostics, discovery.default_diagnostics);
     // A structurally invalid source tree must fail here, before the interview
     // persists anything and before scripts/pre runs a single script: neither
@@ -482,10 +477,14 @@ fn applyPass(
         var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &prov, &diag) catch |e| {
-            try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ shown, @errorName(e) });
-            try explainComposeError(ctx.err, "mox apply", e);
-            if (diag.capture()) |cap|
-                try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
+            if (e == error.FormatViolation) {
+                try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, diag.capture() orelse "?" });
+            } else {
+                try ctx.err.print("mox apply: {s}: compose failed: {s}\n", .{ shown, @errorName(e) });
+                try explainComposeError(ctx.err, "mox apply", e);
+                if (diag.capture()) |cap|
+                    try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
+            }
             counts.fail += 1;
             // A file that fails to compose is undecided this run: it may be a
             // generator with a transient syntax slip, and the orphan sweep
@@ -2099,7 +2098,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const shown = try display.alloc(ctx.alloc, live_path, context.paths.home);
     const own_paths = in.file.own_paths;
     // The walk only attaches own_paths to structured targets.
-    const format = mox.source.format.formatOfPath(in.file.source_base_path).?;
+    const format = in.file.format.?;
 
     const mode: mox.apply.applied.Mode = if (in.file.ownership == .disown) .disown else .own;
     var pdiag: partial_mod.Diag = .{};
@@ -2198,7 +2197,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (live file does not parse as {s}; mox cannot patch what it cannot preserve)\n", .{ shown, @tagName(format) });
+            try ctx.err.print("  ERROR   {s} (live file does not parse as {s}; mox cannot patch what it cannot preserve{s})\n", .{ shown, @tagName(format), partial_mod.liveParseHint(ctx.alloc, format, live_text) });
             counts.fail += 1;
             return;
         },

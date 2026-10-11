@@ -224,12 +224,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             });
             return 1;
         },
-        error.UnknownAttributeKey,
-        error.InvalidAttributeValue,
+        error.TomlParseError,
         => {
-            try ctx.err.print("mox diff: attributes.toml: {s}: {s}\n", .{
-                walk_diag.capture() orelse "?", mox.source.attributes.diagText(e),
-            });
+            try ctx.err.print("mox diff: .mox/attributes.toml: not valid TOML\n", .{});
             return 1;
         },
         else => return e,
@@ -261,7 +258,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
-            try ctx.err.print("mox diff: {f}: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
+            try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
             continue;
         }
         // A tracked source matching an ignore rule (itself or a containing
@@ -297,6 +294,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &prov, &diag) catch |e| {
+            if (e == error.FormatViolation) {
+                try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), diag.capture() orelse "?" });
+                continue;
+            }
             try ctx.err.print("mox diff: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
             if (diag.capture()) |cap|
                 try ctx.err.print("mox diff:   failing item: {s}\n", .{cap});
@@ -413,7 +414,7 @@ fn diffPartial(
     const live_path = file.live_path;
     const own_paths = file.own_paths;
     // The walk only attaches own_paths to structured targets.
-    const format = mox.source.format.formatOfPath(file.source_base_path).?;
+    const format = file.format.?;
 
     const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const owned = partial_mod.OwnedDoc.parse(ctx.alloc, format, composed_bytes) catch |e| switch (e) {
@@ -456,7 +457,7 @@ fn diffPartial(
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {f} (live file does not parse as {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format) });
+            try ctx.err.print("  ERROR   {f} (live file does not parse as {s}{s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format), partial_mod.liveParseHint(ctx.alloc, format, live) });
             return;
         },
     };

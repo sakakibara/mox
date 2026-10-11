@@ -6,6 +6,7 @@ const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
 const addtree = @import("addtree.zig");
+const json = @import("json");
 
 const Io = std.Io;
 
@@ -37,6 +38,8 @@ pub const Result = struct {
     outcome: Outcome,
     /// Absolute source path (valid for `.added` and `.already_managed`).
     src_path: []const u8 = "",
+    /// The capture recorded `format = "jsonc"` because the file has comments.
+    recorded_jsonc: bool = false,
 };
 
 /// True when `live_path` names HOME itself (ignoring a trailing separator),
@@ -130,7 +133,7 @@ pub fn addFile(
         // A source head declaring ownership means the target is partially
         // owned; a whole-file capture of it would sweep the program's
         // region into the source.
-        if (try sourceDeclaresOwnership(arena, io, src_path, trimmed)) {
+        if (try sourceDeclaresOwnership(arena, io, repo_dir, src_path, trimmed)) {
             return .{ .outcome = .partial_target, .src_path = src_path };
         }
         return .{ .outcome = .already_managed, .src_path = src_path };
@@ -139,44 +142,100 @@ pub fn addFile(
         else => return e,
     }
 
-    if (std.fs.path.dirname(src_path)) |parent| {
-        Io.Dir.cwd().createDirPath(io, parent) catch {};
-    }
-
     // A live symlink: write its target string as the source content (a regular
     // file, so no symlink enters the repo) and record `symlink = true`.
     if (st.kind == .sym_link) {
+        const fields: mox.source.attributes.Entry = .{ .symlink = true, .seed_once = seed_once };
+        try refuseCommentedAttrs(arena, io, repo_dir, trimmed, fields, attrs_diag);
+        if (std.fs.path.dirname(src_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch {};
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const n = try Io.Dir.cwd().readLink(io, live_path, &buf);
         try mox.apply.write.writeAtomic(io, src_path, buf[0..n], 0o644);
-        try recordAttrs(arena, io, repo_dir, home, live_path, .{ .symlink = true, .seed_once = seed_once }, attrs_diag);
+        try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
         return .{ .outcome = .added, .src_path = src_path };
     }
 
     const content = try Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024));
+    const resolved = try resolveAddFormat(arena, io, repo_dir, trimmed, content, attrs_diag);
     // Write the source with the live file's mode so git carries the exec bit
     // (100755) natively -- otherwise an added executable would land at the
     // umask default and lose +x on the next clone.
     const mode = mox.apply.write.modeOf(st.permissions);
-    try mox.apply.write.writeAtomic(io, src_path, content, mode);
 
     // Record whatever git cannot carry: a mode that is not 0644/0755 (those
-    // travel via git+stat), and the explicit seed-once intent. Keyed by the
-    // portable home-relative key, never the native path.
+    // travel via git+stat), the explicit seed-once intent, and the jsonc
+    // dialect of a `.json` file that holds comments. Keyed by the portable
+    // home-relative key, never the native path.
     const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode, .seed_once = seed_once }, attrs_diag);
-    return .{ .outcome = .added, .src_path = src_path };
+    const fields: mox.source.attributes.Entry = .{ .mode = recorded_mode, .seed_once = seed_once, .jsonc = resolved.record_jsonc };
+    try refuseCommentedAttrs(arena, io, repo_dir, trimmed, fields, attrs_diag);
+    if (std.fs.path.dirname(src_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch {};
+    try mox.apply.write.writeAtomic(io, src_path, content, mode);
+    try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
+    return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc };
 }
 
-/// True when the managed source at `src_path` declares partial ownership in
-/// its head. A malformed head reads as declared: the walk refuses it anyway,
-/// and a whole-file add over it must not proceed.
-fn sourceDeclaresOwnership(arena: std.mem.Allocator, io: Io, src_path: []const u8, key: []const u8) !bool {
-    const format = mox.source.format.formatOfPath(key) orelse return false;
+/// The format a captured target takes: its attributes' `format` when it has
+/// one, and for a `.json` file holding comments -- valid JSONC, invalid
+/// strict JSON -- the jsonc dialect, which the capture then records. A
+/// trailing comma alone is not a reason: the program reads strict JSON.
+const AddFormat = struct { format: ?mox.source.format.Format, record_jsonc: bool = false };
+
+fn resolveAddFormat(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    key: []const u8,
+    live: []const u8,
+    attrs_diag: ?*mox.source.attributes.Diag,
+) !AddFormat {
+    const attrs = try mox.source.attributes.loadStrict(arena, io, repo_dir, attrs_diag);
+    const format = mox.source.format.resolve(key, attrs.jsonc(key));
+    if (format != .json) return .{ .format = format };
+    if (!holdsJsonComment(live)) return .{ .format = format };
+    _ = json.parse(arena, live, .{ .dialect = .jsonc }) catch return .{ .format = format };
+    return .{ .format = .jsonc, .record_jsonc = true };
+}
+
+fn holdsJsonComment(text: []const u8) bool {
+    var t = json.Tokenizer.init(text, .jsonc);
+    while (t.next()) |tok| {
+        if (tok.kind == .comment) return true;
+    }
+    return false;
+}
+
+/// Refuse before any side effect when `fields` would rewrite an attributes
+/// file that holds a comment. `key` is the target's portable key.
+fn refuseCommentedAttrs(
+    arena: std.mem.Allocator,
+    io: Io,
+    repo_dir: []const u8,
+    key: []const u8,
+    fields: mox.source.attributes.Entry,
+    attrs_diag: ?*mox.source.attributes.Diag,
+) !void {
+    const attrs = try mox.source.attributes.loadStrict(arena, io, repo_dir, attrs_diag);
+    if (mox.source.attributes.entryEmpty(fields) and !attrs.released(key)) return;
+    attrs.refuseComments() catch |e| {
+        if (attrs_diag) |d| d.set(attrs.path);
+        return e;
+    };
+}
+
+/// True when the managed source at `src_path` declares partial ownership,
+/// wherever the walk reads it: a strict-JSON target's attributes, every
+/// other target's head. A malformed head reads as declared: the walk refuses
+/// it anyway, and a whole-file add over it must not proceed.
+fn sourceDeclaresOwnership(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_path: []const u8, key: []const u8) !bool {
+    const attrs = try mox.source.attributes.load(arena, io, repo_dir);
+    const entry = attrs.lookup(key) orelse mox.source.attributes.Entry{};
+    const format = mox.source.format.resolve(key, entry.jsonc) orelse return false;
+    const marker = format.marker() orelse return entry.ownership != .none;
     // Bounded like the walk's head read: a declaration lives in the leading
     // block, never past `max_head_bytes`.
     const content = mox.source.tree.readHead(arena, io, Io.Dir.cwd(), src_path) orelse return false;
-    const parsed = mox.source.head.parse(arena, content, mox.source.tree.markerForFormat(format)) catch |e| switch (e) {
+    const parsed = mox.source.head.parse(arena, content, marker) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return true,
     };
@@ -195,13 +254,21 @@ fn recordAttrs(
     fields: mox.source.attributes.Entry,
     attrs_diag: ?*mox.source.attributes.Diag,
 ) !void {
-    if (fields.mode == null and !fields.symlink and !fields.seed_once) return;
     const key = try mox.source.path.liveKeyRelToHome(arena, home, live_path);
-    var attrs = try mox.source.attributes.load(arena, io, repo_dir, attrs_diag);
+    var attrs = try mox.source.attributes.loadStrict(arena, io, repo_dir, attrs_diag);
+    if (mox.source.attributes.entryEmpty(fields) and !attrs.released(key)) return;
     var entry = attrs.lookup(key) orelse mox.source.attributes.Entry{};
+    // A source added again at a released path manages it again.
+    entry.released = false;
     if (fields.mode) |m| entry.mode = m;
     if (fields.symlink) entry.symlink = true;
     if (fields.seed_once) entry.seed_once = true;
+    if (fields.jsonc) entry.jsonc = true;
+    if (fields.ownership != .none) {
+        entry.ownership = fields.ownership;
+        entry.paths = fields.paths;
+    }
+    if (fields.when) |w| entry.when = w;
     try attrs.set(key, entry);
     try attrs.write(io, repo_dir);
 }
@@ -229,6 +296,8 @@ pub const OwnResult = struct {
     detail: []const u8 = "",
     /// Top-level live entries outside the declaration (valid for `.added`).
     unowned_top: usize = 0,
+    /// The capture recorded `format = "jsonc"` because the file has comments.
+    recorded_jsonc: bool = false,
 };
 
 /// Take partial ownership of a live file: extract the declared paths' raw
@@ -285,8 +354,6 @@ pub fn addOwnFile(
     if (mox.source.path.keyEscapes(trimmed)) return .{ .outcome = .outside_home };
     if (intoOverlayDir(trimmed)) return .{ .outcome = .into_overlay_dir };
 
-    const format = mox.source.format.formatOfPath(trimmed) orelse return .{ .outcome = .not_structured };
-
     const src_path = try std.fs.path.join(arena, &.{ repo_dir, "src", trimmed });
     if (Io.Dir.cwd().access(io, src_path, .{})) |_| {
         return .{ .outcome = .already_managed, .src_path = src_path };
@@ -294,6 +361,10 @@ pub fn addOwnFile(
         error.FileNotFound => {},
         else => return e,
     }
+
+    const live = try Io.Dir.cwd().readFileAlloc(io, live_target, arena, .limited(64 * 1024 * 1024));
+    const resolved = try resolveAddFormat(arena, io, repo_dir, trimmed, live, attrs_diag);
+    const format = resolved.format orelse return .{ .outcome = .not_structured };
 
     const partial = mox.apply.partial;
     var bad_raw: []const u8 = "";
@@ -306,8 +377,6 @@ pub fn addOwnFile(
         error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
     };
     const all_paths = try std.mem.concat(arena, mox.source.tree.OwnPath, &.{ content_paths, absent_paths });
-
-    const live = try Io.Dir.cwd().readFileAlloc(io, live_target, arena, .limited(64 * 1024 * 1024));
 
     var diag: partial.Diag = .{};
     const extracted = partial.extractOwnedSource(arena, format, live, content_paths, &diag) catch |e| switch (e) {
@@ -336,25 +405,32 @@ pub fn addOwnFile(
         return .{ .outcome = .extract_failed, .detail = "extracted source does not reproduce the live owned content" };
     }
 
-    if (std.fs.path.dirname(src_path)) |parent| {
-        Io.Dir.cwd().createDirPath(io, parent) catch {};
-    }
     const mode = mox.apply.write.modeOf(st.permissions);
     const own_list = try std.mem.concat(arena, []const u8, &.{ own_raws, absent_raws });
-    const source_text = try std.mem.concat(arena, u8, &.{
+    const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
+    // Strict JSON has no comments: its declaration and gate are attributes,
+    // its source the owned spans alone.
+    const fields: mox.source.attributes.Entry = if (format == .json)
+        .{ .mode = recorded_mode, .ownership = .own, .paths = own_list, .when = gate }
+    else
+        .{ .mode = recorded_mode, .jsonc = resolved.record_jsonc };
+    try refuseCommentedAttrs(arena, io, repo_dir, trimmed, fields, attrs_diag);
+    const source_text = if (format == .json) extracted else try std.mem.concat(arena, u8, &.{
         try headDirectiveLines(arena, format, "own", own_list),
         try gateLine(arena, format, gate),
         extracted,
     });
+    if (std.fs.path.dirname(src_path)) |parent| {
+        Io.Dir.cwd().createDirPath(io, parent) catch {};
+    }
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
-
-    const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode }, attrs_diag);
+    try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
 
     return .{
         .outcome = .added,
         .src_path = src_path,
         .unowned_top = partial.unownedTopLevelCount(&live_doc, all_paths),
+        .recorded_jsonc = resolved.record_jsonc,
     };
 }
 
@@ -366,7 +442,7 @@ fn headDirectiveLines(
     keyword: []const u8,
     list: []const []const u8,
 ) ![]const u8 {
-    const marker = mox.source.tree.markerForFormat(format);
+    const marker = format.marker().?;
     var out: std.ArrayList(u8) = .empty;
     for (list) |raw| {
         try out.appendSlice(arena, marker);
@@ -389,7 +465,7 @@ fn gateLine(
     gate: ?[]const u8,
 ) ![]const u8 {
     const expr = gate orelse return "";
-    const marker = mox.source.tree.markerForFormat(format);
+    const marker = format.marker().?;
     return std.fmt.allocPrint(arena, "{s} mox: when {s}\n", .{ marker, expr });
 }
 
@@ -440,8 +516,6 @@ pub fn addDisownFile(
     if (mox.source.path.keyEscapes(trimmed)) return .{ .outcome = .outside_home };
     if (intoOverlayDir(trimmed)) return .{ .outcome = .into_overlay_dir };
 
-    const format = mox.source.format.formatOfPath(trimmed) orelse return .{ .outcome = .not_structured };
-
     const src_path = try std.fs.path.join(arena, &.{ repo_dir, "src", trimmed });
     if (Io.Dir.cwd().access(io, src_path, .{})) |_| {
         return .{ .outcome = .already_managed, .src_path = src_path };
@@ -450,6 +524,10 @@ pub fn addDisownFile(
         else => return e,
     }
 
+    const live = try Io.Dir.cwd().readFileAlloc(io, live_target, arena, .limited(64 * 1024 * 1024));
+    const resolved = try resolveAddFormat(arena, io, repo_dir, trimmed, live, attrs_diag);
+    const format = resolved.format orelse return .{ .outcome = .not_structured };
+
     const partial = mox.apply.partial;
     var bad_raw: []const u8 = "";
     const paths = parseOwnRaws(arena, disown_raws, &bad_raw) catch |e| switch (e) {
@@ -457,7 +535,6 @@ pub fn addDisownFile(
         error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
     };
 
-    const live = try Io.Dir.cwd().readFileAlloc(io, live_target, arena, .limited(64 * 1024 * 1024));
     var diag: partial.Diag = .{};
     const loc = partial.locateSpans(arena, format, live, paths, &diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -515,21 +592,25 @@ pub fn addDisownFile(
         };
     }
 
-    if (std.fs.path.dirname(src_path)) |parent| {
-        Io.Dir.cwd().createDirPath(io, parent) catch {};
-    }
     const mode = mox.apply.write.modeOf(st.permissions);
-    const source_text = try std.mem.concat(arena, u8, &.{
+    const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
+    const fields: mox.source.attributes.Entry = if (format == .json)
+        .{ .mode = recorded_mode, .ownership = .disown, .paths = disown_raws, .when = gate }
+    else
+        .{ .mode = recorded_mode, .jsonc = resolved.record_jsonc };
+    try refuseCommentedAttrs(arena, io, repo_dir, trimmed, fields, attrs_diag);
+    const source_text = if (format == .json) body else try std.mem.concat(arena, u8, &.{
         try headDirectiveLines(arena, format, "disown", disown_raws),
         try gateLine(arena, format, gate),
         body,
     });
+    if (std.fs.path.dirname(src_path)) |parent| {
+        Io.Dir.cwd().createDirPath(io, parent) catch {};
+    }
     try mox.apply.write.writeAtomic(io, src_path, source_text, mode);
+    try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
 
-    const recorded_mode: ?u32 = if (mode != 0o644 and mode != 0o755) mode else null;
-    try recordAttrs(arena, io, repo_dir, home, live_path, .{ .mode = recorded_mode }, attrs_diag);
-
-    return .{ .outcome = .added, .src_path = src_path };
+    return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc };
 }
 
 fn parseOwnRaws(
@@ -665,6 +746,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const result = addFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, a.seed_once, &attrs_diag) catch |e| switch (e) {
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
+        error.AttributesHaveComments,
         => {
             try ctx.err.print("mox add: attributes.toml: {s}: {s}\n", .{
                 attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
@@ -676,6 +758,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     switch (result.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {f}\n", .{ shown, display.of(result.src_path, home) });
+            if (result.recorded_jsonc) try noteJsonc(ctx, shown);
             if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(live_path))) {
                 try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{shown});
             }
@@ -719,6 +802,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 }
 
+/// Say why a `.json` capture was recorded as jsonc.
+fn noteJsonc(ctx: *app.Ctx, shown: []const u8) !void {
+    try ctx.err.print("mox add: {s}: it has comments, so format = \"jsonc\" is recorded for it in .mox/attributes.toml\n", .{shown});
+}
+
 /// The `mox add --own` flow: extract, validate, record, report.
 fn runOwn(
     ctx: *app.Ctx,
@@ -734,6 +822,7 @@ fn runOwn(
     const r = addOwnFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, own_raws, absent_raws, gate, &attrs_diag) catch |e| switch (e) {
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
+        error.AttributesHaveComments,
         => {
             try ctx.err.print("mox add: attributes.toml: {s}: {s}\n", .{
                 attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
@@ -745,6 +834,7 @@ fn runOwn(
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {f} (own: {d} key-path(s))\n", .{ shown, display.of(r.src_path, home), own_raws.len + absent_raws.len });
+            if (r.recorded_jsonc) try noteJsonc(ctx, shown);
             if (r.unowned_top > 0) {
                 try ctx.out.print("  {d} top-level live entr{s} remain{s} unowned (the program's region)\n", .{
                     r.unowned_top,
@@ -816,6 +906,7 @@ fn runDisown(
     const r = addDisownFile(ctx.alloc, ctx.io, context.paths.repo_dir, home, live_path, disown_raws, gate, &attrs_diag) catch |e| switch (e) {
         error.UnknownAttributeKey,
         error.InvalidAttributeValue,
+        error.AttributesHaveComments,
         => {
             try ctx.err.print("mox add: attributes.toml: {s}: {s}\n", .{
                 attrs_diag.capture() orelse "?", mox.source.attributes.diagText(e),
@@ -827,6 +918,7 @@ fn runDisown(
     switch (r.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {f} (disown: {d} key-path(s) left to the program)\n", .{ shown, display.of(r.src_path, home), disown_raws.len });
+            if (r.recorded_jsonc) try noteJsonc(ctx, shown);
             buildInitialCoupling(ctx, "add");
             return 0;
         },
@@ -1048,7 +1140,7 @@ test "addFile: a restrictive mode is recorded in attributes; 0644/0755 are not" 
     chmod(rc, 0o644);
     try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, rc, false, null)).outcome);
 
-    var attrs = try mox.source.attributes.load(a, io, repo, null);
+    var attrs = try mox.source.attributes.load(a, io, repo);
     try testing.expectEqual(@as(u32, 0o600), attrs.mode(".ssh/config").?);
     try testing.expect(attrs.mode("tool") == null);
     try testing.expect(attrs.mode(".zshrc") == null);
@@ -1075,7 +1167,7 @@ test "addFile: --seed-once records seed_once; a plain add does not" {
     const plain = try std.fs.path.join(a, &.{ home, ".zshrc" });
     try testing.expectEqual(Outcome.added, (try addFile(a, io, repo, home, plain, false, null)).outcome);
 
-    var attrs = try mox.source.attributes.load(a, io, repo, null);
+    var attrs = try mox.source.attributes.load(a, io, repo);
     try testing.expect(attrs.seedOnce(".config/app.local"));
     try testing.expect(!attrs.seedOnce(".zshrc"));
 }

@@ -2731,14 +2731,15 @@ test "compose catA json: orphan with no matching overlay is absent" {
     try std.testing.expect((try result) == null);
 }
 
-test "compose catA json: single base, no overlays passes through verbatim" {
+test "compose catA jsonc: single base, no overlays passes through verbatim" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // A JSON file with no overlays should be returned byte-for-byte,
-    // including JSONC comments and original formatting. Going through
+    // A JSONC file with no overlays should be returned byte-for-byte,
+    // including its comments and original formatting. Going through
     // parse-and-re-emit would drop the comments, which is wrong for a
     // pure pass-through.
+    try writeFile(io, tmp.dir, ".mox/attributes.toml", "[\".config/zed/settings.json\"]\nformat = \"jsonc\"\n");
     const original =
         "{\n" ++
         "  // theme is intentionally dark\n" ++
@@ -2798,12 +2799,13 @@ test "compose catA json: <machine.X> in base content interpolates" {
     try std.testing.expect(std.mem.indexOf(u8, out, "<machine.email>") == null);
 }
 
-test "compose catA json: file with mox directives is processed Cat-B-style" {
+test "compose catA jsonc: file with mox directives is processed Cat-B-style" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Cat A JSON files with `// mox:` directives should route through catB
-    // so users can express inline conditional sections (mirrors TOML).
+    // JSONC files with `// mox:` directives route through catB so users can
+    // express inline conditional sections (mirrors TOML).
+    try writeFile(io, tmp.dir, ".mox/attributes.toml", "[\".config/Code/settings.json\"]\nformat = \"jsonc\"\n");
     try writeFile(io, tmp.dir, "src/.config/Code/settings.json", "{\n" ++
         "  \"editor\": { \"formatOnSave\": true },\n" ++
         "  // mox: include \"work-extras.json\" when profile=work\n" ++
@@ -2831,6 +2833,7 @@ test "compose catA json: jsonc layers merge to plain JSON output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try writeFile(io, tmp.dir, ".mox/attributes.toml", "[\".config/zed/settings.json\"]\nformat = \"jsonc\"\n");
 
     // JSONC input (comments + trailing commas) is accepted on the merge
     // path, but the merged output is plain pretty-printed JSON with no
@@ -4898,9 +4901,9 @@ test "compose catA: a region in a merged json, yaml or gitconfig source is refus
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeFile(io, tmp.dir, "src/app.json", "{\n  // mox: when profile=zzz\n  \"gated\": 1\n  // mox: end\n}\n");
-    try writeFile(io, tmp.dir, "src/app.json.d/os=darwin.json", "{\"other\": 2}\n");
-    try expectRegionRefused(io, &tmp, a, "app.json:2:");
+    try writeFile(io, tmp.dir, "src/app.jsonc", "{\n  // mox: when profile=zzz\n  \"gated\": 1\n  // mox: end\n}\n");
+    try writeFile(io, tmp.dir, "src/app.jsonc.d/os=darwin.jsonc", "{\"other\": 2}\n");
+    try expectRegionRefused(io, &tmp, a, "app.jsonc:2:");
 
     try tmp.dir.deleteTree(io, "src");
     try writeFile(io, tmp.dir, "src/app.yaml", "base: 1\n# mox: when profile=zzz\ngated: 1\n# mox: end\n");
@@ -5079,7 +5082,7 @@ test "compose catA toml: under a held whole-file gate a region still selects, an
     try std.testing.expect(try composeUnderOsProfile(a, &tmp, "linux", "work") == null);
 }
 
-test "compose catA json: under a held whole-file gate a region still selects, and a closed gate omits the file" {
+test "compose catA jsonc: under a held whole-file gate a region still selects, and a closed gate omits the file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5087,7 +5090,7 @@ test "compose catA json: under a held whole-file gate a region still selects, an
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeFile(io, tmp.dir, "src/g.json", "// mox: when os=macos\n{\n  \"a\": 1,\n  // mox: when profile=work\n  \"b\": 2,\n  // mox: end\n  \"c\": 3\n}\n");
+    try writeFile(io, tmp.dir, "src/g.jsonc", "// mox: when os=macos\n{\n  \"a\": 1,\n  // mox: when profile=work\n  \"b\": 2,\n  // mox: end\n  \"c\": 3\n}\n");
 
     try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}\n", (try composeUnderOsProfile(a, &tmp, "macos", "work")).?);
     try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"c\": 3\n}\n", (try composeUnderOsProfile(a, &tmp, "macos", "personal")).?);
@@ -5682,4 +5685,48 @@ test "provenance: a placeholder compose attributes a loop row's secret line as a
     try std.testing.expectEqual(@as(?u32, 0), prov.items[0].origin.loop.site);
     try std.testing.expect(prov.items[1].origin == .secret);
     try std.testing.expect(prov.items[2].origin != .loop);
+}
+
+test "compose catA jsonc: a .jsonc merge reads every layer as JSONC and emits plain JSON; head directives are its comments" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/app.jsonc", "// mox: own theme\n{\n  // base\n  \"theme\": \"a\",\n}\n");
+    try writeFile(io, tmp.dir, "src/app.jsonc.d/os=darwin.jsonc", "{ \"theme\": \"b\", /* overlay */ }\n");
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    try std.testing.expectEqual(mox.source.format.Format.jsonc, tree.files[0].format.?);
+    try std.testing.expectEqual(mox.source.head.Ownership.own, tree.files[0].ownership);
+    var b = std.StringHashMap([]const u8).init(a);
+    var b_r: mox.dsl.resolver.Resolver = .{ .live = &.{ .bindings = &b } };
+    try b.put("os", "darwin");
+    try std.testing.expectEqualStrings("{\n  \"theme\": \"b\"\n}\n", (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?);
+    // One layer keeps its comments; the head directive never reaches output.
+    try b.put("os", "linux");
+    try std.testing.expectEqualStrings("{\n  // base\n  \"theme\": \"a\",\n}\n", (try mox.compose.composeFile(a, io, tree.files[0], &b_r, null, null)).?);
+}
+
+test "walk: format = \"jsonc\" resolves a .json target's dialect, which a strict-JSON target never has" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeFile(io, tmp.dir, "src/a.json", "{}\n");
+    try writeFile(io, tmp.dir, "src/b.json", "{}\n");
+    try writeFile(io, tmp.dir, ".mox/attributes.toml", "[\"b.json\"]\nformat = \"jsonc\"\n");
+    const src_dir = try srcPathAlloc(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(src_dir);
+    const tree = try mox.source.tree.walk(a, io, src_dir, "/home/me");
+    try std.testing.expectEqual(mox.source.format.Format.json, tree.files[0].format.?);
+    try std.testing.expectEqual(mox.source.format.Format.jsonc, tree.files[1].format.?);
+    try std.testing.expect(tree.files[0].marker("// mox: own a\n{}\n") == null);
+    try std.testing.expectEqualStrings("//", tree.files[1].marker("{}").?);
 }

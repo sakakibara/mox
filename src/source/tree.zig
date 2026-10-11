@@ -188,10 +188,29 @@ pub const ManagedFile = struct {
     /// partial write before it lands. Empty means no hook.
     check_argv: []const []const u8 = &.{},
     /// Non-empty when the base head carries a directive-looking line the
-    /// walk cannot honor (an unstructured target): the walk continues, and
-    /// each command reports this file as its own error instead of aborting
-    /// the whole run.
+    /// walk cannot honor (an unstructured target), or the target's
+    /// `.mox/attributes.toml` entry breaks the schema: the walk continues,
+    /// and each command reports this file as its own error instead of
+    /// aborting the whole run.
     head_error: []const u8 = "",
+    /// The structured format, and for the JSON family the dialect, resolved
+    /// by the walk from the target key and its `format` attribute. Null for
+    /// an unstructured target.
+    format: ?format_mod.Format = null,
+    /// A strict-JSON target's whole-file gate, held in `.mox/attributes.toml`
+    /// as `when`. Every other target gates in its own head.
+    gate: ?[]const u8 = null,
+    /// A strict-JSON target's interview defaults, held in
+    /// `.mox/attributes.toml` as `defaults`.
+    defaults: []const attributes.Default = &.{},
+
+    /// The comment marker directives in this file are written in, or null
+    /// when it has none: a structured format's own marker (none for strict
+    /// JSON), else the one inferred from the source's name and content.
+    pub fn marker(self: ManagedFile, content: []const u8) ?[]const u8 {
+        if (self.format) |f| return f.marker();
+        return dsl.comment.markerForFile(self.source_base_path, content);
+    }
 
     /// Absolute path of the TOML data source a `# mox: for` in this file
     /// names: a `/`-bearing key is repo-relative, with the private layer
@@ -228,6 +247,10 @@ pub const ManagedTree = struct {
     /// live entries in these directories that mox does not produce are removed
     /// (snapshotted first). The marker itself is never materialized.
     exact_dirs: []const []const u8 = &.{},
+    /// Live paths `.mox/attributes.toml` holds a tombstone (`released = true`)
+    /// for and no source manages: every machine keeps the live file and
+    /// forgets its records.
+    released: []const []const u8 = &.{},
 };
 
 /// Marker filename that makes its containing directory exact.
@@ -316,19 +339,25 @@ pub fn walkDiag(
     home_dir: []const u8,
     diag: ?*Diag,
 ) !ManagedTree {
-    return walkExcluding(arena, io, src_dir, home_dir, &.{}, diag);
+    return walkExcluding(arena, io, src_dir, std.fs.path.dirname(src_dir) orelse "", home_dir, &.{}, null, diag);
 }
 
 /// `walkDiag`, skipping the top-level directories named in `exclude`: they
 /// are never entered, so nothing under them is a managed file or a walk
-/// error. The private root keeps its `data/` beside its sources, where the
-/// repo keeps its own outside `src/`.
+/// error. The private root keeps its `data/` and `.mox/` beside its sources,
+/// where the repo keeps its own outside `src/`. `attrs_root` is the
+/// directory whose `.mox/attributes.toml` holds this tree's attributes.
+/// `pair_with` names the source paths (`src/...`) of another layer's files:
+/// a `.d/` beside no base here still pairs with one of them, regions alone
+/// included, so the private layer can vary a repo file it has no base for.
 pub fn walkExcluding(
     arena: std.mem.Allocator,
     io: Io,
     src_dir: []const u8,
+    attrs_root: []const u8,
     home_dir: []const u8,
     exclude: []const []const u8,
+    pair_with: ?*const std.StringHashMap(void),
     diag: ?*Diag,
 ) !ManagedTree {
     var files: std.ArrayList(ManagedFile) = .empty;
@@ -342,16 +371,12 @@ pub fn walkExcluding(
     });
     defer dir.close(io);
 
-    // Repo root is the parent of `src/`; `.mox/attributes.toml` there records
-    // the modes git cannot carry (0o600/0o444). It is authoritative for those.
+    // Repo root is the parent of `src/`. A schema violation in
+    // `.mox/attributes.toml` is the named target's error, never the walk's.
     const repo_dir = std.fs.path.dirname(src_dir) orelse "";
-    var attrs_diag: attributes.Diag = .{};
-    const attrs = attributes.load(arena, io, repo_dir, &attrs_diag) catch |e| {
-        if (diag) |d| if (attrs_diag.capture()) |cap| d.set(cap);
-        return e;
-    };
+    const attrs = try attributes.load(arena, io, attrs_root);
 
-    try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs, exclude, diag);
+    try walkDir(arena, io, &files, &exact, dir, "src", src_dir, home_dir, &attrs, exclude, pair_with, diag);
 
     // Stamp every walked file with the repo root (parent of `src/`).
     const out = try files.toOwnedSlice(arena);
@@ -363,8 +388,42 @@ pub fn walkExcluding(
     // Live paths are unique, so ordering by them is total and stable.
     std.mem.sort(ManagedFile, out, {}, livePathLess);
     for (out) |*f| f.repo_dir = repo_dir;
-    return .{ .files = out, .exact_dirs = try exact.toOwnedSlice(arena) };
+    return .{
+        .files = out,
+        .exact_dirs = try exact.toOwnedSlice(arena),
+        .released = try releasedLive(arena, &attrs, out, home_dir),
+    };
 }
+
+/// The live paths of every tombstone no walked source claims. A tombstone
+/// beside a source is that file's error instead
+/// (`released_with_source_error`).
+fn releasedLive(
+    arena: std.mem.Allocator,
+    attrs: *const attributes.Attributes,
+    files: []const ManagedFile,
+    home_dir: []const u8,
+) ![]const []const u8 {
+    var claimed = std.StringHashMap(void).init(arena);
+    for (files) |f| try claimed.put(f.live_path, {});
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = attrs.map.iterator();
+    while (it.next()) |kv| {
+        if (!kv.value_ptr.released) continue;
+        const live = try path_mod.joinKeyOnto(arena, home_dir, kv.key_ptr.*);
+        if (claimed.contains(live)) continue;
+        try out.append(arena, live);
+    }
+    std.mem.sort([]const u8, out.items, {}, lessStr);
+    return out.toOwnedSlice(arena);
+}
+
+fn lessStr(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// The error a released target reports when a source manages it again.
+pub const released_with_source_error = "released, but a source exists: run mox add to manage it again, or delete the source";
 
 fn walkDir(
     arena: std.mem.Allocator,
@@ -377,6 +436,7 @@ fn walkDir(
     home_dir: []const u8,
     attrs: *const attributes.Attributes,
     exclude: []const []const u8,
+    pair_with: ?*const std.StringHashMap(void),
     diag: ?*Diag,
 ) !void {
     var file_names: std.ArrayList([]const u8) = .empty;
@@ -443,7 +503,7 @@ fn walkDir(
         else
             rel;
         const explicit_mode = attrs.mode(target_key);
-        const decl = try headChecked(arena, io, .{ .dir = dir, .name = name }, target_key, attrs, diag);
+        const decl = try declChecked(arena, io, .{ .dir = dir, .name = name }, target_key, attrs, diag);
         try files.append(arena, .{
             .source_base_path = rel,
             .source_base_abs = abs,
@@ -459,6 +519,9 @@ fn walkDir(
             .own_paths = decl.own_paths,
             .check_argv = decl.check_argv,
             .head_error = decl.head_error,
+            .format = decl.format,
+            .gate = decl.gate,
+            .defaults = decl.defaults,
         });
     }
 
@@ -474,7 +537,7 @@ fn walkDir(
                 .follow_symlinks = false,
             });
             defer sub.close(io);
-            try walkDir(arena, io, files, exact, sub, sub_rel, sub_abs, home_dir, attrs, &.{}, diag);
+            try walkDir(arena, io, files, exact, sub, sub_rel, sub_abs, home_dir, attrs, &.{}, pair_with, diag);
             continue;
         }
         if (paired.contains(name)) continue;
@@ -495,13 +558,14 @@ fn walkDir(
         // Without that signal, treat the dir as a regular subdirectory and
         // recurse -- otherwise legitimate convention-named dirs like
         // `~/.config/fish/conf.d/` get hijacked, hiding their real contents.
-        if (overlays.len == 0) {
+        const pairs_other = if (pair_with) |pw| pw.contains(rel) else false;
+        if (overlays.len == 0 and !pairs_other) {
             const sub_rel = try path_mod.joinKey(arena, &.{ rel_prefix, name });
             const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, name });
             // Recurse, then close. We can't use `defer .close()` here because
             // we need to release the handle before the recursive walk also
             // opens the same dir -- Zig's Dir.openDir doesn't reuse handles.
-            try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs, &.{}, diag);
+            try walkDir(arena, io, files, exact, dot_d_dir, sub_rel, sub_abs, home_dir, attrs, &.{}, pair_with, diag);
             dot_d_dir.close(io);
             continue;
         }
@@ -510,7 +574,11 @@ fn walkDir(
         const live = try path_mod.toLivePath(arena, rel, home_dir);
         // No base means no head to declare ownership in: a gated file that
         // is also partial carries its directives in a base whose whole-file
-        // gate conditions the machine, never in an overlay.
+        // gate conditions the machine, never in an overlay -- or, for strict
+        // JSON, in its `.mox/attributes.toml` entry.
+        const target_key = if (std.mem.startsWith(u8, rel, "src/")) rel["src/".len..] else rel;
+        const explicit_mode = attrs.mode(target_key);
+        const decl = try declChecked(arena, io, null, target_key, attrs, diag);
         try files.append(arena, .{
             .source_base_path = rel,
             .source_base_abs = "",
@@ -518,6 +586,15 @@ fn walkDir(
             .has_base = false,
             .overlays = overlays,
             .regions = regions,
+            .mode = explicit_mode orelse 0o644,
+            .mode_explicit = explicit_mode != null,
+            .ownership = decl.ownership,
+            .own_paths = decl.own_paths,
+            .check_argv = decl.check_argv,
+            .head_error = decl.head_error,
+            .format = decl.format,
+            .gate = decl.gate,
+            .defaults = decl.defaults,
         });
     }
 }
@@ -536,6 +613,9 @@ const Decl = struct {
     own_paths: []const OwnPath = &.{},
     check_argv: []const []const u8 = &.{},
     head_error: []const u8 = "",
+    format: ?format_mod.Format = null,
+    gate: ?[]const u8 = null,
+    defaults: []const attributes.Default = &.{},
 };
 
 /// Per-file diagnosis for a head declaration on an unstructured target. A
@@ -552,12 +632,6 @@ pub const unstructured_head_error = "head directives require a structured target
 /// it says).
 pub const wrong_marker_head_error = "a head directive or whole-file gate is spelled with a comment marker other than this file's own; it has no effect";
 
-/// The comment marker head directives use for a structured format: `#`
-/// everywhere except JSON, whose sources are JSONC (`//`).
-pub fn markerForFormat(format: format_mod.Format) []const u8 {
-    return if (format == .json) "//" else "#";
-}
-
 /// Markers probed on an unstructured base, so a head declaration there is a
 /// walk error rather than silently inert content. Compose is loud only for
 /// a declaration in the file's own effective marker (the DSL rejects the
@@ -565,22 +639,94 @@ pub fn markerForFormat(format: format_mod.Format) []const u8 {
 /// the live file, which is why this probe exists.
 const probe_markers = [_][]const u8{ "#", "//", ";", "--" };
 
+/// Resolve a target's format and read its declaration: a strict-JSON
+/// target's from its `.mox/attributes.toml` entry, every other one's from
+/// its base head. An attributes entry that breaks the schema, or a tombstone
+/// beside a source, is this file's error alone.
+fn declChecked(
+    arena: std.mem.Allocator,
+    io: Io,
+    base: ?BaseRef,
+    target_key: []const u8,
+    attrs: *const attributes.Attributes,
+    diag: ?*Diag,
+) !Decl {
+    const entry = attrs.lookup(target_key) orelse attributes.Entry{};
+    const format = format_mod.resolve(target_key, entry.jsonc);
+    if (entry.err.len > 0) return .{ .head_error = entry.err, .format = format };
+    if (entry.released) return .{ .head_error = released_with_source_error, .format = format };
+    if (format == .json) {
+        var decl = try attributeDecl(arena, io, base, target_key, entry, attrs);
+        decl.format = format;
+        return decl;
+    }
+    const b = base orelse return .{ .format = format };
+    var decl = try headChecked(arena, io, b, target_key, format, attrs, diag);
+    decl.format = format;
+    return decl;
+}
+
+/// A strict-JSON target's declaration from its attributes entry: the same
+/// rules a head declaration obeys, each violation this file's error.
+fn attributeDecl(
+    arena: std.mem.Allocator,
+    io: Io,
+    base: ?BaseRef,
+    target_key: []const u8,
+    entry: attributes.Entry,
+    attrs: *const attributes.Attributes,
+) !Decl {
+    var decl: Decl = .{ .gate = entry.when, .defaults = entry.defaults };
+    if (entry.when) |w| {
+        _ = dsl.axis.parseString(arena, w) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .head_error = try std.fmt.allocPrint(arena, ".mox/attributes.toml: when = \"{s}\" does not parse as an axis expression", .{w}) },
+        };
+    }
+    if (entry.ownership == .none) return decl;
+    if (attrs.symlink(target_key)) return .{ .head_error = ".mox/attributes.toml: own cannot combine with symlink" };
+    if (attrs.seedOnce(target_key)) return .{ .head_error = ".mox/attributes.toml: own cannot combine with seed_once" };
+    if (base) |b| {
+        if (readHead(arena, io, b.dir, b.name)) |content| {
+            if (isGeneratorContent(arena, content)) return .{ .head_error = ".mox/attributes.toml: own cannot apply to a generator source" };
+        }
+    }
+    const out = try arena.alloc(OwnPath, entry.paths.len);
+    for (entry.paths, out) |raw, *o| {
+        const segments = keypath.parse(arena, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .head_error = try std.fmt.allocPrint(arena, ".mox/attributes.toml: {s} does not parse as a dotted key path", .{raw}) },
+        };
+        o.* = .{ .raw = raw, .segments = segments };
+    }
+    var overlap_diag: partial.Diag = .{};
+    partial.checkPathOverlap(out, &overlap_diag) catch {
+        return .{ .head_error = try std.fmt.allocPrint(arena, ".mox/attributes.toml: {s}", .{overlap_diag.text()}) };
+    };
+    decl.ownership = entry.ownership;
+    decl.own_paths = out;
+    decl.check_argv = entry.check;
+    return decl;
+}
+
 /// Read and validate a base file's head declaration. No directives yields an
 /// empty declaration; a declaration is rejected on an unstructured target,
 /// combined with `symlink` or `seed_once`, on a generator source, on a
 /// malformed directive line, or when a path fails the key grammar -- `diag`
-/// names the target (and the offending path).
+/// names the target (and the offending path). `format` is the target's
+/// resolved format, never strict JSON, which declares in its attributes.
 fn headChecked(
     arena: std.mem.Allocator,
     io: Io,
     base: BaseRef,
     target_key: []const u8,
+    format_opt: ?format_mod.Format,
     attrs: *const attributes.Attributes,
     diag: ?*Diag,
 ) !Decl {
     const content = readHead(arena, io, base.dir, base.name) orelse return .{};
 
-    const format = format_mod.formatOfPath(target_key) orelse {
+    const format = format_opt orelse {
         // Directives on an unstructured target cannot take effect. A prose
         // line may merely LOOK like one, so this is a per-file error (the
         // walk continues), probed under every marker spelling.
@@ -595,6 +741,7 @@ fn headChecked(
         }
         return .{};
     };
+    const real_marker = format.marker().?;
 
     // A structured target has exactly one real marker (unlike the
     // unstructured case above, where no marker is "correct"): probe every
@@ -603,7 +750,6 @@ fn headChecked(
     // unstructured probe's loop, but the signal is own/disown OR gate here,
     // since a gate is a legitimate head construct on any target and only
     // the WRONG marker makes it garbage.
-    const real_marker = markerForFormat(format);
     for (probe_markers) |marker| {
         if (std.mem.eql(u8, marker, real_marker)) continue;
         const probed = head.parse(arena, content, marker) catch |e| switch (e) {
@@ -615,7 +761,7 @@ fn headChecked(
         }
     }
 
-    const parsed = head.parse(arena, content, markerForFormat(format)) catch |e| switch (e) {
+    const parsed = head.parse(arena, content, real_marker) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.EmptyDirectivePath => {
             setDiag(diag, target_key);
@@ -646,7 +792,7 @@ fn headChecked(
     }
     // The probe parses the DSL, which rejects head-directive lines as
     // unknown verbs; probe the stripped body, exactly what compose sees.
-    if (isGeneratorContent(arena, try head.strip(arena, content, markerForFormat(format)))) {
+    if (isGeneratorContent(arena, try head.strip(arena, content, real_marker))) {
         setDiag(diag, target_key);
         return error.OwnOnGenerator;
     }

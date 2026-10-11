@@ -425,7 +425,7 @@ fn orphanedAttributes(
     src_dir: []const u8,
     context: app.Context,
 ) !?[]const []const u8 {
-    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir, null) catch return null;
+    const attrs = mox.source.attributes.load(arena, io, context.paths.repo_dir) catch return null;
     if (attrs.map.count() == 0) return &.{};
     const m_state = mox.machine.state.capture(arena, io, context.env, context.paths.repo_dir, context.paths.private_dir) catch return null;
     const base_tree = mox.source.tree.walk(arena, io, src_dir, m_state.home) catch return null;
@@ -601,7 +601,7 @@ fn scriptStageProblems(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !
 fn staleFacts(arena: std.mem.Allocator, io: Io, context: app.Context) !?[]const []const u8 {
     var facts_diag: mox.machine.facts.Diag = .{};
     const bound = mox.machine.facts.load(arena, io, context.paths.facts_path, &facts_diag) catch return null;
-    const discovery = mox.machine.dimensions.discover(arena, io, context.paths.repo_dir) catch return null;
+    const discovery = mox.machine.dimensions.discover(arena, io, context.paths.repo_dir, context.paths.private_dir) catch return null;
     if (discovery.tree_error != null) return null;
     const derived_names = mox.machine.derived_facts.declaredNames(arena, io, context.paths.repo_dir, context.paths.private_dir) catch return null;
 
@@ -847,7 +847,7 @@ fn sameDirectory(git_path: []const u8, real_path: []const u8) bool {
 fn unrecordedModes(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, src_dir: []const u8) !?[]const []const u8 {
     if (!Io.File.Permissions.has_executable_bit) return &.{};
 
-    const attrs = mox.source.attributes.load(arena, io, repo_dir, null) catch return null;
+    const attrs = mox.source.attributes.load(arena, io, repo_dir) catch return null;
     const tree = mox.source.tree.walk(arena, io, src_dir, "") catch return null;
 
     var out: std.ArrayList([]const u8) = .empty;

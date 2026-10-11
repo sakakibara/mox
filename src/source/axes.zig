@@ -327,9 +327,17 @@ fn scanFile(ax: *Axes, arena: std.mem.Allocator, io: Io, file: source.tree.Manag
         try addName(ax, rg.name);
         for (rg.fragments) |fr| try addTuple(ax, fr.tuple, fr.exact_tuple);
     }
+    if (file.gate) |g| {
+        if (dsl.axis.parseString(arena, g)) |expr| {
+            try addAxisExpr(ax, expr);
+        } else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+    }
     if (file.has_base and file.source_base_abs.len > 0) {
         const raw = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_bytes)) catch return;
-        const marker = dsl.comment.markerForFile(file.source_base_path, raw) orelse return;
+        const marker = file.marker(raw) orelse return;
         // A head declaration (`own`/`disown`/`check`) is not DSL syntax --
         // the walk and real compose both strip it before parsing (`compose.
         // catA.readBaseHead`) -- so it must be stripped here too, or a file

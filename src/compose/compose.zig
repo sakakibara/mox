@@ -83,7 +83,7 @@ pub fn categoryOf(arena: std.mem.Allocator, io: Io, file: ManagedFile) !?categor
     else
         return null;
     const sample = try peekFile(io, arena, sample_path);
-    return category.detect(file.source_base_path, sample);
+    return category.detect(file.format, file.source_base_path, sample);
 }
 
 /// The whole-file gate's axis expression that just decided `file` is absent
@@ -101,7 +101,7 @@ pub fn wholeFileGateAxisExpr(
 ) !?*const dsl.ast.AxisExpr {
     if (!file.has_base) return null;
     const sample = try peekFile(io, arena, file.source_base_abs);
-    const cat = category.detect(file.source_base_path, sample);
+    const cat = category.detect(file.format, file.source_base_path, sample);
     return switch (cat) {
         .a => try catA.wholeFileGateAxisExpr(arena, io, file),
         .b => try catB.wholeFileGateAxisExpr(arena, io, file),

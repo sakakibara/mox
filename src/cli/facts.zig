@@ -48,7 +48,7 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
         else => return e,
     };
 
-    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "", discovery.diagnostics, discovery.default_diagnostics);
     // Unlike apply, `facts` has no later, richer source-tree walk that could
     // still surface this failure downstream -- so a tree-discovery error
@@ -313,7 +313,7 @@ fn askRun(ctx: *app.Ctx, a: cli.Args(AskSpec)) anyerror!u8 {
         return 1;
     }
 
-    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir);
+    const discovery = try mox.machine.dimensions.discover(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir);
     try mox.machine.dimensions.writeDiagnostics(ctx.err, "", discovery.diagnostics, discovery.default_diagnostics);
     if (discovery.tree_error) |e| {
         try ctx.err.print(

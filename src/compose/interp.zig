@@ -1,5 +1,6 @@
 const std = @import("std");
 const capture = @import("capture.zig");
+const json_interp = @import("json_interp.zig");
 const data = @import("../data/root.zig");
 const dsl = @import("../dsl/root.zig");
 const machine = @import("../machine/root.zig");
@@ -60,7 +61,7 @@ pub const Frame = dsl.row_expr.Frame;
 /// resolved a secret from a dedicated secret manager (`op://`/`pass://`) -- the
 /// signal apply uses to auto-restrict such a live file to 0600.
 pub const Diag = struct {
-    buf: [256]u8 = undefined,
+    buf: [1024]u8 = undefined,
     len: usize = 0,
     /// True once an `op://` or `pass://` secret resolved into this file. Only
     /// these dedicated-manager schemes are treated as unambiguously sensitive;
@@ -75,6 +76,9 @@ pub const Diag = struct {
     /// appended here in the order it is reached; a row's `.loop` provenance
     /// names its loop by index into this list.
     loops: ?*std.ArrayList(LoopSite) = null,
+    /// A capture expanded inside a JSON object key: the output is checked
+    /// for the duplicate key that expansion may have made.
+    json_key_capture: bool = false,
 
     pub fn set(self: *Diag, text: []const u8) void {
         const n = @min(text.len, self.buf.len);
@@ -124,6 +128,9 @@ pub const Ctx = struct {
     diag: ?*Diag = null,
     /// Loop-variable bindings, innermost first. Empty outside any loop.
     scope: []const Frame = &.{},
+    /// Set while composing a JSON-family file: a template is then a chunk
+    /// of a JSON document, and only its string tokens are expanded.
+    json: ?*json_interp.ScanState = null,
 };
 
 const ScopeResult = union(enum) {
@@ -358,6 +365,10 @@ pub fn expandTracked(
     record_opt: ?*const std.StringHashMap(data.value.Value),
     ctx: Ctx,
 ) InterpError!Expansion {
+    if (ctx.json) |st| {
+        const r = try json_interp.expand(arena, template, st.dialect, record_opt, ctx, st);
+        return .{ .bytes = r.bytes, .secret = r.secret, .placeholder = r.placeholder };
+    }
     return expandTrackedImpl(arena, template, record_opt, ctx, true);
 }
 
@@ -685,9 +696,33 @@ const DataSpec = struct { file: []const u8, table: ?[]const u8, key: []const u8 
 /// scalar bytes, null when the file/table/key is absent (so a `| default` can
 /// rescue it), or a fatal error for a non-scalar value or a load failure.
 fn lookupData(arena: std.mem.Allocator, ctx: Ctx, spec: DataSpec) InterpError!?[]const u8 {
+    const s = (try lookupDataTyped(arena, ctx, spec)) orelse return null;
+    return s.text;
+}
+
+fn lookupDataTyped(arena: std.mem.Allocator, ctx: Ctx, spec: DataSpec) InterpError!?data.source.Scalar {
     const io = ctx.io orelse return error.DataRefWithoutContext;
     if (ctx.repo_dir.len == 0) return error.DataRefWithoutContext;
     return data.source.lookupScalar(arena, io, ctx.repo_dir, ctx.private_dir, spec.file, spec.table, spec.key);
+}
+
+/// The scalar a template that is exactly one `<data.FILE[.TABLE].KEY>`
+/// capture (no chain, no default) resolves to, typed, or null when the
+/// template is anything else. A missing file or key, with no default to
+/// rescue it, is the same compose error the text expansion raises.
+pub fn soleDataCapture(arena: std.mem.Allocator, template: []const u8, ctx: Ctx) InterpError!?data.source.Scalar {
+    if (template.len < 2 or template[0] != '<' or template[template.len - 1] != '>') return null;
+    const close = capture.closeIndex(template, 0) orelse return null;
+    if (close != template.len - 1) return null;
+    const inner = template[1..close];
+    if (!std.mem.startsWith(u8, inner, "data.")) return null;
+    if (std.mem.indexOfScalar(u8, inner, '|') != null) return null;
+    const spec = parseDataSpec(inner[5..]) orelse return null;
+    if (ctx.io == null or ctx.repo_dir.len == 0) return null;
+    return (try lookupDataTyped(arena, ctx, spec)) orelse {
+        noteDiag(ctx, inner);
+        return error.UnknownDataKey;
+    };
 }
 
 /// Parse the segments after `data.` into a spec, or null when the depth is

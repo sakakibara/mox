@@ -215,7 +215,7 @@ test "kind matrix: vanished -- status and apply agree; matching removes, edited 
     try tmp.dir.createDirPath(io, "repo/src/.config/git");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/git/ids.inc",
-        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+        .data = "# mox: for e in \"data/ids.toml\"\n[id]\n\tname = <e.k>\n# mox: end\n",
     });
     try tmp.dir.createDirPath(io, "repo/data");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
@@ -238,7 +238,7 @@ test "kind matrix: vanished -- status and apply agree; matching removes, edited 
     // Re-materialize, then EDIT the live copy before emptying again.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = data_path, .data = "[[ids]]\nk = \"one\"\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "id one\nhand edit\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[id]\n\tname = one\nhand edit\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = data_path, .data = "ids = []\n" });
 
     // Edited: status and apply both call it DRIFT, and the file is kept.
@@ -247,12 +247,12 @@ test "kind matrix: vanished -- status and apply agree; matching removes, edited 
     try std.testing.expect(std.mem.indexOf(u8, s2.out, "DRIFT") != null);
     const ap = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), ap.rc);
-    try std.testing.expectEqualStrings("id one\nhand edit\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("[id]\n\tname = one\nhand edit\n", try read(io, a, live));
 
     // commit cannot route an edit into a source that yields no file: it says so.
     const cm = try c.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expect(std.mem.indexOf(u8, cm.err, "source yields no file") != null);
-    try std.testing.expectEqualStrings("id one\nhand edit\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("[id]\n\tname = one\nhand edit\n", try read(io, a, live));
 
     // --overwrite removes it and converges.
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", live })).rc);

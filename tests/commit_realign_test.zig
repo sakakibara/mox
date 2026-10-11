@@ -1107,7 +1107,6 @@ fn runLayout(gpa: Allocator, io: Io, sw: Sweep, st: State, budget: *Budget, seen
     }
     if (st.p.len > 0) {
         try tmp.dir.createDirPath(io, "state/private/" ++ base_rel ++ ".d/profile");
-        try tmp.dir.writeFile(io, .{ .sub_path = "state/private/" ++ base_rel, .data = "top\n" });
         try tmp.dir.writeFile(io, .{ .sub_path = "state/private/" ++ base_rel ++ ".d/profile/personal.hosts", .data = try linesText(a, st.p) });
         try tmp.dir.createDirPath(io, "home/.config/mox");
         try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/mox/facts.toml", .data = "profile = \"personal\"\n" });

@@ -3,17 +3,18 @@ const format = @import("../source/format.zig");
 
 pub const Category = enum { a, b, c };
 
-/// Detect category from filename and (optionally peeking) content.
+/// Detect category from the walk's resolved format, the filename, and
+/// (optionally peeking) content. A structured format is Category A.
 ///
 /// `content` may be the full file or just a prefix. If the file is large,
 /// passing only the first 4KB is sufficient for content sniffing.
-pub fn detect(filename: []const u8, content: []const u8) Category {
+pub fn detect(structured: ?format.Format, filename: []const u8, content: []const u8) Category {
+    if (structured != null) return .a;
     // A known extension is authoritative: a stray control byte (a raw ESC in a
     // color-prompt, an LS_COLORS heredoc) must not demote a text/code file to
     // binary and skip its directives. Only files with no telling extension fall
     // back to a content sniff, where a NUL or a high density of control bytes
     // marks genuine binary.
-    if (format.isGitConfigPath(filename)) return .a;
     if (extensionCategory(filename)) |cat| return cat;
     if (looksBinary(content)) return .c;
     return .b;
@@ -41,13 +42,6 @@ fn isControlByte(b: u8) bool {
 fn extensionCategory(filename: []const u8) ?Category {
     const Map = struct { ext: []const u8, cat: Category };
     const table = [_]Map{
-        // A: structured
-        .{ .ext = ".toml", .cat = .a },
-        .{ .ext = ".yaml", .cat = .a },
-        .{ .ext = ".yml", .cat = .a },
-        .{ .ext = ".json", .cat = .a },
-        .{ .ext = ".ini", .cat = .a },
-        .{ .ext = ".gitconfig", .cat = .a },
         // C: binary
         .{ .ext = ".png", .cat = .c },
         .{ .ext = ".jpg", .cat = .c },
@@ -88,32 +82,33 @@ fn extensionCategory(filename: []const u8) ?Category {
     return best_match;
 }
 
-test "detect: .toml is A" {
-    try std.testing.expectEqual(Category.a, detect("config.toml", "[user]\n"));
+test "detect: a structured format is A" {
+    try std.testing.expectEqual(Category.a, detect(.toml, "config.toml", "[user]\n"));
+    try std.testing.expectEqual(Category.a, detect(.jsonc, "a.jsonc", "{}\n"));
 }
 
 test "detect: .lua is B" {
-    try std.testing.expectEqual(Category.b, detect("init.lua", "local M = {}\n"));
+    try std.testing.expectEqual(Category.b, detect(null, "init.lua", "local M = {}\n"));
 }
 
 test "detect: binary content is C" {
     var bin = [_]u8{ 0x89, 0x50, 0x4e, 0x47 };
-    try std.testing.expectEqual(Category.c, detect("icon.png", &bin));
+    try std.testing.expectEqual(Category.c, detect(null, "icon.png", &bin));
 }
 
 test "detect: unknown extension text -> B" {
-    try std.testing.expectEqual(Category.b, detect("README", "Hello\n"));
+    try std.testing.expectEqual(Category.b, detect(null, "README", "Hello\n"));
 }
 
 test "detect: known C extension overrides text content" {
-    try std.testing.expectEqual(Category.c, detect("foo.png", "Hello\n"));
+    try std.testing.expectEqual(Category.c, detect(null, "foo.png", "Hello\n"));
 }
 
 test "detect: a .sh with control bytes far under the binary threshold is B" {
     // A .sh whose first 4KB embeds a raw ESC (color-code prompt) is still Cat B,
     // so its `# mox:` directives get processed rather than copied verbatim.
     const content = "# mox: when os=darwin\nexport PS1=$'\x1b[31m%n\x1b[0m'\n";
-    try std.testing.expectEqual(Category.b, detect("prompt.sh", content));
+    try std.testing.expectEqual(Category.b, detect(null, "prompt.sh", content));
 }
 
 test "detect: a .sh over the binary threshold is still B, so the extension outranks the sniff" {
@@ -121,45 +116,45 @@ test "detect: a .sh over the binary threshold is still B, so the extension outra
     // it verbatim, skipping every directive in it.
     var content = [_]u8{'a'} ** 100;
     for (content[0..60]) |*b| b.* = 0x1b;
-    try std.testing.expectEqual(Category.b, detect("prompt.sh", &content));
+    try std.testing.expectEqual(Category.b, detect(null, "prompt.sh", &content));
 }
 
 test "detect: no-extension content with NUL is binary C" {
     const content = [_]u8{ 'a', 'b', 0x00, 'c' };
-    try std.testing.expectEqual(Category.c, detect("mystery", &content));
+    try std.testing.expectEqual(Category.c, detect(null, "mystery", &content));
 }
 
 test "detect: no-extension content dense with control bytes is C" {
     const content = [_]u8{ 0x1b, 0x1b, 0x1b, 0x1b, 'a', 'b' };
-    try std.testing.expectEqual(Category.c, detect("mystery", &content));
+    try std.testing.expectEqual(Category.c, detect(null, "mystery", &content));
 }
 
 test "detect: no-extension content with exactly 30 percent control bytes is B" {
     var content = [_]u8{'a'} ** 100;
     for (content[0..30]) |*b| b.* = 0x1b;
-    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+    try std.testing.expectEqual(Category.b, detect(null, "mystery", &content));
 }
 
 test "detect: no-extension content with 31 percent control bytes is C" {
     var content = [_]u8{'a'} ** 100;
     for (content[0..31]) |*b| b.* = 0x1b;
-    try std.testing.expectEqual(Category.c, detect("mystery", &content));
+    try std.testing.expectEqual(Category.c, detect(null, "mystery", &content));
 }
 
 test "detect: no-extension content 31 percent tabs is B" {
     var content = [_]u8{'a'} ** 100;
     for (content[0..31]) |*b| b.* = '\t';
-    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+    try std.testing.expectEqual(Category.b, detect(null, "mystery", &content));
 }
 
 test "detect: no-extension content 31 percent newlines is B" {
     var content = [_]u8{'a'} ** 100;
     for (content[0..31]) |*b| b.* = '\n';
-    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+    try std.testing.expectEqual(Category.b, detect(null, "mystery", &content));
 }
 
 test "detect: no-extension content 31 percent carriage returns is B" {
     var content = [_]u8{'a'} ** 100;
     for (content[0..31]) |*b| b.* = '\r';
-    try std.testing.expectEqual(Category.b, detect("mystery", &content));
+    try std.testing.expectEqual(Category.b, detect(null, "mystery", &content));
 }

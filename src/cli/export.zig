@@ -247,6 +247,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var failed: usize = 0;
 
     for (tree.files) |file| {
+        // A head declaration or attributes entry the walk could not honor is
+        // this file's error alone.
+        if (file.head_error.len > 0) {
+            try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
+            failed += 1;
+            continue;
+        }
         // A GENERATOR renders one file per row, statelessly (export never
         // deletes, so a row dropped since a prior apply simply is not written).
         {
@@ -281,10 +288,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, bindings, &m_state, secrets, null, &diag) catch |e| {
-            try ctx.err.print("mox export: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
-            try apply_cmd.explainComposeError(ctx.err, "mox export", e);
-            if (diag.capture()) |cap|
-                try ctx.err.print("mox export:   failing item: {s}\n", .{cap});
+            if (e == error.FormatViolation) {
+                try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), diag.capture() orelse "?" });
+            } else {
+                try ctx.err.print("mox export: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
+                try apply_cmd.explainComposeError(ctx.err, "mox export", e);
+                if (diag.capture()) |cap|
+                    try ctx.err.print("mox export:   failing item: {s}\n", .{cap});
+            }
             failed += 1;
             continue;
         };
@@ -304,7 +315,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // the same declaration check apply runs.
         if (file.own_paths.len > 0) {
             const partial = mox.apply.partial;
-            const format = mox.source.format.formatOfPath(file.source_base_path).?;
+            const format = file.format.?;
             const owned_doc = partial.OwnedDoc.parse(ctx.alloc, format, bytes) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.OwnedUnparseable => {

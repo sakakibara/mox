@@ -19,6 +19,8 @@ fn keyPath(arena: std.mem.Allocator, path: []const u8) []const u8 {
 }
 const ini_merge = @import("ini_merge.zig");
 const interp = @import("interp.zig");
+const json_interp = @import("json_interp.zig");
+const validate = @import("validate.zig");
 const catB = @import("catB.zig");
 const dsl = @import("../dsl/root.zig");
 const prov_mod = @import("../provenance/root.zig");
@@ -43,8 +45,12 @@ pub const ComposeError = error{
 
 const max_layer_bytes: usize = 4 * 1024 * 1024;
 
-/// Compose a Category A managed file: TOML, JSON (JSONC input), and YAML
-/// deep-merge; gitconfig and INI section-merge.
+/// Compose a Category A managed file: TOML, JSON and YAML deep-merge;
+/// gitconfig and INI section-merge.
+///
+/// Every layer is parsed in the target's format and dialect first, and the
+/// composed output after capture expansion: a failure is
+/// `error.FormatViolation`, `diag` naming where and why.
 ///
 /// Cat A owns its own provenance. A single-layer file carrying `# mox:`
 /// directives routes through Cat B, whose per-line segments (including
@@ -60,22 +66,82 @@ pub fn compose(
     bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
-    prov: ?*std.ArrayList(Segment),
-    diag: ?*interp.Diag,
+    prov_opt: ?*std.ArrayList(Segment),
+    diag_opt: ?*interp.Diag,
 ) !?[]u8 {
-    if (formatOf(file.source_base_path)) |format| return switch (format) {
-        .toml => composeToml(arena, io, file, bindings, machine_state_opt, secrets, prov, diag),
-        .gitconfig => composeSectionMerge(arena, io, file, bindings, machine_state_opt, secrets, .gitconfig, prov, diag),
-        .yaml => composeYaml(arena, io, file, bindings, machine_state_opt, secrets, prov, diag),
-        .json => composeJson(arena, io, file, bindings, machine_state_opt, secrets, prov, diag),
-        .ini => composeSectionMerge(arena, io, file, bindings, machine_state_opt, secrets, .generic, prov, diag),
-    };
-    // Cat A but unrecognized extension: shouldn't happen given the
-    // detector's table, but fail loudly instead of silently.
-    return error.NoBaseOrMatchingOverlay;
+    const format = file.format orelse return error.NoBaseOrMatchingOverlay;
+    // Provenance names the secret lines a parse error must not quote, and
+    // the diag whether a key capture expanded.
+    var local_prov: std.ArrayList(Segment) = .empty;
+    const prov = prov_opt orelse &local_prov;
+    var local_diag: interp.Diag = .{};
+    const diag = diag_opt orelse &local_diag;
+    var run: Run = .{};
+    const out = (try switch (format) {
+        .toml => composeToml(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, &run),
+        .gitconfig => composeSectionMerge(arena, io, file, bindings, machine_state_opt, secrets, .gitconfig, prov, diag, &run),
+        .yaml => composeYaml(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, &run),
+        .json, .jsonc => composeJson(arena, io, file, format, bindings, machine_state_opt, secrets, prov, diag, &run),
+        .ini => composeSectionMerge(arena, io, file, bindings, machine_state_opt, secrets, .generic, prov, diag, &run),
+    }) orelse return null;
+    if (machine_state_opt != null) try checkComposed(arena, file, format, out, run, prov.items, secrets, diag);
+    return out;
 }
 
-const Format = enum { toml, gitconfig, yaml, json, ini };
+/// What one composition used, for the output check.
+const Run = struct {
+    /// Display names of the layers that composed.
+    layers: []const []const u8 = &.{},
+};
+
+/// Parse the composed output in its format. Exempt: an empty partial render
+/// ("mox owns nothing here"), and output off the resolving path still holding
+/// a secret placeholder, whose value is unknown there.
+fn checkComposed(
+    arena: std.mem.Allocator,
+    file: ManagedFile,
+    format: source.format.Format,
+    out: []const u8,
+    run: Run,
+    segments: []const Segment,
+    secrets: ?catB.SecretCtx,
+    diag: *interp.Diag,
+) !void {
+    if (file.ownership != .none and std.mem.trim(u8, out, " \t\r\n").len == 0) return;
+    if (secrets == null and std.mem.indexOf(u8, out, "<SECRET:") != null) return;
+    const lines = prov_mod.map.lineCount(out);
+    const secret_lines = try arena.alloc(bool, lines + 1);
+    @memset(secret_lines, false);
+    for (segments) |seg| {
+        if (seg.origin != .secret) continue;
+        var i: u32 = seg.out_start;
+        while (i < seg.out_start + seg.out_len and i < secret_lines.len) : (i += 1) secret_lines[i] = true;
+    }
+    try validate.checkOutput(arena, format, out, run.layers, secret_lines, diag);
+    if (format.isJson() and (run.layers.len > 1 or diag.json_key_capture)) {
+        try validate.checkDuplicateKeys(arena, format, out, "", run.layers, secret_lines, diag);
+    }
+}
+
+/// A layer path as a diagnostic names it: relative to the repo (or to the
+/// private layer's parent), in key form.
+fn layerDisplay(arena: std.mem.Allocator, file: ManagedFile, path: []const u8) []const u8 {
+    const private_parent = if (file.private_dir.len > 0) std.fs.path.dirname(file.private_dir) orelse "" else "";
+    const roots = [_][]const u8{ file.repo_dir, private_parent };
+    for (roots) |root| {
+        if (root.len == 0) continue;
+        if (path.len > root.len + 1 and std.mem.startsWith(u8, path, root) and std.fs.path.isSep(path[root.len])) {
+            return keyPath(arena, path[root.len + 1 ..]);
+        }
+    }
+    return keyPath(arena, path);
+}
+
+fn displayAll(arena: std.mem.Allocator, file: ManagedFile, paths: []const []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, paths.len);
+    for (paths, out) |p, *o| o.* = layerDisplay(arena, file, p);
+    return out;
+}
 
 /// A base layer after the single leading-block pass: head directives parsed
 /// once, consumed lines stripped, whole-file gate evaluated.
@@ -107,17 +173,19 @@ const Head = struct {
 /// (`has_base == false`) is returned verbatim: a leading `mox:` line there
 /// is inert content, and a gate belongs on a base file. Head recognition
 /// runs on the same `max_head_bytes` prefix the walk reads, so walk and
-/// compose classify a file identically by construction.
+/// compose classify a file identically by construction. Strict JSON has no
+/// head: the walk reads its directives from its attributes.
 fn readBaseHead(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
     path: []const u8,
-    marker: []const u8,
+    marker_opt: ?[]const u8,
     bindings: *const dsl.resolver.Resolver,
 ) !Head {
     const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    if (!file.has_base) return .{ .text = raw, .body = raw };
+    if (marker_opt == null or !file.has_base) return .{ .text = raw, .body = raw, .partial = file.ownership != .none };
+    const marker = marker_opt.?;
     const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
     const parsed = source.head.parse(arena, head_text, marker) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -150,48 +218,80 @@ fn readBaseHead(
 
 const Prepared = struct { layers: []const []const u8, hd: Head };
 
-/// `collectMatchingLayers` + `readBaseHead` + the layered-directive refusal, in
-/// the one order that keeps that refusal a fact about the repo: every machine
-/// runs the scan, whatever its own gate and overlay matches then decide. Null
-/// when the file does not materialize here.
+/// `collectMatchingLayers` + `readBaseHead` + the layered-directive refusal
+/// and the layer checks, in the one order that keeps every refusal a fact
+/// about the repo: every machine runs them, whatever its own gate and
+/// overlay matches then decide. Null when the file does not materialize
+/// here.
 fn prepare(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
+    format: source.format.Format,
     bindings: *const dsl.resolver.Resolver,
-    marker: []const u8,
     diag: ?*interp.Diag,
+    run: *Run,
 ) !?Prepared {
+    const marker = format.marker();
     const layers = try collectMatchingLayers(arena, file, bindings);
-    const hd: Head = if (layers.len == 0)
+    var hd: Head = if (layers.len == 0)
         .{ .text = "", .body = "" }
     else
         try readBaseHead(arena, io, file, layers[0], marker, bindings);
-    if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, marker, diag);
+    if (marker) |m| {
+        if (file.overlays.len > 0) try refuseRegionInLayers(arena, io, file, hd.body, m, diag);
+    }
+    try checkLayers(arena, io, file, format, if (file.has_base) hd else null, layers.len > 1, bindings, diag);
+    if (file.gate) |g| {
+        const expr = try dsl.axis.parseString(arena, g);
+        if (!dsl.axis.evaluate(expr, bindings)) hd.absent = true;
+    }
     if (layers.len == 0 or hd.absent) return null;
+    run.layers = try displayAll(arena, file, layers);
     return .{ .layers = layers, .hd = hd };
 }
 
-fn formatOf(path: []const u8) ?Format {
-    if (source.format.isGitConfigPath(path)) return .gitconfig;
-    const Pair = struct { ext: []const u8, format: Format };
-    const table = [_]Pair{
-        .{ .ext = ".toml", .format = .toml },
-        .{ .ext = ".yaml", .format = .yaml },
-        .{ .ext = ".yml", .format = .yaml },
-        .{ .ext = ".json", .format = .json },
-        .{ .ext = ".ini", .format = .ini },
-        .{ .ext = ".gitconfig", .format = .gitconfig },
-    };
-    var longest: ?Format = null;
-    var longest_len: usize = 0;
-    for (table) |entry| {
-        if (std.mem.endsWith(u8, path, entry.ext) and entry.ext.len > longest_len) {
-            longest = entry.format;
-            longest_len = entry.ext.len;
+/// Parse every layer as written, matching this machine or not: the base
+/// after its head pass, and each overlay. A layer that is no document of
+/// its format until composed is checked through the output instead: a
+/// non-JSON layer holding a capture (`port = <data.u.port>`) or a region (its
+/// alternates may repeat a key), and a JSONC base composed through Cat B.
+/// In a JSON merge each matching layer must also hold no duplicate key,
+/// which its parse would drop.
+fn checkLayers(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    format: source.format.Format,
+    base: ?Head,
+    merging: bool,
+    bindings: *const dsl.resolver.Resolver,
+    diag: ?*interp.Diag,
+) !void {
+    if (base) |hd| {
+        const display = layerDisplay(arena, file, file.source_base_abs);
+        const skip = switch (format) {
+            .json => false,
+            .jsonc => containsMoxDirectiveJson(hd.body),
+            else => containsMoxDirective(hd.body) or interp.containsCapture(hd.body),
+        };
+        if (!skip) {
+            try validate.checkLayer(arena, format, hd.body, display, hd.body_removed, diag);
+            if (format.isJson() and merging) try validate.checkDuplicateKeys(arena, format, hd.body, display, &.{}, &.{}, diag);
         }
     }
-    return longest;
+    for (file.overlays) |o| {
+        const raw = Io.Dir.cwd().readFileAlloc(io, o.path, arena, .limited(max_layer_bytes)) catch |e| {
+            if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}: could not be read: {s}", .{ keyPath(arena, o.path), @errorName(e) }));
+            return e;
+        };
+        if (!format.isJson() and interp.containsCapture(raw)) continue;
+        const display = layerDisplay(arena, file, o.path);
+        try validate.checkLayer(arena, format, raw, display, &.{}, diag);
+        if (format.isJson() and merging and match_mod.matches(match_mod.effectiveOverlayTuple(o, bindings), bindings)) {
+            try validate.checkDuplicateKeys(arena, format, raw, display, &.{}, &.{}, diag);
+        }
+    }
 }
 
 fn composeToml(
@@ -203,8 +303,9 @@ fn composeToml(
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
+    run: *Run,
 ) !?[]u8 {
-    const prep = (try prepare(arena, io, file, bindings, "#", diag)) orelse return null;
+    const prep = (try prepare(arena, io, file, file.format.?, bindings, diag, run)) orelse return null;
     const layers = prep.layers;
     const hd = prep.hd;
 
@@ -232,42 +333,36 @@ fn composeToml(
     return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
 }
 
-/// Compose a `.json` managed file. Mirrors `composeToml`: single layer
-/// passes through verbatim (Cat B if it carries `// mox:` directives);
-/// multiple layers deep-merge structurally. Input layers are parsed as
-/// JSONC (comments and trailing commas accepted); merged output is
-/// pretty-printed plain JSON, so comments survive only the single-layer
-/// pass-through path.
+/// Compose a JSON-family managed file. Mirrors `composeToml`: a single
+/// layer passes through verbatim (a JSONC one through Cat B when it carries
+/// `// mox:` directives); multiple layers deep-merge structurally, every
+/// layer read in the target's dialect. Merged output is pretty-printed plain
+/// JSON, so comments survive only the single-layer pass-through.
 fn composeJson(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
+    format: source.format.Format,
     bindings: *const dsl.resolver.Resolver,
     machine_state_opt: ?*const machine.state.MachineState,
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
+    run: *Run,
 ) !?[]u8 {
-    const prep = (try prepare(arena, io, file, bindings, "//", diag)) orelse return null;
+    const prep = (try prepare(arena, io, file, format, bindings, diag, run)) orelse return null;
     const layers = prep.layers;
     const hd = prep.hd;
+    const dialect = format.jsonDialect();
 
     if (layers.len == 1) {
-        if (containsMoxDirectiveJson(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
+        if (format == .jsonc and containsMoxDirectiveJson(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
+        return interpolateJson(arena, io, file, dialect, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
-    // A blank seed (a directive-only base: nothing remains after the head
-    // pass) is not a parseable JSON document; the overlays supply all
-    // content, so the first one seeds the merge. TOML's empty-table parse
-    // gives the same semantics for free.
-    const blank = std.mem.trim(u8, hd.body, " \t\r\n").len == 0;
-    var merged: json.Value = if (blank)
-        try parseJsonFile(arena, io, layers[1])
-    else
-        try json.parse(arena, hd.body, .{ .dialect = .jsonc });
-    for (layers[if (blank) 2 else 1..]) |path| {
-        const next = try parseJsonFile(arena, io, path);
+    var merged: json.Value = try json.parse(arena, hd.body, .{ .dialect = dialect });
+    for (layers[1..]) |path| {
+        const next = try parseJsonFile(arena, io, path, dialect);
         merged = try json_merge.deepMerge(arena, merged, next);
     }
 
@@ -275,7 +370,7 @@ fn composeJson(
     try json.encode(&aw.writer, merged, .{ .indent = 2 });
     // Target files end with a newline, matching the toml composer's output.
     try aw.writer.writeByte('\n');
-    return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
+    return interpolateJson(arena, io, file, dialect, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
 }
 
 /// Compose a `.yaml` / `.yml` managed file. Mirrors `composeJson`: single
@@ -292,8 +387,9 @@ fn composeYaml(
     secrets: ?catB.SecretCtx,
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
+    run: *Run,
 ) !?[]u8 {
-    const prep = (try prepare(arena, io, file, bindings, "#", diag)) orelse return null;
+    const prep = (try prepare(arena, io, file, file.format.?, bindings, diag, run)) orelse return null;
     const layers = prep.layers;
     const hd = prep.hd;
 
@@ -335,8 +431,9 @@ fn composeSectionMerge(
     dialect: ini_merge.Dialect,
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
+    run: *Run,
 ) !?[]u8 {
-    const prep = (try prepare(arena, io, file, bindings, "#", diag)) orelse return null;
+    const prep = (try prepare(arena, io, file, file.format.?, bindings, diag, run)) orelse return null;
     const layers = prep.layers;
     const hd = prep.hd;
 
@@ -461,9 +558,10 @@ fn wholeFileGateExpr(arena: std.mem.Allocator, content: []const u8, marker: []co
 /// has no base, its format is unrecognized, it cannot be read, or it has no
 /// genuine whole-file gate.
 pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile) !?*const dsl.ast.AxisExpr {
+    if (file.gate) |g| return dsl.axis.parseString(arena, g) catch null;
     if (!file.has_base or file.source_base_abs.len == 0) return null;
-    const format = formatOf(file.source_base_path) orelse return null;
-    const marker: []const u8 = if (format == .json) "//" else "#";
+    const format = file.format orelse return null;
+    const marker = format.marker() orelse return null;
     const raw = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_layer_bytes));
     const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
     const parsed = source.head.parse(arena, head_text, marker) catch |e| switch (e) {
@@ -528,6 +626,44 @@ fn interpolate(
         try recordWhole(arena, prov, result, file, merged, base_removed);
     }
     return result;
+}
+
+/// `interpolate` for the JSON family: captures expand per string token
+/// (`json_interp`), so a resolved value is escaped for JSON and bytes outside
+/// a capture-bearing string are left as written.
+fn interpolateJson(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    dialect: json.Dialect,
+    merged: bool,
+    bytes: []const u8,
+    base_removed: []const u32,
+    machine_state_opt: ?*const machine.state.MachineState,
+    secrets: ?catB.SecretCtx,
+    prov: ?*std.ArrayList(Segment),
+    diag: ?*interp.Diag,
+) !?[]u8 {
+    if (machine_state_opt == null) {
+        try recordWhole(arena, prov, bytes, file, merged, base_removed);
+        return @constCast(bytes);
+    }
+    const ctx: interp.Ctx = .{
+        .io = io,
+        .machine = machine_state_opt,
+        .repo_dir = file.repo_dir,
+        .private_dir = file.private_dir,
+        .secrets = if (secrets) |sc| .{ .env = sc.env, .cache = sc.cache } else null,
+        .diag = diag,
+    };
+    var state: json_interp.ScanState = .{ .dialect = dialect };
+    const res = try json_interp.expand(arena, bytes, dialect, null, ctx, &state);
+    if (res.secret) {
+        try recordPerLineSecret(arena, prov, res.bytes, file, merged, res.line_secret, base_removed);
+    } else {
+        try recordWhole(arena, prov, res.bytes, file, merged, base_removed);
+    }
+    return res.bytes;
 }
 
 /// The non-secret origin a structural Cat A route attributes its output to:
@@ -664,9 +800,9 @@ fn parseFile(arena: std.mem.Allocator, io: Io, path: []const u8) !toml.Value {
     return toml.parse(arena, content, .{});
 }
 
-fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8) !json.Value {
+fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8, dialect: json.Dialect) !json.Value {
     const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    return json.parse(arena, content, .{ .dialect = .jsonc });
+    return json.parse(arena, content, .{ .dialect = dialect });
 }
 
 fn parseYamlFile(arena: std.mem.Allocator, io: Io, path: []const u8) !yaml.Value {

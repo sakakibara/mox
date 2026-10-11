@@ -83,6 +83,7 @@ const source = @import("../source/root.zig");
 const state = @import("state.zig");
 const derived_facts = @import("derived_facts.zig");
 const packages_manifest = @import("../packages/manifest.zig");
+const private_layer = @import("../private/layer.zig");
 
 const Io = std.Io;
 const AxisExpr = dsl.ast.AxisExpr;
@@ -301,12 +302,13 @@ pub const Discovery = struct {
     tree_error: ?anyerror = null,
 };
 
-/// Discover the full config space a repo's sources consume. `repo_dir` is the
-/// mox repo root (the parent of `src/`); a missing `src/`, `scripts/pre/`, or
-/// `scripts/post/` is not an error. Does not read or depend on the private
-/// layer or any machine-local state: same result on every machine for the
-/// same repo tree.
-pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discovery {
+/// Discover the full config space a repo's sources consume, with the private
+/// layer at `private_dir` (empty for none) merged in as compose merges it.
+/// `repo_dir` is the mox repo root (the parent of `src/`); a missing `src/`,
+/// `scripts/pre/`, or `scripts/post/` is not an error. Reads no other
+/// machine-local state: same result for the same repo tree and private
+/// layer.
+pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, private_dir: []const u8) !Discovery {
     var self: Discoverer = .{
         .arena = arena,
         .io = io,
@@ -318,7 +320,7 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
         .default_diagnostics = .empty,
     };
 
-    for (try derived_facts.declaredNames(arena, io, repo_dir, "")) |n| {
+    for (try derived_facts.declaredNames(arena, io, repo_dir, private_dir)) |n| {
         try self.derived_names.put(n, {});
     }
 
@@ -331,7 +333,7 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
     // Only OOM is worth failing discovery itself over.
     const src_dir = try std.fs.path.join(arena, &.{ repo_dir, "src" });
     var tree_error: ?anyerror = null;
-    const tree = source.tree.walk(arena, io, src_dir, "") catch |e| switch (e) {
+    const repo_tree = source.tree.walk(arena, io, src_dir, "") catch |e| switch (e) {
         error.OutOfMemory => return e,
         // No `src/` at all is a fresh/empty repo, not a structural problem
         // (this function's own doc comment: "a missing src/ ... is not an
@@ -341,6 +343,11 @@ pub fn discover(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Discove
             tree_error = e;
             break :blk source.tree.ManagedTree{ .files = &.{} };
         },
+    };
+    // A private layer that does not walk is apply's to report.
+    const tree = if (private_dir.len == 0) repo_tree else private_layer.merge(arena, io, repo_tree, private_dir, "") catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => repo_tree,
     };
     for (tree.files) |file| try self.scanManagedFile(file);
 
@@ -626,16 +633,22 @@ const Discoverer = struct {
             .default => |k| k,
             else => return,
         };
-        if (self.isExcluded(def.name)) {
+        try self.recordDefault(def.name, def.value, source_key);
+    }
+
+    /// One declared default, from a `# mox: default` line or a strict-JSON
+    /// target's `defaults` attribute.
+    fn recordDefault(self: *Discoverer, name: []const u8, value: []const u8, source_key: []const u8) !void {
+        if (self.isExcluded(name)) {
             try self.default_diagnostics.append(self.arena, .{ .reserved = .{
-                .name = try self.arena.dupe(u8, def.name),
+                .name = try self.arena.dupe(u8, name),
                 .source = source_key,
             } });
             return;
         }
         try self.declared_defaults.append(self.arena, .{
-            .name = try self.arena.dupe(u8, def.name),
-            .value = try self.arena.dupe(u8, def.value),
+            .name = try self.arena.dupe(u8, name),
+            .value = try self.arena.dupe(u8, value),
             .source = source_key,
         });
     }
@@ -1076,15 +1089,32 @@ const Discoverer = struct {
             }
         }
 
+        // A strict-JSON target's gate and defaults are its attributes': the
+        // gate conditions everything the base consumes, exactly as a head
+        // gate does.
+        for (file.defaults) |d| try self.recordDefault(d.name, d.value, source_key);
+        var gate_stack: []const *const AxisExpr = &.{};
+        if (file.gate) |g| {
+            if (dsl.axis.parseString(self.arena, g)) |expr| {
+                try self.recordAxisExpr(expr, source_key, null);
+                const one = try self.arena.alloc(*const AxisExpr, 1);
+                one[0] = expr;
+                gate_stack = one;
+            } else |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            }
+        }
+
         if (!file.has_base or file.source_base_abs.len == 0) return;
 
         const raw = Io.Dir.cwd().readFileAlloc(self.io, file.source_base_abs, self.arena, .limited(max_file_bytes)) catch return;
-        const marker = dsl.comment.markerForFile(file.source_base_path, raw) orelse {
+        const marker = file.marker(raw) orelse {
             // Mirrors compose's own null-marker passthrough (`compose.catB.
             // composeTrackedContent`): with no marker at all, no directive
             // can exist in this file either, but compose still interpolates
-            // `<machine.X>` line by line -- scan the same, unconditioned.
-            try self.scanFlatText(raw, &.{}, source_key);
+            // `<machine.X>` line by line -- scan the same.
+            try self.scanFlatText(raw, gate_stack, source_key);
             return;
         };
         const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
@@ -1895,7 +1925,7 @@ test "discover: signing_work_key's redundant multi-occurrence OR simplifies to p
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "signing_work_key").?;
     const cond = dim.asking_condition.?;
     try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, cond));
@@ -1919,7 +1949,7 @@ test "discover: value-compared role from a when gate, with observed value" {
     try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when holt_backend=gdrive\nx = 1\n# mox: end\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "holt_backend").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expect(!dim.roles.captured);
@@ -1940,7 +1970,7 @@ test "discover: presence-only role from a bare when name" {
     try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when signing_key\nx = 1\n# mox: end\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "signing_key").?;
     try std.testing.expect(dim.roles.presence);
     try std.testing.expect(!dim.roles.value_compared);
@@ -1969,7 +1999,7 @@ test "discover: a package row's gate adds its values to the ones source gates co
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "profile").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqual(@as(usize, 2), dim.observed_values.len);
@@ -1998,7 +2028,7 @@ test "discover: a fact only a package manifest compares is still discovered" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "profile").?;
     try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
     try std.testing.expectEqualStrings("work", dim.observed_values[0]);
@@ -2017,7 +2047,7 @@ test "discover: a manifest that does not load leaves the rest of discovery intac
     try writeFile(io, tmp.dir, "data/packages/broken.toml", "[[packages]\nname = \n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "profile").?;
     try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
     try std.testing.expectEqualStrings("work", dim.observed_values[0]);
@@ -2034,7 +2064,7 @@ test "discover: captured role with a default, unconditioned" {
     try writeFile(io, tmp.dir, "src/.gitconfig", "email = <machine.email | default \"me@example.com\">\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "email").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(!dim.roles.value_compared);
@@ -2056,7 +2086,7 @@ test "discover: a .d overlay filename tuple is value-compared" {
     try writeFile(io, tmp.dir, "src/.gitconfig.d/profile=work", "[user]\n  name = w\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "profile").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqualStrings("work", dim.observed_values[0]);
@@ -2074,7 +2104,7 @@ test "discover: a Cat B region fragment is value-compared" {
     try writeFile(io, tmp.dir, "src/kind.lua.d/profile/work.lua", "M.kind = \"work\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "profile").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqualStrings("work", dim.observed_values[0]);
@@ -2097,7 +2127,7 @@ test "discover: a data-driven `name = <var>.field` row predicate is value-compar
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "holt_backend").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expect(!dim.roles.captured);
@@ -2123,7 +2153,7 @@ test "discover: `bound <var>.field` contributes nothing" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     // The sibling `profile=work` gate proves the file parsed successfully
     // (a parse failure would silently drop everything, including this).
     try std.testing.expect(findDim(d, "profile") != null);
@@ -2150,7 +2180,7 @@ test "discover: exclusion -- built-ins, open axes, reserved names never become d
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     for ([_][]const u8{ "os", "tool", "hostname", "tool_path", "env" }) |n| {
         try std.testing.expect(findDim(d, n) == null);
     }
@@ -2171,7 +2201,7 @@ test "discover: a data/facts.toml-declared name is excluded even when captured" 
     try writeFile(io, tmp.dir, "src/.zshrc", "export PATH=<machine.brew_prefix>/bin\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "brew_prefix") == null);
 }
 
@@ -2191,7 +2221,7 @@ test "discover: conditional capture -- asking_condition matches the enclosing ga
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "gdrive_account").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -2217,7 +2247,7 @@ test "discover: the same name gate-compared elsewhere yields a null asking_condi
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "holt_backend").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expect(dim.roles.captured);
@@ -2238,7 +2268,7 @@ test "discover: a top-level solo eq atom is unconditioned" {
     try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when use_1password_ssh_agent=true\nx = 1\n# mox: end\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "use_1password_ssh_agent").?;
     try std.testing.expect(dim.asking_condition == null);
 }
@@ -2259,7 +2289,7 @@ test "discover: a conjunction-sibling presence occurrence is conditioned on the 
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "signing_work_key").?;
     try std.testing.expect(dim.roles.presence);
     const cond = dim.asking_condition.?;
@@ -2283,7 +2313,7 @@ test "discover: both sides of a top-level `or` are unconditioned" {
     try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when a_fact or b_fact\nx = 1\n# mox: end\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "a_fact").?.asking_condition == null);
     try std.testing.expect(findDim(d, "b_fact").?.asking_condition == null);
 }
@@ -2304,7 +2334,7 @@ test "discover: an or-branch nested in an and inherits the and's other conjunct,
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     for ([_][]const u8{ "a_fact", "b_fact" }) |name| {
         const dim = findDim(d, name).?;
@@ -2334,7 +2364,7 @@ test "discover: an occurrence nested inside another directive's own gate inherit
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "holt_backend").?;
     try std.testing.expect(dim.roles.value_compared);
     const cond = dim.asking_condition.?;
@@ -2364,7 +2394,7 @@ test "discover: a fact conditioned here but ALSO used unguarded elsewhere yields
     try writeFile(io, tmp.dir, "src/.zshrc", "# mox: when signing_work_key\ny = 1\n# mox: end\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "signing_work_key").?.asking_condition == null);
 }
 
@@ -2385,7 +2415,7 @@ test "discover: multiple captures under different gates OR together" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "workspace_id").?;
     const cond = dim.asking_condition.?;
     try std.testing.expect(cond.* == .or_);
@@ -2420,7 +2450,7 @@ test "discover: nested when regions AND their conditions" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "gdrive_account").?;
     const cond = dim.asking_condition.?;
     try std.testing.expect(cond.* == .and_);
@@ -2446,7 +2476,7 @@ test "discover: a quoted UTF-8 value is observed" {
     try writeFile(io, tmp.dir, "src/.gitconfig", "# mox: when locale=\"\xe6\x9d\xb1\xe4\xba\xac\"\nx = 1\n# mox: end\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "locale").?;
     try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
     try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", dim.observed_values[0]);
@@ -2468,7 +2498,7 @@ test "discover: a script's MOX_FACT token in a comment is scanned" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
     const s = d.scripts[0];
     try std.testing.expectEqualStrings("scripts/pre/00-brew.sh", s.path);
@@ -2495,7 +2525,7 @@ test "discover: a script's `# mox: needs` overrides the token scan, and links pr
     try writeFile(io, tmp.dir, "src/.zshrc", "op = <machine.onepassword_account>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const s = d.scripts[0];
     try std.testing.expect(s.needs != null);
     try std.testing.expectEqual(@as(usize, 1), s.needs.?.len);
@@ -2521,7 +2551,7 @@ test "discover: an empty `# mox: needs` line declares an explicit empty list" {
     try writeFile(io, tmp.dir, "scripts/post/reload.sh", "#!/bin/sh\n# mox: needs\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const s = d.scripts[0];
     try std.testing.expect(s.needs != null);
     try std.testing.expectEqual(@as(usize, 0), s.needs.?.len);
@@ -2538,7 +2568,7 @@ test "discover: a malformed `# mox: needs` name is a loud diagnostic, not a fata
     try writeFile(io, tmp.dir, "scripts/pre/bad.sh", "#!/bin/sh\n# mox: needs Not-Valid\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
     const diag = d.diagnostics[0].needs_name;
@@ -2562,7 +2592,7 @@ test "discover: a `# mox: needs` name with no other occurrence anywhere register
     try writeFile(io, tmp.dir, "scripts/pre/00-steam.sh", "#!/bin/sh\n# mox: needs steam_library\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "steam_library").?;
     try std.testing.expect(dim.asking_condition == null);
     try std.testing.expectEqual(@as(usize, 0), dim.observed_values.len);
@@ -2591,7 +2621,7 @@ test "discover: an ungated script's declared need leaves a name src/ uses only u
     try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\n# mox: needs onepassword_account\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "onepassword_account").?;
     try std.testing.expect(dim.asking_condition == null);
     try std.testing.expectEqual(@as(usize, 1), dim.provenance.needing_scripts.len);
@@ -2613,7 +2643,7 @@ test "discover: a gated script's declared need ORs its gate directory's tuple wi
     try writeFile(io, tmp.dir, "scripts/pre/os=linux/00-vpn.sh", "#!/bin/sh\n# mox: needs vpn_host\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const cond = findDim(d, "vpn_host").?.asking_condition.?;
 
     var b = std.StringHashMap([]const u8).init(a);
@@ -2643,7 +2673,7 @@ test "discover: an ungated script's scanned token leaves a name src/ uses only u
     try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\necho \"$MOX_FACT_OP_ACCOUNT\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "op_account").?;
     try std.testing.expect(dim.asking_condition == null);
     try std.testing.expectEqual(@as(usize, 1), dim.provenance.needing_scripts.len);
@@ -2663,7 +2693,7 @@ test "discover: a gated script's scanned token ORs its gate directory's tuple wi
     try writeFile(io, tmp.dir, "scripts/pre/os=linux/00-vpn.sh", "#!/bin/sh\necho \"$MOX_FACT_VPN_HOST\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const cond = findDim(d, "vpn_host").?.asking_condition.?;
 
     var b = std.StringHashMap([]const u8).init(a);
@@ -2689,7 +2719,7 @@ test "discover: a scanned token matching no known fact registers no dimension" {
     try writeFile(io, tmp.dir, "scripts/pre/00-steam.sh", "#!/bin/sh\necho \"$MOX_FACT_STEAM_LIBRARY\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 0), d.dimensions.len);
 }
 
@@ -2714,7 +2744,7 @@ test "discover: a `# mox: needs` head keeps the tokens it replaces from widening
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqualStrings(
         "locale=ja",
         try writeExprToStringForTest(a, findDim(d, "profile").?.asking_condition.?),
@@ -2745,7 +2775,7 @@ test "discover: a name whose projection collides with another's is widened by no
     try writeFile(io, tmp.dir, "scripts/pre/00-both.sh", "#!/bin/sh\necho \"$MOX_FACT_FOO_BAR\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqualStrings(
         "locale=ja",
         try writeExprToStringForTest(a, findDim(d, "Foo-Bar").?.asking_condition.?),
@@ -2773,7 +2803,7 @@ test "discover: a src/-gated name no script declares as a need keeps its own gat
     try writeFile(io, tmp.dir, "scripts/pre/00-op.sh", "#!/bin/sh\n# mox: needs op_account\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "op_account").?.asking_condition == null);
     try std.testing.expectEqualStrings(
         "profile=work",
@@ -2792,7 +2822,7 @@ test "discover: a `# mox: needs` name excluded by category (built-in) registers 
     try writeFile(io, tmp.dir, "scripts/pre/00-os.sh", "#!/bin/sh\n# mox: needs os\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "os") == null);
 }
 
@@ -2831,7 +2861,7 @@ test "discover: integration -- gdrive_account gated, 1Password pair gated on pro
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const gdrive = findDim(d, "gdrive_account").?;
     try std.testing.expect(gdrive.roles.captured);
@@ -2887,7 +2917,7 @@ test "discover: a script two levels deep under a non-tuple directory is not scan
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
 }
 
@@ -2907,7 +2937,7 @@ test "discover: the same malformed script still registers (fails loud) at top le
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
     try std.testing.expectEqualStrings("scripts/pre/00-bad.sh", d.diagnostics[0].needs_name.path);
 }
@@ -2928,7 +2958,7 @@ test "discover: the same malformed script still registers (fails loud) one level
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
     try std.testing.expectEqualStrings("scripts/pre/os=linux/util.sh", d.diagnostics[0].needs_name.path);
 }
@@ -2949,7 +2979,7 @@ test "discover: a well-formed script one level inside an axis dir is scanned" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.scripts.len);
     try std.testing.expectEqualStrings("scripts/pre/os=linux/util.sh", d.scripts[0].path);
 }
@@ -2965,7 +2995,7 @@ test "discover: a scripts gate directory's own tuple is value-compared and uncon
     try writeFile(io, tmp.dir, "scripts/pre/profile=work/00-x.sh", "#!/bin/sh\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "profile").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
@@ -2989,7 +3019,7 @@ test "discover: a gated script's declared need is asked under its gate directory
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "work_token").?;
     try std.testing.expectEqualStrings(
         "profile=work",
@@ -3013,7 +3043,7 @@ test "discover: a gated script's own when-head atom is asked under its gate dire
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "vpn_host").?;
     try std.testing.expectEqualStrings(
         "profile=work",
@@ -3032,7 +3062,7 @@ test "discover: an ungated script's declared need stays unconditioned" {
     try writeFile(io, tmp.dir, "scripts/pre/00-x.sh", "#!/bin/sh\n# mox: needs work_token\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "work_token").?.asking_condition == null);
 }
 
@@ -3055,7 +3085,7 @@ test "discover: a need declared by both a gated and an ungated script is uncondi
     try writeFile(io, tmp.dir, "scripts/pre/zz.sh", "#!/bin/sh\n# mox: needs shared_token\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "shared_token").?.asking_condition == null);
 }
 
@@ -3070,7 +3100,7 @@ test "discover: a directory whose name is not an axis tuple is never descended i
     try writeFile(io, tmp.dir, "scripts/pre/helpers/util.sh", "#!/bin/sh\necho hi\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
 }
 
@@ -3100,7 +3130,7 @@ test "discover: two dimension names that sanitize to the same MOX_FACT_ token ar
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const foo_bar = findDim(d, "Foo-Bar").?;
     try std.testing.expectEqual(@as(usize, 0), foo_bar.provenance.needing_scripts.len);
@@ -3131,7 +3161,7 @@ test "discover: an explicit `# mox: needs` link is unaffected by a token collisi
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const foo_bar2 = findDim(d, "foo_bar").?;
     try std.testing.expectEqual(@as(usize, 1), foo_bar2.provenance.needing_scripts.len);
@@ -3149,7 +3179,7 @@ test "discover: a capture field outside the fact-name charset is not a dimension
     try writeFile(io, tmp.dir, "src/.zshrc", "x = <machine.Bad-Name>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "Bad-Name") == null);
     try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
     const diag = d.diagnostics[0].capture_name;
@@ -3170,7 +3200,7 @@ test "discover: a chain's leading machine member is a dimension, not a malformed
     try writeFile(io, tmp.dir, "src/.zshrc", "x = <machine.chain_head | env.SOMETHING>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "chain_head").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
@@ -3187,7 +3217,7 @@ test "discover: a chain's trailing machine member is a dimension" {
     try writeFile(io, tmp.dir, "src/.zshrc", "x = <env.SOMETHING | machine.chain_tail>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "chain_tail").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
@@ -3209,7 +3239,7 @@ test "discover: a chain's mid machine member is a dimension" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "chain_mid").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
@@ -3231,7 +3261,7 @@ test "discover: every machine member of one chain is its own dimension" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "chain_first").?.roles.captured);
     try std.testing.expect(findDim(d, "chain_second").?.roles.captured);
 }
@@ -3252,7 +3282,7 @@ test "discover: a chain's default is no machine member's capture default" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "chain_defaulted").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 0), dim.capture_defaults.len);
@@ -3269,7 +3299,7 @@ test "discover: a chain member's bad fact name is reported as that member's name
     try writeFile(io, tmp.dir, "src/.zshrc", "x = <env.SOMETHING | machine.Bad-Name>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "Bad-Name") == null);
     try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
     const diag = d.diagnostics[0].capture_name;
@@ -3291,7 +3321,7 @@ test "discover: a data row value's fallback chain makes its machine member a dim
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_chain | env.HOME>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "row_chain").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
@@ -3309,7 +3339,7 @@ test "discover: a data row value's plain capture is a dimension" {
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_plain>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "row_plain").?.roles.captured);
 }
 
@@ -3334,7 +3364,7 @@ test "discover: a data row's string-array element is a dimension" {
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndirs = [\"a\", \"<machine.row_elem>/bin\"]\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "row_elem").?.roles.captured);
 }
 
@@ -3350,7 +3380,7 @@ test "discover: a data row value's capture carries its own `| default`" {
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_defaulted | default \\\"/opt\\\">/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "row_defaulted").?;
     try std.testing.expectEqual(@as(usize, 1), dim.capture_defaults.len);
     try std.testing.expectEqualStrings("/opt", dim.capture_defaults[0]);
@@ -3369,7 +3399,7 @@ test "discover: a data row capture read by two loops counts the data file as its
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.shared_row>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), findDim(d, "shared_row").?.provenance.source_count);
 }
 
@@ -3385,7 +3415,7 @@ test "discover: a bad fact name in a data row is reported against the data file"
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.Bad-Row>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "Bad-Row") == null);
     try std.testing.expectEqual(@as(usize, 1), d.diagnostics.len);
     try std.testing.expectEqualStrings("data/tools.toml", d.diagnostics[0].capture_name.path);
@@ -3409,7 +3439,7 @@ test "discover: a data row capture is conditioned on the loop that reads it" {
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_gated>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const cond = findDim(d, "row_gated").?.asking_condition.?;
     try std.testing.expect(cond.* == .eq);
     try std.testing.expectEqualStrings("profile", cond.eq.axis);
@@ -3439,7 +3469,7 @@ test "discover: a data row capture read under two different gates is asked under
     try writeFile(io, tmp.dir, "data/tools.toml", "[[tools]]\ndir = \"<machine.row_two_gates>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const cond = findDim(d, "row_two_gates").?.asking_condition.?;
     try std.testing.expect(cond.* == .or_);
 }
@@ -3456,7 +3486,7 @@ test "discover: a per-file `<base>.d/` data source's row capture is a dimension"
     try writeFile(io, tmp.dir, "src/.zshrc.d/tools.toml", "[[tools]]\ndir = \"<machine.overlay_row>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "overlay_row").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 1), dim.provenance.source_count);
@@ -3479,7 +3509,7 @@ test "discover: a generator loop's data row capture is a dimension" {
     try writeFile(io, tmp.dir, "data/hosts.toml", "[[hosts]]\nname = \"a\"\ndir = \"<machine.gen_row>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "gen_row").?.roles.captured);
 }
 
@@ -3507,7 +3537,7 @@ test "discover: a loop over an enclosing row's array field reads no file of its 
     try writeFile(io, tmp.dir, "src/.zshrc.d/e.dirs", "[[e]]\ndir = \"<machine.decoy_dim>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "elem_dim") != null);
     try std.testing.expect(findDim(d, "decoy_dim") == null);
 }
@@ -3525,7 +3555,7 @@ test "discover: a capture in a data file no loop reads is not a dimension" {
     try writeFile(io, tmp.dir, "data/unread.toml", "[[unread]]\ndir = \"<machine.never_read>/bin\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "never_read") == null);
     try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
 }
@@ -3547,7 +3577,7 @@ test "discover: a capture in an array the data file's stem does not name is not 
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "other_array") == null);
 }
 
@@ -3576,7 +3606,7 @@ test "discover: a data file's comment, key, nested table, and non-row scalar hol
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     // None of these four positions is ever interpolated: a comment is dropped
     // by the TOML parse, a key is looked up rather than emitted, a nested
     // table is dropped by the row projection, and a non-row scalar reached by
@@ -3603,7 +3633,7 @@ test "discover: an unreadable or malformed data source leaves discovery clean" {
     try writeFile(io, tmp.dir, "src/.profile", "y = <machine.still_scanned>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "still_scanned") != null);
     try std.testing.expectEqual(@as(usize, 0), d.diagnostics.len);
 }
@@ -3628,7 +3658,7 @@ test "discover: an append body's capture is unconditioned (always emitted)" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "append_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3652,7 +3682,7 @@ test "discover: a prepend body's capture is unconditioned (always emitted)" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "prepend_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3676,7 +3706,7 @@ test "discover: a gate-false replace literal body's capture is conditioned on `n
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "replace_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -3707,7 +3737,7 @@ test "discover: a remove body's capture is conditioned on `not <gate>`" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "remove_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -3738,7 +3768,7 @@ test "discover: a `replace from` fallback body's capture is unconditioned (no fr
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "fromfallback_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3762,7 +3792,7 @@ test "discover: a top-level `from` fallback body's capture is unconditioned" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "plainfrom_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3786,7 +3816,7 @@ test "discover: a for-loop body's capture is unconditioned (per-row emission is 
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "for_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3810,7 +3840,7 @@ test "discover: a generator loop's `into` path template capture is discovered" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "into_site").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3835,7 +3865,7 @@ test "discover: a generator loop's `into` capture with a declared default is a d
     try writeFile(io, tmp.dir, "src/.zshrc", "# mox: default into_default_site=\"prod\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "into_default_site").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
@@ -3861,7 +3891,7 @@ test "discover: a for-loop body's capture is conditioned on the loop's own `when
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "for_gated_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -3888,7 +3918,7 @@ test "discover: a generator loop's `into` capture is conditioned on the loop's o
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "into_gated_site").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -3909,7 +3939,7 @@ test "discover: a Cat B region fragment's own capture is unconditioned (tuple ma
     try writeFile(io, tmp.dir, "src/kind.lua.d/profile/work.lua", "M.kind = \"<machine.region_frag_dim>\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "region_frag_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3927,7 +3957,7 @@ test "discover: an include-target fragment's capture gets the include's own gate
     try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.include_dim>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "include_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -3952,7 +3982,7 @@ test "discover: an ungated include-target fragment's capture is unconditioned" {
     try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.include_ungated_dim>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "include_ungated_dim").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expect(dim.asking_condition == null);
@@ -3977,7 +4007,7 @@ test "discover: an append fragment target's capture gets the append's own gate" 
     try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.append_frag_dim>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "append_frag_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -4005,7 +4035,7 @@ test "discover: a prepend fragment target's capture gets the prepend's own gate"
     try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.prepend_frag_dim>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "prepend_frag_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -4033,7 +4063,7 @@ test "discover: a gate-true replace fragment target's capture gets the replace's
     try writeFile(io, tmp.dir, "src/.zshrc.d/frag.sh", "y = <machine.replace_frag_dim>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "replace_frag_dim").?;
     try std.testing.expect(dim.roles.captured);
     const cond = dim.asking_condition.?;
@@ -4064,7 +4094,7 @@ test "discover: an axis compared only in a `when` nested inside a for body is st
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "nested_axis").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqual(@as(usize, 1), dim.observed_values.len);
@@ -4091,7 +4121,7 @@ test "discover: a dotted row-field reference in a nested for-body `when` is not 
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "entry") == null);
     try std.testing.expect(findDim(d, "shells") == null);
 }
@@ -4116,7 +4146,7 @@ test "discover: a bare ref matching the enclosing loop variable's own name is no
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "entry") == null);
 }
 
@@ -4140,7 +4170,7 @@ test "discover: a `for` loop's own `when` clause nested inside a when-gate is st
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "nested_for_axis").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqualStrings("val", dim.observed_values[0]);
@@ -4166,7 +4196,7 @@ test "discover: a for loop's own `where` referencing its own loop variable is no
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "entry") == null);
 }
 
@@ -4186,7 +4216,7 @@ test "discover: a for loop's own `where` referencing a genuine machine fact is s
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "signing_key").?;
     try std.testing.expect(dim.roles.presence);
 }
@@ -4210,7 +4240,7 @@ test "discover: a `default` directive records a declared default on an already-r
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "holt_backend").?;
     try std.testing.expect(dim.roles.value_compared);
     try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
@@ -4241,7 +4271,7 @@ test "discover: a `default` directive nested inside an unrelated when-gate is st
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "holt_backend").?;
     try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
     try std.testing.expectEqualStrings("icloud", dim.declared_defaults[0]);
@@ -4259,7 +4289,7 @@ test "discover: conflicting declared defaults for one name is a diagnostic namin
     try writeFile(io, tmp.dir, "src/b.zshrc", "# mox: default conflict_dim=\"second\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
     const diag = d.default_diagnostics[0];
     try std.testing.expect(diag == .conflict);
@@ -4287,7 +4317,7 @@ test "discover: the same declared default value from two files dedupes silently"
     try writeFile(io, tmp.dir, "src/b.zshrc", "# mox: default dedupe_dim=\"same\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 0), d.default_diagnostics.len);
     const dim = findDim(d, "dedupe_dim").?;
     try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
@@ -4305,7 +4335,7 @@ test "discover: a declared default for a fact no source consumes is an unclaimed
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default unclaimed_dim=\"x\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "unclaimed_dim") == null);
     try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
     const diag = d.default_diagnostics[0];
@@ -4332,7 +4362,7 @@ test "discover: a declared default accepts a quoted UTF-8 value" {
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "locale").?;
     try std.testing.expectEqual(@as(usize, 1), dim.declared_defaults.len);
     try std.testing.expectEqualStrings("\xe6\x9d\xb1\xe4\xba\xac", dim.declared_defaults[0]);
@@ -4349,7 +4379,7 @@ test "discover: a declared default naming a built-in is a loud diagnostic, not a
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default os=\"linux\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "os") == null);
     try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
     const diag = d.default_diagnostics[0].reserved;
@@ -4368,7 +4398,7 @@ test "discover: a declared default naming an open probe axis is a loud diagnosti
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default tool=\"fd\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
     try std.testing.expectEqualStrings("tool", d.default_diagnostics[0].reserved.name);
 }
@@ -4385,7 +4415,7 @@ test "discover: a declared default naming a data/facts.toml-derived name is a lo
     try writeFile(io, tmp.dir, "src/a.zshrc", "# mox: default brew_prefix=\"/opt/homebrew\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 1), d.default_diagnostics.len);
     try std.testing.expectEqualStrings("brew_prefix", d.default_diagnostics[0].reserved.name);
 }
@@ -4431,7 +4461,7 @@ test "discover: corpus-shaped fixture with a declared default added -- every oth
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     // Every assertion from the corpus-shaped integration test, unchanged.
     const gdrive = findDim(d, "gdrive_account").?;
@@ -4491,7 +4521,7 @@ test "discover: a markerless-extension file's capture is still a dimension with 
     try writeFile(io, tmp.dir, "src/.config/tool/settings", "value = <machine.newfact | default \"x\">\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const dim = findDim(d, "newfact").?;
     try std.testing.expect(dim.roles.captured);
@@ -4519,7 +4549,7 @@ test "discover: an unrecognized-extension file with a shebang has its gate and c
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const gate = findDim(d, "workonly").?;
     try std.testing.expect(gate.roles.value_compared);
@@ -4556,7 +4586,7 @@ test "discover: an unrecognized-extension file resolves its marker from an appar
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const gate = findDim(d, "apparentfact").?;
     try std.testing.expect(gate.roles.value_compared);
@@ -4591,7 +4621,7 @@ test "discover: a fully markerless file consuming an already-real fact increment
     try writeFile(io, tmp.dir, "src/.config/git/allowed_signers", "sho@example.com namespaces=\"git\" <machine.profile>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const profile = findDim(d, "profile").?;
     try std.testing.expectEqual(@as(usize, 2), profile.provenance.source_count);
@@ -4615,7 +4645,7 @@ test "discover: a recognized-extension file's discovery is unchanged (mutation g
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
 
     const profile = findDim(d, "profile").?;
     try std.testing.expect(profile.roles.value_compared);
@@ -4657,7 +4687,7 @@ test "discover: pathologically deep nested when-gates do not hang or overflow th
     // the wall clock is what the assertion is on: a regression to unbounded
     // recursion fails here instead of hanging the suite forever.
     const started = std.Io.Clock.awake.now(io);
-    _ = try discover(a, io, repo);
+    _ = try discover(a, io, repo, "");
     const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
     try std.testing.expect(elapsed_ms < 30_000);
 }
@@ -4672,7 +4702,7 @@ test "discover: an empty repo (no src, no scripts) yields no dimensions and no s
 
     try tmp.dir.createDirPath(io, ".");
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(@as(usize, 0), d.dimensions.len);
     try std.testing.expectEqual(@as(usize, 0), d.scripts.len);
     try std.testing.expect(d.tree_error == null);
@@ -4690,7 +4720,7 @@ test "discover: a structurally invalid source tree sets tree_error and still deg
     try writeFile(io, tmp.dir, "src/.gitconfig.d/path=brew", "[gpg]\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expectEqual(error.ReservedAxisName, d.tree_error.?);
     // The invalid tree degrades to "nothing found" for dimension content --
     // apply's own richer walkDiag call owns the per-site message for this
@@ -4710,7 +4740,7 @@ test "discover: a Cat A overlay's plain capture is a dimension, asked when its o
     try writeFile(io, tmp.dir, "src/app.toml.d/profile=work", "[work]\nvalue = \"<machine.overlay_fact>\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "overlay_fact").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
@@ -4728,7 +4758,7 @@ test "discover: a Cat A overlay's fallback-chain capture is a dimension, not lef
     try writeFile(io, tmp.dir, "src/app.toml.d/profile=work", "[work]\nvalue = \"<machine.overlay_fact | env.HOME>\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "overlay_fact").?;
     try std.testing.expect(dim.roles.captured);
     // A chain's members carry no interview default: the `| default` rescues an
@@ -4750,7 +4780,7 @@ test "discover: a baseless .d/ overlay's capture is a dimension, asked when its 
     try writeFile(io, tmp.dir, "src/gated.toml.d/profile=work", "value = \"<machine.gated_overlay_fact>\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "gated_overlay_fact").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
@@ -4768,7 +4798,7 @@ test "discover: a raw-line-merged gitconfig overlay's capture is a dimension" {
     try writeFile(io, tmp.dir, "src/.gitconfig.d/profile=work", "[user]\n  email = <machine.work_email>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "work_email").?;
     try std.testing.expect(dim.roles.captured);
     try std.testing.expectEqualStrings("profile=work", try writeExprToStringForTest(a, dim.asking_condition.?));
@@ -4791,7 +4821,7 @@ test "discover: a multi-pair overlay tuple conditions its capture on every pair"
     );
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "work_email").?;
     try std.testing.expectEqualStrings(
         "holt_backend=gdrive and profile=work",
@@ -4814,7 +4844,7 @@ test "discover: an overlay filename's stripped and verbatim tuples are both aske
     try writeFile(io, tmp.dir, "src/.gitconfig.d/hostname=host.local", "[user]\n  email = <machine.host_email>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "host_email").?;
     try std.testing.expectEqualStrings(
         "hostname=host or hostname=host.local",
@@ -4837,7 +4867,7 @@ test "discover: an overlay filename's stripped and verbatim readings are both ob
     try writeFile(io, tmp.dir, "src/.gitconfig.d/zone=eu.local", "[user]\n  email = e@eu\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "zone").?;
     try std.testing.expectEqual(@as(usize, 2), dim.observed_values.len);
     try std.testing.expectEqualStrings("eu", dim.observed_values[0]);
@@ -4856,7 +4886,7 @@ test "discover: a region fragment filename's stripped and verbatim readings are 
     try writeFile(io, tmp.dir, "src/kind.lua.d/zone/eu.local", "M.zone = \"eu\"\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     const dim = findDim(d, "zone").?;
     try std.testing.expectEqual(@as(usize, 2), dim.observed_values.len);
     try std.testing.expectEqualStrings("eu", dim.observed_values[0]);
@@ -4875,7 +4905,7 @@ test "discover: a Cat B overlay's capture is no dimension, since compose never r
     try writeFile(io, tmp.dir, "src/hook.sh.d/profile=work", "echo <machine.never_composed>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "never_composed") == null);
 }
 
@@ -4891,6 +4921,6 @@ test "discover: a Cat C overlay's capture is no dimension, since compose copies 
     try writeFile(io, tmp.dir, "src/id.pem.d/profile=work", "<machine.never_interpolated>\n");
 
     const repo = try tmpAbsPath(a, &tmp, "");
-    const d = try discover(a, io, repo);
+    const d = try discover(a, io, repo, "");
     try std.testing.expect(findDim(d, "never_interpolated") == null);
 }

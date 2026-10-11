@@ -100,6 +100,15 @@ pub const AnyValue = union(enum) {
 
 const iniDialect = format_mod.iniDialect;
 
+/// What a strict-JSON target's live file that does not parse lacks: when it
+/// parses as JSONC, it holds a comment or trailing comma its program would
+/// reject too, unless the program reads JSONC. Empty otherwise.
+pub fn liveParseHint(arena: std.mem.Allocator, format: Format, live: []const u8) []const u8 {
+    if (format != .json) return "";
+    _ = json.parse(arena, live, .{ .dialect = .jsonc }) catch return "";
+    return "; JSON has no comments or trailing commas: remove them, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments";
+}
+
 /// The composed owned document: the parse of the composed source text,
 /// queried per declared path. Later folds reuse this as the record and
 /// canonicalization input.
@@ -113,7 +122,7 @@ pub const OwnedDoc = struct {
             // parser accepts empty input, so represent it directly.
             const empty_root: AnyValue = switch (format) {
                 .toml => .{ .toml = .{ .table = .empty } },
-                .json => .{ .json = .{ .object = .empty } },
+                .json, .jsonc => .{ .json = .{ .object = .empty } },
                 .yaml => .{ .yaml = .null },
                 .ini, .gitconfig => blk: {
                     const root = try arena.create(ini.Section);
@@ -125,7 +134,7 @@ pub const OwnedDoc = struct {
         }
         const root: AnyValue = switch (format) {
             .toml => .{ .toml = toml.parse(arena, text, .{}) catch |e| return parseFail(e) },
-            .json => .{ .json = json.parse(arena, text, .{ .dialect = .jsonc }) catch |e| return parseFail(e) },
+            .json, .jsonc => .{ .json = json.parse(arena, text, .{ .dialect = format.jsonDialect() }) catch |e| return parseFail(e) },
             .yaml => .{ .yaml = yaml.parse(arena, text, .{}) catch |e| return parseFail(e) },
             .ini, .gitconfig => .{ .ini = ini.parse(arena, text, .{ .dialect = iniDialect(format) }) catch |e| return parseFail(e) },
         };
@@ -296,7 +305,7 @@ fn locateFull(
     try checkPathOverlap(own_paths, diag);
     return switch (format) {
         .toml => tomlLocate(arena, live, own_paths, diag),
-        .json => jsonLocate(arena, live, own_paths, diag),
+        .json, .jsonc => jsonLocate(arena, format.jsonDialect(), live, own_paths, diag),
         .yaml => yamlLocate(arena, live, own_paths, diag),
         .ini, .gitconfig => iniLocate(arena, format, live, own_paths, diag),
     };
@@ -318,7 +327,7 @@ pub fn replaceOwned(
     _ = try locateFull(arena, format, live, own_paths, diag);
     return switch (format) {
         .toml => tomlReplace(arena, live, own_paths, owned, diag),
-        .json => jsonReplace(arena, live, own_paths, owned, diag),
+        .json, .jsonc => jsonReplace(arena, format.jsonDialect(), live, own_paths, owned, diag),
         .yaml => yamlReplace(arena, live, own_paths, owned, diag),
         .ini, .gitconfig => iniReplace(arena, format, live, own_paths, owned, diag),
     };
@@ -341,7 +350,7 @@ pub fn verifyInvariant(
 ) VerifyError!void {
     const cand_root: AnyValue = switch (format) {
         .toml => .{ .toml = toml.parse(arena, candidate, .{}) catch |e| return verifyParseFail(e) },
-        .json => .{ .json = json.parse(arena, candidate, .{ .dialect = .jsonc }) catch |e| return verifyParseFail(e) },
+        .json, .jsonc => .{ .json = json.parse(arena, candidate, .{ .dialect = format.jsonDialect() }) catch |e| return verifyParseFail(e) },
         .yaml => .{ .yaml = yaml.parse(arena, candidate, .{}) catch |e| return verifyParseFail(e) },
         .ini, .gitconfig => .{ .ini = ini.parse(arena, candidate, .{ .dialect = iniDialect(format) }) catch |e| return verifyParseFail(e) },
     };
@@ -366,7 +375,7 @@ pub fn verifyInvariant(
     const live_rest = try remainderBytes(arena, live, live_loc);
     const cand_rest = try remainderBytes(arena, candidate, cand_loc);
 
-    if (live.len == 0 and format == .json) {
+    if (live.len == 0 and format.isJson()) {
         // A missing live JSON file gains the root braces with the first
         // append; they are appended structure, not remainder.
         if (std.mem.eql(u8, cand_rest, "") or std.mem.eql(u8, cand_rest, "{}")) return;
@@ -578,8 +587,8 @@ pub fn maskSecretPaths(
             for (leaves.items) |lp| doc.setValueSegments(lp, .{ .string = secret_mask }) catch return error.MaskFailed;
             return emitMasked(arena, &doc);
         },
-        .json => {
-            var doc = json.Document.parse(arena, live, .{ .dialect = .jsonc }) catch return error.MaskFailed;
+        .json, .jsonc => {
+            var doc = json.Document.parse(arena, live, .{ .dialect = format.jsonDialect() }) catch return error.MaskFailed;
             for (leaves.items) |lp| doc.setValueSegments(lp, .{ .string = secret_mask }) catch return error.MaskFailed;
             return emitMasked(arena, &doc);
         },
@@ -1164,8 +1173,8 @@ fn tomlRenderBlock(arena: std.mem.Allocator, segments: []const []const u8, tbl: 
 
 // JSON
 
-fn jsonParseDoc(arena: std.mem.Allocator, live: []const u8) LocateError!json.Document {
-    return json.Document.parse(arena, live, .{ .dialect = .jsonc }) catch |e| switch (e) {
+fn jsonParseDoc(arena: std.mem.Allocator, dialect: json.Dialect, live: []const u8) LocateError!json.Document {
+    return json.Document.parse(arena, live, .{ .dialect = dialect }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.LiveUnparseable,
     };
@@ -1173,6 +1182,7 @@ fn jsonParseDoc(arena: std.mem.Allocator, live: []const u8) LocateError!json.Doc
 
 fn jsonLocate(
     arena: std.mem.Allocator,
+    dialect: json.Dialect,
     live: []const u8,
     own_paths: []const OwnPath,
     diag: ?*Diag,
@@ -1183,7 +1193,7 @@ fn jsonLocate(
     @memset(forms, .none);
     if (live.len == 0) return .{ .spans = spans, .forms = forms, .wrappers = &.{} };
 
-    const doc = try jsonParseDoc(arena, live);
+    const doc = try jsonParseDoc(arena, dialect, live);
     const root = doc.root;
     if (root.data != .object) {
         diagSet(diag, "root of the document is not an object", .{});
@@ -1308,18 +1318,19 @@ fn jsonFullyOwned(arena: std.mem.Allocator, node: anytype, own_paths: []const Ow
 
 fn jsonReplace(
     arena: std.mem.Allocator,
+    dialect: json.Dialect,
     live: []const u8,
     own_paths: []const OwnPath,
     owned: *const OwnedDoc,
     diag: ?*Diag,
 ) ReplaceError![]u8 {
     var doc = if (live.len == 0)
-        json.Document.empty(arena, .{ .dialect = .jsonc }) catch |e| switch (e) {
+        json.Document.empty(arena, .{ .dialect = dialect }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.OwnedRenderFailed,
         }
     else
-        try jsonParseDoc(arena, live);
+        try jsonParseDoc(arena, dialect, live);
 
     // Populated paths first: the document model replaces value bytes in
     // place and appends missing members with the surrounding style.
@@ -1340,7 +1351,7 @@ fn jsonReplace(
     // remainder bytes the invariant pins.
     for (own_paths, 0..) |p, pi| {
         if (owned.populated(p.segments)) continue;
-        const loc = try jsonLocate(arena, text, own_paths, diag);
+        const loc = try jsonLocate(arena, dialect, text, own_paths, diag);
         if (loc.spans[pi]) |sp| text = try spliceBytes(arena, text, sp, "");
     }
     return @constCast(text);
@@ -2235,7 +2246,7 @@ pub fn extractOwnedSource(
     }
     return switch (format) {
         .toml, .ini, .gitconfig => extractHeaderForm(arena, format, text, own_paths, loc),
-        .json => extractJson(arena, text, own_paths, loc),
+        .json, .jsonc => extractJson(arena, text, own_paths, loc),
         .yaml => extractYaml(arena, text, own_paths, loc, diag),
     };
 }
@@ -2544,7 +2555,7 @@ pub fn withoutSubtrees(
     const pruned = try pruneValue(arena, doc.format, doc.root, paths, &stored, &folds);
     const root = pruned orelse switch (doc.format) {
         .toml => AnyValue{ .toml = .{ .table = .empty } },
-        .json => AnyValue{ .json = .{ .object = .empty } },
+        .json, .jsonc => AnyValue{ .json = .{ .object = .empty } },
         .yaml => AnyValue{ .yaml = .null },
         .ini, .gitconfig => blk: {
             const sec = try arena.create(ini.Section);
@@ -2693,7 +2704,7 @@ pub fn replaceDisowned(
         text = switch (format) {
             .toml => try tomlInsertRaw(arena, text, p, raw, form, diag),
             .ini, .gitconfig => try iniInsertRaw(arena, format, text, p, raw, form, diag),
-            .json => try jsonInsertRaw(arena, text, p, raw, diag),
+            .json, .jsonc => try jsonInsertRaw(arena, format.jsonDialect(), text, p, raw, diag),
             .yaml => try yamlInsertRaw(arena, text, p, raw, diag),
         };
     }
@@ -2772,6 +2783,7 @@ fn iniInsertRaw(
 
 fn jsonInsertRaw(
     arena: std.mem.Allocator,
+    dialect: json.Dialect,
     text: []const u8,
     p: OwnPath,
     raw: []const u8,
@@ -2781,7 +2793,7 @@ fn jsonInsertRaw(
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
         return std.mem.concat(arena, u8, &.{ "{\n  ", member, "\n}\n" });
     }
-    const doc = json.Document.parse(arena, text, .{ .dialect = .jsonc }) catch |e| switch (e) {
+    const doc = json.Document.parse(arena, text, .{ .dialect = dialect }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             diagSet(diag, "{s}: composed text does not parse for the splice", .{p.raw});
@@ -2947,7 +2959,7 @@ pub fn textWithoutSpans(arena: std.mem.Allocator, format: Format, text: []const 
     var cursor: usize = 0;
     for (merged.items) |r0| {
         var r = r0;
-        if (format == .json) {
+        if (format.isJson()) {
             jsonAbsorbDanglingComma(text, &r);
             jsonAbsorbEmptiedLine(text, &r);
         }
@@ -3036,7 +3048,7 @@ fn trimTrailingBlankLines(out: *std.ArrayList(u8)) void {
 /// included -- are compared exactly; only separator bytes the splice owns
 /// fall outside the bounds.
 fn structuralSpan(format: Format, bytes: []const u8) []const u8 {
-    if (format == .json) {
+    if (format.isJson()) {
         var s = std.mem.trim(u8, bytes, " \t\r\n");
         if (s.len > 0 and s[0] == ',') s = std.mem.trimStart(u8, s[1..], " \t\r\n");
         if (s.len > 0 and s[s.len - 1] == ',') s = std.mem.trimEnd(u8, s[0 .. s.len - 1], " \t\r\n");
@@ -3445,7 +3457,7 @@ test "json: replace, nested member, append, and creation from empty" {
     try testing.expectEqualStrings("{\"model\": \"opus\", \"z\": 1}", created);
 }
 
-test "json: removing a non-last member keeps a standalone comment between members" {
+test "jsonc: removing a non-last member keeps a standalone comment between members" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3457,9 +3469,18 @@ test "json: removing a non-last member keeps a standalone comment between member
         \\  "c": 3
         \\}
     ;
-    const cand = try testApply(arena, .json, live, &.{"gone"}, "{}");
+    const cand = try testApply(arena, .jsonc, live, &.{"gone"}, "{}");
     try testing.expect(std.mem.indexOf(u8, cand, "// program comment") != null);
     try testing.expect(std.mem.indexOf(u8, cand, "\"gone\"") == null);
+}
+
+test "json: a live file with a comment is refused under the strict dialect" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.OwnedUnparseable, OwnedDoc.parse(arena, .json, "{\n  // note\n  \"a\": 1\n}\n"));
+    try testing.expect(liveParseHint(arena, .json, "{\n  // note\n  \"a\": 1\n}\n").len > 0);
+    try testing.expectEqualStrings("", liveParseHint(arena, .jsonc, "{}"));
 }
 
 test "json: a duplicate key on the declared path is refused" {

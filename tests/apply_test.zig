@@ -463,7 +463,7 @@ test "apply: a file that stops composing to content is removed, its prior conten
     try tmp.dir.createDirPath(io, "repo/src/.config/git");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/git/ids.inc",
-        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+        .data = "# mox: for e in \"data/ids.toml\"\n[id]\n\tname = <e.k>\n# mox: end\n",
     });
     try tmp.dir.createDirPath(io, "repo/data");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
@@ -473,7 +473,7 @@ test "apply: a file that stops composing to content is removed, its prior conten
 
     // Data has a row -> the file materializes.
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expectEqualStrings("id one\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("[id]\n\tname = one\n", try read(io, a, live));
 
     // The data empties -> the source now composes to nothing.
     try Io.Dir.cwd().writeFile(io, .{
@@ -486,7 +486,7 @@ test "apply: a file that stops composing to content is removed, its prior conten
     const r2 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expect(!exists(io, live));
-    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "id one\n"));
+    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "[id]\n\tname = one\n"));
 
     // A third apply with the file already gone is a clean no-op.
     const r3 = try c.run(&.{ "mox", "apply" });
@@ -505,7 +505,7 @@ test "apply: an external edit between the read and the removal is refused, keepi
     try tmp.dir.createDirPath(io, "repo/src/.config/git");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/git/ids.inc",
-        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+        .data = "# mox: for e in \"data/ids.toml\"\n[id]\n\tname = <e.k>\n# mox: end\n",
     });
     try tmp.dir.createDirPath(io, "repo/data");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
@@ -513,7 +513,7 @@ test "apply: an external edit between the read and the removal is refused, keepi
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath(".config/git/ids.inc");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expectEqualStrings("id one\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("[id]\n\tname = one\n", try read(io, a, live));
 
     // The data empties, so this apply reaches the removal.
     try Io.Dir.cwd().writeFile(io, .{
@@ -524,7 +524,7 @@ test "apply: an external edit between the read and the removal is refused, keepi
     Interleaved.real = io;
     Interleaved.trigger_dir = try std.fs.path.join(a, &.{ c.state, "snapshots" });
     Interleaved.live_path = live;
-    Interleaved.edit = "id one\nthe user's own line\n";
+    Interleaved.edit = "[id]\n\tname = one\nthe user's own line\n";
     Interleaved.fired = false;
     var vtable: Io.VTable = undefined;
     const raced = try testutil.setup(a, Interleaved.io(&vtable), &tmp, .{});
@@ -535,7 +535,7 @@ test "apply: an external edit between the read and the removal is refused, keepi
     try std.testing.expect(std.mem.indexOf(u8, r.err, "changed underneath mox mid-apply") != null);
     // The edit stands byte for byte: the snapshot holds the pre-edit bytes,
     // so an unlink here would have left it nowhere to come back from.
-    try std.testing.expectEqualStrings("id one\nthe user's own line\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("[id]\n\tname = one\nthe user's own line\n", try read(io, a, live));
 }
 
 test "apply: an emptied file the user edited is reported as drift, not silently removed" {
@@ -549,7 +549,7 @@ test "apply: an emptied file the user edited is reported as drift, not silently 
     try tmp.dir.createDirPath(io, "repo/src/.config/git");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/git/ids.inc",
-        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+        .data = "# mox: for e in \"data/ids.toml\"\n[id]\n\tname = <e.k>\n# mox: end\n",
     });
     try tmp.dir.createDirPath(io, "repo/data");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
@@ -559,7 +559,7 @@ test "apply: an emptied file the user edited is reported as drift, not silently 
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
     // The user edits the live file, THEN the source stops composing content.
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "id one\nhand edit\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "[id]\n\tname = one\nhand edit\n" });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = try std.fs.path.join(a, &.{ c.repo, "data", "ids.toml" }),
         .data = "ids = []\n",
@@ -568,13 +568,13 @@ test "apply: an emptied file the user edited is reported as drift, not silently 
     // Removing it would destroy the user's edit: it is drift, exit 1, file kept.
     const r2 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r2.rc);
-    try std.testing.expectEqualStrings("id one\nhand edit\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("[id]\n\tname = one\nhand edit\n", try read(io, a, live));
 
     // --overwrite removes it, snapshotting the edit first.
     const r3 = try c.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r3.rc);
     try std.testing.expect(!exists(io, live));
-    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "id one\nhand edit\n"));
+    try std.testing.expect(try snapshotHas(io, a, c.state, ".config/git/ids.inc", "[id]\n\tname = one\nhand edit\n"));
 }
 
 test "apply: an emptied file whose live path is now a special inode is skipped, its record kept" {
@@ -588,7 +588,7 @@ test "apply: an emptied file whose live path is now a special inode is skipped, 
     try tmp.dir.createDirPath(io, "repo/src/.config/git");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/git/ids.inc",
-        .data = "# mox: for e in \"data/ids.toml\"\nid <e.k>\n# mox: end\n",
+        .data = "# mox: for e in \"data/ids.toml\"\n[id]\n\tname = <e.k>\n# mox: end\n",
     });
     try tmp.dir.createDirPath(io, "repo/data");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/ids.toml", .data = "[[ids]]\nk = \"one\"\n" });
@@ -2456,7 +2456,7 @@ test "add: a live symlink is captured as a regular source file plus a symlink fl
     try std.testing.expectEqualStrings("/opt/dotfiles/nvim", try read(io, a, src));
 
     // ... flagged `symlink = true`, keyed by the portable home-relative key.
-    var attrs = try mox.source.attributes.load(a, io, c.repo, null);
+    var attrs = try mox.source.attributes.load(a, io, c.repo);
     try std.testing.expect(attrs.symlink(".config/nvim"));
 }
 
@@ -4590,8 +4590,11 @@ test "apply partial: a directive-only disown base takes all content from overlay
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Strict JSON needs no base: its attributes entry declares the
+    // ownership, and the overlays supply all content.
     try tmp.dir.createDirPath(io, "repo/src/settings.json.d");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/settings.json", .data = "// mox: disown model\n" });
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = "[\"settings.json\"]\ndisown = [\"model\"]\n" });
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/settings.json.d/os=darwin.json",
         .data = "{ \"theme\": \"dark\" }\n",
@@ -4600,12 +4603,13 @@ test "apply partial: a directive-only disown base takes all content from overlay
     const c = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
     const live = try c.homePath("settings.json");
 
+    // A single layer passes through as written.
     const r1 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r1.rc);
-    try std.testing.expectEqualStrings("{\n  \"theme\": \"dark\"\n}\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("{ \"theme\": \"dark\" }\n", try read(io, a, live));
 
     // The program writes its disowned key; apply preserves it untouched.
-    const program = "{\n  \"theme\": \"dark\",\n  \"model\": \"opus\"\n}\n";
+    const program = "{ \"theme\": \"dark\", \"model\": \"opus\" }\n";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
     const r2 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
@@ -5732,13 +5736,30 @@ test "apply partial: declaring ownership over a whole-file target drops its whol
 // settings.json shape, where the user manages nearly everything and the
 // program writes a few keys back.
 
-fn writeDisownFixture(io: Io, tmp: *std.testing.TmpDir, source: []const u8) !void {
+/// A strict-JSON `settings.json` disowning `disown`: strict JSON has no
+/// comments, so its declaration is its `.mox/attributes.toml` entry and its
+/// source is the JSON alone.
+fn writeDisownFixture(io: Io, tmp: *std.testing.TmpDir, disown: []const []const u8, source: []const u8) !void {
     try tmp.dir.createDirPath(io, "repo/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/settings.json", .data = source });
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, "[\"settings.json\"]\ndisown = [");
+    for (disown, 0..) |d, i| {
+        if (i != 0) try buf.appendSlice(std.testing.allocator, ", ");
+        try buf.append(std.testing.allocator, '"');
+        for (d) |ch| {
+            if (ch == '"' or ch == '\\') try buf.append(std.testing.allocator, '\\');
+            try buf.append(std.testing.allocator, ch);
+        }
+        try buf.append(std.testing.allocator, '"');
+    }
+    try buf.appendSlice(std.testing.allocator, "]\n");
+    try tmp.dir.createDirPath(io, "repo/.mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.mox/attributes.toml", .data = buf.items });
 }
 
 const disown_source =
-    \\// mox: disown model
     \\{
     \\  "theme": "dark",
     \\  "editor": "nvim"
@@ -5754,7 +5775,7 @@ test "apply disown: creates, adopts the program's key, and never drifts on its w
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, disown_source);
+    try writeDisownFixture(io, &tmp, &.{"model"}, disown_source);
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("settings.json");
 
@@ -5777,10 +5798,7 @@ test "apply disown: creates, adopts the program's key, and never drifts on its w
 
     // The source moves on: the user keys reassert, the program's key
     // survives byte-for-byte.
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/src/settings.json",
-        .data = "// mox: disown model\n{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\"\n}\n",
-    });
+    try writeDisownFixture(io, &tmp, &.{"model"}, "{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\"\n}\n");
     const r3 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r3.rc);
     const after = try read(io, a, live);
@@ -5803,7 +5821,7 @@ test "apply disown: a user-key live edit drifts and --overwrite reasserts around
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, disown_source);
+    try writeDisownFixture(io, &tmp, &.{"model"}, disown_source);
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("settings.json");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
@@ -5833,8 +5851,7 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp,
-        \\// mox: disown model
+    try writeDisownFixture(io, &tmp, &.{"model"},
         \\{
         \\  "theme": "dark",
         \\  "survey": {"seen": 1}
@@ -5852,10 +5869,7 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
         .sub_path = live,
         .data = "{\n  \"theme\": \"dark\",\n  \"survey\": {\"seen\": 99},\n  \"model\": \"m1\"\n}\n",
     });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/src/settings.json",
-        .data = "// mox: disown model\n// mox: disown survey\n{\n  \"theme\": \"dark\"\n}\n",
-    });
+    try writeDisownFixture(io, &tmp, &.{ "model", "survey" }, "{\n  \"theme\": \"dark\"\n}\n");
     const grown = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), grown.rc);
     try std.testing.expect(std.mem.indexOf(u8, grown.err, "DRIFT") == null);
@@ -5866,10 +5880,7 @@ test "apply disown: grown and shrunk disown lists keep first-contact consent" {
     // The list SHRINKS: model becomes owned content the composed source
     // does not define. Its live content is first contact -- drift, never a
     // silent removal; --overwrite removes it.
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/src/settings.json",
-        .data = "// mox: disown survey\n{\n  \"theme\": \"dark\"\n}\n",
-    });
+    try writeDisownFixture(io, &tmp, &.{"survey"}, "{\n  \"theme\": \"dark\"\n}\n");
     const shrunk = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), shrunk.rc);
     try std.testing.expect(std.mem.indexOf(u8, shrunk.out, "drifted, left untouched") != null);
@@ -5891,7 +5902,7 @@ test "diff disown: shows the owned complement only; the program's key never appe
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, disown_source);
+    try writeDisownFixture(io, &tmp, &.{"model"}, disown_source);
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("settings.json");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
@@ -5919,7 +5930,7 @@ test "rollback disown: re-patches the owned complement and keeps the program's l
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, disown_source);
+    try writeDisownFixture(io, &tmp, &.{"model"}, disown_source);
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("settings.json");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
@@ -5930,10 +5941,7 @@ test "rollback disown: re-patches the owned complement and keeps the program's l
         .sub_path = live,
         .data = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"model\": \"m-old\"\n}\n",
     });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "repo/src/settings.json",
-        .data = "// mox: disown model\n{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\"\n}\n",
-    });
+    try writeDisownFixture(io, &tmp, &.{"model"}, "{\n  \"theme\": \"light\",\n  \"editor\": \"nvim\"\n}\n");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
     // The program writes again AFTER the snapshot.
@@ -6003,7 +6011,7 @@ test "apply disown: a shrunk disown list on a secret record is first contact, ne
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, "// mox: disown model\n// mox: disown survey\n{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S1>\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{ "model", "survey" }, "{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S1>\"\n}\n");
     const c = try testutil.setup(a, io, &tmp, .{
         .extra_env = &.{
             .{ .name = "MY_DISOWN_S1", .value = "disown-s3cr3t-one" },
@@ -6023,7 +6031,7 @@ test "apply disown: a shrunk disown list on a secret record is first contact, ne
     // The disown list SHRINKS past survey while the secret rotates. The
     // program's survey content is newly owned first contact: consent is
     // required, never a silent removal under the stale hash scope.
-    try writeDisownFixture(io, &tmp, "// mox: disown model\n{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S2>\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{"model"}, "{\n  \"theme\": \"dark\",\n  \"token\": \"<secret:env:MY_DISOWN_S2>\"\n}\n");
     const skip = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), skip.rc);
     try std.testing.expect(std.mem.indexOf(u8, skip.out, "drifted, left untouched") != null);
@@ -6050,7 +6058,7 @@ test "apply disown: a nested disowned path with an unpopulated ancestor survives
 
     // The composed source never defines survey; the program creates it live
     // mid-lifecycle. Reassertion must keep the leaf at its declared path.
-    try writeDisownFixture(io, &tmp, "// mox: disown survey.state\n{\n  \"theme\": \"dark\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{"survey.state"}, "{\n  \"theme\": \"dark\"\n}\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("settings.json");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
@@ -6064,7 +6072,7 @@ test "apply disown: a nested disowned path with an unpopulated ancestor survives
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expect(std.mem.indexOf(u8, r2.out, "unchanged") != null);
 
-    try writeDisownFixture(io, &tmp, "// mox: disown survey.state\n{\n  \"theme\": \"light\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{"survey.state"}, "{\n  \"theme\": \"light\"\n}\n");
     const r3 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r3.rc);
     const after = try read(io, a, live);
@@ -6088,7 +6096,7 @@ test "apply disown: a composed source defining content under a disowned path ref
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, "// mox: disown model\n{\n  \"theme\": \"dark\",\n  \"model\": \"x\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{"model"}, "{\n  \"theme\": \"dark\",\n  \"model\": \"x\"\n}\n");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/b.conf", .data = "v1\n" });
     const c = try cliSetup(a, io, &tmp);
 
@@ -6107,7 +6115,7 @@ test "rollback disown: a suffix run of disowned members re-patches through the s
     defer arena.deinit();
     const a = arena.allocator();
 
-    try writeDisownFixture(io, &tmp, "// mox: disown editor\n// mox: disown \"the model\"\n{\n  \"theme\": \"dark\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{ "editor", "\"the model\"" }, "{\n  \"theme\": \"dark\"\n}\n");
     const c = try cliSetup(a, io, &tmp);
     const live = try c.homePath("settings.json");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
@@ -6118,7 +6126,7 @@ test "rollback disown: a suffix run of disowned members re-patches through the s
         .sub_path = live,
         .data = "{\n  \"theme\": \"dark\",\n  \"editor\": \"nvim\",\n  \"the model\": \"m-old\"\n}\n",
     });
-    try writeDisownFixture(io, &tmp, "// mox: disown editor\n// mox: disown \"the model\"\n{\n  \"theme\": \"light\"\n}\n");
+    try writeDisownFixture(io, &tmp, &.{ "editor", "\"the model\"" }, "{\n  \"theme\": \"light\"\n}\n");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
     // The program writes again AFTER the snapshot.
@@ -6902,4 +6910,722 @@ test "trigger: under apply's pending path a check writes the pending records, by
     const r3 = try plain.run(&.{ "mox", "trigger", "seen-version", "k" });
     try std.testing.expectEqual(@as(u8, 0), r3.rc);
     try std.testing.expect(std.mem.indexOf(u8, try readOrEmpty(io, a, state_path), "seen:k=") != null);
+}
+
+// Strict JSON sources, attribute-held directives, and validation of every
+// layer and output.
+
+fn put(io: Io, tmp: *std.testing.TmpDir, sub: []const u8, content: []const u8) !void {
+    if (std.fs.path.dirname(sub)) |parent| try tmp.dir.createDirPath(io, parent);
+    try tmp.dir.writeFile(io, .{ .sub_path = sub, .data = content });
+}
+
+test "strict json: the attribute form of a directive head applies a valid file with no mox syntax" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/s.json", "{\n  \"b\": 2\n}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"s.json\"]\ndisown = [\"a\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const live = try read(io, a, try c.homePath("s.json"));
+    try std.testing.expectEqualStrings("{\n  \"b\": 2\n}\n", live);
+    _ = try json_mod.parse(a, live, .{});
+}
+
+test "strict json: a note comment, an inline comment and a trailing comma are ERRORs in every command, with location and hint" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/b.json", "// just a note\n{\"a\": 1}\n");
+    try put(io, &tmp, "repo/src/c.json", "{\n  \"a\": 1 // note\n}\n");
+    try put(io, &tmp, "repo/src/d.json", "{ \"b\": 1, }\n");
+    try put(io, &tmp, "repo/src/ok.conf", "fine\n");
+    const c = try cliSetup(a, io, &tmp);
+
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; JSON has no comments: remove it, or set format = \"jsonc\""));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:11: trailing comma not allowed in strict json; remove the trailing comma"));
+    // Nothing of an invalid file reaches the live tree; the rest applies.
+    try std.testing.expect(!exists(io, try c.homePath("b.json")));
+    try std.testing.expect(!exists(io, try c.homePath("c.json")));
+    try std.testing.expect(!exists(io, try c.homePath("d.json")));
+    try std.testing.expectEqualStrings("fine\n", try read(io, a, try c.homePath("ok.conf")));
+
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), s.rc);
+    try std.testing.expect(lineHasBoth(s.out, "ERROR", "src/d.json:1:11: trailing comma"));
+
+    const d = try c.run(&.{ "mox", "diff" });
+    try std.testing.expect(lineHasBoth(d.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
+
+    const out = try std.fs.path.join(a, &.{ c.root, "export" });
+    const e = try c.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 2), e.rc);
+    try std.testing.expect(lineHasBoth(e.err, "ERROR   ~/b.json", "src/b.json:1:1:"));
+}
+
+test "strict json: a leading directive is refused naming the attributes key that replaces it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/settings.json", "// mox: disown model\n{\"theme\": \"dark\"}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/settings.json", "src/settings.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml as disown = [\"...\"] for this file"));
+    try std.testing.expect(!exists(io, try c.homePath("settings.json")));
+}
+
+test "strict json: a string spelling a directive is content and applies verbatim" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "{\"desc\": \"// mox: own x\"}\n";
+    try put(io, &tmp, "repo/src/s.json", src);
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings(src, try read(io, a, try c.homePath("s.json")));
+}
+
+test "format = jsonc: a commented .json applies verbatim, and status, diff and export agree" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const src = "{\n  // tabs\n  \"a\": 1,\n}\n";
+    try put(io, &tmp, "repo/src/.config/Code/settings.json", src);
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\".config/Code/settings.json\"]\nformat = \"jsonc\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings(src, try read(io, a, try c.homePath(".config/Code/settings.json")));
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "ERROR") == null);
+    const d = try c.run(&.{ "mox", "diff" });
+    try std.testing.expectEqualStrings("", d.out);
+    try std.testing.expectEqualStrings("", d.err);
+    const out = try std.fs.path.join(a, &.{ c.root, "export" });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "export", out })).rc);
+    try std.testing.expectEqualStrings(src, try read(io, a, try std.fs.path.join(a, &.{ out, ".config", "Code", "settings.json" })));
+}
+
+test "format = jsonc: a partial target keeps the program's comments through apply and rollback" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/s.json", "// mox: own a\n{\n  \"a\": 1\n}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"s.json\"]\nformat = \"jsonc\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("s.json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "{\n  // the program's note\n  \"a\": 1,\n  \"b\": 2,\n}\n" });
+    const r1 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r1.out, "adopted") != null);
+
+    try put(io, &tmp, "repo/src/s.json", "// mox: own a\n{\n  \"a\": 2\n}\n");
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const patched = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, patched, "\"a\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patched, "// the program's note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, (try c.run(&.{ "mox", "status" })).out, "ERROR") == null);
+
+    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const rb = try c.run(&.{ "mox", "rollback", ids[0] });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    const back = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, back, "\"a\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, back, "// the program's note") != null);
+}
+
+test ".jsonc: ownership under a head directive patches a commented live file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/tsconfig.jsonc", "// mox: own compilerOptions\n{\n  \"compilerOptions\": {\"strict\": true}\n}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("tsconfig.jsonc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "{\n  /* kept */\n  \"include\": [\"src\"],\n}\n" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const after = try read(io, a, live);
+    try std.testing.expect(std.mem.indexOf(u8, after, "/* kept */") != null);
+    const v = try json_mod.parse(a, after, .{ .dialect = .jsonc });
+    try std.testing.expect(v.object.get("compilerOptions").?.object.get("strict").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, after, "mox:") == null);
+}
+
+test "strict json: a commented live file of a partial target is refused with the jsonc hint" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/s.json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"s.json\"]\nown = [\"a\"]\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("s.json");
+    const program = "{\n  // program\n  \"a\": 1\n}\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "live file does not parse as json", "set format = \"jsonc\""));
+    try std.testing.expectEqualStrings(program, try read(io, a, live));
+}
+
+test "validation: a layer that does not parse names its line, matching this machine or not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\n");
+    try put(io, &tmp, "repo/src/app.toml.d/os=zzz.toml", "b = 1\nc = = 2\n");
+    try put(io, &tmp, "repo/src/c.yaml", "k: [1\n");
+    try put(io, &tmp, "repo/src/c.ini", "[s\nk = 1\n");
+    try put(io, &tmp, "repo/src/.gitconfig", "x = 1\n[user]\n\tname = me\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "src/app.toml.d/os=zzz.toml:2:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "src/c.yaml:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.ini", "src/c.ini:1:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.gitconfig", "src/.gitconfig:1:"));
+}
+
+test "validation: a stripped head keeps the line a base error names the line the source has it on" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.toml", "# mox: own a\n# mox: own b\n[a]\nk = = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "src/app.toml:4:"));
+}
+
+test "validation: capture-bearing and region-bearing TOML layers are checked on their output, which names its layers" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Invalid alone, valid once expanded.
+    try put(io, &tmp, "repo/data/u.toml", "port = 8080\nname = \"say \\\"hi\\\"\"\n");
+    try put(io, &tmp, "repo/src/ok.toml", "port = <data.u.port>\nlabel = \"<machine.os | default \"x\">\"\n");
+    // Alternate regions repeat a key; one of them composes.
+    try put(io, &tmp, "repo/src/regions.toml", "# mox: when os=zzz\nk = 1\n# mox: end\n# mox: when not os=zzz\nk = 2\n# mox: end\n");
+    // A bare capture whose value is no TOML value: the output is refused.
+    try put(io, &tmp, "repo/src/bad.toml", "a = 1\n");
+    // A quoted capture whose value holds a quote: text expansion breaks it.
+    try put(io, &tmp, "repo/src/bad.toml.d/os=" ++ host_os ++ ".toml", "b = \"<data.u.name>\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath("ok.toml")), "port = 8080") != null);
+    try std.testing.expectEqualStrings("k = 2\n", try read(io, a, try c.homePath("regions.toml")));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/bad.toml", "composed output line 2 from src/bad.toml and src/bad.toml.d/os=" ++ host_os ++ ".toml: "));
+}
+
+const host_os = switch (builtin.os.tag) {
+    .macos => "darwin",
+    else => @tagName(builtin.os.tag),
+};
+
+test "validation: an include fragment is never parsed alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/.gitconfig", "[user]\n\tname = me\n# mox: include \"signing.inc\"\n");
+    try put(io, &tmp, "repo/src/.gitconfig.d/signing.inc", "\tsigningkey = ABC\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("[user]\n\tname = me\n\tsigningkey = ABC\n", try read(io, a, try c.homePath(".gitconfig")));
+}
+
+test "validation: a line carrying a resolved secret is never quoted in a parse error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\ntoken = <secret:env:MOX_TEST_TOKEN>\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t value" }} });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "composed output line 2 from src/app.toml: <redacted>)"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "s3cr3t") == null);
+    try std.testing.expect(!exists(io, try c.homePath("app.toml")));
+}
+
+test "validation: a duplicate JSON key in a merge layer, or made by a key capture, is an ERROR naming the key" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/m.json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/src/m.json.d/os=" ++ host_os ++ ".json", "{\"b\": 1, \"b\": 2}\n");
+    try put(io, &tmp, "repo/src/k.json", "{\"<machine.os>\": 1, \"" ++ host_os ++ "\": 2}\n");
+    // A single layer with no key capture is the program's to judge.
+    try put(io, &tmp, "repo/src/single.json", "{\"a\": 1, \"a\": 2}\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/m.json", "src/m.json.d/os=" ++ host_os ++ ".json:1:10: duplicate key \"b\""));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/k.json", "composed output line 1 from src/k.json: duplicate key \"" ++ host_os ++ "\""));
+    try std.testing.expectEqualStrings("{\"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("single.json")));
+}
+
+test "validation: a bare-key ini file merges, patches partially and commits" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/my.ini", "[mysqld]\nskip-networking\nport = 3306\n");
+    try put(io, &tmp, "repo/src/my.ini.d/os=" ++ host_os ++ ".ini", "[client]\nprotocol = tcp\n");
+    try put(io, &tmp, "repo/src/part.ini", "# mox: own mysqld\n[mysqld]\nskip-networking\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    const part = try c.homePath("part.ini");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = part, .data = "[mysqld]\nskip-networking\n\n[other]\nbare-flag\n" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const merged = try read(io, a, try c.homePath("my.ini"));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "skip-networking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "protocol = tcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "adopted") != null);
+}
+
+test "validation: an empty partial render is exempt, and a jsonc region layer is checked on its output only" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every region gated off: the partial render is empty, "mox owns nothing".
+    try put(io, &tmp, "repo/src/p.jsonc", "// mox: own a\n// mox: when os=zzz\n{\"a\": 1}\n// mox: end\n");
+    // Alternate regions repeat a key: no document until one is chosen.
+    try put(io, &tmp, "repo/src/r.jsonc", "{\n// mox: when os=zzz\n  \"a\": 1\n// mox: end\n// mox: when not os=zzz\n  \"a\": 2\n// mox: end\n}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const p_live = try c.homePath("p.jsonc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p_live, .data = "{\"program\": true}\n" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ERROR") == null);
+    try std.testing.expectEqualStrings("{\"program\": true}\n", try read(io, a, p_live));
+    try std.testing.expectEqualStrings("{\n  \"a\": 2\n}\n", try read(io, a, try c.homePath("r.jsonc")));
+}
+
+test "attributes: a bad entry is that file's error and every other file applies" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/a.toml", "x = 1\n");
+    try put(io, &tmp, "repo/src/b.json", "{}\n");
+    try put(io, &tmp, "repo/src/c.json", "{}\n");
+    try put(io, &tmp, "repo/src/ok.conf", "fine\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml",
+        \\["a.toml"]
+        \\own = ["x"]
+        \\
+        \\["b.json"]
+        \\format = "yaml"
+        \\
+        \\["c.json"]
+        \\check = ["x"]
+        \\
+    );
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/a.toml", "write it as a head directive in the file"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "format = \"jsonc\" is the only format value"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "check requires own or disown"));
+    try std.testing.expectEqualStrings("fine\n", try read(io, a, try c.homePath("ok.conf")));
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(lineHasBoth(s.out, "ERROR", "a.toml"));
+}
+
+test "attributes: own, disown, check, when and defaults each take effect for a strict-JSON target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/own.json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/src/disown.json", "{\"user\": 1}\n");
+    try put(io, &tmp, "repo/src/gated.json", "{\"g\": 1}\n");
+    try put(io, &tmp, "repo/src/checked.json", "{\"tui\": 1}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml",
+        \\["checked.json"]
+        \\own = ["tui"]
+        \\check = ["scripts/check/hook
+    ++ script_ext ++
+        \\"]
+        \\
+        \\["disown.json"]
+        \\disown = ["program"]
+        \\
+        \\["gated.json"]
+        \\when = "profile=work"
+        \\defaults = { profile = "work" }
+        \\
+        \\["own.json"]
+        \\own = ["a", "gone"]
+        \\
+    );
+    const c = try cliSetup(a, io, &tmp);
+    const log = try std.fs.path.join(a, &.{ c.root, "check.log" });
+    try writeExecScript(io, tmp.dir, "repo/" ++ check_rel, try acceptingAnyChecker(a, log), try std.fs.path.join(a, &.{ c.repo, "scripts", "check", "hook" ++ script_ext }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("own.json"), .data = "{\"a\": 1, \"keep\": 2}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("disown.json"), .data = "{\"user\": 1, \"program\": 9}\n" });
+
+    const r = try c.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    // own: only the declared paths are mox's; an unpopulated one is absent.
+    try std.testing.expectEqualStrings("{\"a\": 1, \"keep\": 2}\n", try read(io, a, try c.homePath("own.json")));
+    // disown: the program's key survives.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath("disown.json")), "\"program\": 9") != null);
+    // defaults: the interview bound the declared default, and when held.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath(".config/mox/facts.toml")), "profile = \"work\"") != null);
+    try std.testing.expectEqualStrings("{\"g\": 1}\n", try read(io, a, try c.homePath("gated.json")));
+    // check: the hook ran against the candidate.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, log), "checked.json") != null);
+    try std.testing.expect(exists(io, try c.homePath("checked.json")));
+}
+
+test "attributes: a when that does not hold leaves the strict-JSON target untouched" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/gated.json", "{\"g\": 1}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"gated.json\"]\nwhen = \"os=zzz\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, try c.homePath("gated.json")));
+    try std.testing.expect(lineHasBoth((try c.run(&.{ "mox", "status" })).out, "GATED", "gated.json"));
+}
+
+test "attributes: an attribute gate is in the axis inventory export --as reads" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/gated.json", "{\"g\": 1}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"gated.json\"]\nwhen = \"profile=work\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const out = try std.fs.path.join(a, &.{ c.root, "export" });
+    const r = try c.run(&.{ "mox", "export", "--as", "profile=work", out });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no source names") == null);
+    try std.testing.expectEqualStrings("{\"g\": 1}\n", try read(io, a, try std.fs.path.join(a, &.{ out, "gated.json" })));
+}
+
+test "bases: a strict-JSON target needs no base, a {} base composes, and an empty base is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/nobase.json.d/os=" ++ host_os ++ ".json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/src/nobase.json.d/os=" ++ host_os ++ "+arch=" ++ @tagName(builtin.cpu.arch) ++ ".json", "{\"b\": 2}\n");
+    try put(io, &tmp, "repo/src/braces.json", "{}\n");
+    try put(io, &tmp, "repo/src/braces.json.d/os=" ++ host_os ++ ".json", "{\"c\": 3}\n");
+    try put(io, &tmp, "repo/src/empty.json", "");
+    try put(io, &tmp, "repo/src/empty.json.d/os=" ++ host_os ++ ".json", "{\"d\": 4}\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os, .arch = @tagName(builtin.cpu.arch) });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"b\": 2\n}\n", try read(io, a, try c.homePath("nobase.json")));
+    try std.testing.expectEqualStrings("{\n  \"c\": 3\n}\n", try read(io, a, try c.homePath("braces.json")));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/empty.json", "src/empty.json:1:1: unexpected end of input; an empty file is not JSON: write {}"));
+    try std.testing.expect(!exists(io, try c.homePath("empty.json")));
+}
+
+test "captures in JSON: a value is escaped, a default works inside a string, and a data scalar keeps its type" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/data/u.toml", "port = 8080\nratio = 0.5\non = true\nname = \"C:\\\\Users\\\\me \\\"x\\\"\"\nnum_text = \"42\"\n");
+    try put(io, &tmp, "repo/src/s.json",
+        \\{
+        \\  "port": "<data.u.port>",
+        \\  "ratio": "<data.u.ratio>",
+        \\  "on": "<data.u.on>",
+        \\  "name": "<data.u.name>",
+        \\  "num_text": "<data.u.num_text>",
+        \\  "chain": "<data.u.nope | data.u.port>",
+        \\  "fallback": "<data.u.nope | default \"8\">",
+        \\  "mixed": "port <data.u.port>",
+        \\  "env": "<env.MOX_TEST_PATH>",
+        \\  "<data.u.num_text>": "key"
+        \\}
+        \\
+    );
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_PATH", .value = "C:\\Program Files\\x" }} });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const live = try read(io, a, try c.homePath("s.json"));
+    const v = try json_mod.parse(a, live, .{});
+    try std.testing.expectEqual(@as(i64, 8080), v.object.get("port").?.integer);
+    try std.testing.expectEqual(@as(f64, 0.5), v.object.get("ratio").?.float);
+    try std.testing.expect(v.object.get("on").?.bool);
+    try std.testing.expectEqualStrings("C:\\Users\\me \"x\"", v.object.get("name").?.string);
+    try std.testing.expectEqualStrings("42", v.object.get("num_text").?.string);
+    try std.testing.expectEqualStrings("8080", v.object.get("chain").?.string);
+    try std.testing.expectEqualStrings("8", v.object.get("fallback").?.string);
+    try std.testing.expectEqualStrings("port 8080", v.object.get("mixed").?.string);
+    try std.testing.expectEqualStrings("C:\\Program Files\\x", v.object.get("env").?.string);
+    try std.testing.expectEqualStrings("key", v.object.get("42").?.string);
+}
+
+test "captures in JSON: a capture-free file is byte-identical, and a secret URI is decoded before it resolves" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const plain = "{\"a\": \"\\/x\\u00e9 <b>\", \"c\":[1,2]}\n";
+    try put(io, &tmp, "repo/src/plain.json", plain);
+    if (builtin.os.tag != .windows) {
+        try put(io, &tmp, "repo/src/sec.json", "{\"t\": \"<secret:cmd:printf \\\"%s\\\" ok>\"}\n");
+    }
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings(plain, try read(io, a, try c.homePath("plain.json")));
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqualStrings("{\"t\": \"ok\"}\n", try read(io, a, try c.homePath("sec.json")));
+    }
+}
+
+test "captures in JSON: a bare capture is refused with the hint for its kind" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/data/u.toml", "port = 1\n");
+    try put(io, &tmp, "repo/src/d.json", "{\"port\": <data.u.port>}\n");
+    try put(io, &tmp, "repo/src/m.json", "{\"os\": <machine.os>}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:10:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "; quote it: a quoted single data capture emits its typed value)"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/m.json", "; quote it)"));
+}
+
+test "private: attributes hold for a private-only path, and only mode for a repo path, beating the automatic 0600" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/shared.json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/src/other.json", "{\"b\": 1}\n");
+    try put(io, &tmp, "state/private/mine.json", "{\"m\": 1, \"program\": 0}\n");
+    try put(io, &tmp, "state/private/shared.json.d/os=" ++ host_os ++ ".json", "{\"tok\": \"<secret:pass://p/token>\"}\n");
+    try put(io, &tmp, "state/private/other.json.d/os=" ++ host_os ++ ".json", "{\"c\": 2}\n");
+    try put(io, &tmp, "state/private/.mox/attributes.toml",
+        \\["mine.json"]
+        \\disown = ["program"]
+        \\
+        \\["other.json"]
+        \\when = "os=zzz"
+        \\
+        \\["shared.json"]
+        \\mode = "0640"
+        \\
+    );
+    // A stand-in `pass`, so the dedicated-manager secret resolves and would
+    // restrict the file to 0600.
+    const root = try tmpRoot(a, io, &tmp);
+    const stub = try std.fs.path.join(a, &.{ root, "stubbin" });
+    try writeExecScript(io, tmp.dir, "stubbin/pass", "#!/bin/sh\nprintf 't\\n'\n", try std.fs.path.join(a, &.{ stub, "pass" }));
+    const path = try std.fmt.allocPrint(a, "{s}:{s}", .{ stub, std.testing.environ.getAlloc(a, "PATH") catch "" });
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os, .extra_env = &.{.{ .name = "PATH", .value = path }} });
+    const mine = try c.homePath("mine.json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = "{\"m\": 1, \"program\": 5}\n" });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    // The private-only path's own attributes hold.
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, mine), "\"program\": 5") != null);
+    // A private mode on a repo path wins, over the automatic 0600 too.
+    try std.testing.expectEqual(@as(u32, 0o640), try modeOf(io, try c.homePath("shared.json")));
+    // Any other private key on a repo path is that file's error.
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/other.json", "only mode may be set for a path the repo manages"));
+    // The private attributes file is no source.
+    try std.testing.expect(!exists(io, try c.homePath(".mox/attributes.toml")));
+}
+
+test "private: a base at a repo path is refused naming both, and an overlay into a disowned path names the overlay" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/.myrc", "repo\n");
+    try put(io, &tmp, "state/private/.myrc", "private\n");
+    try put(io, &tmp, "repo/src/s.json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"s.json\"]\ndisown = [\"model\"]\n");
+    try put(io, &tmp, "state/private/s.json.d/os=" ++ host_os ++ ".json", "{\"model\": \"mine\"}\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.myrc", "a private base at a path the repo manages"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.myrc", "src/.myrc"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json", "private overlay"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json", "os=" ++ host_os ++ ".json defines content under disowned path model"));
+    try std.testing.expect(!exists(io, try c.homePath(".myrc")));
+}
+
+test "private: a gate and defaults in private attributes reach fact discovery" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try tmp.dir.createDirPath(io, "repo/src");
+    try put(io, &tmp, "state/private/p.json", "{\"p\": 1}\n");
+    try put(io, &tmp, "state/private/.mox/attributes.toml", "[\"p.json\"]\nwhen = \"site=home\"\ndefaults = { site = \"home\" }\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply", "--defaults" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath(".config/mox/facts.toml")), "site = \"home\"") != null);
+    try std.testing.expectEqualStrings("{\"p\": 1}\n", try read(io, a, try c.homePath("p.json")));
+}
+
+test "captures in JSON: a JSONC loop expands its row captures per token, leaving a multi-line comment alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/data/kv.toml", "[[kv]]\nk = \"a\\\"b\"\nv = \"C:\\\\x\"\n\n[[kv]]\nk = \"c\"\nv = \"d\"\n");
+    try put(io, &tmp, "repo/src/s.jsonc",
+        \\{
+        \\  /* rows below; this
+        \\     <machine.os> stays as written */
+        \\  // mox: for e in "data/kv.toml"
+        \\  "<e.k>": "<e.v>",
+        \\  // mox: end
+        \\  "end": true
+        \\}
+        \\
+    );
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const live = try read(io, a, try c.homePath("s.jsonc"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "<machine.os> stays as written") != null);
+    const v = try json_mod.parse(a, live, .{ .dialect = .jsonc });
+    try std.testing.expectEqualStrings("C:\\x", v.object.get("a\"b").?.string);
+    try std.testing.expectEqualStrings("d", v.object.get("c").?.string);
+    try std.testing.expect(v.object.get("end").?.bool);
+}
+
+test "captures in JSON: a key capture stays a string, and a duplicate it makes in a loop is reported" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/data/kv.toml", "[[kv]]\nk = \"same\"\n\n[[kv]]\nk = \"same\"\n");
+    try put(io, &tmp, "repo/src/s.jsonc", "{\n// mox: for e in \"data/kv.toml\"\n  \"<e.k>\": 1,\n// mox: end\n  \"z\": 0\n}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.jsonc", "duplicate key \"same\""));
 }

@@ -1657,12 +1657,13 @@ test "commit: a coupled update that would diverge an unaffected configuration is
     // B's own configuration space (built from its own two `when os=...`
     // blocks) includes an os=linux sibling that DOES, and an os=windows
     // sibling that does not: a genuine subset, not "every configuration".
-    try writeRepo(io, &tmp, "repo/src/.gitconfig", "signingkey = personal-key\n" ++
+    try writeRepo(io, &tmp, "repo/src/.gitconfig", "[user]\n" ++
+        "\tsigningkey = personal-key\n" ++
         "# mox: when os=linux\n" ++
-        "backup_signingkey = shared@old.example\n" ++
+        "\tbackupsigningkey = shared@old.example\n" ++
         "# mox: end\n" ++
         "# mox: when os=windows\n" ++
-        "backup_signingkey = none\n" ++
+        "\tbackupsigningkey = none\n" ++
         "# mox: end\n");
     const h = try setup(a, io, &tmp, .{});
 
@@ -3505,7 +3506,7 @@ test "commit: a coupled token update that breaks a source where it exists is ref
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
-    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (configuration os=linux would be unable to compose)\n"), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/x.toml undone: ~/.config/x.toml could not take it (recompose failed: FormatViolation)\n"), res.err);
     try std.testing.expectEqualStrings(gated, try read(io, a, try h.srcOf(".config/x.toml")));
 }
 
@@ -4202,7 +4203,7 @@ test "commit: structured drift with no key change is reported, never silently dr
     try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "status" })).rc);
 }
 
-test "commit: an unparseable sibling layer is named, and does not stop the commit" {
+test "commit: an unparseable sibling layer is named, and stops that file's commit" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4215,19 +4216,16 @@ test "commit: an unparseable sibling layer is named, and does not stop the commi
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
 
     _ = try h.run(&.{ "mox", "apply" });
-    // Broken AFTER apply, and only for a configuration this machine never
-    // composes: os=linux is enumerated for the guard, so its parse error used
-    // to escape as a bare error naming neither the file nor the layer.
+    // Broken AFTER apply, in a layer this machine never composes: every layer
+    // is checked on every machine, so the file composes nowhere until it is
+    // fixed, and the error names the layer and its line.
     try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"broken\n");
     try editLive(io, a, try h.liveOf("config.toml"), "\"dark\"", "\"solarized\"");
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
-    try std.testing.expectEqual(@as(u8, 0), res.rc);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "configuration os=linux does not compose") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res.err, "TomlParseError") != null);
-    // A configuration already broken before the edit is the repo's problem,
-    // not a reason to refuse an edit that has nothing to do with it.
-    try std.testing.expectEqualStrings("theme = \"solarized\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    try std.testing.expectEqual(@as(u8, 1), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "src/config.toml.d/os=linux.toml:1:") != null);
+    try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
 }
 
 test "commit: an unparseable live structured file fails only itself" {
@@ -5038,14 +5036,16 @@ test "commit disown: routes a user-key edit to the base; the program's key never
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Strict JSON: the declaration is the attributes entry, the source the
+    // JSON alone.
     try writeRepo(io, &tmp, "repo/src/settings.json",
-        \\// mox: disown model
         \\{
         \\  "theme": "dark",
         \\  "editor": "nvim"
         \\}
         \\
     );
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"settings.json\"]\ndisown = [\"model\"]\n");
     const h = try setup(a, io, &tmp, .{});
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
@@ -5066,10 +5066,10 @@ test "commit disown: routes a user-key edit to the base; the program's key never
     try std.testing.expect(std.mem.indexOf(u8, res.out, "test-model-4.1") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "test-model-4.1") == null);
 
-    // The edit landed in the base source, head declaration intact, and the
+    // The edit landed in the base source, still strict JSON, and the
     // disowned key stayed out of the source.
     const src = try read(io, a, try h.srcOf("settings.json"));
-    try std.testing.expect(std.mem.indexOf(u8, src, "// mox: disown model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "//") == null);
     try std.testing.expect(std.mem.indexOf(u8, src, "\"theme\": \"light\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "test-model-4.1") == null);
     // The live file kept the program's key.
@@ -8903,7 +8903,7 @@ test "commit: a coupled update into a routed target whose live copy keeps the ol
     try std.testing.expectEqual(@as(u8, 1), res.rc);
     try std.testing.expectEqualStrings("quokkakey = 1\n", try read(io, a, try h.srcOf(".config/t.toml")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, try tilde(a, "committed ~/.aenv")) != null);
-    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (its recomposed output differs from live); ~/.config/t.toml not committed\n"), res.err);
+    try std.testing.expectEqualStrings(try tilde(a, "mox commit: coupled update to ~/.config/t.toml undone: ~/.config/t.toml could not take it (recompose failed: FormatViolation); ~/.config/t.toml not committed\n"), res.err);
 }
 
 test "commit: a coupled update its target's own edit already made is not undone when its origin is not committed" {
@@ -10306,7 +10306,6 @@ test "commit: a base line edited beside an equal private-layer line is manual, a
     const base = "export A=1\n# mox: replace from \"profile\"\nfallback\n# mox: end\n";
     const private = "export A=1\nexport B=1\n";
     try writeRepo(io, &tmp, "repo/src/.myrc", base);
-    try writeRepo(io, &tmp, "state/private/.myrc", "top\n");
     try writeRepo(io, &tmp, "state/private/.myrc.d/profile/personal.myrc", private);
     try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\n");
     const h = try setup(a, io, &tmp, .{});
@@ -10379,7 +10378,6 @@ test "commit: a line removed from the repo while one is added to the private lay
     const base = "a\nb\n# mox: replace from \"profile\"\nfallback\n# mox: end\n";
     const private = "p1\np2\n";
     try writeRepo(io, &tmp, "repo/src/.myrc", base);
-    try writeRepo(io, &tmp, "state/private/.myrc", "top\n");
     try writeRepo(io, &tmp, "state/private/.myrc.d/profile/personal.myrc", private);
     try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\n");
     const h = try setup(a, io, &tmp, .{});
@@ -10956,4 +10954,33 @@ test "commit: a key edit into a source a default rewrite was routed to is manual
     const manual = try std.fmt.allocPrint(a, "  manual: {s} srv.x: conflicts with the edit routed from {s} to {s}\n", .{ try shownLive(a, "app.toml"), try shownLive(a, "a.txt"), try r.h.srcOf("a.txt") });
     try std.testing.expect(std.mem.indexOf(u8, r.res.out, manual) != null);
     try std.testing.expectEqualStrings("# e <machine.email | default \"team@work.com\">\n[srv]\nx = 1\n", try read(io, a, try r.h.srcOf("app.toml")));
+}
+
+test "commit: a strict-JSON source is written back as strict JSON, and a .jsonc source keeps its comments" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/s.json", "{\n  \"a\": 1\n}\n");
+    try writeRepo(io, &tmp, "repo/src/s.json.d/os=darwin.json", "{\n  \"b\": 1\n}\n");
+    try writeRepo(io, &tmp, "repo/src/t.jsonc", "{\n  // keep\n  \"a\": 1\n}\n");
+    try writeRepo(io, &tmp, "repo/src/t.jsonc.d/os=darwin.jsonc", "{\n  \"b\": 1 // overlay note\n}\n");
+    const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try editLive(io, a, try h.liveOf("s.json"), "\"b\": 1", "\"b\": 2");
+    try editLive(io, a, try h.liveOf("t.jsonc"), "\"b\": 1", "\"b\": 2");
+
+    const res = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    const s_ov = try read(io, a, try h.srcOf("s.json.d/os=darwin.json"));
+    try std.testing.expect(std.mem.indexOf(u8, s_ov, "\"b\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s_ov, "//") == null);
+    const t_ov = try read(io, a, try h.srcOf("t.jsonc.d/os=darwin.jsonc"));
+    try std.testing.expect(std.mem.indexOf(u8, t_ov, "\"b\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t_ov, "// overlay note") != null);
+    try std.testing.expectEqualStrings("{\n  // keep\n  \"a\": 1\n}\n", try read(io, a, try h.srcOf("t.jsonc")));
 }

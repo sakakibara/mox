@@ -1,4 +1,5 @@
-//! `<repo>/.mox/attributes.toml`: native file attributes that git cannot carry.
+//! `<repo>/.mox/attributes.toml`: per-target facts a source file cannot
+//! carry itself.
 //!
 //! mox derives a managed file's mode from the source file's on-disk mode: git
 //! round-trips `100755`/`100644`, so 0755/0644 survive a fresh clone via
@@ -16,23 +17,31 @@
 //! `seed_once = true`: apply writes the target only when it is absent, then
 //! leaves the user's copy alone.
 //!
-//! Partial ownership does NOT live here: a file's ownership contract is
-//! content semantics and is declared in the source file itself, as head
-//! directives in its leading comment block.
+//! `format = "jsonc"` reads a `.json` target as JSON with comments.
+//!
+//! Strict JSON has no comments, so a strict-JSON target's directives live
+//! here: `own`/`disown` (key-path lists), `check` (an argv), `when` (the
+//! whole-file gate) and `defaults` (fact name -> interview default). Every
+//! other target declares them as head directives in its own source.
+//!
+//! `released = true` is a tombstone `mox remove` leaves: the target is no
+//! longer managed, and every machine keeps its live file.
+//!
+//! An entry that breaks the schema is that target's error alone: `load`
+//! records it on the entry, and `loadStrict` refuses the whole file.
 //!
 //! ```toml
 //! [".ssh/config"]
 //! mode = "0600"
 //!
-//! [".config/nvim"]
-//! symlink = true
-//!
-//! [".config/app.local"]
-//! seed_once = true
+//! [".claude/settings.json"]
+//! disown = ["model"]
 //! ```
 
 const std = @import("std");
 const toml = @import("toml");
+const head = @import("head.zig");
+const format_mod = @import("format.zig");
 
 const Io = std.Io;
 
@@ -40,14 +49,14 @@ const max_bytes: usize = 1024 * 1024;
 
 /// Schema string named in every `load` error, so a user sees the full
 /// contract rather than guessing from one bad field.
-const schema_text = "mode: string, symlink: bool, seed_once: bool";
+const schema_text = "mode: string, symlink: bool, seed_once: bool, format: \"jsonc\", own/disown/check: string arrays, when: string, defaults: table of strings, released: bool";
 
 /// Names the target key and offending field a `load` error was raised for.
 /// Mirrors the `Diag` pattern used elsewhere in mox (fixed buffer, no
 /// allocation): `dsl`/`compose`/`source.tree` each define their own rather
 /// than share one, to avoid import cycles between leaf modules.
 pub const Diag = struct {
-    buf: [256]u8 = undefined,
+    buf: [512]u8 = undefined,
     len: usize = 0,
 
     pub fn set(self: *Diag, text: []const u8) void {
@@ -61,27 +70,21 @@ pub const Diag = struct {
     }
 };
 
-/// Human text for a `load` schema-violation error, naming the full schema so
-/// the fix is obvious without cross-referencing docs.
+/// Human text for a `loadStrict` error, naming the full schema so the fix is
+/// obvious without cross-referencing docs.
 pub fn diagText(e: anyerror) []const u8 {
     return switch (e) {
         error.UnknownAttributeKey => "unknown key (schema: " ++ schema_text ++ ")",
-        error.InvalidAttributeValue => "wrong-typed value (schema: " ++ schema_text ++ ")",
+        error.InvalidAttributeValue => "invalid entry (schema: " ++ schema_text ++ ")",
+        error.AttributesHaveComments => "comments here would be lost; remove them",
         else => @errorName(e),
     };
 }
 
-fn diagErr(diag: ?*Diag, key: []const u8, field: []const u8, err: anyerror) anyerror {
-    if (diag) |d| {
-        var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "\"{s}\" ({s})", .{ key, field }) catch key;
-        d.set(text);
-    }
-    return err;
-}
+/// One `defaults` member: a fact name and its interview default.
+pub const Default = struct { name: []const u8, value: []const u8 };
 
-/// Per-target attributes. Only fields git cannot carry are recorded; a null
-/// field means "derive it natively" (mode from `stat`).
+/// Per-target attributes. A null or empty field means "not recorded".
 pub const Entry = struct {
     /// Octal mode, present only when git cannot carry it (not 0644/0755).
     mode: ?u32 = null,
@@ -91,12 +94,32 @@ pub const Entry = struct {
     /// True when the target is seeded once: apply writes it only when it is
     /// absent, then never composes, drift-checks, or overwrites the user's copy.
     seed_once: bool = false,
+    /// `format = "jsonc"` on a `.json` target.
+    jsonc: bool = false,
+    /// `own` or `disown`, with `paths` the declared key-paths as written.
+    ownership: head.Ownership = .none,
+    paths: []const []const u8 = &.{},
+    /// The `check` argv.
+    check: []const []const u8 = &.{},
+    /// The whole-file gate's axis expression.
+    when: ?[]const u8 = null,
+    defaults: []const Default = &.{},
+    /// A tombstone: the target is no longer managed.
+    released: bool = false,
+    /// Why the entry breaks the schema, or empty. Set only by `load`.
+    err: []const u8 = "",
+
+    /// True when the entry holds any directive key.
+    pub fn hasDirectives(e: Entry) bool {
+        return e.ownership != .none or e.check.len > 0 or e.when != null or e.defaults.len > 0;
+    }
 };
 
 /// True when no field is recorded. Such an entry carries no information:
 /// `load` drops it and `write` emits no table for it.
-fn entryEmpty(e: Entry) bool {
-    return e.mode == null and !e.symlink and !e.seed_once;
+pub fn entryEmpty(e: Entry) bool {
+    return e.mode == null and !e.symlink and !e.seed_once and !e.jsonc and !e.released and
+        !e.hasDirectives() and e.err.len == 0;
 }
 
 /// A loaded `.mox/attributes.toml`, keyed by target home-relative key. All
@@ -104,6 +127,14 @@ fn entryEmpty(e: Entry) bool {
 pub const Attributes = struct {
     arena: std.mem.Allocator,
     map: std.StringHashMap(Entry),
+    /// The loaded file holds a comment, which `write` would drop.
+    has_comment: bool = false,
+    /// Where the file was read from, for the comment refusal.
+    path: []const u8 = "",
+
+    pub fn init(arena: std.mem.Allocator) Attributes {
+        return .{ .arena = arena, .map = std.StringHashMap(Entry).init(arena) };
+    }
 
     /// The full entry for `key`, or null when the record holds none.
     pub fn lookup(self: *const Attributes, key: []const u8) ?Entry {
@@ -128,6 +159,18 @@ pub const Attributes = struct {
         return false;
     }
 
+    /// True when `key` is recorded as `format = "jsonc"`.
+    pub fn jsonc(self: *const Attributes, key: []const u8) bool {
+        if (self.map.get(key)) |e| return e.jsonc;
+        return false;
+    }
+
+    /// True when `key` carries a tombstone.
+    pub fn released(self: *const Attributes, key: []const u8) bool {
+        if (self.map.get(key)) |e| return e.released;
+        return false;
+    }
+
     /// Set (or replace) `key`'s entry. `key` is duped into the arena.
     pub fn set(self: *Attributes, key: []const u8, entry: Entry) !void {
         const gop = try self.map.getOrPut(key);
@@ -140,11 +183,19 @@ pub const Attributes = struct {
         return self.map.remove(key);
     }
 
+    /// `error.AttributesHaveComments` when the loaded file holds a comment: a
+    /// rewrite would drop it. Every command that rewrites the file checks
+    /// this before any side effect.
+    pub fn refuseComments(self: *const Attributes) error{AttributesHaveComments}!void {
+        if (self.has_comment) return error.AttributesHaveComments;
+    }
+
     /// Serialize to `<repo_dir>/.mox/attributes.toml` deterministically (keys
     /// sorted, so diffs stay stable). An entry with no recorded field emits no
     /// table. When the result is empty the file is removed rather than left as
-    /// an empty stub.
+    /// an empty stub. A file that held a comment is refused, never rewritten.
     pub fn write(self: *const Attributes, io: Io, repo_dir: []const u8) !void {
+        try self.refuseComments();
         const path = try std.fs.path.join(self.arena, &.{ repo_dir, ".mox", "attributes.toml" });
 
         var keys: std.ArrayList([]const u8) = .empty;
@@ -178,6 +229,31 @@ pub const Attributes = struct {
             }
             if (entry.symlink) try out.appendSlice(self.arena, "symlink = true\n");
             if (entry.seed_once) try out.appendSlice(self.arena, "seed_once = true\n");
+            if (entry.jsonc) try out.appendSlice(self.arena, "format = \"jsonc\"\n");
+            if (entry.ownership != .none) {
+                try out.appendSlice(self.arena, if (entry.ownership == .own) "own = " else "disown = ");
+                try writeStringArray(self.arena, &out, entry.paths);
+            }
+            if (entry.check.len > 0) {
+                try out.appendSlice(self.arena, "check = ");
+                try writeStringArray(self.arena, &out, entry.check);
+            }
+            if (entry.when) |w| {
+                try out.appendSlice(self.arena, "when = ");
+                try writeQuoted(self.arena, &out, w);
+                try out.append(self.arena, '\n');
+            }
+            if (entry.defaults.len > 0) {
+                try out.appendSlice(self.arena, "defaults = { ");
+                for (entry.defaults, 0..) |d, j| {
+                    if (j != 0) try out.appendSlice(self.arena, ", ");
+                    try out.appendSlice(self.arena, d.name);
+                    try out.appendSlice(self.arena, " = ");
+                    try writeQuoted(self.arena, &out, d.value);
+                }
+                try out.appendSlice(self.arena, " }\n");
+            }
+            if (entry.released) try out.appendSlice(self.arena, "released = true\n");
         }
 
         if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
@@ -187,6 +263,15 @@ pub const Attributes = struct {
 
 fn lessKey(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
+}
+
+fn writeStringArray(arena: std.mem.Allocator, out: *std.ArrayList(u8), items: []const []const u8) !void {
+    try out.append(arena, '[');
+    for (items, 0..) |item, i| {
+        if (i != 0) try out.appendSlice(arena, ", ");
+        try writeQuoted(arena, out, item);
+    }
+    try out.appendSlice(arena, "]\n");
 }
 
 /// Emit `s` as a TOML basic (double-quoted) string. Control characters are
@@ -221,50 +306,170 @@ fn parseMode(s: []const u8) ?u32 {
     return parsed & 0o777;
 }
 
+/// A fact name as `# mox: default` takes it: `[a-z][a-z0-9_]*`.
+fn validFactName(s: []const u8) bool {
+    if (s.len == 0 or !(s[0] >= 'a' and s[0] <= 'z')) return false;
+    for (s[1..]) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_')) return false;
+    }
+    return true;
+}
+
+const directive_home = "a directive key belongs to a strict-JSON target; write it as a head directive in the file";
+
+/// Parse one entry's table. A schema violation is recorded in `err`, with the
+/// fields read so far kept, never returned as an error.
+fn parseEntry(arena: std.mem.Allocator, key: []const u8, tbl: anytype) !Entry {
+    var e: Entry = .{};
+    var own: ?[]const []const u8 = null;
+    var disown: ?[]const []const u8 = null;
+    var fit = tbl.iterator();
+    while (fit.next()) |field| {
+        const name = field.key_ptr.*;
+        const v = field.value_ptr.*;
+        if (std.mem.eql(u8, name, "mode")) {
+            if (v != .string) return failed(arena, e, "mode", "a string of octal digits");
+            e.mode = parseMode(v.string) orelse return failed(arena, e, "mode", "a string of octal digits");
+        } else if (std.mem.eql(u8, name, "symlink")) {
+            if (v != .boolean) return failed(arena, e, "symlink", "a bool");
+            e.symlink = v.boolean;
+        } else if (std.mem.eql(u8, name, "seed_once")) {
+            if (v != .boolean) return failed(arena, e, "seed_once", "a bool");
+            e.seed_once = v.boolean;
+        } else if (std.mem.eql(u8, name, "released")) {
+            if (v != .boolean) return failed(arena, e, "released", "a bool");
+            e.released = v.boolean;
+        } else if (std.mem.eql(u8, name, "format")) {
+            if (v != .string or !std.mem.eql(u8, v.string, "jsonc"))
+                return failedText(arena, e, "format = \"jsonc\" is the only format value");
+            if (!format_mod.isJsonPath(key))
+                return failedText(arena, e, "format = \"jsonc\" applies only to a .json path");
+            e.jsonc = true;
+        } else if (std.mem.eql(u8, name, "own") or std.mem.eql(u8, name, "disown")) {
+            const list = (try stringList(arena, v)) orelse return failed(arena, e, name, "a non-empty array of key-paths");
+            if (list.len == 0) return failed(arena, e, name, "a non-empty array of key-paths");
+            if (name.len == 3) own = list else disown = list;
+        } else if (std.mem.eql(u8, name, "check")) {
+            const list = (try stringList(arena, v)) orelse return failed(arena, e, "check", "a non-empty array of strings");
+            if (list.len == 0) return failed(arena, e, "check", "a non-empty array of strings");
+            e.check = list;
+        } else if (std.mem.eql(u8, name, "when")) {
+            if (v != .string or v.string.len == 0) return failed(arena, e, "when", "an axis expression string");
+            e.when = v.string;
+        } else if (std.mem.eql(u8, name, "defaults")) {
+            if (v != .table) return failed(arena, e, "defaults", "a table of fact name = \"value\"");
+            var out: std.ArrayList(Default) = .empty;
+            var dit = v.table.iterator();
+            while (dit.next()) |d| {
+                if (!validFactName(d.key_ptr.*) or d.value_ptr.* != .string)
+                    return failed(arena, e, "defaults", "a table of fact name = \"value\"");
+                try out.append(arena, .{ .name = d.key_ptr.*, .value = d.value_ptr.string });
+            }
+            std.mem.sort(Default, out.items, {}, lessDefault);
+            e.defaults = try out.toOwnedSlice(arena);
+        } else {
+            return failedText(arena, e, try std.fmt.allocPrint(arena, "unknown key \"{s}\" (schema: " ++ schema_text ++ ")", .{name}));
+        }
+    }
+    if (own != null and disown != null) return failedText(arena, e, "own and disown are exclusive per file");
+    if (own) |l| {
+        e.ownership = .own;
+        e.paths = l;
+    }
+    if (disown) |l| {
+        e.ownership = .disown;
+        e.paths = l;
+    }
+    if (e.check.len > 0 and e.ownership == .none) return failedText(arena, e, "check requires own or disown in the same entry");
+    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return failedText(arena, e, directive_home);
+    if (e.released and (e.mode != null or e.symlink or e.seed_once or e.jsonc or e.hasDirectives()))
+        return failedText(arena, e, "released = true is a tombstone and takes no other keys");
+    return e;
+}
+
+fn lessDefault(_: void, a: Default, b: Default) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+fn failed(arena: std.mem.Allocator, e: Entry, field: []const u8, want: []const u8) !Entry {
+    return failedText(arena, e, try std.fmt.allocPrint(arena, "{s} must be {s}", .{ field, want }));
+}
+
+fn failedText(arena: std.mem.Allocator, e: Entry, text: []const u8) !Entry {
+    var out = e;
+    out.err = try std.fmt.allocPrint(arena, ".mox/attributes.toml: {s}", .{text});
+    return out;
+}
+
+fn stringList(arena: std.mem.Allocator, v: toml.Value) !?[]const []const u8 {
+    if (v != .array) return null;
+    const out = try arena.alloc([]const u8, v.array.items.len);
+    for (v.array.items, out) |item, *o| {
+        if (item != .string) return null;
+        o.* = item.string;
+    }
+    return out;
+}
+
+/// True when `content` holds a TOML comment.
+fn holdsComment(content: []const u8) bool {
+    var t = toml.Tokenizer.init(content);
+    while (t.next()) |tok| {
+        if (tok.kind == .comment) return true;
+    }
+    return false;
+}
+
 /// Load `<repo_dir>/.mox/attributes.toml`. A missing file yields an empty map
-/// (not an error). A TOML parse error fails the load. Within a well-formed
-/// file, an entry key outside `{mode, symlink, seed_once}`, or a value of the
-/// wrong TOML type for its key (including a `mode` string that is not a valid
-/// octal literal), fails the load too -- silently dropping it would apply the
-/// wrong mode, or leave a mistyped `seed_once`/`symlink` intent doing nothing.
-/// `diag`, when non-null, names the offending target key and field.
-pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, diag: ?*Diag) !Attributes {
-    var attrs: Attributes = .{ .arena = arena, .map = std.StringHashMap(Entry).init(arena) };
+/// (not an error), and a TOML parse error fails the load. An entry that
+/// breaks the schema -- an unknown key, a wrong-typed value, a directive key
+/// on a target that is not strict JSON -- is kept with its `err` set: it is
+/// that target's error, and the rest of the file still applies.
+pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Attributes {
+    var attrs = Attributes.init(arena);
 
     const path = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "attributes.toml" });
+    attrs.path = path;
     const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_bytes)) catch |e| switch (e) {
         error.FileNotFound => return attrs,
         else => return e,
     };
+    attrs.has_comment = holdsComment(content);
 
     const v = try toml.parse(arena, content, .{});
     if (v != .table) return attrs;
 
     var it = v.table.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .table) continue;
-        const tbl = entry.value_ptr.table;
-        var e: Entry = .{};
-        var fit = tbl.iterator();
-        while (fit.next()) |field| {
-            if (std.mem.eql(u8, field.key_ptr.*, "mode")) {
-                if (field.value_ptr.* != .string) return diagErr(diag, entry.key_ptr.*, "mode", error.InvalidAttributeValue);
-                e.mode = parseMode(field.value_ptr.string) orelse
-                    return diagErr(diag, entry.key_ptr.*, "mode", error.InvalidAttributeValue);
-            } else if (std.mem.eql(u8, field.key_ptr.*, "symlink")) {
-                if (field.value_ptr.* != .boolean) return diagErr(diag, entry.key_ptr.*, "symlink", error.InvalidAttributeValue);
-                e.symlink = field.value_ptr.boolean;
-            } else if (std.mem.eql(u8, field.key_ptr.*, "seed_once")) {
-                if (field.value_ptr.* != .boolean) return diagErr(diag, entry.key_ptr.*, "seed_once", error.InvalidAttributeValue);
-                e.seed_once = field.value_ptr.boolean;
-            } else {
-                return diagErr(diag, entry.key_ptr.*, field.key_ptr.*, error.UnknownAttributeKey);
-            }
-        }
+        const e: Entry = if (entry.value_ptr.* != .table)
+            try failedText(arena, .{}, "an entry must be a table")
+        else
+            try parseEntry(arena, entry.key_ptr.*, entry.value_ptr.table);
         if (entryEmpty(e)) continue;
         try attrs.set(entry.key_ptr.*, e);
     }
     return attrs;
+}
+
+/// `load`, refusing a file any entry of which breaks the schema: the
+/// commands that rewrite the file must not round-trip a half-read entry.
+/// `diag`, when non-null, names the offending target key and the reason.
+pub fn loadStrict(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, diag: ?*Diag) !Attributes {
+    const attrs = try load(arena, io, repo_dir);
+    var keys: std.ArrayList([]const u8) = .empty;
+    var it = attrs.map.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.err.len > 0) try keys.append(arena, kv.key_ptr.*);
+    }
+    if (keys.items.len == 0) return attrs;
+    std.mem.sort([]const u8, keys.items, {}, lessKey);
+    const first = keys.items[0];
+    if (diag) |d| {
+        var buf: [512]u8 = undefined;
+        d.set(std.fmt.bufPrint(&buf, "\"{s}\" ({s})", .{ first, attrs.map.get(first).?.err }) catch first);
+    }
+    const reason = attrs.map.get(first).?.err;
+    return if (std.mem.indexOf(u8, reason, "unknown key") != null) error.UnknownAttributeKey else error.InvalidAttributeValue;
 }
 
 const testing = std.testing;
@@ -272,7 +477,7 @@ const testing = std.testing;
 test "load: missing file yields an empty map" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var attrs = try load(arena.allocator(), testing.io, "/nonexistent/repo", null);
+    var attrs = try load(arena.allocator(), testing.io, "/nonexistent/repo");
     try testing.expectEqual(@as(usize, 0), attrs.map.count());
     try testing.expect(attrs.mode(".ssh/config") == null);
 }
@@ -301,7 +506,7 @@ test "parse: reads octal mode strings keyed by target key" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 
-    var attrs = try load(a, io, repo, null);
+    var attrs = try load(a, io, repo);
     try testing.expectEqual(@as(u32, 0o600), attrs.mode(".ssh/config").?);
     try testing.expectEqual(@as(u32, 0o444), attrs.mode(".local/share/x").?);
     try testing.expect(attrs.mode("nope") == null);
@@ -336,7 +541,7 @@ test "roundtrip: write then load recovers modes, deterministic sorted order" {
     ;
     try testing.expectEqualStrings(expected, written);
 
-    var back = try load(a, io, repo, null);
+    var back = try load(a, io, repo);
     try testing.expectEqual(@as(u32, 0o600), back.mode(".ssh/config").?);
     try testing.expectEqual(@as(u32, 0o444), back.mode(".bin/tool").?);
 }
@@ -371,7 +576,7 @@ test "roundtrip: symlink flag, alone and beside a mode" {
     ;
     try testing.expectEqualStrings(expected, written);
 
-    var back = try load(a, io, repo, null);
+    var back = try load(a, io, repo);
     try testing.expect(back.symlink(".config/nvim"));
     try testing.expect(back.mode(".config/nvim") == null);
     try testing.expect(back.symlink(".ssh/id"));
@@ -410,7 +615,7 @@ test "roundtrip: seed_once flag, alone and combined with mode and symlink" {
     ;
     try testing.expectEqualStrings(expected, written);
 
-    var back = try load(a, io, repo, null);
+    var back = try load(a, io, repo);
     try testing.expect(back.seedOnce(".config/app.local"));
     try testing.expect(back.mode(".config/app.local") == null);
     try testing.expect(!back.symlink(".config/app.local"));
@@ -474,7 +679,7 @@ test "load: an unknown key fails loudly instead of being dropped" {
     const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 
     var diag: Diag = .{};
-    try testing.expectError(error.UnknownAttributeKey, load(a, io, repo, &diag));
+    try testing.expectError(error.UnknownAttributeKey, loadStrict(a, io, repo, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.capture().?, "seed_one") != null);
     try testing.expect(std.mem.indexOf(u8, diagText(error.UnknownAttributeKey), "schema") != null);
 }
@@ -496,7 +701,7 @@ test "load: an unquoted (non-string) mode fails loudly instead of being dropped"
     const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 
     var diag: Diag = .{};
-    try testing.expectError(error.InvalidAttributeValue, load(a, io, repo, &diag));
+    try testing.expectError(error.InvalidAttributeValue, loadStrict(a, io, repo, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.capture().?, "mode") != null);
 }
 
@@ -516,7 +721,7 @@ test "load: a mode string that is not valid octal fails loudly" {
     const cwd = try std.process.currentPathAlloc(io, a);
     const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 
-    try testing.expectError(error.InvalidAttributeValue, load(a, io, repo, null));
+    try testing.expectError(error.InvalidAttributeValue, loadStrict(a, io, repo, null));
 }
 
 test "roundtrip: a key with control chars (newline, tab) survives write and load" {
@@ -538,6 +743,176 @@ test "roundtrip: a key with control chars (newline, tab) survives write and load
     try attrs.set(key, .{ .mode = 0o600 });
     try attrs.write(io, repo);
 
-    var back = try load(a, io, repo, null);
+    var back = try load(a, io, repo);
     try testing.expectEqual(@as(u32, 0o600), back.mode(key).?);
+}
+
+fn loadText(a: std.mem.Allocator, tmp: *std.testing.TmpDir, text: []const u8) !Attributes {
+    const io = testing.io;
+    try tmp.dir.createDirPath(io, ".mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".mox/attributes.toml", .data = text });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    return load(a, io, repo);
+}
+
+test "load: format accepts only \"jsonc\", and only on a .json path; the error stays on its entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const attrs = try loadText(a, &tmp,
+        \\["a.json"]
+        \\format = "jsonc"
+        \\
+        \\["b.json"]
+        \\format = "yaml"
+        \\
+        \\["c.toml"]
+        \\format = "jsonc"
+        \\
+        \\["d.jsonc"]
+        \\format = "jsonc"
+        \\
+    );
+    try testing.expect(attrs.jsonc("a.json"));
+    try testing.expectEqualStrings("", attrs.lookup("a.json").?.err);
+    try testing.expect(std.mem.indexOf(u8, attrs.lookup("b.json").?.err, "only format value") != null);
+    try testing.expect(std.mem.indexOf(u8, attrs.lookup("c.toml").?.err, "only to a .json path") != null);
+    try testing.expect(std.mem.indexOf(u8, attrs.lookup("d.jsonc").?.err, "only to a .json path") != null);
+}
+
+test "load: directive keys are accepted only on a strict-JSON target" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const attrs = try loadText(a, &tmp,
+        \\[".claude/settings.json"]
+        \\disown = ["model", "autoMode"]
+        \\check = ["scripts/check/claude", "--strict"]
+        \\when = "tool=claude"
+        \\defaults = { profile = "personal" }
+        \\
+        \\["app.toml"]
+        \\own = ["a"]
+        \\
+        \\["app.jsonc"]
+        \\when = "os=darwin"
+        \\
+        \\["vscode.json"]
+        \\format = "jsonc"
+        \\defaults = { profile = "work" }
+        \\
+    );
+    const e = attrs.lookup(".claude/settings.json").?;
+    try testing.expectEqualStrings("", e.err);
+    try testing.expectEqual(head.Ownership.disown, e.ownership);
+    try testing.expectEqual(@as(usize, 2), e.paths.len);
+    try testing.expectEqualStrings("autoMode", e.paths[1]);
+    try testing.expectEqualStrings("--strict", e.check[1]);
+    try testing.expectEqualStrings("tool=claude", e.when.?);
+    try testing.expectEqualStrings("profile", e.defaults[0].name);
+    try testing.expectEqualStrings("personal", e.defaults[0].value);
+    for ([_][]const u8{ "app.toml", "app.jsonc", "vscode.json" }) |k| {
+        try testing.expect(std.mem.indexOf(u8, attrs.lookup(k).?.err, "write it as a head directive in the file") != null);
+    }
+}
+
+test "load: check without ownership, own with disown, and a tombstone with other keys are refused" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const attrs = try loadText(a, &tmp,
+        \\["a.json"]
+        \\check = ["x"]
+        \\
+        \\["b.json"]
+        \\own = ["a"]
+        \\disown = ["b"]
+        \\
+        \\["c.json"]
+        \\released = true
+        \\mode = "0600"
+        \\
+        \\["d.json"]
+        \\released = true
+        \\
+    );
+    try testing.expect(std.mem.indexOf(u8, attrs.lookup("a.json").?.err, "check requires own or disown") != null);
+    try testing.expect(std.mem.indexOf(u8, attrs.lookup("b.json").?.err, "exclusive") != null);
+    try testing.expect(std.mem.indexOf(u8, attrs.lookup("c.json").?.err, "tombstone") != null);
+    try testing.expect(attrs.released("d.json"));
+    try testing.expectEqualStrings("", attrs.lookup("d.json").?.err);
+}
+
+test "roundtrip: directive keys, format and a tombstone write deterministically and load back" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+
+    var attrs = Attributes.init(a);
+    try attrs.set("s.json", .{
+        .ownership = .own,
+        .paths = &.{ "a", "b.\"c d\"" },
+        .check = &.{"scripts/check/s"},
+        .when = "os=darwin",
+        .defaults = &.{.{ .name = "profile", .value = "work" }},
+    });
+    try attrs.set("v.json", .{ .jsonc = true });
+    try attrs.set("gone.json", .{ .released = true });
+    try attrs.write(io, repo);
+
+    const written = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ repo, ".mox", "attributes.toml" }), a, .limited(max_bytes));
+    try testing.expectEqualStrings(
+        \\["gone.json"]
+        \\released = true
+        \\
+        \\["s.json"]
+        \\own = ["a", "b.\"c d\""]
+        \\check = ["scripts/check/s"]
+        \\when = "os=darwin"
+        \\defaults = { profile = "work" }
+        \\
+        \\["v.json"]
+        \\format = "jsonc"
+        \\
+    , written);
+
+    const back = try load(a, io, repo);
+    const s = back.lookup("s.json").?;
+    try testing.expectEqualStrings("", s.err);
+    try testing.expectEqualStrings("b.\"c d\"", s.paths[1]);
+    try testing.expect(back.jsonc("v.json"));
+    try testing.expect(back.released("gone.json"));
+}
+
+test "write: a file holding a comment is refused, never rewritten" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "# why this mode\n[\".ssh/config\"]\nmode = \"0600\"\n";
+    var attrs = try loadText(a, &tmp, text);
+    try testing.expect(attrs.has_comment);
+    try attrs.set(".zshrc", .{ .mode = 0o600 });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const repo = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    try testing.expectError(error.AttributesHaveComments, attrs.write(io, repo));
+    try testing.expectEqualStrings(text, try tmp.dir.readFileAlloc(io, ".mox/attributes.toml", a, .limited(max_bytes)));
+    try testing.expect(std.mem.indexOf(u8, diagText(error.AttributesHaveComments), "comments here would be lost; remove them") != null);
+
+    const plain = try loadText(a, &tmp, "[\".ssh/config\"]\nmode = \"0600\" \n");
+    try testing.expect(!plain.has_comment);
 }
