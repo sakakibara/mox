@@ -105,6 +105,14 @@ All notable changes to mox are documented here. The format follows
   sweeps another repo's untagged generator manifests, as every apply did
   before; once tagged, they are never swept again.
 
+### Fixed
+- apply's summary counts a generator's dropped files, an orphaned
+  generator's files and an exact directory's removed entries in
+  "removed"; it reported "0 removed" for a run that removed only those.
+- An attributes file that is not valid TOML is reported with its line,
+  column and reason, and a directive key on a target that is not strict
+  JSON names the key.
+
 ## [0.12.4] - 2026-10-11
 
 ### Fixed
