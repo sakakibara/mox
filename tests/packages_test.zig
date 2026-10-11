@@ -523,7 +523,8 @@ test "status and apply: an installed row brew cannot judge is UNCHECKED alone, a
     const st = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), st.rc);
     try std.testing.expect(std.mem.indexOf(u8, st.out, "UNCHECKED brew readline (whether it is held astray is unknown: its install receipt ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, st.out, "opt/readline/INSTALL_RECEIPT.json could not be read: it is not JSON)") != null);
+    const receipt = try std.fs.path.join(a, &.{ "opt", "readline", "INSTALL_RECEIPT.json" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, try std.fmt.allocPrint(a, "{s} could not be read: it is not JSON)", .{receipt})) != null);
     try std.testing.expect(std.mem.indexOf(u8, st.out, "Packages: 1 missing, 1 unchecked.") != null);
 
     const ap = try h.run(&.{ "mox", "apply" });
