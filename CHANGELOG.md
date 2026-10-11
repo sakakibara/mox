@@ -36,7 +36,13 @@ All notable changes to mox are documented here. The format follows
   in `apply`, `status`, `diff` and `export`; each such file was producing
   output its format does not allow. The error names the layer and line (or
   the output line and its layers), with a hint, and never quotes a line
-  carrying a resolved secret.
+  carrying a resolved secret. A layer that is no document of its format on
+  its own is checked through the output instead: an include fragment, a
+  non-JSON layer holding a capture or a region, and a JSONC layer holding a
+  `// mox:` directive. An output is checked only where machine state is at
+  hand (it is the output for this machine), an empty partial render ("mox
+  owns nothing here") is exempt, and so is an output composed where secrets
+  are not resolved that still holds a `<SECRET:...>` placeholder.
 - A `.json` target is strict JSON: a comment or trailing comma in any of its
   layers, or in a partial target's live file, is an `ERROR`, and a `// mox:`
   comment is refused naming the attributes key or overlay that replaces it.
@@ -91,8 +97,10 @@ All notable changes to mox are documented here. The format follows
 - A record written before records named their repo is never swept: a file
   deleted, drifted or gated off before the upgrade stays as it was, and the
   first apply after upgrading tags every file it still produces.
-- Downgrading after the upgrade shows every symlink as drift, because an
-  older binary reads the new three-line symlink record as the link target.
+- Downgrading after the upgrade keeps symlinks working: an older binary
+  reads a new symlink record as clean and rewrites it in its own one-line
+  form, which names no repo, so that symlink is never swept until the
+  upgraded binary's next apply tags it again.
 - State is shared across repos, so the first apply after upgrading still
   sweeps another repo's untagged generator manifests, as every apply did
   before; once tagged, they are never swept again.
