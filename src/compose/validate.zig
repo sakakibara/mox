@@ -23,6 +23,7 @@ const trailing_comma_hint = "remove the trailing comma";
 const empty_hint = "an empty file is not JSON: write {}";
 const data_capture_hint = "quote it: a quoted single data capture emits its typed value";
 const capture_hint = "quote it";
+const merged_capture_hint = "layers merge before captures expand, so a capture in a merged layer must sit inside a string";
 
 /// One parse failure: 1-based line and column in the checked text, the
 /// parser's message, and a hint by cause.
@@ -47,6 +48,16 @@ pub fn checkLayer(
     const f = (try firstFailure(arena, format, text, display)) orelse return;
     const line = source.head.sourceLine(removed, f.line);
     return report(arena, diag, try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, line, f.col }), f.message, f.hint);
+}
+
+/// Why a live file `display` names does not parse in `format`, as
+/// `<display>:<line>:<col>: <message>[; <hint>]`, or null when it parses.
+/// A live file may hold secrets mox wrote, so quoted text is redacted.
+pub fn liveFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?[]const u8 {
+    const f = (try firstFailure(arena, format, text, display)) orelse return null;
+    const message = try redactQuoted(arena, f.message);
+    if (f.hint) |h| return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}; {s}", .{ display, f.line, f.col, message, h });
+    return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}", .{ display, f.line, f.col, message });
 }
 
 /// Check a composed output. `layers` names the layers it came from;
@@ -202,8 +213,20 @@ fn firstFailure(arena: std.mem.Allocator, format: Format, text: []const u8, disp
 fn fromSpan(text: []const u8, diags: anytype, e: anyerror) !Failure {
     if (diags.len == 0) return .{ .line = 1, .col = 1, .message = @errorName(e) };
     const d = diags[0];
-    const lc = lineCol(text, @intCast(d.span.start));
-    return .{ .line = lc.line, .col = lc.col, .message = d.message };
+    const start: usize = @intCast(d.span.start);
+    const lc = lineCol(text, start);
+    var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message };
+    if (std.mem.indexOfScalar(u8, lineAt(text, start), '<') != null and interp.containsCapture(lineAt(text, start)))
+        f.hint = merged_capture_hint;
+    return f;
+}
+
+/// The line of `text` holding byte `offset`.
+fn lineAt(text: []const u8, offset: usize) []const u8 {
+    const at = @min(offset, text.len);
+    const start = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |i| i + 1 else 0;
+    const end = std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len;
+    return text[start..end];
 }
 
 fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?Failure {

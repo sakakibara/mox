@@ -125,7 +125,7 @@ fn checkComposed(
 
 /// A layer path as a diagnostic names it: relative to the repo (or to the
 /// private layer's parent), in key form.
-fn layerDisplay(arena: std.mem.Allocator, file: ManagedFile, path: []const u8) []const u8 {
+pub fn layerDisplay(arena: std.mem.Allocator, file: ManagedFile, path: []const u8) []const u8 {
     const private_parent = if (file.private_dir.len > 0) std.fs.path.dirname(file.private_dir) orelse "" else "";
     const roots = [_][]const u8{ file.repo_dir, private_parent };
     for (roots) |root| {
@@ -322,9 +322,9 @@ fn composeToml(
 
     // Multi-layer merge seeds from the head-processed base text, so no
     // consumed directive line reaches the parser.
-    var merged: toml.Value = try toml.parse(arena, hd.body, .{});
+    var merged: toml.Value = toml.parse(arena, hd.body, .{}) catch |e| return layerFailed(arena, e, .toml, hd.body, layerDisplay(arena, file, file.source_base_abs), hd.body_removed, diag);
     for (layers[1..]) |path| {
-        const next = try parseFile(arena, io, path);
+        const next = try parseFile(arena, io, file, path, diag);
         merged = try toml_merge.mergeTables(arena, merged, next);
     }
 
@@ -402,11 +402,11 @@ fn composeYaml(
     // overlay seeds the merge.
     const blank = std.mem.trim(u8, hd.body, " \t\r\n").len == 0;
     var merged: yaml.Value = if (blank)
-        try parseYamlFile(arena, io, layers[1])
+        try parseYamlFile(arena, io, file, layers[1], diag)
     else
-        try yaml.parse(arena, hd.body, .{});
+        yaml.parse(arena, hd.body, .{}) catch |e| return layerFailed(arena, e, .yaml, hd.body, layerDisplay(arena, file, file.source_base_abs), hd.body_removed, diag);
     for (layers[if (blank) 2 else 1..]) |path| {
-        const next = try parseYamlFile(arena, io, path);
+        const next = try parseYamlFile(arena, io, file, path, diag);
         merged = try yaml_merge.deepMerge(arena, merged, next);
     }
 
@@ -795,9 +795,17 @@ const LayerRef = struct {
     }
 };
 
-fn parseFile(arena: std.mem.Allocator, io: Io, path: []const u8) !toml.Value {
+fn parseFile(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const u8, diag: ?*interp.Diag) !toml.Value {
     const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    return toml.parse(arena, content, .{});
+    return toml.parse(arena, content, .{}) catch |e| layerFailed(arena, e, .toml, content, layerDisplay(arena, file, path), &.{}, diag);
+}
+
+/// A merge layer that would not parse: reported like a layer check, with
+/// its location, so a capture the merge reads before it expands is named.
+fn layerFailed(arena: std.mem.Allocator, err: anyerror, format: source.format.Format, text: []const u8, display: []const u8, removed: []const u32, diag: ?*interp.Diag) anyerror {
+    if (err == error.OutOfMemory) return err;
+    try validate.checkLayer(arena, format, text, display, removed, diag);
+    return err;
 }
 
 fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8, dialect: json.Dialect) !json.Value {
@@ -805,9 +813,9 @@ fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8, dialect: js
     return json.parse(arena, content, .{ .dialect = dialect });
 }
 
-fn parseYamlFile(arena: std.mem.Allocator, io: Io, path: []const u8) !yaml.Value {
+fn parseYamlFile(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const u8, diag: ?*interp.Diag) !yaml.Value {
     const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    return yaml.parse(arena, content, .{});
+    return yaml.parse(arena, content, .{}) catch |e| layerFailed(arena, e, .yaml, content, layerDisplay(arena, file, path), &.{}, diag);
 }
 
 test "lessSpecificFirst is a total order: equal tuples tiebreak on path" {

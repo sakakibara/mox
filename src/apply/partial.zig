@@ -98,15 +98,14 @@ pub const AnyValue = union(enum) {
     ini: ini.Value,
 };
 
+const validate = @import("../compose/validate.zig");
 const iniDialect = format_mod.iniDialect;
 
-/// What a strict-JSON target's live file that does not parse lacks: when it
-/// parses as JSONC, it holds a comment or trailing comma its program would
-/// reject too, unless the program reads JSONC. Empty otherwise.
-pub fn liveParseHint(arena: std.mem.Allocator, format: Format, live: []const u8) []const u8 {
-    if (format != .json) return "";
-    _ = json.parse(arena, live, .{ .dialect = .jsonc }) catch return "";
-    return "; JSON has no comments or trailing commas: remove them, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments";
+/// Why a partial target's live file, named `display`, does not parse in
+/// `format`: its location, the parser's reason and a hint by cause.
+pub fn liveParseError(arena: std.mem.Allocator, format: Format, live: []const u8, display: []const u8) ![]const u8 {
+    return (try validate.liveFailure(arena, format, live, display)) orelse
+        try std.fmt.allocPrint(arena, "{s}: does not parse as {s}", .{ display, @tagName(format) });
 }
 
 /// The composed owned document: the parse of the composed source text,
@@ -3479,8 +3478,7 @@ test "json: a live file with a comment is refused under the strict dialect" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectError(error.OwnedUnparseable, OwnedDoc.parse(arena, .json, "{\n  // note\n  \"a\": 1\n}\n"));
-    try testing.expect(liveParseHint(arena, .json, "{\n  // note\n  \"a\": 1\n}\n").len > 0);
-    try testing.expectEqualStrings("", liveParseHint(arena, .jsonc, "{}"));
+    try testing.expectEqualStrings("live ~/a.json:2:3: comments not allowed in strict json; remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments", try liveParseError(arena, .json, "{\n  // note\n  \"a\": 1\n}\n", "live ~/a.json"));
 }
 
 test "json: a duplicate key on the declared path is refused" {

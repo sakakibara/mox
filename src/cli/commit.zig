@@ -1911,9 +1911,13 @@ fn commitRun(
         if (spaces[fidx] == null) spaces[fidx] = try fileSpace(ctx.alloc, ctx.io, &bindings, file);
         const space = spaces[fidx].?;
         const sim = switch (try simulateCouplingImpact(&cc, file, file.source_base_abs, file_edits, space.configs)) {
-            .uncomposable, .unwritable => |e, tag| {
-                const what = if (tag == .uncomposable) "recompose failed: " else "";
-                sim_failed[fidx] = try std.fmt.allocPrint(ctx.alloc, "{s}{s}", .{ what, @errorName(e) });
+            .uncomposable => |why| {
+                sim_failed[fidx] = try std.fmt.allocPrint(ctx.alloc, "recompose failed: {s}", .{why});
+                if (!isOneOf(path, dropped_paths.items)) try dropped_paths.append(ctx.alloc, path);
+                continue;
+            },
+            .unwritable => |e| {
+                sim_failed[fidx] = @errorName(e);
                 if (!isOneOf(path, dropped_paths.items)) try dropped_paths.append(ctx.alloc, path);
                 continue;
             },
@@ -2023,7 +2027,7 @@ fn commitRun(
     @memset(null_before, false);
     for (tree.files, 0..) |file, fidx| {
         if (!coupling_into[fidx]) continue;
-        const before = impact.composeAsApply(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets) catch continue;
+        const before = impact.composeAsApply(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null) catch continue;
         null_before[fidx] = before == null;
     }
 
@@ -2046,7 +2050,7 @@ fn commitRun(
         baseline[fidx] = if (coupling_only[fidx])
             coupling_baseline[fidx]
         else
-            (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets)).per_config;
+            (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets, null)).per_config;
         // A partial file's per-configuration snapshot is the CANONICAL OWNED
         // serialization of that configuration's compose, so the guard compares
         // owned content, never text layout. Pre-existing own-declaration
@@ -2871,8 +2875,9 @@ const Verifier = struct {
         const file2 = findByLive(v.tree_now, file.live_path) orelse file;
 
         if (v.coupling_only[fidx]) {
-            const composed = impact.composeAsApply(arena, v.io, file2, v.resolver, v.m_state, v.secrets) catch |e|
-                return v.recomposeFailed(fidx, e);
+            var adiag: mox.compose.interp.Diag = .{};
+            const composed = impact.composeAsApply(arena, v.io, file2, v.resolver, v.m_state, v.secrets, &adiag) catch |e|
+                return v.recomposeFailed(fidx, try failText(arena, e, &adiag));
             if (composed == null and !v.null_before[fidx]) {
                 try v.err.print("mox commit: {f}: coupled update made the source uncomposable; not committed\n", .{display.of(file.source_base_abs, home)});
                 return v.failFile(fidx, "the source no longer composes");
@@ -2881,8 +2886,9 @@ const Verifier = struct {
         }
 
         var prov2: std.ArrayList(Segment) = .empty;
-        const composed = mox.compose.composeFileTracked(arena, v.io, file2, v.resolver, v.m_state, v.secrets, &prov2, null) catch |e|
-            return v.recomposeFailed(fidx, e);
+        var cdiag: mox.compose.interp.Diag = .{};
+        const composed = mox.compose.composeFileTracked(arena, v.io, file2, v.resolver, v.m_state, v.secrets, &prov2, &cdiag) catch |e|
+            return v.recomposeFailed(fidx, try failText(arena, e, &cdiag));
 
         const live = v.readLive(fidx);
         const held = v.manual_hunks[fidx] + v.declined_hunks[fidx];
@@ -2942,9 +2948,9 @@ const Verifier = struct {
     }
 
     /// Fail a file whose sources no longer compose.
-    fn recomposeFailed(v: *Verifier, fidx: usize, e: anyerror) !bool {
-        try v.err.print("mox commit: {f}: recompose failed; not committed: {s}\n", .{ display.of(v.files[fidx].live_path, v.m_state.home), @errorName(e) });
-        return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "recompose failed: {s}", .{@errorName(e)}));
+    fn recomposeFailed(v: *Verifier, fidx: usize, why: []const u8) !bool {
+        try v.err.print("mox commit: {f}: recompose failed; not committed: {s}\n", .{ display.of(v.files[fidx].live_path, v.m_state.home), why });
+        return v.failFile(fidx, try std.fmt.allocPrint(v.arena, "recompose failed: {s}", .{why}));
     }
 
     /// Fail a unit with unrouted hunks, saying whether its recompose still
@@ -2989,7 +2995,7 @@ const Verifier = struct {
     /// defines no leaf outside its declared own paths.
     fn configsHold(v: *Verifier, fidx: usize, file2: mox.source.tree.ManagedFile, configs: []const Configuration, name: []const u8, what: []const u8) !bool {
         const file = v.files[fidx];
-        var after_per = (try impact.snapshot(v.arena, v.io, file2, configs, v.m_state, v.secrets)).per_config;
+        var after_per = (try impact.snapshot(v.arena, v.io, file2, configs, v.m_state, v.secrets, null)).per_config;
         if (file.own_paths.len > 0) {
             const pc = try partialPerConfig(v.arena, configs, after_per, file);
             if (pc.violation) |viol| {
@@ -4138,20 +4144,22 @@ fn simulateCouplingImpact(
         else => return .{ .unwritable = e },
     };
     const original = recorded orelse return .{ .unwritable = error.FileNotFound };
-    const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| switch (e) {
+    var bdiag: mox.compose.interp.Diag = .{};
+    const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets, &bdiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return .{ .uncomposable = e },
+        else => return .{ .uncomposable = try impact.failText(arena, e, &bdiag) },
     };
 
     const edited = try replaceTokens(arena, original, file_edits);
     // A failed write may have left part of it behind, so it is reverted too.
     const written = Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = edited });
-    const after_or = if (written) impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) else |_| undefined;
+    var adiag: mox.compose.interp.Diag = .{};
+    const after_or = if (written) impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets, &adiag) else |_| undefined;
     try sim.restore(cc);
     written catch |e| return .{ .unwritable = e };
     const after = after_or catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return .{ .uncomposable = e },
+        else => return .{ .uncomposable = try impact.failText(arena, e, &adiag) },
     };
 
     var present: usize = 0;
@@ -4166,7 +4174,8 @@ fn simulateCouplingImpact(
 
 const CouplingSim = union(enum) {
     impact: CouplingImpact,
-    uncomposable: anyerror,
+    /// Why a configuration does not compose.
+    uncomposable: []const u8,
     unwritable: anyerror,
 };
 
@@ -4288,19 +4297,26 @@ fn structLayers(
     file: mox.source.tree.ManagedFile,
     bindings: *const mox.dsl.resolver.Resolver,
     format: commit_struct.Format,
+    diag: ?*mox.compose.interp.Diag,
 ) ![]const commit_struct.StructLayer {
     const paths = try mox.compose.catA.matchingLayerPaths(arena, file, bindings);
     var out: std.ArrayList(commit_struct.StructLayer) = .empty;
     for (paths) |p| {
         const bytes = try Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(max_file_bytes));
+        const value = commit_struct.parseLayer(arena, format, bytes) catch |e| {
+            if (e != error.OutOfMemory) mox.compose.validate.checkLayer(arena, format, bytes, mox.compose.catA.layerDisplay(arena, file, p), &.{}, diag) catch {};
+            return e;
+        };
         try out.append(arena, .{
             .path = p,
             .is_base = file.has_base and std.mem.eql(u8, p, file.source_base_abs),
-            .value = try commit_struct.parseLayer(arena, format, bytes),
+            .value = value,
         });
     }
     return out.toOwnedSlice(arena);
 }
+
+const failText = impact.failText;
 
 /// One placement's full effect over the REPO-WIDE `configs`: transiently apply
 /// every edit in `edits` (the write at the chosen layer plus its surgical
@@ -4341,14 +4357,14 @@ fn simulateStructImpact(
         if (p != null and std.mem.eql(u8, p.?, bytes)) continue;
         writeLayer(io, l.path, bytes) catch |e| return sim.stopAfterWrite(cc, l.path, e);
     }
-    const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
+    const before = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets, null) catch |e| {
         try sim.restore(cc);
         return e;
     };
     for (layers) |l| {
         writeLayer(io, l.path, l.after) catch |e| return sim.stopAfterWrite(cc, l.path, e);
     }
-    const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets) catch |e| {
+    const after = impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets, null) catch |e| {
         try sim.restore(cc);
         return e;
     };
@@ -4436,7 +4452,9 @@ fn processStructFile(
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {f} could not be parsed ({s}); edit its source directly\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
+            const shown = try std.fmt.allocPrint(cc.arena, "{f}", .{display.of(file.live_path, cc.m_state.home)});
+            const why = (try mox.compose.validate.liveFailure(cc.arena, format, live, try std.fmt.allocPrint(cc.arena, "live {s}", .{shown}))) orelse @errorName(e);
+            try cc.stdout.print("  manual: {s} could not be parsed ({s}); edit its source directly\n", .{ shown, why });
             return .cont;
         },
     };
@@ -4478,13 +4496,14 @@ fn routeStructChanges(
 ) !HunkOutcome {
     ra.affected[fidx] = true;
 
-    const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch |e| switch (e) {
+    var ldiag: mox.compose.interp.Diag = .{};
+    const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format, &ldiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {f}: a source layer could not be parsed ({s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
+            try cc.stdout.print("  manual: {f}: a source layer could not be parsed ({s})\n", .{ display.of(file.live_path, cc.m_state.home), ldiag.capture() orelse @errorName(e) });
             return .cont;
         },
     };
@@ -4736,14 +4755,16 @@ fn processFallbackFile(
     }
 
     var prov: std.ArrayList(Segment) = .empty;
-    const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
+    var cdiag: mox.compose.interp.Diag = .{};
+    const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| {
+        const why = try failText(cc.arena, e, &cdiag);
         if (kind == .secret) {
             try cc.stdout.print(
                 "  cannot verify {f}: the secret-derived content could not be recomposed ({s}); overwrite or skip\n",
-                .{ display.of(file.live_path, cc.m_state.home), @errorName(e) },
+                .{ display.of(file.live_path, cc.m_state.home), why },
             );
         } else {
-            try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
+            try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), why });
         }
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
@@ -4760,7 +4781,7 @@ fn processFallbackFile(
     const baseline = composed orelse {
         switch (kind) {
             .first_contact => if (file.format) |format| {
-                const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format) catch &.{};
+                const layers = structLayers(cc.arena, cc.io, file, cc.resolver, format, null) catch &.{};
                 if (layers.len == 0) return createFirstContactOverlay(cc, ra, file, fidx, spaces, format, live, repo_dir);
             },
             // Edited since its record, as the hash check above found.
@@ -5006,8 +5027,9 @@ fn processSymlinkFile(
     const live_target = site.symlink;
 
     var prov: std.ArrayList(Segment) = .empty;
-    const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, null) catch |e| {
-        try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), @errorName(e) });
+    var cdiag: mox.compose.interp.Diag = .{};
+    const composed = mox.compose.composeFileTracked(cc.arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| {
+        try cc.stdout.print("  manual: {f} (compose failed: {s})\n", .{ display.of(file.live_path, cc.m_state.home), try failText(cc.arena, e, &cdiag) });
         ra.manual_count.* += 1;
         ra.manual_hunks[fidx] += 1;
         ra.pending.* = true;
@@ -5507,7 +5529,7 @@ fn processPartialFile(
     const composed = mox.compose.composeFileTracked(arena, cc.io, file, cc.resolver, cc.m_state, cc.secrets, &prov, &cdiag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (compose failed: {s})\n", .{ shown, @errorName(e) });
+            try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  manual: {f} (compose failed: {s})\n", .{ shown, try failText(arena, e, &cdiag) });
             return .cont;
         },
     };
@@ -7458,9 +7480,9 @@ fn simulateImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edit: 
 /// `sim`, transiently holds `edited`; the write is reverted whatever fails,
 /// and a write that fails stops the run.
 fn simulateWrite(cc: *const ClassCtx, sim: *SimJournal, file: mox.source.tree.ManagedFile, path: []const u8, edited: []const u8, configs: []const Configuration) !impact.Impact {
-    const before = try impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets);
+    const before = try impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets, null);
     Io.Dir.cwd().writeFile(cc.io, .{ .sub_path = path, .data = edited }) catch |e| return sim.stopAfterWrite(cc, path, e);
-    const after = impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets) catch |e| {
+    const after = impact.snapshot(cc.arena, cc.io, file, configs, cc.m_state, cc.secrets, null) catch |e| {
         try sim.restore(cc);
         return e;
     };
@@ -7484,9 +7506,9 @@ fn simulateRowImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, edi
 fn simulateFactImpact(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, name: []const u8, new_value: []const u8, configs: []const Configuration) !impact.Impact {
     const arena = cc.arena;
     const io = cc.io;
-    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets);
+    const before = try impact.snapshot(arena, io, file, configs, cc.m_state, cc.secrets, null);
     const edited_state = try withFact(arena, cc.m_state.*, name, new_value);
-    const after = try impact.snapshot(arena, io, file, configs, &edited_state, cc.secrets);
+    const after = try impact.snapshot(arena, io, file, configs, &edited_state, cc.secrets, null);
     return impact.impact(arena, configs, before, after);
 }
 

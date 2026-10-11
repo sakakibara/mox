@@ -2407,7 +2407,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} (live file does not parse as {s}; mox cannot patch what it cannot preserve{s})\n", .{ shown, @tagName(format), partial_mod.liveParseHint(ctx.alloc, format, live_text) });
+            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse, and mox cannot patch what it cannot preserve)\n", .{ shown, try partial_mod.liveParseError(ctx.alloc, format, live_text, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown})) });
             counts.fail += 1;
             return;
         },

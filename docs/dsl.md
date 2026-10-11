@@ -731,9 +731,10 @@ adopted when it already matches the source, and reported as drift otherwise;
 a `disown` path you add simply stops being compared.
 
 A partially owned target's live file is read in the target's format and
-dialect: a strict-JSON live file holding a comment or a trailing comma is
-refused with a hint, since mox cannot patch what it cannot preserve, and its
-program would reject it too unless it reads JSONC.
+dialect: a live file that does not parse is refused, since mox cannot patch
+what it cannot preserve, with its location and a hint (`live ~/x.json:3:9:
+...`). A strict-JSON live file holding a comment or a trailing comma is
+refused this way; its program would reject it too unless it reads JSONC.
 
 ### Check hook
 
@@ -797,6 +798,11 @@ made it: in a layer of a multi-layer merge, which parsing would silently
 reduce to its last value, and in output where a key capture expanded. A
 single layer with no key capture is passed to its program as written: JSON
 permits duplicate keys, and what they mean is the program's call.
+
+A layer of a merge is read before captures expand, so a bare capture in a
+merged TOML or YAML layer is reported at its line and column with a hint to
+put it inside a string. `mox commit` reports a layer or live file that does
+not parse the same way.
 
 A failure is that file's `ERROR` in `apply`, `status`, `diff` and `export`,
 and nothing of it reaches the live tree:

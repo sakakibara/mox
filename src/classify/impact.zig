@@ -67,6 +67,7 @@ pub fn snapshot(
     configs: []const Configuration,
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
+    diag: ?*compose.interp.Diag,
 ) !Snapshot {
     var generator: ?bool = null;
     const per = try arena.alloc(ConfigOutput, configs.len);
@@ -75,16 +76,17 @@ pub fn snapshot(
         // can fail on that source alone. That is the repo's problem to report,
         // not a reason to abandon the caller's whole run, so it is recorded
         // rather than propagated. This machine's own compose still propagates:
-        // the caller cannot proceed without it.
-        per[i] = if (composeOrNull(arena, io, file, &generator, &cfg.bindings, m_state, secrets)) |out|
+        // the caller cannot proceed without it, and `diag` says why.
+        var d: compose.interp.Diag = .{};
+        per[i] = if (composeOrNull(arena, io, file, &generator, &cfg.bindings, m_state, secrets, &d)) |out|
             (if (out) |b| ConfigOutput{ .bytes = b } else ConfigOutput.absent)
-        else |e| if (cfg.is_this_machine)
-            return e
-        else
-            ConfigOutput{ .uncomposable = @errorName(e) };
+        else |e| if (cfg.is_this_machine) {
+            if (diag) |out| if (d.capture()) |cap| out.set(cap);
+            return e;
+        } else ConfigOutput{ .uncomposable = try failText(arena, e, &d) };
     }
     const this_out = for (configs) |cfg| {
-        if (cfg.is_this_machine) break try composeOrNull(arena, io, file, &generator, &cfg.bindings, m_state, secrets);
+        if (cfg.is_this_machine) break try composeOrNull(arena, io, file, &generator, &cfg.bindings, m_state, secrets, diag);
     } else null;
     return .{ .per_config = per, .this_machine = this_out };
 }
@@ -101,9 +103,17 @@ fn composeOrNull(
     bindings: *const std.StringHashMap([]const u8),
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
+    diag: ?*compose.interp.Diag,
 ) !?[]const u8 {
     const resolver: dsl.resolver.Resolver = .{ .fixed = bindings };
-    return composeAs(arena, io, file, generator, &resolver, m_state, secrets);
+    return composeAs(arena, io, file, generator, &resolver, m_state, secrets, diag);
+}
+
+/// What a failed compose says: a format violation's located report, else
+/// the error's name.
+pub fn failText(arena: std.mem.Allocator, e: anyerror, d: *const compose.interp.Diag) ![]const u8 {
+    if (e == error.FormatViolation) if (d.capture()) |cap| return arena.dupe(u8, cap);
+    return @errorName(e);
 }
 
 /// Compose `file` the way apply does: a generator to its produced leaves,
@@ -116,9 +126,10 @@ pub fn composeAsApply(
     resolver: *const dsl.resolver.Resolver,
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
+    diag: ?*compose.interp.Diag,
 ) !?[]const u8 {
     var generator: ?bool = null;
-    return composeAs(arena, io, file, &generator, resolver, m_state, secrets);
+    return composeAs(arena, io, file, &generator, resolver, m_state, secrets, diag);
 }
 
 /// `composeAsApply`, remembering in `generator` whether `file` is a
@@ -132,6 +143,7 @@ fn composeAs(
     resolver: *const dsl.resolver.Resolver,
     m_state: *const MachineState,
     secrets: ?compose.catB.SecretCtx,
+    diag: ?*compose.interp.Diag,
 ) !?[]const u8 {
     if (generator.* != false) {
         if (try compose.catB.composeGenerator(arena, io, file, resolver, m_state, secrets, null)) |leaves| {
@@ -145,7 +157,7 @@ fn composeAs(
         }
         generator.* = false;
     }
-    return try compose.composeFileTracked(arena, io, file, resolver, m_state, secrets, null, null);
+    return try compose.composeFileTracked(arena, io, file, resolver, m_state, secrets, null, diag);
 }
 
 /// Diff before/after snapshots taken around a source edit. A configuration is
@@ -252,7 +264,7 @@ test "impact: an edit inside a gated region affects only that configuration" {
     try env_map.put("HOME", "/home/me");
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
-    const before = try snapshot(a, io, file, configs, &m_state, null);
+    const before = try snapshot(a, io, file, configs, &m_state, null, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
         "# mox: when os=darwin\n" ++
         "mac line EDITED\n" ++
@@ -261,7 +273,7 @@ test "impact: an edit inside a gated region affects only that configuration" {
         "linux line\n" ++
         "# mox: end\n");
     const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
-    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null);
+    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null, null);
 
     const got = try impact(a, configs, before, after);
     try testing.expect(got.this_machine_changes);
@@ -297,7 +309,7 @@ test "impact: an edit outside any gated region affects every configuration" {
     try env_map.put("HOME", "/home/me");
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
-    const before = try snapshot(a, io, file, configs, &m_state, null);
+    const before = try snapshot(a, io, file, configs, &m_state, null, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common EDITED\n" ++
         "# mox: when os=darwin\n" ++
         "mac line\n" ++
@@ -306,7 +318,7 @@ test "impact: an edit outside any gated region affects every configuration" {
         "linux line\n" ++
         "# mox: end\n");
     const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
-    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null);
+    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null, null);
 
     const got = try impact(a, configs, before, after);
     try testing.expect(got.this_machine_changes);
@@ -378,7 +390,7 @@ test "impact: a static tool= literal, seeded, reaches an affected sibling config
     const configs = try config_space.enumerate(a, &this, ax, &.{}, &.{});
     try testing.expect(hasLabel(configs, "os=linux"));
 
-    const before = try snapshot(a, io, file, configs, &built.m_state, null);
+    const before = try snapshot(a, io, file, configs, &built.m_state, null, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
         "# mox: when os=darwin\n" ++
         "mac line\n" ++
@@ -390,7 +402,7 @@ test "impact: a static tool= literal, seeded, reaches an affected sibling config
         "fd line EDITED\n" ++
         "# mox: end\n");
     const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
-    const after = try snapshot(a, io, tree2.files[0], configs, &built.m_state, null);
+    const after = try snapshot(a, io, tree2.files[0], configs, &built.m_state, null, null);
 
     const got = try impact(a, configs, before, after);
     // fd is really on PATH, so the seeded compound key materializes the
@@ -432,7 +444,7 @@ test "impact: an absent tool= literal stays false -- the sibling is not affected
     // The literal was probed and refuted: no compound key was seeded.
     try testing.expect(!this.contains("tool=definitely-not-installed-xyz"));
 
-    const before = try snapshot(a, io, file, configs, &built.m_state, null);
+    const before = try snapshot(a, io, file, configs, &built.m_state, null, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
         "# mox: when os=darwin\n" ++
         "mac line\n" ++
@@ -444,7 +456,7 @@ test "impact: an absent tool= literal stays false -- the sibling is not affected
         "missing-tool line EDITED\n" ++
         "# mox: end\n");
     const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
-    const after = try snapshot(a, io, tree2.files[0], configs, &built.m_state, null);
+    const after = try snapshot(a, io, tree2.files[0], configs, &built.m_state, null, null);
 
     const got = try impact(a, configs, before, after);
     // The gate never materializes on any configuration, so editing its body
@@ -489,7 +501,7 @@ test "impact: an axis compared only by a nested gate adds its sibling configurat
     try env_map.put("HOME", "/home/me");
     const m_state = try machine.state.capture(a, io, .{ .map = &env_map }, "", "");
 
-    const before = try snapshot(a, io, file, configs, &m_state, null);
+    const before = try snapshot(a, io, file, configs, &m_state, null, null);
     try writeFile(io, tmp.dir, "src/.zshrc", "common\n" ++
         "# mox: when os=darwin\n" ++
         "mac line\n" ++
@@ -498,7 +510,7 @@ test "impact: an axis compared only by a nested gate adds its sibling configurat
         "# mox: end\n" ++
         "# mox: end\n");
     const tree2 = try source.tree.walk(a, io, src_dir, "/home/me");
-    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null);
+    const after = try snapshot(a, io, tree2.files[0], configs, &m_state, null, null);
 
     const got = try impact(a, configs, before, after);
     // The edit is invisible to this machine and reaches exactly the sibling

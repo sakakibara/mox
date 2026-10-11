@@ -7104,7 +7104,7 @@ test "strict json: a commented live file of a partial target is refused with the
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "live file does not parse as json", "set format = \"jsonc\""));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json (live ~/s.json:2:3: comments not allowed in strict json; remove it, or set format = \"jsonc\"", "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
     try std.testing.expectEqualStrings(program, try read(io, a, live));
 }
 
@@ -7662,4 +7662,26 @@ test "validation: a secret-bearing error keeps its reason, and a duplicate key f
     try std.testing.expect(std.mem.indexOf(u8, toml_line, ": <redacted>)") == null);
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "duplicate key <redacted>"));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/e.json", "duplicate key \"a\\n\\\"b\""));
+}
+
+test "validation: a bare capture in a merged TOML or YAML layer names its layer, line and column" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/data/u.toml", "port = 8080\n");
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\n");
+    try put(io, &tmp, "repo/src/app.toml.d/os=" ++ host_os ++ ".toml", "b = 2\nport = <data.u.port>\n");
+    try put(io, &tmp, "repo/src/c.yaml", "a: 1\nb: [<data.u.port>\n");
+    try put(io, &tmp, "repo/src/c.yaml.d/os=" ++ host_os ++ ".yaml", "c: 1\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "src/app.toml.d/os=" ++ host_os ++ ".toml:2:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "a capture in a merged layer must sit inside a string"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "src/c.yaml:3:1: unterminated flow sequence"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "TomlParseError") == null);
 }

@@ -484,7 +484,8 @@ fn diffPartial(
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {f} (live file does not parse as {s}{s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format), partial_mod.liveParseHint(ctx.alloc, format, live) });
+            const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(live_path, ctx.context.?.paths.home)});
+            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse)\n", .{ shown, try partial_mod.liveParseError(ctx.alloc, format, live, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown})) });
             return;
         },
     };

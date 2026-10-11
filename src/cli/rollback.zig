@@ -225,7 +225,8 @@ fn repatchPartial(
     _ = partial.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {f} (live file does not parse as {s}; mox cannot patch what it cannot preserve{s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @tagName(format), partial.liveParseHint(ctx.alloc, format, live_text) });
+            const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(live_path, ctx.context.?.paths.home)});
+            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse, and mox cannot patch what it cannot preserve)\n", .{ shown, try partial.liveParseError(ctx.alloc, format, live_text, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown})) });
             failed.* += 1;
             return false;
         },
