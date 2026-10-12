@@ -520,9 +520,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A partial file is classified on its owned subtree only;
         // program activity outside the declared paths can never surface.
         if (file.own_paths.len > 0) {
-            const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?, &units);
+            var why: ?[]const u8 = null;
+            const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?, &units, &why);
             tally.add(cell);
-            try rows.print("  {s:<8} {s}{s}\n", .{ cell.text(), shown, annot });
+            if (why) |w| {
+                try rows.print("  {s:<8} {s}{s} ({s})\n", .{ cell.text(), shown, annot, w });
+            } else try rows.print("  {s:<8} {s}{s}\n", .{ cell.text(), shown, annot });
             continue;
         }
 
@@ -1167,7 +1170,7 @@ fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![
 /// document (OUTDATED), clean when all equal. A composed document violating
 /// its declaration, or an unparseable composed/live file, is ERROR --
 /// the same shapes apply refuses.
-fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit)) !Label {
+fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), why: *?[]const u8) !Label {
     const partial_mod = mox.apply.partial;
     const owned_mod = mox.apply.owned;
     const err_cell: Label = .err;
@@ -1201,7 +1204,10 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
     };
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.OwnedUnparseable => return err_cell,
+        error.OwnedUnparseable => {
+            why.* = try partial_mod.liveParseError(ctx.alloc, format, live, try std.fmt.allocPrint(ctx.alloc, "live {f}", .{display.of(file.live_path, ctx.context.?.paths.home)}));
+            return err_cell;
+        },
     };
 
     const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, file.live_path);

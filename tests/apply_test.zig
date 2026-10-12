@@ -6952,7 +6952,7 @@ test "strict json: a note comment, an inline comment and a trailing comma are ER
 
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; remove it, or set format = \"jsonc\""));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; remove the comment, or set format = \"jsonc\""));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:9: trailing comma not allowed in strict json; remove the trailing comma"));
     // Nothing of an invalid file reaches the live tree; the rest applies.
@@ -6987,7 +6987,7 @@ test "strict json: a leading directive is refused naming the attributes key that
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/conf.d/app.json", "src/.config/conf.d/app.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml and remove the comments:"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/conf.d/app.json", "src/.config/conf.d/app.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml as below and remove the comments)"));
     try std.testing.expect(!exists(io, try c.homePath(".config/conf.d/app.json")));
 
     // The entry printed under the ERROR row is pasted as is.
@@ -7124,7 +7124,7 @@ test "strict json: a commented live file of a partial target is refused with the
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json (live ~/s.json:2:3: does not parse as json; remove it, or set format = \"jsonc\"", "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json (live ~/s.json:2:3: does not parse as json; remove the comment, or set format = \"jsonc\"", "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
     try std.testing.expectEqualStrings(program, try read(io, a, live));
 }
 
@@ -8267,4 +8267,18 @@ test "commit: a named .moxignore'd path whose source left the tree is left alone
     try std.testing.expect(std.mem.indexOf(u8, r.out, "matched by .moxignore, left alone") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "released") == null);
     try std.testing.expect((try mox.apply.applied.read(a, io, c.state, live)) != null);
+}
+
+test "status: a partial target whose live file does not parse gives its location" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/p.toml", "# mox: own a\na = 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("p.toml"), .data = "a = = 1\n" });
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(lineHasBoth(st.out, "ERROR    ~/p.toml", "live ~/p.toml:1:5: does not parse as toml"));
 }

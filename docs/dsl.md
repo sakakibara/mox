@@ -16,10 +16,14 @@ inferred from extension, shebang, or an apparent directive line:
 // mox: include "extra.js"   (js, ts, jsonc, c, ...)
 ```
 
-Strict JSON has no comments, so a `.json` source carries no directive at
-all: its ownership, gate and interview defaults live in
-`.mox/attributes.toml` (see File attributes and head directives), and its
-captures inside string values (see Captures in JSON).
+Strict JSON has no comments, so a strict-JSON layer -- the base or an
+overlay of a `.json` target -- carries no mox syntax at all: its ownership,
+gate and interview defaults live in `.mox/attributes.toml` (see File
+attributes and head directives), and its captures inside string values (see
+Captures in JSON). A generator source keyed `.json` is not a JSON layer but
+a template: its `for ... into` loop and the directives nested in it are
+generator syntax, written with `//`, and each file it produces is
+validated in the format its own path names (see Validation).
 
 ## Line directives
 
@@ -32,9 +36,9 @@ One line, no body.
 | `default <name>="<value>"` | Declare the interview default for fact `<name>`; stripped from output, never gates or emits anything. `<name>` is `[a-z][a-z0-9_]*`. |
 | `keep-empty` | Materialize the file even when it composes to nothing, instead of omitting it (see Empty output). No arguments; stripped from output. |
 
-None of these is written in strict JSON: a secret there is a `<secret:URI>`
-capture inside a string, an interview default the `defaults` attribute, a
-fragment an overlay, and `keep-empty` is never needed.
+None of these is written in a strict-JSON layer: a secret there is a
+`<secret:URI>` capture inside a string, an interview default the `defaults`
+attribute, a fragment an overlay, and `keep-empty` is never needed.
 
 ## Empty output
 
@@ -48,9 +52,11 @@ Three kinds of file are exempt. A file mox infers **no comment marker** for,
 so it could not carry a directive in the first place: a genuinely empty
 `.hushlogin` or `.keep` is written verbatim as an empty file. A structured
 file (`.toml`, `.json`, `.jsonc`, `.yaml`, `.yml`, `.ini`, gitconfig) that
-composes through the structural path rather than the region one -- strict
-JSON always does, and an empty JSON document is no document, so an empty
-`.json` base is refused instead (write `{}`). And a partially owned file
+composes through the structural path rather than the region one -- a
+strict-JSON target always does, and an empty JSON document is no document,
+so an empty `.json` base is refused instead (write `{}`); a generator
+source keyed `.json` follows the generator rule, zero rows making zero
+files. And a partially owned file
 (`own`/`disown`): mox patches only its declared keys into a file a program
 also writes, so an empty render there means "mox owns nothing here", not "no
 file", and is exempt from format validation too.
@@ -111,7 +117,13 @@ Strict JSON reads its layers as JSON instead: any comment in a `.json` layer
 is refused, a `mox:` one naming where its directive lives (the attributes key
 for `own`, `disown`, `check`, a leading `when` and `default`; an overlay
 `<file>.d/<axis>.json` for a region or `include`; a `<secret:URI>` capture
-for `secret`), and a string that merely spells `// mox:` is content.
+for `secret`), and a string that merely spells `// mox:` is content. A
+generator source keyed `.json` is a template, not a layer: its loop and the
+`when` or `for` nested in it are written with `//` and are generator
+syntax. A generator takes no overlay, so it varies with the loop's own
+`when` (the whole set) or a `when` nested in its body (part of a file);
+anything outside the loop, a leading `when` included, makes it no generator
+and is refused as a directive in strict JSON.
 
 The rule reads the same way from the other side. An axis-named `.d/` file is
 an overlay only where a category has layers to fold or to pick from: a
@@ -370,6 +382,13 @@ is refused (see Validation). A capture written outside a string
 (`"port": <data.server.port>`) is not JSON and is refused, with the hint to
 quote it.
 
+A generator source keyed for the JSON family is a template, not a parsed
+layer, so its loop body may also hold a capture outside a string: `"port":
+<id.port>` emits the value as JSON in its own type, a string quoted and
+escaped. A string value that is exactly one loop-row capture (`"<id.port>"`)
+is typed the same way, as a `<data...>` capture is: a row field written
+`port = 1` gives `1`, `port = "1"` gives `"1"`, and `on = true` gives `true`.
+
 A resolved secret is kept out of mox's own on-disk state, but `mox export`
 bakes the resolved cleartext into every file it writes -- that flat tree is the
 walk-away and CI-parity output. So an export that would bake one names those
@@ -593,11 +612,14 @@ directives -- where the format has comments. Strict JSON has none, so a
 | TOML, YAML, INI, gitconfig | head directive, `#` | head directive, `#` | line directive, `#` |
 | JSONC (`.jsonc`, or `format = "jsonc"`) | head directive, `//` | head directive, `//` | line directive, `//` |
 | strict JSON (`.json`) | `own` / `disown` / `check` attribute | `when` attribute | `defaults` attribute |
+| generator source (`for ... into`, any key) | not allowed | the loop's own `when`, in its marker (`//` for a `.json` key) | not allowed |
 | any other text file | not allowed | head directive, its marker | line directive, its marker |
 
 Each file has one home for its directives: a directive attribute on any
 target but strict JSON is refused ("write it as a head directive in the
-file"), and a `mox:` comment in strict JSON is refused naming its attribute.
+file"), and a `mox:` comment in a strict-JSON layer is refused naming its
+attribute. A generator source holds only its loop, so a directive outside
+it is refused with the advice to gate the loop instead.
 
 ### Attributes (`.mox/attributes.toml`)
 
@@ -645,10 +667,12 @@ key on a target that is not strict JSON -- is that file's error alone: it is
 reported as the file's `ERROR`, and every other file still applies. One with
 no source at its path, such as a mistyped tombstone, is reported at that path
 the same way, and nothing is swept while it stands. A file that is not valid
-TOML, the repo's or the private layer's, stops every command except rollback
-with exit 2, named with its line, column and reason; one that cannot be read
-(a directory, no permission) stops them the same way with `cannot read
-<file>: <reason>`. rollback warns and still restores whole files.
+TOML, the repo's or the private layer's, stops every command that reads
+attributes (add, apply, commit, diff, doctor, edit, export, facts, mv,
+remove and status) with exit 2, named with its line, column and reason; one
+that cannot be read (a directory, no permission) stops them the same way
+with `cannot read <file>: <reason>`. rollback warns and still restores
+whole files.
 
 The file is maintained by mox (`add`, `mv`, `remove`): commands that write
 entries rewrite it deterministically, so it carries no comments. A command
@@ -805,8 +829,11 @@ output instead: an `include` fragment (a member snippet such as
 `\tsigningkey = ...`), a non-JSON layer holding a capture (TOML's
 `label = "<a | default "x">"`, or a bare `port = <data.u.port>`), a non-JSON
 layer holding a region (alternate regions may repeat a key), and a JSONC layer
-composed through its regions or loops. A strict-JSON layer has no such case:
-its captures live inside strings, and it has no regions.
+holding a `mox:` line other than its head directives (a region, a loop, or a
+line directive such as `keep-empty`). A JSONC layer whose only `mox:` lines
+are head directives (`own`, `disown`, `check`, a leading `when`) is checked
+as a layer, those lines stripped. A strict-JSON layer has no such case: its
+captures live inside strings, and it has no mox lines at all.
 
 In the JSON family, a duplicate object key is refused where mox could have
 made it: in a layer of a multi-layer merge, which parsing would silently
@@ -816,10 +843,13 @@ permits duplicate keys, and what they mean is the program's call. TOML and
 YAML require a mapping's keys to be unique, so a repeated key is refused in
 any layer or output of those formats.
 
-Only a source whose bytes compose into the target in its format is checked:
-a symlink source holds a link target and a generator template holds a loop,
-so neither is parsed as its key's format. A strict-JSON key's generator
-template spells its loop with `//` lines.
+Only a source whose bytes compose into the target in its format is checked
+as a layer: a symlink source holds a link target and a generator source holds
+a loop, so neither is parsed as its key's format. Each file a generator
+produces is checked through its output instead, in the format its own path
+names: its captures expand per string token in the JSON family, typed and
+escaped as in any JSON file, and a file that does not parse is that file's
+`ERROR` -- it is not written, and its generator's other files are.
 
 A layer of a merge is read before captures expand, so a bare capture in a
 merged TOML or YAML layer is reported at its line and column with a hint to
@@ -830,7 +860,7 @@ A failure is that file's `ERROR` in `apply`, `status`, `diff` and `export`,
 and nothing of it reaches the live tree:
 
 ```
-ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml and remove the comments:)
+ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml as below and remove the comments)
       [".claude/settings.json"]
       disown = ["model", "autoMode"]
 ERROR ~/app.toml (composed output line 2 from src/app.toml and src/app.toml.d/os=darwin.toml: invalid integer)
@@ -882,16 +912,31 @@ sweep would.
 - A released path is forgotten and never removed -- on macOS and Windows,
   whose filesystems ignore case, whatever the ASCII case its record or its
   generator spells (other case differences, and Unicode normalization, are
-  not folded; see the warning below) -- a `.moxignore`-matched one left
-  alone, and one that is the same file as a managed or produced path (a
-  case-only rename on a case-insensitive filesystem, or a hardlink)
-  forgotten with nothing removed. A generator's dropped file is judged the
-  same way.
+  not folded; see the warning below).
+
+Every removal of a file mox wrote -- this sweep, the sweep of an orphaned
+generator's files, a generator's dropped file, a named path -- is judged
+one way, in one order, and `status`, `diff` and `apply --dry-run` judge it
+the same way:
+
+- A path still managed or produced, by any generator, is never removed: a
+  path named to `apply` or `commit` that another generator produces is that
+  generator's, never the file of a generator that left the tree.
+- A path that is the same file as a managed or produced one (a case-only
+  rename on a case-insensitive filesystem, or a hard link; same device and
+  inode) is forgotten with nothing removed.
+- A `.moxignore`-matched path is left alone, records and all, whether a
+  sweep reaches it or a command names it.
+- A path below a symlinked directory is forgotten and never removed, as
+  above; only then is what is there compared with what mox recorded.
 
 `mox status` reports such a file `STALE` (an edited one `DRIFT`), and `mox
 diff` shows a pending removal. Nothing is swept -- by this sweep or by the
-sweep of an orphaned generator's leaves -- in a path-scoped apply, or in a run
-where any file failed to compose or write or carried a head error: a failure
+sweep of an orphaned generator's leaves -- in a run where any file failed to
+compose or write or carried a head error, and a path-scoped apply sweeps
+nothing on its own: it removes only a named path whose source left the
+tree, or a named file of a generator that left the tree, judged as the
+sweep would. A failure
 at a moved path must not remove the old path's file before the new one is
 written. A record that names no repo -- a one-line whole-file record, a
 bare symlink target, an owned record without `repo` -- is never swept; apply
@@ -936,6 +981,13 @@ The private layer's gates and defaults reach fact discovery like the repo's,
 so a fact only a private source compares is still asked. `mox remove` of a
 private-only file forgets it here and writes no tombstone, editing the
 private attributes, not the repo's.
+
+The private layer may be a symlink to a directory elsewhere. Every record
+of a private-only file names the private layer, so while the layer is
+absent -- an unmounted volume, a moved directory -- no sweep touches its
+files: `status` and `apply` warn `private layer <path> is missing; its
+files are left in place`, and the next run with the layer back converges
+as usual.
 
 ## Concurrency and snapshots
 

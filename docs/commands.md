@@ -317,8 +317,10 @@ released by `mox remove` -- converges the same way (see
 [dsl.md](dsl.md#sources-that-leave-the-tree)): an unedited one is removed
 (`removed ~/x (no longer managed)`), an edited one is drift, a partially
 owned one is left in place, and a released one is forgotten. Nothing is
-swept in a run where any file failed to compose or write. A path-scoped run
-sweeps only the stale paths it names: `mox apply --overwrite <path>` is
+swept in a run where any file failed to compose or write or carried a head
+error. A path-scoped apply sweeps nothing on its own: it removes only a
+named path whose source left the tree, or a named file of a generator that
+left the tree, judged as the sweep would. `mox apply --overwrite <path>` is
 how an edited one is removed, since an unscoped `--overwrite` keeps it, and
 `mox commit <path>` keeps its edit by forgetting the path on this machine.
 A file of a generator that left the tree is resolved the same two ways;
@@ -723,7 +725,8 @@ reports it. Read-only and takes no lock. A difference is not
 an error, so a run that completes exits 0 whether or not anything
 differs. An `attributes.toml`, the repo's or the private layer's, that is
 not valid TOML or cannot be read stops the run with exit 2, as it does in
-every command except rollback, which warns and still restores whole files. A
+every command that reads attributes (add, apply, commit, doctor, edit,
+export, facts, mv, remove and status); rollback warns instead. A
 refusal exits 1: a path that is not managed, a head ownership declaration
 that does not parse, and an attributes entry that breaks the schema, with
 or without a source. A file's own `ERROR` that does not come from an
@@ -834,7 +837,10 @@ and `commit` may record it instead). `--json` and
 `--porcelain` serialize that set for tooling instead of the human report.
 
 `--json` emits `{"files": [...], "packages": [...]}`. A file is
-`{path, kind, key?, first_contact}`; a broken manager is
+`{path, kind, key?, first_contact}`, one per drifted unit (the rows the
+`--drift` report lists): an `ERROR`, `STALE`, `MISSING`, `OUTDATED` or
+`ORPHAN` row is not in the set, and the exit code still signals every one
+but `ORPHAN`; a broken manager is
 `{backend, state: "broken", exit, probe, why?}`, where `exit` is the exit
 code or `null` for a call that never reached one -- killed at its bound,
 ended for want of a terminal, or answered in a shape that is not an answer
@@ -854,7 +860,8 @@ backend that could judge none of its installed packages is
 
 `--porcelain` emits stable tab-separated lines, one record per line, with
 the record kind as the first field. File records are `kind`, `key`,
-`first_contact` (0/1), `path`. Package records are `package_missing` or
+`first_contact` (0/1), `path`, one per drifted unit as under `--json`.
+Package records are `package_missing` or
 `package_untracked`, then `backend`, then `id`; an astray package is
 `package_astray`, then `backend`, then `id`, then why, then the fix; one
 that could not be judged for that is `package_unchecked`, then `backend`,
@@ -1048,9 +1055,20 @@ survive) through the same verification and `check` hook as apply, and
 a snapshot whose owned values were secret-masked is refused --
 re-apply the source instead. A symlink mox planted at a live path is
 replaced like any file mox wrote; an entry whose live path is a symlink mox
-did not plant, or lies below a symlinked directory, is not restored:
-rollback names the live path and the snapshot copy left in place, and exits
-1.
+did not plant, lies below a symlinked directory, or is a directory where a
+symlink now sits, is not restored: rollback names the live path and the
+snapshot copy left in place, and exits 1. A snapshot notes which of its
+symlinks mox had planted. A restored link it notes is drift until applied
+again: `status` reports it `DRIFT`, and only `apply --overwrite` replaces
+it, never writing through it; any other restored link is left with no
+record, so a link the user made reads as drift, as before. A snapshot taken
+before these notes notes none. A restored file no longer counts as a link.
+Before rollback replaces anything at a live path, it keeps what is there in
+a snapshot of its own, named in its report and in `mox snapshot`;
+`rollback` with no id never picks such a snapshot, and `mox rollback
+<id>` puts it back. An `attributes.toml` that is not
+valid TOML or cannot be read is a warning here, not exit 2: whole files
+are still restored, and partial targets cannot be re-patched.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10); apply prunes
 the rest. A value that is not an integer warns and the default stands.

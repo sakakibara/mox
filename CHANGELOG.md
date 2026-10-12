@@ -47,7 +47,13 @@ All notable changes to mox are documented here. The format follows
   key reads `duplicate key <redacted>`. A layer that is no document of its
   format on its own is checked through the output instead: an include
   fragment, a non-JSON layer holding a capture or a region, and a JSONC
-  layer holding a `// mox:` directive. An output is checked only where
+  layer holding a `// mox:` line other than its head directives (a region,
+  a loop, or a line directive such as `keep-empty`); a JSONC layer whose only
+  `mox:` lines are head directives (`own`, `disown`, `check`, a leading
+  `when`) is checked as a layer. Each file a generator produces is checked
+  as an output in the format its path names, and one that does not parse is
+  that file's `ERROR`, not written, while its generator's other files are.
+  An output is checked only where
   machine state is at hand (it is the output for this machine), an empty
   partial render ("mox owns nothing here") is exempt, and so is an output
   composed where secrets are not resolved that still holds a
@@ -70,7 +76,11 @@ All notable changes to mox are documented here. The format follows
   for 1e-7 <= |x| < 1e21 and exponent notation otherwise (`1e+300`). A TOML
   `inf` or `nan`, which JSON cannot hold, is a compose error naming the
   capture. Text interpolation renders every value as before. Captures
-  inside JSONC comments are no longer expanded.
+  inside JSONC comments are no longer expanded. A generator's JSON-family
+  files expand their captures the same way, and since a generator source is
+  a template, a capture outside a string there emits its value as typed
+  JSON, and a string that is one loop-row capture is typed as a data
+  capture is (`v = 1` gives `1`, `v = "1"` gives `"1"`).
 - A repeated key in a YAML mapping, which YAML forbids, is refused in any
   layer or output, as TOML's already is.
 - A generic INI file may hold a bare key everywhere mox reads it.
@@ -106,18 +116,40 @@ All notable changes to mox are documented here. The format follows
   file, a file that composes to nothing and an exact directory's entries
   there are left in place and forgotten, `remove --purge` of one is
   refused, and `rollback` names an entry it cannot restore through a
-  symlink instead of failing with `NotDir`.
+  symlink instead of failing with `NotDir`. A removal that fails (a
+  permission error) fails that one file, and the run goes on to its summary.
 - A target that changes kind drops the records of its old kind, and a
   symlink mox planted is replaced by a regular file before the target is
   written as a file, so the file the old link pointed at is never written.
+  `status`, `diff` and `apply --dry-run` show that replacement as the write
+  apply makes; a planted link below a symlinked directory is that file's
+  `ERROR` instead, and nothing is removed.
 - `rollback` replaces a symlink mox planted at a live path, as before, but
-  refuses one it did not plant, naming the snapshot copy left in place and
-  exiting 1, instead of destroying the user's link with no copy kept.
+  refuses one it did not plant, or a symlink where the snapshot has a
+  directory, naming the snapshot copy left in place and exiting 1, instead
+  of destroying the user's link with no copy kept. A restored link that the
+  snapshot notes mox planted is drift until applied again (only `apply
+  --overwrite` replaces it, never writing through it), and any other
+  restored link is left with no record. What rollback replaces is kept
+  first in a snapshot of its own, which `rollback` with no id never picks.
+- A path named to `apply` or `commit` that another generator now produces
+  is never taken for the file of a generator that left the tree: `commit`
+  routes it to the generator that produces it, and `apply` refuses it as
+  not managed, naming that generator. A `.moxignore`-matched file of a gone
+  generator is left alone when named, as the sweep leaves it.
 - An attributes file that is not valid TOML or cannot be read, the repo's or
-  the private layer's, stops every command except rollback with exit 2,
-  naming the file; rollback warns and still restores whole files.
+  the private layer's, stops every command that reads attributes (add,
+  apply, commit, diff, doctor, edit, export, facts, mv, remove and status)
+  with exit 2, naming the file; rollback warns and still restores whole
+  files.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
   run where any file failed to compose or write or carried a head error.
+- Records of a private-only file name the private layer, and while the
+  layer is absent its files are left in place, with a warning in `status`
+  and `apply`. A private layer that is a symlink to a directory is followed
+  instead of failing with `NotDir`.
+- A record whose live path is now a directory mox never wrote is forgotten
+  once, with a note, instead of failing every run.
 
 ### Upgrading
 - A machine on an older mox rejects an attributes file carrying the new keys

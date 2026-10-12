@@ -247,6 +247,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var skipped: usize = 0;
     var failed: usize = 0;
 
+    // A broken attributes entry no source claims is an error at its path,
+    // as apply, status and diff report it.
+    for (tree.entry_errors) |e| {
+        try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, ctx.context.?.paths.home), e.err });
+        failed += 1;
+    }
+
     for (tree.files) |file| {
         // A head declaration or attributes entry the walk could not honor is
         // this file's error alone.

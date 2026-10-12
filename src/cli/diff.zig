@@ -670,7 +670,7 @@ pub const command = app.command(Spec, .{
     .name = "diff",
     .usage = "mox diff [--flags] [<paths...>]",
     .summary = "Show a unified diff of composed output vs each live file",
-    .details = "Read-only and takes no lock. A difference is not an error: exit 0 whether or not anything differs. Exit 2 when an attributes.toml, the repo's or the private layer's, is not valid TOML. Exit 1 on a refusal: a path that is not managed, a head ownership declaration that does not parse, or an attributes entry that breaks the schema. A file's own ERROR -- a head directive on an unstructured target or spelled with another file's comment marker, a mox directive in strict JSON, a layer or output that does not parse -- is reported and exits 0.",
+    .details = "Read-only and takes no lock. A difference is not an error: exit 0 whether or not anything differs. Exit 2 when an attributes.toml, the repo's or the private layer's, is not valid TOML or cannot be read. Exit 1 on a refusal: a path that is not managed, a head ownership declaration that does not parse, or an attributes entry that breaks the schema. A file's own ERROR -- a head directive on an unstructured target or spelled with another file's comment marker, a mox directive in strict JSON, a layer or output that does not parse -- is reported and exits 0.",
     .group = .general,
     .needs_context = true,
 }, run);

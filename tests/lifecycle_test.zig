@@ -5918,6 +5918,10 @@ test "stale: a broken attributes entry with no source is an ERROR, and nothing i
     try std.testing.expect(lineWith(r.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
     try std.testing.expectEqualStrings("k\n", try read(io, a, try h.liveOf(".kept")));
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".kept"))) != null);
+    const e = try h.run(&.{ "mox", "export", try std.fs.path.join(a, &.{ h.root, "out" }) });
+    try std.testing.expect(e.rc != 0);
+    try std.testing.expect(lineWith(e.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
+    try std.testing.expect(lineWith(e.err, "ERROR   ~/.mine", "private .mox/attributes.toml"));
 }
 
 test "stale: a failed write at a moved path keeps the old path's file" {
@@ -6904,4 +6908,24 @@ test "apply: a dropped file that is a hard link to a managed one is forgotten, n
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings("same\n", try read(io, a, try h.liveOf("gone.txt")));
     try std.testing.expectEqualStrings("same\n", try read(io, a, try h.liveOf("keep.txt")));
+}
+
+test "add --own and --disown: a live file that does not parse is refused with its location, no byte of it printed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.keep", "");
+    const live = try h.liveOf("x.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a = = hunter2\n" });
+    for ([_][]const u8{ "--own", "--disown" }) |flag| {
+        const r = try h.run(&.{ "mox", "add", flag, "a", live });
+        try std.testing.expectEqual(@as(u8, 1), r.rc);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, "live ~/x.toml:1:5: does not parse as toml") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
+    }
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try h.srcOf("x.toml"), .{}));
 }

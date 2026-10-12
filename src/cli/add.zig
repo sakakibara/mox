@@ -385,6 +385,7 @@ pub fn addOwnFile(
     };
     const all_paths = try std.mem.concat(arena, mox.source.tree.OwnPath, &.{ content_paths, absent_paths });
 
+    if (try liveParseFailure(arena, format, live, trimmed)) |why| return .{ .outcome = .extract_failed, .detail = why };
     var diag: partial.Diag = .{};
     const extracted = partial.extractOwnedSource(arena, format, live, content_paths, &diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -542,6 +543,7 @@ pub fn addDisownFile(
         error.InvalidOwnPath => return .{ .outcome = .invalid_path, .detail = bad_raw },
     };
 
+    if (try liveParseFailure(arena, format, live, trimmed)) |why| return .{ .outcome = .extract_failed, .detail = why };
     var diag: partial.Diag = .{};
     const loc = partial.locateSpans(arena, format, live, paths, &diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -618,6 +620,12 @@ pub fn addDisownFile(
     try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
 
     return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc };
+}
+
+/// Where and why the live file at home-relative `key` does not parse in
+/// `format`, as fixed text: no byte of a live file is printed.
+fn liveParseFailure(arena: std.mem.Allocator, format: mox.source.format.Format, live: []const u8, key: []const u8) !?[]const u8 {
+    return mox.compose.validate.liveFailure(arena, format, live, try std.fmt.allocPrint(arena, "live ~/{s}", .{key}));
 }
 
 fn parseOwnRaws(

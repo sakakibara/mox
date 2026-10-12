@@ -19,7 +19,7 @@ const Format = source.format.Format;
 
 pub const Error = error{ FormatViolation, OutOfMemory };
 
-const comment_hint = "remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments";
+const comment_hint = "remove the comment, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments";
 const trailing_comma_hint = "remove the trailing comma";
 const empty_hint = "an empty file is not JSON: write {}";
 const data_capture_hint = "quote it: a quoted single data capture emits its typed value";
@@ -406,7 +406,7 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     else if (head_verb) blk: {
         const where = try attributesWhere(arena, display, key);
         var entry: std.ArrayList(u8) = .empty;
-        try entry.print(arena, "declare it in {s} and remove the comments:\n{s}", .{ where.file, where.table });
+        try entry.print(arena, "declare it in {s} as below and remove the comments\n{s}", .{ where.file, where.table });
         if (own.items.len > 0) try entry.print(arena, "\nown = {s}", .{try tomlArray(arena, own.items)});
         if (disown.items.len > 0) try entry.print(arena, "\ndisown = {s}", .{try tomlArray(arena, disown.items)});
         if (check) |argv| try entry.print(arena, "\ncheck = {s}", .{try tomlArray(arena, argv)});
@@ -559,7 +559,7 @@ fn expectFailure(format: Format, text: []const u8, want: []const []const u8) !vo
 }
 
 test "strict JSON: a directive head is refused naming its attributes key" {
-    try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "declare it in .mox/attributes.toml and remove the comments:\n[\"s.json\"]\ndisown = [\"a\"]" });
+    try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "declare it in .mox/attributes.toml as below and remove the comments\n[\"s.json\"]\ndisown = [\"a\"]" });
 }
 
 test "strict JSON: anything beside a generator loop is advised toward the loop" {

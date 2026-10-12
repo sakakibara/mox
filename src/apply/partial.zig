@@ -3478,7 +3478,7 @@ test "json: a live file with a comment is refused under the strict dialect" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectError(error.OwnedUnparseable, OwnedDoc.parse(arena, .json, "{\n  // note\n  \"a\": 1\n}\n"));
-    try testing.expectEqualStrings("live ~/a.json:2:3: does not parse as json; remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments", try liveParseError(arena, .json, "{\n  // note\n  \"a\": 1\n}\n", "live ~/a.json"));
+    try testing.expectEqualStrings("live ~/a.json:2:3: does not parse as json; remove the comment, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments", try liveParseError(arena, .json, "{\n  // note\n  \"a\": 1\n}\n", "live ~/a.json"));
 }
 
 test "json: a duplicate key on the declared path is refused" {
