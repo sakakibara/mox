@@ -305,6 +305,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
                         continue;
                     }
+                    if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, home, o.live_path)) |v| if (v == .remove) {
+                        try diffLinkReplace(ctx, sty, stat_mode, o.live_path, v.remove.link, o.content, o.prov, &total, &changed);
+                        continue;
+                    };
                     try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.live_path, o.content, o.prov, &total, &changed);
                 }
                 continue;
@@ -380,7 +384,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         const links = try stale.managedLinks(ctx.alloc, tree.files);
-        const jc: mox.apply.removable.Ctx = .{ .home = home, .kept = &inodes, .ruleset = &ruleset, .links = &links };
+        const jc: mox.apply.removable.Ctx = .{ .home = home, .keep = &scan.keep, .kept = &inodes, .ruleset = &ruleset, .links = &links };
         for (cands) |c| {
             if (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c)) != .remove) continue;
             if (c.kind == .symlink) {

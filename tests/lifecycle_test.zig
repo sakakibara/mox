@@ -7029,3 +7029,37 @@ test "exact dir: --overwrite of a foreign directory keeps its links and empty di
     try std.testing.expect((try Io.Dir.cwd().statFile(io, try h.liveOf(".cfg/foreign/sub"), .{})).kind == .directory);
     try std.testing.expectEqualStrings("f\n", try read(io, a, try h.liveOf(".cfg/foreign/file")));
 }
+
+test "generated: a file of a generator where mox planted a link replaces the link, and the previews agree" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const real = try std.fs.path.join(a, &.{ h.root, "real" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = real, .data = "k=a\n" });
+    try writeRepo(io, &tmp, "repo/src/.keep", "k\n");
+    try writeRepo(io, &tmp, "repo/src/.config/Id-a.inc", real);
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".config/Id-a.inc\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/Id-a.inc"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    const leaf = try h.liveOf(".config/Id-a.inc");
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(st.out, "OUTDATED", "~/.config/Id-a.inc (replace the symlink mox planted with a file)"));
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "STALE") == null);
+    const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would replace the symlink mox planted at ~/.config/Id-a.inc with a file") != null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf, .{ .follow_symlinks = false })).kind == .file);
+    try std.testing.expectEqualStrings("k=a\n", try read(io, a, real));
+    // Rollback puts the planted link back.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "rollback" })).rc);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf, .{ .follow_symlinks = false })).kind == .sym_link);
+}

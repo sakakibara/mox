@@ -192,10 +192,41 @@ fn orphanRows(
 
 /// One row per file whose source left the tree: STALE where apply would
 /// remove it or leave it no longer managed, DRIFT where it was edited.
+/// The row of a file where mox planted a link, or rollback put one back,
+/// when a file now belongs there: true once printed.
+fn plantedRow(ctx: *app.Ctx, rows: *std.Io.Writer, tally: *Tally, units: *std.ArrayList(mox.apply.drift.Unit), live_path: []const u8, shown: []const u8, annot: []const u8) !bool {
+    const context = ctx.context.?;
+    // A planted link rollback put back is drift: only --overwrite replaces
+    // it with the file.
+    if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, live_path) != null) {
+        tally.add(.drift);
+        try units.append(ctx.alloc, .{ .path = live_path, .kind = .whole_file, .first_contact = true });
+        try rows.print("  {s:<8} {s}{s}\n", .{ Label.drift.text(), shown, annot });
+        return true;
+    }
+    // A symlink mox planted where a file now belongs: apply replaces it
+    // without --overwrite, so it is an ordinary write.
+    if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.home, live_path)) |v| switch (v) {
+        .remove => {
+            tally.add(.outdated);
+            try rows.print("  {s:<8} {s}{s} (replace the symlink mox planted with a file)\n", .{ Label.outdated.text(), shown, annot });
+            return true;
+        },
+        .linked_parent => {
+            tally.add(.err);
+            try rows.print("  {s:<8} {s}{s} ({s})\n", .{ Label.err.text(), shown, annot, mox.apply.parent_link.reason });
+            return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
 fn staleRows(
     ctx: *app.Ctx,
     tree: mox.source.tree.ManagedTree,
     ruleset: *const mox.source.ignore.match.RuleSet,
+    scan: *const mox.apply.generated.OrphanScan,
     rows: *std.Io.Writer,
     tally: *Tally,
     units: *std.ArrayList(mox.apply.drift.Unit),
@@ -210,7 +241,7 @@ fn staleRows(
     for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
     const links = try stale.managedLinks(ctx.alloc, tree.files);
-    const jc: mox.apply.removable.Ctx = .{ .home = home, .kept = &inodes, .ruleset = ruleset, .links = &links };
+    const jc: mox.apply.removable.Ctx = .{ .home = home, .keep = &scan.keep, .kept = &inodes, .ruleset = ruleset, .links = &links };
     for (cands) |c| {
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         switch (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c))) {
@@ -382,6 +413,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), leaf_shown, why });
                         continue;
                     }
+                    if (try plantedRow(ctx, rows, &tally, &units, o.live_path, leaf_shown, "")) continue;
                     // Kind guard BEFORE the open: a FIFO here would block the
                     // read and brick the whole report.
                     if (mox.apply.write.guardLiveRead(ctx.io, o.live_path) == .special) {
@@ -493,30 +525,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             continue;
         }
 
-        // A planted link rollback put back is drift: only --overwrite
-        // replaces it with the file.
-        if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path) != null) {
-            tally.add(.drift);
-            try units.append(ctx.alloc, .{ .path = file.live_path, .kind = .whole_file, .first_contact = true });
-            try rows.print("  {s:<8} {s}{s}\n", .{ Label.drift.text(), shown, annot });
-            continue;
-        }
-
-        // A symlink mox planted where a file now belongs: apply replaces it
-        // without --overwrite, so it is an ordinary write.
-        if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, home, file.live_path)) |v| switch (v) {
-            .remove => {
-                tally.add(.outdated);
-                try rows.print("  {s:<8} {s}{s} (replace the symlink mox planted with a file)\n", .{ Label.outdated.text(), shown, annot });
-                continue;
-            },
-            .linked_parent => {
-                tally.add(.err);
-                try rows.print("  {s:<8} {s}{s} ({s})\n", .{ Label.err.text(), shown, annot, mox.apply.parent_link.reason });
-                continue;
-            },
-            else => {},
-        };
+        if (try plantedRow(ctx, rows, &tally, &units, file.live_path, shown, annot)) continue;
 
         // A partial file is classified on its owned subtree only;
         // program activity outside the declared paths can never surface.
@@ -559,7 +568,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // Files whose source left the tree, as apply's sweeps would judge them.
     // An unavailable private layer stops every sweep, so none is previewed.
     if (a.paths.len == 0 and !priv_down) {
-        try staleRows(ctx, tree, &ruleset, rows, &tally, &units);
+        try staleRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try untaggedRows(ctx, tree, rows, &scan);
     }

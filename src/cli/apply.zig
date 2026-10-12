@@ -2888,6 +2888,9 @@ fn applyGenerator(
             try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
             continue;
         }
+        // A link mox planted here is replaced as any target turning into a
+        // file replaces it, never written through.
+        if (!try dropPlantedLink(ctx, o.live_path, snap_id, dry_run, force, units, counts, snapshotted)) continue;
         try applyRegularFile(ctx, .{
             .repo = if (leaf_private) tags.private else repo,
             .live_path = o.live_path,
