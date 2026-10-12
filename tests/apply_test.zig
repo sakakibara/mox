@@ -7916,19 +7916,21 @@ test "add: a recursive add warns per file that is not strict JSON" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ok.json: warning") == null);
 }
 
-test "apply: every delete, rename or truncating write sits where it was judged" {
+test "apply: every mention of a delete, rename or overwrite primitive sits where it was judged (an accidental-path guard)" {
+    // Lists, by file and function, every mention outside a test block of a
+    // primitive that deletes, renames or overwrites a path. A new mention, or
+    // one more in a listed function, fails until it is judged and listed. It
+    // guards against a removal path added by accident, not against one hidden
+    // on purpose: a call through an alias declared elsewhere, or built at
+    // comptime, passes it. Of the listed sites only live_remove's `remove`
+    // deletes a live path; write.zig's atomic write renames onto its own
+    // target, snapshot.zig's restore puts a snapshot back, and the rest work on
+    // mox's own state, the repo, a temp file or the mox binary.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const io = std.testing.io;
 
-    // Every call outside a test block that deletes, renames or truncates,
-    // by file and enclosing function, with how many such calls it makes. Of
-    // these only live_remove's `remove` deletes a live path; write.zig's
-    // atomic write renames onto its own target, snapshot.zig's restore puts
-    // a snapshot back, and every other site works on mox's own state, the
-    // repo, a temp file or the mox binary. A new call anywhere, or one more
-    // in a listed function, fails here until it is judged and listed.
     const allowed = [_]struct { []const u8, []const u8, usize }{
         .{ "src/apply/applied.zig", "forget", 4 },
         .{ "src/apply/applied.zig", "forgetOwned", 1 },
@@ -7939,26 +7941,42 @@ test "apply: every delete, rename or truncating write sits where it was judged" 
         .{ "src/apply/applied.zig", "recordOwned", 2 },
         .{ "src/apply/applied.zig", "writeSymlinkRecord", 4 },
         .{ "src/apply/generated.zig", "deleteManifest", 1 },
-        .{ "src/apply/generated.zig", "dropLeaf", 1 },
+        .{ "src/apply/generated.zig", "dropLeaf", 2 },
         .{ "src/apply/generated.zig", "sweepOrphans", 2 },
+        .{ "src/apply/generated.zig", "writeManifest", 1 },
         .{ "src/apply/live_remove.zig", "remove", 2 },
-        .{ "src/apply/run_scripts.zig", "moxBinDir", 3 },
+        .{ "src/apply/run_scripts.zig", "moxBinDir", 4 },
         .{ "src/apply/run_scripts.zig", "runCheck", 1 },
         .{ "src/apply/run_scripts.zig", "sweepCheckDirs", 2 },
         .{ "src/apply/snapshot.zig", "notePlanted", 1 },
         .{ "src/apply/snapshot.zig", "prune", 4 },
+        .{ "src/apply/snapshot.zig", "restoreFileEntry", 1 },
         .{ "src/apply/snapshot.zig", "restoreLinkEntry", 1 },
+        .{ "src/apply/snapshot.zig", "save", 1 },
         .{ "src/apply/snapshot.zig", "saveSymlink", 1 },
         .{ "src/apply/snapshot.zig", "saveTree", 1 },
         .{ "src/apply/snapshot.zig", "take", 1 },
         .{ "src/apply/stale.zig", "markTombstones", 1 },
-        .{ "src/apply/write.zig", "writeAtomicImpl", 3 },
+        .{ "src/apply/write.zig", "writeAtomic", 2 },
+        .{ "src/apply/write.zig", "writeAtomicImpl", 4 },
+        .{ "src/apply/write.zig", "writeAtomicPartial", 2 },
         .{ "src/classify/impact.zig", "seededThisAndState", 1 },
-        .{ "src/classify/impact.zig", "writeFile", 1 },
+        .{ "src/classify/impact.zig", "writeFile", 2 },
+        .{ "src/classify/synth.zig", "hazardOf", 1 },
+        .{ "src/cli/add.zig", "addDisownFile", 1 },
+        .{ "src/cli/add.zig", "addFile", 2 },
+        .{ "src/cli/add.zig", "addOwnFile", 1 },
+        .{ "src/cli/apply.zig", "applyPartialFile", 1 },
         .{ "src/cli/apply.zig", "applyPass", 2 },
+        .{ "src/cli/apply.zig", "applyRegularFile", 1 },
         .{ "src/cli/apply.zig", "bootstrapBackends", 1 },
         .{ "src/cli/apply.zig", "partialCheckAccepts", 3 },
+        .{ "src/cli/commit.zig", "acceptedHolder", 2 },
+        .{ "src/cli/commit.zig", "commitRun", 3 },
+        .{ "src/cli/commit.zig", "couplingCandidates", 12 },
+        .{ "src/cli/commit.zig", "replaceTokens", 2 },
         .{ "src/cli/commit.zig", "restore", 3 },
+        .{ "src/cli/commit.zig", "rowPathFault", 4 },
         .{ "src/cli/commit.zig", "runCouplingSim", 1 },
         .{ "src/cli/commit.zig", "saveRecovery", 1 },
         .{ "src/cli/commit.zig", "simulateCouplingImpact", 1 },
@@ -7966,21 +7984,32 @@ test "apply: every delete, rename or truncating write sits where it was judged" 
         .{ "src/cli/commit.zig", "writeLayer", 1 },
         .{ "src/cli/commit.zig", "writePlan", 2 },
         .{ "src/cli/commit_struct.zig", "applyToLayer", 1 },
-        .{ "src/cli/export.zig", "run", 1 },
+        .{ "src/cli/doctor.zig", "staleFacts", 3 },
+        .{ "src/cli/export.zig", "run", 2 },
+        .{ "src/cli/fileops.zig", "copyTree", 1 },
         .{ "src/cli/init.zig", "initFresh", 1 },
         .{ "src/cli/lock.zig", "acquire", 2 },
         .{ "src/cli/lock.zig", "release", 1 },
         .{ "src/cli/mv.zig", "run", 2 },
         .{ "src/cli/remove.zig", "run", 2 },
+        .{ "src/cli/rollback.zig", "repatchPartial", 1 },
         .{ "src/cli/uninstall.zig", "deleteEntry", 2 },
+        .{ "src/cli/update.zig", "classifyStatus", 3 },
         .{ "src/cli/update.zig", "setupFixture", 1 },
         .{ "src/cli/upgrade.zig", "installBinary", 1 },
         .{ "src/cli/upgrade.zig", "replaceBinary", 9 },
         .{ "src/cli/upgrade.zig", "run", 1 },
         .{ "src/cli/upgrade.zig", "stageAsset", 1 },
         .{ "src/cli/upgrade.zig", "writeSums", 1 },
+        .{ "src/compose/catB.zig", "emitDirective", 1 },
         .{ "src/coupling/store.zig", "writeJson", 1 },
-        .{ "src/machine/dimensions.zig", "writeFile", 1 },
+        .{ "src/dsl/ast.zig", "exprEqual", 1 },
+        .{ "src/dsl/driver.zig", "parseFileImpl", 2 },
+        .{ "src/dsl/parser.zig", "parseLineDirective", 1 },
+        .{ "src/dsl/parser.zig", "parseRegionOpener", 1 },
+        .{ "src/machine/dimensions.zig", "recordDirectiveAxes", 1 },
+        .{ "src/machine/dimensions.zig", "recurseDirective", 1 },
+        .{ "src/machine/dimensions.zig", "writeFile", 2 },
         .{ "src/machine/facts.zig", "factsPathAlloc", 1 },
         .{ "src/machine/interview.zig", "persist", 1 },
         .{ "src/machine/interview.zig", "remove", 1 },
@@ -7992,20 +8021,25 @@ test "apply: every delete, rename or truncating write sits where it was judged" 
         .{ "src/packages/exec.zig", "answer", 2 },
         .{ "src/packages/exec.zig", "spawn", 2 },
         .{ "src/packages/exec.zig", "sweepScratch", 1 },
+        .{ "src/packages/ledger.zig", "add", 1 },
         .{ "src/packages/manifest.zig", "expectRefusal", 1 },
         .{ "src/packages/plugin.zig", "bootstrapImpl", 2 },
         .{ "src/packages/windows.zig", "installedExplicitImpl", 2 },
+        .{ "src/packages/write.zig", "append", 2 },
+        .{ "src/packages/write.zig", "seededManifest", 1 },
         .{ "src/provenance/map.zig", "forget", 1 },
         .{ "src/provenance/map.zig", "persist", 1 },
         .{ "src/secret/resolver.zig", "resolveCmdViaScript", 2 },
         .{ "src/source/attributes.zig", "loadText", 1 },
         .{ "src/source/attributes.zig", "write", 2 },
+        .{ "src/source/axes.zig", "addDirective", 1 },
         .{ "src/source/axes.zig", "axesOfSingleFile", 1 },
-        .{ "src/source/axes.zig", "writeFile", 1 },
+        .{ "src/source/axes.zig", "recurseDirective", 1 },
+        .{ "src/source/axes.zig", "writeFile", 2 },
+        .{ "src/source/ignore/load.zig", "stripConditional", 1 },
         .{ "src/trigger/state.zig", "save", 2 },
         .{ "src/trigger/state.zig", "settlePending", 2 },
     };
-    const calls = [_][]const u8{ "deleteFile(", "deleteFileAbsolute(", "deleteDir(", "deleteDirAbsolute(", "deleteTree(", "deleteTreeAbsolute(", "rename(", "renameAbsolute(", "unlink(", "unlinkat(", "renameat(", "createFile(", "createFileAbsolute(", "writeFile(" };
 
     var src = Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest,
@@ -8032,20 +8066,25 @@ test "apply: every delete, rename or truncating write sits where it was judged" 
                 if (std.mem.startsWith(u8, line, "}")) in_test = false;
                 continue;
             }
-            const t = std.mem.trimStart(u8, line, " \t");
-            if (std.mem.startsWith(u8, t, "//")) continue;
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (std.mem.startsWith(u8, t, "\\\\")) continue;
             if (fnName(t)) |n| func = n;
-            const code = if (std.mem.indexOfScalar(u8, t, '"') == null) t[0 .. std.mem.indexOf(u8, t, "//") orelse t.len] else t;
-            for (calls) |c| {
-                var at: usize = 0;
-                while (std.mem.indexOfPos(u8, code, at, c)) |i| : (at = i + c.len) {
-                    if (i > 0 and (std.ascii.isAlphanumeric(code[i - 1]) or code[i - 1] == '_')) continue;
-                    if (std.mem.endsWith(u8, code[0..i], "fn ")) continue;
+            const code = try codeOf(a, t);
+            var i: usize = 0;
+            while (i < code.len) {
+                if (!(std.ascii.isAlphabetic(code[i]) or code[i] == '_')) {
+                    i += 1;
+                    continue;
+                }
+                var k = i;
+                while (k < code.len and (std.ascii.isAlphanumeric(code[k]) or code[k] == '_')) k += 1;
+                if (isOverwritePrimitive(code[i..k])) {
                     const key = try std.fmt.allocPrint(a, "{s}\t{s}", .{ name, func });
                     const gop = try found.getOrPut(key);
                     if (!gop.found_existing) gop.value_ptr.* = 0;
                     gop.value_ptr.* += 1;
                 }
+                i = k;
             }
         }
     }
@@ -8057,17 +8096,58 @@ test "apply: every delete, rename or truncating write sits where it was judged" 
             if (std.mem.eql(u8, try std.fmt.allocPrint(a, "{s}\t{s}", .{ al[0], al[1] }), e.key_ptr.*)) want = al[2];
         }
         if (e.value_ptr.* != want) {
-            std.debug.print("\n{s}: {d} delete/rename/truncating calls, {d} listed\n", .{ e.key_ptr.*, e.value_ptr.*, want });
+            std.debug.print("\n{s}: {d} mentions, {d} listed\n", .{ e.key_ptr.*, e.value_ptr.*, want });
             bad = true;
         }
     }
     for (allowed) |al| {
         if (!found.contains(try std.fmt.allocPrint(a, "{s}\t{s}", .{ al[0], al[1] }))) {
-            std.debug.print("\n{s}\t{s}: listed, but makes no such call\n", .{ al[0], al[1] });
+            std.debug.print("\n{s}\t{s}: listed, but mentions none\n", .{ al[0], al[1] });
             bad = true;
         }
     }
     try std.testing.expect(!bad);
+}
+
+/// True for an identifier naming a primitive that deletes, renames or
+/// overwrites a path, aliases and variants included.
+fn isOverwritePrimitive(ident: []const u8) bool {
+    for ([_][]const u8{ "deleteFile", "deleteDir", "deleteTree", "rename", "createFile", "writeFile", "writeAtomic" }) |p| {
+        if (std.mem.startsWith(u8, ident, p)) return true;
+    }
+    for ([_][]const u8{ "renamePreserve", "copyFile", "createFileAtomic", "replace", "symLinkAtomic", "setLength", "updateFile" }) |x| {
+        if (std.mem.eql(u8, ident, x)) return true;
+    }
+    return false;
+}
+
+/// `t` with its string and character literals emptied and its comment cut.
+fn codeOf(a: std.mem.Allocator, t: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < t.len) {
+        const c = t[i];
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
+        if (c == '"') {
+            i += 1;
+            while (i < t.len and t[i] != '"') : (i += 1) {
+                if (t[i] == '\\') i += 1;
+            }
+            i += 1;
+            try out.appendSlice(a, "\"\"");
+            continue;
+        }
+        if (c == '\'') {
+            if (std.mem.indexOfScalarPos(u8, t, i + 1, '\'')) |j| if (j - i <= 4) {
+                i = j + 1;
+                try out.appendSlice(a, "' '");
+                continue;
+            };
+        }
+        try out.append(a, c);
+        i += 1;
+    }
+    return out.items;
 }
 
 /// The name a line declaring a function gives it, or null.
